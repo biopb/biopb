@@ -30,7 +30,7 @@ const INFO: TileInfo = {
   tile_size: 512,
   plane: { y: 3, x: 4, s: null },
   selectable: { t: 0, c: 1, z: 2 },
-  pinned: [],
+  sel_axes: [],
   levels: [
     { level: 0, scale: 1, height: 1024, width: 1024, cols: 2, rows: 2 },
     { level: 1, scale: 2, height: 512, width: 512, cols: 1, rows: 1 },
@@ -59,11 +59,38 @@ const RGB_INFO: TileInfo = {
   tile_size: 512,
   plane: { y: 3, x: 4, s: 5 },
   selectable: { t: 0, c: 1, z: 2 },
-  pinned: [],
+  sel_axes: [],
   levels: [
     { level: 0, scale: 1, height: 1411, width: 1411, cols: 3, rows: 3 },
     { level: 1, scale: 2, height: 706, width: 706, cols: 2, rows: 2 },
     { level: 2, scale: 4, height: 353, width: 353, cols: 1, rows: 1 },
+  ],
+};
+
+/** A leading axis nothing names: reachable only by wire index. */
+const UNNAMED_INFO: TileInfo = {
+  ...INFO,
+  array_id: "pos/Image:0",
+  dim_labels: ["POS", "C", "Z", "Y", "X"],
+  shape: [5, 3, 16, 1024, 1024],
+  selectable: { t: null, c: 1, z: 2 },
+  sel_axes: [{ axis: 0, label: "POS", extent: 5 }],
+};
+
+/** 155 single-page TIFFs stacked on an opaque file axis. */
+const SEQUENCE_INFO: TileInfo = {
+  array_id: "tiff-sequence_6bc95fdaaeb2",
+  dim_labels: ["i", "y", "x"],
+  shape: [155, 1024, 1024],
+  chunk_shape: [3, 1024, 1024],
+  dtype: "<u2",
+  tile_size: 512,
+  plane: { y: 1, x: 2, s: null },
+  selectable: { t: null, z: null, c: null },
+  sel_axes: [{ axis: 0, label: "i", extent: 155 }],
+  levels: [
+    { level: 0, scale: 1, height: 1024, width: 1024, cols: 2, rows: 2 },
+    { level: 1, scale: 2, height: 512, width: 512, cols: 1, rows: 1 },
   ],
 };
 
@@ -264,25 +291,74 @@ describe("PixelSource.getTile", () => {
     expect(client.tile.mock.calls[0]![1]).toEqual({ signal: ctrl.signal });
   });
 
-  it("refuses to select an axis the tile API cannot address", async () => {
-    const info: TileInfo = {
-      ...INFO,
-      dim_labels: ["POS", "C", "Z", "Y", "X"],
-      selectable: { t: null, c: 1, z: 2 },
-    };
-    const [full] = pixelSourcesFromInfo(stubClient(), info);
-    // Index 0 is the correct default, so only a non-zero request is wrong.
-    await expect(
-      full!.getTile({ x: 0, y: 0, selection: { pos: 0, c: 0, z: 0 } }),
-    ).resolves.toBeDefined();
-    await expect(
-      full!.getTile({ x: 0, y: 0, selection: { pos: 3, c: 0, z: 0 } }),
-    ).rejects.toThrow(/cannot be selected/);
+  it("addresses an axis with no name through sel", async () => {
+    const client = stubClient();
+    const [full] = pixelSourcesFromInfo(client, UNNAMED_INFO);
+    await full!.getTile({ x: 0, y: 0, selection: { a0: 3, c: 0, z: 0 } });
+    const req = client.tile.mock.calls[0]![0];
+    expect(req.sel).toEqual([[0, 3]]);
+    // Not smuggled in under a name it does not have: the server refuses an
+    // axis sent both ways, so the two forms have to be exclusive.
+    expect(req.t).toBeUndefined();
+    expect(req.z).toBe(0);
+    expect(req.c).toBe(0);
+  });
+
+  it("keeps a named axis under its name", async () => {
+    const client = stubClient();
+    const [full] = pixelSourcesFromInfo(client, INFO);
+    await full!.getTile({ x: 0, y: 0, selection: { t: 0, c: 2, z: 5 } });
+    const req = client.tile.mock.calls[0]![0];
+    expect(req).toMatchObject({ t: 0, c: 2, z: 5 });
+    expect(req.sel).toBeUndefined();
+  });
+
+  it("reaches every frame of a TIFF sequence", async () => {
+    // The case this was built for: 155 stacked single-page files on an opaque
+    // `i` axis, which no t/z/c parameter can name.
+    const client = stubClient();
+    const [full] = pixelSourcesFromInfo(client, SEQUENCE_INFO);
+    await full!.getTile({ x: 0, y: 0, selection: { a0: 154 } });
+    expect(client.tile.mock.calls[0]![0].sel).toEqual([[0, 154]]);
+  });
+
+  it("refuses a tensor whose unnamed axis this server cannot reach", () => {
+    // An old server sends `pinned` and no `sel_axes`. Without this probe it
+    // answers `?sel=0:154` with index 0's pixels and a 200, so the viewer scrolls
+    // through 155 copies of frame 0 with nothing on screen saying so.
+    const { sel_axes: _dropped, ...oldServer } = SEQUENCE_INFO;
+    expect(() => pixelSourcesFromInfo(stubClient(), oldServer as TileInfo)).toThrow(
+      /cannot select: i \(155 positions\)/,
+    );
+  });
+
+  it("still tiles a fully named tensor against such a server", () => {
+    // The refusal is about the axis, not the server: TCZYX needs no `sel`.
+    const { sel_axes: _dropped, ...oldServer } = INFO;
+    expect(() => pixelSourcesFromInfo(stubClient(), oldServer as TileInfo)).not.toThrow();
+  });
+
+  it("ignores an unnamed axis of extent 1, which needs no selection", () => {
+    const { sel_axes: _dropped, ...oldServer } = SEQUENCE_INFO;
+    expect(() =>
+      pixelSourcesFromInfo(stubClient(), { ...oldServer, shape: [1, 1024, 1344] } as TileInfo),
+    ).not.toThrow();
   });
 
   it("refuses a non-zero index on an axis the tensor does not have", async () => {
-    const info: TileInfo = { ...INFO, selectable: { t: null, c: 1, z: 2 } };
+    const info: TileInfo = {
+      ...INFO,
+      dim_labels: ["C", "Z", "Y", "X"],
+      shape: [3, 16, 1024, 1024],
+      plane: { y: 2, x: 3, s: null },
+      selectable: { t: null, c: 0, z: 1 },
+    };
     const [full] = pixelSourcesFromInfo(stubClient(), info);
+    // Index 0 is the default every client sends, so only a non-zero one is a
+    // mistake worth reporting.
+    await expect(
+      full!.getTile({ x: 0, y: 0, selection: { t: 0, c: 0, z: 0 } }),
+    ).resolves.toBeDefined();
     await expect(
       full!.getTile({ x: 0, y: 0, selection: { t: 4, c: 0, z: 0 } }),
     ).rejects.toThrow(/no "t" axis/);

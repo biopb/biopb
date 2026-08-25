@@ -40,7 +40,6 @@ import {
   contrastSamples,
   dtypeContrastLimits,
   percentileBounds,
-  pinnedNotice,
   samplesPerPixel,
   tileCacheSize,
   vivColor,
@@ -63,7 +62,13 @@ interface TileViewerProps {
   onUnsupported: (reason: string, kind: FallbackKind) => void;
 }
 
-/** Slice navigation: hold one of these and scroll. Matches {@link ImageViewer}. */
+/**
+ * Slice navigation: hold one of these and scroll. Matches {@link ImageViewer}.
+ *
+ * Only the named axes get a key, because there is no letter to press for an
+ * axis called `i` or `POS` that would not collide with something. Those are
+ * navigated with their slider in {@link SliceControls}.
+ */
 const SLICE_KEYS = ["t", "z", "c"] as const;
 const SLICE_WHEEL_QUIET_MS = 120;
 
@@ -287,8 +292,6 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
 
   useSliceWheelNavigation(hostRef, info);
 
-  const pinned = info ? pinnedNotice(info) : null;
-
   return (
     <div
       ref={hostRef}
@@ -324,19 +327,16 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           {tileError ? "Plane unavailable" : "Reading plane…"}
         </div>
       )}
-      {(pinned || (dataValid && uniformValue !== null)) && (
+      {dataValid && uniformValue !== null && (
         <div style={{ position: "absolute", bottom: 10, left: 10, display: "grid", gap: 4, zIndex: 2 }}>
-          {dataValid && uniformValue !== null && (
-            <div
-              style={{ ...BADGE, position: "static" }}
-              title="Measured from the coarsest pyramid level, subsampled for the contrast histogram."
-            >
-              {uniformValue === 0
-                ? "empty plane (all zeros)"
-                : `uniform plane (value ${Number.isInteger(uniformValue) ? uniformValue : uniformValue.toPrecision(4)})`}
-            </div>
-          )}
-          {pinned && <div style={{ ...BADGE, position: "static" }}>{pinned}</div>}
+          <div
+            style={{ ...BADGE, position: "static" }}
+            title="Measured from the coarsest pyramid level, subsampled for the contrast histogram."
+          >
+            {uniformValue === 0
+              ? "empty plane (all zeros)"
+              : `uniform plane (value ${Number.isInteger(uniformValue) ? uniformValue : uniformValue.toPrecision(4)})`}
+          </div>
         </div>
       )}
       {tileError && (

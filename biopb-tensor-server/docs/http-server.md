@@ -120,17 +120,24 @@ a tile grid — shaped to drop into a Viv `PixelSource[]`:
   "tile_size": 512,
   "plane": {"y": 3, "x": 4, "s": null},
   "selectable": {"t": 0, "c": 1, "z": 2},
-  "pinned": [],
+  "sel_axes": [],
   "levels": [{"level":0,"scale":1,"height":512,"width":512,"cols":1,"rows":1}]
 }
 ```
 
-`selectable` gives the wire index of each addressable slider axis, or `null`.
-`pinned` is the converse and is the one worth reading: non-plane axes with
-extent > 1 that `t`/`z`/`c` **cannot** reach, served at index 0 with the rest
-unreachable through this route — an unlabelled axis (`[{"axis":0,"label":"POS",
-"extent":5}]`), or the second of two axes sharing a label, since only the first
+`selectable` gives the wire index of each **named** slider axis, or `null`.
+`sel_axes` is the converse and is the one worth reading: non-plane axes with
+extent > 1 that `t`/`z`/`c` cannot *name* — an unlabelled axis
+(`[{"axis":0,"label":"POS","extent":5}]`), a TIFF sequence's opaque file axis
+(`"i"`), or the second of two axes sharing a label, since only the first
 occurrence resolves. Empty for an ordinary TCZYX tensor.
+
+Naming is not addressing: `sel_axes` entries **are** selectable, through the
+`sel` parameter below. What the list says is that a client must reach them
+positionally, and that the server has no semantic title to offer for the
+slider — so show the source's own label (`i`), not an invented `Z`. Deriving
+one positionally is the guess `core/axes.py` declines to make, and making it
+client-side only moves it somewhere less visible.
 
 **`level` 0 is full resolution** (Viv's `PixelSource[]` index convention, not the
 map-tile one where z grows with detail); each level halves. `tile_size` is derived
@@ -139,8 +146,23 @@ this tensor, not from the source listing — so a tile *nests* inside a delivere
 chunk rather than straddling one; clients must not assume a constant.
 
 `GET /api/tile/{array_id}` takes `level`, `col`, `row`, the selection
-`t` / `z` / `c` (default 0), and `fmt` (`raw` | `png` | `jpeg`, plus
-`lo` / `hi` / `color` / `use_min_max` for the rendered formats).
+`t` / `z` / `c` (default 0) and `sel` (below), and `fmt` (`raw` | `png` |
+`jpeg`, plus `lo` / `hi` / `color` / `use_min_max` for the rendered formats).
+
+**`sel=<axis>:<index>`**, repeatable, selects an axis by its **wire index** —
+the only handle an axis in `sel_axes` has. `GET /api/tile/seq?sel=0:154` serves
+frame 154 of a 155-file TIFF sequence; before it, that tensor was a one-frame
+image to every tiled client. It composes with the named parameters
+(`?sel=0:4&c=2`) and is refused, 422, when it is malformed, names the same axis
+twice, names an axis the tensor does not have, names a plane axis, or names an
+axis `t`/`z`/`c` already name — that last one even when the two agree, because
+one axis with two spellings in one URL is two cache entries for one tile.
+Unlike `t`/`z`/`c`, `sel` has no index-0 exemption: it is never a default, so
+`sel=9:0` on a 3-D tensor is a client addressing an axis it believes exists.
+
+The ETag is computed over the **resolved** selection rather than the raw
+parameters, so the two spellings of one plane share a cache entry and a
+parameter the resolution ignored cannot vary the key.
 
 | | |
 |---|---|

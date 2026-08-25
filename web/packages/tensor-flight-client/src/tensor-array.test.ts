@@ -10,6 +10,7 @@ import { describe, it, expect, vi, type Mock } from "vitest";
 
 import {
   buildAxisMap,
+  sliderAxes,
   isAxisMapAmbiguous,
   computeScaleHint,
   TensorArray,
@@ -182,6 +183,72 @@ describe("buildAxisMap: the plane is a position", () => {
     // sidecar renders the block they describe. Both must call axis 3 Y.
     const m = buildAxisMap(["T", "C", "Z", "Y", "X", "S"]);
     expect([m.y, m.x, m.s]).toEqual([3, 4, 5]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sliderAxes — navigation without renaming
+// ---------------------------------------------------------------------------
+
+describe("sliderAxes", () => {
+  it("names the axes the labels name", () => {
+    const axes = sliderAxes(["t", "c", "z", "y", "x"], [4, 3, 16, 512, 512]);
+    expect(axes.map((a) => [a.axis, a.named, a.title, a.key])).toEqual([
+      [0, "t", "T", "t"],
+      [1, "c", "C", "c"],
+      [2, "z", "Z", "z"],
+    ]);
+  });
+
+  it("excludes the plane", () => {
+    expect(sliderAxes(["y", "x"], [512, 512])).toEqual([]);
+    expect(sliderAxes(["y", "x", "s"], [512, 512, 3])).toEqual([]);
+  });
+
+  it("does NOT rename an unnamed axis to z", () => {
+    // buildAxisMap's positional fallback would call this one `z`. A TIFF
+    // sequence's 155 stacked files are not depth planes, and nothing in the
+    // source says they are.
+    expect(buildAxisMap(["i", "y", "x"]).z).toBe(0);
+    const axes = sliderAxes(["i", "y", "x"], [155, 1024, 1344]);
+    expect(axes).toEqual([
+      { axis: 0, named: null, title: "i", key: "a0", extent: 155 },
+    ]);
+  });
+
+  it("still makes an unlabelled store navigable", () => {
+    // What the fallback existed to provide, kept: every axis gets a control.
+    // Only the invented semantics are gone.
+    const axes = sliderAxes(["dim0", "dim1", "dim2", "dim3"], [4, 5, 512, 512]);
+    expect(axes.map((a) => a.title)).toEqual(["dim0", "dim1"]);
+    expect(axes.map((a) => a.key)).toEqual(["a0", "a1"]);
+    expect(axes.every((a) => a.named === null)).toBe(true);
+  });
+
+  it("gives the second of two axes sharing a label a key of its own", () => {
+    // Only the first `c` has a name to be addressed by; the second would
+    // otherwise collapse into the same selection entry.
+    const axes = sliderAxes(["c", "c", "y", "x"], [2, 3, 512, 512]);
+    expect(axes.map((a) => [a.named, a.key])).toEqual([
+      ["c", "c"],
+      [null, "a1"],
+    ]);
+  });
+
+  it("titles an empty label by position", () => {
+    const axes = sliderAxes(["", "y", "x"], [7, 512, 512]);
+    expect(axes[0]).toMatchObject({ title: "axis 0", key: "a0" });
+  });
+
+  it("keeps extent-1 axes, which are still part of a selection", () => {
+    const axes = sliderAxes(["t", "y", "x"], [1, 512, 512]);
+    expect(axes).toEqual([{ axis: 0, named: "t", title: "T", key: "t", extent: 1 }]);
+  });
+
+  it("gives every axis a unique key", () => {
+    const labels = ["c", "c", "", "pos", "z", "y", "x"];
+    const axes = sliderAxes(labels, [2, 3, 4, 5, 6, 512, 512]);
+    expect(new Set(axes.map((a) => a.key)).size).toBe(axes.length);
   });
 });
 

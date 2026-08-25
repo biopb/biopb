@@ -72,8 +72,8 @@ export const TIPS: Tip[] = [
     when: selected,
   },
   {
-    id: "pinned-axis",
-    text: "“Showing axis … — not selectable through the tile API” means the plane on screen is not the one you asked for.",
+    id: "unnamed-axis",
+    text: "An axis the file does not name — a TIFF sequence's “i”, a plate's “POS” — gets a slider under that name, not a borrowed T/Z/C.",
     when: selected,
   },
   {

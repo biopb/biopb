@@ -93,6 +93,83 @@ export function buildAxisMap(dimLabels: string[]): AxisMap {
 }
 
 /**
+ * One navigable axis: a slider, and how to address it.
+ *
+ * See {@link sliderAxes} for why this exists alongside {@link AxisMap}.
+ */
+export interface SliderAxis {
+  /** Wire index, i.e. position in `dim_labels`/`shape`. */
+  axis: number;
+  /** The semantic name the labels give it, or null when they give none. */
+  named: "t" | "z" | "c" | null;
+  /** What to title the control: `T`/`Z`/`C`, or the source's own label. */
+  title: string;
+  /** Unique key for store state and for Viv's label-keyed selection. */
+  key: string;
+  extent: number;
+}
+
+/**
+ * Every non-plane axis, in wire order, named only where the labels name it.
+ *
+ * The slider-facing resolver, and deliberately *not* {@link buildAxisMap}: that
+ * one falls back to position for the leading axes it cannot name, so a TIFF
+ * sequence's opaque `i` axis comes back as `z` and the UI titles 155 stacked
+ * files "Z". Navigating the axis is right; calling it depth is a claim about
+ * the data that nothing in the source supports — the same guess
+ * `core/axes.py` refuses to make on the wire, relocated to where it is harder
+ * to see.
+ *
+ * Separating the two is what makes both correct. `buildAxisMap` keeps its
+ * fallback for the programmatic accessor and for `computeScaleHint`, whose
+ * plane reading is positional *by contract*; this one keeps the navigation the
+ * fallback existed to provide — an unlabelled zarr still gets a full set of
+ * sliders — and drops only the naming, because `sel` means an axis no longer
+ * has to be called `t`/`z`/`c` to be addressable.
+ *
+ * Extent-1 axes are included: they are still part of the selection a caller
+ * sends. Filter on `extent > 1` for the ones worth a control.
+ */
+export function sliderAxes(dimLabels: string[], shape: number[]): SliderAxis[] {
+  const map = buildAxisMap(dimLabels);
+  const plane = new Set([map.y, map.x, map.s].filter((i) => i !== null));
+  const labels = dimLabels.map((l) => l.toLowerCase().trim());
+
+  // Label-only, first occurrence wins — matching the server's
+  // `labeled_axis_index`, so `selectable` and this agree about what has a name.
+  // The second of two axes sharing a label has none of its own, and is
+  // addressed positionally like any other unnamed axis.
+  const claimed = new Map<number, "t" | "z" | "c">();
+  const taken = new Set<string>();
+  for (let i = 0; i < labels.length; i++) {
+    if (plane.has(i)) continue;
+    const l = labels[i] as string;
+    const name = TEMPORAL.has(l) ? "t" : SPATIAL_Z.has(l) ? "z" : CHANNEL.has(l) ? "c" : null;
+    if (name && !taken.has(name)) {
+      taken.add(name);
+      claimed.set(i, name);
+    }
+  }
+
+  const out: SliderAxis[] = [];
+  for (let i = 0; i < shape.length; i++) {
+    if (plane.has(i)) continue;
+    const named = claimed.get(i) ?? null;
+    const label = (dimLabels[i] ?? "").trim();
+    out.push({
+      axis: i,
+      named,
+      title: named ? named.toUpperCase() : label || `axis ${i}`,
+      // `a<index>` for the unnamed: unique by construction, which a source's
+      // own label is not (two axes may share one, and one may be empty).
+      key: named ?? `a${i}`,
+      extent: shape[i] ?? 1,
+    });
+  }
+  return out;
+}
+
+/**
  * True when the labels do not name every axis, so the plane came from position.
  *
  * Position is the contract, not a guess, so this no longer means "the plane may

@@ -26,6 +26,7 @@ import type {
 } from "@vivjs/types";
 
 import { TensorAbortError, type TensorHttpClient } from "./client.js";
+import { sliderAxes } from "./tensor-array.js";
 import type { TileInfo, TileLevel } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -85,9 +86,17 @@ function asTypedArray(buffer: ArrayBuffer, dtype: SupportedDtype): SupportedType
  *
  * Viv requires the plane last: `[...rest, "y", "x"]`, with `"_c"` after it for
  * an interleaved RGB(A) samples axis. The data plane already guarantees the
- * canonical `[..., Z, Y, X, S]` order, so this lowercases and renames the
- * samples axis; a tensor that does not satisfy it is rejected here rather than
- * silently rendering a transposed plane.
+ * canonical `[..., Z, Y, X, S]` order, so this renames the plane axes and takes
+ * the rest from {@link sliderAxes}; a tensor that does not satisfy the order is
+ * rejected here rather than silently rendering a transposed plane.
+ *
+ * The non-plane labels come from `sliderAxes` rather than from `dim_labels`
+ * directly because Viv's selection is a *record keyed by label*, so the labels
+ * have to be unique — and a source's own are not. Two axes may share one (the
+ * duplicate-`c` case) and one may be empty, either of which silently collapses
+ * two axes into one selection entry. `sliderAxes` keys the unnamed ones by wire
+ * index instead, which is unique by construction; {@link tileSelection} reads
+ * the mapping back out of the same function, so the two cannot drift.
  */
 export function vivLabels(info: TileInfo): string[] {
   const { plane, dim_labels, shape } = info;
@@ -99,12 +108,51 @@ export function vivLabels(info: TileInfo): string[] {
         `(plane y=${plane.y} x=${plane.x} s=${plane.s} of ${ndim} axes)`,
     );
   }
+  const keys = new Map(
+    sliderAxes(dim_labels, shape).map((axis) => [axis.axis, axis.key]),
+  );
   return dim_labels.map((label, i) => {
     if (i === plane.y) return "y";
     if (i === plane.x) return "x";
     if (i === plane.s) return "_c";
-    return label.toLowerCase();
+    return keys.get(i) ?? label.toLowerCase();
   });
+}
+
+// ---------------------------------------------------------------------------
+// Server capability
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this server's tile route can address an axis by wire index (`sel`).
+ *
+ * `sel_axes` is the marker because it arrived with `sel` in the same change: a
+ * server that publishes the list is a server that accepts the parameter, and one
+ * that predates both sends `pinned` instead and leaves this `undefined`.
+ *
+ * The probe is needed because the failure is otherwise **silent**. Starlette
+ * drops undeclared query parameters, so an old server answers `?sel=0:154` with
+ * index 0's pixels, HTTP 200, and an ETag identical to every other frame's — the
+ * viewer shows one plane of 155 and nothing anywhere says so. That is the exact
+ * failure `_resolve_tile_selection` already refuses one level down ("a client
+ * told it got a plane it did not get"), and version skew is not a reason to
+ * accept it: a browser holding a cached bundle, or a sidecar upgraded on its own
+ * schedule, reaches this without anyone doing anything unusual.
+ *
+ * Deliberately a *capability* question and not a *tensor* one. A TCZYX tensor
+ * needs no `sel` and still tiles perfectly against an old server; only a tensor
+ * with an axis nothing names is affected.
+ */
+export function supportsSelParameter(info: TileInfo): boolean {
+  return Array.isArray(info.sel_axes);
+}
+
+/** The unnamed axes this server cannot reach, or `[]` when it can reach them. */
+function unreachableAxes(info: TileInfo) {
+  if (supportsSelParameter(info)) return [];
+  return sliderAxes(info.dim_labels, info.shape).filter(
+    (axis) => !axis.named && axis.extent > 1,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +355,22 @@ export function pixelSourcesFromInfo(
   info: TileInfo,
   options: TensorPixelSourceOptions = {},
 ): PixelSource<string[]>[] {
+  const unreachable = unreachableAxes(info);
+  if (unreachable.length) {
+    // Refusing the tensor, not the axis: the caller falls back to the
+    // server-rendered viewer, which addresses axes positionally through
+    // `slice_start` and has always served these planes correctly. So the answer
+    // to an old server is a working viewer plus a stated reason, rather than a
+    // slider that scrolls through 155 copies of frame 0.
+    const named = unreachable
+      .map((axis) => `${axis.title} (${axis.extent} positions)`)
+      .join(", ");
+    throw new Error(
+      `Tensor ${info.array_id} has an axis this server's tile route cannot ` +
+        `select: ${named}. Addressing it needs the \`sel\` parameter, which this ` +
+        `server predates — it would answer every position with index 0.`,
+    );
+  }
   const labels = vivLabels(info);
   const dtype = vivDtype(info.dtype);
   // Shared across the levels of this image, so a selection change supersedes
@@ -392,10 +456,15 @@ function makeSource(
       }
       const scale = level.scale;
       const sel = tileSelection(info, selection);
-      // The key is the resolved t/z/c, not the caller's selection object: the
-      // background layer and the contrast sampler build their own objects for
-      // the same plane, and only the resolved form makes those the same read.
-      const key = `t${sel.t ?? 0}/z${sel.z ?? 0}/c${sel.c ?? 0}`;
+      // The key is the resolved selection, not the caller's selection object:
+      // the background layer and the contrast sampler build their own objects
+      // for the same plane, and only the resolved form makes those the same
+      // read. It must cover `sel` too -- keyed on t/z/c alone, every frame of a
+      // TIFF sequence shares one key, so the second plane read would be served
+      // the first plane's in-flight promise.
+      const key =
+        `t${sel.t ?? 0}/z${sel.z ?? 0}/c${sel.c ?? 0}/` +
+        (sel.sel ?? []).map(([axis, index]) => `${axis}:${index}`).join(",");
 
       // A level that fits one tile is one tile. `_tile_levels` stops halving as
       // soon as the plane fits the edge, so the coarsest level always has
@@ -484,50 +553,85 @@ function emptyTile(
   return { data: data as SupportedTypedArray, width: tileSize, height: tileSize };
 }
 
+/** A selection resolved into the two forms the tile route accepts. */
+export interface TileParams {
+  t?: number;
+  z?: number;
+  c?: number;
+  /** Axes with no name, addressed by wire index. */
+  sel?: Array<[number, number]>;
+}
+
 /**
- * Viv's label-keyed selection -> the tile API's `t`/`z`/`c` parameters.
+ * Viv's label-keyed selection -> the tile route's parameters.
  *
- * Those three are all the endpoint can address. Any other slider axis is served
- * at index 0, which is right for the default and wrong for anything else, so a
- * non-zero request on one is refused rather than quietly returning the wrong
- * plane. Extending the endpoint is the fix if a dataset needs it.
+ * Two spellings, one rule for choosing between them: an axis goes under its
+ * *name* when the server says that name resolves to this very axis
+ * (`info.selectable`), and under `sel` — by wire index — when it does not. The
+ * server refuses an axis sent both ways, so the choice has to be exclusive
+ * rather than belt-and-braces.
+ *
+ * Asking `selectable` rather than trusting this side's own naming is what keeps
+ * a disagreement harmless. The two resolvers share a vocabulary and should
+ * always agree, but if they ever did not, the axis simply falls to `sel` — which
+ * addresses it correctly regardless of what either side would have called it. A
+ * drift becomes a wrong slider *title*, never a wrong plane.
  */
 function tileSelection(
   info: TileInfo,
   selection: PixelSourceSelection<string[]>,
-): { t?: number; z?: number; c?: number } {
-  const out: { t?: number; z?: number; c?: number } = {};
+): TileParams {
+  const out: TileParams = {};
+  const byKey = new Map(
+    sliderAxes(info.dim_labels, info.shape).map((axis) => [axis.key, axis]),
+  );
+  const sel: Array<[number, number]> = [];
+
   for (const [label, rawIndex] of Object.entries(selection ?? {})) {
+    if (label === "y" || label === "x" || label === "_c") continue;
     const index = Number(rawIndex ?? 0);
-    if (label === "t" || label === "z" || label === "c") {
-      if (info.selectable[label] === null) {
-        if (index !== 0) {
-          throw new Error(`Tensor ${info.array_id} has no "${label}" axis to select`);
-        }
-        continue;
+    const axis = byKey.get(label);
+    if (!axis) {
+      // A label naming no axis of this tensor. Index 0 is the default every
+      // client sends, so only a non-zero one is a mistake worth reporting --
+      // the same exemption the server applies to `t`/`z`/`c`.
+      if (index !== 0) {
+        throw new Error(
+          `Tensor ${info.array_id} has no "${label}" axis to select ` +
+            `(it has ${[...byKey.keys()].join(", ") || "none"})`,
+        );
       }
-      out[label] = index;
       continue;
     }
-    if (label === "y" || label === "x" || label === "_c") continue;
-    if (index !== 0) {
+    if (axis.named && info.selectable[axis.named] === axis.axis) {
+      out[axis.named] = index;
+    } else {
+      sel.push([axis.axis, index]);
+    }
+  }
+  if (sel.length) {
+    // Unreachable through `pixelSourcesFromInfo`, which refuses such a tensor
+    // up front. Kept because the cost of being wrong here is silent wrong
+    // pixels: this also covers the drift path above, where a *named* axis falls
+    // through to `sel` because the two sides disagree about its name.
+    if (!supportsSelParameter(info)) {
       throw new Error(
-        `Axis "${label}" of ${info.array_id} cannot be selected through the tile ` +
-          `API (only t/z/c); index ${index} would silently read index 0`,
+        `Tensor ${info.array_id} needs the \`sel\` parameter to select ` +
+          `axis ${sel.map(([axis]) => axis).join(", ")}, which this server predates`,
       );
     }
+    out.sel = sel;
   }
   return out;
 }
 
 /** The index the caller chose for wire axis `i`, or 0. */
-function sliderIndexAt(
-  info: TileInfo,
-  sel: { t?: number; z?: number; c?: number },
-  i: number,
-): number {
+function sliderIndexAt(info: TileInfo, params: TileParams, i: number): number {
   for (const axis of ["t", "z", "c"] as const) {
-    if (info.selectable[axis] === i) return sel[axis] ?? 0;
+    if (info.selectable[axis] === i && params[axis] !== undefined) return params[axis];
+  }
+  for (const [axis, index] of params.sel ?? []) {
+    if (axis === i) return index;
   }
   return 0;
 }

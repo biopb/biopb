@@ -1820,6 +1820,12 @@ def _tile_client_for(dim_labels, shape):
             yield tc, mock_fc
 
 
+def _slice_hint_bounds(mock_fc):
+    """The (start, stop) vectors of the last backend read, per axis."""
+    hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+    return [sl.start for sl in hint], [sl.stop for sl in hint]
+
+
 class TestTileSelectionValidation:
     """`t`/`z`/`c` must be checked against the axis they name, not just `ge=0`.
 
@@ -1883,36 +1889,126 @@ class TestTileSelectionValidation:
             assert mock_fc.get_tensor.call_count == before
 
 
-class TestTileInfoPinnedAxes:
-    """Axes the tile API serves at index 0 and cannot address are published."""
+class TestTileInfoUnnamedAxes:
+    """Axes t/z/c cannot name are published, so a client knows to use `sel`."""
 
-    def test_no_pinned_axes_on_a_fully_addressable_tensor(self):
+    def test_no_unnamed_axes_on_a_fully_named_tensor(self):
         with _tile_client_for(["t", "c", "z", "y", "x"], [1, 3, 16, 512, 512]) as (
             tc,
             _,
         ):
-            assert tc.get("/api/tile_info/s").json()["pinned"] == []
+            assert tc.get("/api/tile_info/s").json()["sel_axes"] == []
 
     def test_an_unlabelled_axis_is_reported(self):
-        # 4 of 5 positions are unreachable through this route; say so rather
-        # than leaving a client to diff dim_labels against selectable.
+        # Reachable through `sel`, but with no semantic title -- which is what
+        # this list tells the client, so it shows "pos" rather than inventing Z.
         with _tile_client_for(["pos", "c", "y", "x"], [5, 3, 512, 512]) as (tc, _):
-            assert tc.get("/api/tile_info/s").json()["pinned"] == [
+            assert tc.get("/api/tile_info/s").json()["sel_axes"] == [
                 {"axis": 0, "label": "pos", "extent": 5}
             ]
 
     def test_a_singleton_axis_is_not_reported(self):
-        # Extent 1 hides nothing: index 0 is the only index.
+        # Extent 1 is not navigable: index 0 is the only index.
         with _tile_client_for(["pos", "c", "y", "x"], [1, 3, 512, 512]) as (tc, _):
-            assert tc.get("/api/tile_info/s").json()["pinned"] == []
+            assert tc.get("/api/tile_info/s").json()["sel_axes"] == []
 
     def test_a_duplicate_label_is_reported(self):
-        # labeled_axis_index takes the first match, so the second C is
-        # unreachable even though it is labelled.
+        # labeled_axis_index takes the first match, so the second C has no name
+        # of its own even though it is labelled.
         with _tile_client_for(["c", "c", "y", "x"], [2, 3, 512, 512]) as (tc, _):
-            assert tc.get("/api/tile_info/s").json()["pinned"] == [
+            assert tc.get("/api/tile_info/s").json()["sel_axes"] == [
                 {"axis": 1, "label": "c", "extent": 3}
             ]
+
+    def test_a_tiff_sequence_axis_is_reported(self):
+        # The case this was built for: 155 single-page TIFFs stacked on an
+        # opaque file axis. Before `sel` this was a one-frame tensor to every
+        # tiled client.
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
+            info = tc.get("/api/tile_info/s").json()
+            assert info["selectable"] == {"t": None, "z": None, "c": None}
+            assert info["sel_axes"] == [{"axis": 0, "label": "i", "extent": 155}]
+
+
+class TestTilePositionalSelection:
+    """`sel=<axis>:<index>` reaches an axis t/z/c cannot name."""
+
+    def test_an_unnamed_axis_is_selectable(self):
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, mock_fc):
+            assert tc.get("/api/tile/s", params={"sel": "0:154"}).status_code == 200
+            start, stop = _slice_hint_bounds(mock_fc)
+            assert (start[0], stop[0]) == (154, 155)
+
+    def test_the_index_is_range_checked(self):
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
+            assert tc.get("/api/tile/s", params={"sel": "0:155"}).status_code == 422
+
+    def test_an_axis_the_tensor_lacks_is_refused(self):
+        # No index-0 exemption: `sel` is never a default, so naming a
+        # nonexistent axis is always a client mistake worth reporting.
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
+            assert tc.get("/api/tile/s", params={"sel": "9:0"}).status_code == 422
+
+    def test_a_plane_axis_is_refused(self):
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
+            assert tc.get("/api/tile/s", params={"sel": "1:0"}).status_code == 422
+            assert tc.get("/api/tile/s", params={"sel": "2:0"}).status_code == 422
+
+    def test_a_named_axis_must_use_its_name(self):
+        # Refused even though the two agree: one axis, two spellings, two cache
+        # keys for one tile.
+        with _tile_client_for(["t", "c", "z", "y", "x"], [4, 3, 16, 512, 512]) as (
+            tc,
+            _,
+        ):
+            assert tc.get("/api/tile/s", params={"sel": "0:2"}).status_code == 422
+
+    def test_a_malformed_sel_is_refused(self):
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
+            for bad in ("0", "z:1", "0:", "-1:0", "0:1:2", ""):
+                assert tc.get("/api/tile/s", params={"sel": bad}).status_code == 422, (
+                    bad
+                )
+
+    def test_the_same_axis_twice_is_refused(self):
+        with _tile_client_for(["pos", "c", "y", "x"], [5, 3, 512, 512]) as (tc, _):
+            resp = tc.get("/api/tile/s", params=[("sel", "0:1"), ("sel", "0:2")])
+            assert resp.status_code == 422
+
+    def test_sel_and_a_named_axis_compose(self):
+        with _tile_client_for(["pos", "c", "y", "x"], [5, 3, 512, 512]) as (
+            tc,
+            mock_fc,
+        ):
+            resp = tc.get("/api/tile/s", params={"sel": "0:4", "c": 2})
+            assert resp.status_code == 200
+            start, stop = _slice_hint_bounds(mock_fc)
+            assert (start[0], stop[0]) == (4, 5)
+            assert (start[1], stop[1]) == (2, 3)
+
+    def test_a_rejected_sel_never_reaches_the_backend(self):
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, mock_fc):
+            before = mock_fc.get_tensor.call_count
+            assert tc.get("/api/tile/s", params={"sel": "0:999"}).status_code == 422
+            assert mock_fc.get_tensor.call_count == before
+
+    def test_the_etag_follows_the_plane_not_the_spelling(self):
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
+            first = tc.get("/api/tile/s", params={"sel": "0:7"}).headers["ETag"]
+            same = tc.get("/api/tile/s", params={"sel": "0:7"}).headers["ETag"]
+            other = tc.get("/api/tile/s", params={"sel": "0:8"}).headers["ETag"]
+            assert first == same
+            assert first != other
+
+    def test_an_ignored_parameter_does_not_vary_the_etag(self):
+        # z=0 on a tensor with no z axis resolves to nothing; it must not mint a
+        # second cache entry for the same tile.
+        with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
+            plain = tc.get("/api/tile/s", params={"sel": "0:7"}).headers["ETag"]
+            noisy = tc.get(
+                "/api/tile/s", params={"sel": "0:7", "z": 0, "t": 0}
+            ).headers["ETag"]
+            assert plain == noisy
 
 
 # ===========================================================================

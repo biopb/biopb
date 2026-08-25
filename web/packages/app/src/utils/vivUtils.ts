@@ -6,7 +6,7 @@
  * tile-cache bound, and the axis/colour translations.
  */
 
-import type { TileInfo } from "@biopb/tensor-flight-client";
+import { sliderAxes, type TileInfo } from "@biopb/tensor-flight-client";
 import { getColorMultipliers, type ColorValue } from "./colorUtils";
 
 // ---------------------------------------------------------------------------
@@ -205,27 +205,30 @@ export interface SliceIndices {
   t: number;
   z: number;
   c: number;
+  /** Index per axis with no semantic name, keyed by `SliderAxis.key`. */
+  axes: Record<string, number>;
 }
 
 /**
- * The store's t/z/c -> Viv's label-keyed selection.
+ * The store's slice position -> Viv's label-keyed selection.
  *
- * Only axes the tensor actually has are named, because the adapter rejects a
- * non-zero index on an axis the tile route cannot address. Indices are clamped:
- * the store carries one slice position across a source change, so a tensor with
- * fewer Z planes than the last one would otherwise ask for a plane past the end
- * and get a 422 on every tile.
+ * Every non-plane axis appears, under the key `sliderAxes` gave it: `t`/`z`/`c`
+ * where the labels name the axis, `a<index>` where they do not. The second kind
+ * used to be left out entirely — there was no way to ask for it — which is what
+ * made a 155-file TIFF sequence a one-frame image in this viewer.
+ *
+ * Indices are clamped: the store carries a slice position across a source
+ * change, so a tensor with fewer Z planes than the last one would otherwise ask
+ * for a plane past the end and get a 422 on every tile.
  */
 export function vivSelection(
   info: TileInfo,
   slice: SliceIndices,
 ): Record<string, number> {
   const selection: Record<string, number> = {};
-  for (const axis of ["t", "z", "c"] as const) {
-    const wireAxis = info.selectable[axis];
-    if (wireAxis === null) continue;
-    const extent = info.shape[wireAxis] ?? 1;
-    selection[axis] = Math.min(Math.max(0, slice[axis]), extent - 1);
+  for (const axis of sliderAxes(info.dim_labels, info.shape)) {
+    const want = axis.named ? slice[axis.named] : slice.axes[axis.key] ?? 0;
+    selection[axis.key] = Math.min(Math.max(0, want), Math.max(0, axis.extent - 1));
   }
   return selection;
 }
@@ -246,24 +249,4 @@ export function vivColor(
 ): [number, number, number] {
   const [r, g, b] = getColorMultipliers(color, channelName);
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
-}
-
-// ---------------------------------------------------------------------------
-// Pinned axes
-// ---------------------------------------------------------------------------
-
-/**
- * What the viewer is silently leaving out, if anything.
- *
- * `pinned` lists axes with real extent that t/z/c cannot reach — a second
- * position axis, an unlabelled one. They are served at index 0, which is a fine
- * default and a bad secret: without this the viewer shows one field of forty and
- * nothing on screen says so.
- */
-export function pinnedNotice(info: TileInfo): string | null {
-  if (!info.pinned.length) return null;
-  const parts = info.pinned.map(
-    (axis) => `${axis.label || `axis ${axis.axis}`} 0/${axis.extent - 1}`,
-  );
-  return `Showing ${parts.join(", ")} — not selectable through the tile API`;
 }

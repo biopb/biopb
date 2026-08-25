@@ -1,6 +1,6 @@
 "use client";
 
-import { buildAxisMap } from "@biopb/tensor-flight-client";
+import { sliderAxes, type SliderAxis } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store";
 import {
@@ -40,10 +40,9 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // Debounce timer ref for slider updates
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Local state for slider values (for immediate visual feedback)
-  const [localT, setLocalT] = useState(slice.t);
-  const [localZ, setLocalZ] = useState(slice.z);
-  const [localC, setLocalC] = useState(slice.c);
+  // Local state for slider values (for immediate visual feedback), keyed by
+  // SliderAxis.key so an axis with no name is held the same way as T/Z/C.
+  const [localAxes, setLocalAxes] = useState<Record<string, number>>({});
   const [localPercentile, setLocalPercentile] = useState(slice.percentileScale);
   // Held in octaves, the units of the slider, so a drag does not round-trip
   // through log2/exp and drift off the position the user put it at.
@@ -51,12 +50,10 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
 
   // Sync local state when store slice changes (e.g., from keyboard navigation in ImageViewer)
   useEffect(() => {
-    setLocalT(slice.t);
-    setLocalZ(slice.z);
-    setLocalC(slice.c);
+    setLocalAxes({ t: slice.t, z: slice.z, c: slice.c, ...slice.axes });
     setLocalPercentile(slice.percentileScale);
     setLocalOctaves(octavesFromGamma(slice.gamma));
-  }, [slice.t, slice.z, slice.c, slice.percentileScale, slice.gamma]);
+  }, [slice.t, slice.z, slice.c, slice.axes, slice.percentileScale, slice.gamma]);
 
   // Cleanup debounce timer on unmount
   useEffect(() => {
@@ -77,9 +74,14 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
   }, [sourceId, sources, tensorId]);
 
-  const axisMap = useMemo(() => {
-    if (!descriptor) return { t: null, z: null, c: null, y: null, x: null };
-    return buildAxisMap(descriptor.dim_labels);
+  // Not buildAxisMap: its positional fallback would title a TIFF sequence's
+  // `i` axis "Z", asserting depth about 155 stacked files on the strength of
+  // nothing. sliderAxes navigates the same axes and names only the named ones.
+  const axes: SliderAxis[] = useMemo(() => {
+    if (!descriptor) return [];
+    return sliderAxes(descriptor.dim_labels, descriptor.shape).filter(
+      (axis) => axis.extent > 1,
+    );
   }, [descriptor]);
 
   // Get channel name for current channel index
@@ -123,20 +125,24 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     return <section className="slice-controls">Tensor metadata unavailable</section>;
   }
 
-  const shape = descriptor.shape;
-  const tSize = axisMap.t !== null ? shape[axisMap.t] ?? 1 : 1;
-  const zSize = axisMap.z !== null ? shape[axisMap.z] ?? 1 : 1;
-  const cSize = axisMap.c !== null ? shape[axisMap.c] ?? 1 : 1;
-  const tMax = axisMap.t !== null ? Math.max(0, tSize - 1) : 0;
-  const zMax = axisMap.z !== null ? Math.max(0, zSize - 1) : 0;
-  const cMax = axisMap.c !== null ? Math.max(0, cSize - 1) : 0;
-
   // Always show color picker - pseudo-color rendering is useful for any image
   const showColorPicker = true;
 
-  const showT = axisMap.t !== null && tSize > 1;
-  const showZ = axisMap.z !== null && zSize > 1;
-  const showC = axisMap.c !== null && cSize > 1;
+  /** Write a slider's new index back, under its name or into `axes`. */
+  const commitAxis = (axis: SliderAxis, value: number) => {
+    if (axis.named) {
+      setSlice({ [axis.named]: value });
+      return;
+    }
+    // Read `axes` at commit time rather than closing over the render's copy:
+    // these writes are debounced, so a stale map here would silently drop a
+    // sibling axis's index every time two of them are moved in quick
+    // succession. The named axes have their own store fields and cannot
+    // collide this way.
+    setSlice({
+      axes: { ...useAppStore.getState().slice.axes, [axis.key]: value },
+    });
+  };
 
   // Handle preset color selection
   const handlePresetChange = (value: string) => {
@@ -156,75 +162,56 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   return (
     <section className="slice-controls">
       <div className="slice-grid" style={{ display: "grid", gap: 8 }}>
-        {showT && (
-          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ width: 20 }}>T</span>
-            <input
-              type="range"
-              min={0}
-              max={tMax}
-              value={clamp(localT, 0, tMax)}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setLocalT(val);
-                if (debounceRef.current) clearTimeout(debounceRef.current);
-                debounceRef.current = setTimeout(() => {
-                  setSlice({ t: val });
-                }, SLIDER_DEBOUNCE_MS);
-              }}
-              style={{ flex: 1 }}
-            />
-            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{localT}/{tMax}</span>
-          </label>
-        )}
-
-        {showZ && (
-          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ width: 20 }}>Z</span>
-            <input
-              type="range"
-              min={0}
-              max={zMax}
-              value={clamp(localZ, 0, zMax)}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setLocalZ(val);
-                if (debounceRef.current) clearTimeout(debounceRef.current);
-                debounceRef.current = setTimeout(() => {
-                  setSlice({ z: val });
-                }, SLIDER_DEBOUNCE_MS);
-              }}
-              style={{ flex: 1 }}
-            />
-            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{localZ}/{zMax}</span>
-          </label>
-        )}
-
-        {showC && (
-          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ width: 20 }}>C</span>
-            <input
-              type="range"
-              min={0}
-              max={cMax}
-              value={clamp(localC, 0, cMax)}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setLocalC(val);
-                if (debounceRef.current) clearTimeout(debounceRef.current);
-                debounceRef.current = setTimeout(() => {
-                  setSlice({ c: val });
-                }, SLIDER_DEBOUNCE_MS);
-              }}
-              style={{ flex: 1 }}
-            />
-            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{localC}/{cMax}</span>
-          </label>
-        )}
+        {axes.map((axis) => {
+          const max = Math.max(0, axis.extent - 1);
+          const value = localAxes[axis.key] ?? 0;
+          return (
+            <label
+              key={axis.key}
+              style={{ display: "flex", alignItems: "center", gap: 8 }}
+              // The wire index is what the tile route is actually asked for, so
+              // it is what to check against when a plane looks wrong.
+              title={`${axis.title} — wire axis ${axis.axis}, ${axis.extent} positions`}
+            >
+              <span
+                style={{
+                  width: 20,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  // An unnamed axis carries the source's own label, which is
+                  // not a single letter and should not pretend to be one.
+                  fontSize: axis.named ? undefined : 10,
+                  color: axis.named ? undefined : "#94a3b8",
+                }}
+              >
+                {axis.title}
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={max}
+                value={clamp(value, 0, max)}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setLocalAxes((prev) => ({ ...prev, [axis.key]: val }));
+                  if (debounceRef.current) clearTimeout(debounceRef.current);
+                  debounceRef.current = setTimeout(() => {
+                    commitAxis(axis, val);
+                  }, SLIDER_DEBOUNCE_MS);
+                }}
+                style={{ flex: 1 }}
+              />
+              <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>
+                {value}/{max}
+              </span>
+            </label>
+          );
+        })}
 
         {/* Navigation above, display below. Suppressed when nothing is above
             it: a rule against the top of the panel divides nothing. */}
-        {(showT || showZ || showC) && (
+        {axes.length > 0 && (
           <hr
             style={{
               width: "100%",

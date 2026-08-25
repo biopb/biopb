@@ -599,6 +599,12 @@ export class TensorHttpClient {
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null) qs.set(k, String(v));
     }
+    // `append`, not `set`: `sel` is the one repeatable parameter, one entry per
+    // axis. Sorted by axis so the same plane produces the same URL however the
+    // caller assembled it — the browser cache keys on the string.
+    for (const [axis, index] of [...(req.sel ?? [])].sort((a, b) => a[0] - b[0])) {
+      qs.append("sel", `${axis}:${index}`);
+    }
     const query = qs.toString();
     return `/api/tile/${encodeArrayId(req.array_id)}${query ? `?${query}` : ""}`;
   }
