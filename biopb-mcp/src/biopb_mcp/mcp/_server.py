@@ -455,15 +455,16 @@ def _window_note(window_alive) -> str:
     return ""
 
 
-def _user_digest(host) -> list:
-    """The user-run cells the agent has not been told about, or ``[]``.
+def _foreign_digest(host) -> list:
+    """The cells run by another writer that the agent has not been told about,
+    or ``[]``.
 
-    A pure read — see :func:`_ack_user_digest` for why the ack is a second call.
+    A pure read — see :func:`_ack_foreign_digest` for why the ack is a second call.
     Auxiliary, like the window-liveness probe: a kernel that answers with
     anything but the expected list yields no digest rather than breaking the
     result the agent actually asked for.
     """
-    digest, _res, _w = _run_job_call(host, "user_digest()")
+    digest, _res, _w = _run_job_call(host, "foreign_digest()")
     if not digest or not isinstance(digest, list):
         return []
     if not all(isinstance(d, dict) and "job_id" in d for d in digest):
@@ -471,7 +472,7 @@ def _user_digest(host) -> list:
     return digest
 
 
-def _ack_user_digest(host, digest) -> None:
+def _ack_foreign_digest(host, digest) -> None:
     """Retire the *terminal* entries of *digest*, once the note carrying them is
     on its way back to the agent.
 
@@ -488,10 +489,10 @@ def _ack_user_digest(host, digest) -> None:
     """
     ids = [d["job_id"] for d in digest if d.get("status") != "running"]
     if ids:
-        _run_job_call(host, "ack_user_digest(" + repr(ids) + ")")
+        _run_job_call(host, "ack_foreign_digest(" + repr(ids) + ")")
 
 
-def _render_user_note(digest) -> str:
+def _render_foreign_note(digest) -> str:
     """The digest as a line appended to an agent-facing result, or ``""``.
 
     The agent is not the only writer of this namespace: a person can run code
@@ -509,9 +510,21 @@ def _render_user_note(digest) -> str:
     """
     if not digest:
         return ""
-    listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    # Older kernels' digest entries carry no origin; they could only ever have
+    # been user cells, so read a missing one as "user" rather than dropping the
+    # attribution.
+    origins = {(d.get("origin") or "user") for d in digest}
+    if origins == {"user"}:
+        who = "The user"
+        listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    else:
+        who = "Another writer"
+        listed = ", ".join(
+            f"{d['job_id']} ({d.get('status')}, {d.get('origin') or 'user'})"
+            for d in digest
+        )
     return (
-        "\n\nⓘ The user ran code in this kernel: "
+        f"\n\nⓘ {who} ran code in this kernel: "
         f"{listed}. A finished cell is reported once; a running one repeats "
         "until it ends, so a repeat is not a new cell. Read them with poll_job. "
         "Variables and layers may have changed — re-check with dir() / "
@@ -519,12 +532,12 @@ def _render_user_note(digest) -> str:
     )
 
 
-def _user_activity_note(host) -> str:
+def _foreign_activity_note(host) -> str:
     """Read, render, and retire the user-activity notice, in that order."""
-    digest = _user_digest(host)
-    note = _render_user_note(digest)
+    digest = _foreign_digest(host)
+    note = _render_foreign_note(digest)
     if note:
-        _ack_user_digest(host, digest)
+        _ack_foreign_digest(host, digest)
     return note
 
 
@@ -684,8 +697,14 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
 
 @mcp.tool()
-def execute_code(python_code: str) -> str:
+def execute_code(python_code: str, intent: str = "") -> str:
     """Execute Python code in the napari kernel.
+
+    intent: one short sentence on *why* you are running this cell — the goal you
+    are pursuing for the user, not a restatement of what the code does. It is
+    recorded with the job and written into the session's notebook export, which
+    is otherwise a log of code with no record of what anyone was trying to
+    achieve. Leave it empty rather than padding it.
 
     The kernel is a full Jupyter/IPython kernel (imports allowed) with the
     namespace: viewer (with an add_tensor method), client(image data access), and ops (a
@@ -732,39 +751,40 @@ def execute_code(python_code: str) -> str:
         return "Error: kernel host not initialized"
 
     # Read once at entry, append to whichever path returns below.
-    digest = _user_digest(host)
-    user_note = _render_user_note(digest)
-    if user_note:
-        _ack_user_digest(host, digest)
+    digest = _foreign_digest(host)
+    foreign_note = _render_foreign_note(digest)
+    if foreign_note:
+        _ack_foreign_digest(host, digest)
 
     submitted, res, window_alive = _run_job_call(
-        host, "submit(" + repr(python_code) + ")"
+        host, "submit(" + repr(python_code) + ", intent=" + repr(intent) + ")"
     )
     if submitted is None:
-        return _format_execute_result(res) + user_note
+        return _format_execute_result(res) + foreign_note
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
         # Whose job is running decides the advice. Telling the agent to
-        # "stop it with interrupt_kernel" while a *person* is running a cell
+        # "stop it with interrupt_kernel" while *someone else* is running a cell
         # would have it kill their work; interrupt_kernel refuses that anyway
         # (_jobs.interrupt_current), so the wording must not send it there.
-        if submitted.get("running_job_origin") == "user":
-            # A running user job stays in the digest by design, so the note is
+        running_origin = submitted.get("running_job_origin")
+        if running_origin and running_origin != "agent":
+            # A running foreign job stays in the digest by design, so the note is
             # about to report the very job this branch is reporting. Drop it
-            # when that is *all* it says; keep it when the user also finished
-            # other cells, since those were acked above and will not be offered
-            # again.
+            # when that is *all* it says; keep it when other cells also finished,
+            # since those were acked above and will not be offered again.
             if [d.get("job_id") for d in digest] == [running]:
-                user_note = ""
+                foreign_note = ""
+            who = "The user" if running_origin == "user" else "Another writer"
             return (
-                f"The user is running a cell ({running}) in this kernel. Only one "
+                f"{who} is running a cell ({running}) in this kernel. Only one "
                 f"job runs at a time — wait for it and poll_job('{running}'); do "
-                "not interrupt it." + user_note
+                "not interrupt it." + foreign_note
             )
         return (
             f"A job ({running}) is already running. Poll it with "
             f"poll_job('{running}'), or stop it with interrupt_kernel / "
-            "restart_kernel before starting another." + user_note
+            "restart_kernel before starting another." + foreign_note
         )
 
     job_id = submitted["job_id"]
@@ -774,10 +794,12 @@ def execute_code(python_code: str) -> str:
         time.sleep(0.4)
         snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
-            return _format_execute_result(res) + user_note
+            return _format_execute_result(res) + foreign_note
         if snap.get("status") != "running":
             # terminal: inline result
-            return _format_execute_result(snap) + _window_note(window_alive) + user_note
+            return (
+                _format_execute_result(snap) + _window_note(window_alive) + foreign_note
+            )
 
     # Still running after promote_after: hand back a job handle.
     partial = snap.get("stdout", "") if snap else ""
@@ -788,7 +810,7 @@ def execute_code(python_code: str) -> str:
         "Partial output:\n"
         + (partial or "(none yet)")
         + _window_note(window_alive)
-        + user_note
+        + foreign_note
     )
 
 
@@ -804,14 +826,14 @@ def poll_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
-    user_note = _user_activity_note(host)
+    foreign_note = _foreign_activity_note(host)
     snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
     if snap is None:
-        return _format_execute_result(res) + user_note
+        return _format_execute_result(res) + foreign_note
     if snap.get("status") == "unknown":
-        return f"No such job '{job_id}'." + user_note
+        return f"No such job '{job_id}'." + foreign_note
     note = _window_note(window_alive) if snap.get("status") != "running" else ""
-    return _format_job_status(snap) + note + user_note
+    return _format_job_status(snap) + note + foreign_note
 
 
 @mcp.tool()
@@ -857,7 +879,7 @@ def interrupt_kernel() -> str:
     data, res, _w = _run_job_call(host, "interrupt_current(requester='agent')")
     if data is None:
         return _format_execute_result(res)
-    if data.get("refused") == "user_job":
+    if data.get("refused") == "foreign_job":
         running = data.get("job_id")
         return (
             f"Refused: {running} was started by the user, not by you — it is not "
@@ -1032,7 +1054,7 @@ def server_status() -> str:
 
     # Only on this path: the early returns above are all "kernel not usable",
     # where the digest round-trip cannot land anyway.
-    return "\n".join(lines) + _user_activity_note(host)
+    return "\n".join(lines) + _foreign_activity_note(host)
 
 
 # ---------------------------------------------------------------------------

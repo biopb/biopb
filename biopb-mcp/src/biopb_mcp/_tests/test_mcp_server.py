@@ -47,7 +47,7 @@ def _install_replies(host, *, returns=None, queue=None, digest=()):
     """Install kernel replies that dispatch on the *snippet*, not on call order.
 
     Agent-facing tools carry a user-activity digest round-trip
-    (``_server._user_activity_note``) alongside the call each test is actually
+    (``_server._foreign_activity_note``) alongside the call each test is actually
     about. Answering that by content — rather than letting it consume a slot in
     an ordered ``side_effect`` list — keeps every test's queue one-to-one with
     the calls it asserts on, so an auxiliary round-trip can be added or removed
@@ -60,9 +60,9 @@ def _install_replies(host, *, returns=None, queue=None, digest=()):
     pending = list(queue or [])
 
     def execute(code, *_args, **_kwargs):
-        if "_jobs.user_digest(" in code:
+        if "_jobs.foreign_digest(" in code:
             return _job_envelope(list(digest))
-        if "_jobs.ack_user_digest(" in code:
+        if "_jobs.ack_foreign_digest(" in code:
             return _job_envelope(0)
         if pending:
             return pending.pop(0)
@@ -380,6 +380,36 @@ class TestExecuteCode:
         assert "print('hi')" in snippet  # code embedded via repr
         assert "job-1" in result  # job handle returned
 
+    def test_intent_rides_the_submit_snippet(self, server_with_host):
+        # The job runner lives in the kernel, so the field only reaches the
+        # record if it is marshaled into the submit snippet -- and it must be
+        # repr'd like the code, since it is arbitrary user-supplied text.
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-1", status="running")
+        )
+        _server.set_promote_after(0.0)
+        _server.execute_code("x = 1", intent="isolate the nuclei channel")
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "_jobs.submit(" in c[0][0]
+        ]
+        assert "intent='isolate the nuclei channel'" in snippet
+
+    def test_intent_is_optional(self, server_with_host):
+        # Every existing MCP client calls execute_code with one argument.
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-1", status="running")
+        )
+        _server.set_promote_after(0.0)
+        _server.execute_code("x = 1")
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "_jobs.submit(" in c[0][0]
+        ]
+        assert "intent=''" in snippet
+
     def test_inline_result_when_job_finishes_fast(self, server_with_host):
         # submit -> running, first poll -> terminal ok with output.
         _install_replies(
@@ -537,11 +567,11 @@ class TestUserActivityNote:
 
     def test_no_note_when_the_user_ran_nothing(self, server_with_host):
         _install_replies(server_with_host, returns=_job_reply(**_snapshot()))
-        assert _server._user_activity_note(server_with_host) == ""
+        assert _server._foreign_activity_note(server_with_host) == ""
 
     def test_note_lists_the_jobs_and_points_at_poll_job(self, server_with_host):
         _install_replies(server_with_host, digest=self._DIGEST)
-        note = _server._user_activity_note(server_with_host)
+        note = _server._foreign_activity_note(server_with_host)
         assert "job-7 (ok)" in note and "job-8 (error)" in note
         # No job id in the instruction: pointing at one of several invites the
         # agent to read that one, call the notice discharged, and never see the
@@ -558,10 +588,10 @@ class TestUserActivityNote:
         # later -- acking inside it would retire a notice nobody received.
         running = {"job_id": "job-9", "status": "running", "elapsed": 1.0}
         _install_replies(server_with_host, digest=[*self._DIGEST, running])
-        _server._user_activity_note(server_with_host)
+        _server._foreign_activity_note(server_with_host)
         calls = [c[0][0] for c in server_with_host.execute.call_args_list]
-        assert any("_jobs.user_digest()" in c for c in calls)
-        (ack,) = [c for c in calls if "ack_user_digest(" in c]
+        assert any("_jobs.foreign_digest()" in c for c in calls)
+        (ack,) = [c for c in calls if "ack_foreign_digest(" in c]
         # Terminal ones only: a job reported `running` was not given its final
         # status, so it must stay pending.
         assert "'job-7'" in ack and "'job-8'" in ack
@@ -569,19 +599,19 @@ class TestUserActivityNote:
 
     def test_no_ack_when_there_is_nothing_to_report(self, server_with_host):
         _install_replies(server_with_host, digest=[])
-        assert _server._user_activity_note(server_with_host) == ""
+        assert _server._foreign_activity_note(server_with_host) == ""
         calls = [c[0][0] for c in server_with_host.execute.call_args_list]
-        assert not [c for c in calls if "ack_user_digest(" in c]
+        assert not [c for c in calls if "ack_foreign_digest(" in c]
 
     def test_note_says_a_repeat_is_not_a_new_cell(self, server_with_host):
-        # user_digest re-reports a still-running cell every round trip, so the
+        # foreign_digest re-reports a still-running cell every round trip, so the
         # wording must not read as "another cell ran since last time" -- an
         # agent polling a 5-minute user cell would re-verify on every poll.
         _install_replies(
             server_with_host,
             digest=[{"job_id": "job-9", "status": "running", "elapsed": 2.0}],
         )
-        note = _server._user_activity_note(server_with_host)
+        note = _server._foreign_activity_note(server_with_host)
         assert "since your last call" not in note
         assert "repeats until it ends" in note
 
@@ -591,14 +621,14 @@ class TestUserActivityNote:
         for bad in ("not-a-list", [{"no_job_id": 1}], [None]):
             server_with_host.execute.side_effect = None
             server_with_host.execute.return_value = _job_envelope(bad)
-            assert _server._user_activity_note(server_with_host) == ""
+            assert _server._foreign_activity_note(server_with_host) == ""
 
     def test_unreachable_kernel_yields_no_note(self, server_with_host):
         # Nothing is acked on this path either, so the notice is deferred to the
         # next call rather than dropped.
         server_with_host.execute.side_effect = None
         server_with_host.execute.return_value = _result(status="busy")
-        assert _server._user_activity_note(server_with_host) == ""
+        assert _server._foreign_activity_note(server_with_host) == ""
 
     def test_execute_code_carries_the_note(self, server_with_host):
         _install_replies(
@@ -635,6 +665,30 @@ class TestUserActivityNote:
         # refused, and the suggestion alone invites it to try.
         assert "interrupt_kernel" not in result
         assert "restart_kernel" not in result
+
+    def test_busy_on_a_chat_cell_does_not_call_it_the_user(self, server_with_host):
+        # Same refusal, different writer: the advice must not attribute a chat
+        # agent's cell to the person sitting there.
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(
+                error="busy", running_job_id="job-9", running_job_origin="chat"
+            ),
+        )
+        result = _server.execute_code("x = 1")
+        assert "Another writer is running a cell" in result
+        assert "The user" not in result
+        assert "interrupt_kernel" not in result
+
+    def test_note_names_the_writer_when_it_is_not_the_user(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(**_snapshot(status="ok", stdout="out\n")),
+            digest=[{"job_id": "job-7", "status": "ok", "origin": "chat"}],
+        )
+        result = _server.poll_job("job-1")
+        assert "Another writer ran code" in result
+        assert "job-7 (ok, chat)" in result
 
     def test_busy_on_its_own_job_keeps_the_stop_advice(self, server_with_host):
         _install_replies(
@@ -722,7 +776,7 @@ class TestInterruptRestart:
                 job_id="job-3",
                 interrupted=False,
                 status="running",
-                refused="user_job",
+                refused="foreign_job",
             ),
         )
         result = _server.interrupt_kernel()

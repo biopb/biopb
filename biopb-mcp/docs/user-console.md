@@ -146,6 +146,14 @@ mid-round-trip.
 `__slots__`, `snapshot()`, `jobs_summary()` and `export()`. Everything below is a
 consequence of that one field.
 
+> **Since:** `origin` also admits `"chat"` (the in-process chat loop,
+> `docs/chat-client-evaluation.md`). Every rule stated below as "user-owned" is
+> implemented as *not agent-owned* (`_jobs._foreign`), so it holds for any writer
+> that is not the `execute_code` agent. Two things do **not** generalize: the
+> `seen_by_agent` flag assumes a single reader, so a second in-process reader
+> needs it per-reader; and the observe page is written for a human reader, where
+> "you" still means `"user"` alone.
+
 **The notebook export becomes a real audit.** Cell provenance is recorded rather than
 implied, and the interleaving is already correct — `export()` is job-ordered.
 
@@ -177,13 +185,13 @@ fact already reaches it (`cancel_reason` on a job, `_teardown_reason` on a not-r
 result, `_WINDOW_CLOSED_NOTE` on a result with no viewer).
 
 Each job carries a `seen_by_agent` flag rather than a global seq watermark, so the rule
-can be stated per job. Reading (`user_digest()`) never consumes; retiring is a **second**
-call (`ack_user_digest(ids)`) the server makes only after it has parsed a reply and
+can be stated per job. Reading (`foreign_digest()`) never consumes; retiring is a **second**
+call (`ack_foreign_digest(ids)`) the server makes only after it has parsed a reply and
 rendered the note. Acking inside the read consumed notices that were never delivered:
 `execute_interactive` sends the request before it starts its timeout clock, so a probe
 that times out is still queued at the kernel and runs when the main thread frees up.
 
-The server acks only the ids it reported as **terminal**, and `ack_user_digest` does not
+The server acks only the ids it reported as **terminal**, and `ack_foreign_digest` does not
 re-read the status — deliberately. A cell that finished between the read and the ack was
 reported `running`, which is not the final status the agent is promised, so it must stay
 pending; re-reading would retire exactly that job unheard. A still-running cell therefore
@@ -229,7 +237,7 @@ Two supporting pieces:
 
 Naturally three stacked PRs against `dev`, the control gate reviewable on its own:
 
-1. **`_jobs.py` + `_server.py`** — `origin`, `user_digest`, the busy-message branch, the
+1. **`_jobs.py` + `_server.py`** — `origin`, `foreign_digest`, the busy-message branch, the
    `interrupt_kernel` refusal, the `guide://kernel` paragraph. **Done.**
 2. **`_control.py`** — the `console` root, `host_is_public_bind` gate via
    `serve_control_api`, proxy tests for the public-bind refusal and the traversal cases

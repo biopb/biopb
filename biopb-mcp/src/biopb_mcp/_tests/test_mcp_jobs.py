@@ -274,7 +274,7 @@ class TestJobOrigin:
                 "job_id": jid,
                 "interrupted": False,
                 "status": "running",
-                "refused": "user_job",
+                "refused": "foreign_job",
             }
             # Refused means untouched, not merely unreported.
             assert _jobs.poll(jid)["status"] == "running"
@@ -301,15 +301,18 @@ class TestJobOrigin:
         self._wait(_jobs.submit("a = 1", origin="agent")["job_id"])
         user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
 
-        digest = _jobs.user_digest()
+        digest = _jobs.foreign_digest()
         assert [d["job_id"] for d in digest] == [user_jid]
         assert digest[0]["status"] == "ok"
+        # The entry names its writer: the caller words the notice differently
+        # for a person than for another agent.
+        assert digest[0]["origin"] == "user"
 
         # Reading never consumes; only an explicit ack does, so a finished
         # user job is reported exactly once.
-        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
-        assert _jobs.ack_user_digest([user_jid]) == 1
-        assert _jobs.user_digest() == []
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+        assert _jobs.ack_foreign_digest([user_jid]) == 1
+        assert _jobs.foreign_digest() == []
 
     def test_running_user_job_stays_in_the_digest_until_it_ends(self, runner):
         jid = _jobs.submit(
@@ -319,17 +322,17 @@ class TestJobOrigin:
             # Reading never consumes, so a running cell stays reported:
             # otherwise the agent would hear that a cell started and never
             # learn how it ended. (Excluding it from the ack is the *caller's*
-            # job -- _server._ack_user_digest filters on the reported status,
+            # job -- _server._ack_foreign_digest filters on the reported status,
             # because re-reading it here is the race this split closes.)
-            assert _jobs.user_digest()[0]["status"] == "running"
-            assert _jobs.user_digest()[0]["status"] == "running"
+            assert _jobs.foreign_digest()[0]["status"] == "running"
+            assert _jobs.foreign_digest()[0]["status"] == "running"
         finally:
             _jobs.interrupt_current()
         self._wait(jid)
-        final = _jobs.user_digest()
+        final = _jobs.foreign_digest()
         assert [d["status"] for d in final] == ["interrupted"]
-        _jobs.ack_user_digest([jid])
-        assert _jobs.user_digest() == []
+        _jobs.ack_foreign_digest([jid])
+        assert _jobs.foreign_digest() == []
 
     def test_prune_never_evicts_an_unreported_user_job(self, runner):
         # The digest entry is the agent's only notice that its namespace changed
@@ -339,13 +342,69 @@ class TestJobOrigin:
             self._wait(_jobs.submit("a = 1")["job_id"])
 
         assert user_jid in _jobs._jobs
-        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
-        _jobs.ack_user_digest([user_jid])
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+        _jobs.ack_foreign_digest([user_jid])
 
         # Once reported it is an ordinary record again, and prunes normally.
         for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
             self._wait(_jobs.submit("a = 1")["job_id"])
         assert user_jid not in _jobs._jobs
+
+    def test_a_chat_job_is_foreign_to_the_agent_just_as_a_user_cell_is(self, runner):
+        # Every rule that reads origin means "not the agent", not "the user" --
+        # they were the same set until a third writer existed. A chat job the
+        # agent has not been told about must therefore be digested and held
+        # against eviction exactly like a human's cell.
+        chat_jid = self._wait(_jobs.submit("b = 2", origin="chat")["job_id"])["job_id"]
+        assert [(d["job_id"], d["origin"]) for d in _jobs.foreign_digest()] == [
+            (chat_jid, "chat")
+        ]
+        for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
+            self._wait(_jobs.submit("a = 1")["job_id"])
+        assert chat_jid in _jobs._jobs
+
+        assert _jobs.ack_foreign_digest([chat_jid]) == 1
+        assert _jobs.foreign_digest() == []
+
+    def test_agent_is_refused_a_chat_job(self, runner):
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
+        )["job_id"]
+        try:
+            assert _jobs.interrupt_current(requester="agent") == {
+                "job_id": jid,
+                "interrupted": False,
+                "status": "running",
+                "refused": "foreign_job",
+            }
+        finally:
+            _jobs.interrupt_current()
+        assert self._wait(jid)["status"] == "interrupted"
+
+
+class TestJobIntent:
+    """The `intent` field: recorded with the job, never acted on."""
+
+    _wait = staticmethod(_wait_job)
+
+    def test_intent_defaults_empty_and_rides_the_snapshot(self, runner):
+        assert self._wait(_jobs.submit("x = 1")["job_id"])["intent"] == ""
+
+        jid = _jobs.submit("y = 2", intent="check the drift estimate")["job_id"]
+        assert self._wait(jid)["intent"] == "check the drift estimate"
+        # export() feeds the notebook writer, which is the whole point of the
+        # field -- it has to survive the trip.
+        by_id = {e["job_id"]: e for e in _jobs.export()}
+        assert by_id[jid]["intent"] == "check the drift estimate"
+
+    def test_intent_is_free_text_and_never_reaches_the_kernel(self, runner):
+        # Provenance, not a control input: whatever is in it is stored verbatim
+        # and the job runs exactly the code it was given.
+        weird = "print('boom')  -- why: fix the mask; rm -rf /"
+        snap = self._wait(_jobs.submit("x = 1", intent=weird)["job_id"])
+        assert snap["intent"] == weird
+        assert snap["status"] == "ok"
+        assert snap["stdout"] == ""
 
 
 # ---------------------------------------------------------------------------

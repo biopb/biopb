@@ -20,9 +20,11 @@ serves `/mcp` anyway. No new process topology is needed to host a chat loop.
 
 **A second writer into the kernel, already designed.** The user console
 (`biopb-mcp/docs/user-console.md`, `mcp/_jobs.py:14-21`) put a human and the
-agent on one job runner: one job at a time, no preemption, and a `user_digest`
-so the agent learns its namespace moved under it. A chat agent is a third writer
-of that same class and inherits the design rather than reopening it.
+agent on one job runner: one job at a time, no preemption, and a
+`foreign_digest` so the agent learns its namespace moved under it. A chat agent
+is a third writer of that same class and inherits the design rather than
+reopening it — `origin="chat"` and the `intent` field are already in `_jobs`,
+so the loop fills a record that exists rather than adding one.
 
 **A working agent loop, in the test tree.** `_tests/agentbench/` drives a real
 session with a real model: MCP client, schema translation, tool dispatch,
@@ -474,22 +476,27 @@ limits without varnish: *"an audit record first, a runnable script second"*,
 external state not captured, tensor-server source ids and viewer layers gone on a
 fresh kernel. That is the correct promise and the same one a notebook makes.
 
-What it does **not** capture is intent. `execute_code(python_code: str)` takes
-code and nothing else — no task, no rationale — so the export answers *what ran*
-and never *what was asked*. That is the gap that matters for the failure mode this
-document is about: reading the code cannot catch the agent solving the wrong
-problem, which is exactly the GPT-measured-the-binary-mask case and the 25%
-clean-but-wrong class. Fusing the chat turns into the export as markdown cells —
-the user's request, the agent's plan, its answer, interleaved with the code cells
-they produced — turns the notebook from a code log into *intent + action +
-result*, and makes the plan-first artifact durable rather than scrollback.
-`_notebook.py` already emits markdown cells (the title, the empty-session note),
-so the primitive is there; what is missing is the material.
+What it captures of intent is second-hand. `execute_code` now takes an optional
+`intent` alongside the code, recorded on the job and rendered as the markdown
+cell above it, so the export can answer *what was being attempted* and not only
+*what ran*. That closes the shape of the gap but not its substance: under MCP the
+field is filled by the **agent**, which is the party whose misreading the record
+exists to catch. It is best-effort provenance, and an agent that has misunderstood
+the task will write down the task it misunderstood.
 
-And note where that material would have to come from. Under MCP the prompts live
-in the external harness and biopb never sees them. **An in-process chat is the
-only configuration in which the session record can capture intent at all** — a
-real counterweight to the parity argument above.
+The gap that matters for the failure mode this document is about therefore stays
+open: reading the code cannot catch the agent solving the wrong problem, which is
+exactly the GPT-measured-the-binary-mask case and the 25% clean-but-wrong class,
+and neither can reading the agent's own account of it. Only the user's words
+settle it. **An in-process chat is the only configuration in which the session
+record can capture the user's intent at all** — under MCP the prompts live in the
+external harness and biopb never sees them; the protocol hands a server tool calls
+and nothing else. That is a real counterweight to the parity argument above.
+
+The work the loop then inherits is small, because the record was built to receive
+it: fill `intent` with the user's own turn instead of the agent's paraphrase, and
+fuse the surrounding chat — the request, the plan, the answer — into the export as
+further markdown cells around the code they produced.
 
 **The destructive surface is bounded in the data plane and open everywhere
 else.** Inside the data plane the guarantee is real: tensor-server sources are

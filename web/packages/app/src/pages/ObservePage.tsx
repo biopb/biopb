@@ -18,7 +18,7 @@ import { withBase } from "../base";
 interface JobSummary {
   job_id: string;
   status: string; // running | ok | error | interrupted
-  origin?: string; // agent | user — who submitted the cell
+  origin?: string; // agent | user | chat — who submitted the cell
   elapsed: number;
   code_preview?: string;
 }
@@ -445,9 +445,14 @@ function JobRow({
     <div className={"job" + (open ? " open" : "")}>
       <div className="row" onClick={onToggle}>
         <span className="jid">{job.job_id}</span>
-        {/* Provenance is only worth showing for the cells you ran: "agent" is
-            the norm here and a badge on every row would be noise. */}
-        {job.origin === "user" ? <span className="badge you">you</span> : null}
+        {/* Provenance is worth showing for anything that is not the MCP agent:
+            "agent" is the norm here and a badge on every row would be noise,
+            but a cell run by anyone else must not read as the agent's. */}
+        {job.origin && job.origin !== "agent" ? (
+          <span className="badge you">
+            {job.origin === "user" ? "you" : job.origin}
+          </span>
+        ) : null}
         <span className={"badge " + job.status}>{job.status}</span>
         <span className="preview">{job.code_preview || ""}</span>
         <span className="elapsed">{job.elapsed}s</span>
