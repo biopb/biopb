@@ -101,6 +101,9 @@ def reset_server_state():
     _server._promote_after = old_promote
     _server._skills_enabled = old_skills
     _server.mcp._mcp_server.instructions = old_instructions
+    # The mirrored one-agent claim is process state like the rest: a test that
+    # claims the kernel must not decide whether the next one is refused.
+    _server.clear_claim()
 
 
 @pytest.fixture
@@ -673,6 +676,25 @@ class TestUserActivityNote:
         assert "done" in result  # the agent's own result still leads
         assert "job-7 (ok)" in result
 
+    def test_a_non_owners_read_does_not_discharge_the_notice(self, server_with_host):
+        # poll_job is open to a watching client, but the ack must carry that
+        # client's id so the kernel can refuse it: retiring a notice the holder
+        # never received is the one failure the read/ack split exists to prevent.
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(**_snapshot(status="ok")),
+            digest=self._DIGEST,
+        )
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+            _server.poll_job("job-1")
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "ack_foreign_digest(" in c[0][0]
+        ]
+        assert "writer='sess-B'" in snippet
+
     def test_poll_job_carries_the_note(self, server_with_host):
         _install_replies(
             server_with_host,
@@ -820,30 +842,53 @@ class TestInterruptRestart:
     def test_restart_refused_when_another_client_holds_the_kernel(
         self, server_with_host
     ):
+        # The holder is learned from the kernel *accepting* its code, then
+        # mirrored here -- see _claimed_by.
         _install_replies(
-            server_with_host,
-            returns=_job_envelope({"owner": "sess-A", "label": "claude-code"}),
+            server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
-        # This client has no identity of its own, so nothing is refused...
-        assert "Kernel restarted" in _server.restart_kernel()
-        server_with_host.restart.assert_called_once()
+        _server.set_promote_after(0.0)
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(_server, "_client_identity", lambda: ("sess-A", "claude-code"))
+            _server.execute_code("x = 1")
+        assert _server._claimed_by == "sess-A"
 
-        # ...but an identified stranger is, and the kernel is left alone.
-        server_with_host.restart.reset_mock()
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
             result = _server.restart_kernel()
-        assert "already in use by another client (claude-code)" in result
+        assert "already in use by another client" in result
         server_with_host.restart.assert_not_called()
 
-    def test_restart_allowed_when_the_kernel_cannot_answer(self, server_with_host):
-        # A kernel too broken to report its owner has no live namespace to
-        # protect, and restart is the one tool that fixes it -- an unreadable
-        # claim must not wedge it.
-        _install_replies(server_with_host, returns=_result(status="error"))
+        # The holder itself is not blocked, and a fresh kernel is unclaimed.
         with pytest.MonkeyPatch().context() as mp:
-            mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+            mp.setattr(_server, "_client_identity", lambda: ("sess-A", "claude-code"))
             assert "Kernel restarted" in _server.restart_kernel()
+        server_with_host.restart.assert_called_once()
+        assert _server._claimed_by is None
+
+    def test_restart_is_not_gated_on_a_kernel_round_trip(self, server_with_host):
+        # A busy kernel must never read as an unclaimed one: asking it who owns
+        # it would fail *open* exactly when the holder has a job running, which
+        # is when a stray restart costs the most.
+        _install_replies(server_with_host, returns=_result(status="busy"))
+        _server._claimed_by = "sess-A"
+        try:
+            with pytest.MonkeyPatch().context() as mp:
+                mp.setattr(_server, "_client_identity", lambda: ("sess-B", "other"))
+                result = _server.restart_kernel()
+        finally:
+            _server.clear_claim()
+        assert "already in use by another client" in result
+        server_with_host.restart.assert_not_called()
+
+    def test_an_unidentified_caller_can_still_restart(self, server_with_host):
+        # In-process callers have no identity, so they are not measured against
+        # the claim -- the same rule submit() uses.
+        _server._claimed_by = "sess-A"
+        try:
+            assert "Kernel restarted" in _server.restart_kernel()
+        finally:
+            _server.clear_claim()
 
     def test_interrupt_refused_on_a_user_job(self, server_with_host):
         _install_replies(

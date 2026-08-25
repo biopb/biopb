@@ -307,6 +307,14 @@ async def _api_interrupt(request):
 
 
 async def _api_restart(request):
+    """Restart the kernel on the user's behalf.
+
+    Never gated on the kernel's one-agent claim, which makes this the recovery
+    path for a session held by a client that is gone: an agent cannot take a
+    kernel from another agent, but the person at the machine can always replace
+    it. Clearing the mirrored claim keeps that honest — the next agent to run
+    code here is the new holder, and must not be measured against the old one.
+    """
     host, err = _require_host()
     if err is not None:
         return err
@@ -314,6 +322,7 @@ async def _api_restart(request):
         host.restart()
     except Exception as exc:  # noqa: BLE001 - report restart failure
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    _server.clear_claim()
     return JSONResponse({"ok": True})
 
 

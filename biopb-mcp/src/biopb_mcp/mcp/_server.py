@@ -348,9 +348,14 @@ except Exception as _e:
 
 
 def set_kernel_host(host: KernelHost):
-    """Register the kernel host the tools dispatch to."""
+    """Register the kernel host the tools dispatch to.
+
+    A different host is a different kernel, so the mirrored one-agent claim goes
+    with the old one rather than being inherited by the new.
+    """
     global _kernel_host
     _kernel_host = host
+    clear_claim()
 
 
 def set_promote_after(seconds: float):
@@ -455,6 +460,38 @@ def _window_note(window_alive) -> str:
     return ""
 
 
+# This process's mirror of the kernel's one-agent claim: the last client whose
+# code the kernel actually accepted, or None while unclaimed.
+#
+# The kernel owns the claim -- ``_jobs.submit`` is the choke point and the only
+# thing that can enforce it atomically. But ``restart_kernel`` cannot be gated
+# from inside the kernel it destroys, and asking the kernel who owns it first is
+# both a check-then-act race and *fail-open on a busy kernel*: a round trip that
+# comes back "busy" would read as "no owner", and a kernel busy running the
+# holder's job is exactly when a stray restart costs the most. Every claim
+# passes through this process, so mirroring it here answers the question with no
+# round trip and no window.
+#
+# Set from the kernel's own decision rather than predicted: any submit the kernel
+# did not refuse came from the holder, so assigning on every acceptance keeps the
+# mirror true through a restart that happened somewhere else (the observe page's,
+# which clears it explicitly).
+_claimed_by: str | None = None
+
+
+def _note_claim(writer):
+    """Record that the kernel accepted code from *writer*."""
+    global _claimed_by
+    if writer is not None:
+        _claimed_by = writer
+
+
+def clear_claim():
+    """Forget the mirrored claim, for a caller that just replaced the kernel."""
+    global _claimed_by
+    _claimed_by = None
+
+
 # Refusal for a client that does not hold this kernel's one-agent claim
 # (_jobs.submit). Shared by every state-changing tool so the agent gets one
 # explanation rather than three, and so the recovery named is the same in all of
@@ -521,7 +558,7 @@ def _foreign_digest(host) -> list:
     return digest
 
 
-def _ack_foreign_digest(host, digest) -> None:
+def _ack_foreign_digest(host, digest, writer=None) -> None:
     """Retire the *terminal* entries of *digest*, once the note carrying them is
     on its way back to the agent.
 
@@ -535,10 +572,18 @@ def _ack_foreign_digest(host, digest) -> None:
     Running entries are excluded here rather than in the kernel: they were
     reported as ``running``, which is not the final status the agent is promised,
     so they must stay pending even if they have finished since.
+
+    *writer* is the asking client, passed through so the kernel can refuse an ack
+    from a client that does not hold it: a second client's ``poll_job`` may
+    *read* the digest, but discharging a notice the holder has not received
+    would defeat the exactly-once promise this split exists to keep.
     """
     ids = [d["job_id"] for d in digest if d.get("status") != "running"]
     if ids:
-        _run_job_call(host, "ack_foreign_digest(" + repr(ids) + ")")
+        _run_job_call(
+            host,
+            "ack_foreign_digest(" + repr(ids) + ", writer=" + repr(writer) + ")",
+        )
 
 
 def _render_foreign_note(digest) -> str:
@@ -582,11 +627,16 @@ def _render_foreign_note(digest) -> str:
 
 
 def _foreign_activity_note(host) -> str:
-    """Read, render, and retire the user-activity notice, in that order."""
+    """Read, render, and retire the activity notice, in that order.
+
+    Retiring is the holder's alone (see :func:`_ack_foreign_digest`): a second
+    client reaching a read-only tool still gets shown what ran, but does not
+    consume the notice out from under the agent actually working here.
+    """
     digest = _foreign_digest(host)
     note = _render_foreign_note(digest)
     if note:
-        _ack_foreign_digest(host, digest)
+        _ack_foreign_digest(host, digest, _client_identity()[0])
     return note
 
 
@@ -806,13 +856,14 @@ def execute_code(python_code: str, intent: str = "") -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
+    writer, writer_label = _client_identity()
+
     # Read once at entry, append to whichever path returns below.
     digest = _foreign_digest(host)
     foreign_note = _render_foreign_note(digest)
     if foreign_note:
-        _ack_foreign_digest(host, digest)
+        _ack_foreign_digest(host, digest, writer)
 
-    writer, writer_label = _client_identity()
     submitted, res, window_alive = _run_job_call(
         host,
         "submit("
@@ -831,6 +882,9 @@ def execute_code(python_code: str, intent: str = "") -> str:
         held_by = submitted.get("owner") or ""
         held_by = f" ({held_by})" if held_by else ""
         return _NOT_OWNER_MSG.format(held_by=held_by) + foreign_note
+    # Anything the kernel did not refuse came from the holder, "busy" included:
+    # submit() decides the claim before it looks at what is running.
+    _note_claim(writer)
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
         # Whose job is running decides the advice. Telling the agent to
@@ -956,10 +1010,17 @@ def interrupt_kernel() -> str:
         return _NOT_OWNER_MSG.format(held_by="")
     if data.get("refused") == "foreign_job":
         running = data.get("job_id")
+        # "Foreign" is not a synonym for "the user's": it is anything this agent
+        # did not start. Naming the wrong writer would tell the agent to wait on
+        # a person who is not there.
+        by = (
+            "the user" if (data.get("origin") or "user") == "user" else "another writer"
+        )
+        who = "The user" if by == "the user" else "Whoever started it"
         return (
-            f"Refused: {running} was started by the user, not by you — it is not "
-            f"yours to stop. Wait for it and poll_job('{running}'). (The user can "
-            "stop their own cell from the observe page.)"
+            f"Refused: {running} was started by {by}, not by you — it is not "
+            f"yours to stop. Wait for it and poll_job('{running}'). ({who} can "
+            "stop it.)"
         )
     if data.get("interrupted"):
         return (
@@ -1022,21 +1083,17 @@ def restart_kernel() -> str:
     if host is None:
         return "Error: kernel host not initialized"
     # Gated like every other state change, and this is the sharpest of them: a
-    # restart would discard the holder's whole session. Read the claim from the
-    # kernel rather than caching it here -- a kernel that cannot answer has no
-    # live namespace to protect, so an unreadable claim allows the restart
-    # instead of wedging the one tool that recovers a broken kernel.
+    # restart discards the holder's whole session. Decided against the local
+    # mirror (_claimed_by) rather than a round trip to the kernel, so a kernel
+    # too busy to answer cannot be mistaken for an unclaimed one.
     writer, _label = _client_identity()
-    held, _res, _w = _run_job_call(host, "owner()")
-    if isinstance(held, dict) and writer is not None:
-        held_id = held.get("owner")
-        if held_id is not None and held_id != writer:
-            label = held.get("label") or ""
-            return _NOT_OWNER_MSG.format(held_by=f" ({label})" if label else "")
+    if _claimed_by is not None and writer is not None and writer != _claimed_by:
+        return _NOT_OWNER_MSG.format(held_by="")
     try:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
+    clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 

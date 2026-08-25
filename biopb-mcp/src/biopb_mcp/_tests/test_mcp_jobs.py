@@ -275,6 +275,7 @@ class TestJobOrigin:
                 "interrupted": False,
                 "status": "running",
                 "refused": "foreign_job",
+                "origin": "user",
             }
             # Refused means untouched, not merely unreported.
             assert _jobs.poll(jid)["status"] == "running"
@@ -376,6 +377,7 @@ class TestJobOrigin:
                 "interrupted": False,
                 "status": "running",
                 "refused": "foreign_job",
+                "origin": "chat",
             }
         finally:
             _jobs.interrupt_current()
@@ -448,6 +450,35 @@ class TestKernelOwner:
         finally:
             _jobs.interrupt_current()
         assert self._wait(jid)["status"] == "interrupted"
+
+    def test_a_non_owner_may_read_the_digest_but_not_discharge_it(self, runner):
+        # A watching client's poll_job carries the same digest round trip. It may
+        # see what ran -- but acking would retire a notice the holder never
+        # received, and the holder is promised it exactly once.
+        self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
+        user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+        assert _jobs.ack_foreign_digest([user_jid], writer="sess-B") == 0
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+
+        assert _jobs.ack_foreign_digest([user_jid], writer="sess-A") == 1
+        assert _jobs.foreign_digest() == []
+
+    def test_the_foreign_refusal_names_the_writer(self, runner):
+        # "Foreign" stopped being a synonym for "the user's" when a third writer
+        # appeared; a caller that assumes otherwise tells the agent to wait on a
+        # person who is not there.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
+        )["job_id"]
+        try:
+            refused = _jobs.interrupt_current(requester="agent")
+            assert refused["refused"] == "foreign_job"
+            assert refused["origin"] == "chat"
+        finally:
+            _jobs.interrupt_current()
+        self._wait(jid)
 
     def test_the_human_can_always_stop_a_held_kernel(self, runner):
         # The recovery belongs to the person at the machine: requester="user" is

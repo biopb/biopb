@@ -537,6 +537,9 @@ def interrupt_current(reason=None, requester="user", writer=None):
             "interrupted": False,
             "status": "running",
             "refused": "foreign_job",
+            # Whose job it is, so the caller can name the writer. "Foreign" is
+            # no longer a synonym for "the user's" -- see _foreign().
+            "origin": job.origin,
         }
     job.interrupted = True  # finalize as "interrupted"
     _cancel(job.job_id, reason=reason)
@@ -605,8 +608,17 @@ def foreign_digest():
         ]
 
 
-def ack_foreign_digest(job_ids):
+def ack_foreign_digest(job_ids, writer=None):
     """Mark the jobs in *job_ids* as reported; return how many were marked.
+
+    **Only the kernel's owner can discharge a notice.** Reading the digest is
+    open to anyone — a second client watching the session is welcome to see that
+    a cell ran — but ``seen_by_agent`` records that *the agent working here* has
+    been told, and it is promised the notice exactly once. A bystander's
+    ``poll_job`` acking it would retire a notice the owner never received, which
+    is the one failure this whole split exists to prevent. A caller with
+    ``writer=None`` is the in-process case and acks as before; an unclaimed
+    kernel has no owner to defer to.
 
     *job_ids* is what the caller actually told the agent **and reported as
     terminal** — never the whole digest. The status is deliberately **not**
@@ -619,6 +631,8 @@ def ack_foreign_digest(job_ids):
     """
     wanted = set(job_ids)
     with _lock:
+        if writer is not None and _owner not in (None, writer):
+            return 0
         acked = 0
         for job in _jobs.values():
             if _foreign(job) and not job.seen_by_agent and job.job_id in wanted:
