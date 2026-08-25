@@ -130,8 +130,35 @@ It resolves no endpoint from config and persists nothing.
 Its connect policy: the **control is the only source of a data plane** (#628). One
 `ensure_data_plane` call both brings the plane up if it is down and returns the
 *authoritative* gRPC endpoint. `$BIOPB_TENSOR_URL` is the one escape hatch, for
-connecting to a data-server _not_ supervised by the control. A local TLS data server
-is trusted from disk (its cert is already on this machine).
+connecting to a data-server _not_ supervised by the control; it bypasses the
+control completely — not consulted, and no local plane started as a side effect.
+The control's own credential (the token file it writes for the plane it owns) is
+**never** forwarded to such a server: authenticate it with `$BIOPB_TENSOR_TOKEN`
+instead. A local TLS data server is trusted from disk (its cert is already on this
+machine).
+
+Because the control is the only source, a session that has none has no data at
+all. An agent harness launching over the stdio shim gets one for free — the shim
+starts the control — but a plain `napari` session does not, and the Tensor Browser
+says so ("No biopb control plane is running"); `biopb control start` is the fix,
+and `biopb mcp view` refuses to open without one rather than presenting an empty
+viewer.
+
+### Ports, logs, and per-user isolation
+
+The data plane's default gRPC port is **8815**, which is the one piece of shared
+state on a multi-user machine — an HPC node where another user already holds it is
+the common startup failure. Two ways out: point at the existing server with
+`$BIOPB_TENSOR_URL`, or move your own. The containerized/HPC server derives its
+ports from `$BIOPB_BASE_PORT` (HTTP `BASE+4`, gRPC `BASE+5`); a local
+`biopb control start` takes the same number as `--base-port`.
+
+Everything else is already per-user: each user gets a private on-disk cache
+(`/tmp/biopb-cache-<uid>`) with its own lock, so co-tenants running their own
+servers on one node do not collide. When a plane fails to come up the browser
+shows the cause inline; the full server output is in
+`~/.local/state/biopb/logs/`, and the MCP session's own log in
+`~/.local/state/biopb/mcp/`.
 
 ### Extending the kernel namespace
 
