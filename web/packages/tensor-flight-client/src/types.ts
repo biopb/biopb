@@ -278,15 +278,6 @@ export interface TileRequest {
   reduction_method?: string;
 }
 
-/** A rendered tile: appearance is baked server-side, so contrast is part of the key. */
-export interface TileImageRequest extends TileRequest {
-  fmt?: "png" | "jpeg";
-  lo?: number;
-  hi?: number;
-  color?: string;
-  use_min_max?: boolean;
-}
-
 /** A raw tile plus the grid the server actually served it from. */
 export interface TileResult extends TypedNdArray {
   /** Echoed from `X-Tile-*`, so a client can check the grid it assumed. */

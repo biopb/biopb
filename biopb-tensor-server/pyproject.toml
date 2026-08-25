@@ -45,8 +45,6 @@ dependencies = [
   web = [
     "fastapi >= 0.111.0",
     "uvicorn[standard] >= 0.30.0",
-    "pillow >= 9.0.0",
-    "simplejpeg >= 1.6.0",
   ]
   # Self-signed TLS cert generation for `serve --tls` / `cert init` (#604).
   # Kept OUT of the default install closure on purpose: `cryptography` pulls a

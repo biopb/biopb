@@ -193,6 +193,13 @@ runtime: raw when channel count is low or contrast is being adjusted, rendered w
 the link is slow or eight channels are loaded. Ship `fmt=raw` first; without the
 parameter designed in, this ends up as two viewers.
 
+> **Overtaken.** `fmt=png|jpeg` shipped and never acquired a caller — the tiled
+> client always wanted raw, and the slow-link case it was reserved for never
+> arrived. It was removed along with `renderer.py`; see "Retiring the
+> server-rendered viewer". The parameter survives only to answer 410, so the
+> reasoning above is kept as the record of a bet that did not pay, not as
+> current design.
+
 **The server advertises the tile size** (below), rather than the client hardcoding it.
 
 **Compression: measure before building.** `Content-Encoding` at the nginx edge is
@@ -433,15 +440,21 @@ What the audit found, and what decided it:
 - **What remains is dtype coverage.** Viv holds u1/i1/u2/i2/u4/i4/f4/f8; `int64`,
   `float16`, `bool` and complex have no GPU equivalent and now cost the tensor its
   display rather than degrading to a second viewer.
-- **The cheap way to close that gap is already built.** `GET /api/tile?fmt=png|jpeg`
-  serves server-composited tiles through the same `renderer.py`, and
-  `client.tileImage()` exists but is unwired. That is a *tiled* server-render — it
-  keeps deck.gl and drops only GPU contrast — and is a far better answer for an
-  `int64` label image than a whole second viewer with its own websocket. Wire it
-  before the dtype gap is worth worrying about.
+- **The one remaining server-render mechanism was reviewed and dropped too.**
+  `GET /api/tile?fmt=png|jpeg` composited tiles through `renderer.py` and
+  `client.tileImage()` could ask for them, but nothing did. Wiring it would have
+  meant re-teaching the client a second pixel format, a second contrast model and
+  a second cache identity to serve dtypes the catalog may hold none of. Keeping it
+  unwired meant carrying ~820 lines and two dependencies (`pillow`, `simplejpeg`)
+  on the strength of a hypothetical. So it went, and **the dtype gap is accepted
+  rather than closed**.
 
-The cost accepted knowingly: a browser without WebGL2, or a tensor with an
-unsupported dtype, now gets a stated refusal instead of a working picture.
+The cost accepted knowingly: a browser without WebGL2, or a tensor whose dtype has
+no GPU equivalent (`int64`, `float16`, `bool`, complex), gets a stated refusal
+instead of a working picture. If a real corpus of such tensors turns up, the answer
+is a **conversion at the read seam** — serve `int64` as `float32` for display, which
+is a change to one route rather than a second rendering stack — not a second viewer
+and not a second wire format.
 
 ## Deferred
 
@@ -463,7 +476,7 @@ unsupported dtype, now gets a stated refusal instead of a working picture.
 3. ~~**Server-side cancellation**~~ — done, with the threadpool change it depends on.
 4. ~~**Caller-supplied `AbortSignal`**~~ — done: every read method on
    `TensorHttpClient` takes `{ signal }`, composed with its own timeout, plus
-   `tileInfo()` / `tile()` / `tileImage()` so the tile API is reachable. A caller
+   `tileInfo()` / `tile()` so the tile API is reachable. A caller
    abort raises `TensorAbortError` (`name: "AbortError"`) rather than the 408 the
    helpers used to synthesise, so a tile the viewport moved past is not reported
    as a server failure.
@@ -743,16 +756,15 @@ reads as an extensions change and recompiles every layer's shader.
 
 **Gamma goes on the intensity, not on the RGB.** `pow(i*c) != pow(i)*c`, so
 applying the exponent after the colour multiplier would shift hue as the slider
-moved. Both implementations apply it to the normalized intensity, after the
-contrast window and before the colour — the shader in the hook above, the server's
-own compositor in `renderer.apply_gamma`. A test pins the difference (`0x804000` at
-half intensity: 91, not 128).
+moved. The shader applies it to the normalized intensity, after the contrast window
+and before the colour. A test pins the difference (`0x804000` at half intensity:
+91, not 128). (`renderer.apply_gamma` used to mirror this server-side; it went with
+`renderer.py`, so the shader is now the only implementation.)
 
 **The control is in octaves.** Halving and doubling are equal and opposite
 corrections, so they belong the same distance from neutral; on a linear 0.25–4
 track four fifths of the travel would be darkening. The store holds the exponent
-itself, and both ends clamp identically (`clampGamma` / `renderer.clamp_gamma`) so
-a stored value means one thing in both viewers. A gamma of 0 is not "very dim" —
+itself, and `clampGamma` holds both ends. A gamma of 0 is not "very dim" —
 as an exponent it is a uniform white plane — so it is pulled back to the end of
 the range rather than trusted.
 

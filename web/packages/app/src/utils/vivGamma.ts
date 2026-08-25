@@ -9,11 +9,11 @@
  * in scope — it lives in the always-included `channelIntensity` module — so the
  * ramp is reused rather than reimplemented.
  *
- * Doing it at the hook, rather than after colouring, is what makes this agree
- * with the server's own rendering (`serving/renderer.py`, which bakes the same
- * ramp into a `fmt=png|jpeg` tile): both raise the *intensity* to the exponent
- * and only then multiply by the channel colour. Applying it to the final RGB
- * instead would shift hue as gamma moved, since pow(i*c) != pow(i)*c.
+ * Doing it at the hook, rather than after colouring, is what keeps hue stable as
+ * gamma moves: the exponent lands on the *intensity* and only then multiplies by
+ * the channel colour. Applying it to the final RGB instead would shift hue,
+ * since pow(i*c) != pow(i)*c. This is now the only implementation of the curve —
+ * the server-side one went with `renderer.py`.
  *
  * Interleaved RGB is drawn by a `BitmapLayer`, which Viv constructs with
  * `extensions: []` — gamma does not reach it, exactly as contrast limits do not.

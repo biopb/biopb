@@ -1634,25 +1634,28 @@ class TestTileEndpoint:
         b = tc.get("/api/tile/tiled", params={"col": 1}).headers["ETag"]
         assert a != b
 
-    def test_etag_distinguishes_render_settings(self, tile_client):
-        tc, _ = tile_client
-        a = tc.get("/api/tile/tiled", params={"fmt": "png", "lo": 1}).headers["ETag"]
-        b = tc.get("/api/tile/tiled", params={"fmt": "png", "lo": 5}).headers["ETag"]
-        assert a != b
-
-    def test_raw_etag_ignores_render_settings(self, tile_client):
-        # Contrast is applied client-side for raw, so it must not fragment the cache.
+    def test_etag_ignores_appearance_parameters(self, tile_client):
+        # Contrast is applied client-side, so it must not fragment the cache --
+        # and these parameters are no longer declared at all, so Starlette drops
+        # them before the handler sees them.
         tc, _ = tile_client
         a = tc.get("/api/tile/tiled", params={"lo": 1}).headers["ETag"]
-        b = tc.get("/api/tile/tiled", params={"lo": 5}).headers["ETag"]
+        b = tc.get("/api/tile/tiled", params={"lo": 5, "color": "green"}).headers[
+            "ETag"
+        ]
         assert a == b
 
-    def test_rendered_tile_returns_an_image(self, tile_client):
-        tc, _ = tile_client
-        r = tc.get("/api/tile/tiled", params={"fmt": "png"})
-        assert r.status_code == 200
-        assert r.headers["content-type"] == "image/png"
-        assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+    def test_a_rendered_tile_is_refused_not_silently_served_raw(self, tile_client):
+        # The withdrawn form has to fail loudly: answering raw bytes to a caller
+        # that asked for a PNG is the silent-wrong-content failure `sel` exists
+        # to prevent.
+        tc, mock_fc = tile_client
+        before = mock_fc.get_tensor.call_count
+        for bad in ("png", "jpeg"):
+            r = tc.get("/api/tile/tiled", params={"fmt": bad})
+            assert r.status_code == 410, r.text
+            assert "fmt=raw" in r.json()["detail"]
+        assert mock_fc.get_tensor.call_count == before
 
 
 # ===========================================================================
