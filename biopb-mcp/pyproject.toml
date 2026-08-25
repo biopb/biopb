@@ -138,7 +138,7 @@ mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil",
 # and `biopb-tensor-server` to the sibling workspace members (editable), so the
 # whole stack is always built from this same checkout and version-pairing is
 # automatic — no URL/SHA to bump and re-`uv lock` on every server release.
-# `[web]` pulls fastapi/uvicorn/pillow/simplejpeg — the server's CLI
+# `[web]` pulls fastapi/uvicorn — the server's CLI
 # (`biopb server start`) imports its HTTP server at module load, so without it
 # even importing the CLI raises ModuleNotFoundError: fastapi.
 integration = [

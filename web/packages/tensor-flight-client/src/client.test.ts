@@ -751,29 +751,6 @@ describe("TensorHttpClient.tile", () => {
   });
 });
 
-describe("TensorHttpClient.tileImage", () => {
-  it("sends the render settings that form the cache key", async () => {
-    const c = new TensorHttpClient(BASE, TOKEN);
-    mockFetch.mockResolvedValueOnce(
-      new Response(new Blob(["x"]), { status: 200, headers: { "Content-Type": "image/png" } }),
-    );
-    await c.tileImage({ array_id: "src0", fmt: "png", lo: 1, hi: 99, color: "green" });
-    const url = mockFetch.mock.calls[0]![0] as string;
-    for (const q of ["fmt=png", "lo=1", "hi=99", "color=green"]) {
-      expect(url).toContain(q);
-    }
-  });
-
-  it("defaults to jpeg", async () => {
-    const c = new TensorHttpClient(BASE, TOKEN);
-    mockFetch.mockResolvedValueOnce(
-      new Response(new Blob(["x"]), { status: 200, headers: { "Content-Type": "image/jpeg" } }),
-    );
-    await c.tileImage({ array_id: "src0" });
-    expect(mockFetch.mock.calls[0]![0]).toContain("fmt=jpeg");
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Cancellation covers the body, not just the headers
 // ---------------------------------------------------------------------------

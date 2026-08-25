@@ -21,7 +21,6 @@ import type {
   QuerySourcesResult,
   ReadyzSnapshot,
   SliceRequest,
-  TileImageRequest,
   TileInfo,
   TileRequest,
   TileResult,
@@ -555,7 +554,7 @@ export class TensorHttpClient {
    * @throws {TensorAbortError} if `opts.signal` fired.
    */
   async tile(req: TileRequest, opts?: RequestOptions): Promise<TileResult> {
-    return this.fetchGet(this.tilePath(req, {}), this.chunkTimeoutMs, opts, async (res) => ({
+    return this.fetchGet(this.tilePath(req), this.chunkTimeoutMs, opts, async (res) => ({
       ...(await readNdArray(res)),
       tileSize: parseInt(res.headers.get("X-Tile-Size") ?? "0", 10),
       level: parseInt(res.headers.get("X-Tile-Level") ?? "0", 10),
@@ -564,25 +563,8 @@ export class TensorHttpClient {
     }));
   }
 
-  /**
-   * One tile rendered server-side (`GET /api/tile`, `fmt=png|jpeg`).
-   *
-   * The same tile as {@link tile}, with appearance baked in: far fewer bytes,
-   * at the cost of making contrast part of the cache key. Intended for slow
-   * links and high channel counts, not as a separate rendering path.
-   */
-  async tileImage(req: TileImageRequest, opts?: RequestOptions): Promise<Blob> {
-    const { fmt = "jpeg", lo, hi, color, use_min_max } = req;
-    return this.fetchGet(
-      this.tilePath(req, { fmt, lo, hi, color, use_min_max }),
-      this.chunkTimeoutMs * 2,
-      opts,
-      (res) => res.blob(),
-    );
-  }
-
   /** Build a tile URL. Every parameter that decides the bytes is in it, by design. */
-  private tilePath(req: TileRequest, extra: Record<string, unknown>): string {
+  private tilePath(req: TileRequest): string {
     const qs = new URLSearchParams();
     const params: Record<string, unknown> = {
       level: req.level,
@@ -592,7 +574,6 @@ export class TensorHttpClient {
       z: req.z,
       c: req.c,
       reduction_method: req.reduction_method,
-      ...extra,
     };
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null) qs.set(k, String(v));

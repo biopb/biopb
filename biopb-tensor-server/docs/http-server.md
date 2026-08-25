@@ -71,7 +71,7 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
 | `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels and selectable axes for one tensor |
-| `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (`fmt=raw\|png\|jpeg`) |
+| `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (raw bytes) |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region |
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
@@ -159,19 +159,22 @@ parameter the resolution ignored cannot vary the key.
 
 | | |
 |---|---|
-| `fmt=raw` | `application/octet-stream`, the tensor's own dtype, C-contiguous. `X-Shape` / `X-Dtype` / `X-Dim-Labels` as on `/api/slice` |
-| `fmt=png\|jpeg` | image bytes, plus `X-Image-Width` / `-Height` and `X-Percentile-Lo-Value` / `-Hi-Value` |
+| body | `application/octet-stream`, the tensor's own dtype, C-contiguous. `X-Shape` / `X-Dtype` / `X-Dim-Labels` as on `/api/slice` |
 | always | `ETag`, `Cache-Control: private, max-age=3600`, `Vary: Authorization`, `X-Tile-Size` / `-Level` / `-Col` / `-Row` |
 
 `If-None-Match` revalidates to **304 without reading tile data**. Revalidation
 still consults the catalog to resolve the tensor descriptor and compute the
-ETag, but it does not call `get_tensor()` or run a data read. The ETag covers
-render settings only for the rendered formats, so adjusting contrast does not
-fragment the raw-tile cache (raw contrast is a client-side shader concern).
+ETag, but it does not call `get_tensor()` or run a data read. Appearance is a
+client-side shader concern and no appearance parameter is declared, so adjusting
+contrast cannot fragment the tile cache.
 
 `(level, col, row)` is validated against exactly the grid `/api/tile_info`
 publishes — a level the tensor does not have, or a tile outside that level's
 `cols`×`rows`, is **404**. A selection index outside its axis is **422**.
+
+`fmt` accepts only `raw`. The server-composited `png` / `jpeg` forms were removed
+with the server-rendered viewer and now answer **410** — a deliberate refusal
+rather than silently handing raw bytes to a caller that asked for an image.
 
 `t`/`z`/`c` are checked against the axis they name, not merely against `ge=0`: an
 index past the axis extent is **422**, and so is a *non-zero* index on an axis the

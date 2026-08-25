@@ -493,16 +493,6 @@ def _dim_labels_for(
     return []
 
 
-def _image_media_type(output_format: str) -> str:
-    """Map a render output format to its HTTP media type."""
-    fmt = output_format.lower()
-    if fmt == "raw":
-        return "application/octet-stream"  # Raw RGBA bytes
-    if fmt == "png":
-        return "image/png"
-    return "image/jpeg"
-
-
 def _normalize_array(arr: np.ndarray) -> np.ndarray:
     """Coerce to native byte order + C-contiguous for predictable wire bytes."""
     if arr.dtype.byteorder not in ("=", "|"):
@@ -1353,10 +1343,6 @@ async def get_tile(
     c: int = Query(0, ge=0),
     sel: Optional[List[str]] = _SEL_QUERY,
     fmt: str = Query("raw", pattern="^(raw|png|jpeg)$"),
-    lo: float = Query(1.0, ge=0.0, le=100.0),
-    hi: float = Query(99.0, ge=0.0, le=100.0),
-    color: str = Query("auto"),
-    use_min_max: bool = Query(False),
     reduction_method: Optional[str] = Query(None),
 ) -> Response:
     """One tile of a tensor, addressed by pyramid level and grid position.
@@ -1377,11 +1363,12 @@ async def get_tile(
     made a 155-file sequence a one-frame tensor to every tiled client.
     ``/api/tile_info`` lists them under ``sel_axes``.
 
-    ``fmt`` selects the transport, not a different viewer: ``raw`` ships the
-    tile's own dtype for client-side (WebGL) contrast and blending, while
-    ``png``/``jpeg`` bake appearance server-side for slow links and high channel
-    counts. Both are valid backing stores for the same tiled client, which is
-    why it is one route and not two (docs/remote-viewer-tiles.md).
+    Tiles ship as ``raw`` -- the tile's own dtype, for client-side (WebGL)
+    contrast and blending. ``fmt`` survives only to *refuse* the server-composited
+    ``png``/``jpeg`` forms this route used to serve: they have no caller since the
+    server-rendered viewer was retired, and answering raw bytes to a request that
+    asked for an image would be the silent-wrong-content failure the ``sel`` work
+    was written to avoid (docs/remote-viewer-tiles.md).
 
     Response headers mirror /api/slice (``X-Shape``/``X-Dtype``/``X-Dim-Labels``)
     plus ``X-Tile-Size``/``X-Tile-Level``/``X-Tile-Col``/``X-Tile-Row`` so a
@@ -1394,6 +1381,18 @@ async def get_tile(
     ctx = _sidecar(request)
     ctx.check_token(request)
     t0 = time.monotonic()
+
+    if fmt != "raw":
+        # 410, not 400: the form was valid and is now withdrawn, which is what a
+        # caller pinned to an older server needs to be told apart from a typo.
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                f"fmt={fmt} (server-composited tiles) was removed with the "
+                "server-rendered viewer; request fmt=raw and apply appearance "
+                "client-side"
+            ),
+        )
 
     # Cheapest possible bail-out, before any backend call: under a tile burst
     # this handler may have sat in the queue long enough for the browser to pan
@@ -1444,11 +1443,6 @@ async def get_tile(
         _parse_sel(sel or []),
     )
 
-    render_identity = (
-        [("lo", lo), ("hi", hi), ("color", color), ("mm", use_min_max)]
-        if fmt != "raw"
-        else []
-    )
     etag = _tile_etag(
         td.array_id,
         [
@@ -1461,11 +1455,9 @@ async def get_tile(
             # two cache entries for one tile, and a parameter the resolution
             # ignored must not vary the key at all.
             ("sel", ",".join(f"{i}:{v}" for i, v in sorted(resolved.items()))),
-            ("fmt", fmt),
             ("red", reduction_method or ""),
             ("edge", edge),
-        ]
-        + render_identity,
+        ],
     )
     cache_headers = {
         "ETag": etag,
@@ -1509,37 +1501,14 @@ async def get_tile(
 
         ctx.diag.latency.record((time.monotonic() - t0) * 1000)
 
-        if fmt == "raw":
-            return Response(
-                content=arr.tobytes(),
-                media_type="application/octet-stream",
-                headers={
-                    **cache_headers,
-                    "X-Shape": ",".join(str(d) for d in arr.shape),
-                    "X-Dtype": str(arr.dtype),
-                    "X-Dim-Labels": ",".join(dim_labels),
-                },
-            )
-
-        from .renderer import render_array_to_image_bytes
-
-        image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes(
-            arr,
-            dim_labels,
-            percentile_lo=lo if not use_min_max else 0.0,
-            percentile_hi=hi if not use_min_max else 100.0,
-            color=color,
-            output_format=fmt,
-        )
         return Response(
-            content=image_bytes,
-            media_type=_image_media_type(fmt),
+            content=arr.tobytes(),
+            media_type="application/octet-stream",
             headers={
                 **cache_headers,
-                "X-Image-Width": str(width),
-                "X-Image-Height": str(height),
-                "X-Percentile-Lo-Value": str(lo_val),
-                "X-Percentile-Hi-Value": str(hi_val),
+                "X-Shape": ",".join(str(d) for d in arr.shape),
+                "X-Dtype": str(arr.dtype),
+                "X-Dim-Labels": ",".join(dim_labels),
             },
         )
 
@@ -1942,10 +1911,6 @@ def create_app(
             "X-Shape",
             "X-Dtype",
             "X-Dim-Labels",
-            "X-Image-Width",
-            "X-Image-Height",
-            "X-Percentile-Lo-Value",
-            "X-Percentile-Hi-Value",
             "X-Tile-Size",
             "X-Tile-Level",
             "X-Tile-Col",
