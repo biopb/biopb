@@ -17,6 +17,7 @@ import {
   type LiveOutput,
   type ToolCallItem,
 } from "../utils/chatThread";
+import { escAction, sendsOnEnter } from "../utils/chatKeys";
 
 // The built-in agent, beside the job list it drives.
 //
@@ -107,6 +108,28 @@ export default function ChatPane({
     poll();
   }, [base, poll]);
 
+  // Escape, bound on the window rather than the composer: a reader who clicked
+  // a job row to watch its output would otherwise find the key silently stops
+  // working. `escAction` holds the ordering and the two cases Escape is already
+  // spoken for; see chatKeys.ts.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const action = escAction({
+        composing: e.isComposing,
+        imageOpen: zoom !== null,
+        inConsole: !!document.activeElement?.closest(".console"),
+        busy,
+      });
+      if (action === "none") return;
+      e.preventDefault();
+      if (action === "close-image") setZoom(null);
+      else stop();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoom, busy, stop]);
+
   const toggle = useCallback((id: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -188,36 +211,49 @@ export default function ChatPane({
       </div>
 
       <div className="chat-compose">
-        <textarea
-          value={text}
-          disabled={!status.ready}
-          placeholder={
-            status.ready ? "Ask about this session…" : "chat is unavailable"
-          }
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            // Enter sends, Shift+Enter is a newline — the opposite of the
-            // console below, deliberately: that one is code, where a newline is
-            // the common keystroke and running is the rare one.
-            if (e.key === "Enter" && !e.shiftKey) {
+        <div className="chat-input">
+          <textarea
+            value={text}
+            disabled={!status.ready}
+            placeholder={
+              status.ready ? "Ask about this session…" : "chat is unavailable"
+            }
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (!sendsOnEnter(e)) return;
               e.preventDefault();
               submit();
-            }
-          }}
-        />
+            }}
+          />
+          {/* In the corner of the box rather than on a row of its own. Enter is
+              the way to send and the hint below says so, but a submit control
+              has to exist: it is the only pointer path, and the only thing a
+              screen reader can find. */}
+          <button
+            className="chat-send"
+            aria-label="Send message"
+            title="Send (Enter)"
+            disabled={!status.ready || sending || busy || !text.trim()}
+            onClick={submit}
+          >
+            ↩
+          </button>
+        </div>
+
         <div className="chat-bar">
           {busy ? (
-            <button onClick={stop}>Cancel turn</button>
+            // Where the Cancel button used to be, and where the eye already is
+            // during a turn. A button that replaces Send mid-turn changes what
+            // the control under the cursor means while you are looking at it.
+            <span className="chat-busy">
+              working… · <kbd>esc</kbd> to cancel
+            </span>
           ) : (
-            <button
-              className="primary"
-              disabled={!status.ready || sending || !text.trim()}
-              onClick={submit}
-            >
-              {sending ? "sending…" : "Send  (Enter)"}
-            </button>
+            <span className="chat-hint">
+              <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a
+              newline
+            </span>
           )}
-          {busy ? <span className="chat-busy">working…</span> : null}
           {error ? <span className="chat-err">{error}</span> : null}
         </div>
       </div>
@@ -360,15 +396,29 @@ const CHAT_CSS = `
   .chat-thumb { max-width: 120px; max-height: 120px; border: 1px solid #333;
                 border-radius: 4px; cursor: zoom-in; display: block; }
   .chat-compose { border-top: 1px solid #333; padding: 8px 10px; }
+  .chat-input { position: relative; }
   .chat-compose textarea { width: 100%; box-sizing: border-box; min-height: 56px;
                 resize: vertical; background: #0c0c0c; color: #ddd;
-                border: 1px solid #333; border-radius: 4px; padding: 8px;
+                border: 1px solid #333; border-radius: 4px;
+                /* room for the send button in the corner */
+                padding: 8px 34px 8px 8px;
                 font: inherit; }
   .chat-compose textarea:focus { outline: none; border-color: #2a5; }
   .chat-compose textarea:disabled { opacity: .5; }
-  .chat-bar { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
-  .chat-bar button:disabled { opacity: .55; cursor: default; background: #222; }
+  .chat-send { position: absolute; right: 6px; bottom: 6px; width: 22px;
+               height: 22px; padding: 0; line-height: 1; border-radius: 4px;
+               border: 1px solid #333; background: #1a2a1a; color: #7e7;
+               cursor: pointer; font-size: 12px; }
+  .chat-send:hover:not(:disabled) { background: #244; }
+  .chat-send:disabled { opacity: .35; cursor: default; background: #181818;
+                        color: #666; }
+  .chat-bar { display: flex; align-items: baseline; gap: 10px; margin-top: 6px;
+              min-height: 15px; }
   .chat-busy { color: #7e7; font-size: 12px; }
+  .chat-hint { color: #666; font-size: 12px; }
+  .chat-bar kbd { font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+                  border: 1px solid #3a3a3a; border-radius: 3px; padding: 0 3px;
+                  color: #999; }
   .chat-err { color: #f99; font-size: 12px; }
   .chat-zoom { position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 50;
                display: flex; align-items: center; justify-content: center;
