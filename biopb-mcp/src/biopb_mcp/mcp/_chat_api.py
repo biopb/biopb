@@ -46,6 +46,17 @@ _enabled = False
 # waiting on the lock.
 _turn_task = None
 
+# Partial output of the cell a turn is waiting on, and the cell it belongs to.
+#
+# Held here rather than appended to the conversation because ``_llm_messages``
+# re-projects every stored message on every later turn: streamed stdout would go
+# back to the provider again and again, growing the prompt with text the
+# finished tool result already carries in full. This is a view's read, so it
+# lives on the transport and never enters the thread.
+_live_job = None
+_live_text = ""
+_live_len = 0
+
 
 def configure(config):
     """Take the resolved config; return whether chat should be served.
@@ -95,6 +106,10 @@ async def _api_chat_history(request):
     would be wasteful in exactly the sessions that matter. An unknown id returns
     everything, which is the right answer for a view that has just loaded or has
     fallen behind a reset.
+
+    ``partial`` carries the running cell's output so far. It rides this read
+    rather than a route of its own because a view wants the two together: the
+    thread says which tool is running, and this says what it has printed since.
     """
     messages = _chat.history()
     after = request.query_params.get("after")
@@ -103,13 +118,57 @@ async def _api_chat_history(request):
             if msg["id"] == after:
                 messages = messages[i + 1 :]
                 break
-    return JSONResponse({"messages": messages, "busy": _chat.busy()})
+    return JSONResponse(
+        {"messages": messages, "busy": _chat.busy(), "partial": _partial()}
+    )
+
+
+def _note_progress(chunk):
+    """Accumulate a running cell's output, keyed to the cell it came from.
+
+    Chunks carry no job id, but they only ever arrive from inside that cell's
+    poll loop, so the loop's own ``running_job_id()`` is the answer -- and a
+    change in it is how a new cell resets the buffer.
+    """
+    global _live_job, _live_text, _live_len
+    job_id = _chat.running_job_id()
+    if job_id != _live_job:
+        _live_job, _live_text, _live_len = job_id, "", 0
+    _live_text += chunk
+    _live_len += len(chunk)
+    # Bounded here, not only in the response: a cell printing in a loop would
+    # otherwise grow this for as long as it runs. The tail is what is kept, for
+    # the reason the job detail keeps it -- on a running job the newest output
+    # is the informative part.
+    cap = _observe._max_output_chars
+    if len(_live_text) > cap:
+        _live_text = _live_text[-cap:]
+
+
+def _partial():
+    """The running cell's output so far, or None when no cell is running.
+
+    Gated on the job still being the current one. Once it finishes, the same
+    text is in the thread as the tool's result, and reporting both would show a
+    reader the cell's output twice.
+    """
+    job_id = _chat.running_job_id()
+    if job_id is None or job_id != _live_job:
+        return None
+    return {
+        "job_id": job_id,
+        "stdout": _live_text,
+        "truncated": _live_len > len(_live_text),
+        "stdout_len": _live_len,
+    }
 
 
 async def _run_turn(text):
     """Run one turn, recording a failure in the thread rather than losing it."""
     try:
-        await _chat.run_turn(text, _model.make_model(_config))
+        await _chat.run_turn(
+            text, _model.make_model(_config), on_progress=_note_progress
+        )
     except asyncio.CancelledError:
         # Deliberate, and already in the thread. Absorbed here rather than in
         # _chat because this is the layer that asked for it; anywhere else, a

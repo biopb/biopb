@@ -15,7 +15,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from biopb_mcp._config import McpConfig
-from biopb_mcp.mcp import _chat, _chat_api, _model
+from biopb_mcp.mcp import _chat, _chat_api, _model, _observe
 
 
 @pytest.fixture
@@ -283,3 +283,104 @@ def test_chat_follows_the_page_it_lives_on():
     cfg.observe.chat_enabled = True
     cfg.observe.enabled = False
     assert _chat_api.configure(cfg) is False
+
+
+@pytest.fixture
+def no_live(monkeypatch):
+    """A transport with no cell running and an empty progress buffer."""
+    monkeypatch.setattr(_chat_api, "_live_job", None)
+    monkeypatch.setattr(_chat_api, "_live_text", "")
+    monkeypatch.setattr(_chat_api, "_live_len", 0)
+    monkeypatch.setattr(_chat, "_running_job_id", None)
+
+
+def _running(monkeypatch, job_id):
+    """Pretend the loop is polling *job_id* right now."""
+    monkeypatch.setattr(_chat, "_running_job_id", job_id)
+
+
+class TestPartialOutput:
+    """The running cell's stdout, published without entering the conversation.
+
+    ``_run_code`` has always streamed partial output to ``on_progress``; nothing
+    passed one, so it was computed and dropped. A long cell left the thread
+    silent for its whole duration, which is the one thing the promote window was
+    given up to avoid.
+    """
+
+    def test_the_turn_is_given_somewhere_to_stream_to(self, configured, monkeypatch):
+        # The whole defect in one line: a turn started without a sink discards
+        # every byte the cell prints while it runs.
+        seen = {}
+
+        async def capture(text, model, on_progress=None):
+            seen["on_progress"] = on_progress
+
+        monkeypatch.setattr(_chat, "run_turn", capture)
+        asyncio.run(_chat_api._run_turn("go"))
+        assert seen["on_progress"] is _chat_api._note_progress
+
+    def test_a_running_cell_publishes_what_it_has_printed(
+        self, client, no_live, monkeypatch
+    ):
+        _running(monkeypatch, "job-1")
+        _chat_api._note_progress("step 1\n")
+        _chat_api._note_progress("step 2\n")
+        body = client.get("/api/chat/history").json()
+        assert body["partial"] == {
+            "job_id": "job-1",
+            "stdout": "step 1\nstep 2\n",
+            "truncated": False,
+            "stdout_len": 14,
+        }
+
+    def test_nothing_is_published_when_no_cell_is_running(self, client, no_live):
+        assert client.get("/api/chat/history").json()["partial"] is None
+
+    def test_output_stops_being_published_once_the_cell_ends(
+        self, client, no_live, monkeypatch
+    ):
+        # The finished cell's output is in the thread as the tool's result.
+        # Publishing both would show a reader the same output twice.
+        _running(monkeypatch, "job-1")
+        _chat_api._note_progress("done\n")
+        _running(monkeypatch, None)
+        assert client.get("/api/chat/history").json()["partial"] is None
+
+    def test_a_new_cell_does_not_inherit_the_last_one_s_output(
+        self, client, no_live, monkeypatch
+    ):
+        # Chunks carry no job id, so a buffer that is not reset would show the
+        # previous cell's output as this one's -- and it would look like output
+        # this cell had already produced before printing anything.
+        _running(monkeypatch, "job-1")
+        _chat_api._note_progress("first cell\n")
+        _running(monkeypatch, "job-2")
+        _chat_api._note_progress("second cell\n")
+        partial = client.get("/api/chat/history").json()["partial"]
+        assert partial["job_id"] == "job-2"
+        assert partial["stdout"] == "second cell\n"
+
+    def test_a_chatty_cell_does_not_grow_the_buffer_without_limit(
+        self, client, no_live, monkeypatch
+    ):
+        # Polled every half second while a turn runs, so an unbounded buffer is
+        # both memory and payload. The tail is kept, as the job detail keeps it.
+        monkeypatch.setattr(_observe, "_max_output_chars", 20)
+        _running(monkeypatch, "job-1")
+        for i in range(50):
+            _chat_api._note_progress(f"line {i}\n")
+        partial = client.get("/api/chat/history").json()["partial"]
+        assert len(partial["stdout"]) == 20
+        assert partial["truncated"] is True
+        assert partial["stdout_len"] > 20
+        assert partial["stdout"].endswith("line 49\n")
+
+    def test_streamed_output_never_enters_the_conversation(self, no_live, monkeypatch):
+        # It lives on the transport because `_llm_messages` re-projects every
+        # stored message on every later turn: streamed stdout would be sent to
+        # the provider again and again, duplicating what the finished tool
+        # result already carries in full.
+        _running(monkeypatch, "job-1")
+        _chat_api._note_progress("noisy output\n")
+        assert _chat.history() == []
