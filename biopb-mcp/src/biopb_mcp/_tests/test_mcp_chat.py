@@ -208,6 +208,33 @@ class TestToolSurface:
             "data:image/png;base64,"
         )
 
+    def test_an_image_does_not_break_up_a_round_of_tool_results(self, chat_host):
+        # Parallel tool calls are on by default, so a screenshot can land beside
+        # another call. Its user message must wait for the whole round: a tool
+        # result that does not directly follow its assistant turn is rejected,
+        # and the malformed run is *stored*, so it would poison every later turn
+        # too rather than just failing this one.
+        model = _scripted(
+            {
+                "content": "",
+                "tool_calls": [_call("take_screenshot"), _call("server_status")],
+            },
+            {"content": "looks fine"},
+        )
+        asyncio.run(_chat.run_turn("what do you see?", model))
+
+        sent = model.seen[1]["messages"]
+        i = next(i for i, m in enumerate(sent) if m.get("tool_calls"))
+        answers = sent[i + 1 : i + 3]
+        assert [m["role"] for m in answers] == ["tool", "tool"]
+        assert {m["tool_call_id"] for m in answers} == {
+            c["id"] for c in sent[i]["tool_calls"]
+        }
+        # The image still arrives, after the round, and still says whose it is.
+        assert (
+            sent[i + 3]["content"][0]["text"] == "(image returned by take_screenshot)"
+        )
+
 
 class TestResources:
     """The resource surface, which function-calling has no verb for.

@@ -421,6 +421,12 @@ async def _run_turn(user_text, model, on_progress):
             _append("assistant", reply.get("content") or "", tool_calls=calls)
             if not calls:
                 break
+            # Images are held back until every call in the round has answered.
+            # A tool message that does not directly follow its assistant turn is
+            # rejected outright, so an image landing between two tool results
+            # would strand the second call's id -- and, being stored, would fail
+            # the same way on every later turn rather than just this one.
+            pending = []
             for call in calls:
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
@@ -430,13 +436,14 @@ async def _run_turn(user_text, model, on_progress):
                     args = {}
                 text, images = await _dispatch(name, args, on_progress)
                 _append("tool", text, tool_call_id=call.get("id"), name=name)
-                for img in images:
-                    _append(
-                        "user",
-                        f"(image returned by {name})",
-                        image=img.data,
-                        mime=img.mimeType,
-                    )
+                pending.extend((name, img) for img in images)
+            for name, img in pending:
+                _append(
+                    "user",
+                    f"(image returned by {name})",
+                    image=img.data,
+                    mime=img.mimeType,
+                )
         else:
             # Not an error the model can be told about mid-turn: it is the turn
             # ending without an answer, and the user is owed that plainly.
