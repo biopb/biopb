@@ -18,9 +18,11 @@ from biopb_mcp.mcp import _model
 
 @pytest.fixture
 def config():
-    cfg = McpConfig()
-    cfg.observe.chat_enabled = True
-    cfg.chat.model = "test-model"
+    # A dict, as the launcher threads it -- see test_mcp_chat_api.chat_config.
+    cfg = {
+        "observe": {"enabled": True, "chat_enabled": True},
+        "chat": {"model": "test-model"},
+    }
     return cfg
 
 
@@ -54,9 +56,9 @@ class TestKeyProvenance:
         import dataclasses
 
         write_credential("sk-secret", _model.KEY_NAME)
-        rendered = str(dataclasses.asdict(config))
+        rendered = str(config)
         assert "sk-secret" not in rendered
-        assert not any(f.name == "key" for f in dataclasses.fields(config.chat)), (
+        assert not any(f.name == "key" for f in dataclasses.fields(McpConfig().chat)), (
             "a bare `key` field would be the exact mistake this avoids"
         )
 
@@ -66,11 +68,11 @@ class TestReadiness:
         # Only the provider halves: whether chat is offered at all is
         # observe.chat_enabled, and it decides whether these routes exist, so
         # nothing that reaches check_ready can be switched off.
-        config.chat.model = ""
+        config["chat"]["model"] = ""
         with pytest.raises(_model.ChatNotConfigured, match="model"):
             _model.check_ready(config)
 
-        config.chat.model = "test-model"
+        config["chat"]["model"] = "test-model"
         with pytest.raises(_model.ChatNotConfigured) as exc:
             _model.check_ready(config)
         # Actionable: the path to write, and the env var, not just "no key".

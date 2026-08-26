@@ -48,7 +48,12 @@ def api_key(config):
     """
     import os
 
-    name = getattr(config.chat, "api_key_env", "") or ""
+    from .._config import get_setting
+
+    # No explicit default: passing one to get_setting *disables* the
+    # DEFAULT_CONFIG fallback, and a config file with no chat section at all --
+    # the common case -- must still get the default env var name.
+    name = get_setting(config, "chat.api_key_env") or ""
     return (os.environ.get(name) if name else None) or read_credential(KEY_NAME)
 
 
@@ -63,7 +68,9 @@ def check_ready(config):
     and it decides whether these routes exist at all, so anything that gets this
     far is on by construction.
     """
-    if not config.chat.model:
+    from .._config import get_setting
+
+    if not get_setting(config, "chat.model"):
         raise ChatNotConfigured(
             "No chat model is configured. Set chat.model in mcp-config.json — "
             "there is no default, because guessing one would bill you for a "
@@ -75,7 +82,7 @@ def check_ready(config):
         raise ChatNotConfigured(
             "No provider key. Write it to "
             f"{credential_file(KEY_NAME)} (owner-only), or set "
-            f"${config.chat.api_key_env}."
+            f"${get_setting(config, 'chat.api_key_env')}."
         )
 
 
@@ -88,20 +95,23 @@ def make_model(config):
     notice is a support question waiting to happen.
     """
 
+    from .._config import get_setting
+
     async def model(messages, tools):
         key = api_key(config)
         if not key:
             raise ChatNotConfigured("No provider key.")
         payload = {
-            "model": config.chat.model,
+            "model": get_setting(config, "chat.model"),
             "messages": messages,
             "tools": tools,
             # The loop decides when it is finished by whether tool_calls come
             # back, so the model must stay free to answer instead of calling.
             "tool_choice": "auto",
         }
-        url = config.chat.base_url.rstrip("/") + "/chat/completions"
-        async with httpx.AsyncClient(timeout=config.chat.request_timeout) as client:
+        url = get_setting(config, "chat.base_url").rstrip("/") + "/chat/completions"
+        timeout = get_setting(config, "chat.request_timeout")
+        async with httpx.AsyncClient(timeout=timeout) as client:
             reply = await client.post(
                 url, json=payload, headers={"Authorization": f"Bearer {key}"}
             )
@@ -110,11 +120,14 @@ def make_model(config):
             # payload the model rejected (a schema it dislikes, a context
             # overflow), and the detail is the only thing that identifies which.
             raise RuntimeError(
-                f"{config.chat.model} returned {reply.status_code}: {reply.text[:500]}"
+                f"{get_setting(config, 'chat.model')} returned "
+                f"{reply.status_code}: {reply.text[:500]}"
             )
         choices = reply.json().get("choices") or []
         if not choices:
-            raise RuntimeError(f"{config.chat.model} returned no choices")
+            raise RuntimeError(
+                f"{get_setting(config, 'chat.model')} returned no choices"
+            )
         return choices[0].get("message") or {}
 
     return model
