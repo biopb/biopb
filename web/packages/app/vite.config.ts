@@ -98,6 +98,13 @@ export default defineConfig({
       // gets index.html back, and fails on the JSON parse with the editor
       // looking perfectly functional.
       [`^${rx}/session/[^/]+/console`]: control,
+      // The chat pane's writes share that root's fate — the control proxies
+      // `/chat/*` on exactly the same loopback condition — and so need the same
+      // rule for the same reason: unproxied, a sent turn POSTs into the SPA
+      // fallback, parses index.html as JSON and fails with the composer looking
+      // perfectly functional. The chat *reads* are under /session/<id>/api and
+      // are already covered above.
+      [`^${rx}/session/[^/]+/chat`]: control,
     },
   },
 });
