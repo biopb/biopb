@@ -186,6 +186,27 @@ def _setup_observe(config):
         return False
 
 
+def _setup_chat(config):
+    """Wire up the built-in chat client.
+
+    Off by default (``chat.enabled``): it spends the user's own provider
+    credits, so an install must not turn it on for them. Guarded like observe —
+    a chat failure logs and is swallowed rather than blocking the MCP server,
+    which is the surface an already-working harness depends on. Returns True if
+    mounted.
+    """
+    try:
+        from . import _chat_api
+
+        if not _chat_api.configure(config):
+            return False
+        _chat_api.register_http_routes()
+        return True
+    except Exception:
+        logger.exception("chat API failed to start; continuing without it")
+        return False
+
+
 def _config_defaults(config):
     """Validate/coerce the config-derived launcher defaults.
 
@@ -491,6 +512,7 @@ def _serve_http(config, port, view=False):
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built.
     _setup_observe(config)
+    _setup_chat(config)
 
     if view:
         # Agentless viewer: bring the window up now (the human wants it

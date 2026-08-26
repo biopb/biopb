@@ -157,15 +157,31 @@ _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 # being the exception.
 _SESSION_CONSOLE_ROOT = "console"
 
+# The built-in chat client's one write route (biopb-mcp ``mcp/_chat_api.py``).
+# Gated identically to the console and for the identical reason: a chat turn
+# runs arbitrary code in the session kernel, so it is the same RCE the allowlist
+# above exists to keep off this origin. Its *reads* are not here -- they live
+# under `api`, which is both correct (a conversation is a read like the job
+# list) and required, since the POST-only assumption above would forward a
+# cross-site GET to this root unchecked.
+_SESSION_CHAT_ROOT = "chat"
+
 
 def _session_proxy_roots(console_enabled: bool) -> frozenset[str]:
     """The session-child path roots this control will proxy.
 
     One source for both the proxy's own gate and the auth middleware, so the
     guard and the thing it guards cannot disagree about what is reachable.
+
+    The flag reads "console" for history but means **this control is
+    loopback-bound**: it is computed from the bind, not from any feature switch,
+    and it gates every execute-capable root together. Whether a given one is
+    actually served is the child's own decision (``observe.console_enabled``,
+    ``chat.enabled``), which is the half this control does not and should not
+    know.
     """
     if console_enabled:
-        return _SESSION_ALLOWED_ROOTS | {_SESSION_CONSOLE_ROOT}
+        return _SESSION_ALLOWED_ROOTS | {_SESSION_CONSOLE_ROOT, _SESSION_CHAT_ROOT}
     return _SESSION_ALLOWED_ROOTS
 
 

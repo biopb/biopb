@@ -1101,6 +1101,36 @@ def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
         assert client.get("/session/s1/api/jobs").status_code == 502
 
 
+@pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
+def test_chat_root_follows_the_same_switch(tmp_path, console_enabled, expected):
+    # The chat turn runs arbitrary code in the session kernel, so it is the same
+    # RCE the allowlist exists to keep off this origin and rides the same gate.
+    # The flag reads "console" but means "this control is loopback-bound".
+    from starlette.testclient import TestClient
+
+    _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    app = build_app(
+        DataPlaneSupervisor(spec),
+        8.0,
+        f"http://127.0.0.1:{_free_port()}",
+        console_enabled=console_enabled,
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
+        resp = client.post("/session/s1/chat/turn", json={"text": "hi"})
+        assert resp.status_code == expected
+        # Chat's *reads* are not on this root: they are ordinary API calls, and
+        # stay reachable either way. That split is deliberate -- the gate above
+        # enforces POST-only, so a history GET here would be forwarded
+        # cross-site unchecked.
+        assert client.get("/session/s1/api/chat/history").status_code == 502
+
+
 class _StopServe(Exception):
     """Abort serve_control_api once build_app has been called (nothing binds)."""
 

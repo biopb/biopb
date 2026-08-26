@@ -82,6 +82,22 @@ class TurnInProgress(RuntimeError):
     """
 
 
+def busy():
+    """Whether a turn is running. A read, for the transport's status/409."""
+    return _turn_lock.locked()
+
+
+def note_error(text):
+    """Record a failed turn in the thread itself.
+
+    A turn that dies inside a background task would otherwise vanish: the view
+    is polling a conversation that simply stops growing, which reads as a hung
+    session rather than a failure. Flagged so a view can render it as an error
+    instead of as something the agent said.
+    """
+    return _append("assistant", text, error=True)
+
+
 def reset():
     """Drop the conversation (used by tests and on an explicit new session)."""
     global _seq
