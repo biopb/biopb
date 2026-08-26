@@ -110,9 +110,33 @@ async def _run_turn(text):
     """Run one turn, recording a failure in the thread rather than losing it."""
     try:
         await _chat.run_turn(text, _model.make_model(_config))
+    except asyncio.CancelledError:
+        # Deliberate, and already in the thread. Absorbed here rather than in
+        # _chat because this is the layer that asked for it; anywhere else, a
+        # swallowed cancel is a bug.
+        logger.info("chat turn cancelled")
     except Exception as exc:  # noqa: BLE001 - a provider/tool failure is content
         logger.warning("chat turn failed: %s", exc)
         _chat.note_error(f"The turn failed: {exc}")
+
+
+def _in_flight():
+    """Whether a turn is accepted-or-running.
+
+    Two signals, because they cover different windows. The task exists from the
+    moment a turn is *accepted*; the lock is held from the moment it *starts*,
+    one event-loop step later — ``create_task`` only schedules, and the 202 goes
+    out before the coroutine has run a line. Either alone leaves that step
+    unguarded: reading only the lock, a second POST lands while the first turn
+    is still queued and orphans it; reading only the task, a cancel reports
+    success on a turn that had not begun and so recorded nothing.
+
+    Neither is redundant in the other direction either — the task is the handle
+    a cancel needs, and the lock is what a turn started by any other caller
+    holds.
+    """
+    task = _turn_task
+    return _chat.busy() or (task is not None and not task.done())
 
 
 async def _chat_turn(request):
@@ -128,7 +152,7 @@ async def _chat_turn(request):
     if not isinstance(text, str) or not text.strip():
         return JSONResponse({"error": "missing 'text'"}, status_code=400)
 
-    if _chat.busy():
+    if _in_flight():
         # State, not a failed action -- the same shape the console reports a busy
         # kernel with, so the view renders it as "wait" rather than "retry".
         return JSONResponse(
@@ -140,12 +164,46 @@ async def _chat_turn(request):
     return JSONResponse({"accepted": True}, status_code=202)
 
 
-# Reads under `api` (always proxied), the one write under `chat` (proxied only
-# by a loopback-bound control, and POST-only, which is what that gate assumes).
+async def _chat_cancel(request):
+    """Stop the running turn, if there is one.
+
+    POST because it changes state and because the control narrows this root to
+    POST -- but also because it *should* be unforgeable: a cross-site request
+    that kills someone's turn is a smaller harm than one that runs code, not a
+    different kind of one. Hence ``_json_route`` too, though this carries no
+    body and that guard's rationale exempts body-less POSTs: a JSON
+    content-type is one an HTML form cannot set, and it costs a caller one
+    header.
+
+    Not an error when nothing is running. A person clicking cancel on a turn
+    that has just finished has made no mistake, and an error toast would say
+    they had.
+    """
+    if not _in_flight():
+        return JSONResponse({"cancelled": False, "reason": "no turn is running"})
+    # Reported, not just acted on: a turn cancelled before it started recorded
+    # nothing, because nothing of it ran. That is the right thread -- the turn
+    # is wholly absent rather than half-present -- but a view waiting for a
+    # cancellation message would wait forever, so it is told which happened.
+    started = _chat.busy()
+    task = _turn_task
+    # Only the turn. A cell it started keeps running, exactly as one started
+    # through `execute_code` does when its MCP client goes away: the call stops
+    # waiting, the kernel does not stop working, and whether to interrupt is the
+    # human's call from the job list. Reaching into the kernel from here would
+    # make the chat pane the one place where walking away also destroys work.
+    if task is not None:
+        task.cancel()
+    return JSONResponse({"cancelled": True, "started": started})
+
+
+# Reads under `api` (always proxied), the writes under `chat` (proxied only by a
+# loopback-bound control, and POST-only, which that gate enforces).
 _ROUTES = [
     ("/api/chat/status", ["GET"], _observe._route(_api_chat_status)),
     ("/api/chat/history", ["GET"], _observe._route(_api_chat_history)),
     ("/chat/turn", ["POST"], _observe._json_route(_chat_turn)),
+    ("/chat/cancel", ["POST"], _observe._json_route(_chat_cancel)),
 ]
 
 
@@ -157,7 +215,7 @@ def register_http_routes():
     """
     for path, methods, handler in _ROUTES:
         _server_custom_route(path, methods)(handler)
-    logger.info("chat API mounted at /api/chat/* and /chat/turn")
+    logger.info("chat API mounted at /api/chat/* and /chat/{turn,cancel}")
 
 
 def _server_custom_route(path, methods):

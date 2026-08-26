@@ -6,6 +6,7 @@ than as functions.
 """
 
 import asyncio
+import json
 
 import pytest
 from biopb._credentials import remove_credential, write_credential
@@ -54,6 +55,7 @@ class TestRootSplit:
         assert by_path["/api/chat/history"] == ["GET"]
         assert by_path["/api/chat/status"] == ["GET"]
         assert by_path["/chat/turn"] == ["POST"]
+        assert by_path["/chat/cancel"] == ["POST"]
         assert not any(
             p.startswith("/chat/") and m != ["POST"] for p, m, _ in _chat_api._ROUTES
         )
@@ -148,6 +150,120 @@ class TestTurn:
     @pytest.mark.parametrize("payload", [{}, {"text": ""}, {"text": "   "}])
     def test_an_empty_message_is_rejected(self, client, payload):
         assert client.post("/chat/turn", json=payload).status_code == 400
+
+
+class TestCancel:
+    @staticmethod
+    def _wait_for(predicate, timeout=2.0):
+        import time
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_it_carries_the_json_guard_despite_having_no_body(self, client):
+        # _json_route's rationale exempts body-less POSTs, since the content-type
+        # rule is there for "the one route that submits code". Cancel takes it
+        # anyway: a JSON content-type is one an HTML form cannot set, and it
+        # costs a caller a header to stop a cross-site page from killing
+        # someone's turn. A body-less POST is not a harmless one.
+        assert (
+            client.post(
+                "/chat/cancel", headers={"content-type": "text/plain"}
+            ).status_code
+            == 400
+        )
+
+    def test_a_scheduled_turn_already_counts(self, client, monkeypatch):
+        # busy() is the turn lock, taken when a turn *starts*. The task exists
+        # from when it is *accepted*, one event-loop step earlier -- create_task
+        # only schedules, and the 202 goes out before the coroutine runs a line.
+        # Reading either signal alone leaves that step unguarded.
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                assert _chat.busy() is False  # not started: the lock is free
+                assert _chat_api._in_flight() is True  # ...but it is accepted
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_cancelling_before_the_turn_starts_says_so(self, client, monkeypatch):
+        # Nothing of the turn ran, so nothing recorded it -- which is the right
+        # thread, but a view waiting for a cancellation message would wait
+        # forever. Hence `started`.
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                reply = await _chat_api._chat_cancel(None)
+                assert json.loads(bytes(reply.body)) == {
+                    "cancelled": True,
+                    "started": False,
+                }
+                assert _chat.history() == []
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_nothing_running_is_not_an_error(self, client):
+        # A person clicking cancel on a turn that has just finished has made no
+        # mistake; an error status would say they had.
+        reply = client.post("/chat/cancel", json={})
+        assert reply.status_code == 200
+        assert reply.json()["cancelled"] is False
+
+    def test_a_running_turn_stops_and_says_so(self, client, monkeypatch):
+        started = asyncio.Event()
+
+        async def hang(messages, tools):
+            started.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: hang)
+        client.post("/chat/turn", json={"text": "hello"})
+        assert self._wait_for(started.is_set)
+
+        assert client.post("/chat/cancel", json={}).json()["cancelled"] is True
+        # The thread carries the outcome, and the session frees up: a view is
+        # polling these two, and both have to move or the cancel looks ignored.
+        assert self._wait_for(lambda: any(m.get("cancelled") for m in _chat.history()))
+        assert self._wait_for(lambda: not _chat.busy())
+        assert client.get("/api/chat/status").json()["busy"] is False
+
+    def test_it_does_not_reach_into_the_kernel(self, client, monkeypatch):
+        # Deliberate, and the whole shape of this route: stopping the turn is
+        # not stopping the user's code. An MCP client going away leaves its cell
+        # running too; the chat pane must not be the one place where walking
+        # away destroys work.
+        started = asyncio.Event()
+        touched = []
+
+        async def hang(messages, tools):
+            started.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: hang)
+        monkeypatch.setattr(
+            _chat, "_job_call", lambda *a, **k: touched.append(a) or (None, {}, None)
+        )
+        client.post("/chat/turn", json={"text": "hello"})
+        assert self._wait_for(started.is_set)
+        client.post("/chat/cancel", json={})
+        assert self._wait_for(lambda: not _chat.busy())
+        assert touched == []
 
 
 def test_routes_are_not_mounted_when_chat_is_off():

@@ -25,6 +25,13 @@ Design notes
   ``_server._local_identity`` for the length of a dispatch, so the kernel's
   one-agent claim covers it: a chat session and an attached MCP harness are
   mutually exclusive, and neither can quietly write into the other's namespace.
+* **A cancel stops the turn, not the cell.** ``execute_code`` over MCP hands
+  back a job handle after ``promote_after`` and the cell outlives the call; the
+  human stops it, or does not, from the observe page. A chat turn holds for the
+  life of the cell instead (see ``_run_code``), but ending the turn should not
+  quietly change what happens to the user's running code. So cancelling stops
+  the polling and says which cell was left behind — the same two decisions an
+  MCP user gets, made in the same order.
 * **The model is injected.** Nothing here knows a provider. The caller passes an
   async ``model(messages, tools) -> assistant message``, which keeps the loop
   testable with no key and no network, and keeps provider choice out of it.
@@ -68,6 +75,10 @@ _POLL_INTERVAL = 0.3
 _messages: list = []
 _seq = 0
 
+# The cell a turn is currently waiting on, or None. Only so a cancelled turn can
+# name what it walked away from -- the job outlives the turn by design.
+_running_job_id = None
+
 # One turn at a time, for the same reason the kernel runs one job at a time.
 # Two turns would interleave into the one thread and each compose against a
 # history the other is still writing -- and both would reach for the same
@@ -103,9 +114,10 @@ def note_error(text):
 
 def reset():
     """Drop the conversation (used by tests and on an explicit new session)."""
-    global _seq
+    global _seq, _running_job_id
     _messages.clear()
     _seq = 0
+    _running_job_id = None
 
 
 def _append(role, content, **extra):
@@ -319,19 +331,36 @@ async def _run_code(arguments, on_progress):
             "kernel; wait for it to finish."
         )
 
+    global _running_job_id
     job_id = submitted["job_id"]
+    # Recorded so a cancelled turn can name the cell it walked away from. It
+    # means "the cell being polled right now", and every way of ceasing to poll
+    # clears it except the one where the statement stays true.
+    _running_job_id = job_id
     seen = 0
-    while True:
-        await asyncio.sleep(_POLL_INTERVAL)
-        snap, res, _w = await _job_call(host, "poll(" + repr(job_id) + ")")
-        if snap is None:
-            return _server._format_execute_result(res)
-        out = snap.get("stdout") or ""
-        if on_progress is not None and len(out) > seen:
-            on_progress(out[seen:])
-            seen = len(out)
-        if snap.get("status") != "running":
-            return _server._format_execute_result(snap)
+    try:
+        while True:
+            await asyncio.sleep(_POLL_INTERVAL)
+            snap, res, _w = await _job_call(host, "poll(" + repr(job_id) + ")")
+            if snap is None:
+                _running_job_id = None
+                return _server._format_execute_result(res)
+            out = snap.get("stdout") or ""
+            if on_progress is not None and len(out) > seen:
+                on_progress(out[seen:])
+                seen = len(out)
+            if snap.get("status") != "running":
+                _running_job_id = None
+                return _server._format_execute_result(snap)
+    except asyncio.CancelledError:
+        # The one case that keeps it: the cell really is still running, and the
+        # turn's handler is about to name it. That handler clears it.
+        raise
+    except BaseException:
+        # Stopping for any other reason says nothing about the cell, and the id
+        # must not linger to be reported as "still running" by a later cancel.
+        _running_job_id = None
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -409,15 +438,47 @@ async def run_turn(user_text, model, on_progress=None):
         return await _run_turn(user_text, model, on_progress)
 
 
-async def _run_turn(user_text, model, on_progress):
-    # Before the append: the user's own turn is one of the new messages a view
-    # has to render, not context it already had.
-    start = len(_messages)
-    _append("user", user_text)
-    tools = await tool_payload()
+def _close_open_calls(reason):
+    """Answer every tool call the last assistant turn left open.
 
+    A turn that stops mid-round would otherwise store an assistant message whose
+    calls were never all answered, and ``_llm_messages`` re-projects the whole
+    thread on every later turn -- so an interrupted turn would fail the
+    conversation at the provider from then on. The thread has to be left
+    well-formed whatever ends the turn, not only when it ends by finishing.
+    """
+    for i in range(len(_messages) - 1, -1, -1):
+        if _messages[i].get("tool_calls"):
+            break
+    else:
+        return
+    answered = {
+        m.get("tool_call_id") for m in _messages[i + 1 :] if m["role"] == "tool"
+    }
+    for call in _messages[i]["tool_calls"]:
+        if call.get("id") in answered:
+            continue
+        _append(
+            "tool",
+            reason,
+            tool_call_id=call.get("id"),
+            name=(call.get("function") or {}).get("name") or "",
+            error=True,
+        )
+
+
+async def _run_turn(user_text, model, on_progress):
+    # Everything that touches the thread is inside the try, so the turn is
+    # either wholly absent or recorded with an outcome. Appending the user's
+    # message and *then* awaiting outside the handler left the one state a view
+    # cannot read: its own message, followed by nothing, forever.
+    start = len(_messages)
     token = _server._local_identity.set((WRITER_ID, WRITER_LABEL))
     try:
+        # Before the first await: the user's own turn is one of the new messages
+        # a view has to render, not context it already had.
+        _append("user", user_text)
+        tools = await tool_payload()
         for _round in range(_MAX_TOOL_ROUNDS):
             reply = await model(_llm_messages(), tools)
             calls = reply.get("tool_calls") or []
@@ -474,6 +535,35 @@ async def _run_turn(user_text, model, on_progress):
                 f"Stopped after {_MAX_TOOL_ROUNDS} tool calls without reaching an "
                 "answer. Ask me to continue, or narrow the question.",
             )
+    except asyncio.CancelledError:
+        # Recorded, then re-raised. Recorded because a view polling the history
+        # would otherwise see the conversation simply stop growing, which reads
+        # as a hang -- the same reason a failed turn lands in the thread.
+        # Re-raised because swallowing a cancel lies to whoever asked for it,
+        # and the transport is the layer that knows this one was deliberate.
+        global _running_job_id
+        _close_open_calls("Cancelled before this call finished.")
+        # The cell is deliberately left alone -- see the module docstring. Named,
+        # because a turn that vanishes while the kernel is still busy is the one
+        # thing a user cannot work out from the thread.
+        _append(
+            "assistant",
+            "Turn cancelled."
+            + (
+                f" Cell {_running_job_id} is still running in the kernel;"
+                " interrupt it from the job list if you want it stopped."
+                if _running_job_id
+                else ""
+            ),
+            cancelled=True,
+        )
+        # Cleared only now, once it has been reported. Held past the poll loop
+        # so this message could name the cell; held any longer and the *next*
+        # cancel would name it too, by which time it has almost certainly
+        # finished -- a stale id here does not read as stale, it reads as a
+        # second cell nobody started.
+        _running_job_id = None
+        raise
     finally:
         _server._local_identity.reset(token)
 
