@@ -27,7 +27,7 @@ def configured(tmp_path, monkeypatch):
     cfg = McpConfig()
     cfg.observe.chat_enabled = True
     cfg.chat.model = "test-model"
-    _chat_api.configure(cfg)
+    _chat_api.configure(cfg, agentless=True)
     _chat.reset()
     yield cfg
     _chat.reset()
@@ -272,7 +272,7 @@ def test_routes_are_not_mounted_when_chat_is_off():
     # one answer rather than a status code to interpret.
     cfg = McpConfig()
     assert cfg.observe.chat_enabled is False
-    assert _chat_api.configure(cfg) is False
+    assert _chat_api.configure(cfg, agentless=True) is False
 
 
 def test_chat_follows_the_page_it_lives_on():
@@ -282,7 +282,31 @@ def test_chat_follows_the_page_it_lives_on():
     cfg = McpConfig()
     cfg.observe.chat_enabled = True
     cfg.observe.enabled = False
-    assert _chat_api.configure(cfg) is False
+    assert _chat_api.configure(cfg, agentless=True) is False
+
+
+def test_a_harness_driven_session_gets_no_chat():
+    # The loop is for users *without* an MCP harness. On a session an agent is
+    # already driving, a second one is not a feature: only one writer can hold
+    # the kernel claim, so the pane would answer questions and then refuse to
+    # run anything -- correct, and not what anyone opening it expects.
+    #
+    # Config alone cannot express this. Both switches are on here, and the
+    # surface is still withheld, because the deciding fact is how the session
+    # was launched rather than how it was configured.
+    cfg = McpConfig()
+    cfg.observe.chat_enabled = True
+    cfg.chat.model = "test-model"
+    assert _chat_api.configure(cfg, agentless=False) is False
+    assert _chat_api.configure(cfg, agentless=True) is True
+
+
+def test_chat_cannot_be_configured_on_by_accident():
+    # `agentless` is required, not defaulted: either default is wrong for one
+    # of the two callers, and the failure would be silent both ways -- chat on
+    # every harness-driven session, or missing from the viewer it was built for.
+    with pytest.raises(TypeError):
+        _chat_api.configure(McpConfig())
 
 
 @pytest.fixture

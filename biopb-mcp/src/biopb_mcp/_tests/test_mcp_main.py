@@ -13,6 +13,7 @@ from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
+    _is_agentless_viewer,
     _parse_args,
     _register_view_session,
     _setup_observe,
@@ -203,6 +204,34 @@ class TestSetupObserve:
         cfg = {"observe": {"enabled": True}}
         # An observe failure must never propagate out of the launcher.
         assert _setup_observe(cfg) is False
+
+
+class TestAgentlessViewer:
+    """Which sessions count as a viewer a human opened.
+
+    Two things hang off this and must not drift apart: such a session publishes
+    itself to the registry, and it is the only kind served the built-in chat
+    loop. Pinned as a truth table rather than trusted to two inline expressions,
+    which is what they were.
+    """
+
+    @pytest.mark.parametrize(
+        "view,shim_owned,expected",
+        [
+            # `biopb mcp view`: a human opened a window; no agent is attached.
+            (True, False, True),
+            # A shim-owned child is serving an MCP client. It cannot reach here
+            # with view=True today, and must answer False if it ever does.
+            (True, True, False),
+            # The stdio shim's ordinary child.
+            (False, True, False),
+            # A direct `--transport http` launch: wired to something by its
+            # operator, and publishes no session, so it has no observe page.
+            (False, False, False),
+        ],
+    )
+    def test_only_a_shimless_viewer_counts(self, view, shim_owned, expected):
+        assert _is_agentless_viewer(view, shim_owned) is expected
 
 
 class TestViewSessionRegistration:
