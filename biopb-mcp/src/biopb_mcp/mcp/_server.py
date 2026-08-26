@@ -7,6 +7,7 @@ dask, and the TensorFlightClient live.  The kernel can be interrupted or
 hard-restarted independently of this process.
 """
 
+import contextvars
 import json
 import logging
 import os
@@ -527,8 +528,18 @@ _NOT_OWNER_MSG = (
 )
 
 
+# Identity for a caller that reaches the tools without an MCP request at all --
+# the in-process chat loop, which is a client of this server in every sense that
+# matters but arrives as a plain function call. Set for the length of one
+# dispatch (``_chat``), so every tool gates it the way it gates a remote client
+# instead of letting it through as "no identity".
+_local_identity: contextvars.ContextVar = contextvars.ContextVar(
+    "biopb_local_identity", default=None
+)
+
+
 def _client_identity():
-    """``(id, label)`` for the MCP client behind this call, or ``(None, "")``.
+    """``(id, label)`` for the client behind this call, or ``(None, "")``.
 
     The streamable-http transport mints a per-connection ``mcp-session-id``, so
     two clients reaching one session child are distinguishable even though the
@@ -542,8 +553,14 @@ def _client_identity():
     makes the function uncallable without one, and every in-process caller (the
     tests today, an in-process chat loop later) has no request at all. Outside a
     request this yields no identity, which ``submit`` reads as "nothing to claim
-    with" and lets through.
+    with" and lets through -- unless an in-process caller has announced itself
+    through :data:`_local_identity`, which takes precedence over the request
+    because it *is* the caller; a loop dispatching tools has no request of its
+    own to be found.
     """
+    local = _local_identity.get()
+    if local is not None:
+        return local
     try:
         rc = mcp.get_context().request_context
     except Exception:  # noqa: BLE001 - no request, or an SDK shape we don't know

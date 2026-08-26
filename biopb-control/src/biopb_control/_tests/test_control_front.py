@@ -1051,20 +1051,23 @@ def test_session_console_is_gated_like_the_api(control, upstream):
     assert exc.value.code == 403
 
 
-def test_console_root_is_post_only(control, upstream):
+@pytest.mark.parametrize("path", ["console/execute", "chat/turn"])
+def test_the_execute_capable_roots_are_post_only(control, upstream, path):
     # The CSRF gate skips safe methods (correctly -- safe verbs must not change
     # state), so a cross-site GET is forwarded unchecked to whatever the child
     # serves. `<img src=".../console/execute?code=...">` is the shape. Pinning
-    # POST here means that claim does not depend on the child's method list.
+    # POST here means that claim does not depend on the child's method list --
+    # which is the whole point, and is why chat is checked too: it is the same
+    # RCE behind the same gate, and a promise about another package's route
+    # table is exactly what this refuses to rely on.
     _register_session("s1", upstream)
     for method in ("GET", "HEAD", "PUT", "DELETE"):
-        req = urllib.request.Request(
-            f"{control}/session/s1/console/execute?code=1", method=method
-        )
+        req = urllib.request.Request(f"{control}/session/s1/{path}?x=1", method=method)
         with pytest.raises(urllib.error.HTTPError) as exc:
             urllib.request.urlopen(req, timeout=5)
         assert exc.value.code == 405, method
-    # The data API keeps every verb: only the console is narrowed.
+    # The data API keeps every verb: only the execute-capable roots are narrowed,
+    # which is what lets chat's history be a readable GET under `api`.
     status, _headers, _body = _get(f"{control}/session/s1/api/jobs")
     assert status == 200
 
@@ -1099,6 +1102,36 @@ def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
         assert resp.status_code == expected
         # The data API is unaffected either way -- the switch narrows one root.
         assert client.get("/session/s1/api/jobs").status_code == 502
+
+
+@pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
+def test_chat_root_follows_the_same_switch(tmp_path, console_enabled, expected):
+    # The chat turn runs arbitrary code in the session kernel, so it is the same
+    # RCE the allowlist exists to keep off this origin and rides the same gate.
+    # The flag reads "console" but means "this control is loopback-bound".
+    from starlette.testclient import TestClient
+
+    _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    app = build_app(
+        DataPlaneSupervisor(spec),
+        8.0,
+        f"http://127.0.0.1:{_free_port()}",
+        console_enabled=console_enabled,
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
+        resp = client.post("/session/s1/chat/turn", json={"text": "hi"})
+        assert resp.status_code == expected
+        # Chat's *reads* are not on this root: they are ordinary API calls, and
+        # stay reachable either way. That split is deliberate -- the gate above
+        # enforces POST-only, so a history GET here would be forwarded
+        # cross-site unchecked.
+        assert client.get("/session/s1/api/chat/history").status_code == 502
 
 
 class _StopServe(Exception):

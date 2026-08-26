@@ -436,6 +436,57 @@ class ObserveConfig:
         "narrow the surface -- the control refuses to proxy the console at all "
         "unless it is loopback-bound, whatever this says.",
     )
+    chat_enabled: bool = _h(
+        False,
+        "Offer the built-in chat client: a pane on the observe page that drives "
+        "this session's kernel through a model. Lives here beside the console "
+        "because it is the same kind of thing -- an execute-capable surface on "
+        "this page -- and because it needs the page: chat routes served without "
+        "one have nothing to reach them. Off by default because it spends the "
+        "user's own provider credits; the model and endpoint are in `chat`. "
+        "Like the console, this can only narrow the surface.",
+    )
+
+
+@dataclass
+class ChatConfig:
+    """Provider settings for the built-in chat client.
+
+    The on/off switch is **not** here: it is ``observe.chat_enabled``, beside the
+    console's, because what it turns on is a pane on the observe page. This
+    section is only *which* endpoint and model that pane talks to, so there is
+    one place to enable a surface and one place to point it somewhere.
+
+    The provider key is deliberately not here either. This file is served whole
+    by the control's ``GET /api/mcp_config`` so the admin page can edit it, and a
+    key in it would be rendered in a browser; it lives in an owner-only
+    credential file instead (``biopb._credentials``, name ``chat-provider.token``)
+    for the same reasons that module was written. What is here is configuration
+    a person may reasonably want to change and no one needs to keep secret.
+    """
+
+    model: str = _h(
+        "",
+        "Model id to send, e.g. 'gpt-4o' or 'deepseek-v4'. Empty means chat is "
+        "unconfigured, which reports as such rather than guessing a default that "
+        "would bill the user for a model they did not choose.",
+    )
+    base_url: str = _h(
+        "https://api.openai.com/v1",
+        "OpenAI-compatible chat-completions base URL. Any gateway speaking that "
+        "shape works; '/chat/completions' is appended.",
+    )
+    api_key_env: str = _h(
+        "BIOPB_CHAT_API_KEY",
+        "Environment variable consulted *before* the credential file. For CI and "
+        "development; the file is the supported path, because an env var leaks "
+        "through /proc, `ps e`, and every inherited child.",
+    )
+    request_timeout: float = _h(
+        120.0,
+        "Seconds to wait for one model reply. Covers a slow first token on a "
+        "long conversation, not the tool calls it triggers.",
+    )
 
 
 @dataclass
@@ -483,6 +534,7 @@ class McpConfig:
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
     observe: ObserveConfig = field(default_factory=ObserveConfig)
+    chat: ChatConfig = field(default_factory=ChatConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
 
 
@@ -512,6 +564,9 @@ _CONSTRAINTS = {
     "MemoryConfig": {
         "warn_threshold_mb": Range(exclusive_min=0),
         "error_threshold_mb": Range(exclusive_min=0),
+    },
+    "ChatConfig": {
+        "request_timeout": Range(exclusive_min=0),
     },
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
