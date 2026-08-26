@@ -1051,20 +1051,23 @@ def test_session_console_is_gated_like_the_api(control, upstream):
     assert exc.value.code == 403
 
 
-def test_console_root_is_post_only(control, upstream):
+@pytest.mark.parametrize("path", ["console/execute", "chat/turn"])
+def test_the_execute_capable_roots_are_post_only(control, upstream, path):
     # The CSRF gate skips safe methods (correctly -- safe verbs must not change
     # state), so a cross-site GET is forwarded unchecked to whatever the child
     # serves. `<img src=".../console/execute?code=...">` is the shape. Pinning
-    # POST here means that claim does not depend on the child's method list.
+    # POST here means that claim does not depend on the child's method list --
+    # which is the whole point, and is why chat is checked too: it is the same
+    # RCE behind the same gate, and a promise about another package's route
+    # table is exactly what this refuses to rely on.
     _register_session("s1", upstream)
     for method in ("GET", "HEAD", "PUT", "DELETE"):
-        req = urllib.request.Request(
-            f"{control}/session/s1/console/execute?code=1", method=method
-        )
+        req = urllib.request.Request(f"{control}/session/s1/{path}?x=1", method=method)
         with pytest.raises(urllib.error.HTTPError) as exc:
             urllib.request.urlopen(req, timeout=5)
         assert exc.value.code == 405, method
-    # The data API keeps every verb: only the console is narrowed.
+    # The data API keeps every verb: only the execute-capable roots are narrowed,
+    # which is what lets chat's history be a readable GET under `api`.
     status, _headers, _body = _get(f"{control}/session/s1/api/jobs")
     assert status == 200
 

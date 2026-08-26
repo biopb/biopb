@@ -166,6 +166,13 @@ _SESSION_CONSOLE_ROOT = "console"
 # cross-site GET to this root unchecked.
 _SESSION_CHAT_ROOT = "chat"
 
+# The execute-capable roots, which `session_proxy` narrows to POST. Both are
+# here for the same reason the console was: the CSRF gate skips safe methods, so
+# a cross-site GET to either is forwarded unchecked, and the root's claim must
+# not rest on the child's method list. Naming the set rather than testing one
+# root means a third such root inherits the narrowing by being added here.
+_SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CONSOLE_ROOT, _SESSION_CHAT_ROOT})
+
 
 def _session_proxy_roots(console_enabled: bool) -> frozenset[str]:
     """The session-child path roots this control will proxy.
@@ -1114,18 +1121,19 @@ def build_app(
         segments = sub_path.split("/")
         if segments[0] not in session_roots or ".." in segments:
             return JSONResponse({"error": "not found"}, status_code=404)
-        # The console is POST-only *here*, not merely in the child that happens
-        # to serve it that way. The CSRF gate upstream only inspects unsafe
-        # methods -- correct, since safe verbs must not change state -- so a
-        # cross-site GET (`<img src=".../console/execute?code=...">`) is
-        # forwarded unchecked, exactly as a GET to /api/jobs is. That is harmless
-        # only while nothing under this root acts on a GET, which is a promise
-        # about code living in another package. Pinning the method here makes the
-        # root's claim ("reaching the console requires a request a hostile page
-        # cannot forge") true at the layer that makes it, and fences off a future
-        # GET route that would silently reopen it. Checked before resolving the
-        # session, so it discloses nothing about which ids exist.
-        if segments[0] == _SESSION_CONSOLE_ROOT and request.method != "POST":
+        # The execute-capable roots are POST-only *here*, not merely in the
+        # children that happen to serve them that way. The CSRF gate upstream
+        # only inspects unsafe methods -- correct, since safe verbs must not
+        # change state -- so a cross-site GET (`<img
+        # src=".../console/execute?code=...">`) is forwarded unchecked, exactly
+        # as a GET to /api/jobs is. That is harmless only while nothing under
+        # these roots acts on a GET, which is a promise about code living in
+        # another package. Pinning the method here makes the roots' claim
+        # ("reaching an RCE requires a request a hostile page cannot forge") true
+        # at the layer that makes it, and fences off a future GET route that
+        # would silently reopen it. Checked before resolving the session, so it
+        # discloses nothing about which ids exist.
+        if segments[0] in _SESSION_POST_ONLY_ROOTS and request.method != "POST":
             return JSONResponse({"error": "method not allowed"}, status_code=405)
         rec = _sessions.resolve(session_id)
         if rec is None:
