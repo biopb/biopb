@@ -58,6 +58,7 @@ def chat_host():
     }
     host._submit = None
     host._states = [("ok", "")]
+    host.interrupts = []
 
     def execute(code, *_args, **_kwargs):
         if "_jobs.submit(" in code:
@@ -78,6 +79,9 @@ def chat_host():
                     "elapsed": 0.1,
                 }
             )
+        if "_jobs.interrupt_current(" in code:
+            host.interrupts.append(code)
+            return _envelope({"job_id": "job-1", "interrupted": True, "status": "ok"})
         if "_jobs.foreign_digest(" in code:
             return _envelope([])
         if "_jobs.ack_foreign_digest(" in code:
@@ -518,6 +522,162 @@ class TestGuards:
         i = next(i for i, m in enumerate(sent) if m.get("tool_calls"))
         answered = {m["tool_call_id"] for m in sent[i + 1 :] if m["role"] == "tool"}
         assert answered == {c["id"] for c in sent[i]["tool_calls"]}
+
+
+class TestCancel:
+    """Stopping a turn part-way, which is where the thread is easiest to corrupt."""
+
+    @staticmethod
+    def _cancel_mid_round(model, monkeypatch):
+        """Run a turn, cancel it while the first tool call is in flight."""
+        reached = asyncio.Event()
+
+        async def hang(name, args, on_progress):
+            reached.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(_chat, "_dispatch", hang)
+
+        async def scenario():
+            task = asyncio.create_task(_chat.run_turn("hi", model))
+            await reached.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+
+    def test_every_call_is_still_answered(self, chat_host, monkeypatch):
+        # The invariant a cancel is most likely to break: two calls issued, none
+        # answered when the cancel lands. Both have to be closed out, or the
+        # stored turn is malformed.
+        model = _scripted(
+            {
+                "content": "",
+                "tool_calls": [_call("server_status"), _call("take_screenshot")],
+            }
+        )
+        self._cancel_mid_round(model, monkeypatch)
+
+        msgs = _chat.history()
+        i = next(i for i, m in enumerate(msgs) if m.get("tool_calls"))
+        answered = {m["tool_call_id"] for m in msgs[i + 1 :] if m["role"] == "tool"}
+        assert answered == {c["id"] for c in msgs[i]["tool_calls"]}
+
+    def test_the_thread_is_still_usable_afterwards(self, chat_host, monkeypatch):
+        # The reason the invariant above matters. A malformed run is re-sent on
+        # every later turn, so a corrupt cancel would not cost the turn it
+        # interrupted -- it would cost the conversation.
+        model = _scripted({"content": "", "tool_calls": [_call("server_status")]})
+        self._cancel_mid_round(model, monkeypatch)
+
+        sent = _chat._llm_messages()
+        i = next(i for i, m in enumerate(sent) if m.get("tool_calls"))
+        answers = sent[i + 1 : i + 1 + len(sent[i]["tool_calls"])]
+        assert all(m["role"] == "tool" for m in answers)
+        assert {m["tool_call_id"] for m in answers} == {
+            c["id"] for c in sent[i]["tool_calls"]
+        }
+
+    def test_the_cancellation_is_recorded(self, chat_host, monkeypatch):
+        # A view polling the history would otherwise see the thread stop growing,
+        # which reads as a hang rather than as the thing it just asked for.
+        model = _scripted({"content": "", "tool_calls": [_call("server_status")]})
+        self._cancel_mid_round(model, monkeypatch)
+        assert _chat.history()[-1]["cancelled"] is True
+
+    def test_a_cancel_before_the_first_round_is_still_recorded(
+        self, chat_host, monkeypatch
+    ):
+        # tool_payload() is awaited before any model call, and was awaited
+        # outside the handler -- so a cancel landing there left the user's
+        # message in the thread with nothing after it, ever. That is the one
+        # state a polling view cannot tell from a hang, which is precisely what
+        # recording a cancellation exists to prevent.
+        reached = asyncio.Event()
+
+        async def hang():
+            reached.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(_chat, "tool_payload", hang)
+
+        async def scenario():
+            task = asyncio.create_task(_chat.run_turn("hi", _scripted()))
+            await reached.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+
+        assert [m["role"] for m in _chat.history()] == ["user", "assistant"]
+        assert _chat.history()[-1]["cancelled"] is True
+
+    def test_a_later_cancel_does_not_name_an_old_cell(self, chat_host, monkeypatch):
+        # The id is held past the poll loop so the first cancel can name the
+        # cell. Held any longer and the next cancel names it again -- by which
+        # time it has almost certainly finished, and a stale id does not read as
+        # stale: it reads as a second cell nobody started.
+        chat_host.script_job([("running", ""), ("running", "")])
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="go()")]}
+        )
+
+        async def first():
+            task = asyncio.create_task(_chat.run_turn("go", model))
+            while _chat._running_job_id is None:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(first())
+        assert "job-1" in _chat.history()[-1]["content"]
+
+        # A second turn cancelled before it runs any cell at all.
+        reached = asyncio.Event()
+
+        async def hang():
+            reached.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(_chat, "tool_payload", hang)
+
+        async def second():
+            task = asyncio.create_task(_chat.run_turn("again", _scripted()))
+            await reached.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(second())
+        assert _chat.history()[-1]["content"] == "Turn cancelled."
+
+    def test_the_cell_is_left_running_and_named(self, chat_host):
+        # The contract: a cancel ends the turn, not the user's code. Same two
+        # decisions an MCP user gets -- the call stops waiting, and whether to
+        # interrupt stays theirs -- so the thread has to say which cell was left,
+        # or a busy kernel with no explanation is all they have to go on.
+        chat_host.script_job([("running", ""), ("running", "")])
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="go()")]}
+        )
+
+        async def scenario():
+            task = asyncio.create_task(_chat.run_turn("go", model))
+            while _chat._running_job_id is None:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+
+        assert chat_host.interrupts == []  # nothing reached into the kernel
+        last = _chat.history()[-1]
+        assert last["cancelled"] is True
+        assert "job-1" in last["content"]
 
 
 @pytest.mark.parametrize("text", ["", "   "])
