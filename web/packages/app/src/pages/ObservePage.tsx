@@ -6,7 +6,9 @@ import {
   useState,
 } from "react";
 import { useParams } from "react-router-dom";
-import { consoleEnabled } from "../auth";
+import { localRootsProxied } from "../auth";
+import ChatPane from "../components/ChatPane";
+import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
 import { sessionFetch } from "../utils/sessionFetch";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
@@ -73,8 +75,14 @@ export default function ObservePage() {
   // loopback-bound) and this session child serves it (observe.console_enabled).
   // Either half false means every submit would 404, so render no editor at all.
   const [childConsole, setChildConsole] = useState(false);
-  const [controlConsole, setControlConsole] = useState(false);
-  const showConsole = childConsole && controlConsole;
+  // The control's half of the answer for both local roots: whether it is
+  // loopback-bound, and so whether it will proxy /console/* and /chat/* at all.
+  const [controlLocal, setControlLocal] = useState(false);
+  // Null until probed, and null again means unreachable rather than off — the
+  // same distinction `console_enabled` draws below, and for the same reason.
+  const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
+  const showConsole = childConsole && controlLocal;
+  const showChat = !!chatStatus?.enabled && controlLocal;
 
   const lastNewest = useRef<string | null>(null);
   // Latest expanded set + details for the poll closure (which fetches details for
@@ -155,17 +163,28 @@ export default function ObservePage() {
     }
   }, [base]);
 
-  // The control's half of the console answer. Fixed for the life of the page
-  // (it follows the control's bind), so probe once rather than on every poll.
+  // Both halves of the local-root answer are config, fixed for the life of the
+  // page — the control's follows its bind, the child's follows its config
+  // file — so probe once rather than on every poll.
   useEffect(() => {
     let live = true;
-    consoleEnabled().then((on) => {
-      if (live) setControlConsole(on);
+    localRootsProxied().then((on) => {
+      if (live) setControlLocal(on);
     });
     return () => {
       live = false;
     };
   }, []);
+
+  useEffect(() => {
+    let live = true;
+    fetchChatStatus(base).then((s) => {
+      if (live && s) setChatStatus(s);
+    });
+    return () => {
+      live = false;
+    };
+  }, [base]);
 
   useEffect(() => {
     poll();
@@ -329,25 +348,32 @@ export default function ObservePage() {
           Restart kernel
         </button>
       </header>
-      <main>
-        {showConsole ? <ConsolePanel running={running} onRun={runCell} /> : null}
-        <div id="jobs">
-          {jobs == null ? (
-            <div className="empty">loading…</div>
-          ) : jobs.length === 0 ? (
-            <div className="empty">no jobs yet</div>
-          ) : (
-            // newest-first
-            [...jobs].reverse().map((j) => (
-              <JobRow
-                key={j.job_id}
-                job={j}
-                open={expanded.has(j.job_id)}
-                detail={details[j.job_id]}
-                onToggle={() => toggle(j.job_id)}
-              />
-            ))
-          )}
+      <main className={showChat ? "with-chat" : ""}>
+        {showChat && chatStatus ? (
+          <ChatPane base={base} status={chatStatus} pollMs={pollMs} />
+        ) : null}
+        <div className="work">
+          {showConsole ? (
+            <ConsolePanel running={running} onRun={runCell} />
+          ) : null}
+          <div id="jobs">
+            {jobs == null ? (
+              <div className="empty">loading…</div>
+            ) : jobs.length === 0 ? (
+              <div className="empty">no jobs yet</div>
+            ) : (
+              // newest-first
+              [...jobs].reverse().map((j) => (
+                <JobRow
+                  key={j.job_id}
+                  job={j}
+                  open={expanded.has(j.job_id)}
+                  detail={details[j.job_id]}
+                  onToggle={() => toggle(j.job_id)}
+                />
+              ))
+            )}
+          </div>
         </div>
       </main>
       <style>{OBS_CSS}</style>
@@ -517,6 +543,17 @@ const OBS_CSS = `
                    font-weight: 600; margin-right: 6px; }
   .obs-page button.primary:hover { background: #25804b; }
   .obs-page main { padding: 12px 16px; }
+  /* The thread beside the jobs it drives: a chat cell shows up in that list,
+     and its live stdout is what stands in for the thread's missing stream. */
+  .obs-page main.with-chat { display: flex; gap: 12px; align-items: flex-start; }
+  .obs-page main.with-chat .chat { flex: 0 0 clamp(340px, 34%, 520px);
+             position: sticky; top: 58px; height: calc(100vh - 82px); }
+  .obs-page main.with-chat .work { flex: 1; min-width: 0; }
+  @media (max-width: 900px) {
+    .obs-page main.with-chat { display: block; }
+    .obs-page main.with-chat .chat { position: static; height: 60vh;
+               margin-bottom: 12px; }
+  }
   .obs-page .job { border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; overflow: hidden; }
   .obs-page .row { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }
   .obs-page .row:hover { background: #1a1a1a; }
