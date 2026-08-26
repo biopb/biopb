@@ -177,8 +177,8 @@ def _session_proxy_roots(console_enabled: bool) -> frozenset[str]:
     loopback-bound**: it is computed from the bind, not from any feature switch,
     and it gates every execute-capable root together. Whether a given one is
     actually served is the child's own decision (``observe.console_enabled``,
-    ``chat.enabled``), which is the half this control does not and should not
-    know.
+    ``observe.chat_enabled``), which is the half this control does not and
+    should not know.
     """
     if console_enabled:
         return _SESSION_ALLOWED_ROOTS | {_SESSION_CONSOLE_ROOT, _SESSION_CHAT_ROOT}

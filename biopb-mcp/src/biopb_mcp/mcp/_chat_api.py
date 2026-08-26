@@ -48,10 +48,15 @@ _turn_task = None
 
 
 def configure(config):
-    """Take the resolved config; return whether chat should be served."""
+    """Take the resolved config; return whether chat should be served.
+
+    The switch is ``observe.chat_enabled``, beside the console's, because what it
+    turns on is a pane on the observe page — and it is read together with
+    ``observe.enabled`` because that page is how anyone reaches these routes.
+    """
     global _config, _enabled
     _config = config
-    _enabled = bool(config.chat.enabled)
+    _enabled = bool(config.observe.enabled and config.observe.chat_enabled)
     return _enabled
 
 

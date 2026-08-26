@@ -189,11 +189,11 @@ def _setup_observe(config):
 def _setup_chat(config):
     """Wire up the built-in chat client.
 
-    Off by default (``chat.enabled``): it spends the user's own provider
-    credits, so an install must not turn it on for them. Guarded like observe —
-    a chat failure logs and is swallowed rather than blocking the MCP server,
-    which is the surface an already-working harness depends on. Returns True if
-    mounted.
+    Off by default (``observe.chat_enabled``, beside the console's switch): it
+    spends the user's own provider credits, so an install must not turn it on
+    for them. Guarded like observe — a chat failure logs and is swallowed rather
+    than blocking the MCP server, which is the surface an already-working
+    harness depends on. Returns True if mounted.
     """
     try:
         from . import _chat_api

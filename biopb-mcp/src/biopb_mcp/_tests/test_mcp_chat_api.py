@@ -24,7 +24,7 @@ def configured(tmp_path, monkeypatch):
     monkeypatch.delenv("BIOPB_CHAT_API_KEY", raising=False)
     write_credential("sk-x", _model.KEY_NAME)
     cfg = McpConfig()
-    cfg.chat.enabled = True
+    cfg.observe.chat_enabled = True
     cfg.chat.model = "test-model"
     _chat_api.configure(cfg)
     _chat.reset()
@@ -155,5 +155,15 @@ def test_routes_are_not_mounted_when_chat_is_off():
     # same shape the console's gate takes: "is there a way to submit here?" has
     # one answer rather than a status code to interpret.
     cfg = McpConfig()
-    assert cfg.chat.enabled is False
+    assert cfg.observe.chat_enabled is False
+    assert _chat_api.configure(cfg) is False
+
+
+def test_chat_follows_the_page_it_lives_on():
+    # The pane is on the observe page, so chat routes without that page have
+    # nothing that can reach them. Enforced rather than documented: the two
+    # flags cannot be set to a combination that serves an unreachable surface.
+    cfg = McpConfig()
+    cfg.observe.chat_enabled = True
+    cfg.observe.enabled = False
     assert _chat_api.configure(cfg) is False

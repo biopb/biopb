@@ -19,7 +19,7 @@ from biopb_mcp.mcp import _model
 @pytest.fixture
 def config():
     cfg = McpConfig()
-    cfg.chat.enabled = True
+    cfg.observe.chat_enabled = True
     cfg.chat.model = "test-model"
     return cfg
 
@@ -63,11 +63,9 @@ class TestKeyProvenance:
 
 class TestReadiness:
     def test_each_missing_piece_says_which(self, config, state_home):
-        config.chat.enabled = False
-        with pytest.raises(_model.ChatNotConfigured, match="chat is off|chat.enabled"):
-            _model.check_ready(config)
-
-        config.chat.enabled = True
+        # Only the provider halves: whether chat is offered at all is
+        # observe.chat_enabled, and it decides whether these routes exist, so
+        # nothing that reaches check_ready can be switched off.
         config.chat.model = ""
         with pytest.raises(_model.ChatNotConfigured, match="model"):
             _model.check_ready(config)
@@ -87,7 +85,7 @@ class TestReadiness:
         # A default would bill the user for a model they never chose, and would
         # silently be the wrong one for whatever gateway they pointed at.
         assert McpConfig().chat.model == ""
-        assert McpConfig().chat.enabled is False
+        assert McpConfig().observe.chat_enabled is False
 
 
 class _FakeClient:

@@ -53,17 +53,16 @@ def api_key(config):
 
 
 def check_ready(config):
-    """Raise :class:`ChatNotConfigured` unless chat can actually run.
+    """Raise :class:`ChatNotConfigured` unless the provider can be reached.
 
     Called before a turn is accepted rather than at the first model call, so a
     misconfigured install says so instead of taking the user's message, running
     tools against their kernel, and only then failing at the provider.
+
+    Whether chat is *offered* is not asked here: that is ``observe.chat_enabled``
+    and it decides whether these routes exist at all, so anything that gets this
+    far is on by construction.
     """
-    if not config.chat.enabled:
-        raise ChatNotConfigured(
-            "The built-in chat is off. Set chat.enabled in mcp-config.json "
-            "(or from the /mcp/admin page)."
-        )
     if not config.chat.model:
         raise ChatNotConfigured(
             "No chat model is configured. Set chat.model in mcp-config.json — "

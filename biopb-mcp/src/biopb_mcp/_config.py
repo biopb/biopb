@@ -436,26 +436,35 @@ class ObserveConfig:
         "narrow the surface -- the control refuses to proxy the console at all "
         "unless it is loopback-bound, whatever this says.",
     )
+    chat_enabled: bool = _h(
+        False,
+        "Offer the built-in chat client: a pane on the observe page that drives "
+        "this session's kernel through a model. Lives here beside the console "
+        "because it is the same kind of thing -- an execute-capable surface on "
+        "this page -- and because it needs the page: chat routes served without "
+        "one have nothing to reach them. Off by default because it spends the "
+        "user's own provider credits; the model and endpoint are in `chat`. "
+        "Like the console, this can only narrow the surface.",
+    )
 
 
 @dataclass
 class ChatConfig:
-    """The built-in chat client: a session agent for users without an MCP harness.
+    """Provider settings for the built-in chat client.
 
-    The provider key is deliberately **not** here. This file is served whole by
-    the control's ``GET /api/mcp_config`` so the admin page can edit it, and a
+    The on/off switch is **not** here: it is ``observe.chat_enabled``, beside the
+    console's, because what it turns on is a pane on the observe page. This
+    section is only *which* endpoint and model that pane talks to, so there is
+    one place to enable a surface and one place to point it somewhere.
+
+    The provider key is deliberately not here either. This file is served whole
+    by the control's ``GET /api/mcp_config`` so the admin page can edit it, and a
     key in it would be rendered in a browser; it lives in an owner-only
     credential file instead (``biopb._credentials``, name ``chat-provider.token``)
     for the same reasons that module was written. What is here is configuration
     a person may reasonably want to change and no one needs to keep secret.
     """
 
-    enabled: bool = _h(
-        False,
-        "Offer the built-in chat client. Off by default: it needs a provider key "
-        "and spends the user's own credits, so it is opt-in rather than something "
-        "an install turns on for them.",
-    )
     model: str = _h(
         "",
         "Model id to send, e.g. 'gpt-4o' or 'deepseek-v4'. Empty means chat is "
