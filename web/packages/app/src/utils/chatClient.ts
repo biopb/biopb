@@ -9,7 +9,14 @@
 // control always proxies, and the writes are `/chat/*`, which it proxies only
 // when it is loopback-bound. A write therefore 404s on a control that will not
 // serve it, which is why the pane gates on `localRootsProxied()` as well.
+//
+// Everything goes through `sessionFetch`: both roots are behind the control's
+// auth gate, and a token is optional rather than absent on a loopback control
+// (biopb#468). Calling bare is what left the observe page inert under `--token`
+// for as long as it did (biopb#730), and it failed silently there because a 401
+// body parses as JSON -- which is exactly how these readers would fail too.
 
+import { sessionFetch } from "./sessionFetch";
 import type { ChatMessage } from "./chatThread";
 
 export interface ChatStatus {
@@ -34,7 +41,7 @@ export interface HistoryPage {
  */
 export async function fetchChatStatus(base: string): Promise<ChatStatus | null> {
   try {
-    const r = await fetch(base + "/api/chat/status");
+    const r = await sessionFetch(base + "/api/chat/status");
     if (!r.ok) return null;
     const j = await r.json();
     return {
@@ -56,7 +63,7 @@ export async function fetchHistory(
 ): Promise<HistoryPage | null> {
   const q = after ? "?after=" + encodeURIComponent(after) : "";
   try {
-    const r = await fetch(base + "/api/chat/history" + q);
+    const r = await sessionFetch(base + "/api/chat/history" + q);
     if (!r.ok) return null;
     const j = await r.json();
     return {
@@ -78,10 +85,11 @@ export async function sendTurn(
 ): Promise<string | null> {
   let r: Response;
   try {
-    r = await fetch(base + "/chat/turn", {
+    r = await sessionFetch(base + "/chat/turn", {
       method: "POST",
       // Required by the child on this root: a JSON content-type is one a
       // cross-site form POST cannot set, and this route reaches a kernel.
+      // `sessionFetch` adds the bearer token alongside it.
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
@@ -98,7 +106,7 @@ export async function sendTurn(
  * and what actually happened arrives in the thread on the next poll. */
 export async function cancelTurn(base: string): Promise<void> {
   try {
-    await fetch(base + "/chat/cancel", {
+    await sessionFetch(base + "/chat/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
