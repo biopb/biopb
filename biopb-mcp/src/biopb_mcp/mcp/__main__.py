@@ -186,7 +186,19 @@ def _setup_observe(config):
         return False
 
 
-def _setup_chat(config):
+def _is_agentless_viewer(view, shim_owned):
+    """Whether this session is a viewer a human opened, not a harness's child.
+
+    Two things follow from it and must not drift apart: such a session publishes
+    *itself* to the registry (nothing else owns its reap), and it is the only
+    kind that gets the built-in chat loop. A shim-owned child is serving an MCP
+    client; a direct ``--transport http`` launch is neither, and publishes no
+    session at all, so it has no observe page for a pane to live on.
+    """
+    return bool(view and not shim_owned)
+
+
+def _setup_chat(config, agentless):
     """Wire up the built-in chat client.
 
     Off by default (``observe.chat_enabled``, beside the console's switch): it
@@ -194,11 +206,14 @@ def _setup_chat(config):
     for them. Guarded like observe — a chat failure logs and is swallowed rather
     than blocking the MCP server, which is the surface an already-working
     harness depends on. Returns True if mounted.
+
+    *agentless* says whether this session is a `biopb mcp view` viewer rather
+    than a child some MCP client is driving; chat is served only on the former.
     """
     try:
         from . import _chat_api
 
-        if not _chat_api.configure(config):
+        if not _chat_api.configure(config, agentless=agentless):
             return False
         _chat_api.register_http_routes()
         return True
@@ -512,7 +527,9 @@ def _serve_http(config, port, view=False):
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built.
     _setup_observe(config)
-    _setup_chat(config)
+    # A shim-owned child is serving an MCP client, which is the one situation the
+    # built-in loop is not for.
+    _setup_chat(config, agentless=_is_agentless_viewer(view, shim_owned))
 
     if view:
         # Agentless viewer: bring the window up now (the human wants it
@@ -531,7 +548,7 @@ def _serve_http(config, port, view=False):
     # operator already knows. Done last, with the kernel up and the serve loop
     # the next statement, so a record implies a session that is all but
     # answering.
-    if view and not shim_owned:
+    if _is_agentless_viewer(view, shim_owned):
         session_id = _register_view_session(port)
 
     _server.run(

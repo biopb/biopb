@@ -58,16 +58,31 @@ _live_text = ""
 _live_len = 0
 
 
-def configure(config):
+def configure(config, *, agentless):
     """Take the resolved config; return whether chat should be served.
 
     The switch is ``observe.chat_enabled``, beside the console's, because what it
     turns on is a pane on the observe page — and it is read together with
     ``observe.enabled`` because that page is how anyone reaches these routes.
+
+    *agentless* is the third term, and the one that is not configuration: this
+    loop exists for users **without** an MCP harness, so a session an agent is
+    already driving does not get one. Offering it there would be technically
+    sound and practically confusing -- two agents on one kernel, of which only
+    one can hold the claim, so the pane would answer questions and then refuse
+    to run anything. The console has the same shape and is offered anyway,
+    because a human typing a cell is not a second agent; a chat loop is.
+
+    Required rather than defaulted, because both answers are wrong to assume: a
+    default of True serves chat to every harness-driven session, and a default
+    of False silently withholds it from the viewer it was built for. The two
+    call sites both know.
     """
     global _config, _enabled
     _config = config
-    _enabled = bool(config.observe.enabled and config.observe.chat_enabled)
+    _enabled = bool(
+        config.observe.enabled and config.observe.chat_enabled and agentless
+    )
     return _enabled
 
 
