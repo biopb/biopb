@@ -15,10 +15,24 @@ import { withBase } from "../base";
 // control front serves this SPA shell at /session/<id>/observe and proxies
 // /session/<id>/api/* to the child. The API base is therefore the session prefix.
 
+/** What to call the writer of a cell, in prose the reader is part of.
+ *
+ * Every site that needed this used to test `=== "user"` and call the other
+ * branch "agent", which was fine while there were two writers and mislabelled
+ * a chat cell the moment there were three. One mapping, so a fourth writer
+ * shows its own name rather than someone else's.
+ */
+function writerName(origin?: string): string {
+  if (origin === "user") return "you";
+  if (origin === "chat") return "chat";
+  if (origin === "mcp") return "the MCP client";
+  return origin || "another writer";
+}
+
 interface JobSummary {
   job_id: string;
   status: string; // running | ok | error | interrupted
-  origin?: string; // agent | user | chat — who submitted the cell
+  origin?: string; // mcp | user | chat — which surface submitted the cell
   elapsed: number;
   code_preview?: string;
 }
@@ -265,7 +279,7 @@ export default function ObservePage() {
         const who =
           d.running_job_origin === "user"
             ? "you already have"
-            : "the agent already has";
+            : `${writerName(d.running_job_origin)} already has`;
         return `${who} a cell running (${d.running_job_id}). Wait for it, or Interrupt.`;
       }
       if (!r.ok) return String(d.error || `submit failed (${r.status})`);
@@ -364,7 +378,7 @@ function ConsolePanel({
   }, [code, busy, submitting, onRun]);
 
   const label = busy
-    ? `kernel busy · ${running!.job_id} (${running!.origin === "user" ? "you" : "agent"})`
+    ? `kernel busy · ${running!.job_id} (${writerName(running!.origin)})`
     : submitting
       ? "running…"
       : "▶ Run  (Ctrl+Enter)";
@@ -445,13 +459,11 @@ function JobRow({
     <div className={"job" + (open ? " open" : "")}>
       <div className="row" onClick={onToggle}>
         <span className="jid">{job.job_id}</span>
-        {/* Provenance is worth showing for anything that is not the MCP agent:
-            "agent" is the norm here and a badge on every row would be noise,
-            but a cell run by anyone else must not read as the agent's. */}
-        {job.origin && job.origin !== "agent" ? (
-          <span className="badge you">
-            {job.origin === "user" ? "you" : job.origin}
-          </span>
+        {/* Provenance is worth showing for anything that is not the MCP
+            client: "mcp" is the norm here and a badge on every row would be
+            noise, but a cell run by anyone else must not read as its. */}
+        {job.origin && job.origin !== "mcp" ? (
+          <span className="badge you">{writerName(job.origin)}</span>
         ) : null}
         <span className={"badge " + job.status}>{job.status}</span>
         <span className="preview">{job.code_preview || ""}</span>

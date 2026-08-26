@@ -379,13 +379,13 @@ def test_console_reports_a_collision_as_409_with_whose_job(client, host):
     # One job at a time, no preemption and no queue -- so a collision is an
     # expected outcome, and the page needs to know *whose* job it lost to.
     host.execute.return_value = _reply(
-        {"error": "busy", "running_job_id": "job-3", "running_job_origin": "agent"}
+        {"error": "busy", "running_job_id": "job-3", "running_job_origin": "mcp"}
     )
     r = client.post("/console/execute", json={"code": "1"})
     assert r.status_code == 409
     body = r.json()
     assert body["running_job_id"] == "job-3"
-    assert body["running_job_origin"] == "agent"
+    assert body["running_job_origin"] == "mcp"
 
 
 def test_console_kernel_lock_busy_is_a_retryable_503(client, host):

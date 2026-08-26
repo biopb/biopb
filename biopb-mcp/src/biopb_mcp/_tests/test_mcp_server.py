@@ -746,7 +746,7 @@ class TestUserActivityNote:
         _install_replies(
             server_with_host,
             returns=_job_reply(
-                error="busy", running_job_id="job-3", running_job_origin="agent"
+                error="busy", running_job_id="job-3", running_job_origin="mcp"
             ),
         )
         result = _server.execute_code("x = 1")
@@ -819,7 +819,7 @@ class TestInterruptRestart:
             for c in server_with_host.execute.call_args_list
             if "interrupt_current(" in c[0][0]
         ]
-        assert "requester='agent'" in snippet
+        assert "requester='mcp'" in snippet
 
     def test_interrupt_refused_when_another_client_holds_the_kernel(
         self, server_with_host
