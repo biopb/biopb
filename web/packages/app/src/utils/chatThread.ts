@@ -238,17 +238,20 @@ function lastToolCall(items: ThreadItem[], name?: string): ToolCallItem | null {
  * three minutes is the stalled cursor that was being avoided. The finished
  * result replaces this on the next poll, arriving as the tool's own message.
  *
- * Only `execute_code` submits a cell, and the kernel runs one at a time, so
- * there is at most one call this can belong to. Anything else in progress is a
- * call that does not print.
+ * **The first matching call, not the last.** A round's calls are dispatched
+ * one at a time and each result is appended only when its own dispatch returns,
+ * so while the first cell runs neither it nor the calls behind it have an
+ * answer yet -- and an unanswered call reads as `in_progress`. With two
+ * parallel `execute_code` calls that makes both of them in progress, while the
+ * kernel is running only the earlier one. Scanning from the end would put a
+ * cell's output on the call that has not started.
  */
 export function applyLiveOutput(
   items: ThreadItem[],
   live: LiveOutput | null,
 ): ThreadItem[] {
   if (!live || !live.stdout) return items;
-  for (let i = items.length - 1; i >= 0; i--) {
-    const item = items[i]!;
+  for (const item of items) {
     if (item.kind !== "tool_call") continue;
     if (item.status !== "in_progress" || item.title !== "execute_code") continue;
     // Replaces the text rather than adding to it: this is the whole buffer on

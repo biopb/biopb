@@ -330,6 +330,49 @@ describe("applyLiveOutput", () => {
     expect(toolText(calls(items)[0]!)).toBe("a\nb\n");
   });
 
+  it("gives the output to the running cell, not the one queued behind it", () => {
+    // A round's calls are dispatched one at a time and each result is appended
+    // only when its own dispatch returns, so while the first cell runs neither
+    // call has an answer and both read as in_progress. The kernel is running
+    // the earlier one. Taking the last match would put a cell's output on a
+    // call that has not started, and the output would jump rows when the first
+    // finished.
+    const items = fromChatHistory(
+      [
+        assistant("m-1", "", [
+          { id: "c1", name: "execute_code" },
+          { id: "c2", name: "execute_code" },
+        ]),
+      ],
+      true,
+    );
+    applyLiveOutput(items, live("from the first cell\n"));
+    const [first, second] = calls(items);
+    expect(toolText(first!)).toBe("from the first cell\n");
+    expect(first!.live).toBe(true);
+    expect(toolText(second!)).toBe("");
+    expect(second!.live).toBeUndefined();
+  });
+
+  it("moves on to the next cell once the first has answered", () => {
+    // The second call is running now, and its predecessor's output is its own
+    // result rather than something still streaming.
+    const items = fromChatHistory(
+      [
+        assistant("m-1", "", [
+          { id: "c1", name: "execute_code" },
+          { id: "c2", name: "execute_code" },
+        ]),
+        toolResult("m-2", "c1", "execute_code", "first done"),
+      ],
+      true,
+    );
+    applyLiveOutput(items, live("from the second cell\n"));
+    const [first, second] = calls(items);
+    expect(toolText(first!)).toBe("first done");
+    expect(toolText(second!)).toBe("from the second cell\n");
+  });
+
   it("leaves a finished call alone", () => {
     // Once the cell ends, its output is the tool's own result. Attaching the
     // stale buffer too would show it twice, and mark a result as still running.
