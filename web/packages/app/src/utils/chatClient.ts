@@ -17,7 +17,7 @@
 // body parses as JSON -- which is exactly how these readers would fail too.
 
 import { sessionFetch } from "./sessionFetch";
-import type { ChatMessage } from "./chatThread";
+import type { ChatMessage, LiveOutput } from "./chatThread";
 
 export interface ChatStatus {
   enabled: boolean;
@@ -30,6 +30,8 @@ export interface ChatStatus {
 export interface HistoryPage {
   messages: ChatMessage[];
   busy: boolean;
+  /** The cell being polled right now, and what it has printed. */
+  live: LiveOutput | null;
 }
 
 /**
@@ -69,10 +71,23 @@ export async function fetchHistory(
     return {
       messages: Array.isArray(j.messages) ? j.messages : [],
       busy: !!j.busy,
+      live: readLive(j.partial),
     };
   } catch {
     return null;
   }
+}
+
+/** `partial` off the history read, or null when no cell is running.
+ *
+ * The child sends `null` between cells and omits nothing, but this is parsed
+ * defensively like the rest: a degraded payload must read as "nothing running"
+ * rather than throw inside a poll the pane depends on. */
+function readLive(raw: unknown): LiveOutput | null {
+  if (!raw || typeof raw !== "object") return null;
+  const p = raw as Record<string, unknown>;
+  if (typeof p.job_id !== "string" || typeof p.stdout !== "string") return null;
+  return { jobId: p.job_id, stdout: p.stdout, truncated: !!p.truncated };
 }
 
 /** Start a turn. Returns an error to show, or null when it was accepted.

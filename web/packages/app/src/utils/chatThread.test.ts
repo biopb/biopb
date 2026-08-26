@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyLiveOutput,
   fromChatHistory,
   groupThread,
+  latestLine,
   mergeHistory,
   toolText,
   type ChatMessage,
@@ -295,5 +297,86 @@ describe("groupThread", () => {
       fromChatHistory([user("m-1", "hi"), assistant("m-2", "hello")]),
     );
     expect(groups.map((g) => g.kind)).toEqual(["message", "message"]);
+  });
+});
+
+
+describe("applyLiveOutput", () => {
+  const running = (busy = true) =>
+    fromChatHistory(
+      [assistant("m-1", "", [{ id: "c1", name: "execute_code" }])],
+      busy,
+    );
+
+  const live = (stdout: string) => ({
+    jobId: "job-1",
+    stdout,
+    truncated: false,
+  });
+
+  it("shows a running cell's output on the call that is running it", () => {
+    // The reason the promote window was dropped at all: a long cell has to say
+    // something while it runs, or the turn is the stalled cursor it replaced.
+    const items = applyLiveOutput(running(), live("step 1\n"));
+    expect(toolText(calls(items)[0]!)).toBe("step 1\n");
+    expect(calls(items)[0]!.live).toBe(true);
+  });
+
+  it("replaces rather than accumulates", () => {
+    // `partial` is the whole buffer on every poll, not a delta. Appending would
+    // repeat the output once per poll -- twice a second.
+    let items = applyLiveOutput(running(), live("a\n"));
+    items = applyLiveOutput(items, live("a\nb\n"));
+    expect(toolText(calls(items)[0]!)).toBe("a\nb\n");
+  });
+
+  it("leaves a finished call alone", () => {
+    // Once the cell ends, its output is the tool's own result. Attaching the
+    // stale buffer too would show it twice, and mark a result as still running.
+    const items = fromChatHistory([
+      assistant("m-1", "", [{ id: "c1", name: "execute_code" }]),
+      toolResult("m-2", "c1", "execute_code", "final"),
+    ]);
+    applyLiveOutput(items, live("partial"));
+    expect(toolText(calls(items)[0]!)).toBe("final");
+    expect(calls(items)[0]!.live).toBeUndefined();
+  });
+
+  it("ignores a call that cannot be running a cell", () => {
+    // Only execute_code submits one; anything else in progress does not print.
+    const items = fromChatHistory(
+      [assistant("m-1", "", [{ id: "c1", name: "find_skills" }])],
+      true,
+    );
+    applyLiveOutput(items, live("noise"));
+    expect(toolText(calls(items)[0]!)).toBe("");
+  });
+
+  it("does nothing when no cell is running", () => {
+    const items = applyLiveOutput(running(), null);
+    expect(toolText(calls(items)[0]!)).toBe("");
+    expect(calls(items)[0]!.live).toBeUndefined();
+  });
+
+  it("does not mark an empty buffer as live output", () => {
+    // A cell that has printed nothing yet should read as running, not as a
+    // tool that answered with silence.
+    const items = applyLiveOutput(running(), live(""));
+    expect(calls(items)[0]!.live).toBeUndefined();
+  });
+});
+
+describe("latestLine", () => {
+  it("takes the newest line", () => {
+    expect(latestLine("a\nb\nc\n")).toBe("c");
+  });
+
+  it("looks past the blank line a print leaves", () => {
+    expect(latestLine("working\n\n\n")).toBe("working");
+  });
+
+  it("has nothing to say about no output", () => {
+    expect(latestLine("")).toBe("");
+    expect(latestLine("\n\n")).toBe("");
   });
 });
