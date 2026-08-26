@@ -10,6 +10,10 @@ import { localRootsProxied } from "../auth";
 import ChatPane from "../components/ChatPane";
 import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
 import { sessionFetch } from "../utils/sessionFetch";
+import {
+  clampChatWidth,
+  defaultChatWidth,
+} from "../utils/chatPaneWidth";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 
@@ -31,6 +35,8 @@ function writerName(origin?: string): string {
   if (origin === "mcp") return "the MCP client";
   return origin || "another writer";
 }
+
+const CHAT_WIDTH_KEY = "biopb.observe.chatWidth";
 
 interface JobSummary {
   job_id: string;
@@ -83,6 +89,42 @@ export default function ObservePage() {
   const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
   const showConsole = childConsole && controlLocal;
   const showChat = !!chatStatus?.enabled && controlLocal;
+
+  // The chat/work split, in pixels, remembered per browser. A preference, not
+  // state anyone else needs, so localStorage rather than the server -- and every
+  // access is guarded because a private window or blocked site data throws on
+  // the accessor itself rather than returning null.
+  const [chatWidth, setChatWidth] = useState<number | null>(() => {
+    try {
+      const stored = localStorage.getItem(CHAT_WIDTH_KEY);
+      return stored === null
+        ? null
+        : clampChatWidth(Number(stored), window.innerWidth) || null;
+    } catch {
+      return null;
+    }
+  });
+  const mainRef = useRef<HTMLElement | null>(null);
+  const dragging = useRef(false);
+
+  useEffect(() => {
+    if (chatWidth === null) return; // nothing chosen yet; leave the default alone
+    try {
+      localStorage.setItem(CHAT_WIDTH_KEY, String(chatWidth));
+    } catch {
+      /* a preference that cannot be saved is still a working session */
+    }
+  }, [chatWidth]);
+
+  const resizeTo = useCallback((clientX: number) => {
+    const main = mainRef.current;
+    if (!main) return;
+    const width = clampChatWidth(
+      clientX - main.getBoundingClientRect().left,
+      window.innerWidth,
+    );
+    if (width) setChatWidth(width);
+  }, []);
 
   const lastNewest = useRef<string | null>(null);
   // Latest expanded set + details for the poll closure (which fetches details for
@@ -348,9 +390,48 @@ export default function ObservePage() {
           Restart kernel
         </button>
       </header>
-      <main className={showChat ? "with-chat" : ""}>
+      <main
+        ref={mainRef}
+        className={showChat ? "with-chat" : ""}
+        style={
+          chatWidth === null
+            ? undefined
+            : ({ ["--chat-w" as string]: `${chatWidth}px` } as React.CSSProperties)
+        }
+      >
         {showChat && chatStatus ? (
           <ChatPane base={base} status={chatStatus} pollMs={pollMs} />
+        ) : null}
+        {showChat && chatStatus ? (
+          // Pointer events rather than mouse: capture keeps the drag alive when
+          // the cursor outruns the handle, which it will on a fast drag.
+          <div
+            className="splitter"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize the chat pane"
+            tabIndex={0}
+            onPointerDown={(e) => {
+              e.currentTarget.setPointerCapture(e.pointerId);
+              dragging.current = true;
+            }}
+            onPointerMove={(e) => {
+              if (dragging.current) resizeTo(e.clientX);
+            }}
+            onPointerUp={(e) => {
+              dragging.current = false;
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            }}
+            onKeyDown={(e) => {
+              // Usable without a pointer, and the only way to nudge it exactly.
+              const step = e.key === "ArrowLeft" ? -16 : e.key === "ArrowRight" ? 16 : 0;
+              if (!step) return;
+              e.preventDefault();
+              const current = chatWidth ?? defaultChatWidth(window.innerWidth);
+              const width = clampChatWidth(current + step, window.innerWidth);
+              if (width) setChatWidth(width);
+            }}
+          />
         ) : null}
         <div className="work">
           {showConsole ? (
@@ -410,17 +491,32 @@ function ConsolePanel({
     ? `kernel busy · ${running!.job_id} (${writerName(running!.origin)})`
     : submitting
       ? "running…"
-      : "▶ Run  (Ctrl+Enter)";
+      : "▶ Run";
 
   return (
     <div className="console">
-      <div className="label">your cell — runs in this session&apos;s kernel</div>
+      {/* The Run button rides the label row rather than a bar of its own: that
+          bar cost a whole line of a column that is now a fixed height, and the
+          line it cost came off the job list. The error sits between them, where
+          there was nothing but empty space. */}
+      <div className="console-head">
+        <span className="label">your cell — runs in this session&apos;s kernel</span>
+        <span className="console-err">{error || ""}</span>
+        <button
+          className="primary"
+          disabled={busy || submitting || !code.trim()}
+          onClick={submit}
+        >
+          {label}
+        </button>
+      </div>
       <textarea
         className="console-input"
         value={code}
         spellCheck={false}
         placeholder="viewer.layers"
         onChange={(e) => setCode(e.target.value)}
+        title="Ctrl+Enter to run"
         onKeyDown={(e) => {
           // Ctrl/Cmd+Enter submits; plain Enter stays a newline (this is code).
           if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -429,16 +525,6 @@ function ConsolePanel({
           }
         }}
       />
-      <div className="console-bar">
-        <button
-          className="primary"
-          disabled={busy || submitting || !code.trim()}
-          onClick={submit}
-        >
-          {label}
-        </button>
-        {error ? <span className="console-err">{error}</span> : null}
-      </div>
     </div>
   );
 }
@@ -545,14 +631,37 @@ const OBS_CSS = `
   .obs-page main { padding: 12px 16px; }
   /* The thread beside the jobs it drives: a chat cell shows up in that list,
      and its live stdout is what stands in for the thread's missing stream. */
-  .obs-page main.with-chat { display: flex; gap: 12px; align-items: flex-start; }
-  .obs-page main.with-chat .chat { flex: 0 0 clamp(340px, 34%, 520px);
-             position: sticky; top: 58px; height: calc(100vh - 82px); }
-  .obs-page main.with-chat .work { flex: 1; min-width: 0; }
+  /* Both columns are their own scroll region, the height of the viewport, so
+     the page itself never scrolls: the console stays put while the job list
+     moves under it, and the composer stays put while the thread moves. A
+     single page scroll took the console off screen exactly when a running job
+     made the list long -- which is when you want to type the next cell. */
+  .obs-page main.with-chat { display: flex; gap: 0; align-items: flex-start;
+             height: calc(100vh - 58px); box-sizing: border-box; overflow: hidden; }
+  /* The fallback is the original rule, so an untouched pane is sized exactly as
+     it was; --chat-w exists only once the splitter has been dragged. */
+  .obs-page main.with-chat .chat { flex: 0 0 var(--chat-w, clamp(340px, 34%, 520px));
+             height: 100%; }
+  .obs-page main.with-chat .work { flex: 1; min-width: 0; height: 100%;
+             display: flex; flex-direction: column; }
+  /* The console keeps its natural height; only the job list scrolls. */
+  .obs-page main.with-chat .work .console { flex: 0 0 auto; }
+  .obs-page main.with-chat #jobs { flex: 1; min-height: 0; overflow-y: auto;
+             padding-right: 2px; }
+  .obs-page .splitter { flex: 0 0 10px; align-self: stretch; cursor: col-resize;
+             background: transparent; border: none; position: relative; }
+  .obs-page .splitter::after { content: ""; position: absolute; top: 0; bottom: 0;
+             left: 4px; width: 2px; background: #2a2a2a; }
+  .obs-page .splitter:hover::after, .obs-page .splitter:focus-visible::after {
+             background: #2a5; }
+  .obs-page .splitter:focus-visible { outline: none; }
   @media (max-width: 900px) {
-    .obs-page main.with-chat { display: block; }
-    .obs-page main.with-chat .chat { position: static; height: 60vh;
-               margin-bottom: 12px; }
+    /* Stacked: one page scroll again, and nothing to drag. */
+    .obs-page main.with-chat { display: block; height: auto; overflow: visible; }
+    .obs-page main.with-chat .chat { height: 60vh; margin-bottom: 12px; }
+    .obs-page main.with-chat .work { height: auto; display: block; }
+    .obs-page main.with-chat #jobs { overflow-y: visible; }
+    .obs-page .splitter { display: none; }
   }
   .obs-page .job { border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; overflow: hidden; }
   .obs-page .row { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }
@@ -584,7 +693,11 @@ const OBS_CSS = `
              border-radius: 4px; padding: 8px;
              font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
   .obs-page .console-input:focus { outline: none; border-color: #2a5; }
-  .obs-page .console-bar { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .obs-page .console-head { display: flex; align-items: center; gap: 10px;
+             margin-bottom: 6px; }
+  .obs-page .console-head .label { margin: 0; flex: 0 0 auto; }
+  .obs-page .console-head .console-err { flex: 1; min-width: 0; text-align: right;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .obs-page .console button:disabled { opacity: .55; cursor: default; background: #222; }
   .obs-page .console-err { color: #f99; font-size: 12px; }
 `;
