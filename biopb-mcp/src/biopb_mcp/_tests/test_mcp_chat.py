@@ -482,6 +482,43 @@ class TestGuards:
         asyncio.run(_chat.run_turn("hi", model))
         assert _chat.history()[-1]["content"] == "recovered"
 
+    def test_a_raising_tool_answers_the_call_instead_of_ending_the_turn(
+        self, chat_host
+    ):
+        # A hallucinated tool name is an ordinary event and call_tool raises
+        # ToolError for it. The model gets the error as the call's result and a
+        # round to correct itself.
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("no_such_tool")]},
+            {"content": "", "tool_calls": [_call("server_status")]},
+            {"content": "recovered"},
+        )
+        asyncio.run(_chat.run_turn("hi", model))
+
+        answer = [m for m in _chat.history() if m["role"] == "tool"][0]
+        assert answer["error"] is True
+        assert "no_such_tool" in answer["content"]
+        assert _chat.history()[-1]["content"] == "recovered"
+
+    def test_a_raising_tool_still_answers_every_call_id(self, chat_host):
+        # The severe half: an escaping exception would store an assistant turn
+        # whose calls were never answered, and that run is re-sent on every
+        # later turn -- so one bad call would fail the conversation from then
+        # on, not just the turn it happened in.
+        model = _scripted(
+            {
+                "content": "",
+                "tool_calls": [_call("no_such_tool"), _call("server_status")],
+            },
+            {"content": "recovered"},
+        )
+        asyncio.run(_chat.run_turn("hi", model))
+
+        sent = model.seen[1]["messages"]
+        i = next(i for i, m in enumerate(sent) if m.get("tool_calls"))
+        answered = {m["tool_call_id"] for m in sent[i + 1 :] if m["role"] == "tool"}
+        assert answered == {c["id"] for c in sent[i]["tool_calls"]}
+
 
 @pytest.mark.parametrize("text", ["", "   "])
 def test_an_empty_turn_is_still_recorded(chat_host, text):

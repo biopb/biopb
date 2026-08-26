@@ -32,11 +32,14 @@ Design notes
 
 import asyncio
 import json
+import logging
 import time
 
 from mcp.types import ImageContent, TextContent
 
 from . import _server
+
+logger = logging.getLogger(__name__)
 
 #: This loop's client id, for the kernel's one-agent claim (``_jobs.submit``).
 #: A fixed string rather than a per-view id, because every view drives the one
@@ -434,8 +437,27 @@ async def _run_turn(user_text, model, on_progress):
                     args = json.loads(fn.get("arguments") or "{}")
                 except ValueError:
                     args = {}
-                text, images = await _dispatch(name, args, on_progress)
-                _append("tool", text, tool_call_id=call.get("id"), name=name)
+                try:
+                    text, images = await _dispatch(name, args, on_progress)
+                    failed = False
+                except Exception as exc:  # noqa: BLE001 - a raising tool is content
+                    # The hand-written paths already answer their own failures
+                    # (_read_resource, _run_code); this gives the generic one the
+                    # same manners. A tool that raises is usually the model's
+                    # mistake to correct -- a hallucinated name, an argument the
+                    # schema let through -- so it gets another round to do that,
+                    # bounded by _MAX_TOOL_ROUNDS. Letting it escape would also
+                    # store an assistant turn whose calls were never answered,
+                    # which fails at the provider on every turn after it.
+                    logger.warning("chat tool %s failed: %s", name, exc)
+                    text, images, failed = f"Error: {exc}", [], True
+                _append(
+                    "tool",
+                    text,
+                    tool_call_id=call.get("id"),
+                    name=name,
+                    **({"error": True} if failed else {}),
+                )
                 pending.extend((name, img) for img in images)
             for name, img in pending:
                 _append(
