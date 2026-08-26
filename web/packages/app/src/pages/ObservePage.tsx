@@ -344,7 +344,7 @@ export default function ObservePage() {
           d.running_job_origin === "user"
             ? "you already have"
             : `${writerName(d.running_job_origin)} already has`;
-        return `${who} a cell running (${d.running_job_id}). Wait for it, or Interrupt.`;
+        return `${who} a cell running (${d.running_job_id}). Wait for it, or interrupt it from its row above.`;
       }
       if (!r.ok) return String(d.error || `submit failed (${r.status})`);
       poll(); // show the new job immediately
@@ -353,10 +353,17 @@ export default function ObservePage() {
     [base, poll],
   );
 
+  // Offered on the running job's row rather than the header, because that is
+  // what it does: the kernel runs one cell at a time, so interrupting *it* and
+  // interrupting *that job* are the same act -- and on the row, the thing being
+  // stopped is named, with its origin and its output beside it.
+  //
+  // No "nothing was running" dialog any more. The button exists only while a
+  // row says running, so the one way to reach it idle is a job that finished
+  // between the paint and the click -- and the row turning `ok` says so better
+  // than an alert that reads as a mistake.
   const interrupt = useCallback(async () => {
-    const d = await jpost(base + "/api/kernel/interrupt");
-    if (d && d.interrupted === false && d.status === "idle")
-      alert("No running job.");
+    await jpost(base + "/api/kernel/interrupt");
     poll();
   }, [base, poll]);
 
@@ -385,7 +392,6 @@ export default function ObservePage() {
         <button className="primary" onClick={saveNotebook}>
           ⤓ Save notebook
         </button>
-        <button onClick={interrupt}>Interrupt</button>
         <button className="danger" onClick={restart}>
           Restart kernel
         </button>
@@ -451,6 +457,7 @@ export default function ObservePage() {
                   open={expanded.has(j.job_id)}
                   detail={details[j.job_id]}
                   onToggle={() => toggle(j.job_id)}
+                  onInterrupt={interrupt}
                 />
               ))
             )}
@@ -529,16 +536,18 @@ function ConsolePanel({
   );
 }
 
-function JobRow({
+export function JobRow({
   job,
   open,
   detail,
   onToggle,
+  onInterrupt,
 }: {
   job: JobSummary;
   open: boolean;
   detail: JobDetail | undefined;
   onToggle: () => void;
+  onInterrupt: () => void;
 }) {
   const outRef = useRef<HTMLPreElement | null>(null);
   // Whether the user is parked at the bottom of the output; a live job then keeps
@@ -583,6 +592,21 @@ function JobRow({
         <span className={"badge " + job.status}>{job.status}</span>
         <span className="preview">{job.code_preview || ""}</span>
         <span className="elapsed">{job.elapsed}s</span>
+        {job.status === "running" ? (
+          // The whole row toggles the detail, so this has to keep its click:
+          // reaching for Interrupt and collapsing the output you were reading
+          // is the one mistake the placement makes possible.
+          <button
+            className="job-stop"
+            title="Interrupt this cell"
+            onClick={(e) => {
+              e.stopPropagation();
+              onInterrupt();
+            }}
+          >
+            interrupt
+          </button>
+        ) : null}
       </div>
       <div className="detail">
         {open && detail ? (
@@ -676,6 +700,13 @@ const OBS_CSS = `
   .obs-page .preview { color: #8a8; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
   .obs-page .elapsed { color: #888; font-size: 12px; margin-left: auto; }
+  /* Beside the elapsed time, which margin-left:auto has already pushed to
+     the right edge -- so the row reads left to right as what ran, how long it
+     has been running, and the way to stop it. */
+  .obs-page .job-stop { font-size: 11px; padding: 1px 8px; border-radius: 10px;
+                        border: 1px solid #533; background: #2a1a1a;
+                        color: #f99; cursor: pointer; }
+  .obs-page .job-stop:hover { background: #3a2020; border-color: #744; }
   .obs-page .detail { border-top: 1px solid #333; padding: 10px 12px; display: none; }
   .obs-page .job.open .detail { display: block; }
   .obs-page .label { color: #6a8; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin: 8px 0 2px; }
