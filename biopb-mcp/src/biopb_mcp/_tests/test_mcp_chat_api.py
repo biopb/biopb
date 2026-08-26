@@ -17,6 +17,18 @@ from starlette.testclient import TestClient
 from biopb_mcp._config import McpConfig
 from biopb_mcp.mcp import _chat, _chat_api, _model, _observe
 
+# The shape the launcher actually threads: `load_config()` returns a **dict**,
+# and every consumer reads it with `get_setting`, which falls back to
+# `DEFAULT_CONFIG` per key. Tests build the same partial dicts a real
+# mcp-config.json produces -- a file with no `chat` section at all is the common
+# case, and it was an `McpConfig` instance here that hid the bug: attribute access
+# worked in every test and raised on the real dict in production.
+
+
+def chat_config(**observe):
+    """A config dict with chat on, plus any observe overrides."""
+    return {"observe": {"enabled": True, "chat_enabled": True, **observe}}
+
 
 @pytest.fixture
 def configured(tmp_path, monkeypatch):
@@ -24,9 +36,8 @@ def configured(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
     monkeypatch.delenv("BIOPB_CHAT_API_KEY", raising=False)
     write_credential("sk-x", _model.KEY_NAME)
-    cfg = McpConfig()
-    cfg.observe.chat_enabled = True
-    cfg.chat.model = "test-model"
+    cfg = chat_config()
+    cfg["chat"] = {"model": "test-model"}
     _chat_api.configure(cfg, agentless=True)
     _chat.reset()
     yield cfg
@@ -73,7 +84,7 @@ class TestStatus:
         }
 
     def test_reports_why_it_is_not_ready(self, client, configured):
-        configured.chat.model = ""
+        configured["chat"]["model"] = ""
         body = client.get("/api/chat/status").json()
         assert body["ready"] is False
         # The reason is carried so a view can render it once at the top of an
@@ -134,7 +145,7 @@ class TestTurn:
     def test_an_unconfigured_chat_refuses_before_taking_the_message(
         self, client, configured
     ):
-        configured.chat.model = ""
+        configured["chat"]["model"] = ""
         reply = client.post("/chat/turn", json={"text": "hello"})
         assert reply.status_code == 503
         assert "model" in reply.json()["error"]
@@ -270,8 +281,8 @@ def test_routes_are_not_mounted_when_chat_is_off():
     # Off drops the surface entirely rather than serving a refusing one, the
     # same shape the console's gate takes: "is there a way to submit here?" has
     # one answer rather than a status code to interpret.
-    cfg = McpConfig()
-    assert cfg.observe.chat_enabled is False
+    cfg = {}
+    assert McpConfig().observe.chat_enabled is False  # the default this relies on
     assert _chat_api.configure(cfg, agentless=True) is False
 
 
@@ -279,9 +290,7 @@ def test_chat_follows_the_page_it_lives_on():
     # The pane is on the observe page, so chat routes without that page have
     # nothing that can reach them. Enforced rather than documented: the two
     # flags cannot be set to a combination that serves an unreachable surface.
-    cfg = McpConfig()
-    cfg.observe.chat_enabled = True
-    cfg.observe.enabled = False
+    cfg = chat_config(enabled=False)
     assert _chat_api.configure(cfg, agentless=True) is False
 
 
@@ -294,9 +303,8 @@ def test_a_harness_driven_session_gets_no_chat():
     # Config alone cannot express this. Both switches are on here, and the
     # surface is still withheld, because the deciding fact is how the session
     # was launched rather than how it was configured.
-    cfg = McpConfig()
-    cfg.observe.chat_enabled = True
-    cfg.chat.model = "test-model"
+    cfg = chat_config()
+    cfg["chat"] = {"model": "test-model"}
     assert _chat_api.configure(cfg, agentless=False) is False
     assert _chat_api.configure(cfg, agentless=True) is True
 
@@ -306,7 +314,7 @@ def test_chat_cannot_be_configured_on_by_accident():
     # of the two callers, and the failure would be silent both ways -- chat on
     # every harness-driven session, or missing from the viewer it was built for.
     with pytest.raises(TypeError):
-        _chat_api.configure(McpConfig())
+        _chat_api.configure(chat_config())
 
 
 @pytest.fixture

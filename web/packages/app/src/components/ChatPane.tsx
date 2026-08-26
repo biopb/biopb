@@ -6,12 +6,15 @@ import {
   type ChatStatus,
 } from "../utils/chatClient";
 import {
+  applyLiveOutput,
   fromChatHistory,
   groupThread,
+  latestLine,
   mergeHistory,
   toolText,
   type ChatMessage,
   type ImageBlock,
+  type LiveOutput,
   type ToolCallItem,
 } from "../utils/chatThread";
 
@@ -40,6 +43,7 @@ export default function ChatPane({
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [zoom, setZoom] = useState<ImageBlock | null>(null);
+  const [live, setLive] = useState<LiveOutput | null>(null);
 
   // The cursor into the conversation. A ref, not state: it is read by the poll
   // and must never be a render's worth of steps behind it.
@@ -61,9 +65,16 @@ export default function ChatPane({
     }
     if (!page) return; // unreachable; keep what is on screen
     setBusy(page.busy);
-    if (!page.messages.length) return;
-    setMessages((prev) => mergeHistory(prev, page.messages));
-    after.current = page.messages[page.messages.length - 1]!.id;
+    setLive(page.live);
+    // No early return above this: while a cell runs the thread gains no
+    // messages at all, so a poll with an empty page is exactly the poll whose
+    // live output matters. Skipping the rest on `!messages.length` would have
+    // frozen the output for the entire cell -- so the skip is expressed as the
+    // guard it actually is, and cannot grow to cover anything else.
+    if (page.messages.length) {
+      setMessages((prev) => mergeHistory(prev, page.messages));
+      after.current = page.messages[page.messages.length - 1]!.id;
+    }
   }, [base]);
 
   // Faster while a turn runs. The page's own interval is tuned for a job list;
@@ -105,7 +116,9 @@ export default function ChatPane({
     });
   }, []);
 
-  const groups = groupThread(fromChatHistory(messages, busy));
+  const groups = groupThread(
+    applyLiveOutput(fromChatHistory(messages, busy), live),
+  );
 
   // Stick to the newest message unless the reader has scrolled up to read.
   const scroller = useRef<HTMLDivElement | null>(null);
@@ -113,7 +126,7 @@ export default function ChatPane({
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && atBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages, expanded]);
+  }, [messages, expanded, live]);
 
   return (
     <section className="chat">
@@ -259,6 +272,11 @@ function ToolGroup({
   const running = calls.some((c) => c.status === "in_progress");
   const label =
     calls.length === 1 ? "1 tool call" : `${calls.length} tool calls`;
+  // Collapsing hides tool *detail*; a running cell's newest line is progress,
+  // and withholding it restores the silence the streaming work removed. One
+  // line, only while it runs, replaced by the folded result when it finishes.
+  const streaming = calls.find((c) => c.live);
+  const tail = streaming ? latestLine(toolText(streaming)) : "";
 
   return (
     <div className={"tools" + (open ? " open" : "")}>
@@ -277,13 +295,16 @@ function ToolGroup({
             <div key={c.id} className="tool">
               <div className={"tool-name " + c.status}>
                 {c.title}
-                <span className="tool-status">{c.status}</span>
+                <span className="tool-status">
+                  {c.live ? "running — output so far" : c.status}
+                </span>
               </div>
               <pre>{toolText(c) || "(no output)"}</pre>
             </div>
           ))}
         </div>
       ) : null}
+      {!open && tail ? <div className="tools-tail">{tail}</div> : null}
       {images.length ? (
         <div className="tools-images">
           {images.map((b, i) => (
@@ -332,6 +353,9 @@ const CHAT_CSS = `
                      background: #0c0c0c; padding: 6px 8px; border-radius: 4px;
                      max-height: 32vh; overflow: auto;
                      font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  .chat .tools-tail { color: #7a8a7a; font-family: ui-monospace, Menlo, monospace;
+                      font-size: 11px; margin: 2px 0 0 15px;
+                      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .chat .tools-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .chat-thumb { max-width: 120px; max-height: 120px; border: 1px solid #333;
                 border-radius: 4px; cursor: zoom-in; display: block; }

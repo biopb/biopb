@@ -32,6 +32,7 @@ import logging
 
 from starlette.responses import JSONResponse
 
+from .._config import get_setting
 from . import _chat, _model, _observe
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,9 @@ def configure(config, *, agentless):
     global _config, _enabled
     _config = config
     _enabled = bool(
-        config.observe.enabled and config.observe.chat_enabled and agentless
+        get_setting(config, "observe.enabled")
+        and get_setting(config, "observe.chat_enabled")
+        and agentless
     )
     return _enabled
 
@@ -108,7 +111,7 @@ async def _api_chat_status(request):
             "ready": ready,
             "reason": reason,
             "busy": _chat.busy(),
-            "model": _config.chat.model if ready else "",
+            "model": get_setting(_config, "chat.model") if ready else "",
         }
     )
 

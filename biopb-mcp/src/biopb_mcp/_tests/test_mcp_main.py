@@ -4,11 +4,13 @@ These exercise the pure plumbing in ``biopb_mcp.mcp.__main__`` (arg parsing
 and the stdio-vs-http dispatch) without starting a real kernel or viewer.
 """
 
+import dataclasses
 import os
 import sys
 
 import pytest
 
+from biopb_mcp._config import McpConfig
 from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
@@ -16,6 +18,7 @@ from biopb_mcp.mcp.__main__ import (
     _is_agentless_viewer,
     _parse_args,
     _register_view_session,
+    _setup_chat,
     _setup_observe,
     _unregister_session,
     main,
@@ -204,6 +207,59 @@ class TestSetupObserve:
         cfg = {"observe": {"enabled": True}}
         # An observe failure must never propagate out of the launcher.
         assert _setup_observe(cfg) is False
+
+
+class TestSetupChat:
+    """Chat mounts on the config the launcher actually threads.
+
+    This exists because it did not. `load_config()` returns a **dict**, and
+    `_chat_api.configure` read it with attribute access -- correct for the
+    `McpConfig` dataclass every test built, and an `AttributeError` on the real
+    thing. `_setup_chat` catches broadly so a chat failure can never take down
+    the MCP server, so the raise became one swallowed log line and chat simply
+    never appeared. Nothing was red.
+
+    Two lessons, both encoded here: exercise the launcher's own function rather
+    than the thing it calls, and feed it the launcher's own shape.
+    """
+
+    @pytest.fixture
+    def mounted(self, monkeypatch):
+        from biopb_mcp.mcp import _chat_api
+
+        calls = []
+        monkeypatch.setattr(_chat_api, "register_http_routes", lambda: calls.append(1))
+        return calls
+
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            # A file with only the switch in it -- get_setting fills the rest
+            # from DEFAULT_CONFIG, which is what a real mcp-config.json does.
+            {"observe": {"enabled": True, "chat_enabled": True}},
+            # And the fully-populated shape, as the admin page writes it.
+            {
+                **dataclasses.asdict(McpConfig()),
+                "observe": {
+                    **dataclasses.asdict(McpConfig().observe),
+                    "chat_enabled": True,
+                },
+            },
+        ],
+        ids=["partial", "full"],
+    )
+    def test_it_mounts_for_a_viewer(self, cfg, mounted):
+        assert _setup_chat(cfg, agentless=True) is True
+        assert mounted == [1]
+
+    def test_it_mounts_nothing_for_a_harness_session(self, mounted):
+        cfg = {"observe": {"enabled": True, "chat_enabled": True}}
+        assert _setup_chat(cfg, agentless=False) is False
+        assert mounted == []
+
+    def test_it_mounts_nothing_when_the_switch_is_off(self, mounted):
+        assert _setup_chat({"observe": {"enabled": True}}, agentless=True) is False
+        assert mounted == []
 
 
 class TestAgentlessViewer:

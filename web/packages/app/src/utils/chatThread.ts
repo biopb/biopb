@@ -42,9 +42,25 @@ export interface ToolCallItem {
   status: ToolStatus;
   /** The result, once there is one. */
   blocks: Block[];
+  /** These blocks are a running cell's output so far, not its result. */
+  live?: boolean;
 }
 
 export type ThreadItem = MessageItem | ToolCallItem;
+
+/** What the cell being polled right now has printed so far.
+ *
+ * Not part of the thread: the loop keeps it on the transport because
+ * `_llm_messages` re-projects every stored message on every later turn, so
+ * streamed stdout appended to the conversation would go back to the provider
+ * again and again. It reaches the pane on the history read and is attached to
+ * the running call here, which is where the finished result lands too. */
+export interface LiveOutput {
+  jobId: string;
+  stdout: string;
+  /** Older output was dropped; `stdout` is the tail. */
+  truncated: boolean;
+}
 
 /** The wire shape of one `/api/chat/history` message. */
 export interface ChatMessage {
@@ -212,6 +228,53 @@ function lastToolCall(items: ThreadItem[], name?: string): ToolCallItem | null {
       return item;
   }
   return fallback;
+}
+
+/**
+ * Show a running cell's output on the call that is running it.
+ *
+ * The turn's whole reason for dropping `execute_code`'s promote window is that
+ * a long cell should say something while it runs; a thread that goes quiet for
+ * three minutes is the stalled cursor that was being avoided. The finished
+ * result replaces this on the next poll, arriving as the tool's own message.
+ *
+ * **The first matching call, not the last.** A round's calls are dispatched
+ * one at a time and each result is appended only when its own dispatch returns,
+ * so while the first cell runs neither it nor the calls behind it have an
+ * answer yet -- and an unanswered call reads as `in_progress`. With two
+ * parallel `execute_code` calls that makes both of them in progress, while the
+ * kernel is running only the earlier one. Scanning from the end would put a
+ * cell's output on the call that has not started.
+ */
+export function applyLiveOutput(
+  items: ThreadItem[],
+  live: LiveOutput | null,
+): ThreadItem[] {
+  if (!live || !live.stdout) return items;
+  for (const item of items) {
+    if (item.kind !== "tool_call") continue;
+    if (item.status !== "in_progress" || item.title !== "execute_code") continue;
+    // Replaces the text rather than adding to it: this is the whole buffer on
+    // every poll, not a delta, and the call has no result of its own until it
+    // finishes. Written so re-applying it is a no-op -- the render path rebuilds
+    // the items each time, but a function that only works once because of that
+    // is one bug away from repeating a cell's output twice a second.
+    item.blocks = [
+      { type: "text", text: live.stdout },
+      ...item.blocks.filter((b) => b.type !== "text"),
+    ];
+    item.live = true;
+    return items;
+  }
+  return items;
+}
+
+/** The newest line worth showing on one line — what a collapsed group reports
+ * while its cell runs. Trailing blank lines are what a `print()` leaves. */
+export function latestLine(text: string): string {
+  const lines = text.split("\n");
+  while (lines.length && !lines[lines.length - 1]!.trim()) lines.pop();
+  return lines.length ? lines[lines.length - 1]!.trim() : "";
 }
 
 /** A run of consecutive tool calls, or a single message — what the pane draws.
