@@ -101,6 +101,15 @@ def busy():
     return _turn_lock.locked()
 
 
+def running_job_id():
+    """The cell the turn is waiting on right now, or None.
+
+    Public because a transport buffering that cell's partial output has to know
+    which cell the chunks belong to, and when it stopped being the current one.
+    """
+    return _running_job_id
+
+
 def note_error(text):
     """Record a failed turn in the thread itself.
 
@@ -426,7 +435,8 @@ async def run_turn(user_text, model, on_progress=None):
 
     *on_progress* receives partial output from a running cell as it arrives. It
     is what makes a long job legible in a chat window instead of a stalled
-    cursor; a transport will hand it a stream, tests hand it a list.
+    cursor; the HTTP surface hands it a buffer it publishes on the history read,
+    tests hand it a list.
 
     Raises :class:`TurnInProgress` if a turn is already running. Checking the
     lock before taking it is safe on the one event loop this process runs:
