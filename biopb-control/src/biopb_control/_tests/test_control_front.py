@@ -1027,6 +1027,28 @@ def test_session_console_is_proxied_on_a_loopback_control(control, upstream):
     assert echoed["method"] == "POST"
 
 
+def test_session_roots_are_reachable_with_a_token(tokened_control, upstream):
+    # The other half of the gate, and the half the browser depends on: a caller
+    # that *does* present the token gets through to the child.
+    #
+    # Pinned because the observe page went a long time sending no token at all
+    # (biopb#730). It failed silently -- a 401 body is valid JSON, so the page
+    # read through it and rendered a healthy session as an idle one with a dead
+    # kernel -- and nothing on either side said the contract was broken. This
+    # asserts the scheme the SPA sends is the scheme the control accepts.
+    _register_session("s-auth", upstream)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_control}/session/s-auth/api/jobs")
+    assert exc.value.code == 401
+
+    status, _headers, body = _get(
+        f"{tokened_control}/session/s-auth/api/jobs",
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    assert status == 200
+    assert json.loads(body)["path"] == "/api/jobs"
+
+
 def test_session_console_is_gated_like_the_api(control, upstream):
     # The console is the one proxied path whose payload is arbitrary code, so it
     # must not be reachable by DNS-rebinding or as a cross-site write. Same gate,

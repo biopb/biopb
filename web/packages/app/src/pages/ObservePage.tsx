@@ -7,6 +7,7 @@ import {
 } from "react";
 import { useParams } from "react-router-dom";
 import { consoleEnabled } from "../auth";
+import { sessionFetch } from "../utils/sessionFetch";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 
@@ -49,7 +50,7 @@ interface JobDetail {
 
 async function jpost(url: string): Promise<{ [k: string]: unknown }> {
   try {
-    const r = await fetch(url, { method: "POST" });
+    const r = await sessionFetch(url, { method: "POST" });
     return await r.json().catch(() => ({}));
   } catch (e) {
     return { error: String(e) };
@@ -87,7 +88,9 @@ export default function ObservePage() {
   const fetchDetail = useCallback(
     async (id: string) => {
       try {
-        const r = await fetch(base + "/api/jobs/" + encodeURIComponent(id));
+        const r = await sessionFetch(
+          base + "/api/jobs/" + encodeURIComponent(id),
+        );
         if (!r.ok) return;
         const d: JobDetail = await r.json();
         setDetails((m) => ({ ...m, [id]: d }));
@@ -101,7 +104,7 @@ export default function ObservePage() {
   const poll = useCallback(async () => {
     let data: { busy?: boolean; jobs?: JobSummary[] };
     try {
-      data = await (await fetch(base + "/api/jobs")).json();
+      data = await (await sessionFetch(base + "/api/jobs")).json();
     } catch {
       setStatus("unreachable");
       return;
@@ -134,7 +137,7 @@ export default function ObservePage() {
 
   const pollStatus = useCallback(async () => {
     try {
-      const s = await (await fetch(base + "/api/status")).json();
+      const s = await (await sessionFetch(base + "/api/status")).json();
       if (typeof s.poll_interval_ms === "number") setPollMs(s.poll_interval_ms);
       // Only when the field is actually there. A degraded status payload (the
       // child's 503 with no kernel host, the proxy's 502 on a wedged session)
@@ -193,7 +196,7 @@ export default function ObservePage() {
   const saveNotebook = useCallback(async () => {
     let r: Response;
     try {
-      r = await fetch(base + "/api/notebook");
+      r = await sessionFetch(base + "/api/notebook");
     } catch (e) {
       alert("Save failed: " + e);
       return;
@@ -259,11 +262,11 @@ export default function ObservePage() {
     async (code: string): Promise<string | null> => {
       let r: Response;
       try {
-        r = await fetch(base + "/console/execute", {
+        r = await sessionFetch(base + "/console/execute", {
           method: "POST",
           // Not decoration: a JSON content-type is one a cross-site form POST
           // cannot set, and the child requires it on this route for exactly
-          // that reason.
+          // that reason. `sessionFetch` adds the bearer token alongside it.
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ code }),
         });
