@@ -112,7 +112,7 @@ class _Job:
         "finished",
     )
 
-    def __init__(self, job_id, code="", origin="agent", intent=""):
+    def __init__(self, job_id, code="", origin="mcp", intent=""):
         self.job_id = job_id
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
@@ -132,8 +132,10 @@ class _Job:
         # result, instead of an unexplained cancellation. None for agent-driven
         # or untagged stops.
         self.cancel_reason = None
-        # Who started this job:
-        #   "agent" — the execute_code tool, driven by an external MCP client
+        # Who started this job. Each value names a *surface*, not a kind of
+        # actor: "agent" was two of these at once once the chat loop arrived,
+        # and code asking "is this the agent's?" quietly meant "the MCP one's".
+        #   "mcp"   — the execute_code tool, driven by an external MCP client
         #   "user"  — a cell run by a human from the observe page
         #   "chat"  — the in-process chat loop (docs/chat-client-evaluation.md)
         # Set at submit and never inferred later — a job outlives the request
@@ -143,7 +145,7 @@ class _Job:
         # introduced after the fact cannot relabel the records made without it.
         self.origin = origin
         # Why this job was run, in the words of whoever asked for it — the
-        # agent's own statement of purpose under "agent", the user's turn once
+        # client's own statement of purpose under "mcp", the user's turn once
         # a chat loop fills it. Free text, optional and unvalidated: it is
         # best-effort provenance for the notebook export, never a control input.
         self.intent = intent
@@ -337,15 +339,19 @@ def _has_running_job():
 
 
 def _foreign(job):
-    """Whether *job* was written by someone other than the ``execute_code`` agent.
+    """Whether *job* was written by someone other than the MCP client.
 
-    The rules that keep the writers apart — the digest, the eviction hold, the
-    interrupt refusal — are all about *whose* job it is from that agent's point
-    of view, and every one of them was written when "not the agent" and "the
-    user" were the same set. They are not once a chat loop submits, so the test
-    is spelled out here rather than inlined as ``origin == "user"``.
+    The rules this serves — the digest and the eviction hold — are about *whose*
+    job it is from that client's point of view, and both were written when "not
+    the agent" and "the user" were the same set. They are not once a chat loop
+    submits, so the test is spelled out here rather than inlined as
+    ``origin == "user"``.
+
+    Deliberately not the interrupt's question, which is "is this the *asker's*
+    job?" — see :func:`interrupt_current`. Answering it with this one refused
+    the chat loop its own cell.
     """
-    return job.origin != "agent"
+    return job.origin != "mcp"
 
 
 def _prune():
@@ -363,7 +369,7 @@ def _prune():
         del _jobs[terminal.pop(0)]
 
 
-def submit(code, origin="agent", intent="", writer=None, writer_label=""):
+def submit(code, origin="mcp", intent="", writer=None, writer_label=""):
     """Start *code* in a background thread; return ``{"job_id": ...}`` or, if a
     job is already running, ``{"error": "busy", "running_job_id": ...,
     "running_job_origin": ...}``.
@@ -513,12 +519,19 @@ def interrupt_current(reason=None, requester="user", writer=None):
     False, "status": "idle"}`` when the kernel is idle.
 
     *requester* is who is asking — ``"user"`` (the observe UI, the default: a
-    person may stop anything running in their own session) or ``"agent"``. An
-    **agent is refused a job it did not start** (``{"refused": "foreign_job"}``):
-    the stop would be silent, since attribution runs one way only — a user stop
-    reaches the agent through ``cancel_reason``, but the other writer would see
-    nothing beyond an unexplained ``interrupted`` badge. The human has the
-    observe UI and can stop their own work; the agent has no consent to.
+    person may stop anything running in their own session) or ``"mcp"``. An
+    **MCP client is refused a job it did not start** (``{"refused":
+    "foreign_job"}``): the stop would be silent, since attribution runs one way
+    only — a user stop reaches it through ``cancel_reason``, but the other
+    writer would see nothing beyond an unexplained ``interrupted`` badge. The
+    human has the observe UI and can stop their own work; a program has no
+    consent to.
+
+    Note the test is against *the MCP client*, not against each writer and its
+    own work: a second writer asking as ``"mcp"`` would be refused its own cell.
+    Nothing does that today — the chat loop's cancel stops its turn and leaves
+    the cell to the human, exactly as an MCP client's does. Worth knowing before
+    adding a programmatic interrupt for a writer that is not this one.
 
     *writer* is the asking client's id, checked against the kernel's one-agent
     claim (:func:`submit`): a client that does not hold this kernel cannot stop
@@ -530,14 +543,14 @@ def interrupt_current(reason=None, requester="user", writer=None):
     job = _running_job()
     if job is None:
         return {"job_id": None, "interrupted": False, "status": "idle"}
-    if requester == "agent" and writer is not None and _owner not in (None, writer):
+    if requester == "mcp" and writer is not None and _owner not in (None, writer):
         return {
             "job_id": job.job_id,
             "interrupted": False,
             "status": "running",
             "refused": "not_owner",
         }
-    if requester == "agent" and _foreign(job):
+    if requester == "mcp" and _foreign(job):
         return {
             "job_id": job.job_id,
             "interrupted": False,

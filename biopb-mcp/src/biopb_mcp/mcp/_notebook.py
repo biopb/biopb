@@ -150,7 +150,7 @@ def _intent_cell(snap):
     if not intent:
         return None
     job_id = snap.get("job_id", "?")
-    origin = snap.get("origin") or "agent"
+    origin = snap.get("origin") or "mcp"
     return _markdown_cell(f"**{job_id}** · {origin} — {intent}")
 
 
@@ -163,7 +163,7 @@ def _job_cell(snap):
     # without provenance a human's `mask = mask > 0.7` is indistinguishable from
     # the agent's own work. Older records carry no origin, so default rather
     # than assert -- an export must never fail on a field added later.
-    origin = snap.get("origin") or "agent"
+    origin = snap.get("origin") or "mcp"
     header = (
         f"# [{job_id} · {origin} · {status} · {elapsed}s · "
         f"{_fmt_ts(snap.get('created'))}]\n"

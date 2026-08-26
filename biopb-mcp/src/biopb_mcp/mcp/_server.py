@@ -935,7 +935,7 @@ def execute_code(python_code: str, intent: str = "") -> str:
         # would have it kill their work; interrupt_kernel refuses that anyway
         # (_jobs.interrupt_current), so the wording must not send it there.
         running_origin = submitted.get("running_job_origin")
-        if running_origin and running_origin != "agent":
+        if running_origin and running_origin != "mcp":
             # A running foreign job stays in the digest by design, so the note is
             # about to report the very job this branch is reporting. Drop it
             # when that is *all* it says; keep it when other cells also finished,
@@ -1045,7 +1045,7 @@ def interrupt_kernel() -> str:
         return "Error: kernel host not initialized"
     writer, _label = _client_identity()
     data, res, _w = _run_job_call(
-        host, "interrupt_current(requester='agent', writer=" + repr(writer) + ")"
+        host, "interrupt_current(requester='mcp', writer=" + repr(writer) + ")"
     )
     if data is None:
         return _format_execute_result(res)

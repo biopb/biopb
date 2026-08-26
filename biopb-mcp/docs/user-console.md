@@ -142,14 +142,20 @@ mid-round-trip.
 
 ## Attribution — `origin` on the job
 
-`_Job` gains `origin` (`"agent"` | `"user"`), set at `submit()`, carried through
+`_Job` gains `origin` (`"mcp"` | `"user"`), set at `submit()`, carried through
 `__slots__`, `snapshot()`, `jobs_summary()` and `export()`. Everything below is a
 consequence of that one field.
 
 > **Since:** `origin` also admits `"chat"` (the in-process chat loop,
 > `docs/chat-client-evaluation.md`). Every rule stated below as "user-owned" is
-> implemented as *not agent-owned* (`_jobs._foreign`), so it holds for any writer
-> that is not the `execute_code` agent.
+> implemented as *not MCP-owned* (`_jobs._foreign`), so it holds for any writer
+> that is not the `execute_code` client.
+>
+> That value was spelled `"agent"` until the chat loop shipped, when it stopped
+> being a description of anything: the chat loop is an agent too, so
+> `requester="agent"` from it read as correct and was refused its own cell. Each
+> value now names a *surface* — `mcp`, `user`, `chat` — and `requester` shares
+> the vocabulary, so "may this writer stop this job?" is one comparison.
 >
 > The writer count is nonetheless still **two**, and now by construction: the
 > first non-user submitter claims the kernel and a second agent's `execute_code`

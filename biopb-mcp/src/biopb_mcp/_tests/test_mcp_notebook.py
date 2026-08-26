@@ -41,12 +41,12 @@ def test_one_job_cell_structure():
     assert len(code) == 2
     job = code[-1]
     src = "".join(job["source"])
-    assert "# [job-1 · agent · ok · 0.1s ·" in src  # audit header comment
+    assert "# [job-1 · mcp · ok · 0.1s ·" in src  # audit header comment
     assert "x = 1" in src
     assert job["metadata"]["biopb"]["job_id"] == "job-1"
     # Who ran it, in both places. A record predating `origin` reads as the
     # agent, which is what every pre-console session was.
-    assert job["metadata"]["biopb"]["origin"] == "agent"
+    assert job["metadata"]["biopb"]["origin"] == "mcp"
 
 
 def test_a_user_cell_is_attributed_in_the_export():
@@ -70,7 +70,7 @@ def test_intent_becomes_a_markdown_cell_above_its_code():
     assert kinds[-2:] == ["markdown", "code"]
     note = "".join(nb["cells"][-2]["source"])
     assert "find the drift between t0 and t1" in note
-    assert "job-1" in note and "agent" in note
+    assert "job-1" in note and "mcp" in note
     assert (
         nb["cells"][-1]["metadata"]["biopb"]["intent"]
         == "find the drift between t0 and t1"

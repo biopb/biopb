@@ -243,11 +243,11 @@ class TestJobOrigin:
     def test_origin_defaults_to_agent_and_rides_the_snapshot(self, runner):
         jid = _jobs.submit("x = 1")["job_id"]
         snap = self._wait(jid)
-        assert snap["origin"] == "agent"
+        assert snap["origin"] == "mcp"
         summ = {j["job_id"]: j for j in _jobs.jobs_summary()}[jid]
-        assert summ["origin"] == "agent"
+        assert summ["origin"] == "mcp"
         # export() feeds the notebook writer -- provenance must survive there too.
-        assert {e["job_id"]: e for e in _jobs.export()}[jid]["origin"] == "agent"
+        assert {e["job_id"]: e for e in _jobs.export()}[jid]["origin"] == "mcp"
 
     def test_busy_reports_who_is_running(self, runner):
         jid = _jobs.submit(
@@ -269,7 +269,7 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
         )["job_id"]
         try:
-            res = _jobs.interrupt_current(requester="agent")
+            res = _jobs.interrupt_current(requester="mcp")
             assert res == {
                 "job_id": jid,
                 "interrupted": False,
@@ -295,11 +295,11 @@ class TestJobOrigin:
 
     def test_agent_may_stop_its_own_job(self, runner):
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
-        assert _jobs.interrupt_current(requester="agent")["interrupted"] is True
+        assert _jobs.interrupt_current(requester="mcp")["interrupted"] is True
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_digest_reports_only_unseen_user_jobs(self, runner):
-        self._wait(_jobs.submit("a = 1", origin="agent")["job_id"])
+        self._wait(_jobs.submit("a = 1", origin="mcp")["job_id"])
         user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
 
         digest = _jobs.foreign_digest()
@@ -372,7 +372,7 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
         )["job_id"]
         try:
-            assert _jobs.interrupt_current(requester="agent") == {
+            assert _jobs.interrupt_current(requester="mcp") == {
                 "job_id": jid,
                 "interrupted": False,
                 "status": "running",
@@ -440,7 +440,7 @@ class TestKernelOwner:
             "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
         )["job_id"]
         try:
-            assert _jobs.interrupt_current(requester="agent", writer="sess-B") == {
+            assert _jobs.interrupt_current(requester="mcp", writer="sess-B") == {
                 "job_id": jid,
                 "interrupted": False,
                 "status": "running",
@@ -448,9 +448,7 @@ class TestKernelOwner:
             }
             # The owner still can, and so can the human (the default requester).
             assert (
-                _jobs.interrupt_current(requester="agent", writer="sess-A")[
-                    "interrupted"
-                ]
+                _jobs.interrupt_current(requester="mcp", writer="sess-A")["interrupted"]
                 is True
             )
         finally:
@@ -479,7 +477,7 @@ class TestKernelOwner:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
         )["job_id"]
         try:
-            refused = _jobs.interrupt_current(requester="agent")
+            refused = _jobs.interrupt_current(requester="mcp")
             assert refused["refused"] == "foreign_job"
             assert refused["origin"] == "chat"
         finally:
