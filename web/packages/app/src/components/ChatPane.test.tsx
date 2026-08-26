@@ -52,6 +52,15 @@ describe("ChatPane", () => {
     expect(html).toContain("disabled");
   });
 
+  it("advertises the keys, and still offers a control to click", () => {
+    // The Send button is gone in favour of Enter, so the composer has to say
+    // so -- and a submit control still has to exist for the pointer and for a
+    // screen reader, which is what puts it in the corner of the box.
+    const html = render(status());
+    expect(html).toContain("to send");
+    expect(html).toContain('aria-label="Send message"');
+  });
+
   it("leaves the composer usable when chat is ready", () => {
     expect(render(status())).not.toContain("<textarea disabled");
   });
