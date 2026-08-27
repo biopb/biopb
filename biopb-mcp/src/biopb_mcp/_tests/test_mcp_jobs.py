@@ -351,6 +351,18 @@ class TestJobOrigin:
             self._wait(_jobs.submit("a = 1")["job_id"])
         assert user_jid not in _jobs._jobs
 
+    def test_the_chat_loop_is_not_told_about_its_own_cells(self, runner):
+        # "Someone else's cell" is a relation, not a property of the cell. Read
+        # from the MCP client's fixed point of view -- the only one there used
+        # to be -- the loop was handed its own cells as another writer's, and
+        # acking that discharged the user's notices along with them.
+        chat_jid = self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])["job_id"]
+        user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+
+        assert [d["job_id"] for d in _jobs.foreign_digest("chat")] == [user_jid]
+        # The MCP client's view is unchanged: both of those are someone else's.
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [chat_jid, user_jid]
+
     def test_a_chat_job_is_foreign_to_the_agent_just_as_a_user_cell_is(self, runner):
         # Every rule that reads origin means "not the agent", not "the user" --
         # they were the same set until a third writer existed. A chat job the

@@ -59,6 +59,10 @@ def chat_host():
     host._submit = None
     host._states = [("ok", "")]
     host.interrupts = []
+    # What another writer has run and the loop has not been told about, and the
+    # acks it sends back. Empty by default: most tests are not about the notice.
+    host._digest = []
+    host.acked = []
 
     def execute(code, *_args, **_kwargs):
         if "_jobs.submit(" in code:
@@ -83,9 +87,10 @@ def chat_host():
             host.interrupts.append(code)
             return _envelope({"job_id": "job-1", "interrupted": True, "status": "ok"})
         if "_jobs.foreign_digest(" in code:
-            return _envelope([])
+            return _envelope(host._digest)
         if "_jobs.ack_foreign_digest(" in code:
-            return _envelope(0)
+            host.acked.append(code)
+            return _envelope(len(host._digest))
         if _server._PNG_DELIM in code or "screenshot" in code:
             return {
                 "stdout": _server._PNG_DELIM + _PNG + "\n",
@@ -310,6 +315,74 @@ class TestExecuteCode:
         assert "origin='chat'" in snippet
         # ...and its own writer id, so the kernel's one-agent claim covers it.
         assert "writer='biopb-chat'" in snippet
+
+    def test_the_users_cells_reach_the_model_through_execute_code(self, chat_host):
+        # The tool the model reaches for most, and the one path that carried no
+        # notice: poll_job and server_status append it, but a model with no
+        # reason to call them ran a whole session never learning that the person
+        # at the machine had redefined its variables.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        result = [m for m in _chat.history() if m["role"] == "tool"][-1]["content"]
+        assert "The user ran code in this kernel" in result
+        assert "job-7 (ok)" in result
+
+    def test_the_digest_is_read_from_the_loops_own_point_of_view(self, chat_host):
+        # Read as the MCP client, the digest hands the loop its own cells: every
+        # rule spelled "not mcp" calls a chat job foreign. The asking origin is
+        # what makes "someone else" mean someone else.
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        (snippet,) = [
+            c[0][0]
+            for c in chat_host.execute.call_args_list
+            if "foreign_digest(" in c[0][0]
+        ]
+        assert "foreign_digest('chat')" in snippet
+
+    def test_the_notice_is_not_discharged_until_the_result_is_recorded(self, chat_host):
+        # The ack promises the agent *has been told*, and it has been told when
+        # the result carrying the note is in the thread -- not when the note was
+        # rendered. Acked at entry, a turn cancelled three minutes into a job
+        # had retired a notice nobody ever received, and the digest does not
+        # offer a finished cell twice.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        calls = [c[0][0] for c in chat_host.execute.call_args_list]
+        submitted = next(i for i, c in enumerate(calls) if "_jobs.submit(" in c)
+        acked = next(i for i, c in enumerate(calls) if "ack_foreign_digest(" in c)
+        assert acked > submitted
+
+    def test_the_notice_is_discharged_only_once_it_has_been_delivered(self, chat_host):
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        # Acked as the loop, because the kernel refuses an ack from a client
+        # that does not hold it -- a bystander must not retire a notice the
+        # agent working here never received.
+        assert chat_host.acked and "writer='biopb-chat'" in chat_host.acked[0]
+
+    def test_nothing_is_acked_when_there_is_nothing_to_report(self, chat_host):
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        assert chat_host.acked == []
 
     def test_intent_falls_back_to_the_users_own_words(self, chat_host):
         # The model may state a purpose closer to the cell than the turn is; when
@@ -563,6 +636,20 @@ class TestCancel:
         i = next(i for i, m in enumerate(msgs) if m.get("tool_calls"))
         answered = {m["tool_call_id"] for m in msgs[i + 1 :] if m["role"] == "tool"}
         assert answered == {c["id"] for c in msgs[i]["tool_calls"]}
+
+    def test_a_cancelled_turn_leaves_the_activity_notice_pending(
+        self, chat_host, monkeypatch
+    ):
+        # It was written into a result that never reached the thread. Left
+        # un-acked, the digest offers those cells again on the next call: a
+        # repeat, which the note's own wording covers, rather than a cell the
+        # agent is never told about at all.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]}
+        )
+        self._cancel_mid_round(model, monkeypatch)
+        assert chat_host.acked == []
 
     def test_the_thread_is_still_usable_afterwards(self, chat_host, monkeypatch):
         # The reason the invariant above matters. A malformed run is re-sent on

@@ -537,6 +537,15 @@ _local_identity: contextvars.ContextVar = contextvars.ContextVar(
     "biopb_local_identity", default=None
 )
 
+# The job origin this caller submits under, which is also the point of view the
+# foreign-activity digest is read from: "someone else's cell" is a relation, not
+# a property of the cell. Defaults to the remote clients this server was written
+# for; the in-process chat loop sets it for the length of a dispatch, beside its
+# identity above.
+_local_origin: contextvars.ContextVar = contextvars.ContextVar(
+    "biopb_local_origin", default="mcp"
+)
+
 
 def _client_identity():
     """``(id, label)`` for the client behind this call, or ``(None, "")``.
@@ -582,12 +591,17 @@ def _foreign_digest(host) -> list:
     """The cells run by another writer that the agent has not been told about,
     or ``[]``.
 
+    "Another writer" is relative to :data:`_local_origin`, so the chat loop is
+    not handed its own cells.
+
     A pure read — see :func:`_ack_foreign_digest` for why the ack is a second call.
     Auxiliary, like the window-liveness probe: a kernel that answers with
     anything but the expected list yields no digest rather than breaking the
     result the agent actually asked for.
     """
-    digest, _res, _w = _run_job_call(host, "foreign_digest()")
+    digest, _res, _w = _run_job_call(
+        host, "foreign_digest(" + repr(_local_origin.get()) + ")"
+    )
     if not digest or not isinstance(digest, list):
         return []
     if not all(isinstance(d, dict) and "job_id" in d for d in digest):

@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 WRITER_ID = "biopb-chat"
 WRITER_LABEL = "chat"
 
+#: The job origin this loop submits under. Also the point of view its
+#: foreign-activity digest is read from (``_server._local_origin``): a cell is
+#: someone *else's* only relative to whoever is asking.
+ORIGIN = "chat"
+
 #: Name of the synthesized tool that reads ``guide://`` and ``skill://``.
 #: Resources are an MCP concept with no function-calling equivalent, so a model
 #: driven by this loop cannot reach them unless one is invented -- and the
@@ -74,6 +79,12 @@ _POLL_INTERVAL = 0.3
 # session, survives kernel restarts, and dies with this process.
 _messages: list = []
 _seq = 0
+
+# A foreign-activity digest that has been written into a tool result but not yet
+# discharged at the kernel. Held here for the step between the two, which is the
+# only point at which the notice is provably delivered -- see
+# :func:`_discharge_notice`.
+_pending_notice = None
 
 # The cell a turn is currently waiting on, or None. Only so a cancelled turn can
 # name what it walked away from -- the job outlives the turn by design.
@@ -304,12 +315,46 @@ async def _run_code(arguments, on_progress):
     *intent* prefers what the model supplied — it is closer to the cell than the
     turn is — and falls back to the user's own words, so the notebook export has
     a stated purpose either way.
+
+    The foreign-activity note is read and appended here for the same reason
+    ``execute_code`` does it, and this path is the one that matters: it is the
+    tool the model reaches for most, so a session where it only ever runs code
+    never learned that the person at the machine had run any. Read once at
+    entry, appended to whichever branch returns.
     """
     host = _server._kernel_host
     if host is None:
         return "Error: kernel host not initialized"
     code = arguments.get("python_code") or ""
     intent = arguments.get("intent") or _last_user_text()
+
+    # Off the loop, like every other kernel round trip here. The context copy
+    # carries `_local_origin`, which is what keeps this loop's own cells out of
+    # its own digest.
+    digest = await asyncio.to_thread(_server._foreign_digest, host)
+    foreign_note = _server._render_foreign_note(digest)
+
+    def deliver(text):
+        """Attach the notice, and hold the digest for discharge.
+
+        Not discharged here. The ack is a promise that the agent *has been
+        told*, and it is told when the result carrying the note is appended to
+        the thread -- which is after this returns, and after everything below
+        that can be cancelled. Acking at entry made the loss window the whole
+        cell: a turn cancelled three minutes into a job had retired a notice
+        that never reached anyone, and the digest does not offer it twice.
+
+        Nothing has to unset this on the way out. Every path that reaches it
+        returns, and from here to the ``_append`` that records the result there
+        is no await for a cancellation to be delivered at -- so the slot is
+        never left armed by a turn that died. Put an await in between and that
+        stops being true.
+        """
+        global _pending_notice
+        if not foreign_note:
+            return text
+        _pending_notice = digest
+        return text + foreign_note
 
     # Claimed before the call, and mirrored, for the same reason execute_code
     # does it: a lost reply must not leave the kernel held while this process
@@ -319,7 +364,9 @@ async def _run_code(arguments, on_progress):
         host,
         "submit("
         + repr(code)
-        + ", origin='chat', intent="
+        + ", origin="
+        + repr(ORIGIN)
+        + ", intent="
         + repr(intent)
         + ", writer="
         + repr(WRITER_ID)
@@ -328,15 +375,24 @@ async def _run_code(arguments, on_progress):
         + ")",
     )
     if submitted is None:
-        return _server._format_execute_result(res)
+        return deliver(_server._format_execute_result(res))
     if submitted.get("error") == "not_owner":
         held = submitted.get("owner") or ""
         _server._note_claim(submitted.get("owner_id"))
-        return _server._NOT_OWNER_MSG.format(held_by=f" ({held})" if held else "")
+        return deliver(
+            _server._NOT_OWNER_MSG.format(held_by=f" ({held})" if held else "")
+        )
     _server._note_claim(WRITER_ID)
     if submitted.get("error") == "busy":
-        return (
-            f"A job ({submitted.get('running_job_id')}) is already running in this "
+        running = submitted.get("running_job_id")
+        # A running foreign job stays in the digest by design, so the note is
+        # about to report the very cell this branch reports. Drop it when that
+        # is all it says, and keep it when other cells also finished -- those
+        # were acked above and will not be offered again.
+        if [d.get("job_id") for d in digest] == [running]:
+            foreign_note = ""
+        return deliver(
+            f"A job ({running}) is already running in this "
             "kernel; wait for it to finish."
         )
 
@@ -353,14 +409,14 @@ async def _run_code(arguments, on_progress):
             snap, res, _w = await _job_call(host, "poll(" + repr(job_id) + ")")
             if snap is None:
                 _running_job_id = None
-                return _server._format_execute_result(res)
+                return deliver(_server._format_execute_result(res))
             out = snap.get("stdout") or ""
             if on_progress is not None and len(out) > seen:
                 on_progress(out[seen:])
                 seen = len(out)
             if snap.get("status") != "running":
                 _running_job_id = None
-                return _server._format_execute_result(snap)
+                return deliver(_server._format_execute_result(snap))
     except asyncio.CancelledError:
         # The one case that keeps it: the cell really is still running, and the
         # turn's handler is about to name it. That handler clears it.
@@ -425,6 +481,29 @@ def _llm_messages():
     return out
 
 
+async def _discharge_notice():
+    """Retire the activity notice now that the result carrying it is recorded.
+
+    The read/ack split exists so a notice is **deferred, never dropped**
+    (:func:`_jobs.ack_foreign_digest`), and the ack is meant to happen "once the
+    note carrying them is on its way back to the agent". In this loop the note
+    is on its way back when it is in ``_messages``: the next projection carries
+    it whatever becomes of this turn.
+
+    So this runs immediately after the tool result is appended -- a step with no
+    await between it and the append, so nothing can land in between. Cancelled
+    *here* the notice simply stays pending and is offered again on the next
+    call: a repeat, which the note's own wording covers, rather than a cell the
+    agent is never told about.
+    """
+    global _pending_notice
+    digest, _pending_notice = _pending_notice, None
+    host = _server._kernel_host
+    if not digest or host is None:
+        return
+    await asyncio.to_thread(_server._ack_foreign_digest, host, digest, WRITER_ID)
+
+
 async def run_turn(user_text, model, on_progress=None):
     """Append the user's turn, run it to an answer, return the new messages.
 
@@ -484,6 +563,7 @@ async def _run_turn(user_text, model, on_progress):
     # cannot read: its own message, followed by nothing, forever.
     start = len(_messages)
     token = _server._local_identity.set((WRITER_ID, WRITER_LABEL))
+    origin_token = _server._local_origin.set(ORIGIN)
     try:
         # Before the first await: the user's own turn is one of the new messages
         # a view has to render, not context it already had.
@@ -529,6 +609,10 @@ async def _run_turn(user_text, model, on_progress):
                     name=name,
                     **({"error": True} if failed else {}),
                 )
+                # Recorded, so the notice that rode in on it has been delivered.
+                # Immediately after the append and before any await, so a cancel
+                # cannot land between the two.
+                await _discharge_notice()
                 pending.extend((name, img) for img in images)
             for name, img in pending:
                 _append(
@@ -576,5 +660,6 @@ async def _run_turn(user_text, model, on_progress):
         raise
     finally:
         _server._local_identity.reset(token)
+        _server._local_origin.reset(origin_token)
 
     return _messages[start:]

@@ -338,8 +338,8 @@ def _has_running_job():
     return any(j.status == "running" for j in _jobs.values())
 
 
-def _foreign(job):
-    """Whether *job* was written by someone other than the MCP client.
+def _foreign(job, for_origin="mcp"):
+    """Whether *job* was written by someone other than *for_origin*'s client.
 
     The rules this serves — the digest and the eviction hold — are about *whose*
     job it is from that client's point of view, and both were written when "not
@@ -350,8 +350,13 @@ def _foreign(job):
     Deliberately not the interrupt's question, which is "is this the *asker's*
     job?" — see :func:`interrupt_current`. Answering it with this one refused
     the chat loop its own cell.
+
+    *for_origin* is the asking client's own origin, because "someone else's
+    cell" is a relation, not a property: the chat loop submits as ``chat``, so
+    reading the digest from the MCP client's fixed point of view reported the
+    loop its own cells back to it as another writer's.
     """
-    return job.origin != "mcp"
+    return job.origin != for_origin
 
 
 def _prune():
@@ -594,9 +599,9 @@ def jobs_summary():
     ]
 
 
-def foreign_digest():
-    """Jobs the ``execute_code`` agent did not start and has not been told about
-    yet, oldest-first.
+def foreign_digest(for_origin="mcp"):
+    """Jobs the asking agent did not start and has not been told about yet,
+    oldest-first.
 
     Returns ``[{"job_id", "status", "elapsed", "origin"}, ...]``; *origin* is
     carried because the caller words the notice differently for a person than
@@ -606,6 +611,12 @@ def foreign_digest():
     (``_server._foreign_activity_note``). Pull, not push:
     an MCP server->client notification is not reliably surfaced mid-turn, and
     when the agent is idle there is no turn to interrupt.
+
+    *for_origin* is the asking client's own job origin -- ``"mcp"`` for a remote
+    client, ``"chat"`` for the in-process loop -- so each is told about the
+    *other* writers rather than about itself. ``seen_by_agent`` stays a single
+    flag because the kernel's one-agent claim makes the two mutually exclusive:
+    only one of them is ever the agent being promised a notice exactly once.
 
     A pure read: marking entries reported is :func:`ack_foreign_digest`, a
     **separate** call the caller makes only once the notice has actually reached
@@ -623,7 +634,7 @@ def foreign_digest():
                 "origin": j.origin,
             }
             for j in _jobs.values()
-            if _foreign(j) and not j.seen_by_agent
+            if _foreign(j, for_origin) and not j.seen_by_agent
         ]
 
 

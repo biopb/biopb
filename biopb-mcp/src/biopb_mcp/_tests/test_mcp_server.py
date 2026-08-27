@@ -623,7 +623,9 @@ class TestUserActivityNote:
         _install_replies(server_with_host, digest=[*self._DIGEST, running])
         _server._foreign_activity_note(server_with_host)
         calls = [c[0][0] for c in server_with_host.execute.call_args_list]
-        assert any("_jobs.foreign_digest()" in c for c in calls)
+        # Named point of view: the digest is read as whoever is asking, so an
+        # MCP client is not handed the chat loop's cells (or its own).
+        assert any("_jobs.foreign_digest('mcp')" in c for c in calls)
         (ack,) = [c for c in calls if "ack_foreign_digest(" in c]
         # Terminal ones only: a job reported `running` was not given its final
         # status, so it must stay pending.
