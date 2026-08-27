@@ -41,6 +41,10 @@ interface SessionRec {
   // true for an agentless `biopb mcp view` session whose chat this control will
   // proxy. Absent on an older control, which reads as an observe link.
   chat?: boolean;
+  // Whether the session serves a stop verb -- true only where it owns its own
+  // reap (a viewer, not a child some MCP client's shim will reap). Absent on an
+  // older control, which reads as no stop button rather than one that 404s.
+  can_stop?: boolean;
 }
 interface AgentRec {
   id: string;
@@ -116,6 +120,8 @@ export default function DashboardPage() {
   const [canStart, setCanStart] = useState(false);
   const [startBlocked, setStartBlocked] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  // Which session's stop is in flight, so only that row's button goes busy.
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
   // Outcome of the last launch, rendered under the list rather than alert()ed:
   // a failure carries the child's log tail, which no dialog reads well.
   const [startMsg, setStartMsg] = useState<{ err: boolean; text: string } | null>(
@@ -243,6 +249,41 @@ export default function DashboardPage() {
       pollSessions();
     }
   }, [pollStatus, pollSessions]);
+
+  // Stopping is the session ending *itself* -- the control proxies the verb to
+  // the child, which runs the same teardown Ctrl-C does. So this works the same
+  // for a session started here and one started with `biopb mcp view` in a
+  // terminal, and the confirm says so: that terminal is about to come back.
+  const stopSession = useCallback(
+    async (id: string) => {
+      if (
+        !confirm(
+          `Stop session ${id}?\n\nThe napari window closes and any running ` +
+            `work is lost. If it was started with \`biopb mcp view\` in a ` +
+            `terminal, that terminal returns.`,
+        )
+      )
+        return;
+      setStoppingId(id);
+      setStartMsg(null);
+      try {
+        const r = await fetchAuth(withBase(`/session/${id}/api/shutdown`), {
+          method: "POST",
+        });
+        const res = await r.json().catch(() => ({}));
+        if (res.error) setStartMsg({ err: true, text: res.error });
+      } catch (e) {
+        setStartMsg({ err: true, text: String(e) });
+      } finally {
+        setStoppingId(null);
+        // The child de-registers on its way out, so the row goes on the next
+        // read rather than being removed here.
+        pollStatus();
+        pollSessions();
+      }
+    },
+    [pollStatus, pollSessions],
+  );
 
   const verb = useCallback(
     async (url: string, confirmMsg?: string) => {
@@ -541,6 +582,17 @@ export default function DashboardPage() {
                     >
                       {s.chat ? "chat →" : "observe →"}
                     </a>
+                    {s.can_stop ? (
+                      <button
+                        className="mini stop"
+                        onClick={() => stopSession(s.session_id)}
+                        disabled={stoppingId === s.session_id}
+                        title="Stop this session (closes its napari window)"
+                        aria-label={`Stop session ${s.session_id}`}
+                      >
+                        {stoppingId === s.session_id ? "…" : "✕"}
+                      </button>
+                    ) : null}
                   </li>
                 );
               })
@@ -735,6 +787,10 @@ const DASH_CSS = `
   .ctrl-dash .k-error { background: #422; color: #f99; }
   .ctrl-dash .k-unknown { background: #2a2a2a; color: #777; }
   .ctrl-dash .mini { padding: 0 8px; font-size: 12px; margin-left: 8px; vertical-align: middle; }
+  /* Per-row stop. Muted until hovered: it is destructive, but it sits beside
+     every viewer row and should not read as the thing to click. */
+  .ctrl-dash button.mini.stop { color: #888; border-color: #3a3a3a; margin-left: 6px; }
+  .ctrl-dash button.mini.stop:hover:not(:disabled) { color: #f99; border-color: #844; }
   .ctrl-dash .state { color: #888; font-size: 12px; }
   .ctrl-dash .note { color: #667; font-size: 12px; margin: 12px 0 0; }
   /* A failed launch renders the child's own log tail, so keep its newlines and

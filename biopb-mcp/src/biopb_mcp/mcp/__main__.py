@@ -157,13 +157,18 @@ def _has_display():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _setup_observe(config):
+def _setup_observe(config, agentless=False, on_shutdown=None):
     """Wire up the web observe UI.
 
     On by default (``observe.enabled``, opt-out); it mounts on the existing
     MCP app and shares its loop/port. Fully guarded — an observe failure logs
     and is swallowed so it can never block the MCP server. Returns True if
     mounted.
+
+    *agentless* / *on_shutdown* decide whether this session serves the stop
+    route, and what it runs. Passed in rather than read here because the
+    launcher's ``_shutdown`` is the thing being handed over, and it must be
+    registered before the routes are, which is inside this call.
     """
     from .._config import get_setting
 
@@ -172,6 +177,7 @@ def _setup_observe(config):
     try:
         from . import _observe
 
+        _observe.set_session_owns_its_reap(agentless, on_shutdown=on_shutdown)
         _observe.configure(
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
@@ -534,12 +540,23 @@ def _serve_http(config, port, view=False):
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # Whether this session owns its own reap. Two things hang off it, and the
+    # single expression keeps them from drifting: the built-in chat loop, and
+    # the stop route (a shim-owned child is reaped by its shim, so ending it
+    # here would leave that shim bridging to a dead process).
+    agentless = _is_agentless_viewer(view, shim_owned)
+
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
-    # custom routes are read when the streamable-http app is built.
-    _setup_observe(config)
+    # custom routes are read when the streamable-http app is built. `_shutdown`
+    # goes with it, so a stop from the web takes the same path Ctrl-C does.
+    _setup_observe(
+        config,
+        agentless=agentless,
+        on_shutdown=lambda: _shutdown("stopped from the web"),
+    )
     # A shim-owned child is serving an MCP client, which is the one situation the
     # built-in loop is not for.
-    _setup_chat(config, agentless=_is_agentless_viewer(view, shim_owned))
+    _setup_chat(config, agentless=agentless)
 
     if view:
         # Agentless viewer: bring the window up now (the human wants it

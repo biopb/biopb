@@ -149,3 +149,12 @@ its window *before* it registers — so a record means a viewer really opened, a
 a child that dies first never registers and comes back with its own log tail.
 The verb is offered only where it can work (I1); the dashboard reads that from
 `/api/status` and shows the refusal in the button's place.
+
+**Stopping one is not the mirror image.** The control does not signal a pid — it
+proxies `/session/<id>/api/shutdown`, and the session runs the same teardown
+Ctrl-C does. So ownership never enters it: a viewer started from a terminal and
+one started here are the same process ending itself, and the control keeps no
+record of which it launched. The route rides `api` rather than the local-only
+gate (it is not an execute surface, and `api` already carries the kernel
+restart), and only a session that owns its own reap serves it — a shim-owned
+child does not, since ending it would leave its shim bridging to a dead process.

@@ -618,36 +618,48 @@ def _kernel_state(health: dict) -> str:
     return "none"
 
 
-async def _probe_session(client: httpx.AsyncClient, rec: dict) -> tuple[str, bool]:
-    """Best-effort ``(kernel state, serves chat)`` for one session.
+# What a session probe reports when the child cannot be reached or understood.
+# Every field degrades to its least-claiming value: an unknown kernel, no chat,
+# and no stop offered — never a button that would 404.
+_PROBE_UNKNOWN = {"kernel": "unknown", "chat": False, "agentless": False}
+
+
+async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
+    """Best-effort ``{kernel, chat, agentless}`` for one session.
 
     A single cheap loopback GET to the child's ``/api/status`` — which returns
     ``KernelHost.health()`` with no kernel round-trip and whose ``api`` observe
     root the control already proxies. Never raises: a missing port, an
     unreachable/slow child, a non-200, or unparseable JSON all degrade to
-    ``("unknown", False)`` so the session list is never blocked or truncated by a
+    :data:`_PROBE_UNKNOWN` so the session list is never blocked or truncated by a
     probe. httpx sets ``Host`` from the target (satisfying the child's loopback
     guard) and sends no ``Origin`` (passing its Origin guard), like the session
     proxy.
 
-    ``chat_enabled`` comes off the same response rather than a second request:
-    only an agentless ``biopb mcp view`` session mounts chat, so it is also the
-    answer to "is this a viewer a human opened, or an MCP client's child?" —
-    which is what the dashboard labels the session's link by. Absent on an older
-    child, which reads as False (the pre-existing behaviour: an observe link).
+    The two booleans come off the same response rather than extra requests, and
+    answer different questions. ``chat_enabled`` says what that session's page
+    leads with, which is how the dashboard labels its link. ``agentless`` says
+    who owns the reap — only a ``biopb mcp view`` viewer ends itself, a
+    shim-owned child is its shim's to reap — which is how the dashboard decides
+    whether to offer a stop. Both absent on an older child, which reads as
+    False: an observe link and no stop button, the behaviour that predates them.
     """
     port = rec.get("port")
     if not port:
-        return "unknown", False
+        return dict(_PROBE_UNKNOWN)
     url = _loopback_url(rec.get("host", "127.0.0.1"), port) + "/api/status"
     try:
         resp = await client.get(url, timeout=_KERNEL_PROBE_TIMEOUT)
         if resp.status_code != 200:
-            return "unknown", False
+            return dict(_PROBE_UNKNOWN)
         health = resp.json()
-        return _kernel_state(health), bool(health.get("chat_enabled"))
+        return {
+            "kernel": _kernel_state(health),
+            "chat": bool(health.get("chat_enabled")),
+            "agentless": bool(health.get("agentless")),
+        }
     except Exception:  # noqa: BLE001 - a probe is decorative; never fail the list
-        return "unknown", False
+        return dict(_PROBE_UNKNOWN)
 
 
 # --- launching a viewer session ------------------------------------------- #
@@ -1106,14 +1118,19 @@ def build_app(
                 "started_at": rec.get("started_at"),
                 "port": rec.get("port"),
                 "observe_url": f"/session/{rec['session_id']}/observe",
-                "kernel": kernel,
+                "kernel": probe["kernel"],
                 # Whether that page will lead with the chat client: the child
                 # mounts it (only a `biopb mcp view` viewer does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
-                "chat": chat and console_enabled,
+                "chat": probe["chat"] and console_enabled,
+                # Whether the session serves a stop verb. Not gated on the bind
+                # the way chat is: the route lives under `api`, which is proxied
+                # everywhere, and stopping a session is no more destructive than
+                # the kernel restart already there.
+                "can_stop": probe["agentless"],
             }
-            for rec, (kernel, chat) in zip(records, probes, strict=True)
+            for rec, probe in zip(records, probes, strict=True)
         ]
         return JSONResponse({"sessions": sessions})
 
