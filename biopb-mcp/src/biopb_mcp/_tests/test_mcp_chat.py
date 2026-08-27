@@ -316,6 +316,38 @@ class TestExecuteCode:
         # ...and its own writer id, so the kernel's one-agent claim covers it.
         assert "writer='biopb-chat'" in snippet
 
+    def test_the_model_is_not_told_to_poll_for_a_handle_it_never_gets(self, chat_host):
+        # _dispatch already overrides the behaviour; the description has to be
+        # overridden at the same seam. Otherwise the loop's model is told a
+        # long cell comes back as job-N -- and handed poll_job to chase it with.
+        (payload,) = [
+            t["function"]
+            for t in asyncio.run(_chat.tool_payload())
+            if t["function"]["name"] == "execute_code"
+        ]
+        # Not the phrase "job handle", which the replacement uses to deny it --
+        # the promise itself.
+        assert "job-N" not in payload["description"]
+        assert "Poll it with poll_job" not in payload["description"]
+        assert "waits for the cell to finish" in payload["description"]
+        # The substitution found its paragraph: if the docstring is reworded,
+        # this fails rather than quietly restoring the wire wording.
+        assert _server.PROMOTE_PARAGRAPH not in payload["description"]
+        # ...and the rest is still the registry's own words, not a copy.
+        assert "napari kernel" in payload["description"]
+
+    def test_intent_asks_for_itself_on_the_parameter(self, chat_host):
+        # A function-calling model reads the schema per argument. With the
+        # guidance only in the prose, `intent` arrived as a bare optional
+        # string that nothing asked it to fill in.
+        (payload,) = [
+            t["function"]
+            for t in asyncio.run(_chat.tool_payload())
+            if t["function"]["name"] == "execute_code"
+        ]
+        intent = payload["parameters"]["properties"]["intent"]
+        assert "why" in intent["description"]
+
     def test_the_users_cells_reach_the_model_through_execute_code(self, chat_host):
         # The tool the model reaches for most, and the one path that carried no
         # notice: poll_job and server_status append it, but a model with no

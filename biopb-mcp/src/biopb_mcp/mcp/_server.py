@@ -12,10 +12,12 @@ import json
 import logging
 import os
 import time
+from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent, TextContent
+from pydantic import Field
 
 from . import _resources, _skills
 from ._kernel import KernelHost
@@ -846,15 +848,36 @@ def take_screenshot(canvas_only: bool = True) -> list:
     return [ImageContent(type="image", mimeType="image/png", data=data)]
 
 
-@mcp.tool()
-def execute_code(python_code: str, intent: str = "") -> str:
-    """Execute Python code in the napari kernel.
+#: ``intent``'s guidance, on the parameter rather than only in the prose above
+#: it: a function-calling model reads the schema per argument, and an
+#: undocumented optional string is one nothing asks it to fill in.
+_INTENT_DESC = (
+    "One short sentence on *why* you are running this cell -- the goal you are "
+    "pursuing for the user, not a restatement of what the code does. Recorded "
+    "with the job and written into the session's notebook export, which is "
+    "otherwise a log of code with no record of what anyone was trying to "
+    "achieve. Leave it empty rather than padding it."
+)
 
-    intent: one short sentence on *why* you are running this cell — the goal you
-    are pursuing for the user, not a restatement of what the code does. It is
-    recorded with the job and written into the session's notebook export, which
-    is otherwise a log of code with no record of what anyone was trying to
-    achieve. Leave it empty rather than padding it.
+#: The paragraph of :func:`execute_code`'s description that is true only over
+#: the wire. The in-process chat loop waits for the cell instead of promoting it,
+#: so it substitutes its own (``_chat._CHAT_RUN_PARAGRAPH``); named here, and
+#: pinned by a test, so a reworded docstring fails loudly rather than quietly
+#: leaving the loop's model told to poll for a handle it will never be given.
+PROMOTE_PARAGRAPH = """Code runs in a background thread so it does not block the main thread.
+    If it finishes quickly the result is returned inline; otherwise this returns
+    a job handle (job-N) and the code keeps running. Poll it with poll_job,
+    watch it with take_screenshot / server_status, and stop it with
+    interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
+    runs at a time."""
+
+
+@mcp.tool()
+def execute_code(
+    python_code: str,
+    intent: Annotated[str, Field(description=_INTENT_DESC)] = "",
+) -> str:
+    """Execute Python code in the napari kernel.
 
     The kernel is a full Jupyter/IPython kernel (imports allowed) with the
     namespace: viewer (with an add_tensor method), client(image data access), and ops (a
