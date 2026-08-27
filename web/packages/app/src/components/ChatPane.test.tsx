@@ -11,6 +11,11 @@ const status = (over: Partial<ChatStatus> = {}): ChatStatus => ({
   enabled: true,
   ready: true,
   reason: null,
+  engine: "builtin",
+  engines: [
+    { engine: "builtin", ready: true, reason: null },
+    { engine: "acp", ready: false, reason: "opencode is not installed" },
+  ],
   model: "claude-sonnet-5",
   compacted: 0,
   ...over,

@@ -17,13 +17,29 @@
 // body parses as JSON -- which is exactly how these readers would fail too.
 
 import { sessionFetch } from "./sessionFetch";
-import type { ChatMessage, LiveOutput } from "./chatThread";
+import type { AcpItem, ChatMessage, LiveOutput } from "./chatThread";
+
+/** Which agent drives the pane. `builtin` is the in-process loop; `acp` is a
+ * coding harness the user already runs, hosted over the Agent Client Protocol. */
+export type ChatEngine = "builtin" | "acp";
+
+/** One engine's availability, for the switcher. A view offering the choice has
+ * to be able to grey out the half that cannot run and say why. */
+export interface EngineRow {
+  engine: ChatEngine;
+  ready: boolean;
+  reason: string | null;
+}
 
 export interface ChatStatus {
   enabled: boolean;
   ready: boolean;
   /** Why chat cannot run, when it cannot — an unset API key, typically. */
   reason: string | null;
+  engine: ChatEngine;
+  engines: EngineRow[];
+  /** Who is answering: a model id under `builtin`, a harness name under `acp`.
+   * One field because to a reader they are one fact. */
   model: string;
   /** How many leading messages the model now sees only as a summary. The pane
    * renders all of them regardless, so this is the only sign compaction
@@ -31,12 +47,31 @@ export interface ChatStatus {
   compacted: number;
 }
 
+/** A slash command the agent advertises, which biopb neither defines nor runs.
+ *
+ * They arrive by notification and can change mid-session, which is why they
+ * ride the polled history read rather than the once-probed status. */
+export interface AgentCommand {
+  name: string;
+  description: string;
+  hint: string;
+}
+
 export interface HistoryPage {
+  /** The built-in loop's thread. Empty under the ACP engine. */
   messages: ChatMessage[];
+  /** The ACP thread. Null unless the child is running that engine — which is
+   * how a reader tells the two apart without asking, and why the child sends
+   * one key or the other rather than both. */
+  items: AcpItem[] | null;
+  /** The revision watermark to poll from next, under the ACP engine. */
+  rev: number | null;
   /** Whether this page is the whole thread rather than a delta — a cursor the
    * child did not recognise, which after a reset is every other window's. */
   full: boolean;
   busy: boolean;
+  /** What the agent says it can be asked to do. Empty under `builtin`. */
+  commands: AgentCommand[];
   /** The cell being polled right now, and what it has printed. */
   live: LiveOutput | null;
 }
@@ -57,6 +92,10 @@ export async function fetchChatStatus(base: string): Promise<ChatStatus | null> 
       enabled: !!j.enabled,
       ready: !!j.ready,
       reason: typeof j.reason === "string" ? j.reason : null,
+      // Defaulted to the built-in loop, not to nothing: an older child that
+      // does not send this field is one that only has that engine.
+      engine: j.engine === "acp" ? "acp" : "builtin",
+      engines: Array.isArray(j.engines) ? j.engines.map(readEngineRow) : [],
       model: typeof j.model === "string" ? j.model : "",
       // Read here or it does not exist: this builds the status field by field
       // rather than returning the body, so a key the type declares and the
@@ -68,27 +107,58 @@ export async function fetchChatStatus(base: string): Promise<ChatStatus | null> 
   }
 }
 
-/** The conversation after *after*, or all of it when *after* is unknown to the
- * child. Null on a failed read, so the pane keeps what it has. */
+function readEngineRow(raw: unknown): EngineRow {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  return {
+    engine: r.engine === "acp" ? "acp" : "builtin",
+    ready: !!r.ready,
+    reason: typeof r.reason === "string" ? r.reason : null,
+  };
+}
+
+/** The conversation after *cursor*, or all of it when the child does not
+ * recognise it. Null on a failed read, so the pane keeps what it has.
+ *
+ * *cursor* is a last-seen message id under the built-in loop and a revision
+ * watermark under ACP — two engines, two ways of saying "what I already have",
+ * because only one of them can express an item that changed in place. The pane
+ * holds whichever the child last gave it and passes it back unread. */
 export async function fetchHistory(
   base: string,
-  after: string | null,
+  cursor: string | number | null,
 ): Promise<HistoryPage | null> {
-  const q = after ? "?after=" + encodeURIComponent(after) : "";
+  const q =
+    cursor === null || cursor === ""
+      ? ""
+      : typeof cursor === "number"
+        ? "?since=" + cursor
+        : "?after=" + encodeURIComponent(cursor);
   try {
     const r = await sessionFetch(base + "/api/chat/history" + q);
     if (!r.ok) return null;
     const j = await r.json();
     return {
       messages: Array.isArray(j.messages) ? j.messages : [],
+      items: Array.isArray(j.items) ? j.items : null,
+      rev: typeof j.rev === "number" ? j.rev : null,
       // Absent on an older child, where every page was effectively a delta.
       full: !!j.full,
       busy: !!j.busy,
+      commands: Array.isArray(j.commands) ? j.commands.map(readCommand) : [],
       live: readLive(j.partial),
     };
   } catch {
     return null;
   }
+}
+
+function readCommand(raw: unknown): AgentCommand {
+  const c = (raw ?? {}) as Record<string, unknown>;
+  return {
+    name: typeof c.name === "string" ? c.name : "",
+    description: typeof c.description === "string" ? c.description : "",
+    hint: typeof c.hint === "string" ? c.hint : "",
+  };
 }
 
 /** `partial` off the history read, or null when no cell is running.
@@ -172,6 +242,61 @@ export async function resetThread(base: string): Promise<string | null> {
   if (r.status === 409) return "A turn is running. Cancel it first.";
   const d = await r.json().catch(() => ({}) as Record<string, unknown>);
   return String(d.error || `reset failed (${r.status})`);
+}
+
+/** Answer the question the agent is blocked on. Returns an error, or null.
+ *
+ * A null *optionId* is a deliberate refusal — the person dismissed the question
+ * rather than choosing from it — which the child forwards as ACP's `cancelled`
+ * outcome. A 409 means someone else already answered: two windows watch one
+ * conversation, and being second is not a mistake, so it reports as news rather
+ * than as a failure.
+ */
+export async function answerPermission(
+  base: string,
+  requestId: string,
+  optionId: string | null,
+): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await sessionFetch(base + "/chat/permission", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, option_id: optionId }),
+    });
+  } catch (e) {
+    return String(e);
+  }
+  if (r.ok) return null;
+  if (r.status === 409) return "That question was already answered.";
+  const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  return String(d.error || `could not answer (${r.status})`);
+}
+
+/** Switch which agent drives the pane. Returns an error to show, or null.
+ *
+ * The interesting failure is a 409 naming the client that holds the kernel: one
+ * agent runs code in a session, the claim is only released by a kernel restart,
+ * and a switch made anyway would produce a pane that answers questions and then
+ * refuses every cell. The child's message says so and names the way out.
+ */
+export async function setEngine(
+  base: string,
+  engine: ChatEngine,
+): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await sessionFetch(base + "/chat/engine", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine }),
+    });
+  } catch (e) {
+    return String(e);
+  }
+  if (r.ok) return null;
+  const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  return String(d.error || `could not switch (${r.status})`);
 }
 
 /** Stop the running turn. Nothing to report: cancelling nothing is a success,

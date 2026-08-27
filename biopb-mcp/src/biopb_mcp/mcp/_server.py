@@ -515,6 +515,18 @@ def clear_claim():
     _claimed_by = None
 
 
+def claim_holder():
+    """Who holds this kernel, as far as this process has seen, or ``None``.
+
+    A read for a caller deciding whether an action is worth offering at all --
+    the chat pane's engine switch, which would otherwise hand the session to a
+    second client that the kernel then refuses on its first cell. Mirrored, so
+    it can be stale in the safe direction only: it is set from what the kernel
+    actually said (:func:`_note_claim`), and cleared when the kernel is replaced.
+    """
+    return _claimed_by
+
+
 # Refusal for a client that does not hold this kernel's one-agent claim
 # (_jobs.submit). Shared by every state-changing tool so the agent gets one
 # explanation rather than three, and so the recovery named is the same in all of

@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   COMMANDS,
   contextReport,
+  localCommands,
   matchCommands,
   parseCommand,
 } from "./chatCommands";
+import type { AgentCommand } from "./chatClient";
 import type { ChatMessage } from "./chatThread";
 
 const msg = (over: Partial<ChatMessage> = {}): ChatMessage => ({
@@ -130,5 +132,61 @@ describe("contextReport", () => {
     const out = contextReport([msg()], 0, "claude-sonnet-5");
     expect(out).toContain("system prompt");
     expect(out).not.toMatch(/token/i);
+  });
+});
+
+const advertised: AgentCommand[] = [
+  { name: "review", description: "Review the diff", hint: "path" },
+  { name: "init", description: "Write an agent file", hint: "" },
+];
+
+describe("the two command namespaces", () => {
+  it("keeps only /new under a hosted harness", () => {
+    // /compact and /context act on the built-in loop's projection of the
+    // thread. A harness manages its own context and never shows us its budget,
+    // so both would be answering about a thread nobody reads.
+    expect(localCommands("acp").map((c) => c.typed)).toEqual(["/new"]);
+    expect(localCommands("builtin")).toEqual(COMMANDS);
+  });
+
+  it("sends an advertised command through as text, arguments and all", () => {
+    // ACP has no method for invoking one: the agent parses its own prefix, and
+    // its `input.hint` exists precisely because these take arguments.
+    expect(parseCommand("/review src/x.ts", "acp", advertised)).toEqual({
+      kind: "send",
+      text: "/review src/x.ts",
+    });
+  });
+
+  it("still refuses a name in neither namespace", () => {
+    // What keeps a typo'd /conect from silently becoming a prompt.
+    const parsed = parseCommand("/conect", "acp", advertised);
+    expect(parsed.kind).toBe("reject");
+    if (parsed.kind === "reject") expect(parsed.message).toContain("/review");
+  });
+
+  it("resolves a collision to the local command", () => {
+    const withNew: AgentCommand[] = [
+      { name: "new", description: "the agent's own", hint: "" },
+    ];
+    expect(parseCommand("/new", "acp", withNew)).toEqual({
+      kind: "command",
+      name: "new",
+    });
+  });
+
+  it("does not offer the agent's commands at all", () => {
+    // Accepted but not advertised. biopb gives the harness an empty throwaway
+    // cwd, and a coding agent's commands are about a project: /review has no
+    // repo, /init writes a file that dies with the temp dir. Listing them would
+    // advertise no-ops.
+    expect(matchCommands("/rev", "acp")).toEqual([]);
+    expect(matchCommands("/", "acp").map((c) => c.typed)).toEqual(["/new"]);
+  });
+
+  it("leaves a path that starts with a slash as prose", () => {
+    expect(parseCommand("/data/run3/stack.tif is the one", "acp", advertised)).toEqual(
+      { kind: "send", text: "/data/run3/stack.tif is the one" },
+    );
   });
 });

@@ -4,6 +4,12 @@
 against `1d542391`; the in-process loop spike below was run 2026-08-25 and
 settles the hand-roll-vs-vendor question.
 
+The loop has since been built, and so has a second engine beside it: the pane
+can instead host a harness the user already runs, over ACP
+([chat-acp-engine.md](chat-acp-engine.md)). That answers the "complementary, not
+a substitute" line under *Vendoring* — both are shipped, and which one a session
+uses is `chat.engine`.
+
 Three things have since been settled and are marked where they are argued:
 chat runs in **local mode only** (*Where chat may run*); the loop must not take
 `execute_code`'s promote window (*the one tool not to take as-is*); and

@@ -42,16 +42,27 @@ export function sendsOnEnter(e: {
  *   muscle memory, and spending it on a chat turn in the *other* column is a
  *   surprise. The console does not bind it today; this leaves it free to.
  */
-export type EscAction = "close-image" | "cancel-turn" | "none";
+export type EscAction =
+  | "close-image"
+  | "refuse-permission"
+  | "cancel-turn"
+  | "none";
 
 export function escAction(state: {
   composing: boolean;
   imageOpen: boolean;
   inConsole: boolean;
   busy: boolean;
+  permissionOpen?: boolean;
 }): EscAction {
   if (state.composing) return "none";
   if (state.imageOpen) return "close-image";
   if (state.inConsole) return "none";
+  // Ahead of the cancel, and the reason is the dismiss-innermost rule rather
+  // than an exception to it: a question the agent is blocked on is the
+  // innermost thing on screen. It is also the kinder reading of the keypress --
+  // "no, don't do that" refuses one action, where a cancel throws away the
+  // whole turn that led to it.
+  if (state.permissionOpen) return "refuse-permission";
   return state.busy ? "cancel-turn" : "none";
 }

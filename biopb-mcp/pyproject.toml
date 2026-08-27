@@ -115,7 +115,7 @@ tables = [
 # fresh from PyPI, not from uv.lock -- swallow the new major, so every release
 # back to 0.8.0 installs a server that cannot start. Lift the cap only together
 # with the FastMCP port and a re-examined override.
-mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn"]
+mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn", "agent-client-protocol>=0.12,<1"]
 3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a

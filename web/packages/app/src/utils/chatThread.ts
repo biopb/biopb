@@ -46,7 +46,27 @@ export interface ToolCallItem {
   live?: boolean;
 }
 
-export type ThreadItem = MessageItem | ToolCallItem;
+/** A question the agent is blocked on, waiting for someone to answer.
+ *
+ * Only the ACP engine produces these: the built-in loop calls biopb's own tools
+ * and asks nobody. The options are the *agent's*, verbatim — it decides what
+ * they mean, so the pane offers exactly what it was given and invents nothing. */
+export interface PermissionItem {
+  kind: "permission";
+  id: string;
+  /** What the agent wants to do, in its own words. */
+  title: string;
+  /** ACP's classification — "edit", "execute", … — or "" when it gave none.
+   * An edit's title is a bare path, so this is what says what will happen. */
+  toolKind: string;
+  options: { id: string; name: string; kind: string }[];
+  /** The id the answer is addressed to. */
+  requestId: string;
+  /** The option chosen, `"cancelled"` if it was refused, null while open. */
+  outcome: string | null;
+}
+
+export type ThreadItem = MessageItem | ToolCallItem | PermissionItem;
 
 /** What the cell being polled right now has printed so far.
  *
@@ -275,6 +295,116 @@ export function applyLiveOutput(
   return items;
 }
 
+/** The wire shape of one `/api/chat/history` item under the ACP engine.
+ *
+ * Already the pane's shape, because the child does the translating: it holds
+ * the protocol connection, so it is the only side that ever sees ACP's own
+ * spelling. What arrives here is a thread, not a protocol. */
+export interface AcpItem {
+  id: string;
+  kind: "message" | "tool_call" | "permission";
+  rev: number;
+  role?: "user" | "assistant";
+  blocks?: Block[];
+  error?: boolean;
+  cancelled?: boolean;
+  title?: string;
+  status?: ToolStatus;
+  request_id?: string;
+  tool_kind?: string;
+  options?: { id: string; name: string; kind: string }[];
+  outcome?: string | null;
+}
+
+/**
+ * Merge a polled `?since=<rev>` page into what the pane already holds.
+ *
+ * Not `mergeHistory`: that one deduplicates, because the built-in loop's thread
+ * only ever grows and a repeat is an overlap between two polls. Here a repeat is
+ * the *point* — a tool call moving to `completed` arrives as the same id again —
+ * so an item in the page replaces the one it names and appends only if it is new.
+ */
+export function mergeAcpItems(
+  existing: AcpItem[],
+  incoming: AcpItem[],
+  full = false,
+): AcpItem[] {
+  if (full) return incoming;
+  if (!incoming.length) return existing;
+  const out = existing.slice();
+  const at = new Map(out.map((item, i) => [item.id, i]));
+  for (const item of incoming) {
+    const i = at.get(item.id);
+    if (i === undefined) {
+      at.set(item.id, out.length);
+      out.push(item);
+    } else {
+      out[i] = item;
+    }
+  }
+  return out;
+}
+
+/**
+ * Project an ACP thread onto the items the pane renders.
+ *
+ * *busy* does the same job it does for the built-in loop: a call the agent
+ * never reported finishing is running while the turn is, and abandoned once it
+ * is not. The agent is not obliged to close every call it opens — a cancelled
+ * turn leaves them open by design — so this is the only thing that stops a
+ * spinner from spinning forever.
+ */
+export function fromAcpItems(items: AcpItem[], busy = false): ThreadItem[] {
+  const out: ThreadItem[] = [];
+  for (const item of items) {
+    if (item.kind === "message") {
+      out.push({
+        kind: "message",
+        id: item.id,
+        role: item.role === "user" ? "user" : "assistant",
+        blocks: item.blocks ?? [],
+        ...(item.error ? { error: true } : {}),
+        ...(item.cancelled ? { cancelled: true } : {}),
+      });
+    } else if (item.kind === "tool_call") {
+      const status = item.status ?? "pending";
+      out.push({
+        kind: "tool_call",
+        id: item.id,
+        title: item.title || "(tool)",
+        status:
+          !busy && (status === "pending" || status === "in_progress")
+            ? "failed"
+            : status,
+        blocks: item.blocks ?? [],
+      });
+    } else if (item.kind === "permission") {
+      out.push({
+        kind: "permission",
+        id: item.id,
+        title: item.title || "run something",
+        toolKind: item.tool_kind ?? "",
+        options: item.options ?? [],
+        requestId: item.request_id ?? "",
+        outcome: item.outcome ?? null,
+      });
+    }
+  }
+  return out;
+}
+
+/** The question the pane should be asking right now, if any.
+ *
+ * At most one: the agent blocks on each in turn, so a second open question
+ * means the first was answered and the child has not been polled since. */
+export function openPermission(items: ThreadItem[]): PermissionItem | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i]!;
+    if (item.kind === "permission" && item.outcome === null) return item;
+  }
+  return null;
+}
+
 /** The newest line worth showing on one line — what a collapsed group reports
  * while its cell runs. Trailing blank lines are what a `print()` leaves. */
 export function latestLine(text: string): string {
@@ -290,6 +420,7 @@ export function latestLine(text: string): string {
  * round to one line. */
 export type ThreadGroup =
   | { kind: "message"; id: string; item: MessageItem }
+  | { kind: "permission"; id: string; item: PermissionItem }
   | { kind: "tools"; id: string; calls: ToolCallItem[]; images: ImageBlock[] };
 
 export function groupThread(items: ThreadItem[]): ThreadGroup[] {
@@ -297,6 +428,14 @@ export function groupThread(items: ThreadItem[]): ThreadGroup[] {
   for (const item of items) {
     if (item.kind === "message") {
       groups.push({ kind: "message", id: item.id, item });
+      continue;
+    }
+    // Never folded into a tool group, even sitting among tool calls, which is
+    // exactly where one arrives: it is the only item in the thread that is
+    // *asking* the reader something, and a question inside a collapsed round is
+    // a question nobody answers.
+    if (item.kind === "permission") {
+      groups.push({ kind: "permission", id: item.id, item });
       continue;
     }
     const last = groups[groups.length - 1];

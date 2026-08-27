@@ -75,6 +75,13 @@ class TestRootSplit:
 class TestStatus:
     def test_reports_ready_when_configured(self, client):
         body = client.get("/api/chat/status").json()
+        # Lifted out and asserted on its own: whether the *ACP* engine is ready
+        # depends on whether a harness is installed on the machine running the
+        # tests, which is not something this case is about.
+        engines = body.pop("engines")
+        assert [e["engine"] for e in engines] == ["builtin", "acp"]
+        assert engines[0] == {"engine": "builtin", "ready": True, "reason": None}
+        assert set(engines[1]) == {"engine", "ready", "reason"}
         assert body == {
             "enabled": True,
             "ready": True,
@@ -85,6 +92,7 @@ class TestStatus:
             # message either way, so compaction would otherwise be invisible to
             # the person who asked for it.
             "compacted": 0,
+            "engine": "builtin",
         }
 
     def test_reports_why_it_is_not_ready(self, client, configured):

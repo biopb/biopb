@@ -508,6 +508,24 @@ def _serve_http(config, port, view=False):
     # even on a Ctrl-C that arrives during the viewer's bring-up.
     session_id = None
 
+    def _stop_acp_agent():
+        """Reap the chat pane's ACP harness and remove its scratch dir.
+
+        Guarded and imported late for the same reason the chat mount is: an
+        engine that was never used, or a module that failed to import, must not
+        be able to stop this process from exiting.
+        """
+        try:
+            from . import _chat_acp
+
+            _chat_acp.stop_sync()
+            _chat_acp.cleanup_cwd()
+        except Exception:  # noqa: BLE001 - teardown is best-effort
+            logger.debug("stopping the ACP agent failed", exc_info=True)
+
+    # Backstop for the exits that skip _shutdown, matching the dask cluster's.
+    atexit.register(_stop_acp_agent)
+
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
         server loop returning: reap the kernel, close the session-child-owned
@@ -527,6 +545,10 @@ def _serve_http(config, port, view=False):
         # the registry's own pid-liveness prune is the backstop for a kill this
         # never runs for.
         _unregister_session(session_id)
+        # Before the kernel: an ACP harness holds an MCP session against this
+        # server, so it is a client, and clients go before the thing they are
+        # attached to. Cheap and idempotent when chat never ran.
+        _stop_acp_agent()
         host.shutdown()
         # After the kernel is reaped (no clients left attached): stop the
         # session-child-owned cluster, then rmtree its now-idle spill dir. This
