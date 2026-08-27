@@ -223,10 +223,21 @@ class TestJobRunnerUnit:
         summ = {j["job_id"]: j for j in _jobs.jobs_summary()}[jid]
         assert summ["code_preview"] == "print('first real line')"
 
-    def test_code_preview_helper(self):
-        assert _jobs._code_preview("") == ""
-        assert _jobs._code_preview("\n\n  hello  \nworld") == "hello"
-        capped = _jobs._code_preview("x" * 100)
+    def test_jobs_summary_has_intent_preview(self, runner):
+        # What the row actually shows. Empty when nobody said why, which is the
+        # case the UI falls back to the code line for.
+        jid = _jobs.submit("x = 1", intent="isolate the nuclei channel")["job_id"]
+        bare = _jobs.submit("y = 2")["job_id"]
+        self._wait(jid)
+        self._wait(bare)
+        summ = {j["job_id"]: j for j in _jobs.jobs_summary()}
+        assert summ[jid]["intent_preview"] == "isolate the nuclei channel"
+        assert summ[bare]["intent_preview"] == ""
+
+    def test_one_line_helper(self):
+        assert _jobs._one_line("") == ""
+        assert _jobs._one_line("\n\n  hello  \nworld") == "hello"
+        capped = _jobs._one_line("x" * 100)
         assert len(capped) == 80 and capped.endswith("…")
 
 

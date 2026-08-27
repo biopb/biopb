@@ -572,13 +572,13 @@ def interrupt_current(reason=None, requester="user", writer=None):
     return {"job_id": job.job_id, "interrupted": bool(raised)}
 
 
-def _code_preview(code, limit=80):
-    """First non-blank line of *code*, trimmed and length-capped.
+def _one_line(text, limit=80):
+    """First non-blank line of *text*, trimmed and length-capped.
 
-    Keeps jobs_summary light (the full source is in the per-job snapshot) while
-    giving each list row an identifying one-liner.
+    Keeps jobs_summary light (the full source and the full intent are both in
+    the per-job snapshot) while giving each list row an identifying one-liner.
     """
-    for line in code.splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if line:
             return line if len(line) <= limit else line[: limit - 1] + "…"
@@ -593,7 +593,12 @@ def jobs_summary():
             "origin": j.origin,
             "elapsed": j.elapsed(),
             "stdout_len": len(j.stdout.getvalue()),
-            "code_preview": _code_preview(j.code),
+            "code_preview": _one_line(j.code),
+            # Why the cell was run, when whoever ran it said. The observe list
+            # prefers it over the code line: "isolate the nuclei channel" tells
+            # the person watching what is happening to their data, and
+            # `arr = arr[..., 1]` makes them reconstruct it.
+            "intent_preview": _one_line(j.intent),
         }
         for j in _jobs.values()
     ]

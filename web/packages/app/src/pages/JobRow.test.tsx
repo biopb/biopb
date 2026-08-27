@@ -28,6 +28,21 @@ const render = (j: ReturnType<typeof job>) =>
   );
 
 describe("JobRow", () => {
+  it("says why the cell was run, when whoever ran it said", () => {
+    const html = render(job({ intent_preview: "isolate the nuclei channel" }));
+    expect(html).toContain("isolate the nuclei channel");
+    // Why *instead of* what: the row has one line, and the code is in the
+    // detail this row expands to.
+    expect(html).not.toContain("print(1)");
+  });
+
+  it("falls back to the code line when nobody said", () => {
+    // The user console submits no intent, and neither does an older child.
+    for (const j of [job(), job({ intent_preview: "" })]) {
+      expect(render(j)).toContain("print(1)");
+    }
+  });
+
   it("offers interrupt on the cell that is running", () => {
     // Matched on the class, not the word: an `interrupted` job's own status
     // badge says "interrupted", which is a substring of it.
