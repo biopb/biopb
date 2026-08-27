@@ -7,7 +7,13 @@ vi.mock("../auth", () => ({
   redirectToUnlock: vi.fn(),
 }));
 
-import { fetchChatStatus, fetchEngine, fetchHistory } from "./chatClient";
+import {
+  fetchChatStatus,
+  fetchEngine,
+  fetchHistory,
+  fetchModels,
+  setModel,
+} from "./chatClient";
 
 const answering = (body: unknown) =>
   vi.stubGlobal(
@@ -75,5 +81,62 @@ describe("fetchHistory", () => {
   it("treats a child that does not say as sending a delta", async () => {
     answering({ messages: [], busy: false });
     expect((await fetchHistory("/s", "m-1"))!.full).toBe(false);
+  });
+});
+
+describe("fetchModels", () => {
+  it("takes the choices, and names one that came without a name", () => {
+    answering({
+      model: "openai/gpt-5.5",
+      choices: [{ value: "openai/gpt-5.5", name: "GPT-5.5" }, { value: "x/y" }],
+    });
+    return fetchModels("/s").then((m) => {
+      expect(m).toEqual({
+        model: "openai/gpt-5.5",
+        choices: [
+          { value: "openai/gpt-5.5", name: "GPT-5.5" },
+          { value: "x/y", name: "x/y" },
+        ],
+      });
+    });
+  });
+
+  it("drops a choice with no value rather than offering a blank row", async () => {
+    answering({ model: "m", choices: [{ name: "no value" }, null, { value: "ok" }] });
+    expect((await fetchModels("/s"))!.choices).toEqual([
+      { value: "ok", name: "ok" },
+    ]);
+  });
+
+  it("reads an engine with no list as having none, not as unreachable", async () => {
+    // The built-in loop. Null is a failed read and means keep what you have;
+    // an empty list is an answer.
+    answering({ model: "test-model", choices: [] });
+    expect((await fetchModels("/s"))!.choices).toEqual([]);
+  });
+});
+
+describe("setModel", () => {
+  const refusing = (status: number, body: unknown) =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(body), { status })),
+    );
+
+  it("passes on what the agent does offer", async () => {
+    // The refusal has to say what to type instead, or it sends the reader to
+    // the config file to find out.
+    refusing(400, { error: "opencode does not offer 'gpt-6'. Offered: x, y" });
+    expect(await setModel("/s", "gpt-6")).toContain("Offered: x, y");
+  });
+
+  it("reads a busy session as state rather than as a failure", async () => {
+    refusing(409, {});
+    expect(await setModel("/s", "x")).toContain("turn is running");
+  });
+
+  it("is null when it took", async () => {
+    answering({ model: "x" });
+    expect(await setModel("/s", "x")).toBe(null);
   });
 });

@@ -199,16 +199,57 @@ rather than after it.
   illustration — `/review` has no repo, `/init` writes an AGENTS.md that dies
   with the temp dir, `/customize-opencode` edits config that biopb pins or that
   the temp dir takes with it. Revisit if the harness is ever given a real
-  persistent workspace. Locally, `/new` survives under this engine; `/compact`
-  and `/context` do not, since they act on the built-in loop's projection of a
-  thread the harness never reads.
-- **The model is named, not inherited.** `chat.acp_model` is applied with
-  `session/set_config_option` after `session/new`. A fresh session otherwise
-  takes the harness's default, which is a model the user did not choose on a
-  provider that may be unreachable — observed: opencode's default
-  `opencode/big-pickle` failed with "Endpoint is unavailable" while the CLI
-  worked, because the CLI's model choice lives in opencode's session store and
-  a new session does not inherit it.
+  persistent workspace. Locally, `/new`, `/context` and `/model` survive under
+  this engine; `/compact` does not, since it folds the built-in loop's
+  projection of a thread the harness never reads — and ACP has no compaction
+  method to forward it to. `/context` is *better* here: the agent reports its
+  own `used`/`size` rather than the pane estimating from characters.
+- **`chat.acp_model` overrides; it is not required.** When set, it is applied
+  with `session/set_config_option` after `session/new`. When unset, the harness
+  decides — and it decides from *its own config file*, which biopb does not
+  shadow: `OPENCODE_CONFIG_CONTENT` merges rather than replaces, outranking the
+  file only for the keys it declares (permissions, the MCP suppression), and
+  `model` is not one of them. Measured, spawning `opencode acp` three ways: no
+  env pin and no file model → `opencode/big-pickle`; biopb's pin over a file
+  saying `openai/gpt-5.4` → `openai/gpt-5.4`; a pin that does carry `model` →
+  that model.
+
+  What a new session cannot inherit is the choice made in opencode's **TUI**,
+  which lives in its session store rather than its config. So a user whose CLI
+  works fine can still land on the built-in default here — observed:
+  `opencode/big-pickle` failing with "Endpoint is unavailable" while the CLI
+  worked. Setting a model in the harness's own config fixes that for both;
+  `chat.acp_model` and `/model` are for pointing *this* session somewhere else.
+- **The model moves at runtime, which is why it is not pinned.** `/model` reads
+  `GET /api/chat/models` and writes `POST /chat/model`; under ACP that is
+  another `session/set_config_option` on the *live* session, so changing model
+  does not cost the conversation. Under the built-in loop it is `chat.model`,
+  which `_model.make_model` reads per provider call — so the switch lands on the
+  next call, with no restart. Refused mid-turn under both: a turn is several
+  provider calls, and switching between them answers half a round in one voice
+  and half in another. Not persisted, for the reason the engine is not.
+
+  The list is never ours to keep. The harness states its own in
+  `config_options`, groups flattened; the built-in loop reads the provider's
+  `GET {base_url}/models`, which is optional in the OpenAI-compatible shape, so
+  a provider that does not answer it is reported as publishing no list rather
+  than as having one model.
+
+  **The two are not symmetric, and the write path is shaped by it.** ACP has no
+  session-less way to ask what exists: `config_options` rides `session/new`,
+  `session/load`, `session/fork` and the set call itself, and nothing else. So
+  `POST /chat/model` *starts the agent* under this engine before it validates.
+  Without that, a name typed before the first turn is a name nobody checked —
+  it is checked at spawn, found wanting, and silently replaced by the harness's
+  default, leaving the pane naming a model it is not using. (Observed:
+  `gpt-5.6-luna` accepted, where opencode offers `openai/gpt-5.6-luna`.)
+  Starting the agent does not cost the engine switch: the one-agent claim is
+  taken when a client *runs code*, not when one connects.
+
+  The spawn-time fallback that remains — a bad `chat.acp_model` in the config
+  file, which no keystroke can intercept — now lands in the thread as well as
+  the log. The only other sign was the header quietly naming a model the user
+  did not choose.
 - **Threads move the pipes.** The harness is a plain `Popen` behind an
   `acp.Transport`, not `asyncio.create_subprocess_exec`: on Windows this server
   runs on the Selector loop, which implements neither subprocesses nor pipes.

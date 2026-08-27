@@ -379,6 +379,11 @@ class _PaneClient:
             _set_commands(data.get("availableCommands") or [])
         elif kind == "usage_update":
             _set_usage(data)
+        elif kind == "config_option_update":
+            # The harness changing its own mind -- a model picked in its TUI, or
+            # one swapped out from under a session. Taken rather than ignored so
+            # the pane names the model that is actually answering.
+            _note_config_options(data.get("configOptions"))
 
     async def request_permission(self, session_id, tool_call, options, **kwargs):
         from acp.schema import AllowedOutcome, DeniedOutcome, RequestPermissionResponse
@@ -512,6 +517,113 @@ def commands():
 
 def usage():
     return dict(_usage)
+
+
+# The models the harness offers and the one this session is on. Recorded when
+# the session opens and refreshed from every answer that carries the options,
+# so `/model` can list them without a round trip and a model changed inside the
+# harness is not reported back as the one we last set.
+_model_choices: list = []
+_model_current = None
+
+
+def _flatten_select(option):
+    """The values a select option offers, groups flattened away.
+
+    A harness may send a flat list or one grouped by provider (opencode groups),
+    and the difference is presentation, not meaning: a `/model` list is a list.
+    Getting this wrong is not cosmetic -- reading a group as an option yields a
+    value of None, which is what a validity check would then compare against.
+    """
+    out = []
+    for entry in option.get("options") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("group") is not None or (
+            "value" not in entry and entry.get("options")
+        ):
+            out.extend(e for e in entry.get("options") or [] if isinstance(e, dict))
+        else:
+            out.append(entry)
+    return [
+        {"value": e["value"], "name": e.get("name") or e["value"]}
+        for e in out
+        if e.get("value")
+    ]
+
+
+def _note_config_options(options):
+    """Take the session's config options as the harness last stated them."""
+    global _model_choices, _model_current
+    for raw in options or ():
+        opt = raw if isinstance(raw, dict) else _dump(raw)
+        if opt.get("id") != "model":
+            continue
+        _model_choices = _flatten_select(opt)
+        if opt.get("currentValue") is not None:
+            _model_current = opt.get("currentValue")
+        return
+
+
+def model_choices():
+    return list(_model_choices)
+
+
+def current_model():
+    return _model_current
+
+
+async def set_model(value):
+    """Point the running session at *value*.
+
+    Runtime rather than a respawn, which is the whole reason the model is not in
+    the pinned environment (:func:`_pinned_config`): changing model should not
+    cost the conversation.
+
+    Raises ``ValueError`` when the harness does not offer the model. Checked
+    here against what it advertised, so a typo says so in the pane instead of
+    failing at the provider on the next turn -- and unchecked when it advertised
+    nothing, because then we have nothing to check against and refusing would
+    withhold a model that works.
+    """
+    global _model_current
+    if _conn is None or _session_id is None:
+        raise ValueError("the agent is not running yet")
+    known = [c["value"] for c in _model_choices]
+    if known and value not in known:
+        raise ValueError(
+            f"{_agent_name or 'the agent'} does not offer {value!r}. "
+            f"Offered: {', '.join(known[:8])}" + ("..." if len(known) > 8 else "")
+        )
+    reply = await _conn.set_config_option(
+        config_id="model", session_id=_session_id, value=value
+    )
+    _model_current = value
+    # The answer carries the options as they now stand; taking them keeps the
+    # list honest when setting one model changes what the others are.
+    _note_config_options(getattr(reply, "config_options", None))
+    return value
+
+
+async def choose_model(value, config):
+    """Set the model a person just typed, starting the agent if it is not up.
+
+    The agent is otherwise started by the first turn, and before that there is
+    no session -- so no advertised list, so nothing to check a name against.
+    ACP has no session-less way to ask: ``config_options`` rides
+    ``session/new``, ``session/load``, ``session/fork`` and the set call itself,
+    and nothing else. A name accepted unchecked is then applied at spawn, found
+    wanting, and silently replaced by the harness's default, which is a pane
+    that reported a model it is not using.
+
+    So this starts it. Cheap next to the alternative, and it does not take the
+    kernel with it: the one-agent claim is made when a client *runs code*
+    (``_server._presume_claim``, on submit), not when one connects, so a switch
+    back to the built-in loop is still available afterwards.
+    """
+    async with _lock():
+        await ensure_agent(config)
+        return await set_model(value)
 
 
 # --------------------------------------------------------------------------- #
@@ -824,11 +936,11 @@ async def ensure_agent(config):
 
     _child, _conn, _agent_name = child, conn, name
     _session_id = session.session_id
-    await _apply_model(conn, session, get_setting(config, "chat.acp_model"))
+    await _apply_model(session, get_setting(config, "chat.acp_model"))
     logger.info("ACP agent %s ready (session %s)", name, _session_id)
 
 
-async def _apply_model(conn, session, wanted):
+async def _apply_model(session, wanted):
     """Point the new session at the configured model, if one was named.
 
     A fresh session takes the harness's default, and the default is neither
@@ -841,31 +953,33 @@ async def _apply_model(conn, session, wanted):
     session that still works, on the default; refusing to open the pane over it
     would trade a degraded chat for no chat.
     """
+    global _model_choices, _model_current
+    _model_choices, _model_current = [], None
+    _note_config_options(getattr(session, "config_options", None))
     if not wanted:
         return
-    options = getattr(session, "config_options", None) or []
-    model = next((o for o in options if getattr(o, "id", None) == "model"), None)
-    if model is None:
+    if not _model_choices and _model_current is None:
         logger.warning(
             "chat.acp_model is set but %s exposes no model setting; using its default",
             _agent_name,
         )
         return
-    # Checked against what the harness offered, so a typo says so here instead
-    # of failing at the provider on the first turn.
-    known = [getattr(o, "value", None) for o in getattr(model, "options", None) or []]
-    if known and wanted not in known:
-        logger.warning(
-            "chat.acp_model %r is not one this agent offers (%s...); using its default",
-            wanted,
-            ", ".join(str(k) for k in known[:4]),
-        )
-        return
     try:
-        await conn.set_config_option(
-            config_id="model", session_id=session.session_id, value=wanted
-        )
+        await set_model(wanted)
         logger.info("ACP session model set to %s", wanted)
+    except ValueError as exc:
+        # A typo in the config file is not worth refusing to open the pane over:
+        # the session still works, on the harness's default. But it is worth
+        # *saying* -- the only other sign is the model name in the header
+        # quietly becoming one the user did not choose, which reads as the pane
+        # being wrong rather than as a setting being.
+        logger.warning("%s; using its default", exc)
+        running = _model_current or "its default"
+        note_error(
+            f"chat.acp_model is {wanted!r}, which {_agent_name or 'the agent'} "
+            f"does not offer. Answering as {running} instead — "
+            "/model lists what it does offer."
+        )
     except Exception as exc:  # noqa: BLE001 - a default model still works
         logger.warning("could not set the ACP model to %r: %s", wanted, exc)
 
@@ -900,10 +1014,13 @@ def _own_mcp_url():
 
 async def shutdown():
     """Stop the harness. Idempotent, and safe to call on a dead one."""
-    global _child, _conn, _session_id
+    global _child, _conn, _session_id, _model_choices, _model_current
     _cancel_pending()
     conn, child = _conn, _child
     _conn, _child, _session_id = None, None, None
+    # The model belonged to that session. Left behind it would name a model
+    # nothing is running on.
+    _model_choices, _model_current = [], None
     if conn is not None:
         try:
             await conn.close()
@@ -918,9 +1035,10 @@ async def shutdown():
 
 def stop_sync():
     """Reap the harness from a non-async caller (``atexit``, ``_shutdown``)."""
-    global _child, _conn, _session_id
+    global _child, _conn, _session_id, _model_choices, _model_current
     child = _child
     _conn, _child, _session_id = None, None, None
+    _model_choices, _model_current = [], None
     if child is not None:
         try:
             child.stop()

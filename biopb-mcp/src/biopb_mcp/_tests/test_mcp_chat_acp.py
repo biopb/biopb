@@ -450,6 +450,43 @@ class TestHttpSurface:
             "model": "test-model",
         }
 
+    def test_choosing_a_model_starts_the_agent_to_check_it(
+        self, acp_client, monkeypatch
+    ):
+        """Only a running session can say which models exist, so a name taken
+        before one is a name nobody checked -- and the check that does happen,
+        at spawn, only falls back to the default and logs it."""
+        called = []
+
+        async def choose(value, config):
+            called.append(value)
+
+        monkeypatch.setattr(_chat_acp, "choose_model", choose)
+        r = self.post(acp_client, "/chat/model", {"model": "openai/gpt-5.5"})
+        assert r.status_code == 200
+        assert called == ["openai/gpt-5.5"]
+        # Written to the config as well, so a `/new` respawn comes back on it.
+        assert acp_client.get("/api/chat/models").json()["model"] == "openai/gpt-5.5"
+
+    def test_a_name_the_agent_does_not_offer_is_refused_when_it_is_typed(
+        self, acp_client, monkeypatch
+    ):
+        """The case this exists for: `gpt-5.6-luna` when opencode offers
+        `openai/gpt-5.6-luna`. Answered at the keystroke, with the names."""
+
+        async def choose(value, config):
+            raise ValueError(
+                "opencode does not offer 'gpt-5.6-luna'. "
+                "Offered: openai/gpt-5.5, openai/gpt-5.6-luna"
+            )
+
+        monkeypatch.setattr(_chat_acp, "choose_model", choose)
+        r = self.post(acp_client, "/chat/model", {"model": "gpt-5.6-luna"})
+        assert r.status_code == 400
+        assert "openai/gpt-5.6-luna" in r.json()["error"]
+        # And not written: a refused name must not become what a respawn uses.
+        assert acp_client.get("/api/chat/models").json()["model"] == ""
+
     def test_an_unknown_engine_is_refused(self, acp_client):
         assert (
             self.post(acp_client, "/chat/engine", {"engine": "vim"}).status_code == 400
@@ -467,16 +504,19 @@ class TestHttpSurface:
 
 
 class TestModelSelection:
-    """`chat.acp_model` is applied to the session the harness just opened."""
-
-    class Opt:
-        def __init__(self, value):
-            self.value = value
+    """The model the session runs on: named at open, changed at runtime."""
 
     class ConfigOption:
-        def __init__(self, option_id, options):
-            self.id = option_id
-            self.options = options
+        """Stands in for acp's ``SessionConfigOptionSelect`` -- what ``_dump``
+        sees. Wire spelling, because that is what the real one dumps to."""
+
+        def __init__(self, option_id, options, current=None):
+            self._wire = {"id": option_id, "options": options}
+            if current is not None:
+                self._wire["currentValue"] = current
+
+        def model_dump(self, **_):
+            return dict(self._wire)
 
     class Session:
         session_id = "ses_1"
@@ -491,12 +531,28 @@ class TestModelSelection:
         async def set_config_option(self, **kw):
             self.calls.append(kw)
 
-    def session(self, values=("openai/gpt-5.5", "opencode/big-pickle")):
-        return self.Session([self.ConfigOption("model", [self.Opt(v) for v in values])])
+    @pytest.fixture
+    def conn(self, monkeypatch):
+        """A live session, which is what a model change acts on."""
+        c = self.Conn()
+        monkeypatch.setattr(_chat_acp, "_conn", c)
+        monkeypatch.setattr(_chat_acp, "_session_id", "ses_1")
+        monkeypatch.setattr(_chat_acp, "_agent_name", "opencode")
+        monkeypatch.setattr(_chat_acp, "_model_choices", [])
+        monkeypatch.setattr(_chat_acp, "_model_current", None)
+        return c
 
-    def test_names_the_model_when_one_is_configured(self):
-        conn = self.Conn()
-        asyncio.run(_chat_acp._apply_model(conn, self.session(), "openai/gpt-5.5"))
+    def session(self, values=("openai/gpt-5.5", "opencode/big-pickle"), current=None):
+        return self.Session(
+            [
+                self.ConfigOption(
+                    "model", [{"value": v} for v in values], current=current
+                )
+            ]
+        )
+
+    def test_names_the_model_when_one_is_configured(self, conn):
+        asyncio.run(_chat_acp._apply_model(self.session(), "openai/gpt-5.5"))
         assert conn.calls == [
             {
                 "config_id": "model",
@@ -505,30 +561,135 @@ class TestModelSelection:
             }
         ]
 
-    def test_leaves_the_default_alone_when_none_is(self):
-        conn = self.Conn()
-        asyncio.run(_chat_acp._apply_model(conn, self.session(), ""))
+    def test_leaves_the_default_alone_when_none_is(self, conn):
+        asyncio.run(_chat_acp._apply_model(self.session(), ""))
         assert conn.calls == []
 
-    def test_a_model_the_agent_does_not_offer_is_not_sent(self):
+    def test_a_model_the_agent_does_not_offer_is_not_sent(self, conn):
         """A typo should say so here, not fail at the provider on turn one."""
-        conn = self.Conn()
-        asyncio.run(_chat_acp._apply_model(conn, self.session(), "openai/gpt-5.5-typo"))
+        asyncio.run(_chat_acp._apply_model(self.session(), "openai/gpt-5.5-typo"))
         assert conn.calls == []
 
-    def test_an_agent_with_no_model_setting_is_not_an_error(self):
-        conn = self.Conn()
-        asyncio.run(_chat_acp._apply_model(conn, self.Session([]), "openai/gpt-5.5"))
+    def test_an_agent_with_no_model_setting_is_not_an_error(self, conn):
+        asyncio.run(_chat_acp._apply_model(self.Session([]), "openai/gpt-5.5"))
         assert conn.calls == []
 
-    def test_a_refused_set_still_leaves_a_usable_session(self):
+    def test_a_refused_set_still_leaves_a_usable_session(self, conn, monkeypatch):
         """Degraded chat beats no chat: the default model still answers."""
 
         class Failing(self.Conn):
             async def set_config_option(self, **kw):
                 raise RuntimeError("nope")
 
-        asyncio.run(_chat_acp._apply_model(Failing(), self.session(), "openai/gpt-5.5"))
+        monkeypatch.setattr(_chat_acp, "_conn", Failing())
+        asyncio.run(_chat_acp._apply_model(self.session(), "openai/gpt-5.5"))
+
+    def test_the_offered_models_are_recorded_for_the_pane(self, conn):
+        asyncio.run(_chat_acp._apply_model(self.session(), ""))
+        assert [c["value"] for c in _chat_acp.model_choices()] == [
+            "openai/gpt-5.5",
+            "opencode/big-pickle",
+        ]
+
+    def test_grouped_options_are_a_list_like_any_other(self, conn):
+        """A harness may group models by provider. Read as options, a group
+        yields a value of None -- which is then what a validity check compares
+        against, so every model looks like a typo."""
+        grouped = self.Session(
+            [
+                self.ConfigOption(
+                    "model",
+                    [
+                        {
+                            "group": "openai",
+                            "name": "OpenAI",
+                            "options": [{"value": "openai/gpt-5.5"}],
+                        },
+                        {
+                            "group": "anthropic",
+                            "name": "Anthropic",
+                            "options": [{"value": "anthropic/claude-sonnet-5"}],
+                        },
+                    ],
+                )
+            ]
+        )
+        asyncio.run(_chat_acp._apply_model(grouped, "anthropic/claude-sonnet-5"))
+        assert [c["value"] for c in _chat_acp.model_choices()] == [
+            "openai/gpt-5.5",
+            "anthropic/claude-sonnet-5",
+        ]
+        assert conn.calls[0]["value"] == "anthropic/claude-sonnet-5"
+
+    def test_the_harness_s_own_default_is_reported_not_guessed(self, conn):
+        """No model configured, and the agent says which one it is on."""
+        asyncio.run(_chat_acp._apply_model(self.session(current="openai/gpt-5.5"), ""))
+        assert _chat_acp.current_model() == "openai/gpt-5.5"
+
+    def test_switching_at_runtime_does_not_touch_the_session(self, conn):
+        """The whole point of not pinning the model in the environment: a
+        change should not cost the conversation."""
+        asyncio.run(_chat_acp._apply_model(self.session(), ""))
+        asyncio.run(_chat_acp.set_model("opencode/big-pickle"))
+        assert conn.calls == [
+            {
+                "config_id": "model",
+                "session_id": "ses_1",
+                "value": "opencode/big-pickle",
+            }
+        ]
+        assert _chat_acp.current_model() == "opencode/big-pickle"
+
+    def test_a_model_the_agent_never_offered_is_refused_by_name(self, conn):
+        asyncio.run(_chat_acp._apply_model(self.session(), ""))
+        with pytest.raises(ValueError) as exc:
+            asyncio.run(_chat_acp.set_model("openai/gpt-5.5-typo"))
+        # The message carries what it *does* offer: a refusal that does not say
+        # what to type instead sends the reader to the config file.
+        assert "openai/gpt-5.5" in str(exc.value)
+        assert conn.calls == []
+
+    def test_an_agent_that_advertises_nothing_is_taken_at_its_word(self, conn):
+        """Nothing to check against is not the same as nothing allowed."""
+        asyncio.run(_chat_acp._apply_model(self.Session([]), ""))
+        asyncio.run(_chat_acp.set_model("something/only-it-knows"))
+        assert conn.calls[0]["value"] == "something/only-it-knows"
+
+    def test_choosing_starts_the_agent_before_it_checks(self, conn, monkeypatch):
+        """`/model` before the first turn has no session, and ACP has no
+        session-less way to ask what exists."""
+        started = []
+
+        async def ensure(config):
+            started.append(True)
+            _chat_acp._note_config_options(self.session().config_options)
+
+        monkeypatch.setattr(_chat_acp, "ensure_agent", ensure)
+        asyncio.run(_chat_acp.choose_model("openai/gpt-5.5", {}))
+        assert started == [True]
+        assert conn.calls[0]["value"] == "openai/gpt-5.5"
+
+    def test_a_model_the_config_named_wrongly_is_said_out_loud(self, conn):
+        """The only other sign is the header quietly naming a model the user did
+        not choose, which reads as the pane being wrong rather than the config."""
+        before = _chat_acp.revision()
+        asyncio.run(
+            _chat_acp._apply_model(
+                self.session(current="openai/gpt-5.5"), "gpt-5.5-typo"
+            )
+        )
+        items, _ = _chat_acp.history(before)
+        assert len(items) == 1
+        text = items[0]["blocks"][0]["text"]
+        assert "gpt-5.5-typo" in text and "openai/gpt-5.5" in text
+        assert items[0]["error"] is True
+
+    def test_the_model_does_not_outlive_the_session(self, conn):
+        """A name left behind after the harness dies is a model nothing runs."""
+        asyncio.run(_chat_acp._apply_model(self.session(current="openai/gpt-5.5"), ""))
+        _chat_acp.stop_sync()
+        assert _chat_acp.current_model() is None
+        assert _chat_acp.model_choices() == []
 
 
 class TestPinnedConfig:
