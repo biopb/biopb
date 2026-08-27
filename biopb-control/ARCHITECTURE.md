@@ -147,6 +147,12 @@ spawns `biopb mcp view` and waits for it to appear in this registry, matched on
 the child's own pid. Registration is an exact readiness signal — `--view` opens
 its window *before* it registers — so a record means a viewer really opened, and
 a child that dies first never registers and comes back with its own log tail.
+Each launch writes **its own** file under `state/biopb/mcp/viewers/` (pruned to
+the newest few), beside the shim's per-session logs and for the same reason: a
+shared file interleaves concurrent viewers, and lines that cannot be attributed
+to a process are no use for diagnosing a session that is still running. The
+child is told the path, so `server_status` names the file its output really
+went to.
 The verb is offered only where it can work (I1); the dashboard reads that from
 `/api/status` and shows the refusal in the button's place.
 

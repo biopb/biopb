@@ -21,6 +21,7 @@ import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
@@ -1284,9 +1285,10 @@ def test_start_session_reports_a_child_that_dies_first(tmp_path, monkeypatch):
     assert "no display detected" in body["log"]
 
 
-def test_start_session_log_tail_is_this_launch_only(tmp_path, monkeypatch):
-    # The log is shared by successive launches; reporting a previous one's
-    # traceback for this one's failure would be worse than reporting nothing.
+def test_each_launch_gets_its_own_log(tmp_path, monkeypatch):
+    # One file per launch, so a line can always be attributed to a process --
+    # the case the failure tail does not cover is diagnosing a session that is
+    # still running, where a shared, interleaved log is no use.
     from starlette.testclient import TestClient
 
     from biopb_control import _control
@@ -1295,13 +1297,79 @@ def test_start_session_log_tail_is_this_launch_only(tmp_path, monkeypatch):
     second = "import sys; sys.stderr.write('NEW-FAILURE\\n'); sys.exit(1)"
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", first])
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
-        assert "OLD-FAILURE" in client.post("/api/sessions/new").json()["log"]
+        old = client.post("/api/sessions/new").json()
         monkeypatch.setattr(
             _control, "_viewer_argv", lambda: [sys.executable, "-c", second]
         )
-        body = client.post("/api/sessions/new").json()
-    assert "NEW-FAILURE" in body["log"]
-    assert "OLD-FAILURE" not in body["log"]
+        new = client.post("/api/sessions/new").json()
+
+    assert "OLD-FAILURE" in old["log"] and "NEW-FAILURE" not in old["log"]
+    assert "NEW-FAILURE" in new["log"] and "OLD-FAILURE" not in new["log"]
+    # Two launches, two files -- not one file read at two offsets.
+    assert old["log_path"] != new["log_path"]
+    assert {Path(old["log_path"]).name, Path(new["log_path"]).name} == {
+        p.name for p in Path(old["log_path"]).parent.glob("viewer-*.log")
+    }
+
+
+def test_same_second_launches_do_not_share_a_log(tmp_path, monkeypatch):
+    # The uniquifier earns its keep only here: a bare timestamp would put two
+    # launches inside one second back into one file and reintroduce the
+    # interleaving in miniature.
+    from biopb_control import _control
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_control.time, "strftime", lambda *_a: "20260827-090413")
+    paths = []
+    for _ in range(3):
+        fh, path = _control._open_viewer_log()
+        fh.close()
+        paths.append(path)
+    assert len({str(p) for p in paths}) == 3
+
+
+def test_old_launch_logs_are_pruned(tmp_path, monkeypatch):
+    # Retention matches the shim's per-session logs: a couple of past attempts
+    # to look back over, not an unbounded pile of Qt chatter.
+    from biopb_control import _control
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_control, "_VIEWER_LOG_KEEP", 3)
+    made = []
+    for i in range(6):
+        # Distinct names *and* distinct mtimes, so "newest N" is well-defined
+        # without depending on how fast the loop runs.
+        monkeypatch.setattr(_control.time, "strftime", lambda *_a, i=i: f"2026082{i}")
+        fh, path = _control._open_viewer_log()
+        fh.close()
+        os.utime(path, (1000 + i, 1000 + i))
+        made.append(path)
+    live = sorted(p.name for p in made[0].parent.glob("viewer-*.log"))
+    assert live == sorted(p.name for p in made[-3:])
+
+
+def test_the_child_is_told_where_its_log_went(tmp_path, monkeypatch):
+    # The session reports its own logfile (server_status) off this env var, and
+    # a viewer the control launched has no other way to know it -- its own
+    # fallback would name the canonical mcp-server.log, which is not where its
+    # output actually went.
+    from biopb import _locations
+
+    from biopb_control import _control
+
+    seen = {}
+    real_popen = _control.subprocess.Popen
+
+    def _spy(argv, **kwargs):
+        seen.update(kwargs)
+        return real_popen(argv, **kwargs)
+
+    _launchable(monkeypatch, tmp_path, [sys.executable, "-c", "pass"])
+    monkeypatch.setattr(_control.subprocess, "Popen", _spy)
+    _control._launch_viewer(5.0)
+    logged = seen["env"][_locations.MCP_SESSION_LOG_ENV]
+    assert Path(logged).name.startswith("viewer-")
+    assert Path(logged).exists()
 
 
 def test_start_session_returns_starting_when_the_child_is_slow(tmp_path, monkeypatch):

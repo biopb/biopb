@@ -696,6 +696,16 @@ _VIEWER_POLL_INTERVAL = 0.25
 # install) and the only one the dashboard can show.
 _VIEWER_LOG_TAIL = 2000
 
+# How many past launches' logs to keep. Matches the shim's session-log retention
+# (``transport.session_log_keep``): enough to look back over a couple of failed
+# attempts, not an unbounded pile of Qt chatter.
+_VIEWER_LOG_KEEP = 5
+
+# Cap on same-second name collisions before giving up on a log for this launch.
+# Two dashboard launches inside one second is already a double-click; a hundred
+# is a bug, and a viewer that starts without a log beats one that does not start.
+_VIEWER_LOG_ATTEMPTS = 100
+
 
 def _display_available() -> bool:
     """Whether this process could put a window on the user's screen.
@@ -754,16 +764,75 @@ def _viewer_argv() -> list[str]:
     return [sys.executable, "-m", "biopb_mcp.mcp", "--view", "--port", "0"]
 
 
-def _viewer_log_tail(path, offset: int) -> str:
-    """This launch's own output, read from *offset* — the log's size at spawn.
+def _prune_viewer_logs(log_dir, keep: int) -> None:
+    """Keep only the newest *keep* launch logs. Best-effort.
 
-    Anchored at an offset rather than tailing the file: the log is shared by
-    successive launches, and reporting the previous one's traceback for this
-    one's failure would be worse than reporting nothing.
+    *keep* is passed rather than defaulted from the module constant: a default
+    argument binds once at definition, so the constant would be frozen into this
+    signature and could never be overridden.
+
+    Run before this launch's file exists, so the count it leaves room for
+    includes the one about to be created. A prune failure never affects the
+    launch.
     """
     try:
+        logs = sorted(
+            log_dir.glob("viewer-*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for old in logs[max(keep - 1, 0) :]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def _open_viewer_log():
+    """Create this launch's own logfile; return ``(handle, path)``.
+
+    **One file per launch**, not one shared file appended to. A shared log
+    interleaves concurrent viewers, and lines that cannot be attributed to a
+    process are no use for diagnosing a session that is still running — which is
+    the case the failure tail does not cover. The shim reached the same
+    conclusion for its per-session logs.
+
+    Exclusive-create rather than a bare timestamp: two launches in the same
+    second would otherwise land on one name and reintroduce the interleaving in
+    miniature. On any failure the caller still spawns, with the child's output
+    discarded — a viewer that starts without a log beats one that does not start.
+    """
+    try:
+        log_dir = _locations.mcp_viewer_log_dir()
+    except OSError:
+        logger.warning("No viewer log dir; discarding child output", exc_info=True)
+        return None, None
+    _prune_viewer_logs(log_dir, _VIEWER_LOG_KEEP)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(1, _VIEWER_LOG_ATTEMPTS + 1):
+        suffix = "" if n == 1 else f"-{n}"
+        path = log_dir / f"viewer-{stamp}{suffix}.log"
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        except OSError:
+            break
+        # Binary + unbuffered, like every other owned-child log here: the fd is
+        # inherited by the child (and its kernel), which emits arbitrary bytes
+        # from native Qt/GL/dask writers, so it must not be a text wrapper.
+        return os.fdopen(fd, "wb", buffering=0), path
+    logger.warning("Could not create a viewer log in %s; discarding output", log_dir)
+    return None, None
+
+
+def _viewer_log_tail(path) -> str:
+    """This launch's own output. The whole file *is* this launch, so no anchor
+    is needed — that is what one file per launch buys."""
+    try:
         with open(path, "rb") as f:
-            f.seek(offset)
             data = f.read()
     except OSError:
         return ""
@@ -787,36 +856,29 @@ def _launch_viewer(timeout: float) -> dict:
     Returns ``{"state": "started"|"starting"|"failed", ...}``; only ``failed``
     carries ``error`` and ``log``.
     """
-    log_path = _locations.mcp_viewer_log()
-    try:
-        _locations.rotate_log(log_path)
-    except OSError:
-        # Housekeeping only, and it fails on Windows while a previous viewer
-        # still holds the file. Kept off the open below so it cannot cost this
-        # launch the log that is its whole diagnosis.
-        logger.debug("Could not rotate %s", log_path, exc_info=True)
-    log_fh = None
-    try:
-        log_fh = open(log_path, "ab", buffering=0)  # noqa: SIM115 - handed to the child; closed after spawn
-    except OSError:
-        logger.warning("Cannot open viewer log %s; discarding child output", log_path)
-    offset = log_fh.tell() if log_fh is not None else 0
+    log_fh, log_path = _open_viewer_log()
     argv = _viewer_argv()
-    logger.info("Launching viewer session: %s", " ".join(argv))
+    logger.info("Launching viewer session: %s (log: %s)", " ".join(argv), log_path)
+    # The environment is inherited: it carries the DISPLAY/XAUTHORITY/
+    # WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
+    # where the window lands. That inheritance is the whole risk #98 named and
+    # the whole reason for the gate above. The one addition tells the child where
+    # its own output went, so `server_status` can name the file rather than
+    # guessing the canonical one -- the same thing the shim does for its child.
+    env = None
+    if log_path is not None:
+        env = {**os.environ, _locations.MCP_SESSION_LOG_ENV: str(log_path)}
     try:
-        # The environment is inherited, deliberately and unmodified: it carries
-        # the DISPLAY/XAUTHORITY/WAYLAND_DISPLAY (or the Aqua session, or the
-        # Windows station) that decides where the window lands. That inheritance
-        # is the whole risk #98 named and the whole reason for the gate above.
         proc = subprocess.Popen(
             argv,
             stdout=log_fh if log_fh is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if log_fh is not None else subprocess.DEVNULL,
+            env=env,
             **detach_kwargs(),
         )
     except OSError as exc:
         logger.exception("Could not launch a viewer session")
-        return {"state": "failed", "error": str(exc), "log": ""}
+        return {"state": "failed", "error": str(exc), "log": "", "log_path": None}
     finally:
         if log_fh is not None:
             log_fh.close()  # the child holds its own dup
@@ -834,19 +896,24 @@ def _launch_viewer(timeout: float) -> dict:
                 }
         code = proc.poll()
         if code is not None:
-            tail = _viewer_log_tail(log_path, offset)
             logger.error("Viewer session exited with code %s before starting", code)
             return {
                 "state": "failed",
                 "error": f"the viewer exited with code {code} before it opened",
-                "log": tail,
+                "log": _viewer_log_tail(log_path) if log_path else "",
+                # Named so a tail that was truncated, or empty because no log
+                # could be opened, still leads somewhere.
+                "log_path": str(log_path) if log_path else None,
             }
         if time.monotonic() >= deadline:
             # Still alive, just slow (a cold napari import on a loaded box). Say
             # so instead of failing: the dashboard polls /api/sessions anyway and
             # will show it the moment it registers.
             logger.info("Viewer session still starting after %.0fs", timeout)
-            return {"state": "starting"}
+            return {
+                "state": "starting",
+                "log_path": str(log_path) if log_path else None,
+            }
         time.sleep(_VIEWER_POLL_INTERVAL)
 
 
