@@ -204,13 +204,22 @@ rather than after it.
   projection of a thread the harness never reads — and ACP has no compaction
   method to forward it to. `/context` is *better* here: the agent reports its
   own `used`/`size` rather than the pane estimating from characters.
-- **The model is named, not inherited.** `chat.acp_model` is applied with
-  `session/set_config_option` after `session/new`. A fresh session otherwise
-  takes the harness's default, which is a model the user did not choose on a
-  provider that may be unreachable — observed: opencode's default
-  `opencode/big-pickle` failed with "Endpoint is unavailable" while the CLI
-  worked, because the CLI's model choice lives in opencode's session store and
-  a new session does not inherit it.
+- **`chat.acp_model` overrides; it is not required.** When set, it is applied
+  with `session/set_config_option` after `session/new`. When unset, the harness
+  decides — and it decides from *its own config file*, which biopb does not
+  shadow: `OPENCODE_CONFIG_CONTENT` merges rather than replaces, outranking the
+  file only for the keys it declares (permissions, the MCP suppression), and
+  `model` is not one of them. Measured, spawning `opencode acp` three ways: no
+  env pin and no file model → `opencode/big-pickle`; biopb's pin over a file
+  saying `openai/gpt-5.4` → `openai/gpt-5.4`; a pin that does carry `model` →
+  that model.
+
+  What a new session cannot inherit is the choice made in opencode's **TUI**,
+  which lives in its session store rather than its config. So a user whose CLI
+  works fine can still land on the built-in default here — observed:
+  `opencode/big-pickle` failing with "Endpoint is unavailable" while the CLI
+  worked. Setting a model in the harness's own config fixes that for both;
+  `chat.acp_model` and `/model` are for pointing *this* session somewhere else.
 - **The model moves at runtime, which is why it is not pinned.** `/model` reads
   `GET /api/chat/models` and writes `POST /chat/model`; under ACP that is
   another `session/set_config_option` on the *live* session, so changing model
