@@ -32,6 +32,28 @@ export class SessionLocked extends Error {
   }
 }
 
+/** What a session-API reply says about the *session*, as opposed to the kernel
+ * inside it.
+ *
+ * The control answers 404 for a session id it cannot resolve, and prunes the
+ * record as it does, so that answer never comes back: the child exited. A 502
+ * is the opposite — a session still registered but not answering right now.
+ * Worth separating because the page's response differs in kind: a blip is
+ * waited out, an ended session means stop, and say so.
+ *
+ * Every non-ok reply used to be read straight through instead. A 404 body is
+ * valid JSON, so `data.jobs` came back undefined and rendered as "no jobs yet"
+ * and `s.alive` undefined rendered as `dead · starting` — an ended session
+ * looked exactly like a fresh idle one, the same way a token-gated one did
+ * before `sessionFetch` caught the 401. */
+export function sessionVerdict(
+  status: number,
+): "live" | "ended" | "unreachable" {
+  if (status === 404) return "ended";
+  if (!(status >= 200 && status < 300)) return "unreachable";
+  return "live";
+}
+
 /**
  * `fetch`, carrying the stored token and treating a 401 as a locked session.
  *
