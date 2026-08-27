@@ -9,7 +9,7 @@ import { useParams } from "react-router-dom";
 import { localRootsProxied } from "../auth";
 import ChatPane from "../components/ChatPane";
 import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
-import { sessionFetch } from "../utils/sessionFetch";
+import { sessionFetch, sessionVerdict } from "../utils/sessionFetch";
 import {
   clampChatWidth,
   defaultChatWidth,
@@ -68,8 +68,11 @@ async function jpost(url: string): Promise<{ [k: string]: unknown }> {
 export default function ObservePage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const base = withBase(`/session/${sessionId}`);
+  // Terminal, once true: the id does not resolve and never will again, so the
+  // page stops polling and stops offering anything that acts on the kernel.
+  const [ended, setEnded] = useState(false);
   useDocumentTitle(
-    `BioPB mcp - observe${sessionId ? ` · ${sessionId}` : ""}`,
+    `BioPB mcp - ${ended ? "ended" : "observe"}${sessionId ? ` · ${sessionId}` : ""}`,
   );
 
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
@@ -87,8 +90,10 @@ export default function ObservePage() {
   // Null until probed, and null again means unreachable rather than off — the
   // same distinction `console_enabled` draws below, and for the same reason.
   const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
-  const showConsole = childConsole && controlLocal;
-  const showChat = !!chatStatus?.enabled && controlLocal;
+  // Both also require a session to run in: an editor and a composer on a dead
+  // session are two more surfaces that look live and answer 404 on submit.
+  const showConsole = childConsole && controlLocal && !ended;
+  const showChat = !!chatStatus?.enabled && controlLocal && !ended;
 
   // The chat/work split, in pixels, remembered per browser. A preference, not
   // state anyone else needs, so localStorage rather than the server -- and every
@@ -152,13 +157,19 @@ export default function ObservePage() {
   );
 
   const poll = useCallback(async () => {
-    let data: { busy?: boolean; jobs?: JobSummary[] };
+    let r: Response;
     try {
-      data = await (await sessionFetch(base + "/api/jobs")).json();
+      r = await sessionFetch(base + "/api/jobs");
     } catch {
       setStatus("unreachable");
       return;
     }
+    // pollStatus below owns the diagnosis; all this has to do is not overwrite
+    // a good job list with the empty one an error body parses as.
+    if (sessionVerdict(r.status) !== "live") return;
+    const data: { busy?: boolean; jobs?: JobSummary[] } = await r
+      .json()
+      .catch(() => ({}));
     if (data.busy) return; // transient; keep current render
     const list = data.jobs || [];
     if (!list.length) {
@@ -186,8 +197,25 @@ export default function ObservePage() {
   }, [base, fetchDetail]);
 
   const pollStatus = useCallback(async () => {
+    let r: Response;
     try {
-      const s = await (await sessionFetch(base + "/api/status")).json();
+      r = await sessionFetch(base + "/api/status");
+    } catch {
+      setStatus("unreachable");
+      return;
+    }
+    const verdict = sessionVerdict(r.status);
+    if (verdict !== "live") {
+      if (verdict === "ended") {
+        setEnded(true);
+        setStatus("session ended");
+      } else {
+        setStatus("unreachable");
+      }
+      return;
+    }
+    try {
+      const s = await r.json();
       if (typeof s.poll_interval_ms === "number") setPollMs(s.poll_interval_ms);
       // Only when the field is actually there. A degraded status payload (the
       // child's 503 with no kernel host, the proxy's 502 on a wedged session)
@@ -229,6 +257,7 @@ export default function ObservePage() {
   }, [base]);
 
   useEffect(() => {
+    if (ended) return; // the record is pruned; there is nothing left to ask
     poll();
     pollStatus();
     const a = setInterval(poll, pollMs);
@@ -237,7 +266,7 @@ export default function ObservePage() {
       clearInterval(a);
       clearInterval(b);
     };
-  }, [poll, pollStatus, pollMs]);
+  }, [poll, pollStatus, pollMs, ended]);
 
   const toggle = useCallback(
     (id: string) => {
@@ -389,12 +418,18 @@ export default function ObservePage() {
         />
         <h1>BioPB mcp - observe</h1>
         <span id="status">{status}</span>
-        <button className="primary" onClick={saveNotebook}>
-          ⤓ Save notebook
-        </button>
-        <button className="danger" onClick={restart}>
-          Restart kernel
-        </button>
+        {/* Both act on the child, so both 404 once it is gone. A dead button is
+            how the page told the user nothing was wrong. */}
+        {ended ? null : (
+          <>
+            <button className="primary" onClick={saveNotebook}>
+              ⤓ Save notebook
+            </button>
+            <button className="danger" onClick={restart}>
+              Restart kernel
+            </button>
+          </>
+        )}
       </header>
       <main
         ref={mainRef}
@@ -405,6 +440,13 @@ export default function ObservePage() {
             : ({ ["--chat-w" as string]: `${chatWidth}px` } as React.CSSProperties)
         }
       >
+        {ended ? (
+          <div className="ended" role="status">
+            <strong>This session has ended.</strong> Its kernel and viewer are
+            gone — anything below is the last state this page saw, not live.{" "}
+            <a href={withBase("/")}>Back to the dashboard</a>
+          </div>
+        ) : null}
         {showChat && chatStatus ? (
           <ChatPane base={base} status={chatStatus} pollMs={pollMs} />
         ) : null}
@@ -445,7 +487,9 @@ export default function ObservePage() {
           ) : null}
           <div id="jobs">
             {jobs == null ? (
-              <div className="empty">loading…</div>
+              // Never fetched anything, and on an ended session never will:
+              // "loading…" for ever is the same lie in miniature.
+              ended ? null : <div className="empty">loading…</div>
             ) : jobs.length === 0 ? (
               <div className="empty">no jobs yet</div>
             ) : (
@@ -731,4 +775,8 @@ const OBS_CSS = `
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .obs-page .console button:disabled { opacity: .55; cursor: default; background: #222; }
   .obs-page .console-err { color: #f99; font-size: 12px; }
+  .obs-page .ended { border: 1px solid #744; background: #241a1a; color: #fbb;
+             border-radius: 5px; padding: 10px 12px; margin-bottom: 12px; }
+  .obs-page .ended strong { color: #fdd; }
+  .obs-page .ended a { color: #fbb; }
 `;

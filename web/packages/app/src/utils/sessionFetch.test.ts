@@ -12,7 +12,7 @@ vi.mock("../auth", () => ({
 }));
 
 import { redirectToUnlock } from "../auth";
-import { SessionLocked, sessionFetch } from "./sessionFetch";
+import { SessionLocked, sessionFetch, sessionVerdict } from "./sessionFetch";
 
 const unlock = redirectToUnlock as unknown as ReturnType<typeof vi.fn>;
 
@@ -82,5 +82,25 @@ describe("sessionFetch", () => {
     });
     expect(r.status).toBe(409);
     expect(unlock).not.toHaveBeenCalled();
+  });
+});
+
+describe("sessionVerdict", () => {
+  it("calls a 404 ended", () => {
+    // The control answers 404 for an id it cannot resolve, and prunes the
+    // record as it does: the child is gone for good.
+    expect(sessionVerdict(404)).toBe("ended");
+  });
+
+  it("does not call a wedged child gone", () => {
+    // 502 is a session still registered and not answering; the page waits it
+    // out rather than declaring the session over and stopping its polls.
+    for (const code of [500, 502, 503]) {
+      expect(sessionVerdict(code)).toBe("unreachable");
+    }
+  });
+
+  it("passes a normal reply through", () => {
+    expect(sessionVerdict(200)).toBe("live");
   });
 });
