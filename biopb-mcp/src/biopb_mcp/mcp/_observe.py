@@ -77,6 +77,12 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 _max_output_chars = 20000
 _poll_interval_ms = 3000
 _console_enabled = True
+# Whether the built-in chat client is actually mounted on this session. Not a
+# config mirror: chat is served only on an agentless `biopb mcp view` session
+# and only when enabled, so `_setup_chat`'s verdict is the one truth. Set by
+# set_chat_enabled() rather than configure(), which resets its extras on every
+# call and so cannot be called twice.
+_chat_enabled = False
 _extra_origins = ()
 _extra_hosts = ()
 
@@ -119,6 +125,18 @@ def configure(
     _extra_origins = tuple(allowed_origins)
     _extra_hosts = tuple(allowed_hosts)
     _mw = None  # rebuilt with the new extras on next request
+
+
+def set_chat_enabled(enabled):
+    """Record whether this session mounted the chat routes, for ``/api/status``.
+
+    Separate from :func:`configure` because the launcher only knows this *after*
+    it has tried to mount chat, and configure() is not safely re-callable (it
+    resets ``allowed_origins``/``allowed_hosts`` whether or not they were
+    passed).
+    """
+    global _chat_enabled
+    _chat_enabled = bool(enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +405,17 @@ async def _api_status(request):
     # console_enabled rides here so the page knows whether to offer an editor at
     # all. It is only *this* half of the answer -- the control's gate is the
     # other -- so the SPA needs both before it renders one (see ObservePage).
+    # chat_enabled rides here for a different reader: the control's dashboard,
+    # which probes this endpoint per session anyway and needs it to label the
+    # session's link -- a `biopb mcp view` session leads with chat, an MCP
+    # client's child with the job list. Reporting it beside console_enabled
+    # keeps that one probe the whole answer.
     return JSONResponse(
         {
             **host.health(),
             "poll_interval_ms": _poll_interval_ms,
             "console_enabled": _console_enabled,
+            "chat_enabled": _chat_enabled,
         }
     )
 

@@ -261,6 +261,37 @@ class TestSetupChat:
         assert _setup_chat({"observe": {"enabled": True}}, agentless=True) is False
         assert mounted == []
 
+    @pytest.mark.parametrize(
+        "cfg, agentless, expected",
+        [
+            ({"observe": {"enabled": True, "chat_enabled": True}}, True, True),
+            ({"observe": {"enabled": True, "chat_enabled": True}}, False, False),
+            ({"observe": {"enabled": True}}, True, False),
+        ],
+    )
+    def test_it_publishes_the_verdict_on_api_status(
+        self, mounted, cfg, agentless, expected
+    ):
+        # The control's dashboard labels a session's link by what it serves, and
+        # reads that off /api/status. Set on every path, so a session that never
+        # mounted chat -- or failed to -- reads as off rather than stale.
+        from biopb_mcp.mcp import _observe
+
+        _observe.set_chat_enabled(not expected)  # a value that must be overwritten
+        assert _setup_chat(cfg, agentless=agentless) is expected
+        assert _observe._chat_enabled is expected
+
+    def test_a_failed_mount_reads_as_off(self, monkeypatch):
+        from biopb_mcp.mcp import _chat_api, _observe
+
+        monkeypatch.setattr(
+            _chat_api, "configure", lambda *a, **k: (_ for _ in ()).throw(RuntimeError)
+        )
+        _observe.set_chat_enabled(True)
+        cfg = {"observe": {"enabled": True, "chat_enabled": True}}
+        assert _setup_chat(cfg, agentless=True) is False
+        assert _observe._chat_enabled is False
+
 
 class TestAgentlessViewer:
     """Which sessions count as a viewer a human opened.

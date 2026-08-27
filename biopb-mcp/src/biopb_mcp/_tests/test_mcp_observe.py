@@ -414,6 +414,30 @@ def test_status_advertises_the_console_switch(host):
         assert r.json()["console_enabled"] is enabled
 
 
+def test_status_advertises_whether_chat_is_mounted(host):
+    # The control's dashboard reads this to label a session's link: only an
+    # agentless `biopb mcp view` session mounts chat, so this is also its answer
+    # to "viewer, or an MCP client's child?".
+    old = _observe._chat_enabled
+    try:
+        for enabled in (True, False):
+            _observe.set_chat_enabled(enabled)
+            r = _console_client().get("/api/status")
+            assert r.json()["chat_enabled"] is enabled
+    finally:
+        _observe.set_chat_enabled(old)
+
+
+def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
+    # Deliberately not folded into configure(), which resets allowed_origins /
+    # allowed_hosts on every call and so cannot be called a second time to add
+    # one fact without dropping others.
+    _observe.configure(allowed_origins=("https://front",), allowed_hosts=("front",))
+    _observe.set_chat_enabled(True)
+    assert _observe._extra_origins == ("https://front",)
+    assert _observe._extra_hosts == ("front",)
+
+
 # -- busy kernel ------------------------------------------------------------
 
 

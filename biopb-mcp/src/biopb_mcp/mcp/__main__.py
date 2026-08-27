@@ -209,17 +209,27 @@ def _setup_chat(config, agentless):
 
     *agentless* says whether this session is a `biopb mcp view` viewer rather
     than a child some MCP client is driving; chat is served only on the former.
+
+    The verdict is also published on ``/api/status``
+    (:func:`_observe.set_chat_enabled`), so the control's dashboard can label
+    this session by what it actually serves — a viewer leads with chat, an MCP
+    client's child with the job list — instead of guessing from launch flags it
+    never sees. Set on every path, so a failed mount reads as off rather than
+    stale.
     """
+    from . import _observe
+
+    mounted = False
     try:
         from . import _chat_api
 
-        if not _chat_api.configure(config, agentless=agentless):
-            return False
-        _chat_api.register_http_routes()
-        return True
+        if _chat_api.configure(config, agentless=agentless):
+            _chat_api.register_http_routes()
+            mounted = True
     except Exception:
         logger.exception("chat API failed to start; continuing without it")
-        return False
+    _observe.set_chat_enabled(mounted)
+    return mounted
 
 
 def _config_defaults(config):
