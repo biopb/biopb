@@ -261,6 +261,35 @@ async def _read_resource(uri):
     return "\n".join(out)
 
 
+#: What :func:`_run_code` actually does, in place of the promote-and-poll
+#: paragraph the wire tools describe. The behaviour is already overridden in
+#: :func:`_dispatch`; the description has to be overridden at the same seam, or
+#: the model is told to poll for a handle it will never be given -- and offered
+#: ``poll_job`` to do it with.
+_CHAT_RUN_PARAGRAPH = """Code runs in a background thread so it does not block the main thread.
+    This call waits for the cell to finish and returns its output -- there is no
+    job handle and nothing to poll for. Only one job runs at a time; stop a cell
+    with interrupt_kernel (best-effort) or restart_kernel (guaranteed).
+
+    poll_job still reads cells *the user* ran from the observe page, which is
+    what the activity notice on these results points you at."""
+
+
+def _describe(tool):
+    """*tool*'s description as this loop's model should read it.
+
+    Only ``execute_code`` differs, and only in the paragraph that describes a
+    wire behaviour :func:`_run_code` replaces. Substituted rather than rewritten
+    whole, so the rest stays the registry's own words -- a hand-written copy is
+    the one thing that can silently stop matching the tool that actually runs.
+    A test pins that this still finds its paragraph.
+    """
+    description = tool.description or ""
+    if tool.name != "execute_code":
+        return description
+    return description.replace(_server.PROMOTE_PARAGRAPH, _CHAT_RUN_PARAGRAPH)
+
+
 async def tool_payload():
     """The function-calling tool list, generated from the live MCP registry.
 
@@ -274,7 +303,7 @@ async def tool_payload():
             "type": "function",
             "function": {
                 "name": tool.name,
-                "description": tool.description or "",
+                "description": _describe(tool),
                 "parameters": _clean_schema(tool.inputSchema),
             },
         }
