@@ -151,6 +151,63 @@ export async function fetchEngine(
   }
 }
 
+/** One model the engine offers. */
+export interface ModelChoice {
+  value: string;
+  name: string;
+}
+
+/** What the engine can be pointed at, and what it is pointed at now.
+ *
+ * Read when `/model` is typed rather than polled: the list moves only when the
+ * session does. An empty `choices` is the built-in loop, which has no list to
+ * offer -- not a failed read, which is null.
+ */
+export async function fetchModels(
+  base: string,
+): Promise<{ model: string; choices: ModelChoice[] } | null> {
+  try {
+    const r = await sessionFetch(base + "/api/chat/models");
+    if (!r.ok) return null;
+    const j = await r.json();
+    const raw = Array.isArray(j.choices) ? j.choices : [];
+    return {
+      model: typeof j.model === "string" ? j.model : "",
+      choices: raw
+        .filter((c: unknown) => c && typeof (c as ModelChoice).value === "string")
+        .map((c: ModelChoice) => ({ value: c.value, name: c.name || c.value })),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Point the engine at *model*. Returns an error to show, or null.
+ *
+ * The interesting failure is a 400 naming what the harness does offer: the
+ * check happens against the list the agent advertised, so a typo is answered
+ * here rather than by a turn that fails at the provider.
+ */
+export async function setModel(
+  base: string,
+  model: string,
+): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await sessionFetch(base + "/chat/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    });
+  } catch (e) {
+    return String(e);
+  }
+  if (r.ok) return null;
+  const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  if (r.status === 409) return "A turn is running. Wait for it, or cancel it.";
+  return String(d.error || `could not switch model (${r.status})`);
+}
+
 /** The conversation after *cursor*, or all of it when the child does not
  * recognise it. Null on a failed read, so the pane keeps what it has.
  *

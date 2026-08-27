@@ -5,6 +5,7 @@ import {
   contextReport,
   localCommands,
   matchCommands,
+  modelReport,
   parseCommand,
 } from "./chatCommands";
 import type { AgentCommand, ContextUsage } from "./chatClient";
@@ -19,16 +20,19 @@ const msg = (over: Partial<ChatMessage> = {}): ChatMessage => ({
 
 describe("parseCommand", () => {
   it("recognises each command, and the alias", () => {
-    expect(parseCommand("/new")).toEqual({ kind: "command", name: "new" });
-    expect(parseCommand("/clear")).toEqual({ kind: "command", name: "new" });
-    expect(parseCommand("/compact")).toEqual({ kind: "command", name: "compact" });
-    expect(parseCommand("/context")).toEqual({ kind: "command", name: "context" });
+    const cmd = (name: string) => ({ kind: "command", name, arg: "" });
+    expect(parseCommand("/new")).toEqual(cmd("new"));
+    expect(parseCommand("/clear")).toEqual(cmd("new"));
+    expect(parseCommand("/compact")).toEqual(cmd("compact"));
+    expect(parseCommand("/context")).toEqual(cmd("context"));
+    expect(parseCommand("/model")).toEqual(cmd("model"));
   });
 
   it("ignores case and surrounding space", () => {
     expect(parseCommand("  /Compact  ")).toEqual({
       kind: "command",
       name: "compact",
+      arg: "",
     });
   });
 
@@ -60,6 +64,21 @@ describe("parseCommand", () => {
     expect(p.kind).toBe("reject");
     if (p.kind !== "reject") return;
     expect(p.message).toContain("no arguments");
+  });
+
+  it("hands the rest of the line to the command that asked for one", () => {
+    expect(parseCommand("/model openai/gpt-5.5")).toEqual({
+      kind: "command",
+      name: "model",
+      arg: "openai/gpt-5.5",
+    });
+    // Rejoined from the split, so extra space between the two is not a
+    // different model id.
+    expect(parseCommand("/model   openai/gpt-5.5")).toEqual({
+      kind: "command",
+      name: "model",
+      arg: "openai/gpt-5.5",
+    });
   });
 
   it("treats ordinary prose as a message", () => {
@@ -146,10 +165,12 @@ describe("the two command namespaces", () => {
     // /compact folds the built-in loop's projection of the thread, which the
     // harness never reads -- and ACP has no compaction method, so there is
     // nothing to forward it to either. /context survives because the question
-    // is still the user's to ask and the agent answers it itself.
+    // is still the user's to ask and the agent answers it itself, and /model
+    // because both engines can be moved off the model they started on.
     expect(localCommands("acp").map((c) => c.typed)).toEqual([
       "/new",
       "/context",
+      "/model",
     ]);
     expect(localCommands("builtin")).toEqual(COMMANDS);
   });
@@ -177,6 +198,7 @@ describe("the two command namespaces", () => {
     expect(parseCommand("/new", "acp", withNew)).toEqual({
       kind: "command",
       name: "new",
+      arg: "",
     });
   });
 
@@ -189,6 +211,7 @@ describe("the two command namespaces", () => {
     expect(matchCommands("/", "acp").map((c) => c.typed)).toEqual([
       "/new",
       "/context",
+      "/model",
     ]);
   });
 
@@ -240,5 +263,44 @@ describe("acpContextReport", () => {
     expect(acpContextReport(usage({ used: null }), "opencode")).toContain(
       "not reported",
     );
+  });
+});
+
+describe("modelReport", () => {
+  const choice = (value: string) => ({ value, name: value });
+
+  it("names the model and what else there is", () => {
+    const out = modelReport("openai/gpt-5.5", [
+      choice("openai/gpt-5.5"),
+      choice("anthropic/claude-sonnet-5"),
+    ], "acp");
+    expect(out).toContain("openai/gpt-5.5");
+    expect(out).toContain("anthropic/claude-sonnet-5");
+    expect(out).toContain("/model <name>");
+  });
+
+  it("stops short of a wall of text, and says how much it left out", () => {
+    // A harness fronting several providers advertises dozens, and the column
+    // is narrow. Silently truncating would read as the whole list.
+    const many = Array.from({ length: 30 }, (_, i) => choice(`m-${i}`));
+    const out = modelReport("m-0", many, "acp");
+    expect(out).not.toContain("m-29");
+    expect(out).toContain("18 more");
+  });
+
+  it("does not imply the built-in loop has a list", () => {
+    // An OpenAI-compatible endpoint takes whatever id its provider knows, and
+    // which ids those are is not biopb's to state.
+    const out = modelReport("test-model", [], "builtin");
+    expect(out).toContain("test-model");
+    expect(out).toContain("does not keep a list");
+  });
+
+  it("says when a harness would not say", () => {
+    expect(modelReport("m", [], "acp")).toContain("does not say");
+  });
+
+  it("reports an unset model as unset rather than as blank", () => {
+    expect(modelReport("", [], "builtin")).toContain("No model is set.");
   });
 });

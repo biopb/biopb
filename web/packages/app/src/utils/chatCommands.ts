@@ -13,10 +13,15 @@
 // so the sentence a mistyped command produces is pinned by a test instead of
 // living in a JSX branch nothing reaches.
 
-import type { AgentCommand, ChatEngine, ContextUsage } from "./chatClient";
+import type {
+  AgentCommand,
+  ChatEngine,
+  ContextUsage,
+  ModelChoice,
+} from "./chatClient";
 import type { ChatMessage } from "./chatThread";
 
-export type CommandName = "new" | "compact" | "context";
+export type CommandName = "new" | "compact" | "context" | "model";
 
 export interface CommandSpec {
   name: CommandName;
@@ -26,6 +31,13 @@ export interface CommandSpec {
   aliases: string[];
   /** One line, for the completion row. */
   help: string;
+  /** Whether the rest of the line is the command's, rather than a mistake.
+   *
+   * Off by default, and the default is the careful one: a command that quietly
+   * drops what follows it is how `/compact keep the segmentation notes` becomes
+   * a compaction that did not keep them.
+   */
+  argument?: boolean;
 }
 
 
@@ -50,12 +62,21 @@ export const COMMANDS: CommandSpec[] = [
     help: "what the model is being sent",
     aliases: [],
   },
+  {
+    name: "model",
+    typed: "/model",
+    help: "show or change the model",
+    aliases: [],
+    // Bare it reports and lists; with a name it switches. One command rather
+    // than two because the list is what tells you what to type next.
+    argument: true,
+  },
 ];
 
 export type Parsed =
   /** Not a command, or one only the agent knows. Send it. */
   | { kind: "send"; text: string }
-  | { kind: "command"; name: CommandName }
+  | { kind: "command"; name: CommandName; arg: string }
   /** Meant as a command and is not one; *message* is what to show. */
   | { kind: "reject"; message: string };
 
@@ -79,7 +100,14 @@ export function localCommands(engine: ChatEngine): CommandSpec[] {
   // the user's to ask, and under this engine the answer is *better*: the agent
   // reports `used`/`size` itself (ACP `usage_update`), where the built-in loop
   // could only estimate from characters the pane happened to be holding.
-  return COMMANDS.filter((c) => c.name === "new" || c.name === "context");
+  //
+  // `/model` stays under both. Which model is answering is the same question
+  // either way, and both engines can be moved off the one they started on --
+  // the built-in loop by the id it sends the provider, the harness by ACP's
+  // `session/set_config_option`.
+  return COMMANDS.filter(
+    (c) => c.name === "new" || c.name === "context" || c.name === "model",
+  );
 }
 
 /** What `/context` answers under the ACP engine.
@@ -112,6 +140,40 @@ export function acpContextReport(
   );
   return lines.join("\n");
 }
+
+/** What a bare `/model` answers: what is answering, and what else could.
+ *
+ * The list is the harness's own -- biopb does not keep a catalogue of models
+ * and would be wrong about it within a month. Under the built-in loop there is
+ * no list at all, and the report says so rather than implying the model in
+ * force is the only one: an OpenAI-compatible endpoint takes whatever id its
+ * provider knows, and which ids those are is not ours to state.
+ */
+export function modelReport(
+  current: string,
+  choices: ModelChoice[],
+  engine: ChatEngine = "builtin",
+): string {
+  const lines = [current ? `model: ${current}` : "No model is set."];
+  if (choices.length) {
+    const names = choices.map((c) => c.value);
+    const shown = names.slice(0, MODEL_LIST_MAX);
+    lines.push(`offered: ${shown.join(", ")}`);
+    if (names.length > shown.length) {
+      lines.push(`...and ${names.length - shown.length} more.`);
+    }
+  } else if (engine === "acp") {
+    lines.push("This agent does not say which models it offers.");
+  } else {
+    lines.push("Any id your provider knows; biopb does not keep a list.");
+  }
+  lines.push("/model <name> switches, and keeps the conversation.");
+  return lines.join("\n");
+}
+
+/** Enough to choose from, short of a wall of text in a narrow column. A harness
+ * fronting several providers advertises dozens. */
+const MODEL_LIST_MAX = 12;
 
 /** A bare `/word`, which is the only thing treated as a command attempt.
  *
@@ -175,13 +237,15 @@ export function parseCommand(
       message: `Unknown command ${first}. Available: ${listing(specs, agent)}.`,
     };
   }
-  // Rejected rather than ignored. None of the *local* ones take an argument, and
-  // quietly dropping the rest of the line is how `/compact keep the segmentation
-  // notes` becomes a compaction that did not keep them.
-  if (rest.length) {
+  // Rejected rather than ignored, for every command that does not declare one:
+  // quietly dropping the rest of the line is how `/compact keep the
+  // segmentation notes` becomes a compaction that did not keep them.
+  if (rest.length && !spec.argument) {
     return { kind: "reject", message: `${spec.typed} takes no arguments.` };
   }
-  return { kind: "command", name: spec.name };
+  // Rejoined from the split rather than sliced out of the input, so `/model
+  // openai/gpt-5` and `/model   openai/gpt-5` are the same command.
+  return { kind: "command", name: spec.name, arg: rest.join(" ") };
 }
 
 /** The commands *input* could still become, for the completion list.

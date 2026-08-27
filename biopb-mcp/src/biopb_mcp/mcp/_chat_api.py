@@ -173,7 +173,10 @@ def _who(ready):
         # the model is what it costs, and a reader wants the second as much as
         # the first. Agent alone when it was not, because naming the harness's
         # default here would be a guess rendered as fact.
-        model = get_setting(_config, "chat.acp_model")
+        #
+        # The live session first: it is the one answering, and it can be moved
+        # off the configured model -- by `/model`, or by the harness itself.
+        model = _chat_acp.current_model() or get_setting(_config, "chat.acp_model")
         return f"{agent} · {model}" if model else agent
     return get_setting(_config, "chat.model")
 
@@ -196,6 +199,84 @@ async def _api_chat_engine(request):
     # an engine switched under them that still names the outgoing engine's model
     # is a header contradicting the switcher beside it.
     return JSONResponse({"engine": _engine, "model": _who(ready)})
+
+
+async def _api_chat_models(request):
+    """What this engine can be pointed at, and what it is pointed at now.
+
+    Read when ``/model`` is typed rather than polled: the list changes only when
+    the session does, and it is long enough that carrying it on every poll would
+    be paying for it a hundred times to read it once.
+
+    ``choices`` is empty under the built-in loop, and that is not a degraded
+    answer -- an OpenAI-compatible endpoint has no model list we could trust, so
+    the honest report is the model in force and an invitation to name another.
+    The pane says which of the two it is by whether the list is empty.
+    """
+    if _acp():
+        return JSONResponse(
+            {
+                "engine": "acp",
+                "model": _chat_acp.current_model()
+                or get_setting(_config, "chat.acp_model"),
+                "choices": _chat_acp.model_choices(),
+            }
+        )
+    return JSONResponse(
+        {
+            "engine": "builtin",
+            "model": get_setting(_config, "chat.model"),
+            "choices": [],
+        }
+    )
+
+
+async def _chat_model(request):
+    """Point the engine in force at another model.
+
+    Refused while a turn is running, and for a sharper reason than a reset is: a
+    turn is several provider calls, and the built-in loop reads the model on
+    each one. Switching mid-turn would answer half a round in one model's voice
+    and half in another's.
+
+    Not persisted, for the reason the engine is not: the config file says what a
+    session *starts* as, and a change made in one window should not re-aim every
+    future viewer. It does reach every window of *this* session -- the pane
+    reads the model beside the engine on every poll.
+    """
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed body is the client's error
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    wanted = payload.get("model") if isinstance(payload, dict) else None
+    if not isinstance(wanted, str) or not wanted.strip():
+        return JSONResponse(
+            {"error": "model must be a non-empty string"}, status_code=400
+        )
+    wanted = wanted.strip()
+    if _in_flight():
+        return JSONResponse(
+            {"error": "a turn is running; cancel it first", "busy": True},
+            status_code=409,
+        )
+    key = "acp_model" if _acp() else "model"
+    if _acp() and _chat_acp.session_started():
+        # A live session moves without a respawn, which is the point: changing
+        # model should not cost the conversation.
+        try:
+            await _chat_acp.set_model(wanted)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001 - the harness's failure to report
+            logger.warning("could not set the ACP model: %s", exc)
+            return JSONResponse(
+                {"error": f"the agent refused the model: {exc}"}, status_code=502
+            )
+    # Written back either way, so the answer survives what ends the session: an
+    # agent not yet spawned starts on it, and one restarted by `/new` comes back
+    # on it rather than on the model the config file named an hour ago.
+    _config.setdefault("chat", {})[key] = wanted
+    return JSONResponse({"model": wanted, "engine": _engine})
 
 
 async def _api_chat_history(request):
@@ -633,12 +714,14 @@ _ROUTES = [
     ("/api/chat/status", ["GET"], _observe._route(_api_chat_status)),
     ("/api/chat/history", ["GET"], _observe._route(_api_chat_history)),
     ("/api/chat/engine", ["GET"], _observe._route(_api_chat_engine)),
+    ("/api/chat/models", ["GET"], _observe._route(_api_chat_models)),
     ("/chat/turn", ["POST"], _observe._json_route(_chat_turn)),
     ("/chat/cancel", ["POST"], _observe._json_route(_chat_cancel)),
     ("/chat/reset", ["POST"], _observe._json_route(_chat_reset)),
     ("/chat/summary", ["POST"], _observe._json_route(_chat_summary)),
     ("/chat/permission", ["POST"], _observe._json_route(_chat_permission)),
     ("/chat/engine", ["POST"], _observe._json_route(_chat_engine)),
+    ("/chat/model", ["POST"], _observe._json_route(_chat_model)),
 ]
 
 
@@ -652,7 +735,7 @@ def register_http_routes():
         _server_custom_route(path, methods)(handler)
     logger.info(
         "chat API mounted at /api/chat/* and "
-        "/chat/{turn,cancel,reset,summary,permission,engine} (engine: %s)",
+        "/chat/{turn,cancel,reset,summary,permission,engine,model} (engine: %s)",
         _engine,
     )
 

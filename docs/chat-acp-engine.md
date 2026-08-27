@@ -199,9 +199,11 @@ rather than after it.
   illustration — `/review` has no repo, `/init` writes an AGENTS.md that dies
   with the temp dir, `/customize-opencode` edits config that biopb pins or that
   the temp dir takes with it. Revisit if the harness is ever given a real
-  persistent workspace. Locally, `/new` survives under this engine; `/compact`
-  and `/context` do not, since they act on the built-in loop's projection of a
-  thread the harness never reads.
+  persistent workspace. Locally, `/new`, `/context` and `/model` survive under
+  this engine; `/compact` does not, since it folds the built-in loop's
+  projection of a thread the harness never reads — and ACP has no compaction
+  method to forward it to. `/context` is *better* here: the agent reports its
+  own `used`/`size` rather than the pane estimating from characters.
 - **The model is named, not inherited.** `chat.acp_model` is applied with
   `session/set_config_option` after `session/new`. A fresh session otherwise
   takes the harness's default, which is a model the user did not choose on a
@@ -209,6 +211,19 @@ rather than after it.
   `opencode/big-pickle` failed with "Endpoint is unavailable" while the CLI
   worked, because the CLI's model choice lives in opencode's session store and
   a new session does not inherit it.
+- **The model moves at runtime, which is why it is not pinned.** `/model` reads
+  `GET /api/chat/models` and writes `POST /chat/model`; under ACP that is
+  another `session/set_config_option` on the *live* session, so changing model
+  does not cost the conversation. Under the built-in loop it is `chat.model`,
+  which `_model.make_model` reads per provider call — so the switch lands on the
+  next call, with no restart. Refused mid-turn under both: a turn is several
+  provider calls, and switching between them answers half a round in one voice
+  and half in another. Not persisted, for the reason the engine is not.
+
+  The list comes from the harness (`config_options`, groups flattened), never
+  from a catalogue of our own — biopb would be wrong about it within a month.
+  The built-in loop has no list at all and the report says so rather than
+  implying the model in force is the only one.
 - **Threads move the pipes.** The harness is a plain `Popen` behind an
   `acp.Transport`, not `asyncio.create_subprocess_exec`: on Windows this server
   runs on the Selector loop, which implements neither subprocesses nor pipes.

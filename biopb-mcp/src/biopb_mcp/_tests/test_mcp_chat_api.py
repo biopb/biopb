@@ -115,6 +115,71 @@ class TestEngineRead:
         }
 
 
+class TestModelRoute:
+    def test_the_built_in_loop_offers_no_list_and_says_which_model(self, client):
+        # No list is the honest answer, not a degraded one: an
+        # OpenAI-compatible endpoint takes whatever id its provider knows.
+        assert client.get("/api/chat/models").json() == {
+            "engine": "builtin",
+            "model": "test-model",
+            "choices": [],
+        }
+
+    def test_a_switch_takes_effect_without_a_restart(self, client, configured):
+        r = client.post(
+            "/chat/model",
+            json={"model": "other-model"},
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 200
+        # Read back through the routes a pane actually polls, not the config
+        # dict: the model is read per provider call, so this is the next turn's
+        # model and the header's in one.
+        assert client.get("/api/chat/engine").json()["model"] == "other-model"
+        assert client.get("/api/chat/status").json()["model"] == "other-model"
+        assert configured["chat"]["model"] == "other-model"
+
+    @pytest.mark.parametrize("payload", [{}, {"model": ""}, {"model": "  "}])
+    def test_an_empty_model_is_refused(self, client, payload):
+        r = client.post(
+            "/chat/model", json=payload, headers={"Content-Type": "application/json"}
+        )
+        assert r.status_code == 400
+
+    def test_a_running_turn_keeps_its_model(self, client, monkeypatch):
+        """A turn is several provider calls and the loop reads the model on each
+        one, so a switch mid-turn answers half a round in another voice."""
+
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                r = client.post(
+                    "/chat/model",
+                    json={"model": "other-model"},
+                    headers={"Content-Type": "application/json"},
+                )
+                assert r.status_code == 409
+                assert r.json()["busy"] is True
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_it_carries_the_json_guard(self, client):
+        assert (
+            client.post(
+                "/chat/model",
+                content=json.dumps({"model": "other-model"}),
+                headers={"content-type": "text/plain"},
+            ).status_code
+            == 400
+        )
+
+
 class TestHistory:
     def test_after_returns_only_what_the_caller_has_not_seen(self, client):
         first = _chat._append("user", "one")

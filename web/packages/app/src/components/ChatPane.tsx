@@ -5,9 +5,11 @@ import {
   compactThread,
   fetchEngine,
   fetchHistory,
+  fetchModels,
   resetThread,
   sendTurn,
   setEngine,
+  setModel,
   type AgentCommand,
   type ChatEngine,
   type ChatStatus,
@@ -35,6 +37,7 @@ import {
   acpContextReport,
   contextReport,
   matchCommands,
+  modelReport,
   parseCommand,
 } from "../utils/chatCommands";
 
@@ -78,8 +81,8 @@ export default function ChatPane({
   const acp = engine === "acp";
   // Who is answering. Held here rather than read from the once-probed status
   // because it moves with the engine, and the engine moves under this pane.
-  const [model, setModel] = useState(status.model);
-  useEffect(() => setModel(status.model), [status.model]);
+  const [model, setModelState] = useState(status.model);
+  useEffect(() => setModelState(status.model), [status.model]);
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [text, setText] = useState("");
@@ -138,7 +141,7 @@ export default function ChatPane({
       // thread is left exactly as it is.
       const now = await fetchEngine(base);
       if (now) {
-        setModel(now.model);
+        setModelState(now.model);
         if (now.engine !== engineRef.current) adoptEngine(now.engine);
       }
       page = await fetchHistory(base, after.current);
@@ -300,6 +303,34 @@ export default function ChatPane({
     else poll();
   }, [base, poll]);
 
+  // `/model`. Bare it reads; with a name it writes and then reads back through
+  // the poll, so what the header ends up saying is the child's answer rather
+  // than this pane's optimism about its own request.
+  const pickModel = useCallback(
+    async (wanted: string) => {
+      if (!wanted) {
+        const now = await fetchModels(base);
+        if (!now) {
+          setError("Could not read the model list.");
+          return;
+        }
+        setNotice(modelReport(now.model, now.choices, engineRef.current));
+        return;
+      }
+      const err = await setModel(base, wanted);
+      if (err) {
+        setError(err);
+        return;
+      }
+      // Not announced here beyond the fact of it: the name in the header comes
+      // from the child on the next poll, and two places saying it is two places
+      // that can disagree.
+      setNotice(`Switched to ${wanted}.`);
+      poll();
+    },
+    [base, poll],
+  );
+
   // Enter, and the button beside it. Every path in goes through here so a
   // command cannot be reachable one way and not the other -- which is what a
   // send button disabled during a turn would do to `/context`, the one command
@@ -331,6 +362,11 @@ export default function ChatPane({
       );
       return;
     }
+    if (parsed.name === "model") {
+      setNotice(null);
+      await pickModel(parsed.arg);
+      return;
+    }
     setNotice(null);
     if (parsed.name === "new") await startNew();
     else await compact();
@@ -346,6 +382,7 @@ export default function ChatPane({
     commands,
     startNew,
     compact,
+    pickModel,
   ]);
 
   const toggle = useCallback((id: string) => {
