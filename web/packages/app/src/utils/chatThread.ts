@@ -110,10 +110,17 @@ function textBlocks(content: string): Block[] {
 export function mergeHistory(
   existing: ChatMessage[],
   incoming: ChatMessage[],
+  full = false,
 ): ChatMessage[] {
+  // The child says this page is the whole thread, not a delta. Replace, and
+  // replace with nothing when the thread is empty: after a reset that is
+  // exactly what every other window is told, and reading an empty page as "no
+  // news" is what left the cleared conversation on their screen with the new
+  // one appended to it. Ids are monotone across a reset, so no id-based guess
+  // can stand in for this.
+  if (full) return incoming;
   if (!existing.length) return incoming;
   if (!incoming.length) return existing;
-  if (incoming[0]!.id === existing[0]!.id) return incoming;
   const have = new Set(existing.map((m) => m.id));
   const fresh = incoming.filter((m) => !have.has(m.id));
   return fresh.length ? existing.concat(fresh) : existing;

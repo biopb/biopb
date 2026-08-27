@@ -79,10 +79,22 @@ describe("mergeHistory", () => {
     ]);
   });
 
-  it("replaces after a reset, whose ids start over at m-1", () => {
+  it("replaces the thread when the child says the page is the whole of it", () => {
+    // A reset, seen from a window that did not ask for one. Ids are monotone
+    // across a reset, so the new thread shares none with the old and no
+    // id-based guess can tell this from an ordinary delta -- appending is
+    // exactly what left the cleared conversation on screen.
     const held = [user("m-1", "old"), assistant("m-2", "older")];
-    const fresh = [user("m-1", "new")];
-    expect(mergeHistory(held, fresh)).toEqual(fresh);
+    const fresh = [user("m-3", "new")];
+    expect(mergeHistory(held, fresh, true)).toEqual(fresh);
+  });
+
+  it("clears the thread when the whole of it is nothing", () => {
+    // The other half of the same case: reset, and nobody has said anything
+    // since. Reading an empty full page as "no news" keeps the old
+    // conversation on screen forever.
+    const held = [user("m-1", "old"), assistant("m-2", "older")];
+    expect(mergeHistory(held, [], true)).toEqual([]);
   });
 
   it("does not truncate the thread when two polls overlap", () => {

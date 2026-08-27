@@ -33,6 +33,9 @@ export interface ChatStatus {
 
 export interface HistoryPage {
   messages: ChatMessage[];
+  /** Whether this page is the whole thread rather than a delta — a cursor the
+   * child did not recognise, which after a reset is every other window's. */
+  full: boolean;
   busy: boolean;
   /** The cell being polled right now, and what it has printed. */
   live: LiveOutput | null;
@@ -74,6 +77,8 @@ export async function fetchHistory(
     const j = await r.json();
     return {
       messages: Array.isArray(j.messages) ? j.messages : [],
+      // Absent on an older child, where every page was effectively a delta.
+      full: !!j.full,
       busy: !!j.busy,
       live: readLive(j.partial),
     };

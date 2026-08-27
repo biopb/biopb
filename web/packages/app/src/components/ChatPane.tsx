@@ -74,9 +74,13 @@ export default function ChatPane({
     // live output matters. Skipping the rest on `!messages.length` would have
     // frozen the output for the entire cell -- so the skip is expressed as the
     // guard it actually is, and cannot grow to cover anything else.
-    if (page.messages.length) {
-      setMessages((prev) => mergeHistory(prev, page.messages));
-      after.current = page.messages[page.messages.length - 1]!.id;
+    // A full page is acted on even when it is empty -- that is a reset, seen
+    // from a window that did not ask for one.
+    if (page.full || page.messages.length) {
+      setMessages((prev) => mergeHistory(prev, page.messages, page.full));
+      after.current = page.messages.length
+        ? page.messages[page.messages.length - 1]!.id
+        : null;
     }
   }, [base]);
 

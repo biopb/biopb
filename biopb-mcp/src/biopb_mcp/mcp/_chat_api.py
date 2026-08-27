@@ -127,7 +127,9 @@ async def _api_chat_history(request):
     the thread as base64, so re-sending the whole conversation every few seconds
     would be wasteful in exactly the sessions that matter. An unknown id returns
     everything, which is the right answer for a view that has just loaded or has
-    fallen behind a reset.
+    fallen behind a reset -- and ``full`` says which of those two a page is, so
+    a view that has fallen behind a reset replaces what it holds instead of
+    appending to it.
 
     ``partial`` carries the running cell's output so far. It rides this read
     rather than a route of its own because a view wants the two together: the
@@ -135,13 +137,27 @@ async def _api_chat_history(request):
     """
     messages = _chat.history()
     after = request.query_params.get("after")
+    full = True
     if after:
         for i, msg in enumerate(messages):
             if msg["id"] == after:
-                messages = messages[i + 1 :]
+                messages, full = messages[i + 1 :], False
                 break
     return JSONResponse(
-        {"messages": messages, "busy": _chat.busy(), "partial": _partial()}
+        {
+            "messages": messages,
+            # Whether this is the whole thread or a delta. A view cannot tell
+            # them apart from the messages alone, and after a reset it must:
+            # every other window is still holding the old conversation and a
+            # cursor into it, and appending the new thread to the old one leaves
+            # the cleared conversation on screen. Ids are monotone across a
+            # reset (see _chat.reset), so an unrecognised cursor is exactly this
+            # case -- and a *full* page can be empty, which is what a reset with
+            # nothing said since looks like.
+            "full": full,
+            "busy": _chat.busy(),
+            "partial": _partial(),
+        }
     )
 
 

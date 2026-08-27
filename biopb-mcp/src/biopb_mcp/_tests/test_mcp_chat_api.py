@@ -213,6 +213,32 @@ class TestReset:
             == 400
         )
 
+    def test_the_new_thread_is_marked_whole_not_a_delta(self, client):
+        # The window that did not ask for the reset is still holding the old
+        # conversation and a cursor into it. Ids are monotone across a reset, so
+        # nothing in the messages distinguishes "here is the rest" from "here is
+        # everything, start again" -- and appending leaves the cleared thread on
+        # screen with the new one after it.
+        _chat._append("user", "old")
+        stale = _chat.history()[-1]["id"]
+        client.post("/chat/reset", json={})
+        body = client.get(f"/api/chat/history?after={stale}").json()
+        assert body["full"] is True
+        assert body["messages"] == []
+
+        _chat._append("user", "new")
+        body = client.get(f"/api/chat/history?after={stale}").json()
+        assert body["full"] is True
+        assert [m["content"] for m in body["messages"]] == ["new"]
+
+    def test_a_recognised_cursor_is_a_delta(self, client):
+        _chat._append("user", "one")
+        cursor = _chat.history()[-1]["id"]
+        _chat._append("assistant", "two")
+        body = client.get(f"/api/chat/history?after={cursor}").json()
+        assert body["full"] is False
+        assert [m["content"] for m in body["messages"]] == ["two"]
+
     def test_a_view_that_asks_after_a_cleared_message_gets_the_new_thread(self, client):
         # Another window is still holding an id from the old conversation. An
         # unknown `after` returns everything, which is what lets it notice.
