@@ -546,11 +546,24 @@ class TestPinnedConfig:
         assert "*" not in permission
         assert "read" not in permission
 
-    def test_allow_pins_nothing_at_all(self):
+    def test_allow_pins_no_permission_policy(self):
         """ "Allow" means do not interfere -- including not overriding a stricter
-        choice the user made in their own config. With nothing to pin, the
-        variable is not set rather than set to an empty policy."""
-        assert _chat_acp._agent_env(self.cfg("allow")) == {}
+        choice the user made in their own config."""
+        assert "permission" not in self.policy("allow")
+
+    def test_the_agents_own_biopb_registration_is_switched_off(self):
+        """The installer writes one into the user's client config, and opencode
+        merges config MCP servers into an ACP session. Without this the agent
+        gets biopb twice -- ours over http on the viewer in front of the user,
+        and theirs over stdio, which becomes a second napari window."""
+        for mode in ("ask", "allow"):
+            # Unconditional: a second viewer is a wrong session, not a
+            # preference about one.
+            assert self.policy(mode)["mcp"] == {"biopb": {"enabled": False}}
+
+    def test_only_biopbs_own_entry_is_suppressed(self):
+        """Any other MCP server the user configured is theirs and stays."""
+        assert list(self.policy("ask")["mcp"]) == ["biopb"]
 
     def test_an_agent_with_no_known_settings_is_launched_untouched(self):
         assert _chat_acp._agent_env(self.cfg("ask", agent="nothing")) == {}

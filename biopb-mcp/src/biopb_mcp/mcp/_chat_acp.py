@@ -89,6 +89,24 @@ _ACP_AGENTS = {
         # are the harness's *own* mutating and outbound actions. Reads stay
         # unprompted (noisy, low harm) and `external_directory` is left alone
         # because opencode already defaults it to "ask".
+        # The harness's *own* registration of biopb, switched off. The installer
+        # writes one into the user's client config under exactly this key
+        # (``biopb._agents``), and opencode merges config MCP servers into an
+        # ACP session alongside the ones handed to it -- so without this the
+        # agent gets biopb twice: ours over http, driving the viewer the user is
+        # looking at, and theirs over stdio, which the shim turns into a second
+        # session child and a second napari window.
+        #
+        # Today the two happen to collide on the name "biopb" and ours wins, so
+        # the duplicate does not appear. That is an accident of naming, not a
+        # guarantee, and it stops holding the moment anyone registers biopb
+        # under a different key. Measured: with our entry renamed, the agent
+        # listed eighteen biopb tools.
+        #
+        # Only biopb's own entry. Any other MCP server the user configured is
+        # theirs and stays: this is about not being present twice, not about
+        # taking their tools away.
+        "suppress_mcp": ("biopb",),
         "strict_permission": {
             "edit": "ask",
             "bash": "ask",
@@ -701,6 +719,11 @@ def _pinned_config(config):
 
     spec = _ACP_AGENTS.get(get_setting(config, "chat.acp_agent")) or {}
     body = {}
+    # Unconditional: two biopb servers means two viewers, which is a wrong
+    # session rather than a preference about one.
+    suppress = spec.get("suppress_mcp") or ()
+    if suppress:
+        body["mcp"] = {name: {"enabled": False} for name in suppress}
     if get_setting(config, "chat.acp_permission") == "ask":
         # Absent under "allow": that answer means do not interfere, including
         # not overriding a stricter choice the user made in their own config.

@@ -108,6 +108,29 @@ settings survive, and nothing the agent writes displaces ours. Verified with a
 project `opencode.json` saying `{"permission": {"edit": "allow"}}`: the prompt
 still fired.
 
+### The harness's own biopb registration is switched off
+
+The same inline config carries `{"mcp": {"biopb": {"enabled": false}}}`, and this
+one is unconditional.
+
+opencode **merges MCP servers from its config into an ACP session**, alongside
+the ones handed to it in `session/new`. The installer registers biopb in that
+config under exactly the key `biopb` (`biopb._agents`), over stdio — which the
+shim turns into a second session child and a second napari window. So without
+this the agent gets biopb twice: ours on the viewer the user is watching, and
+theirs on a viewer nobody is.
+
+It looks like it works without the suppression, because the two collide on the
+name `biopb` and ours wins. That is an accident of naming, not a guarantee, and
+it stops holding the moment anyone registers biopb under a different key —
+measured: with our entry renamed to `biopb-http`, the agent listed eighteen
+biopb tools and connected both servers.
+
+Servers from `session/new` are a separate namespace, so disabling the config
+entry does not touch ours — verified the same way. And only biopb's own entry is
+suppressed: any other MCP server the user configured is theirs and stays. This is
+about not being present twice, not about taking their tools away.
+
 ### What is pinned, and what is not
 
 Only what must not move once the agent is running. **Permissions** are pinned
