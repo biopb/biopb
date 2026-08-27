@@ -117,6 +117,28 @@ export async function sendTurn(
   return String(d.error || `send failed (${r.status})`);
 }
 
+/** Start a new conversation. Returns an error string, or null.
+ *
+ * Refused with 409 while a turn is in flight: a cleared thread that the running
+ * turn then appends the rest of its round into is an assistant turn whose calls
+ * have no history behind them, which fails at the provider on every later turn.
+ */
+export async function resetThread(base: string): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await sessionFetch(base + "/chat/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return String(e);
+  }
+  if (r.ok) return null;
+  if (r.status === 409) return "A turn is running. Cancel it first.";
+  const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  return String(d.error || `reset failed (${r.status})`);
+}
+
 /** Stop the running turn. Nothing to report: cancelling nothing is a success,
  * and what actually happened arrives in the thread on the next poll. */
 export async function cancelTurn(base: string): Promise<void> {

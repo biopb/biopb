@@ -61,6 +61,13 @@ describe("ChatPane", () => {
     expect(html).toContain('aria-label="Send message"');
   });
 
+  it("offers a way out of a thread that has grown too long", () => {
+    // The conversation is re-projected to the provider whole on every turn and
+    // has no other bound; without this the only escape was restarting the
+    // session child, which takes the kernel and the viewer with it.
+    expect(render(status())).toContain("chat-new");
+  });
+
   it("leaves the composer usable when chat is ready", () => {
     expect(render(status())).not.toContain("<textarea disabled");
   });

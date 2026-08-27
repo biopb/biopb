@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import {
   cancelTurn,
   fetchHistory,
+  resetThread,
   sendTurn,
   type ChatStatus,
 } from "../utils/chatClient";
@@ -129,6 +130,27 @@ export default function ChatPane({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [zoom, busy, stop]);
+  // The thread's only bound. `_llm_messages` re-projects every stored message
+  // on every turn, so a conversation that outgrows the provider's context fails
+  // -- and records the failure in the thread, so it fails the same way forever.
+  // Confirmed because it cannot be undone; the cells it ran are untouched, which
+  // is what the wording has to get across.
+  const startNew = useCallback(async () => {
+    if (!confirm("Start a new conversation? This clears the chat. Cells it ran stay in the job list."))
+      return;
+    const err = await resetThread(base);
+    if (err) {
+      setError(err);
+      return;
+    }
+    setMessages([]);
+    after.current = null;
+    setExpanded(new Set());
+    setLive(null);
+    setBusy(false);
+    setError(null);
+    poll();
+  }, [base, poll]);
 
   const toggle = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -156,6 +178,9 @@ export default function ChatPane({
       <div className="chat-head">
         <span className="chat-title">chat</span>
         <span className="chat-model">{status.model}</span>
+        <button className="chat-new" onClick={startNew} title="Start a new conversation">
+          new
+        </button>
       </div>
 
       <div
@@ -420,6 +445,12 @@ const CHAT_CSS = `
                   border: 1px solid #3a3a3a; border-radius: 3px; padding: 0 3px;
                   color: #999; }
   .chat-err { color: #f99; font-size: 12px; }
+  /* No margin-left:auto here -- .chat-model already has one, and a second
+     would share the free space between them instead of pinning both right. */
+  .chat-new { font-size: 11px; padding: 1px 8px;
+              border-radius: 10px; border: 1px solid #333; background: #181818;
+              color: #999; cursor: pointer; }
+  .chat-new:hover { background: #222; color: #ccc; }
   .chat-zoom { position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 50;
                display: flex; align-items: center; justify-content: center;
                cursor: zoom-out; padding: 24px; }

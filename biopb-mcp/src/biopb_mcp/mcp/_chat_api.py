@@ -274,6 +274,40 @@ async def _chat_cancel(request):
     return JSONResponse({"cancelled": True, "started": started})
 
 
+async def _chat_reset(request):
+    """Drop the conversation and start a new one.
+
+    The escape hatch the thread had no other exit from. ``_llm_messages``
+    re-projects every stored message on every turn, so a conversation only
+    grows -- and once it outgrows the provider's context the turn fails, records
+    the failure *in the thread*, and fails the same way forever. Without this
+    the only way out was restarting the session child, which takes the kernel
+    and the viewer window with it: losing a namespace to clear a chat.
+
+    Refused while a turn is in flight rather than cancelling it. A reset lands
+    mid-flight as a cleared thread that ``_run_turn`` then appends the rest of
+    its round into -- an assistant turn whose calls have no history behind them,
+    which is the shape that fails at the provider on every later turn. Cancel is
+    right there, and says what it is doing.
+
+    The cells the conversation ran are *not* touched. They stay in the job list
+    and the notebook export, because clearing a conversation is not undoing the
+    work it did -- and the kernel namespace it built is still live.
+    """
+    if _in_flight():
+        return JSONResponse(
+            {"error": "a turn is running; cancel it first", "busy": True},
+            status_code=409,
+        )
+    global _turn_task, _live_job, _live_text, _live_len
+    _chat.reset()
+    _turn_task = None
+    # The partial belongs to the thread that just went away. Left behind, it
+    # would be published beside the first message of the new one.
+    _live_job, _live_text, _live_len = None, "", 0
+    return JSONResponse({"reset": True})
+
+
 # Reads under `api` (always proxied), the writes under `chat` (proxied only by a
 # loopback-bound control, and POST-only, which that gate enforces).
 _ROUTES = [
@@ -281,6 +315,7 @@ _ROUTES = [
     ("/api/chat/history", ["GET"], _observe._route(_api_chat_history)),
     ("/chat/turn", ["POST"], _observe._json_route(_chat_turn)),
     ("/chat/cancel", ["POST"], _observe._json_route(_chat_cancel)),
+    ("/chat/reset", ["POST"], _observe._json_route(_chat_reset)),
 ]
 
 
@@ -292,7 +327,7 @@ def register_http_routes():
     """
     for path, methods, handler in _ROUTES:
         _server_custom_route(path, methods)(handler)
-    logger.info("chat API mounted at /api/chat/* and /chat/{turn,cancel}")
+    logger.info("chat API mounted at /api/chat/* and /chat/{turn,cancel,reset}")
 
 
 def _server_custom_route(path, methods):

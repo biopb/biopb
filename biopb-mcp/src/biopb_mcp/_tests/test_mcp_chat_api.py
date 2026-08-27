@@ -163,6 +163,63 @@ class TestTurn:
         assert client.post("/chat/turn", json=payload).status_code == 400
 
 
+class TestReset:
+    def test_it_clears_the_thread(self, client):
+        _chat._append("user", "hello")
+        _chat._append("assistant", "hi")
+        assert client.post("/chat/reset", json={}).json() == {"reset": True}
+        assert _chat.history() == []
+
+    def test_the_running_cells_output_does_not_outlive_the_thread(self, client):
+        # The partial belongs to the conversation that just went away; left
+        # behind it would be published beside the first message of the next.
+        _chat_api._live_job, _chat_api._live_text = "job-3", "half a result\n"
+        _chat_api._live_len = len("half a result\n")
+        client.post("/chat/reset", json={})
+        assert _chat_api._partial() is None
+        assert _chat_api._live_text == ""
+
+    def test_a_running_turn_is_not_reset_out_from_under(self, client, monkeypatch):
+        # A cleared thread that _run_turn then appends the rest of its round
+        # into is an assistant turn whose calls have no history behind them --
+        # the shape that fails at the provider on every later turn, not just
+        # this one. Cancel is right there and says what it is doing.
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                _chat._append("user", "hello")
+                r = client.post("/chat/reset", json={})
+                assert r.status_code == 409
+                assert r.json()["busy"] is True
+                assert len(_chat.history()) == 1
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_it_carries_the_json_guard_despite_having_no_body(self, client):
+        assert (
+            client.post(
+                "/chat/reset", headers={"content-type": "text/plain"}
+            ).status_code
+            == 400
+        )
+
+    def test_a_view_that_asks_after_a_cleared_message_gets_the_new_thread(self, client):
+        # Another window is still holding an id from the old conversation. An
+        # unknown `after` returns everything, which is what lets it notice.
+        _chat._append("user", "old")
+        stale = _chat.history()[-1]["id"]
+        client.post("/chat/reset", json={})
+        _chat._append("user", "new")
+        body = client.get(f"/api/chat/history?after={stale}").json()
+        assert [m["content"] for m in body["messages"]] == ["new"]
+
+
 class TestCancel:
     @staticmethod
     def _wait_for(predicate, timeout=2.0):

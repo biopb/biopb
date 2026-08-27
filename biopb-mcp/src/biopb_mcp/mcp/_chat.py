@@ -133,10 +133,22 @@ def note_error(text):
 
 
 def reset():
-    """Drop the conversation (used by tests and on an explicit new session)."""
-    global _seq, _running_job_id
+    """Drop the conversation.
+
+    The thread only grows -- ``_llm_messages`` re-projects all of it every turn
+    -- so starting a new one is the only bound it has until the projection
+    itself gets a budget. Clears the running-cell id with it: the next thread
+    must not open by naming a cell it never started.
+
+    The id sequence is **not** restarted. Ids are how a view tells a message it
+    has already drawn from one it has not, and ``/api/chat/history?after=`` is
+    documented to return everything for an id it does not recognise -- which is
+    how a window open across a reset notices. Restarting the count reissues the
+    old thread's ids to the new one, so that stale cursor matches a message the
+    view has never seen and it skips the new conversation's opening instead.
+    """
+    global _running_job_id
     _messages.clear()
-    _seq = 0
     _running_job_id = None
 
 
