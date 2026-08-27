@@ -69,6 +69,13 @@ describe("ChatPane", () => {
     expect(render(status())).toContain("chat-new");
   });
 
+  it("tells the reader the commands are there", () => {
+    // A slash command nobody knows about is not a feature. The list itself
+    // appears once a slash is typed, which a static render cannot reach, so
+    // the standing hint is the part that has to be here.
+    expect(render(status())).toContain("for commands");
+  });
+
   it("leaves the composer usable when chat is ready", () => {
     expect(render(status())).not.toContain("<textarea disabled");
   });
