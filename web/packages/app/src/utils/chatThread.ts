@@ -96,16 +96,15 @@ function textBlocks(content: string): Block[] {
  * that has just loaded or has fallen behind a reset, but leaves a replay and a
  * delta indistinguishable at the call site.
  *
- * They are distinguishable *here*, because a replay always starts at the
- * conversation's first message and so does what we hold — the pane never drops a
- * prefix. Matching first ids is therefore the replay, and it covers a reset too:
- * ids restart at `m-1`, so the new thread's first id equals the old one's and
- * the stale conversation is replaced rather than grown.
+ * So the child says which it sent, in `full`, and nothing here guesses. The
+ * guess that used to live here — a replay starts at the conversation's first
+ * message, so matching first ids is a replay — held only while a reset restarted
+ * message ids. Ids are monotone across one now, precisely so a stale cursor
+ * cannot match a message this view has never seen.
  *
- * Anything else is a delta, and it is deduplicated rather than trusted: two
- * polls overlap whenever a fetch outlives the interval, and the second returns
- * messages the first has already appended. Reading that repetition as a replay
- * would truncate the thread to the overlap.
+ * A delta is deduplicated rather than trusted: two polls overlap whenever a
+ * fetch outlives the interval, and the second returns messages the first has
+ * already appended. Appending that repetition would show the thread twice.
  */
 export function mergeHistory(
   existing: ChatMessage[],
