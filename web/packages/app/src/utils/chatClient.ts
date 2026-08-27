@@ -127,6 +127,30 @@ function readEngineRow(raw: unknown): EngineRow {
   };
 }
 
+/** Who is driving the pane right now, or null when the read failed.
+ *
+ * Read before every history read rather than taken from the once-probed status:
+ * the engine is session state, and the window that switched it is not
+ * necessarily this one. A pane that missed the switch renders the outgoing
+ * engine's thread forever -- it holds both, and picks by an `engine` its own
+ * click is the only thing that ever moved.
+ */
+export async function fetchEngine(
+  base: string,
+): Promise<{ engine: ChatEngine; model: string } | null> {
+  try {
+    const r = await sessionFetch(base + "/api/chat/engine");
+    if (!r.ok) return null;
+    const j = await r.json();
+    return {
+      engine: j.engine === "acp" ? "acp" : "builtin",
+      model: typeof j.model === "string" ? j.model : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** The conversation after *cursor*, or all of it when the child does not
  * recognise it. Null on a failed read, so the pane keeps what it has.
  *

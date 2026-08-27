@@ -178,6 +178,26 @@ def _who(ready):
     return get_setting(_config, "chat.model")
 
 
+async def _api_chat_engine(request):
+    """Which engine is driving the pane, right now.
+
+    A read of its own rather than a field on the status probe, because the
+    engine is session state and any window can change it: two observe pages on
+    one session, and the one that did not click has to find out. Status is
+    probed once per page, so it cannot be where that lands.
+
+    The pane reads this ahead of every history read. Everything about how it
+    renders is keyed to the engine -- which adapter parses the page, how the
+    cursor is spelled, which slash commands exist -- so it is asked before the
+    thread rather than inferred from it.
+    """
+    ready, reason = _readiness()
+    # `model` rides along because it is the same fact from the reader's side:
+    # an engine switched under them that still names the outgoing engine's model
+    # is a header contradicting the switcher beside it.
+    return JSONResponse({"engine": _engine, "model": _who(ready)})
+
+
 async def _api_chat_history(request):
     """The conversation, or the part of it the caller has not seen.
 
@@ -612,6 +632,7 @@ async def _chat_engine(request):
 _ROUTES = [
     ("/api/chat/status", ["GET"], _observe._route(_api_chat_status)),
     ("/api/chat/history", ["GET"], _observe._route(_api_chat_history)),
+    ("/api/chat/engine", ["GET"], _observe._route(_api_chat_engine)),
     ("/chat/turn", ["POST"], _observe._json_route(_chat_turn)),
     ("/chat/cancel", ["POST"], _observe._json_route(_chat_cancel)),
     ("/chat/reset", ["POST"], _observe._json_route(_chat_reset)),

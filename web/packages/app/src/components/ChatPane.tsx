@@ -3,11 +3,13 @@ import {
   answerPermission,
   cancelTurn,
   compactThread,
+  fetchEngine,
   fetchHistory,
   resetThread,
   sendTurn,
   setEngine,
   type AgentCommand,
+  type ChatEngine,
   type ChatStatus,
   type ContextUsage,
 } from "../utils/chatClient";
@@ -62,12 +64,22 @@ export default function ChatPane({
   const [commands, setCommands] = useState<AgentCommand[]>([]);
   const [usage, setUsage] = useState<ContextUsage | null>(null);
   // The engine in force *now*. Seeded from the status the page probed once at
-  // mount, and then owned here, because switching is a thing this pane does and
-  // re-probing the whole page to learn the result of its own click would be a
-  // round trip to find out something it already knows.
+  // mount, and then kept current by the poll rather than by that probe: the
+  // engine is session state, and a switch made in another window of the same
+  // session has to arrive here somehow.
   const [engine, setEngineState] = useState(status.engine);
-  useEffect(() => setEngineState(status.engine), [status.engine]);
+  // The same value where the poll can read it, for the reason `after` is a ref:
+  // the poll must not run a render behind the engine it is reading for.
+  const engineRef = useRef(status.engine);
+  useEffect(() => {
+    engineRef.current = status.engine;
+    setEngineState(status.engine);
+  }, [status.engine]);
   const acp = engine === "acp";
+  // Who is answering. Held here rather than read from the once-probed status
+  // because it moves with the engine, and the engine moves under this pane.
+  const [model, setModel] = useState(status.model);
+  useEffect(() => setModel(status.model), [status.model]);
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [text, setText] = useState("");
@@ -97,11 +109,38 @@ export default function ChatPane({
   // `mergeHistory` survives the overlap; this keeps it from happening.
   const reading = useRef(false);
 
+  // Hand the pane to an engine, from wherever the switch came from. The thread
+  // does not travel with it: the two hold different conversations, and showing
+  // one engine's transcript above another engine's answers would invent a
+  // continuity that does not exist. The cursor goes with the thread -- the two
+  // engines do not even spell it the same way.
+  const adoptEngine = useCallback((next: ChatEngine) => {
+    engineRef.current = next;
+    setEngineState(next);
+    setMessages([]);
+    setItems([]);
+    setCommands([]);
+    setUsage(null);
+    setLive(null);
+    setNotice(null);
+    after.current = null;
+  }, []);
+
   const poll = useCallback(async () => {
     if (reading.current) return;
     reading.current = true;
     let page;
     try {
+      // The engine first, because a session has one and any window can change
+      // it. A pane that learned it only from its own click keeps rendering the
+      // outgoing engine's thread, and keeps asking for it with a cursor the
+      // incoming one cannot read. Null is a failed read, not a change: the
+      // thread is left exactly as it is.
+      const now = await fetchEngine(base);
+      if (now) {
+        setModel(now.model);
+        if (now.engine !== engineRef.current) adoptEngine(now.engine);
+      }
       page = await fetchHistory(base, after.current);
     } finally {
       reading.current = false;
@@ -133,7 +172,7 @@ export default function ChatPane({
         ? page.messages[page.messages.length - 1]!.id
         : null;
     }
-  }, [base]);
+  }, [base, adoptEngine]);
 
   // Faster while a turn runs. The page's own interval is tuned for a job list;
   // a conversation updating every three seconds reads as a stall.
@@ -171,29 +210,21 @@ export default function ChatPane({
   // At most one, and it is what Escape means while it is up.
   const asking = acp ? openPermission(thread) : null;
 
-  // Switching hands the pane to the other agent. The thread does not travel
-  // with it: the two hold different conversations, and showing one engine's
-  // transcript above another engine's answers would invent a continuity that
-  // does not exist.
+  // Switching from this window. The other window's switch arrives through the
+  // poll, and lands in the same place.
   const switchEngine = useCallback(
-    async (next: "builtin" | "acp") => {
+    async (next: ChatEngine) => {
       if (next === engine) return;
       const err = await setEngine(base, next);
       if (err) {
         setError(err);
         return;
       }
-      setEngineState(next);
+      adoptEngine(next);
       setError(null);
-      setNotice(null);
-      setMessages([]);
-      setItems([]);
-      setCommands([]);
-      setUsage(null);
-      after.current = null;
       poll();
     },
-    [base, engine, poll],
+    [base, engine, poll, adoptEngine],
   );
 
   const stop = useCallback(async () => {
@@ -295,8 +326,8 @@ export default function ChatPane({
       // the pane holds, the harness reports its own use.
       setNotice(
         acp
-          ? acpContextReport(usage, status.model)
-          : contextReport(messages, status.compacted, status.model),
+          ? acpContextReport(usage, model)
+          : contextReport(messages, status.compacted, model),
       );
       return;
     }
@@ -308,7 +339,7 @@ export default function ChatPane({
     submit,
     messages,
     status.compacted,
-    status.model,
+    model,
     engine,
     acp,
     usage,
@@ -351,7 +382,7 @@ export default function ChatPane({
           <select
             className="chat-engine"
             value={engine}
-            onChange={(e) => switchEngine(e.target.value as "builtin" | "acp")}
+            onChange={(e) => switchEngine(e.target.value as ChatEngine)}
             title="Which agent drives this pane"
           >
             {status.engines.map((e) => (
@@ -365,12 +396,12 @@ export default function ChatPane({
           className="chat-model"
           title={acp ? "an ACP harness, running as you" : "the built-in loop"}
         >
-          {status.model}
+          {model}
         </span>
         {/* Shown only once there is something to fold: a control that cannot
             act is how the observe page's Interrupt earned its "No running job."
             dialog. */}
-        {status.compacted ? (
+        {!acp && status.compacted ? (
           <span className="chat-folded" title="Messages the model now sees only as a summary">
             {status.compacted} folded
           </span>

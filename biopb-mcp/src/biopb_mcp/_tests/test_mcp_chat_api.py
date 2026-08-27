@@ -105,6 +105,16 @@ class TestStatus:
         assert body["model"] == ""
 
 
+class TestEngineRead:
+    def test_the_engine_is_readable_on_its_own(self, client):
+        # Read before every history read, because the engine is session state
+        # and the window that switched it is not necessarily the one asking.
+        assert client.get("/api/chat/engine").json() == {
+            "engine": "builtin",
+            "model": "test-model",
+        }
+
+
 class TestHistory:
     def test_after_returns_only_what_the_caller_has_not_seen(self, client):
         first = _chat._append("user", "one")

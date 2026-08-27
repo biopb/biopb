@@ -7,7 +7,7 @@ vi.mock("../auth", () => ({
   redirectToUnlock: vi.fn(),
 }));
 
-import { fetchChatStatus, fetchHistory } from "./chatClient";
+import { fetchChatStatus, fetchEngine, fetchHistory } from "./chatClient";
 
 const answering = (body: unknown) =>
   vi.stubGlobal(
@@ -34,6 +34,33 @@ describe("fetchChatStatus", () => {
   it("reads a child that does not send one as having folded nothing", async () => {
     answering({ enabled: true, ready: true, model: "m" });
     expect((await fetchChatStatus("/s"))!.compacted).toBe(0);
+  });
+});
+
+describe("fetchEngine", () => {
+  it("reads the engine and who is answering under it", async () => {
+    // Both move together: an engine switched by another window that still names
+    // the outgoing engine's model is a header contradicting the switcher.
+    answering({ engine: "acp", model: "opencode · claude-sonnet-5" });
+    expect(await fetchEngine("/s")).toEqual({
+      engine: "acp",
+      model: "opencode · claude-sonnet-5",
+    });
+  });
+
+  it("reads anything else as the built-in loop", async () => {
+    // A child too old to have the route 404s, which is a failed read; a child
+    // that answers with something unexpected is the one this covers.
+    answering({ engine: "", model: "m" });
+    expect((await fetchEngine("/s"))!.engine).toBe("builtin");
+  });
+
+  it("is null when the read fails, so the pane keeps its thread", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("nope", { status: 404 })),
+    );
+    expect(await fetchEngine("/s")).toBe(null);
   });
 });
 

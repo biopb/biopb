@@ -440,6 +440,16 @@ class TestHttpSurface:
         assert r.status_code == 200
         assert r.json() == {"engine": "acp", "changed": False}
 
+    def test_a_switch_is_visible_to_a_window_that_did_not_make_it(self, acp_client):
+        """Two observe pages, one session: the one that did not click has to
+        find out, and the once-probed status is not where that can land."""
+        assert acp_client.get("/api/chat/engine").json()["engine"] == "acp"
+        assert self.post(acp_client, "/chat/engine", {"engine": "builtin"}).status_code
+        assert acp_client.get("/api/chat/engine").json() == {
+            "engine": "builtin",
+            "model": "test-model",
+        }
+
     def test_an_unknown_engine_is_refused(self, acp_client):
         assert (
             self.post(acp_client, "/chat/engine", {"engine": "vim"}).status_code == 400

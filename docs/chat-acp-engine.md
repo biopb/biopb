@@ -168,6 +168,14 @@ at the restart control.
 It is not persisted. The config file says what a session *starts* as; a click in
 one window should not re-aim every future viewer.
 
+The switch is session state, so the window that did not click has to find out:
+the pane reads `GET /api/chat/engine` ahead of every history read and adopts
+what it says, dropping the thread and cursor it was holding. Not a field on the
+status probe, which happens once per page — and not inferred from which key the
+history page carried, because the cursor spelling, the adapter and the slash
+commands are all keyed to the engine, so it has to be known before the read
+rather than after it.
+
 ## Shapes worth knowing
 
 - **The thread is items with a revision.** ACP updates items in place, so the
