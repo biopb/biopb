@@ -12,6 +12,7 @@ const status = (over: Partial<ChatStatus> = {}): ChatStatus => ({
   ready: true,
   reason: null,
   model: "claude-sonnet-5",
+  compacted: 0,
   ...over,
 });
 

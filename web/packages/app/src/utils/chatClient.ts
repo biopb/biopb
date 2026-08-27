@@ -27,8 +27,8 @@ export interface ChatStatus {
   model: string;
   /** How many leading messages the model now sees only as a summary. The pane
    * renders all of them regardless, so this is the only sign compaction
-   * happened. Absent on an older child. */
-  compacted?: number;
+   * happened. Zero on an older child, which never folds anything. */
+  compacted: number;
 }
 
 export interface HistoryPage {
@@ -58,6 +58,10 @@ export async function fetchChatStatus(base: string): Promise<ChatStatus | null> 
       ready: !!j.ready,
       reason: typeof j.reason === "string" ? j.reason : null,
       model: typeof j.model === "string" ? j.model : "",
+      // Read here or it does not exist: this builds the status field by field
+      // rather than returning the body, so a key the type declares and the
+      // parser drops is invisible on both sides of the seam.
+      compacted: typeof j.compacted === "number" ? j.compacted : 0,
     };
   } catch {
     return null;
