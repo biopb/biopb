@@ -13,7 +13,7 @@
 // so the sentence a mistyped command produces is pinned by a test instead of
 // living in a JSX branch nothing reaches.
 
-import type { AgentCommand, ChatEngine } from "./chatClient";
+import type { AgentCommand, ChatEngine, ContextUsage } from "./chatClient";
 import type { ChatMessage } from "./chatThread";
 
 export type CommandName = "new" | "compact" | "context";
@@ -70,7 +70,47 @@ export type Parsed =
  */
 export function localCommands(engine: ChatEngine): CommandSpec[] {
   if (engine !== "acp") return COMMANDS;
-  return COMMANDS.filter((c) => c.name === "new");
+  // `/compact` goes: it folds the built-in loop's projection of the thread, and
+  // a hosted harness reads its own context, not ours. There is no ACP method
+  // for compaction either -- it is a command an agent advertises or does not,
+  // and if one ever does, `parseCommand` already sends it through.
+  //
+  // `/context` stays. The question it answers -- how full is this -- is still
+  // the user's to ask, and under this engine the answer is *better*: the agent
+  // reports `used`/`size` itself (ACP `usage_update`), where the built-in loop
+  // could only estimate from characters the pane happened to be holding.
+  return COMMANDS.filter((c) => c.name === "new" || c.name === "context");
+}
+
+/** What `/context` answers under the ACP engine.
+ *
+ * From the agent's own accounting rather than a count of what the pane holds.
+ * It also has to say what to do about a full context, and the honest answer is
+ * not `/compact`: the harness compacts on its own terms, and the only lever
+ * biopb has is starting over.
+ */
+export function acpContextReport(
+  usage: ContextUsage | null,
+  agent: string,
+): string {
+  if (!usage || usage.used === null) {
+    return `${agent || "The agent"} has not reported its context use yet — ask it something first.`;
+  }
+  const used = usage.used.toLocaleString();
+  const lines = [
+    usage.size
+      ? `${used} of ${usage.size.toLocaleString()} tokens (${Math.round(
+          (usage.used / usage.size) * 100,
+        )}%)`
+      : `${used} tokens`,
+  ];
+  // Only when the agent priced it. Zero is a real answer -- a subscription
+  // model reports it -- and hiding a genuine zero would read as "not measured".
+  if (usage.cost !== null) lines.push(`$${usage.cost.toFixed(4)} this session`);
+  lines.push(
+    `${agent || "The agent"} manages its own context; /new starts a fresh one.`,
+  );
+  return lines.join("\n");
 }
 
 /** A bare `/word`, which is the only thing treated as a command attempt.

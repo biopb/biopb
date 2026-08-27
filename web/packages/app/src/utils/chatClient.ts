@@ -57,6 +57,14 @@ export interface AgentCommand {
   hint: string;
 }
 
+/** What the agent says its context holds. ACP's `usage_update`, which is the
+ * agent's own accounting rather than anything the pane could estimate. */
+export interface ContextUsage {
+  used: number | null;
+  size: number | null;
+  cost: number | null;
+}
+
 export interface HistoryPage {
   /** The built-in loop's thread. Empty under the ACP engine. */
   messages: ChatMessage[];
@@ -72,6 +80,9 @@ export interface HistoryPage {
   busy: boolean;
   /** What the agent says it can be asked to do. Empty under `builtin`. */
   commands: AgentCommand[];
+  /** The agent's own context accounting. Null under `builtin`, and until the
+   * agent has reported once. */
+  usage: ContextUsage | null;
   /** The cell being polled right now, and what it has printed. */
   live: LiveOutput | null;
 }
@@ -145,11 +156,22 @@ export async function fetchHistory(
       full: !!j.full,
       busy: !!j.busy,
       commands: Array.isArray(j.commands) ? j.commands.map(readCommand) : [],
+      usage: readUsage(j.usage),
       live: readLive(j.partial),
     };
   } catch {
     return null;
   }
+}
+
+function readUsage(raw: unknown): ContextUsage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const u = raw as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === "number" ? v : null);
+  const usage = { used: num(u.used), size: num(u.size), cost: num(u.cost) };
+  // An empty object is what the child sends before the agent has reported
+  // anything, and "nothing yet" must not render as "zero tokens".
+  return usage.used === null && usage.size === null ? null : usage;
 }
 
 function readCommand(raw: unknown): AgentCommand {

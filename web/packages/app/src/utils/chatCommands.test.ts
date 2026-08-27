@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   COMMANDS,
+  acpContextReport,
   contextReport,
   localCommands,
   matchCommands,
   parseCommand,
 } from "./chatCommands";
-import type { AgentCommand } from "./chatClient";
+import type { AgentCommand, ContextUsage } from "./chatClient";
 import type { ChatMessage } from "./chatThread";
 
 const msg = (over: Partial<ChatMessage> = {}): ChatMessage => ({
@@ -141,11 +142,15 @@ const advertised: AgentCommand[] = [
 ];
 
 describe("the two command namespaces", () => {
-  it("keeps only /new under a hosted harness", () => {
-    // /compact and /context act on the built-in loop's projection of the
-    // thread. A harness manages its own context and never shows us its budget,
-    // so both would be answering about a thread nobody reads.
-    expect(localCommands("acp").map((c) => c.typed)).toEqual(["/new"]);
+  it("drops /compact but keeps /context under a hosted harness", () => {
+    // /compact folds the built-in loop's projection of the thread, which the
+    // harness never reads -- and ACP has no compaction method, so there is
+    // nothing to forward it to either. /context survives because the question
+    // is still the user's to ask and the agent answers it itself.
+    expect(localCommands("acp").map((c) => c.typed)).toEqual([
+      "/new",
+      "/context",
+    ]);
     expect(localCommands("builtin")).toEqual(COMMANDS);
   });
 
@@ -181,12 +186,59 @@ describe("the two command namespaces", () => {
     // repo, /init writes a file that dies with the temp dir. Listing them would
     // advertise no-ops.
     expect(matchCommands("/rev", "acp")).toEqual([]);
-    expect(matchCommands("/", "acp").map((c) => c.typed)).toEqual(["/new"]);
+    expect(matchCommands("/", "acp").map((c) => c.typed)).toEqual([
+      "/new",
+      "/context",
+    ]);
   });
 
   it("leaves a path that starts with a slash as prose", () => {
     expect(parseCommand("/data/run3/stack.tif is the one", "acp", advertised)).toEqual(
       { kind: "send", text: "/data/run3/stack.tif is the one" },
+    );
+  });
+});
+
+describe("acpContextReport", () => {
+  const usage = (over: Partial<ContextUsage> = {}): ContextUsage => ({
+    used: 12000,
+    size: 200000,
+    cost: 0,
+    ...over,
+  });
+
+  it("reports the agent's own numbers, not an estimate", () => {
+    const out = acpContextReport(usage(), "opencode");
+    expect(out).toContain("12,000 of 200,000 tokens (6%)");
+  });
+
+  it("says what to do about a full context, and it is not /compact", () => {
+    const out = acpContextReport(usage(), "opencode");
+    expect(out).toContain("/new");
+    expect(out).not.toContain("/compact");
+  });
+
+  it("shows a genuine zero cost rather than hiding it", () => {
+    // A subscription model really does report 0; hiding it would read as "not
+    // measured", which is a different claim.
+    expect(acpContextReport(usage({ cost: 0 }), "opencode")).toContain("$0.0000");
+  });
+
+  it("omits cost the agent did not price", () => {
+    expect(acpContextReport(usage({ cost: null }), "opencode")).not.toContain("$");
+  });
+
+  it("copes with a size the agent did not give", () => {
+    const out = acpContextReport(usage({ size: null }), "opencode");
+    expect(out).toContain("12,000 tokens");
+    expect(out).not.toContain("%");
+  });
+
+  it("says so before the agent has reported anything", () => {
+    // Rather than rendering "0 tokens", which is a measurement, not a silence.
+    expect(acpContextReport(null, "opencode")).toContain("not reported");
+    expect(acpContextReport(usage({ used: null }), "opencode")).toContain(
+      "not reported",
     );
   });
 });

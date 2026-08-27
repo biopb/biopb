@@ -9,6 +9,7 @@ import {
   setEngine,
   type AgentCommand,
   type ChatStatus,
+  type ContextUsage,
 } from "../utils/chatClient";
 import {
   applyLiveOutput,
@@ -29,6 +30,7 @@ import {
 } from "../utils/chatThread";
 import { escAction, sendsOnEnter } from "../utils/chatKeys";
 import {
+  acpContextReport,
   contextReport,
   matchCommands,
   parseCommand,
@@ -58,6 +60,7 @@ export default function ChatPane({
   // switched mid-session, and the other thread is still there to come back to.
   const [items, setItems] = useState<AcpItem[]>([]);
   const [commands, setCommands] = useState<AgentCommand[]>([]);
+  const [usage, setUsage] = useState<ContextUsage | null>(null);
   // The engine in force *now*. Seeded from the status the page probed once at
   // mount, and then owned here, because switching is a thing this pane does and
   // re-probing the whole page to learn the result of its own click would be a
@@ -120,6 +123,7 @@ export default function ChatPane({
       const fresh = page.items;
       setItems((prev) => mergeAcpItems(prev, fresh, page.full));
       setCommands(page.commands);
+      setUsage(page.usage);
       after.current = page.rev;
       return;
     }
@@ -185,6 +189,7 @@ export default function ChatPane({
       setMessages([]);
       setItems([]);
       setCommands([]);
+      setUsage(null);
       after.current = null;
       poll();
     },
@@ -286,7 +291,13 @@ export default function ChatPane({
       // Answered from what the pane already holds. Nothing is sent, so this
       // works during a turn and costs the conversation nothing -- which matters
       // for the one command a person runs *because* they are worried about size.
-      setNotice(contextReport(messages, status.compacted, status.model));
+      // Two engines, two honest answers: the built-in loop is counted from what
+      // the pane holds, the harness reports its own use.
+      setNotice(
+        acp
+          ? acpContextReport(usage, status.model)
+          : contextReport(messages, status.compacted, status.model),
+      );
       return;
     }
     setNotice(null);
@@ -299,6 +310,8 @@ export default function ChatPane({
     status.compacted,
     status.model,
     engine,
+    acp,
+    usage,
     commands,
     startNew,
     compact,
@@ -659,40 +672,41 @@ function ToolGroup({
 }
 
 const CHAT_CSS = `
-.chat-engine {
-  font: inherit;
-  font-size: 11px;
-  background: transparent;
-  color: inherit;
-  border: 1px solid var(--border, #444);
-  border-radius: 4px;
-  padding: 0 2px;
-}
+  /* The pane is dark and hard-coded; color-scheme is what makes the browser
+     draw the *native* dropdown to match, since the option list is system chrome
+     and takes none of the select's own colours. The explicit option rule is the
+     fallback for browsers that ignore it -- without both, "transparent" plus an
+     inherited light colour renders white on white and the menu is unreadable. */
+  .chat-engine { font: inherit; font-size: 11px; color-scheme: dark;
+                 background: #181818; color: #999; cursor: pointer;
+                 border: 1px solid #333; border-radius: 4px; padding: 0 4px; }
+  .chat-engine:hover { background: #222; color: #ccc; }
+  .chat-engine option { background: #181818; color: #ccc; }
 
-.chat-ask {
-  margin: 6px 0;
-  padding: 8px 10px;
-  border: 1px solid var(--warn, #b58900);
-  border-radius: 6px;
-  background: rgba(181, 137, 0, 0.08);
-  font-size: 12px;
-}
-.chat-ask.done { opacity: 0.6; border-style: dashed; }
-.chat-ask-title { font-weight: 600; margin-bottom: 6px; word-break: break-word; }
-.chat-ask-kind { font-weight: 400; opacity: 0.7; margin-right: 6px;
-                 font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
-.chat-ask-options { display: flex; flex-wrap: wrap; gap: 6px; }
-.chat-ask-btn {
-  padding: 3px 8px;
-  border-radius: 4px;
-  border: 1px solid currentColor;
-  background: transparent;
-  cursor: pointer;
-  font: inherit;
-}
-.chat-ask-btn.allow { color: var(--ok, #2a7); }
-.chat-ask-btn.reject { color: var(--muted, #888); }
-.chat-ask-outcome { font-style: italic; }
+  .chat-ask {
+    margin: 6px 0;
+    padding: 8px 10px;
+    border: 1px solid var(--warn, #b58900);
+    border-radius: 6px;
+    background: rgba(181, 137, 0, 0.08);
+    font-size: 12px;
+  }
+  .chat-ask.done { opacity: 0.6; border-style: dashed; }
+  .chat-ask-title { font-weight: 600; margin-bottom: 6px; word-break: break-word; }
+  .chat-ask-kind { font-weight: 400; opacity: 0.7; margin-right: 6px;
+                   font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  .chat-ask-options { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chat-ask-btn {
+    padding: 3px 8px;
+    border-radius: 4px;
+    border: 1px solid currentColor;
+    background: transparent;
+    cursor: pointer;
+    font: inherit;
+  }
+  .chat-ask-btn.allow { color: var(--ok, #2a7); }
+  .chat-ask-btn.reject { color: var(--muted, #888); }
+  .chat-ask-outcome { font-style: italic; }
 
   .chat { display: flex; flex-direction: column; min-height: 0;
           border: 1px solid #333; border-radius: 5px; background: #161616; }
