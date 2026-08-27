@@ -25,6 +25,10 @@ export interface ChatStatus {
   /** Why chat cannot run, when it cannot — an unset API key, typically. */
   reason: string | null;
   model: string;
+  /** How many leading messages the model now sees only as a summary. The pane
+   * renders all of them regardless, so this is the only sign compaction
+   * happened. Absent on an older child. */
+  compacted?: number;
 }
 
 export interface HistoryPage {
@@ -115,6 +119,28 @@ export async function sendTurn(
   const d = await r.json().catch(() => ({}) as Record<string, unknown>);
   if (r.status === 409) return "A turn is already running. Wait for it, or cancel it.";
   return String(d.error || `send failed (${r.status})`);
+}
+
+/** Fold the older part of the thread into a summary. Returns an error, or null.
+ *
+ * Projection only: the pane still renders every message. What changes is what
+ * the model is given, which is why the result is reported through `compacted`
+ * on the status read rather than by anything appearing in the thread.
+ */
+export async function compactThread(base: string): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await sessionFetch(base + "/chat/summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return String(e);
+  }
+  if (r.ok) return null;
+  if (r.status === 409) return "A turn is running. Wait for it, or cancel it.";
+  const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  return String(d.error || `compact failed (${r.status})`);
 }
 
 /** Start a new conversation. Returns an error string, or null.

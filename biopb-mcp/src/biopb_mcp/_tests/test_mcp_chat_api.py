@@ -81,6 +81,10 @@ class TestStatus:
             "reason": None,
             "busy": False,
             "model": "test-model",
+            # Nothing folded yet. Reported because the pane renders every
+            # message either way, so compaction would otherwise be invisible to
+            # the person who asked for it.
+            "compacted": 0,
         }
 
     def test_reports_why_it_is_not_ready(self, client, configured):
@@ -218,6 +222,66 @@ class TestReset:
         _chat._append("user", "new")
         body = client.get(f"/api/chat/history?after={stale}").json()
         assert [m["content"] for m in body["messages"]] == ["new"]
+
+
+class TestSummary:
+    def _thread(self, n=4):
+        for i in range(n):
+            _chat._append("user", f"turn {i}")
+            _chat._append("assistant", f"reply {i}")
+
+    def test_it_folds_the_projection_and_reports_how_much(self, client, monkeypatch):
+        self._thread()
+
+        async def model(messages, tools):
+            return {"content": "SUMMARY"}
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: model)
+        body = client.post("/chat/summary", json={}).json()
+        assert body == {"compacted": 4, "folded": 4}
+        # Projection only: the pane still renders every word.
+        assert len(_chat.history()) == 8
+        assert client.get("/api/chat/status").json()["compacted"] == 4
+
+    def test_a_provider_failure_is_reported_not_half_applied(self, client, monkeypatch):
+        self._thread()
+
+        async def model(messages, tools):
+            raise RuntimeError("model returned 429")
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: model)
+        r = client.post("/chat/summary", json={})
+        assert r.status_code == 502
+        assert "429" in r.json()["error"]
+        # Nothing folded, so the next turn is composed against the whole thread
+        # rather than against a prefix that was silently dropped.
+        assert _chat.summary_state() == (None, 0)
+
+    def test_a_running_turn_is_not_compacted_out_from_under(self, client, monkeypatch):
+        # The projection is read once per tool round, so moving it mid-turn
+        # would change the ground under a round already in flight.
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                r = client.post("/chat/summary", json={})
+                assert r.status_code == 409
+                assert r.json()["busy"] is True
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_it_carries_the_json_guard(self, client):
+        assert (
+            client.post(
+                "/chat/summary", headers={"content-type": "text/plain"}
+            ).status_code
+            == 400
+        )
 
 
 class TestCancel:

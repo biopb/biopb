@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   cancelTurn,
+  compactThread,
   fetchHistory,
   resetThread,
   sendTurn,
@@ -152,6 +153,16 @@ export default function ChatPane({
     poll();
   }, [base, poll]);
 
+  // The gentler half of the same problem: a reset gives up what was said, this
+  // keeps it and folds it. Not confirmed -- nothing is lost from the thread, so
+  // the worst case is a wasted provider call.
+  const compact = useCallback(async () => {
+    setError(null);
+    const err = await compactThread(base);
+    if (err) setError(err);
+    else poll();
+  }, [base, poll]);
+
   const toggle = useCallback((id: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -178,6 +189,21 @@ export default function ChatPane({
       <div className="chat-head">
         <span className="chat-title">chat</span>
         <span className="chat-model">{status.model}</span>
+        {/* Shown only once there is something to fold: a control that cannot
+            act is how the observe page's Interrupt earned its "No running job."
+            dialog. */}
+        {status.compacted ? (
+          <span className="chat-folded" title="Messages the model now sees only as a summary">
+            {status.compacted} folded
+          </span>
+        ) : null}
+        <button
+          className="chat-new"
+          onClick={compact}
+          title="Summarise the older part of the conversation for the model. The thread is not changed."
+        >
+          compact
+        </button>
         <button className="chat-new" onClick={startNew} title="Start a new conversation">
           new
         </button>
@@ -451,6 +477,7 @@ const CHAT_CSS = `
               border-radius: 10px; border: 1px solid #333; background: #181818;
               color: #999; cursor: pointer; }
   .chat-new:hover { background: #222; color: #ccc; }
+  .chat-folded { color: #777; font-size: 11px; }
   .chat-zoom { position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 50;
                display: flex; align-items: center; justify-content: center;
                cursor: zoom-out; padding: 24px; }

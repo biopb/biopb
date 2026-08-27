@@ -112,6 +112,10 @@ async def _api_chat_status(request):
             "reason": reason,
             "busy": _chat.busy(),
             "model": get_setting(_config, "chat.model") if ready else "",
+            # How much of the thread the model no longer sees in full. The pane
+            # renders every message either way, so without this the compaction
+            # would be invisible to the person who asked for it.
+            "compacted": _chat.summary_state()[1],
         }
     )
 
@@ -308,6 +312,50 @@ async def _chat_reset(request):
     return JSONResponse({"reset": True})
 
 
+async def _chat_summary(request):
+    """Fold the older part of the conversation into a summary.
+
+    The other half of the thread's context problem, and the gentler one: a
+    reset gives up what was said, this keeps it. The summary stands in for the
+    folded messages **only when the thread is projected to the provider** --
+    ``_chat.history()`` is untouched, so the pane still shows every word. The
+    human's record and the model's budget are different things and there is no
+    reason to spend one to buy the other.
+
+    A write, so it lives beside turn and cancel: it costs a provider call and
+    changes what every later turn is composed against.
+
+    User-triggered rather than automatic, which is also the kind answer for
+    prompt caching. Every provider caches on an exact prefix, so folding the
+    front of the thread invalidates it -- once, here, when a person asked for
+    it. A rule that trimmed a little each turn would move the prefix on every
+    call instead, including the twelve a single turn can make.
+
+    Cannot rescue a thread that has *already* overflowed: summarising reads the
+    part being folded, so a conversation too large to send is too large to
+    summarise. That case is what /chat/reset is for.
+    """
+    ready, reason = _readiness()
+    if not ready:
+        return JSONResponse({"error": reason}, status_code=503)
+    if _in_flight():
+        return JSONResponse(
+            {"error": "a turn is running; wait for it or cancel it", "busy": True},
+            status_code=409,
+        )
+    before = _chat.summary_state()[1]
+    try:
+        compacted = await _chat.compact(_model.make_model(_config))
+    except _chat.TurnInProgress:
+        return JSONResponse(
+            {"error": "a turn is already running", "busy": True}, status_code=409
+        )
+    except Exception as exc:  # noqa: BLE001 - a provider failure is the answer
+        logger.warning("chat compaction failed: %s", exc)
+        return JSONResponse({"error": f"could not summarise: {exc}"}, status_code=502)
+    return JSONResponse({"compacted": compacted, "folded": compacted - before})
+
+
 # Reads under `api` (always proxied), the writes under `chat` (proxied only by a
 # loopback-bound control, and POST-only, which that gate enforces).
 _ROUTES = [
@@ -316,6 +364,7 @@ _ROUTES = [
     ("/chat/turn", ["POST"], _observe._json_route(_chat_turn)),
     ("/chat/cancel", ["POST"], _observe._json_route(_chat_cancel)),
     ("/chat/reset", ["POST"], _observe._json_route(_chat_reset)),
+    ("/chat/summary", ["POST"], _observe._json_route(_chat_summary)),
 ]
 
 
@@ -327,7 +376,7 @@ def register_http_routes():
     """
     for path, methods, handler in _ROUTES:
         _server_custom_route(path, methods)(handler)
-    logger.info("chat API mounted at /api/chat/* and /chat/{turn,cancel,reset}")
+    logger.info("chat API mounted at /api/chat/* and /chat/{turn,cancel,reset,summary}")
 
 
 def _server_custom_route(path, methods):
