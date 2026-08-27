@@ -16,6 +16,10 @@ import {
 // /api/algorithms (on load / manual refresh), and POSTs the data-plane verbs.
 
 const POLL_MS = 3000;
+// How long the browser waits on POST /api/sessions/new. Sized for a cold napari
+// import on a loaded machine; the control is told this bound and answers just
+// under it, so hitting it here means something is wrong, not merely slow.
+const START_TIMEOUT_MS = 180000;
 
 interface DataPlane {
   state?: string;
@@ -33,6 +37,14 @@ interface SessionRec {
   // Best-effort kernel state probed by the control (none|starting|ready|busy|
   // error|unknown); decorative, may be absent on an older control.
   kernel?: string;
+  // Whether that page leads with the chat client rather than the job list --
+  // true for an agentless `biopb mcp view` session whose chat this control will
+  // proxy. Absent on an older control, which reads as an observe link.
+  chat?: boolean;
+  // Whether the session serves a stop verb -- true only where it owns its own
+  // reap (a viewer, not a child some MCP client's shim will reap). Absent on an
+  // older control, which reads as no stop button rather than one that 404s.
+  can_stop?: boolean;
 }
 interface AgentRec {
   id: string;
@@ -102,6 +114,19 @@ export default function DashboardPage() {
   const [plugins, setPlugins] = useState<PluginsRec | null>(null);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
+  // Whether this control will launch a viewer session, and the sentence it gave
+  // for refusing. Both from /api/status; undefined on an older control, which is
+  // read as "no" so the button appears only where it is known to work.
+  const [canStart, setCanStart] = useState(false);
+  const [startBlocked, setStartBlocked] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  // Which session's stop is in flight, so only that row's button goes busy.
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
+  // Outcome of the last launch, rendered under the list rather than alert()ed:
+  // a failure carries the child's log tail, which no dialog reads well.
+  const [startMsg, setStartMsg] = useState<{ err: boolean; text: string } | null>(
+    null,
+  );
   // Whether a token is held (remote mode). Lock only means something when there
   // is a token to drop; local mode has none, so the button is disabled.
   const [hasToken, setHasToken] = useState(() => !!getToken());
@@ -113,6 +138,8 @@ export default function DashboardPage() {
       setConnOk(true);
       setDataPlane(s.data_plane || {});
       if (s.version) setVersion(s.version);
+      setCanStart(!!s.can_start_session);
+      setStartBlocked(s.start_session_blocked || null);
     } catch {
       setConn("control unreachable");
       setConnOk(false);
@@ -184,6 +211,80 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, [pollStatus, pollSessions, pollAgents, pollAlgos]);
 
+  // Launching a viewer is slow by nature: the control waits for the child to
+  // open its napari window before it answers, so this holds for as long as a
+  // cold Qt/napari import takes. Bound it with an AbortController and tell the
+  // control our bound (?client_timeout), so it answers "starting" just before we
+  // would give up rather than leaving us to time out over a working launch.
+  const startSession = useCallback(async () => {
+    setStarting(true);
+    setStartMsg(null);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), START_TIMEOUT_MS);
+    try {
+      const r = await fetchAuth(
+        withBase("/api/sessions/new?client_timeout=" + START_TIMEOUT_MS / 1000),
+        { method: "POST", signal: ctl.signal },
+      );
+      const res = await r.json().catch(() => ({}));
+      if (res.error) {
+        setStartMsg({
+          err: true,
+          text: res.log ? res.error + "\n\n" + res.log : res.error,
+        });
+      } else if (res.state === "starting") {
+        setStartMsg({
+          err: false,
+          text: "Still opening the viewer — it will appear here when it is up.",
+        });
+      } else {
+        setStartMsg({ err: false, text: "Viewer session started." });
+      }
+    } catch (e) {
+      setStartMsg({ err: true, text: String(e) });
+    } finally {
+      clearTimeout(timer);
+      setStarting(false);
+      pollStatus();
+      pollSessions();
+    }
+  }, [pollStatus, pollSessions]);
+
+  // Stopping is the session ending *itself* -- the control proxies the verb to
+  // the child, which runs the same teardown Ctrl-C does. So this works the same
+  // for a session started here and one started with `biopb mcp view` in a
+  // terminal, and the confirm says so: that terminal is about to come back.
+  const stopSession = useCallback(
+    async (id: string) => {
+      if (
+        !confirm(
+          `Stop session ${id}?\n\nThe napari window closes and any running ` +
+            `work is lost. If it was started with \`biopb mcp view\` in a ` +
+            `terminal, that terminal returns.`,
+        )
+      )
+        return;
+      setStoppingId(id);
+      setStartMsg(null);
+      try {
+        const r = await fetchAuth(withBase(`/session/${id}/api/shutdown`), {
+          method: "POST",
+        });
+        const res = await r.json().catch(() => ({}));
+        if (res.error) setStartMsg({ err: true, text: res.error });
+      } catch (e) {
+        setStartMsg({ err: true, text: String(e) });
+      } finally {
+        setStoppingId(null);
+        // The child de-registers on its way out, so the row goes on the next
+        // read rather than being removed here.
+        pollStatus();
+        pollSessions();
+      }
+    },
+    [pollStatus, pollSessions],
+  );
+
   const verb = useCallback(
     async (url: string, confirmMsg?: string) => {
       if (confirmMsg && !confirm(confirmMsg)) return;
@@ -241,22 +342,6 @@ export default function DashboardPage() {
           {conn}
         </span>
         <div className="hdr-spacer" />
-        {/* biopb-mcp's own global settings (transport/kernel/dask/algorithm
-            servers), served by the control at /api/mcp_config. A top-level nav
-            link — it is neither a data-plane nor a per-session concern. */}
-        <a className="hdr-link" href={withBase("/mcp/admin")} target="_blank" rel="noopener">
-          <svg
-            className="gear-icon"
-            viewBox="0 0 16 16"
-            width="13"
-            height="13"
-            fill="currentColor"
-            aria-hidden="true"
-          >
-            <path d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079.158.212.224.231.114.454.243.668.386.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 1.82.63.27.385.506.792.704 1.218.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147-.088.294.016.257.016.515 0 .772-.01.147.039.246.088.294l.814.806c.475.469.679 1.216.364 1.891a7.977 7.977 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.103-.303c-.066-.019-.176-.011-.299.071a4.909 4.909 0 0 1-.668.386c-.133.066-.194.158-.212.224l-.288 1.107c-.17.645-.716 1.195-1.459 1.259a8.147 8.147 0 0 1-1.402 0c-.743-.064-1.289-.614-1.459-1.259l-.288-1.107c-.018-.066-.079-.158-.212-.224a4.911 4.911 0 0 1-.668-.386c-.123-.082-.233-.09-.299-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a7.988 7.988 0 0 1-.704-1.217c-.315-.675-.111-1.422.364-1.891l.814-.806c.049-.048.098-.147.088-.294a6.214 6.214 0 0 1 0-.772c.01-.147-.039-.246-.088-.294l-.814-.806C.635 6.045.431 5.298.746 4.623a7.921 7.921 0 0 1 .704-1.218c.428-.609 1.176-.806 1.82-.63l1.103.303c.066.019.176.011.299-.071.214-.143.437-.272.668-.386.133-.066.194-.158.212-.224l.288-1.107C6.01.645 6.556.095 7.299.03 7.53.01 7.764 0 8 0Zm0 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7ZM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z" />
-          </svg>
-          Settings
-        </a>
         <button
           className="lock-btn"
           disabled={!hasToken}
@@ -432,12 +517,47 @@ export default function DashboardPage() {
         </div>
 
         <div className="card">
-          <h2>Agent sessions</h2>
+          <h2 className="with-actions">
+            Sessions
+            {canStart ? (
+              <button
+                className="mini"
+                onClick={startSession}
+                disabled={starting}
+                title="Open a napari viewer session on this machine"
+              >
+                {starting ? "opening…" : "+ new viewer"}
+              </button>
+            ) : null}
+            {/* biopb-mcp's own global settings (transport/kernel/dask/algorithm
+                servers), served by the control at /api/mcp_config. It sits here
+                rather than in the header because it is what every session in
+                this list was launched with — including the ones the button
+                beside it starts. */}
+            <a
+              className="gear-link"
+              href={withBase("/mcp/admin")}
+              target="_blank"
+              rel="noopener"
+            >
+              <svg
+                className="gear-icon"
+                viewBox="0 0 16 16"
+                width="13"
+                height="13"
+                fill="currentColor"
+                aria-hidden="true"
+              >
+                <path d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079.158.212.224.231.114.454.243.668.386.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 1.82.63.27.385.506.792.704 1.218.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147-.088.294.016.257.016.515 0 .772-.01.147.039.246.088.294l.814.806c.475.469.679 1.216.364 1.891a7.977 7.977 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.103-.303c-.066-.019-.176-.011-.299.071a4.909 4.909 0 0 1-.668.386c-.133.066-.194.158-.212.224l-.288 1.107c-.17.645-.716 1.195-1.459 1.259a8.147 8.147 0 0 1-1.402 0c-.743-.064-1.289-.614-1.459-1.259l-.288-1.107c-.018-.066-.079-.158-.212-.224a4.911 4.911 0 0 1-.668-.386c-.123-.082-.233-.09-.299-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a7.988 7.988 0 0 1-.704-1.217c-.315-.675-.111-1.422.364-1.891l.814-.806c.049-.048.098-.147.088-.294a6.214 6.214 0 0 1 0-.772c.01-.147-.039-.246-.088-.294l-.814-.806C.635 6.045.431 5.298.746 4.623a7.921 7.921 0 0 1 .704-1.218c.428-.609 1.176-.806 1.82-.63l1.103.303c.066.019.176.011.299-.071.214-.143.437-.272.668-.386.133-.066.194-.158.212-.224l.288-1.107C6.01.645 6.556.095 7.299.03 7.53.01 7.764 0 8 0Zm0 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7ZM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z" />
+              </svg>
+              Session settings
+            </a>
+          </h2>
           <ul>
             {sessions == null ? (
               <li className="empty">loading…</li>
             ) : sessions.length === 0 ? (
-              <li className="empty">no agent sessions</li>
+              <li className="empty">no sessions</li>
             ) : (
               sessions.map((s) => {
                 const when = s.started_at
@@ -460,13 +580,32 @@ export default function DashboardPage() {
                       target="_blank"
                       rel="noopener"
                     >
-                      observe →
+                      {s.chat ? "chat →" : "observe →"}
                     </a>
+                    {s.can_stop ? (
+                      <button
+                        className="mini stop"
+                        onClick={() => stopSession(s.session_id)}
+                        disabled={stoppingId === s.session_id}
+                        title="Stop this session (closes its napari window)"
+                        aria-label={`Stop session ${s.session_id}`}
+                      >
+                        {stoppingId === s.session_id ? "…" : "✕"}
+                      </button>
+                    ) : null}
                   </li>
                 );
               })
             )}
           </ul>
+          {startMsg ? (
+            <p className={startMsg.err ? "note err launch" : "note launch"}>
+              {startMsg.text}
+            </p>
+          ) : null}
+          {!canStart && startBlocked ? (
+            <p className="note">Cannot open a viewer here: {startBlocked}.</p>
+          ) : null}
         </div>
       </main>
       <style>{DASH_CSS}</style>
@@ -582,12 +721,19 @@ const DASH_CSS = `
            padding: 2px 9px; border-radius: 10px; white-space: nowrap; }
   .ctrl-dash #conn.ok { background: #243; color: #7e7; }
   .ctrl-dash #conn.bad { background: #422; color: #f99; }
-  /* Pushes the header actions (MCP Settings, Lock) to the right edge, like the
-     admin pages' topbar-spacer. */
+  /* Pushes the header actions (Lock) to the right edge, like the admin pages'
+     topbar-spacer. */
   .ctrl-dash .hdr-spacer { flex: 1; }
-  .ctrl-dash a.hdr-link { font-size: 12px; color: #8bf; text-decoration: none;
-           display: inline-flex; align-items: center; gap: 5px; }
-  .ctrl-dash a.hdr-link:hover { text-decoration: underline; }
+  /* A card heading carrying actions: the title, then whatever it owns, with the
+     last item pushed to the card's right edge. */
+  .ctrl-dash h2.with-actions { display: flex; align-items: center; gap: 8px; }
+  .ctrl-dash h2.with-actions .mini { margin-left: 0; }
+  .ctrl-dash h2.with-actions > :last-child { margin-left: auto; }
+  /* Cancels the h2's uppercase/tracking: this is a link, not part of the title. */
+  .ctrl-dash a.gear-link { font-size: 12px; color: #8bf; text-decoration: none;
+           display: inline-flex; align-items: center; gap: 5px;
+           text-transform: none; letter-spacing: 0; }
+  .ctrl-dash a.gear-link:hover { text-decoration: underline; }
   .ctrl-dash .gear-icon { flex: none; }
   .ctrl-dash main { padding: 16px; max-width: 760px; }
   .ctrl-dash .card { border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px;
@@ -641,8 +787,19 @@ const DASH_CSS = `
   .ctrl-dash .k-error { background: #422; color: #f99; }
   .ctrl-dash .k-unknown { background: #2a2a2a; color: #777; }
   .ctrl-dash .mini { padding: 0 8px; font-size: 12px; margin-left: 8px; vertical-align: middle; }
+  /* Per-row stop. Muted until hovered: it is destructive, but it sits beside
+     every viewer row and should not read as the thing to click. */
+  .ctrl-dash button.mini.stop { color: #888; border-color: #3a3a3a; margin-left: 6px; }
+  .ctrl-dash button.mini.stop:hover:not(:disabled) { color: #f99; border-color: #844; }
   .ctrl-dash .state { color: #888; font-size: 12px; }
   .ctrl-dash .note { color: #667; font-size: 12px; margin: 12px 0 0; }
+  /* A failed launch renders the child's own log tail, so keep its newlines and
+     let it scroll rather than stretching the card. */
+  .ctrl-dash .note.launch { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace;
+         max-height: 180px; overflow-y: auto; }
+  /* .err alone loses to .note on equal specificity (it is declared earlier), so
+     the failure colour needs the extra class to actually apply. */
+  .ctrl-dash .note.launch.err { color: #f99; }
   .ctrl-dash .note code { color: #89a; font-family: ui-monospace, Menlo, monospace; }
   .ctrl-dash .subhead { color: #aab; font-size: 12px; font-weight: 600;
          text-transform: uppercase; letter-spacing: .04em; margin: 16px 0 6px;

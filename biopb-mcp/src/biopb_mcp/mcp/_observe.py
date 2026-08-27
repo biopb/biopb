@@ -2,8 +2,19 @@
 
 The ``/api/*`` calls behind the observe page: ``execute_code`` job history with
 truncated output plus global control knobs — interrupt the current job (force a
-KeyboardInterrupt into its thread), hard-restart the kernel, and save the session
-as a notebook. On by default (opt-out via ``observe.enabled``).
+KeyboardInterrupt into its thread), hard-restart the kernel, save the session as
+a notebook, and — where this session owns its own reap — end it. On by default
+(opt-out via ``observe.enabled``).
+
+**Stopping the session** (``/api/shutdown``) exists only for an agentless
+``biopb mcp view`` viewer, and runs the launcher's own ``_shutdown``: the same
+single path Ctrl-C and SIGTERM take, injected at wiring time
+(:func:`set_session_owns_its_reap`) rather than reimplemented. That is what
+keeps the control out of the ownership question — it proxies a session ending
+*itself*, so a viewer someone started in a terminal and one the dashboard
+launched behave identically and neither is anybody's to kill. A shim-owned child
+gets no such route: its shim owns its reap, and ending it here would leave that
+shim bridging to a dead process.
 
 The observe **page** itself is served by the control front — it is the React
 ``ObservePage`` in the ``web/`` SPA, served at ``/session/<id>/observe`` — and it
@@ -50,12 +61,14 @@ is only to be honest about which routes exist; the reachability question belongs
 to ``biopb-control``.
 """
 
+import asyncio
 import functools
 import json
 import logging
 
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.responses import (
     JSONResponse,
     PlainTextResponse,
@@ -77,6 +90,25 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 _max_output_chars = 20000
 _poll_interval_ms = 3000
 _console_enabled = True
+# Whether the built-in chat client is actually mounted on this session. Not a
+# config mirror: chat is served only on an agentless `biopb mcp view` session
+# and only when enabled, so `_setup_chat`'s verdict is the one truth. Set by
+# set_chat_enabled() rather than configure(), which resets its extras on every
+# call and so cannot be called twice.
+_chat_enabled = False
+# Whether this session owns its own reap -- an agentless `biopb mcp view`
+# viewer, as opposed to a child a stdio shim spawned and will reap. The stop
+# route exists only for the former: ending a shim's child would leave the shim
+# bridging to a dead process and its MCP client reading errors instead of a
+# clean close. Deliberately NOT keyed off _chat_enabled, which is a config
+# switch that is off by default -- a viewer with chat disabled still owns its
+# reap and still needs a way out.
+_agentless = False
+# The session's own teardown (the launcher's `_shutdown`), or None where there
+# is nothing this session may end. Injected rather than reimplemented: it is the
+# same single path Ctrl-C and SIGTERM take, so a stop from the web de-registers,
+# reaps the kernel and closes the cluster in exactly the same order.
+_shutdown_hook = None
 _extra_origins = ()
 _extra_hosts = ()
 
@@ -119,6 +151,31 @@ def configure(
     _extra_origins = tuple(allowed_origins)
     _extra_hosts = tuple(allowed_hosts)
     _mw = None  # rebuilt with the new extras on next request
+
+
+def set_session_owns_its_reap(agentless, on_shutdown=None):
+    """Record that this session may be stopped from the web, and how.
+
+    Must run before :func:`register_http_routes`, which reads it to decide
+    whether the stop route exists at all -- an absent route rather than a
+    refusing one, the same shape the console gate uses, so "can this session be
+    ended from here?" is one answer and not a status code to interpret.
+    """
+    global _agentless, _shutdown_hook
+    _agentless = bool(agentless)
+    _shutdown_hook = on_shutdown if _agentless else None
+
+
+def set_chat_enabled(enabled):
+    """Record whether this session mounted the chat routes, for ``/api/status``.
+
+    Separate from :func:`configure` because the launcher only knows this *after*
+    it has tried to mount chat, and configure() is not safely re-callable (it
+    resets ``allowed_origins``/``allowed_hosts`` whether or not they were
+    passed).
+    """
+    global _chat_enabled
+    _chat_enabled = bool(enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -387,13 +444,55 @@ async def _api_status(request):
     # console_enabled rides here so the page knows whether to offer an editor at
     # all. It is only *this* half of the answer -- the control's gate is the
     # other -- so the SPA needs both before it renders one (see ObservePage).
+    # chat_enabled rides here for a different reader: the control's dashboard,
+    # which probes this endpoint per session anyway and needs it to label the
+    # session's link -- a `biopb mcp view` session leads with chat, an MCP
+    # client's child with the job list. Reporting it beside console_enabled
+    # keeps that one probe the whole answer.
     return JSONResponse(
         {
             **host.health(),
             "poll_interval_ms": _poll_interval_ms,
             "console_enabled": _console_enabled,
+            "chat_enabled": _chat_enabled,
+            # Two different questions, both read by the control's dashboard off
+            # this one probe: chat_enabled says what the page leads with,
+            # agentless says who owns the reap -- and so whether to offer a stop.
+            "agentless": _agentless,
         }
     )
+
+
+# How long the stop route waits before tearing the process down. The teardown
+# ends in os._exit, so it must not run until the response has left: a background
+# task already runs after the body is sent, and this covers the flush behind it.
+_SHUTDOWN_DELAY = 0.25
+
+
+async def _api_shutdown(_request):
+    """End this session -- the same teardown Ctrl-C runs.
+
+    The control proxies this rather than signalling a pid, which is what keeps
+    the ownership question from arising: a session started from a terminal and
+    one started from the dashboard are the same process ending itself the same
+    way, and the control needs no record of which it launched.
+
+    Answers *before* it exits. The teardown's own log line carries the reason,
+    so a viewer started in a terminal says why it is returning rather than
+    dying silently under the person watching it.
+    """
+    if _shutdown_hook is None:
+        return JSONResponse(
+            {"error": "this session does not own its own shutdown"},
+            status_code=404,
+        )
+
+    async def _teardown():
+        await asyncio.sleep(_SHUTDOWN_DELAY)
+        _shutdown_hook()
+
+    logger.info("Stop requested from the web; shutting down.")
+    return JSONResponse({"stopping": True}, background=BackgroundTask(_teardown))
 
 
 # (path, methods, handler) — shared by the http custom routes and the standalone
@@ -409,6 +508,14 @@ _ROUTES = [
     ("/api/status", ["GET"], _route(_api_status)),
 ]
 
+# Served only where this session owns its own reap. Under ``api`` rather than a
+# root of its own: the control already proxies that root everywhere, and it
+# already carries a comparably destructive verb in /api/kernel/restart. This is
+# not an execute surface, so it needs none of the console's local-only gating.
+_SHUTDOWN_ROUTES = [
+    ("/api/shutdown", ["POST"], _route(_api_shutdown)),
+]
+
 # Under its own root, so the control can proxy it on a different rule than
 # /api/* (biopb-control `_session_proxy_roots`).
 _CONSOLE_ROUTES = [
@@ -417,10 +524,14 @@ _CONSOLE_ROUTES = [
 
 
 def _routes():
-    """The routes to serve: the data API, plus the console when enabled."""
+    """The routes to serve: the data API, plus the console and the stop route
+    where each is enabled."""
+    routes = list(_ROUTES)
     if _console_enabled:
-        return _ROUTES + _CONSOLE_ROUTES
-    return _ROUTES
+        routes += _CONSOLE_ROUTES
+    if _agentless:
+        routes += _SHUTDOWN_ROUTES
+    return routes
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +552,9 @@ def register_http_routes():
         _server.mcp.custom_route(path, methods=methods)(handler)
     _mounted_http = True
     logger.info(
-        "observe API mounted on the MCP app at /api/* (console: %s)",
+        "observe API mounted on the MCP app at /api/* (console: %s, stop: %s)",
         "on" if _console_enabled else "off",
+        "on" if _agentless else "off",
     )
 
 

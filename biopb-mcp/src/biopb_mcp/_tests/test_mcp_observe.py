@@ -414,6 +414,72 @@ def test_status_advertises_the_console_switch(host):
         assert r.json()["console_enabled"] is enabled
 
 
+def test_status_advertises_whether_chat_is_mounted(host):
+    # The control's dashboard reads this to label a session's link: only an
+    # agentless `biopb mcp view` session mounts chat, so this is also its answer
+    # to "viewer, or an MCP client's child?".
+    old = _observe._chat_enabled
+    try:
+        for enabled in (True, False):
+            _observe.set_chat_enabled(enabled)
+            r = _console_client().get("/api/status")
+            assert r.json()["chat_enabled"] is enabled
+    finally:
+        _observe.set_chat_enabled(old)
+
+
+def test_status_advertises_who_owns_the_reap(host):
+    # The control's dashboard offers a stop only where the session ends itself.
+    # Distinct from chat_enabled: chat is a config switch that is off by
+    # default, and a viewer with chat off still owns its reap.
+    old = (_observe._agentless, _observe._shutdown_hook)
+    try:
+        for agentless in (True, False):
+            _observe.set_session_owns_its_reap(agentless, on_shutdown=lambda: None)
+            r = _console_client().get("/api/status")
+            assert r.json()["agentless"] is agentless
+    finally:
+        _observe._agentless, _observe._shutdown_hook = old
+
+
+def test_shutdown_route_absent_for_a_shim_owned_child(host):
+    # Not a refusing route -- no route. Ending a shim's child would leave that
+    # shim bridging to a dead process, so the verb must not exist there at all.
+    _observe.set_session_owns_its_reap(False)
+    try:
+        client = _console_client()
+        assert client.post("/api/shutdown").status_code == 404
+        assert client.get("/api/jobs").status_code == 200  # untouched
+    finally:
+        _observe.set_session_owns_its_reap(False)
+
+
+def test_shutdown_runs_the_session_teardown_after_answering(host):
+    # The stop is the session ending itself on the launcher's own `_shutdown`
+    # path -- so the hook is what runs, and it runs only once the response is
+    # out (it ends in os._exit, which would otherwise cut the reply off).
+    calls = []
+    _observe.set_session_owns_its_reap(True, on_shutdown=lambda: calls.append(1))
+    try:
+        r = _console_client().post("/api/shutdown")
+        assert r.status_code == 200
+        assert r.json()["stopping"] is True
+    finally:
+        _observe.set_session_owns_its_reap(False)
+    # TestClient runs background tasks before returning, so by here it has run.
+    assert calls == [1]
+
+
+def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
+    # Deliberately not folded into configure(), which resets allowed_origins /
+    # allowed_hosts on every call and so cannot be called a second time to add
+    # one fact without dropping others.
+    _observe.configure(allowed_origins=("https://front",), allowed_hosts=("front",))
+    _observe.set_chat_enabled(True)
+    assert _observe._extra_origins == ("https://front",)
+    assert _observe._extra_hosts == ("front",)
+
+
 # -- busy kernel ------------------------------------------------------------
 
 

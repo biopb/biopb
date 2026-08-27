@@ -303,6 +303,19 @@ def mcp_server_log() -> Path:
     return mcp_log_dir() / "mcp-server.log"
 
 
+def mcp_viewer_log() -> Path:
+    """Combined stdout/stderr for a viewer session the **control** launched.
+
+    Control-launched viewers are the one session kind whose output has no other
+    home: a shim-owned child logs to the shim's per-session file and a
+    ``biopb mcp view`` started by hand writes to that terminal, but a viewer
+    spawned from the dashboard has neither. Lives here, in the core SDK, because
+    the control may not import biopb-mcp (control ARCHITECTURE.md, I2) and so
+    cannot ask it where its logs go.
+    """
+    return mcp_log_dir() / "viewer.log"
+
+
 # --- session registry / pids / sentinels --------------------------------- #
 
 

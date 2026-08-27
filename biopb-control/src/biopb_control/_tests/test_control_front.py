@@ -16,6 +16,7 @@ in for ``web/packages/app/dist``.
 import json
 import os
 import socket
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -307,23 +308,37 @@ def test_api_sessions_kernel_unknown_when_child_unreachable(control):
     assert len(sessions) == 1
     assert sessions[0]["session_id"] == "s-unreach"
     assert sessions[0]["kernel"] == "unknown"
+    # Every probed field degrades to its least-claiming value: no chat link, and
+    # no stop button that would only 404.
+    assert sessions[0]["chat"] is False
+    assert sessions[0]["can_stop"] is False
 
 
-def test_probe_kernel_maps_child_health():
-    # _probe_kernel over a real loopback GET to a stub child reporting a ready
-    # kernel returns "ready" (the full HTTP + parse + map path).
+@pytest.mark.parametrize("flag, expected", [(True, True), (False, False)])
+def test_probe_session_maps_child_health(flag, expected):
+    # _probe_session over a real loopback GET to a stub child reporting a ready
+    # kernel returns its kernel state plus both booleans -- the full HTTP +
+    # parse + map path, and every fact off the one request.
     import asyncio
 
     import httpx
 
-    from biopb_control._control import _probe_kernel
+    from biopb_control._control import _probe_session
 
     class _Health(BaseHTTPRequestHandler):
         def log_message(self, *_a):
             pass
 
         def do_GET(self):  # noqa: N802
-            payload = json.dumps({"alive": True, "ready": True, "busy": False}).encode()
+            payload = json.dumps(
+                {
+                    "alive": True,
+                    "ready": True,
+                    "busy": False,
+                    "chat_enabled": flag,
+                    "agentless": flag,
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -337,9 +352,53 @@ def test_probe_kernel_maps_child_health():
 
         async def go():
             async with httpx.AsyncClient(timeout=None) as c:
-                return await _probe_kernel(c, rec)
+                return await _probe_session(c, rec)
 
-        assert asyncio.run(go()) == "ready"
+        assert asyncio.run(go()) == {
+            "kernel": "ready",
+            "chat": expected,
+            "agentless": expected,
+        }
+    finally:
+        server.shutdown()
+
+
+def test_probe_session_flags_default_off_on_an_older_child():
+    # A child that predates the fields must not read as a chat session (the
+    # dashboard would label an MCP client's child "chat") nor as a stoppable one
+    # (the button would 404). Absent means "no", never "assume yes".
+    import asyncio
+
+    import httpx
+
+    from biopb_control._control import _probe_session
+
+    class _Old(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_GET(self):  # noqa: N802
+            payload = json.dumps({"alive": False}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Old)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        rec = {"host": "127.0.0.1", "port": server.server_address[1]}
+
+        async def go():
+            async with httpx.AsyncClient(timeout=None) as c:
+                return await _probe_session(c, rec)
+
+        assert asyncio.run(go()) == {
+            "kernel": "none",
+            "chat": False,
+            "agentless": False,
+        }
     finally:
         server.shutdown()
 
@@ -1094,6 +1153,197 @@ def test_the_execute_capable_roots_are_post_only(control, upstream, path):
     assert status == 200
 
 
+# --- launching a viewer session (POST /api/sessions/new) ------------------ #
+
+
+def _launchable(monkeypatch, tmp_path, argv):
+    """Make the launch verb runnable in a test: a display this control believes
+    in, an isolated state tree for the child log, and *argv* standing in for the
+    real `python -m biopb_mcp.mcp --view`."""
+    from biopb_control import _control
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(_control, "_display_available", lambda: True)
+    monkeypatch.setattr(_control, "_viewer_argv", lambda: argv)
+
+
+def _launch_app(tmp_path, console_enabled=True):
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    return build_app(
+        DataPlaneSupervisor(spec),
+        8.0,
+        f"http://127.0.0.1:{_free_port()}",
+        console_enabled=console_enabled,
+    )
+
+
+@pytest.mark.parametrize(
+    "console_enabled, has_display, can_start, reason_hint",
+    [
+        (True, True, True, None),
+        # A viewer this control started would open on the server's display.
+        (False, True, False, "loopback"),
+        # Nowhere to put a window: it would fail every time, so do not offer it.
+        (True, False, False, "display"),
+        (False, False, False, "loopback"),  # the bind is reported first
+    ],
+)
+def test_session_launch_gate(
+    monkeypatch, console_enabled, has_display, can_start, reason_hint
+):
+    from biopb_control import _control
+
+    monkeypatch.setattr(_control, "_display_available", lambda: has_display)
+    ok, reason = _control._session_launch_gate(console_enabled)
+    assert ok is can_start
+    if can_start:
+        assert reason is None
+    else:
+        assert reason and reason_hint in reason
+
+
+def test_api_status_advertises_the_launch_verb(tmp_path, monkeypatch):
+    # The dashboard shows the button only where the control says it works, and
+    # shows the refusal in its place otherwise -- so both ride /api/status.
+    from starlette.testclient import TestClient
+
+    from biopb_control import _control
+
+    monkeypatch.setattr(_control, "_display_available", lambda: True)
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        body = client.get("/api/status").json()
+        assert body["can_start_session"] is True
+        assert body["start_session_blocked"] is None
+
+    monkeypatch.setattr(_control, "_display_available", lambda: False)
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        body = client.get("/api/status").json()
+        assert body["can_start_session"] is False
+        assert "display" in body["start_session_blocked"]
+
+
+@pytest.mark.parametrize("console_enabled", [True, False])
+def test_start_session_is_refused_when_gated(tmp_path, monkeypatch, console_enabled):
+    # 409, not 403: the request is fine, this deployment just cannot serve it --
+    # and nothing is spawned, which is the part that matters.
+    from starlette.testclient import TestClient
+
+    from biopb_control import _control
+
+    spawned = []
+    monkeypatch.setattr(_control, "_display_available", lambda: False)
+    monkeypatch.setattr(
+        _control.subprocess, "Popen", lambda *a, **k: spawned.append(a) or None
+    )
+    app = _launch_app(tmp_path, console_enabled=console_enabled)
+    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
+        resp = client.post("/api/sessions/new")
+        assert resp.status_code == 409
+        assert resp.json()["error"]
+    assert spawned == []
+
+
+def test_start_session_waits_for_the_child_to_register(tmp_path, monkeypatch):
+    # The readiness signal is the child publishing itself, matched on its own
+    # pid: `--view` registers only after its napari window is really open, so a
+    # record under that pid is the proof the launch worked. The stand-in child
+    # does exactly that, then stays alive as a real viewer would.
+    from starlette.testclient import TestClient
+
+    child = (
+        "import os, time;"
+        "from biopb import _sessions;"
+        "_sessions.register('launched', port=1234, pid=os.getpid());"
+        "time.sleep(30)"
+    )
+    _launchable(monkeypatch, tmp_path, [sys.executable, "-c", child])
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        body = client.post("/api/sessions/new").json()
+    assert body["state"] == "started"
+    assert body["session_id"] == "launched"
+    assert body["observe_url"] == "/session/launched/observe"
+
+
+def test_start_session_reports_a_child_that_dies_first(tmp_path, monkeypatch):
+    # The failure this exists to report: the viewer could not open a window and
+    # exited without registering. Its own output is the whole diagnosis, so the
+    # tail comes back with the verdict rather than only reaching the log.
+    from starlette.testclient import TestClient
+
+    child = "import sys; sys.stderr.write('no display detected\\n'); sys.exit(2)"
+    _launchable(monkeypatch, tmp_path, [sys.executable, "-c", child])
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        body = client.post("/api/sessions/new").json()
+    assert body["state"] == "failed"
+    assert "code 2" in body["error"]
+    assert "no display detected" in body["log"]
+
+
+def test_start_session_log_tail_is_this_launch_only(tmp_path, monkeypatch):
+    # The log is shared by successive launches; reporting a previous one's
+    # traceback for this one's failure would be worse than reporting nothing.
+    from starlette.testclient import TestClient
+
+    from biopb_control import _control
+
+    first = "import sys; sys.stderr.write('OLD-FAILURE\\n'); sys.exit(1)"
+    second = "import sys; sys.stderr.write('NEW-FAILURE\\n'); sys.exit(1)"
+    _launchable(monkeypatch, tmp_path, [sys.executable, "-c", first])
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        assert "OLD-FAILURE" in client.post("/api/sessions/new").json()["log"]
+        monkeypatch.setattr(
+            _control, "_viewer_argv", lambda: [sys.executable, "-c", second]
+        )
+        body = client.post("/api/sessions/new").json()
+    assert "NEW-FAILURE" in body["log"]
+    assert "OLD-FAILURE" not in body["log"]
+
+
+def test_start_session_returns_starting_when_the_child_is_slow(tmp_path, monkeypatch):
+    # A launch that outruns the wait is not a failure: the child is still coming
+    # up and the dashboard's own poll will show it. Saying "failed" here would
+    # leave a working viewer opening behind a red message.
+    from starlette.testclient import TestClient
+
+    from biopb_control import _control
+
+    _launchable(
+        monkeypatch, tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    monkeypatch.setattr(_control, "_VIEWER_START_TIMEOUT", 1.0)
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        body = client.post("/api/sessions/new").json()
+    assert body["state"] == "starting"
+    assert "error" not in body
+
+
+def test_launched_viewer_is_detached_from_the_control(tmp_path, monkeypatch):
+    # The control launches a viewer; it does not own one. A detached child means
+    # a control restart never closes the user's window -- and it is what keeps
+    # the registry the only thing that tracks sessions (ARCHITECTURE.md, I1).
+    from biopb_control import _control
+
+    seen = {}
+    real_popen = _control.subprocess.Popen
+
+    def _spy(argv, **kwargs):
+        seen.update(kwargs)
+        return real_popen(argv, **kwargs)
+
+    _launchable(monkeypatch, tmp_path, [sys.executable, "-c", "pass"])
+    monkeypatch.setattr(_control.subprocess, "Popen", _spy)
+    _control._launch_viewer(5.0)
+    if sys.platform == "win32":
+        assert seen["creationflags"]
+    else:
+        assert seen["start_new_session"] is True
+
+
 @pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
 def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
     # The behavioral half of the local-mode gate, asserted on build_app so the
@@ -1124,6 +1374,33 @@ def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
         assert resp.status_code == expected
         # The data API is unaffected either way -- the switch narrows one root.
         assert client.get("/session/s1/api/jobs").status_code == 502
+
+
+@pytest.mark.parametrize("console_enabled", [True, False])
+def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, console_enabled):
+    # Stopping a session is deliberately NOT gated like the console and chat:
+    # it is not an execute surface, it lives under `api`, and `api` already
+    # carries a comparably destructive verb in /api/kernel/restart. 502 both
+    # ways means routed to a child that is not there -- the point is that the
+    # route exists regardless of the bind. (Whether the child *serves* it is the
+    # child's own call: only a session that owns its reap mounts it.)
+    from starlette.testclient import TestClient
+
+    _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    app = build_app(
+        DataPlaneSupervisor(spec),
+        8.0,
+        f"http://127.0.0.1:{_free_port()}",
+        console_enabled=console_enabled,
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
+        assert client.post("/session/s1/api/shutdown").status_code == 502
 
 
 @pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
