@@ -112,6 +112,10 @@ async def _api_chat_status(request):
             "reason": reason,
             "busy": _chat.busy(),
             "model": get_setting(_config, "chat.model") if ready else "",
+            # How much of the thread the model no longer sees in full. The pane
+            # renders every message either way, so without this the compaction
+            # would be invisible to the person who asked for it.
+            "compacted": _chat.summary_state()[1],
         }
     )
 
@@ -123,7 +127,9 @@ async def _api_chat_history(request):
     the thread as base64, so re-sending the whole conversation every few seconds
     would be wasteful in exactly the sessions that matter. An unknown id returns
     everything, which is the right answer for a view that has just loaded or has
-    fallen behind a reset.
+    fallen behind a reset -- and ``full`` says which of those two a page is, so
+    a view that has fallen behind a reset replaces what it holds instead of
+    appending to it.
 
     ``partial`` carries the running cell's output so far. It rides this read
     rather than a route of its own because a view wants the two together: the
@@ -131,13 +137,27 @@ async def _api_chat_history(request):
     """
     messages = _chat.history()
     after = request.query_params.get("after")
+    full = True
     if after:
         for i, msg in enumerate(messages):
             if msg["id"] == after:
-                messages = messages[i + 1 :]
+                messages, full = messages[i + 1 :], False
                 break
     return JSONResponse(
-        {"messages": messages, "busy": _chat.busy(), "partial": _partial()}
+        {
+            "messages": messages,
+            # Whether this is the whole thread or a delta. A view cannot tell
+            # them apart from the messages alone, and after a reset it must:
+            # every other window is still holding the old conversation and a
+            # cursor into it, and appending the new thread to the old one leaves
+            # the cleared conversation on screen. Ids are monotone across a
+            # reset (see _chat.reset), so an unrecognised cursor is exactly this
+            # case -- and a *full* page can be empty, which is what a reset with
+            # nothing said since looks like.
+            "full": full,
+            "busy": _chat.busy(),
+            "partial": _partial(),
+        }
     )
 
 
@@ -274,6 +294,84 @@ async def _chat_cancel(request):
     return JSONResponse({"cancelled": True, "started": started})
 
 
+async def _chat_reset(request):
+    """Drop the conversation and start a new one.
+
+    The escape hatch the thread had no other exit from. ``_llm_messages``
+    re-projects every stored message on every turn, so a conversation only
+    grows -- and once it outgrows the provider's context the turn fails, records
+    the failure *in the thread*, and fails the same way forever. Without this
+    the only way out was restarting the session child, which takes the kernel
+    and the viewer window with it: losing a namespace to clear a chat.
+
+    Refused while a turn is in flight rather than cancelling it. A reset lands
+    mid-flight as a cleared thread that ``_run_turn`` then appends the rest of
+    its round into -- an assistant turn whose calls have no history behind them,
+    which is the shape that fails at the provider on every later turn. Cancel is
+    right there, and says what it is doing.
+
+    The cells the conversation ran are *not* touched. They stay in the job list
+    and the notebook export, because clearing a conversation is not undoing the
+    work it did -- and the kernel namespace it built is still live.
+    """
+    if _in_flight():
+        return JSONResponse(
+            {"error": "a turn is running; cancel it first", "busy": True},
+            status_code=409,
+        )
+    global _turn_task, _live_job, _live_text, _live_len
+    _chat.reset()
+    _turn_task = None
+    # The partial belongs to the thread that just went away. Left behind, it
+    # would be published beside the first message of the new one.
+    _live_job, _live_text, _live_len = None, "", 0
+    return JSONResponse({"reset": True})
+
+
+async def _chat_summary(request):
+    """Fold the older part of the conversation into a summary.
+
+    The other half of the thread's context problem, and the gentler one: a
+    reset gives up what was said, this keeps it. The summary stands in for the
+    folded messages **only when the thread is projected to the provider** --
+    ``_chat.history()`` is untouched, so the pane still shows every word. The
+    human's record and the model's budget are different things and there is no
+    reason to spend one to buy the other.
+
+    A write, so it lives beside turn and cancel: it costs a provider call and
+    changes what every later turn is composed against.
+
+    User-triggered rather than automatic, which is also the kind answer for
+    prompt caching. Every provider caches on an exact prefix, so folding the
+    front of the thread invalidates it -- once, here, when a person asked for
+    it. A rule that trimmed a little each turn would move the prefix on every
+    call instead, including the twelve a single turn can make.
+
+    Cannot rescue a thread that has *already* overflowed: summarising reads the
+    part being folded, so a conversation too large to send is too large to
+    summarise. That case is what /chat/reset is for.
+    """
+    ready, reason = _readiness()
+    if not ready:
+        return JSONResponse({"error": reason}, status_code=503)
+    if _in_flight():
+        return JSONResponse(
+            {"error": "a turn is running; wait for it or cancel it", "busy": True},
+            status_code=409,
+        )
+    before = _chat.summary_state()[1]
+    try:
+        compacted = await _chat.compact(_model.make_model(_config))
+    except _chat.TurnInProgress:
+        return JSONResponse(
+            {"error": "a turn is already running", "busy": True}, status_code=409
+        )
+    except Exception as exc:  # noqa: BLE001 - a provider failure is the answer
+        logger.warning("chat compaction failed: %s", exc)
+        return JSONResponse({"error": f"could not summarise: {exc}"}, status_code=502)
+    return JSONResponse({"compacted": compacted, "folded": compacted - before})
+
+
 # Reads under `api` (always proxied), the writes under `chat` (proxied only by a
 # loopback-bound control, and POST-only, which that gate enforces).
 _ROUTES = [
@@ -281,6 +379,8 @@ _ROUTES = [
     ("/api/chat/history", ["GET"], _observe._route(_api_chat_history)),
     ("/chat/turn", ["POST"], _observe._json_route(_chat_turn)),
     ("/chat/cancel", ["POST"], _observe._json_route(_chat_cancel)),
+    ("/chat/reset", ["POST"], _observe._json_route(_chat_reset)),
+    ("/chat/summary", ["POST"], _observe._json_route(_chat_summary)),
 ]
 
 
@@ -292,7 +392,7 @@ def register_http_routes():
     """
     for path, methods, handler in _ROUTES:
         _server_custom_route(path, methods)(handler)
-    logger.info("chat API mounted at /api/chat/* and /chat/{turn,cancel}")
+    logger.info("chat API mounted at /api/chat/* and /chat/{turn,cancel,reset,summary}")
 
 
 def _server_custom_route(path, methods):

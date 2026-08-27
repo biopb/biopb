@@ -12,6 +12,7 @@ const status = (over: Partial<ChatStatus> = {}): ChatStatus => ({
   ready: true,
   reason: null,
   model: "claude-sonnet-5",
+  compacted: 0,
   ...over,
 });
 
@@ -59,6 +60,20 @@ describe("ChatPane", () => {
     const html = render(status());
     expect(html).toContain("to send");
     expect(html).toContain('aria-label="Send message"');
+  });
+
+  it("offers a way out of a thread that has grown too long", () => {
+    // The conversation is re-projected to the provider whole on every turn and
+    // has no other bound; without this the only escape was restarting the
+    // session child, which takes the kernel and the viewer with it.
+    expect(render(status())).toContain("chat-new");
+  });
+
+  it("tells the reader the commands are there", () => {
+    // A slash command nobody knows about is not a feature. The list itself
+    // appears once a slash is typed, which a static render cannot reach, so
+    // the standing hint is the part that has to be here.
+    expect(render(status())).toContain("for commands");
   });
 
   it("leaves the composer usable when chat is ready", () => {

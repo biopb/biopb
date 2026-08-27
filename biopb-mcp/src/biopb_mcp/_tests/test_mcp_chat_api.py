@@ -81,6 +81,10 @@ class TestStatus:
             "reason": None,
             "busy": False,
             "model": "test-model",
+            # Nothing folded yet. Reported because the pane renders every
+            # message either way, so compaction would otherwise be invisible to
+            # the person who asked for it.
+            "compacted": 0,
         }
 
     def test_reports_why_it_is_not_ready(self, client, configured):
@@ -161,6 +165,149 @@ class TestTurn:
     @pytest.mark.parametrize("payload", [{}, {"text": ""}, {"text": "   "}])
     def test_an_empty_message_is_rejected(self, client, payload):
         assert client.post("/chat/turn", json=payload).status_code == 400
+
+
+class TestReset:
+    def test_it_clears_the_thread(self, client):
+        _chat._append("user", "hello")
+        _chat._append("assistant", "hi")
+        assert client.post("/chat/reset", json={}).json() == {"reset": True}
+        assert _chat.history() == []
+
+    def test_the_running_cells_output_does_not_outlive_the_thread(self, client):
+        # The partial belongs to the conversation that just went away; left
+        # behind it would be published beside the first message of the next.
+        _chat_api._live_job, _chat_api._live_text = "job-3", "half a result\n"
+        _chat_api._live_len = len("half a result\n")
+        client.post("/chat/reset", json={})
+        assert _chat_api._partial() is None
+        assert _chat_api._live_text == ""
+
+    def test_a_running_turn_is_not_reset_out_from_under(self, client, monkeypatch):
+        # A cleared thread that _run_turn then appends the rest of its round
+        # into is an assistant turn whose calls have no history behind them --
+        # the shape that fails at the provider on every later turn, not just
+        # this one. Cancel is right there and says what it is doing.
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                _chat._append("user", "hello")
+                r = client.post("/chat/reset", json={})
+                assert r.status_code == 409
+                assert r.json()["busy"] is True
+                assert len(_chat.history()) == 1
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_it_carries_the_json_guard_despite_having_no_body(self, client):
+        assert (
+            client.post(
+                "/chat/reset", headers={"content-type": "text/plain"}
+            ).status_code
+            == 400
+        )
+
+    def test_the_new_thread_is_marked_whole_not_a_delta(self, client):
+        # The window that did not ask for the reset is still holding the old
+        # conversation and a cursor into it. Ids are monotone across a reset, so
+        # nothing in the messages distinguishes "here is the rest" from "here is
+        # everything, start again" -- and appending leaves the cleared thread on
+        # screen with the new one after it.
+        _chat._append("user", "old")
+        stale = _chat.history()[-1]["id"]
+        client.post("/chat/reset", json={})
+        body = client.get(f"/api/chat/history?after={stale}").json()
+        assert body["full"] is True
+        assert body["messages"] == []
+
+        _chat._append("user", "new")
+        body = client.get(f"/api/chat/history?after={stale}").json()
+        assert body["full"] is True
+        assert [m["content"] for m in body["messages"]] == ["new"]
+
+    def test_a_recognised_cursor_is_a_delta(self, client):
+        _chat._append("user", "one")
+        cursor = _chat.history()[-1]["id"]
+        _chat._append("assistant", "two")
+        body = client.get(f"/api/chat/history?after={cursor}").json()
+        assert body["full"] is False
+        assert [m["content"] for m in body["messages"]] == ["two"]
+
+    def test_a_view_that_asks_after_a_cleared_message_gets_the_new_thread(self, client):
+        # Another window is still holding an id from the old conversation. An
+        # unknown `after` returns everything, which is what lets it notice.
+        _chat._append("user", "old")
+        stale = _chat.history()[-1]["id"]
+        client.post("/chat/reset", json={})
+        _chat._append("user", "new")
+        body = client.get(f"/api/chat/history?after={stale}").json()
+        assert [m["content"] for m in body["messages"]] == ["new"]
+
+
+class TestSummary:
+    def _thread(self, n=4):
+        for i in range(n):
+            _chat._append("user", f"turn {i}")
+            _chat._append("assistant", f"reply {i}")
+
+    def test_it_folds_the_projection_and_reports_how_much(self, client, monkeypatch):
+        self._thread()
+
+        async def model(messages, tools):
+            return {"content": "SUMMARY"}
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: model)
+        body = client.post("/chat/summary", json={}).json()
+        assert body == {"compacted": 4, "folded": 4}
+        # Projection only: the pane still renders every word.
+        assert len(_chat.history()) == 8
+        assert client.get("/api/chat/status").json()["compacted"] == 4
+
+    def test_a_provider_failure_is_reported_not_half_applied(self, client, monkeypatch):
+        self._thread()
+
+        async def model(messages, tools):
+            raise RuntimeError("model returned 429")
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: model)
+        r = client.post("/chat/summary", json={})
+        assert r.status_code == 502
+        assert "429" in r.json()["error"]
+        # Nothing folded, so the next turn is composed against the whole thread
+        # rather than against a prefix that was silently dropped.
+        assert _chat.summary_state() == (None, 0)
+
+    def test_a_running_turn_is_not_compacted_out_from_under(self, client, monkeypatch):
+        # The projection is read once per tool round, so moving it mid-turn
+        # would change the ground under a round already in flight.
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                r = client.post("/chat/summary", json={})
+                assert r.status_code == 409
+                assert r.json()["busy"] is True
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_it_carries_the_json_guard(self, client):
+        assert (
+            client.post(
+                "/chat/summary", headers={"content-type": "text/plain"}
+            ).status_code
+            == 400
+        )
 
 
 class TestCancel:

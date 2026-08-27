@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   cancelTurn,
+  compactThread,
   fetchHistory,
+  resetThread,
   sendTurn,
   type ChatStatus,
 } from "../utils/chatClient";
@@ -18,6 +20,11 @@ import {
   type ToolCallItem,
 } from "../utils/chatThread";
 import { escAction, sendsOnEnter } from "../utils/chatKeys";
+import {
+  contextReport,
+  matchCommands,
+  parseCommand,
+} from "../utils/chatCommands";
 
 // The built-in agent, beside the job list it drives.
 //
@@ -45,6 +52,13 @@ export default function ChatPane({
   const [sending, setSending] = useState(false);
   const [zoom, setZoom] = useState<ImageBlock | null>(null);
   const [live, setLive] = useState<LiveOutput | null>(null);
+  // The pane answering the pane, rather than the model answering the user.
+  // Kept out of `messages` on purpose: everything in there is the child's and
+  // has an id the poll merges against, and a locally invented message would
+  // either collide with one or survive a reset. So it is one line, held below
+  // the thread, replaced by the next command and cleared by the next turn --
+  // which is also the moment it stops being true.
+  const [notice, setNotice] = useState<string | null>(null);
 
   // The cursor into the conversation. A ref, not state: it is read by the poll
   // and must never be a render's worth of steps behind it.
@@ -72,9 +86,13 @@ export default function ChatPane({
     // live output matters. Skipping the rest on `!messages.length` would have
     // frozen the output for the entire cell -- so the skip is expressed as the
     // guard it actually is, and cannot grow to cover anything else.
-    if (page.messages.length) {
-      setMessages((prev) => mergeHistory(prev, page.messages));
-      after.current = page.messages[page.messages.length - 1]!.id;
+    // A full page is acted on even when it is empty -- that is a reset, seen
+    // from a window that did not ask for one.
+    if (page.full || page.messages.length) {
+      setMessages((prev) => mergeHistory(prev, page.messages, page.full));
+      after.current = page.messages.length
+        ? page.messages[page.messages.length - 1]!.id
+        : null;
     }
   }, [base]);
 
@@ -99,6 +117,7 @@ export default function ChatPane({
       return;
     }
     setText(""); // cleared only once it was accepted, so nothing is lost
+    setNotice(null); // a context report describes the thread as it was
     setBusy(true); // poll faster immediately rather than after one slow tick
     poll();
   }, [base, text, busy, sending, poll]);
@@ -129,6 +148,68 @@ export default function ChatPane({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [zoom, busy, stop]);
+  // The thread's only bound. `_llm_messages` re-projects every stored message
+  // on every turn, so a conversation that outgrows the provider's context fails
+  // -- and records the failure in the thread, so it fails the same way forever.
+  // Confirmed because it cannot be undone; the cells it ran are untouched, which
+  // is what the wording has to get across.
+  const startNew = useCallback(async () => {
+    if (!confirm("Start a new conversation? This clears the chat. Cells it ran stay in the job list."))
+      return;
+    const err = await resetThread(base);
+    if (err) {
+      setError(err);
+      return;
+    }
+    setMessages([]);
+    after.current = null;
+    setExpanded(new Set());
+    setLive(null);
+    setNotice(null);
+    setBusy(false);
+    setError(null);
+    poll();
+  }, [base, poll]);
+
+  // The gentler half of the same problem: a reset gives up what was said, this
+  // keeps it and folds it. Not confirmed -- nothing is lost from the thread, so
+  // the worst case is a wasted provider call.
+  const compact = useCallback(async () => {
+    setError(null);
+    const err = await compactThread(base);
+    if (err) setError(err);
+    else poll();
+  }, [base, poll]);
+
+  // Enter, and the button beside it. Every path in goes through here so a
+  // command cannot be reachable one way and not the other -- which is what a
+  // send button disabled during a turn would do to `/context`, the one command
+  // whose whole point is answering "should I stop and compact?" mid-turn.
+  const onEnter = useCallback(async () => {
+    const parsed = parseCommand(text);
+    if (parsed.kind === "send") {
+      submit();
+      return;
+    }
+    if (parsed.kind === "reject") {
+      // Beside the composer, where the typo is, and the text is left alone so
+      // it can be corrected rather than retyped.
+      setError(parsed.message);
+      return;
+    }
+    setText("");
+    setError(null);
+    if (parsed.name === "context") {
+      // Answered from what the pane already holds. Nothing is sent, so this
+      // works during a turn and costs the conversation nothing -- which matters
+      // for the one command a person runs *because* they are worried about size.
+      setNotice(contextReport(messages, status.compacted, status.model));
+      return;
+    }
+    setNotice(null);
+    if (parsed.name === "new") await startNew();
+    else await compact();
+  }, [text, submit, messages, status.compacted, status.model, startNew, compact]);
 
   const toggle = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -138,6 +219,11 @@ export default function ChatPane({
       return next;
     });
   }, []);
+
+  // Both read the typed text the same way, so the button is enabled exactly
+  // when Enter would do something.
+  const matches = matchCommands(text);
+  const isCommand = parseCommand(text).kind === "command";
 
   const groups = groupThread(
     applyLiveOutput(fromChatHistory(messages, busy), live),
@@ -149,13 +235,31 @@ export default function ChatPane({
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && atBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages, expanded, live]);
+  }, [messages, expanded, live, notice]);
 
   return (
     <section className="chat">
       <div className="chat-head">
         <span className="chat-title">chat</span>
         <span className="chat-model">{status.model}</span>
+        {/* Shown only once there is something to fold: a control that cannot
+            act is how the observe page's Interrupt earned its "No running job."
+            dialog. */}
+        {status.compacted ? (
+          <span className="chat-folded" title="Messages the model now sees only as a summary">
+            {status.compacted} folded
+          </span>
+        ) : null}
+        <button
+          className="chat-new"
+          onClick={compact}
+          title="Summarise the older part of the conversation for the model. The thread is not changed."
+        >
+          compact
+        </button>
+        <button className="chat-new" onClick={startNew} title="Start a new conversation">
+          new
+        </button>
       </div>
 
       <div
@@ -208,9 +312,32 @@ export default function ChatPane({
             />
           ),
         )}
+
+        {notice ? <div className="chat-report">{notice}</div> : null}
       </div>
 
       <div className="chat-compose">
+        {/* How anyone finds out these exist. A slash on its own lists them all,
+            and a click completes rather than runs -- Enter stays the thing that
+            acts, including for the one that clears the conversation. */}
+        {matches.length ? (
+          <div className="chat-cmds">
+            {matches.map((c) => (
+              <button
+                key={c.name}
+                className="chat-cmd"
+                onClick={() => setText(c.typed)}
+              >
+                <span className="chat-cmd-name">{c.typed}</span>
+                {c.aliases.length ? (
+                  <span className="chat-cmd-alias">{c.aliases.join(", ")}</span>
+                ) : null}
+                <span className="chat-cmd-help">{c.help}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
         <div className="chat-input">
           <textarea
             value={text}
@@ -222,7 +349,7 @@ export default function ChatPane({
             onKeyDown={(e) => {
               if (!sendsOnEnter(e)) return;
               e.preventDefault();
-              submit();
+              onEnter();
             }}
           />
           {/* In the corner of the box rather than on a row of its own. Enter is
@@ -233,8 +360,8 @@ export default function ChatPane({
             className="chat-send"
             aria-label="Send message"
             title="Send (Enter)"
-            disabled={!status.ready || sending || busy || !text.trim()}
-            onClick={submit}
+            disabled={!status.ready || sending || (busy && !isCommand) || !text.trim()}
+            onClick={onEnter}
           >
             ↩
           </button>
@@ -251,7 +378,7 @@ export default function ChatPane({
           ) : (
             <span className="chat-hint">
               <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a
-              newline
+              newline · <kbd>/</kbd> for commands
             </span>
           )}
           {error ? <span className="chat-err">{error}</span> : null}
@@ -420,6 +547,27 @@ const CHAT_CSS = `
                   border: 1px solid #3a3a3a; border-radius: 3px; padding: 0 3px;
                   color: #999; }
   .chat-err { color: #f99; font-size: 12px; }
+  .chat-report { white-space: pre-wrap; color: #8a8; font-size: 12px;
+                 font-family: ui-monospace, Menlo, monospace;
+                 border-left: 2px solid #3a3a3a; padding: 4px 0 4px 10px;
+                 margin: 0 0 10px; }
+  .chat-cmds { display: flex; flex-direction: column; margin-bottom: 6px;
+               border: 1px solid #333; border-radius: 4px; overflow: hidden; }
+  .chat-cmd { display: flex; align-items: baseline; gap: 8px; text-align: left;
+              padding: 4px 8px; border: 0; background: #121212; color: #999;
+              cursor: pointer; font: inherit; font-size: 12px; }
+  .chat-cmd:hover { background: #1d2a1d; }
+  .chat-cmd-name { color: #7e7; font-family: ui-monospace, Menlo, monospace; }
+  .chat-cmd-alias { color: #666; font-family: ui-monospace, Menlo, monospace;
+                    font-size: 11px; }
+  .chat-cmd-help { color: #777; margin-left: auto; }
+  /* No margin-left:auto here -- .chat-model already has one, and a second
+     would share the free space between them instead of pinning both right. */
+  .chat-new { font-size: 11px; padding: 1px 8px;
+              border-radius: 10px; border: 1px solid #333; background: #181818;
+              color: #999; cursor: pointer; }
+  .chat-new:hover { background: #222; color: #ccc; }
+  .chat-folded { color: #777; font-size: 11px; }
   .chat-zoom { position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 50;
                display: flex; align-items: center; justify-content: center;
                cursor: zoom-out; padding: 24px; }

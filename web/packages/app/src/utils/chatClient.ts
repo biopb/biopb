@@ -25,10 +25,17 @@ export interface ChatStatus {
   /** Why chat cannot run, when it cannot — an unset API key, typically. */
   reason: string | null;
   model: string;
+  /** How many leading messages the model now sees only as a summary. The pane
+   * renders all of them regardless, so this is the only sign compaction
+   * happened. Zero on an older child, which never folds anything. */
+  compacted: number;
 }
 
 export interface HistoryPage {
   messages: ChatMessage[];
+  /** Whether this page is the whole thread rather than a delta — a cursor the
+   * child did not recognise, which after a reset is every other window's. */
+  full: boolean;
   busy: boolean;
   /** The cell being polled right now, and what it has printed. */
   live: LiveOutput | null;
@@ -51,6 +58,10 @@ export async function fetchChatStatus(base: string): Promise<ChatStatus | null> 
       ready: !!j.ready,
       reason: typeof j.reason === "string" ? j.reason : null,
       model: typeof j.model === "string" ? j.model : "",
+      // Read here or it does not exist: this builds the status field by field
+      // rather than returning the body, so a key the type declares and the
+      // parser drops is invisible on both sides of the seam.
+      compacted: typeof j.compacted === "number" ? j.compacted : 0,
     };
   } catch {
     return null;
@@ -70,6 +81,8 @@ export async function fetchHistory(
     const j = await r.json();
     return {
       messages: Array.isArray(j.messages) ? j.messages : [],
+      // Absent on an older child, where every page was effectively a delta.
+      full: !!j.full,
       busy: !!j.busy,
       live: readLive(j.partial),
     };
@@ -115,6 +128,50 @@ export async function sendTurn(
   const d = await r.json().catch(() => ({}) as Record<string, unknown>);
   if (r.status === 409) return "A turn is already running. Wait for it, or cancel it.";
   return String(d.error || `send failed (${r.status})`);
+}
+
+/** Fold the older part of the thread into a summary. Returns an error, or null.
+ *
+ * Projection only: the pane still renders every message. What changes is what
+ * the model is given, which is why the result is reported through `compacted`
+ * on the status read rather than by anything appearing in the thread.
+ */
+export async function compactThread(base: string): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await sessionFetch(base + "/chat/summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return String(e);
+  }
+  if (r.ok) return null;
+  if (r.status === 409) return "A turn is running. Wait for it, or cancel it.";
+  const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  return String(d.error || `compact failed (${r.status})`);
+}
+
+/** Start a new conversation. Returns an error string, or null.
+ *
+ * Refused with 409 while a turn is in flight: a cleared thread that the running
+ * turn then appends the rest of its round into is an assistant turn whose calls
+ * have no history behind them, which fails at the provider on every later turn.
+ */
+export async function resetThread(base: string): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await sessionFetch(base + "/chat/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    return String(e);
+  }
+  if (r.ok) return null;
+  if (r.status === 409) return "A turn is running. Cancel it first.";
+  const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  return String(d.error || `reset failed (${r.status})`);
 }
 
 /** Stop the running turn. Nothing to report: cancelling nothing is a success,

@@ -138,6 +138,133 @@ def _scripted(*replies):
     return model
 
 
+def _round(user, call_id, name="execute_code", result="out"):
+    """One user turn that made a tool call and got a result."""
+    _chat._append("user", user)
+    _chat._append(
+        "assistant",
+        "",
+        tool_calls=[{"id": call_id, "type": "function", "function": {"name": name}}],
+    )
+    _chat._append("tool", result, tool_call_id=call_id, name=name)
+    _chat._append("assistant", "done")
+
+
+class TestCompaction:
+    def test_the_projection_is_folded_and_the_record_is_not(self, chat_host):
+        for i in range(4):
+            _round(f"turn {i}", f"c{i}")
+        kept = len(_chat.history())
+        model = _scripted({"content": "SUMMARY"})
+        assert asyncio.run(_chat.compact(model)) == 8
+
+        # The human's record of the conversation is not the model's context
+        # budget: every word is still there to render.
+        assert len(_chat.history()) == kept
+
+        projected = _chat._llm_messages()
+        assert any(
+            m["role"] == "system" and "SUMMARY" in m["content"] for m in projected
+        )
+        assert [m.get("content") for m in projected if m["role"] == "user"] == [
+            "turn 2",
+            "turn 3",
+        ]
+
+    def test_the_cut_lands_on_a_turn_boundary(self, chat_host):
+        # Anywhere else orphans a tool_call_id -- a tool message whose assistant
+        # turn was folded away is rejected outright, and being a property of the
+        # stored thread it is rejected on every later turn, not just this one.
+        for i in range(4):
+            _round(f"turn {i}", f"c{i}")
+        asyncio.run(_chat.compact(_scripted({"content": "S"}), keep_turns=1))
+        projected = _chat._llm_messages()
+        offered = set()
+        for m in projected:
+            for call in m.get("tool_calls") or []:
+                offered.add(call["id"])
+            if m["role"] == "tool":
+                assert m["tool_call_id"] in offered
+
+    def test_an_image_carrier_is_not_a_turn_boundary(self, chat_host):
+        # An image rides back from a tool as a `user` message, but it is not a
+        # turn anyone took: cutting there leaves the summary followed by a bare
+        # "(image returned by ...)" whose call is inside the summary. Two turns
+        # with keep_turns=2 means there is nothing to fold -- unless the image
+        # is miscounted as a third.
+        _round("turn 0", "c0")
+        _chat._append(
+            "user", "(image returned by take_screenshot)", image="A", mime="image/png"
+        )
+        _round("turn 1", "c1")
+        model = _scripted({"content": "S"})
+        assert asyncio.run(_chat.compact(model, keep_turns=2)) == 0
+        assert model.seen == []
+
+    def test_nothing_to_fold_calls_no_model(self, chat_host):
+        _round("only turn", "c0")
+        model = _scripted({"content": "S"})
+        assert asyncio.run(_chat.compact(model)) == 0
+        assert model.seen == []
+
+    def test_a_second_compaction_folds_the_first_summary_not_the_thread(
+        self, chat_host
+    ):
+        # Otherwise the summarising call grows with the session -- the cost this
+        # exists to bound.
+        for i in range(4):
+            _round(f"turn {i}", f"c{i}")
+        asyncio.run(_chat.compact(_scripted({"content": "FIRST"})))
+        for i in range(4, 6):
+            _round(f"turn {i}", f"c{i}")
+        second = _scripted({"content": "SECOND"})
+        asyncio.run(_chat.compact(second))
+
+        (asked,) = [m["messages"][0]["content"] for m in second.seen]
+        assert "FIRST" in asked
+        assert "turn 0" not in asked  # already behind the first summary
+        assert "turn 2" in asked
+        assert _chat.summary_state()[0] == "SECOND"
+
+    def test_images_are_named_not_carried(self, chat_host):
+        # They are the bulk of a thread that has grown large, so sending them
+        # would make the summarising call expensive in exactly the conversation
+        # that needed compacting.
+        _round("turn 0", "c0")
+        _chat._append(
+            "user",
+            "(image returned by take_screenshot)",
+            image="AAAA",
+            mime="image/png",
+        )
+        for i in range(1, 3):
+            _round(f"turn {i}", f"c{i}")
+        model = _scripted({"content": "S"})
+        asyncio.run(_chat.compact(model))
+        (asked,) = [m["messages"][0]["content"] for m in model.seen]
+        assert "(image)" in asked
+        assert "AAAA" not in asked
+
+    def test_an_empty_summary_is_not_stored(self, chat_host):
+        # A provider that answers with nothing must not silently delete the
+        # front of the conversation from the model's view.
+        for i in range(4):
+            _round(f"turn {i}", f"c{i}")
+        with pytest.raises(RuntimeError):
+            asyncio.run(_chat.compact(_scripted({"content": "  "})))
+        assert _chat.summary_state() == (None, 0)
+
+    def test_reset_drops_the_summary_with_the_messages(self, chat_host):
+        for i in range(4):
+            _round(f"turn {i}", f"c{i}")
+        asyncio.run(_chat.compact(_scripted({"content": "S"})))
+        _chat.reset()
+        assert _chat.summary_state() == (None, 0)
+        # ...and the projection is a bare system prompt again, not a summary of
+        # messages that no longer exist.
+        assert len(_chat._llm_messages()) == 1
+
+
 class TestConversation:
     def test_the_thread_is_shared_not_per_caller(self, chat_host):
         # One conversation per session: two senders append to one thread, which
