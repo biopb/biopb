@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 WRITER_ID = "biopb-chat"
 WRITER_LABEL = "chat"
 
+#: The job origin this loop submits under. Also the point of view its
+#: foreign-activity digest is read from (``_server._local_origin``): a cell is
+#: someone *else's* only relative to whoever is asking.
+ORIGIN = "chat"
+
 #: Name of the synthesized tool that reads ``guide://`` and ``skill://``.
 #: Resources are an MCP concept with no function-calling equivalent, so a model
 #: driven by this loop cannot reach them unless one is invented -- and the
@@ -304,12 +309,26 @@ async def _run_code(arguments, on_progress):
     *intent* prefers what the model supplied — it is closer to the cell than the
     turn is — and falls back to the user's own words, so the notebook export has
     a stated purpose either way.
+
+    The foreign-activity note is read and appended here for the same reason
+    ``execute_code`` does it, and this path is the one that matters: it is the
+    tool the model reaches for most, so a session where it only ever runs code
+    never learned that the person at the machine had run any. Read once at
+    entry, appended to whichever branch returns.
     """
     host = _server._kernel_host
     if host is None:
         return "Error: kernel host not initialized"
     code = arguments.get("python_code") or ""
     intent = arguments.get("intent") or _last_user_text()
+
+    # Off the loop, like every other kernel round trip here. The context copy
+    # carries `_local_origin`, which is what keeps this loop's own cells out of
+    # its own digest.
+    digest = await asyncio.to_thread(_server._foreign_digest, host)
+    foreign_note = _server._render_foreign_note(digest)
+    if foreign_note:
+        await asyncio.to_thread(_server._ack_foreign_digest, host, digest, WRITER_ID)
 
     # Claimed before the call, and mirrored, for the same reason execute_code
     # does it: a lost reply must not leave the kernel held while this process
@@ -319,7 +338,9 @@ async def _run_code(arguments, on_progress):
         host,
         "submit("
         + repr(code)
-        + ", origin='chat', intent="
+        + ", origin="
+        + repr(ORIGIN)
+        + ", intent="
         + repr(intent)
         + ", writer="
         + repr(WRITER_ID)
@@ -328,16 +349,26 @@ async def _run_code(arguments, on_progress):
         + ")",
     )
     if submitted is None:
-        return _server._format_execute_result(res)
+        return _server._format_execute_result(res) + foreign_note
     if submitted.get("error") == "not_owner":
         held = submitted.get("owner") or ""
         _server._note_claim(submitted.get("owner_id"))
-        return _server._NOT_OWNER_MSG.format(held_by=f" ({held})" if held else "")
+        return (
+            _server._NOT_OWNER_MSG.format(held_by=f" ({held})" if held else "")
+            + foreign_note
+        )
     _server._note_claim(WRITER_ID)
     if submitted.get("error") == "busy":
+        running = submitted.get("running_job_id")
+        # A running foreign job stays in the digest by design, so the note is
+        # about to report the very cell this branch reports. Drop it when that
+        # is all it says, and keep it when other cells also finished -- those
+        # were acked above and will not be offered again.
+        if [d.get("job_id") for d in digest] == [running]:
+            foreign_note = ""
         return (
-            f"A job ({submitted.get('running_job_id')}) is already running in this "
-            "kernel; wait for it to finish."
+            f"A job ({running}) is already running in this "
+            "kernel; wait for it to finish." + foreign_note
         )
 
     global _running_job_id
@@ -353,14 +384,14 @@ async def _run_code(arguments, on_progress):
             snap, res, _w = await _job_call(host, "poll(" + repr(job_id) + ")")
             if snap is None:
                 _running_job_id = None
-                return _server._format_execute_result(res)
+                return _server._format_execute_result(res) + foreign_note
             out = snap.get("stdout") or ""
             if on_progress is not None and len(out) > seen:
                 on_progress(out[seen:])
                 seen = len(out)
             if snap.get("status") != "running":
                 _running_job_id = None
-                return _server._format_execute_result(snap)
+                return _server._format_execute_result(snap) + foreign_note
     except asyncio.CancelledError:
         # The one case that keeps it: the cell really is still running, and the
         # turn's handler is about to name it. That handler clears it.
@@ -484,6 +515,7 @@ async def _run_turn(user_text, model, on_progress):
     # cannot read: its own message, followed by nothing, forever.
     start = len(_messages)
     token = _server._local_identity.set((WRITER_ID, WRITER_LABEL))
+    origin_token = _server._local_origin.set(ORIGIN)
     try:
         # Before the first await: the user's own turn is one of the new messages
         # a view has to render, not context it already had.
@@ -576,5 +608,6 @@ async def _run_turn(user_text, model, on_progress):
         raise
     finally:
         _server._local_identity.reset(token)
+        _server._local_origin.reset(origin_token)
 
     return _messages[start:]
