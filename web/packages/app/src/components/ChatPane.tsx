@@ -1,26 +1,38 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
+  answerPermission,
   cancelTurn,
   compactThread,
+  fetchEngine,
   fetchHistory,
   resetThread,
   sendTurn,
+  setEngine,
+  type AgentCommand,
+  type ChatEngine,
   type ChatStatus,
+  type ContextUsage,
 } from "../utils/chatClient";
 import {
   applyLiveOutput,
+  fromAcpItems,
   fromChatHistory,
   groupThread,
   latestLine,
+  mergeAcpItems,
   mergeHistory,
+  openPermission,
   toolText,
+  type AcpItem,
   type ChatMessage,
   type ImageBlock,
   type LiveOutput,
+  type PermissionItem,
   type ToolCallItem,
 } from "../utils/chatThread";
 import { escAction, sendsOnEnter } from "../utils/chatKeys";
 import {
+  acpContextReport,
   contextReport,
   matchCommands,
   parseCommand,
@@ -45,6 +57,29 @@ export default function ChatPane({
   pollMs: number;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  // The ACP engine's thread, and what the harness says it can be asked to do.
+  // Held beside `messages` rather than in place of it: the engine can be
+  // switched mid-session, and the other thread is still there to come back to.
+  const [items, setItems] = useState<AcpItem[]>([]);
+  const [commands, setCommands] = useState<AgentCommand[]>([]);
+  const [usage, setUsage] = useState<ContextUsage | null>(null);
+  // The engine in force *now*. Seeded from the status the page probed once at
+  // mount, and then kept current by the poll rather than by that probe: the
+  // engine is session state, and a switch made in another window of the same
+  // session has to arrive here somehow.
+  const [engine, setEngineState] = useState(status.engine);
+  // The same value where the poll can read it, for the reason `after` is a ref:
+  // the poll must not run a render behind the engine it is reading for.
+  const engineRef = useRef(status.engine);
+  useEffect(() => {
+    engineRef.current = status.engine;
+    setEngineState(status.engine);
+  }, [status.engine]);
+  const acp = engine === "acp";
+  // Who is answering. Held here rather than read from the once-probed status
+  // because it moves with the engine, and the engine moves under this pane.
+  const [model, setModel] = useState(status.model);
+  useEffect(() => setModel(status.model), [status.model]);
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [text, setText] = useState("");
@@ -62,18 +97,50 @@ export default function ChatPane({
 
   // The cursor into the conversation. A ref, not state: it is read by the poll
   // and must never be a render's worth of steps behind it.
-  const after = useRef<string | null>(null);
+  //
+  // Two engines spell it differently -- a last-seen message id for the built-in
+  // loop, a revision watermark for ACP -- and the pane holds whichever it was
+  // last given rather than deciding. Only one of the two can say "an item you
+  // already have has changed", which is the thing ACP does constantly.
+  const after = useRef<string | number | null>(null);
   // One read at a time. A fetch slower than the interval would otherwise leave
   // several in flight against the same cursor, each fetching what the last has
   // already appended -- worst on exactly the slow link where it costs most.
   // `mergeHistory` survives the overlap; this keeps it from happening.
   const reading = useRef(false);
 
+  // Hand the pane to an engine, from wherever the switch came from. The thread
+  // does not travel with it: the two hold different conversations, and showing
+  // one engine's transcript above another engine's answers would invent a
+  // continuity that does not exist. The cursor goes with the thread -- the two
+  // engines do not even spell it the same way.
+  const adoptEngine = useCallback((next: ChatEngine) => {
+    engineRef.current = next;
+    setEngineState(next);
+    setMessages([]);
+    setItems([]);
+    setCommands([]);
+    setUsage(null);
+    setLive(null);
+    setNotice(null);
+    after.current = null;
+  }, []);
+
   const poll = useCallback(async () => {
     if (reading.current) return;
     reading.current = true;
     let page;
     try {
+      // The engine first, because a session has one and any window can change
+      // it. A pane that learned it only from its own click keeps rendering the
+      // outgoing engine's thread, and keeps asking for it with a cursor the
+      // incoming one cannot read. Null is a failed read, not a change: the
+      // thread is left exactly as it is.
+      const now = await fetchEngine(base);
+      if (now) {
+        setModel(now.model);
+        if (now.engine !== engineRef.current) adoptEngine(now.engine);
+      }
       page = await fetchHistory(base, after.current);
     } finally {
       reading.current = false;
@@ -88,13 +155,24 @@ export default function ChatPane({
     // guard it actually is, and cannot grow to cover anything else.
     // A full page is acted on even when it is empty -- that is a reset, seen
     // from a window that did not ask for one.
+    if (page.items !== null) {
+      // The ACP engine. Every page is acted on, including an empty one: a
+      // watermark only moves forward, and holding it back on a quiet poll would
+      // re-fetch the whole thread on the next one.
+      const fresh = page.items;
+      setItems((prev) => mergeAcpItems(prev, fresh, page.full));
+      setCommands(page.commands);
+      setUsage(page.usage);
+      after.current = page.rev;
+      return;
+    }
     if (page.full || page.messages.length) {
       setMessages((prev) => mergeHistory(prev, page.messages, page.full));
       after.current = page.messages.length
         ? page.messages[page.messages.length - 1]!.id
         : null;
     }
-  }, [base]);
+  }, [base, adoptEngine]);
 
   // Faster while a turn runs. The page's own interval is tuned for a job list;
   // a conversation updating every three seconds reads as a stall.
@@ -122,10 +200,49 @@ export default function ChatPane({
     poll();
   }, [base, text, busy, sending, poll]);
 
+  // One shape, two sources: whichever engine is running produces the same
+  // `ThreadItem[]`, so everything below this line renders one thread and knows
+  // nothing about where it came from.
+  const thread = acp
+    ? fromAcpItems(items, busy)
+    : applyLiveOutput(fromChatHistory(messages, busy), live);
+  const groups = groupThread(thread);
+  // At most one, and it is what Escape means while it is up.
+  const asking = acp ? openPermission(thread) : null;
+
+  // Switching from this window. The other window's switch arrives through the
+  // poll, and lands in the same place.
+  const switchEngine = useCallback(
+    async (next: ChatEngine) => {
+      if (next === engine) return;
+      const err = await setEngine(base, next);
+      if (err) {
+        setError(err);
+        return;
+      }
+      adoptEngine(next);
+      setError(null);
+      poll();
+    },
+    [base, engine, poll, adoptEngine],
+  );
+
   const stop = useCallback(async () => {
     await cancelTurn(base);
     poll();
   }, [base, poll]);
+
+  // Answering is a write and then a poll, like every other action here: the
+  // outcome is server state, so the thread shows what happened rather than this
+  // guessing on its behalf.
+  const answer = useCallback(
+    async (item: PermissionItem, optionId: string | null) => {
+      const err = await answerPermission(base, item.requestId, optionId);
+      if (err) setError(err);
+      poll();
+    },
+    [base, poll],
+  );
 
   // Escape, bound on the window rather than the composer: a reader who clicked
   // a job row to watch its output would otherwise find the key silently stops
@@ -139,15 +256,17 @@ export default function ChatPane({
         imageOpen: zoom !== null,
         inConsole: !!document.activeElement?.closest(".console"),
         busy,
+        permissionOpen: !!asking,
       });
       if (action === "none") return;
       e.preventDefault();
       if (action === "close-image") setZoom(null);
+      else if (action === "refuse-permission") answer(asking!, null);
       else stop();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [zoom, busy, stop]);
+  }, [zoom, busy, stop, asking, answer]);
   // The thread's only bound. `_llm_messages` re-projects every stored message
   // on every turn, so a conversation that outgrows the provider's context fails
   // -- and records the failure in the thread, so it fails the same way forever.
@@ -186,7 +305,7 @@ export default function ChatPane({
   // send button disabled during a turn would do to `/context`, the one command
   // whose whole point is answering "should I stop and compact?" mid-turn.
   const onEnter = useCallback(async () => {
-    const parsed = parseCommand(text);
+    const parsed = parseCommand(text, engine, commands);
     if (parsed.kind === "send") {
       submit();
       return;
@@ -203,13 +322,31 @@ export default function ChatPane({
       // Answered from what the pane already holds. Nothing is sent, so this
       // works during a turn and costs the conversation nothing -- which matters
       // for the one command a person runs *because* they are worried about size.
-      setNotice(contextReport(messages, status.compacted, status.model));
+      // Two engines, two honest answers: the built-in loop is counted from what
+      // the pane holds, the harness reports its own use.
+      setNotice(
+        acp
+          ? acpContextReport(usage, model)
+          : contextReport(messages, status.compacted, model),
+      );
       return;
     }
     setNotice(null);
     if (parsed.name === "new") await startNew();
     else await compact();
-  }, [text, submit, messages, status.compacted, status.model, startNew, compact]);
+  }, [
+    text,
+    submit,
+    messages,
+    status.compacted,
+    model,
+    engine,
+    acp,
+    usage,
+    commands,
+    startNew,
+    compact,
+  ]);
 
   const toggle = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -222,12 +359,9 @@ export default function ChatPane({
 
   // Both read the typed text the same way, so the button is enabled exactly
   // when Enter would do something.
-  const matches = matchCommands(text);
-  const isCommand = parseCommand(text).kind === "command";
+  const matches = matchCommands(text, engine);
+  const isCommand = parseCommand(text, engine, commands).kind === "command";
 
-  const groups = groupThread(
-    applyLiveOutput(fromChatHistory(messages, busy), live),
-  );
 
   // Stick to the newest message unless the reader has scrolled up to read.
   const scroller = useRef<HTMLDivElement | null>(null);
@@ -235,28 +369,52 @@ export default function ChatPane({
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && atBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages, expanded, live, notice]);
+  }, [messages, items, expanded, live, notice]);
 
   return (
     <section className="chat">
       <div className="chat-head">
         <span className="chat-title">chat</span>
-        <span className="chat-model">{status.model}</span>
+        {/* Offered only when there is a choice to make. One engine configured
+            is the common install, and a select with a single option is a
+            control that cannot act. */}
+        {status.engines.filter((e) => e.ready).length > 1 ? (
+          <select
+            className="chat-engine"
+            value={engine}
+            onChange={(e) => switchEngine(e.target.value as ChatEngine)}
+            title="Which agent drives this pane"
+          >
+            {status.engines.map((e) => (
+              <option key={e.engine} value={e.engine} disabled={!e.ready}>
+                {e.engine === "acp" ? "harness" : "built-in"}
+              </option>
+            ))}
+          </select>
+        ) : null}
+        <span
+          className="chat-model"
+          title={acp ? "an ACP harness, running as you" : "the built-in loop"}
+        >
+          {model}
+        </span>
         {/* Shown only once there is something to fold: a control that cannot
             act is how the observe page's Interrupt earned its "No running job."
             dialog. */}
-        {status.compacted ? (
+        {!acp && status.compacted ? (
           <span className="chat-folded" title="Messages the model now sees only as a summary">
             {status.compacted} folded
           </span>
         ) : null}
-        <button
-          className="chat-new"
-          onClick={compact}
-          title="Summarise the older part of the conversation for the model. The thread is not changed."
-        >
-          compact
-        </button>
+        {acp ? null : (
+          <button
+            className="chat-new"
+            onClick={compact}
+            title="Summarise the older part of the conversation for the model. The thread is not changed."
+          >
+            compact
+          </button>
+        )}
         <button className="chat-new" onClick={startNew} title="Start a new conversation">
           new
         </button>
@@ -301,6 +459,8 @@ export default function ChatPane({
                 ),
               )}
             </div>
+          ) : g.kind === "permission" ? (
+            <Permission key={g.id} item={g.item} onAnswer={answer} />
           ) : (
             <ToolGroup
               key={g.id}
@@ -324,8 +484,9 @@ export default function ChatPane({
           <div className="chat-cmds">
             {matches.map((c) => (
               <button
-                key={c.name}
+                key={c.typed}
                 className="chat-cmd"
+                title={c.help}
                 onClick={() => setText(c.typed)}
               >
                 <span className="chat-cmd-name">{c.typed}</span>
@@ -418,6 +579,68 @@ function Thumb({
 
 /** A round of tool calls as one line, with the images it produced kept out of
  * the fold. */
+/** The agent is blocked, asking whether it may do something.
+ *
+ * The buttons are the agent's own options, in its own words and its own order.
+ * Nothing is relabelled and nothing is added: it decides what "allow always"
+ * scopes to, and a pane that renamed the choices would be answering a different
+ * question from the one it was asked.
+ *
+ * Answered, it stays in the thread showing what was chosen. A question that
+ * vanishes leaves the reader unable to say later what they agreed to -- which
+ * is exactly the record worth keeping about an agent with its own shell.
+ */
+function Permission({
+  item,
+  onAnswer,
+}: {
+  item: PermissionItem;
+  onAnswer: (item: PermissionItem, optionId: string | null) => void;
+}) {
+  const chosen = item.outcome
+    ? item.options.find((o) => o.id === item.outcome)
+    : undefined;
+  return (
+    <div className={"chat-ask" + (item.outcome ? " done" : "")}>
+      <div className="chat-ask-title">
+        {item.toolKind ? (
+          <span className="chat-ask-kind">{item.toolKind}</span>
+        ) : null}
+        {item.title}
+      </div>
+      {item.outcome ? (
+        <div className="chat-ask-outcome">
+          {item.outcome === "cancelled" ? "refused" : (chosen?.name ?? item.outcome)}
+        </div>
+      ) : (
+        <div className="chat-ask-options">
+          {item.options.map((o) => (
+            <button
+              key={o.id}
+              className={
+                "chat-ask-btn" +
+                (o.kind.startsWith("allow") ? " allow" : " reject")
+              }
+              onClick={() => onAnswer(item, o.id)}
+            >
+              {o.name}
+            </button>
+          ))}
+          {/* Escape does this too; the button is here because a question with
+              no visible way out reads as a trap. */}
+          <button
+            className="chat-ask-btn reject"
+            onClick={() => onAnswer(item, null)}
+            title="Refuse without choosing (Esc)"
+          >
+            dismiss
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ToolGroup({
   calls,
   images,
@@ -480,6 +703,42 @@ function ToolGroup({
 }
 
 const CHAT_CSS = `
+  /* The pane is dark and hard-coded; color-scheme is what makes the browser
+     draw the *native* dropdown to match, since the option list is system chrome
+     and takes none of the select's own colours. The explicit option rule is the
+     fallback for browsers that ignore it -- without both, "transparent" plus an
+     inherited light colour renders white on white and the menu is unreadable. */
+  .chat-engine { font: inherit; font-size: 11px; color-scheme: dark;
+                 background: #181818; color: #999; cursor: pointer;
+                 border: 1px solid #333; border-radius: 4px; padding: 0 4px; }
+  .chat-engine:hover { background: #222; color: #ccc; }
+  .chat-engine option { background: #181818; color: #ccc; }
+
+  .chat-ask {
+    margin: 6px 0;
+    padding: 8px 10px;
+    border: 1px solid var(--warn, #b58900);
+    border-radius: 6px;
+    background: rgba(181, 137, 0, 0.08);
+    font-size: 12px;
+  }
+  .chat-ask.done { opacity: 0.6; border-style: dashed; }
+  .chat-ask-title { font-weight: 600; margin-bottom: 6px; word-break: break-word; }
+  .chat-ask-kind { font-weight: 400; opacity: 0.7; margin-right: 6px;
+                   font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  .chat-ask-options { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chat-ask-btn {
+    padding: 3px 8px;
+    border-radius: 4px;
+    border: 1px solid currentColor;
+    background: transparent;
+    cursor: pointer;
+    font: inherit;
+  }
+  .chat-ask-btn.allow { color: var(--ok, #2a7); }
+  .chat-ask-btn.reject { color: var(--muted, #888); }
+  .chat-ask-outcome { font-style: italic; }
+
   .chat { display: flex; flex-direction: column; min-height: 0;
           border: 1px solid #333; border-radius: 5px; background: #161616; }
   .chat-head { display: flex; align-items: baseline; gap: 10px; padding: 8px 12px;
@@ -560,7 +819,12 @@ const CHAT_CSS = `
   .chat-cmd-name { color: #7e7; font-family: ui-monospace, Menlo, monospace; }
   .chat-cmd-alias { color: #666; font-family: ui-monospace, Menlo, monospace;
                     font-size: 11px; }
-  .chat-cmd-help { color: #777; margin-left: auto; }
+  /* Ellipsised, not wrapped: an agent's description can be a paragraph, and a
+     completion list whose rows grow to fit one is unreadable. min-width:0 is
+     what lets a flex child shrink below its content and actually clip. */
+  .chat-cmd-help { color: #777; margin-left: auto; min-width: 0;
+                   white-space: nowrap; overflow: hidden;
+                   text-overflow: ellipsis; }
   /* No margin-left:auto here -- .chat-model already has one, and a second
      would share the free space between them instead of pinning both right. */
   .chat-new { font-size: 11px; padding: 1px 8px;

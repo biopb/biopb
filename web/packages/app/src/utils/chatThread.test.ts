@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   applyLiveOutput,
+  fromAcpItems,
   fromChatHistory,
   groupThread,
   latestLine,
+  mergeAcpItems,
   mergeHistory,
+  openPermission,
   toolText,
+  type AcpItem,
   type ChatMessage,
+  type PermissionItem,
   type ToolCallItem,
 } from "./chatThread";
 
@@ -433,5 +438,131 @@ describe("latestLine", () => {
   it("has nothing to say about no output", () => {
     expect(latestLine("")).toBe("");
     expect(latestLine("\n\n")).toBe("");
+  });
+});
+
+const acpItem = (over: Partial<AcpItem> = {}): AcpItem => ({
+  id: "i-1",
+  kind: "tool_call",
+  rev: 1,
+  title: "biopb_execute_code",
+  status: "pending",
+  blocks: [],
+  ...over,
+});
+
+describe("mergeAcpItems", () => {
+  it("replaces an item the page names again", () => {
+    // The whole reason this is not `mergeHistory`: a repeated id is a tool call
+    // that changed, not an overlap between two polls to be deduplicated away.
+    const before = [acpItem()];
+    const after = mergeAcpItems(before, [acpItem({ status: "completed" })]);
+    expect(after).toHaveLength(1);
+    expect(after[0]!.status).toBe("completed");
+  });
+
+  it("appends one it has not seen", () => {
+    const after = mergeAcpItems([acpItem()], [acpItem({ id: "i-2" })]);
+    expect(after.map((i) => i.id)).toEqual(["i-1", "i-2"]);
+  });
+
+  it("keeps the position of an item it replaces", () => {
+    // Otherwise a tool call jumps to the bottom of the thread the moment it
+    // finishes, reordering the conversation around the reader.
+    const before = [acpItem(), acpItem({ id: "i-2", kind: "message" })];
+    const after = mergeAcpItems(before, [acpItem({ status: "completed" })]);
+    expect(after.map((i) => i.id)).toEqual(["i-1", "i-2"]);
+  });
+
+  it("takes a full page whole, including an empty one", () => {
+    // An empty full page is a reset seen from a window that did not ask for one.
+    expect(mergeAcpItems([acpItem()], [], true)).toEqual([]);
+  });
+
+  it("keeps what it has when a delta is empty", () => {
+    expect(mergeAcpItems([acpItem()], [])).toHaveLength(1);
+  });
+});
+
+describe("fromAcpItems", () => {
+  it("renders a message with its blocks", () => {
+    const items = fromAcpItems([
+      acpItem({
+        kind: "message",
+        role: "assistant",
+        blocks: [{ type: "text", text: "hello" }],
+      }),
+    ]);
+    expect(items[0]).toMatchObject({ kind: "message", role: "assistant" });
+  });
+
+  it("fails a call the agent never finished once the turn is over", () => {
+    // The agent is not obliged to close every call it opened -- a cancelled
+    // turn leaves them open -- so nothing else stops the spinner.
+    const [item] = fromAcpItems([acpItem({ status: "in_progress" })], false);
+    expect((item as ToolCallItem).status).toBe("failed");
+  });
+
+  it("leaves it running while the turn is", () => {
+    const [item] = fromAcpItems([acpItem({ status: "in_progress" })], true);
+    expect((item as ToolCallItem).status).toBe("in_progress");
+  });
+
+  it("carries a permission question and its options", () => {
+    const [item] = fromAcpItems([
+      acpItem({
+        kind: "permission",
+        title: "run rm -rf /",
+        request_id: "p-1",
+        options: [{ id: "yes", name: "Allow", kind: "allow_once" }],
+        outcome: null,
+      }),
+    ]);
+    expect(item).toMatchObject({
+      kind: "permission",
+      requestId: "p-1",
+      outcome: null,
+    });
+  });
+});
+
+describe("openPermission", () => {
+  const ask = (over: Partial<PermissionItem> = {}): PermissionItem => ({
+    kind: "permission",
+    id: "i-1",
+    title: "x",
+    toolKind: "edit",
+    options: [],
+    requestId: "p-1",
+    outcome: null,
+    ...over,
+  });
+
+  it("finds the question still waiting", () => {
+    expect(openPermission([ask()])?.requestId).toBe("p-1");
+  });
+
+  it("ignores one that was already answered", () => {
+    expect(openPermission([ask({ outcome: "yes" })])).toBeNull();
+  });
+
+  it("takes the newest when a stale page shows two", () => {
+    const items = [ask(), ask({ id: "i-2", requestId: "p-2" })];
+    expect(openPermission(items)?.requestId).toBe("p-2");
+  });
+});
+
+describe("groupThread with a question in it", () => {
+  it("never folds it into the surrounding tool calls", () => {
+    // It arrives among them, and a question inside a collapsed round is a
+    // question nobody answers.
+    const groups = groupThread(
+      fromAcpItems([
+        acpItem(),
+        acpItem({ id: "i-2", kind: "permission", request_id: "p-1" }),
+        acpItem({ id: "i-3" }),
+      ]),
+    );
+    expect(groups.map((g) => g.kind)).toEqual(["tools", "permission", "tools"]);
   });
 });

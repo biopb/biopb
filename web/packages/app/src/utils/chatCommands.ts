@@ -13,6 +13,7 @@
 // so the sentence a mistyped command produces is pinned by a test instead of
 // living in a JSX branch nothing reaches.
 
+import type { AgentCommand, ChatEngine, ContextUsage } from "./chatClient";
 import type { ChatMessage } from "./chatThread";
 
 export type CommandName = "new" | "compact" | "context";
@@ -23,8 +24,10 @@ export interface CommandSpec {
   typed: string;
   /** Other spellings that mean the same thing. */
   aliases: string[];
+  /** One line, for the completion row. */
   help: string;
 }
+
 
 export const COMMANDS: CommandSpec[] = [
   {
@@ -50,11 +53,65 @@ export const COMMANDS: CommandSpec[] = [
 ];
 
 export type Parsed =
-  /** Not a command. Send it. */
+  /** Not a command, or one only the agent knows. Send it. */
   | { kind: "send"; text: string }
   | { kind: "command"; name: CommandName }
   /** Meant as a command and is not one; *message* is what to show. */
   | { kind: "reject"; message: string };
+
+/** The local commands under *engine*.
+ *
+ * Under ACP the set shrinks to `/new`. `/compact` and `/context` act on the
+ * built-in loop's projection of the thread -- the summary it stands behind, and
+ * a count of what it is about to send. A hosted harness manages its own context
+ * and never shows us its budget, so both would be answering about a thread
+ * nobody reads. `/new` survives because clearing the conversation is still
+ * something biopb does: it ends the agent's session as well as the transcript.
+ */
+export function localCommands(engine: ChatEngine): CommandSpec[] {
+  if (engine !== "acp") return COMMANDS;
+  // `/compact` goes: it folds the built-in loop's projection of the thread, and
+  // a hosted harness reads its own context, not ours. There is no ACP method
+  // for compaction either -- it is a command an agent advertises or does not,
+  // and if one ever does, `parseCommand` already sends it through.
+  //
+  // `/context` stays. The question it answers -- how full is this -- is still
+  // the user's to ask, and under this engine the answer is *better*: the agent
+  // reports `used`/`size` itself (ACP `usage_update`), where the built-in loop
+  // could only estimate from characters the pane happened to be holding.
+  return COMMANDS.filter((c) => c.name === "new" || c.name === "context");
+}
+
+/** What `/context` answers under the ACP engine.
+ *
+ * From the agent's own accounting rather than a count of what the pane holds.
+ * It also has to say what to do about a full context, and the honest answer is
+ * not `/compact`: the harness compacts on its own terms, and the only lever
+ * biopb has is starting over.
+ */
+export function acpContextReport(
+  usage: ContextUsage | null,
+  agent: string,
+): string {
+  if (!usage || usage.used === null) {
+    return `${agent || "The agent"} has not reported its context use yet — ask it something first.`;
+  }
+  const used = usage.used.toLocaleString();
+  const lines = [
+    usage.size
+      ? `${used} of ${usage.size.toLocaleString()} tokens (${Math.round(
+          (usage.used / usage.size) * 100,
+        )}%)`
+      : `${used} tokens`,
+  ];
+  // Only when the agent priced it. Zero is a real answer -- a subscription
+  // model reports it -- and hiding a genuine zero would read as "not measured".
+  if (usage.cost !== null) lines.push(`$${usage.cost.toFixed(4)} this session`);
+  lines.push(
+    `${agent || "The agent"} manages its own context; /new starts a fresh one.`,
+  );
+  return lines.join("\n");
+}
 
 /** A bare `/word`, which is the only thing treated as a command attempt.
  *
@@ -65,31 +122,62 @@ export type Parsed =
  * else is claimed. */
 const COMMANDISH = /^\/[a-zA-Z]+$/;
 
-const listing = () =>
-  COMMANDS.map((c) =>
-    c.aliases.length ? `${c.typed} (or ${c.aliases.join(", ")})` : c.typed,
-  ).join(", ");
+const listing = (specs: CommandSpec[], agent: AgentCommand[]) =>
+  specs
+    .map((c) =>
+      c.aliases.length ? `${c.typed} (or ${c.aliases.join(", ")})` : c.typed,
+    )
+    .concat(agent.map((c) => "/" + c.name))
+    .join(", ");
 
-function lookup(token: string): CommandSpec | undefined {
+function lookup(token: string, specs: CommandSpec[]): CommandSpec | undefined {
   const t = token.toLowerCase();
-  return COMMANDS.find((c) => c.typed === t || c.aliases.includes(t));
+  return specs.find((c) => c.typed === t || c.aliases.includes(t));
 }
 
-/** What pressing Enter on *input* should do. */
-export function parseCommand(input: string): Parsed {
+/**
+ * What pressing Enter on *input* should do.
+ *
+ * Two namespaces meet here. The local commands act on this pane and are handled
+ * without a round trip; *agent* holds what a hosted harness advertised, which
+ * biopb neither defines nor runs -- ACP has no method for invoking one, so the
+ * command goes to the agent as ordinary prompt text and the agent parses its own
+ * prefix. Local wins a collision, and there are only ever a couple of local
+ * names to collide with.
+ *
+ * What survives from the closed set is the rejection. A name in neither
+ * namespace is still refused rather than sent, because that is what keeps
+ * `/data/run3/stack.tif is the one I mean` prose and stops a typo'd `/conect`
+ * from becoming a prompt nobody meant to write.
+ */
+export function parseCommand(
+  input: string,
+  engine: ChatEngine = "builtin",
+  agent: AgentCommand[] = [],
+): Parsed {
   const text = input.trim();
   const [first, ...rest] = text.split(/\s+/);
   if (!first || !COMMANDISH.test(first)) return { kind: "send", text };
-  const spec = lookup(first);
+  const specs = localCommands(engine);
+  // Only a hosted harness has commands of its own, and only it can parse one.
+  // Gated here rather than left to the caller to pass nothing, so the answer
+  // does not depend on a list happening to be empty.
+  if (engine !== "acp") agent = [];
+  const spec = lookup(first, specs);
   if (!spec) {
+    if (agent.some((c) => "/" + c.name.toLowerCase() === first.toLowerCase())) {
+      // The agent's to interpret, arguments and all: its `input.hint` exists
+      // precisely because these take them.
+      return { kind: "send", text };
+    }
     return {
       kind: "reject",
-      message: `Unknown command ${first}. Available: ${listing()}.`,
+      message: `Unknown command ${first}. Available: ${listing(specs, agent)}.`,
     };
   }
-  // Rejected rather than ignored. None of these take an argument, and quietly
-  // dropping the rest of the line is how `/compact keep the segmentation notes`
-  // becomes a compaction that did not keep them.
+  // Rejected rather than ignored. None of the *local* ones take an argument, and
+  // quietly dropping the rest of the line is how `/compact keep the segmentation
+  // notes` becomes a compaction that did not keep them.
   if (rest.length) {
     return { kind: "reject", message: `${spec.typed} takes no arguments.` };
   }
@@ -107,13 +195,27 @@ export function parseCommand(input: string): Parsed {
  * goes on treating it as text. */
 const PARTIAL = /^\/[a-zA-Z]*$/;
 
-export function matchCommands(input: string): CommandSpec[] {
+export function matchCommands(
+  input: string,
+  engine: ChatEngine = "builtin",
+): CommandSpec[] {
   const text = input.trim();
   if (!PARTIAL.test(text)) return [];
   const t = text.toLowerCase();
-  return COMMANDS.filter(
-    (c) =>
-      c.typed.startsWith(t) || c.aliases.some((a) => a.startsWith(t)),
+  // Local commands only. The agent's own are *accepted* -- `parseCommand` sends
+  // an advertised name straight through -- but not offered, because offering
+  // one is a promise the pane cannot keep: biopb gives the harness an empty,
+  // throwaway working directory, and a coding agent's commands are about a
+  // project. opencode's three are the illustration: `/review` has no repo to
+  // review, `/init` writes an AGENTS.md that dies with the temp dir, and
+  // `/customize-opencode` edits config that biopb pins or that the temp dir
+  // takes with it. Listing them would advertise three no-ops.
+  //
+  // Worth revisiting if the harness is ever given a real, persistent workspace;
+  // at that point they would start meaning something and listing them would be
+  // honest.
+  return localCommands(engine).filter(
+    (c) => c.typed.startsWith(t) || c.aliases.some((a) => a.startsWith(t)),
   );
 }
 

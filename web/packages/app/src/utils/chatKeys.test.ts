@@ -69,4 +69,30 @@ describe("escAction", () => {
     expect(escAction(state({ composing: true, busy: true }))).toBe("none");
     expect(escAction(state({ composing: true, imageOpen: true }))).toBe("none");
   });
+
+  it("refuses the agent's question before cancelling the turn", () => {
+    // Dismiss-innermost, and the kinder reading of the key: refusing one action
+    // is not the same as throwing away the turn that led to it.
+    expect(escAction(state({ permissionOpen: true, busy: true }))).toBe(
+      "refuse-permission",
+    );
+  });
+
+  it("still gives the image overlay and the IME precedence over it", () => {
+    expect(escAction(state({ permissionOpen: true, imageOpen: true }))).toBe(
+      "close-image",
+    );
+    expect(escAction(state({ permissionOpen: true, composing: true }))).toBe(
+      "none",
+    );
+  });
+
+  it("answers a question even when no turn is running", () => {
+    // The turn is what is waiting *on* the answer, so a pane that only bound
+    // Escape while busy would leave the question unanswerable exactly when the
+    // agent is blocked on it.
+    expect(escAction(state({ permissionOpen: true, busy: false }))).toBe(
+      "refuse-permission",
+    );
+  });
 });
