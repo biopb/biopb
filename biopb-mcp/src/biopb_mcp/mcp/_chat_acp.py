@@ -605,6 +605,27 @@ async def set_model(value):
     return value
 
 
+async def choose_model(value, config):
+    """Set the model a person just typed, starting the agent if it is not up.
+
+    The agent is otherwise started by the first turn, and before that there is
+    no session -- so no advertised list, so nothing to check a name against.
+    ACP has no session-less way to ask: ``config_options`` rides
+    ``session/new``, ``session/load``, ``session/fork`` and the set call itself,
+    and nothing else. A name accepted unchecked is then applied at spawn, found
+    wanting, and silently replaced by the harness's default, which is a pane
+    that reported a model it is not using.
+
+    So this starts it. Cheap next to the alternative, and it does not take the
+    kernel with it: the one-agent claim is made when a client *runs code*
+    (``_server._presume_claim``, on submit), not when one connects, so a switch
+    back to the built-in loop is still available afterwards.
+    """
+    async with _lock():
+        await ensure_agent(config)
+        return await set_model(value)
+
+
 # --------------------------------------------------------------------------- #
 # Permission questions in flight
 # --------------------------------------------------------------------------- #
@@ -948,9 +969,17 @@ async def _apply_model(session, wanted):
         logger.info("ACP session model set to %s", wanted)
     except ValueError as exc:
         # A typo in the config file is not worth refusing to open the pane over:
-        # the session still works, on the harness's default, and the pane names
-        # which model that is.
+        # the session still works, on the harness's default. But it is worth
+        # *saying* -- the only other sign is the model name in the header
+        # quietly becoming one the user did not choose, which reads as the pane
+        # being wrong rather than as a setting being.
         logger.warning("%s; using its default", exc)
+        running = _model_current or "its default"
+        note_error(
+            f"chat.acp_model is {wanted!r}, which {_agent_name or 'the agent'} "
+            f"does not offer. Answering as {running} instead — "
+            "/model lists what it does offer."
+        )
     except Exception as exc:  # noqa: BLE001 - a default model still works
         logger.warning("could not set the ACP model to %r: %s", wanted, exc)
 

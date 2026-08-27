@@ -450,20 +450,42 @@ class TestHttpSurface:
             "model": "test-model",
         }
 
-    def test_a_model_chosen_before_the_agent_starts_is_what_it_starts_on(
-        self, acp_client
+    def test_choosing_a_model_starts_the_agent_to_check_it(
+        self, acp_client, monkeypatch
     ):
-        """The harness spawns on the first turn, so `/model` before then has no
-        session to set. Written to the config it spawns from instead, which is
-        also where a `/new` respawn reads it back."""
+        """Only a running session can say which models exist, so a name taken
+        before one is a name nobody checked -- and the check that does happen,
+        at spawn, only falls back to the default and logs it."""
+        called = []
+
+        async def choose(value, config):
+            called.append(value)
+
+        monkeypatch.setattr(_chat_acp, "choose_model", choose)
         r = self.post(acp_client, "/chat/model", {"model": "openai/gpt-5.5"})
         assert r.status_code == 200
-        body = acp_client.get("/api/chat/models").json()
-        assert body == {
-            "engine": "acp",
-            "model": "openai/gpt-5.5",
-            "choices": [],
-        }
+        assert called == ["openai/gpt-5.5"]
+        # Written to the config as well, so a `/new` respawn comes back on it.
+        assert acp_client.get("/api/chat/models").json()["model"] == "openai/gpt-5.5"
+
+    def test_a_name_the_agent_does_not_offer_is_refused_when_it_is_typed(
+        self, acp_client, monkeypatch
+    ):
+        """The case this exists for: `gpt-5.6-luna` when opencode offers
+        `openai/gpt-5.6-luna`. Answered at the keystroke, with the names."""
+
+        async def choose(value, config):
+            raise ValueError(
+                "opencode does not offer 'gpt-5.6-luna'. "
+                "Offered: openai/gpt-5.5, openai/gpt-5.6-luna"
+            )
+
+        monkeypatch.setattr(_chat_acp, "choose_model", choose)
+        r = self.post(acp_client, "/chat/model", {"model": "gpt-5.6-luna"})
+        assert r.status_code == 400
+        assert "openai/gpt-5.6-luna" in r.json()["error"]
+        # And not written: a refused name must not become what a respawn uses.
+        assert acp_client.get("/api/chat/models").json()["model"] == ""
 
     def test_an_unknown_engine_is_refused(self, acp_client):
         assert (
@@ -632,6 +654,35 @@ class TestModelSelection:
         asyncio.run(_chat_acp._apply_model(self.Session([]), ""))
         asyncio.run(_chat_acp.set_model("something/only-it-knows"))
         assert conn.calls[0]["value"] == "something/only-it-knows"
+
+    def test_choosing_starts_the_agent_before_it_checks(self, conn, monkeypatch):
+        """`/model` before the first turn has no session, and ACP has no
+        session-less way to ask what exists."""
+        started = []
+
+        async def ensure(config):
+            started.append(True)
+            _chat_acp._note_config_options(self.session().config_options)
+
+        monkeypatch.setattr(_chat_acp, "ensure_agent", ensure)
+        asyncio.run(_chat_acp.choose_model("openai/gpt-5.5", {}))
+        assert started == [True]
+        assert conn.calls[0]["value"] == "openai/gpt-5.5"
+
+    def test_a_model_the_config_named_wrongly_is_said_out_loud(self, conn):
+        """The only other sign is the header quietly naming a model the user did
+        not choose, which reads as the pane being wrong rather than the config."""
+        before = _chat_acp.revision()
+        asyncio.run(
+            _chat_acp._apply_model(
+                self.session(current="openai/gpt-5.5"), "gpt-5.5-typo"
+            )
+        )
+        items, _ = _chat_acp.history(before)
+        assert len(items) == 1
+        text = items[0]["blocks"][0]["text"]
+        assert "gpt-5.5-typo" in text and "openai/gpt-5.5" in text
+        assert items[0]["error"] is True
 
     def test_the_model_does_not_outlive_the_session(self, conn):
         """A name left behind after the harness dies is a model nothing runs."""

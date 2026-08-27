@@ -220,10 +220,27 @@ rather than after it.
   provider calls, and switching between them answers half a round in one voice
   and half in another. Not persisted, for the reason the engine is not.
 
-  The list comes from the harness (`config_options`, groups flattened), never
-  from a catalogue of our own — biopb would be wrong about it within a month.
-  The built-in loop has no list at all and the report says so rather than
-  implying the model in force is the only one.
+  The list is never ours to keep. The harness states its own in
+  `config_options`, groups flattened; the built-in loop reads the provider's
+  `GET {base_url}/models`, which is optional in the OpenAI-compatible shape, so
+  a provider that does not answer it is reported as publishing no list rather
+  than as having one model.
+
+  **The two are not symmetric, and the write path is shaped by it.** ACP has no
+  session-less way to ask what exists: `config_options` rides `session/new`,
+  `session/load`, `session/fork` and the set call itself, and nothing else. So
+  `POST /chat/model` *starts the agent* under this engine before it validates.
+  Without that, a name typed before the first turn is a name nobody checked —
+  it is checked at spawn, found wanting, and silently replaced by the harness's
+  default, leaving the pane naming a model it is not using. (Observed:
+  `gpt-5.6-luna` accepted, where opencode offers `openai/gpt-5.6-luna`.)
+  Starting the agent does not cost the engine switch: the one-agent claim is
+  taken when a client *runs code*, not when one connects.
+
+  The spawn-time fallback that remains — a bad `chat.acp_model` in the config
+  file, which no keystroke can intercept — now lands in the thread as well as
+  the log. The only other sign was the header quietly naming a model the user
+  did not choose.
 - **Threads move the pipes.** The harness is a plain `Popen` behind an
   `acp.Transport`, not `asyncio.create_subprocess_exec`: on Windows this server
   runs on the Selector loop, which implements neither subprocesses nor pipes.

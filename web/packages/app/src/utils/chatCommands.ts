@@ -143,11 +143,11 @@ export function acpContextReport(
 
 /** What a bare `/model` answers: what is answering, and what else could.
  *
- * The list is the harness's own -- biopb does not keep a catalogue of models
- * and would be wrong about it within a month. Under the built-in loop there is
- * no list at all, and the report says so rather than implying the model in
- * force is the only one: an OpenAI-compatible endpoint takes whatever id its
- * provider knows, and which ids those are is not ours to state.
+ * The list is never ours: the harness states its own, and an OpenAI-compatible
+ * provider publishes `GET /models`. Empty means different things on the two
+ * sides, so the report says which -- a harness lists its models only once it is
+ * running, while a provider that answers nothing simply does not publish a
+ * catalogue. Neither is "there is one model".
  */
 export function modelReport(
   current: string,
@@ -163,9 +163,11 @@ export function modelReport(
       lines.push(`...and ${names.length - shown.length} more.`);
     }
   } else if (engine === "acp") {
-    lines.push("This agent does not say which models it offers.");
+    // Almost always "not started yet": the agent states its models when a
+    // session opens, and biopb does not open one until it is needed.
+    lines.push("No list yet — the agent states its models once it is running.");
   } else {
-    lines.push("Any id your provider knows; biopb does not keep a list.");
+    lines.push("This provider publishes no list; any id it knows will do.");
   }
   lines.push("/model <name> switches, and keeps the conversation.");
   return lines.join("\n");

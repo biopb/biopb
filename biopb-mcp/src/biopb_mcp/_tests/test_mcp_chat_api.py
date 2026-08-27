@@ -116,14 +116,28 @@ class TestEngineRead:
 
 
 class TestModelRoute:
-    def test_the_built_in_loop_offers_no_list_and_says_which_model(self, client):
-        # No list is the honest answer, not a degraded one: an
-        # OpenAI-compatible endpoint takes whatever id its provider knows.
+    def test_the_built_in_loop_lists_what_the_provider_publishes(
+        self, client, monkeypatch
+    ):
+        async def listed(config):
+            return [{"value": "deepseek-v4-flash", "name": "deepseek-v4-flash"}]
+
+        monkeypatch.setattr(_model, "list_models", listed)
         assert client.get("/api/chat/models").json() == {
             "engine": "builtin",
             "model": "test-model",
-            "choices": [],
+            "choices": [{"value": "deepseek-v4-flash", "name": "deepseek-v4-flash"}],
         }
+
+    def test_a_provider_with_no_catalogue_is_not_an_error(self, client, monkeypatch):
+        # `GET /models` is optional in the OpenAI-compatible shape; an endpoint
+        # that does not answer it still serves completions.
+        async def listed(config):
+            return []
+
+        monkeypatch.setattr(_model, "list_models", listed)
+        body = client.get("/api/chat/models").json()
+        assert body["choices"] == [] and body["model"] == "test-model"
 
     def test_a_switch_takes_effect_without_a_restart(self, client, configured):
         r = client.post(
@@ -646,3 +660,79 @@ class TestPartialOutput:
         _running(monkeypatch, "job-1")
         _chat_api._note_progress("noisy output\n")
         assert _chat.history() == []
+
+
+class TestProviderModelList:
+    """``GET {base_url}/models`` -- the OpenAI-compatible catalogue."""
+
+    class Reply:
+        def __init__(self, status, body):
+            self.status_code = status
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def client_answering(self, reply):
+        class Client:
+            def __init__(self, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, headers=None):
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+
+        return Client
+
+    def read(self, monkeypatch, reply, cfg=None):
+        monkeypatch.setattr(_model.httpx, "AsyncClient", self.client_answering(reply))
+        return asyncio.run(_model.list_models(cfg or {"chat": {}}))
+
+    def test_it_takes_the_ids_in_the_provider_s_own_order(
+        self, monkeypatch, configured
+    ):
+        # Their curation: sorting it alphabetically buries the model they put
+        # first.
+        body = {"data": [{"id": "glm-5.3"}, {"id": "deepseek-v4-flash"}]}
+        assert self.read(monkeypatch, self.Reply(200, body), configured) == [
+            {"value": "glm-5.3", "name": "glm-5.3"},
+            {"value": "deepseek-v4-flash", "name": "deepseek-v4-flash"},
+        ]
+
+    def test_an_entry_with_no_id_is_dropped(self, monkeypatch, configured):
+        body = {"data": [{"object": "model"}, "junk", {"id": "ok"}]}
+        assert self.read(monkeypatch, self.Reply(200, body), configured) == [
+            {"value": "ok", "name": "ok"}
+        ]
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            Reply(404, {}),
+            Reply(401, {}),
+            RuntimeError("connection refused"),
+        ],
+    )
+    def test_a_provider_that_will_not_say_is_an_empty_list_not_a_failure(
+        self, monkeypatch, configured, reply
+    ):
+        # The caller's job is to offer names it is sure of, not to make the
+        # absence of a catalogue into the user's problem.
+        assert self.read(monkeypatch, reply, configured) == []
+
+    def test_it_does_not_call_out_with_no_key(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv("BIOPB_CHAT_API_KEY", raising=False)
+
+        def explode(**kw):
+            raise AssertionError("asked the provider without a key")
+
+        monkeypatch.setattr(_model.httpx, "AsyncClient", explode)
+        assert asyncio.run(_model.list_models({"chat": {}})) == []

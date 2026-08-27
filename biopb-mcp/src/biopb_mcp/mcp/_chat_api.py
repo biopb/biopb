@@ -208,10 +208,12 @@ async def _api_chat_models(request):
     the session does, and it is long enough that carrying it on every poll would
     be paying for it a hundred times to read it once.
 
-    ``choices`` is empty under the built-in loop, and that is not a degraded
-    answer -- an OpenAI-compatible endpoint has no model list we could trust, so
-    the honest report is the model in force and an invitation to name another.
-    The pane says which of the two it is by whether the list is empty.
+    Two sources, because the two engines answer it differently. The harness
+    states its models in ``config_options``, which rides a session and so is
+    known only once it is running. An OpenAI-compatible endpoint publishes
+    ``GET /models``, which needs nothing running -- though it is an optional
+    route, so an empty list there means "this provider does not say", never
+    "this provider has one model".
     """
     if _acp():
         return JSONResponse(
@@ -226,7 +228,7 @@ async def _api_chat_models(request):
         {
             "engine": "builtin",
             "model": get_setting(_config, "chat.model"),
-            "choices": [],
+            "choices": await _model.list_models(_config),
         }
     )
 
@@ -260,11 +262,13 @@ async def _chat_model(request):
             status_code=409,
         )
     key = "acp_model" if _acp() else "model"
-    if _acp() and _chat_acp.session_started():
-        # A live session moves without a respawn, which is the point: changing
-        # model should not cost the conversation.
+    if _acp():
+        # Starts the agent if it is not up. Only a running session can say which
+        # models exist, so accepting a name without one is accepting a name
+        # nobody has checked -- and it is checked later, at spawn, where the
+        # only outcome is a silent fall back to the harness's default.
         try:
-            await _chat_acp.set_model(wanted)
+            await _chat_acp.choose_model(wanted, _config)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:  # noqa: BLE001 - the harness's failure to report

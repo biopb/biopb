@@ -288,16 +288,18 @@ describe("modelReport", () => {
     expect(out).toContain("18 more");
   });
 
-  it("does not imply the built-in loop has a list", () => {
-    // An OpenAI-compatible endpoint takes whatever id its provider knows, and
-    // which ids those are is not biopb's to state.
+  it("does not read an unpublished list as a single-model provider", () => {
+    // `GET /models` is optional in the OpenAI-compatible shape: an endpoint
+    // that does not answer it still serves completions.
     const out = modelReport("test-model", [], "builtin");
     expect(out).toContain("test-model");
-    expect(out).toContain("does not keep a list");
+    expect(out).toContain("publishes no list");
   });
 
-  it("says when a harness would not say", () => {
-    expect(modelReport("m", [], "acp")).toContain("does not say");
+  it("says a harness has not listed yet, rather than that it has none", () => {
+    // Empty here is almost always "not started": the agent states its models
+    // when a session opens, and biopb opens one only when it is needed.
+    expect(modelReport("m", [], "acp")).toContain("once it is running");
   });
 
   it("reports an unset model as unset rather than as blank", () => {

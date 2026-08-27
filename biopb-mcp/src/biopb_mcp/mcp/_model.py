@@ -86,6 +86,46 @@ def check_ready(config):
         )
 
 
+#: How long the model list may take. Shorter than ``chat.request_timeout``,
+#: which is sized for a turn: this one is answering a keystroke.
+_LIST_TIMEOUT = 10
+
+
+async def list_models(config):
+    """The provider's own catalogue, or ``[]`` when it does not publish one.
+
+    ``GET {base_url}/models`` is the OpenAI-compatible spelling and most servers
+    implement it, but it is optional -- an endpoint that 404s here still serves
+    completions perfectly well. So every failure is an empty list rather than an
+    error: the caller's job is to offer names it is sure of, not to make the
+    absence of a catalogue into the user's problem.
+
+    The order is the provider's, not ours. It is their curation, and sorting it
+    alphabetically would bury the model they put first.
+    """
+    from .._config import get_setting
+
+    key = api_key(config)
+    if not key:
+        return []
+    url = get_setting(config, "chat.base_url").rstrip("/") + "/models"
+    try:
+        async with httpx.AsyncClient(timeout=_LIST_TIMEOUT) as client:
+            reply = await client.get(url, headers={"Authorization": f"Bearer {key}"})
+        if reply.status_code >= 400:
+            logger.debug("%s answered %s for the model list", url, reply.status_code)
+            return []
+        data = reply.json().get("data") or []
+    except Exception as exc:  # noqa: BLE001 - no list is a usable answer
+        logger.debug("could not read the model list from %s: %s", url, exc)
+        return []
+    return [
+        {"value": m["id"], "name": m["id"]}
+        for m in data
+        if isinstance(m, dict) and m.get("id")
+    ]
+
+
 def make_model(config):
     """Build the async ``(messages, tools) -> assistant message`` the loop takes.
 
