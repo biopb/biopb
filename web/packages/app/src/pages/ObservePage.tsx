@@ -44,9 +44,13 @@ interface JobSummary {
   origin?: string; // mcp | user | chat — which surface submitted the cell
   elapsed: number;
   code_preview?: string;
+  /** Why the cell was run, when whoever ran it said why. Absent on an older
+   * child, and empty for a cell nobody explained (the console's, typically). */
+  intent_preview?: string;
 }
 interface JobDetail {
   code?: string;
+  intent?: string;
   truncated?: boolean;
   stdout_len?: number;
   elapsed?: number;
@@ -634,7 +638,17 @@ export function JobRow({
           <span className="badge you">{writerName(job.origin)}</span>
         ) : null}
         <span className={"badge " + job.status}>{job.status}</span>
-        <span className="preview">{job.code_preview || ""}</span>
+        {/* Why over what: `arr = arr[..., 1]` is a fact about the code, and
+            "isolate the nuclei channel" is a fact about the reader's data. The
+            source is one click away either way, so the row spends its one line
+            on the half that is not already reconstructable from the other. */}
+        {job.intent_preview ? (
+          <span className="intent" title={job.intent_preview}>
+            {job.intent_preview}
+          </span>
+        ) : (
+          <span className="preview">{job.code_preview || ""}</span>
+        )}
         <span className="elapsed">{job.elapsed}s</span>
         {job.status === "running" ? (
           // The whole row toggles the detail, so this has to keep its click:
@@ -655,6 +669,13 @@ export function JobRow({
       <div className="detail">
         {open && detail ? (
           <>
+            {detail.intent ? (
+              // In full here, because the row caps it at one line.
+              <>
+                <div className="label">intent</div>
+                <div className="intent-full">{detail.intent}</div>
+              </>
+            ) : null}
             {detail.code ? (
               <>
                 <div className="label">code</div>
@@ -743,6 +764,9 @@ const OBS_CSS = `
   .obs-page .interrupted { background: #324; color: #c9f; }
   .obs-page .preview { color: #8a8; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .obs-page .intent { color: #bcd; flex: 1; min-width: 0;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .obs-page .intent-full { color: #bcd; }
   .obs-page .elapsed { color: #888; font-size: 12px; margin-left: auto; }
   /* Beside the elapsed time, which margin-left:auto has already pushed to
      the right edge -- so the row reads left to right as what ran, how long it
