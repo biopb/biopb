@@ -24,6 +24,8 @@ import socket
 import sys
 import tempfile
 
+from biopb._locations import MCP_SESSION_LOG_ENV
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,10 +35,12 @@ logger = logging.getLogger(__name__)
 # direct `--transport http` launch (fixed port). Kept in sync with _shim.
 ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
-# Env var the stdio shim sets to the child's own session logfile path, so the
-# child can report it (server_status) and the agent's execute_code can read it
-# from os.environ. Kept in sync with _shim.ENV_SESSION_LOG.
-ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
+# Env var naming this process's own logfile, so it can report it (server_status)
+# and the agent's execute_code can read it from os.environ. Set by whoever
+# redirected our output: the stdio shim for the child it spawns, the control for
+# a viewer it launches. Bound from the core SDK rather than repeated, since it is
+# now three processes across two packages that must agree on one string.
+ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
 
 
 def _report_port(path, port):

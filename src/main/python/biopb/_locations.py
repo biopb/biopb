@@ -62,6 +62,15 @@ logger = logging.getLogger(__name__)
 # of the state tree. BIOPB_STATE_HOME moves everything; this moves only sessions.
 SESSIONS_DIR_ENV = "BIOPB_SESSIONS_DIR"
 
+# Env var naming the file a session's own stdout/stderr went to, so the session
+# can report it (``server_status``) and an agent's ``execute_code`` can read it
+# from ``os.environ``. Set by whoever redirected that output -- the stdio shim
+# for the child it spawns, the control for a viewer it launches -- and read by
+# the session itself. Defined here because that is now three processes across
+# two packages that must agree on one string, and none of them may import the
+# others (control ARCHITECTURE.md, I2).
+MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
+
 
 # --- base trees ---------------------------------------------------------- #
 #
@@ -303,8 +312,8 @@ def mcp_server_log() -> Path:
     return mcp_log_dir() / "mcp-server.log"
 
 
-def mcp_viewer_log() -> Path:
-    """Combined stdout/stderr for a viewer session the **control** launched.
+def mcp_viewer_log_dir() -> Path:
+    """Where a viewer session the **control** launched writes its output.
 
     Control-launched viewers are the one session kind whose output has no other
     home: a shim-owned child logs to the shim's per-session file and a
@@ -312,8 +321,16 @@ def mcp_viewer_log() -> Path:
     spawned from the dashboard has neither. Lives here, in the core SDK, because
     the control may not import biopb-mcp (control ARCHITECTURE.md, I2) and so
     cannot ask it where its logs go.
+
+    **One file per launch**, beside the shim's per-session directory and for the
+    same reason: concurrent viewers sharing one file interleave, and a log whose
+    lines cannot be attributed to a process is not a log you can diagnose a
+    running session from. Retention is the caller's (the control prunes to the
+    newest few, as the shim does).
     """
-    return mcp_log_dir() / "viewer.log"
+    d = mcp_log_dir() / "viewers"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 # --- session registry / pids / sentinels --------------------------------- #

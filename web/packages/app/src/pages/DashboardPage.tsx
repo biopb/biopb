@@ -228,14 +228,19 @@ export default function DashboardPage() {
       );
       const res = await r.json().catch(() => ({}));
       if (res.error) {
+        // The tail is the diagnosis, but it is capped and can be empty (no log
+        // could be opened at all), so name the file either way.
+        const where = res.log_path ? `\n\nFull log: ${res.log_path}` : "";
         setStartMsg({
           err: true,
-          text: res.log ? res.error + "\n\n" + res.log : res.error,
+          text: (res.log ? res.error + "\n\n" + res.log : res.error) + where,
         });
       } else if (res.state === "starting") {
         setStartMsg({
           err: false,
-          text: "Still opening the viewer — it will appear here when it is up.",
+          text:
+            "Still opening the viewer — it will appear here when it is up." +
+            (res.log_path ? `\nLog: ${res.log_path}` : ""),
         });
       } else {
         setStartMsg({ err: false, text: "Viewer session started." });

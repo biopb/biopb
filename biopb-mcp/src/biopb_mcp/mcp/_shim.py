@@ -56,7 +56,7 @@ import threading
 import time
 
 import anyio
-from biopb import _sessions
+from biopb import _locations, _sessions
 from biopb._lifecycle import winjob as _winjob
 from biopb._lifecycle.owned_child import OwnedChild, open_child_log
 from mcp import types
@@ -87,9 +87,11 @@ ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
 # Env var telling the child the path of its own session logfile, so it can report
 # it (server_status) and the agent's execute_code can read it from os.environ.
-# The child inherits it, and so does the kernel it spawns. Kept in sync with
-# __main__.ENV_SESSION_LOG.
-ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
+# The child inherits it, and so does the kernel it spawns. Bound from the core
+# SDK -- unlike the sentinel paths above, this one is not private to biopb-mcp:
+# the control sets it too, for the viewers it launches. `biopb._locations` is
+# stdlib-only, so this stays as featherweight as a literal.
+ENV_SESSION_LOG = _locations.MCP_SESSION_LOG_ENV
 
 
 def _port_listening(port, timeout=0.5):
