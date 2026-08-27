@@ -347,6 +347,23 @@ class TestExecuteCode:
         ]
         assert "foreign_digest('chat')" in snippet
 
+    def test_the_notice_is_not_discharged_until_the_result_is_recorded(self, chat_host):
+        # The ack promises the agent *has been told*, and it has been told when
+        # the result carrying the note is in the thread -- not when the note was
+        # rendered. Acked at entry, a turn cancelled three minutes into a job
+        # had retired a notice nobody ever received, and the digest does not
+        # offer a finished cell twice.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        calls = [c[0][0] for c in chat_host.execute.call_args_list]
+        submitted = next(i for i, c in enumerate(calls) if "_jobs.submit(" in c)
+        acked = next(i for i, c in enumerate(calls) if "ack_foreign_digest(" in c)
+        assert acked > submitted
+
     def test_the_notice_is_discharged_only_once_it_has_been_delivered(self, chat_host):
         chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
         model = _scripted(
@@ -619,6 +636,20 @@ class TestCancel:
         i = next(i for i, m in enumerate(msgs) if m.get("tool_calls"))
         answered = {m["tool_call_id"] for m in msgs[i + 1 :] if m["role"] == "tool"}
         assert answered == {c["id"] for c in msgs[i]["tool_calls"]}
+
+    def test_a_cancelled_turn_leaves_the_activity_notice_pending(
+        self, chat_host, monkeypatch
+    ):
+        # It was written into a result that never reached the thread. Left
+        # un-acked, the digest offers those cells again on the next call: a
+        # repeat, which the note's own wording covers, rather than a cell the
+        # agent is never told about at all.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]}
+        )
+        self._cancel_mid_round(model, monkeypatch)
+        assert chat_host.acked == []
 
     def test_the_thread_is_still_usable_afterwards(self, chat_host, monkeypatch):
         # The reason the invariant above matters. A malformed run is re-sent on
