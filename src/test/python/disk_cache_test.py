@@ -443,3 +443,32 @@ def test_a_disk_hit_is_weak_cached_not_strong_cached(pool, fetch, tmp_path):
     held = call()  # a weak entry only survives while some holder keeps the array
     assert list(tmp_path.rglob(f"*{dc._SUFFIX}"))
     assert pool._view_cache_get(LOC, None, b"cid".hex()) is held
+
+
+# --- the unsafe-directory guard ------------------------------------------- #
+
+
+def test_ram_backed_root_disables_the_cache(tmp_path, caplog, monkeypatch):
+    """tmpfs would make this unevictable RAM plus a mapping that is also RAM --
+    strictly worse than the in-memory LRU it is meant to relieve."""
+    monkeypatch.setattr(
+        dc, "unsafe_cache_dir_reason", lambda _p, **k: "a RAM-backed filesystem (tmpfs)"
+    )
+    with caplog.at_level("WARNING"):
+        s = dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(tmp_path)})
+    assert s is None
+    assert "tmpfs" in caplog.text
+
+
+def test_local_disk_root_is_accepted(tmp_path):
+    assert dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(tmp_path)})
+
+
+def test_guard_asks_for_memory_rejection(tmp_path, monkeypatch):
+    """The SDK has no memory backend to demote to, unlike the server."""
+    seen = {}
+    monkeypatch.setattr(
+        dc, "unsafe_cache_dir_reason", lambda _p, **k: seen.update(k) or None
+    )
+    dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(tmp_path)})
+    assert seen == {"reject_memory": True}

@@ -43,6 +43,7 @@ from typing import List, Optional, Tuple
 import pyarrow as pa
 from dask.utils import parse_bytes
 
+from biopb._fs_detect import unsafe_cache_dir_reason
 from biopb._lifecycle.file_lock import ExclusiveFileLock
 from biopb._locations import cache_dir
 
@@ -149,6 +150,27 @@ def load_settings(env=None) -> Optional[Settings]:
 
     raw_dir = env.get(ENV_DIR)
     root = Path(raw_dir) if raw_dir and raw_dir.strip() else cache_dir() / "chunks"
+
+    # Refuse storage that would make this cache a liability rather than a win.
+    # RAM-backed (tmpfs) is the trap worth naming: it turns "unbounded disk" into
+    # unevictable RAM plus a mapping that is also RAM -- strictly worse than the
+    # in-memory LRU this is meant to relieve, and invisible unless we say so.
+    # Network and cloud-synced dirs break the mmap semantics the read path needs
+    # (an unlinked-but-mapped inode, a page that never vanishes under the reader)
+    # and stall on dehydrated-file recall.
+    #
+    # Loud, not silent: the user asked for this cache by setting a budget, so a
+    # refusal has to say why. Disabling degrades to the in-memory fallback, which
+    # is the designed floor for every other disk-cache failure too.
+    reason = unsafe_cache_dir_reason(root, reject_memory=True)
+    if reason:
+        logger.warning(
+            "Chunk cache disabled: %s is %s. Set %s to a directory on local disk.",
+            root,
+            reason,
+            ENV_DIR,
+        )
+        return None
 
     return Settings(
         root=root,

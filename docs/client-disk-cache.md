@@ -108,9 +108,17 @@ why: the other three hold kilobytes, while this one is sized for tens of GB,
 which is exactly what `%LOCALAPPDATA%` exists to keep out of roaming profiles and
 Folder Redirection. `BIOPB_CHUNK_CACHE_DIR` relocates it.
 
-Still outstanding: demoting or refusing a `tmpfs` or network directory the way
-the server already demotes a network `cache_dir` to its memory backend
-(biopb/biopb#571). See *Open questions*.
+A root on `tmpfs`, a network mount, or a cloud-synced folder is **refused**:
+`load_settings` returns None with a warning naming the reason, and the read path
+degrades to the in-memory fallback like any other disk-cache failure. The
+classification is `biopb._fs_detect` — the same probe the server uses to demote a
+bad `cache_dir` to its memory backend (biopb/biopb#571), moved down into the core
+SDK so both tenants share one parser instead of the SDK growing a second.
+
+RAM-backed rejection is opt-in there (`reject_memory=True`) because the two
+tenants genuinely disagree: the server's answer to an unusable `cache_dir` *is*
+its memory backend, so demoting a `tmpfs` dir would trade RAM for the same RAM.
+This cache has no such fallback and exists precisely to keep bytes out of RAM.
 
 ## Eviction
 
@@ -295,11 +303,6 @@ plainly at the config surface.
 
 ## Not yet done
 
-- **The `tmpfs` / network-filesystem guard.** `biopb_tensor_server.core.fs_detect`
-  already does exactly this classification, stdlib-only and metadata-only, but the
-  SDK cannot import the server. Moving `fs_detect` down into core `biopb` (the
-  same reasoning that put `file_lock` and `_config_*` there) and adding a memory-fs
-  check beside its network/cloud one is the fix.
 - **Config surface.** Environment variables only so far; nothing plumbs this
   through biopb-mcp's `dask.*` config the way `cache_budget` is plumbed.
 
