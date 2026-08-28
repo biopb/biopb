@@ -1232,6 +1232,15 @@ def server_status() -> str:
     else:
         lines.append("  status: not running (observe.enabled off or failed to start)")
     lines.append("")
+
+    # Where a skill the agent writes has to land. Server-process state (the
+    # catalog is scanned here, not in the kernel), and the path is configurable,
+    # so a hard-coded ~/.config/biopb/skills in a skill body can be wrong.
+    if _skills_enabled:
+        lines.append("## Skills")
+        lines.append(_skills.local_dir_status())
+        lines.append("")
+
     lines.append("## Kernel")
 
     if host is None:

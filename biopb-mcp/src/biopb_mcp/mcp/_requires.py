@@ -116,7 +116,8 @@ def plugin_status_lines() -> list[str]:
     """The body of the ``## Kernel plugins`` section of ``server_status``.
 
     Formatted here rather than in the status snippet so it is unit-testable
-    without a kernel. A skill's ``plugin:<name>`` matches a name on either line;
+    without a kernel. A skill's ``plugin:<name>`` matches a name on either of the
+    two name lines (``dir:`` is not one of them);
     they are printed apart so the "not listed → it failed to load" reading is
     only offered where it holds. Both lines print unconditionally, so a name
     absent from the report is absent because it did not load -- not because the
@@ -125,12 +126,21 @@ def plugin_status_lines() -> list[str]:
     if not _PLUGINS_ENABLED:
         return ["  (disabled — services.namespace_enabled)"]
     lines = []
+    # The dir is a default, not a constant (the config-tree env vars move it), and
+    # it is resolved in *this* interpreter -- the one that loads the plugins. An
+    # agent dropping a plugin file has nowhere else to read the real path.
+    try:
+        from biopb._locations import mcp_plugin_dir
+
+        lines.append("  dir: " + str(mcp_plugin_dir()))
+    except Exception:
+        lines.append("  dir: (unresolvable — biopb core SDK missing)")
     if _LOADED_FILES:
         lines.append("  files: " + ", ".join(sorted(_LOADED_FILES)))
     else:
         lines.append(
             "  files: (none — `biopb-mcp-seed-plugins` seeds the built-in example "
-            "into ~/.config/biopb/kernel/, then the kernel must restart)"
+            "into that dir, then the kernel must restart)"
         )
     lines.append(
         "    a *.py in that dir but missing above failed on load; "

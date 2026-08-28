@@ -3,7 +3,7 @@ id: write-a-skill
 title: Write a new biopb skill file
 description: Turn a workflow the user has just validated into a reviewed skill file for the biopb catalog.
 tags: [workflow, authoring]
-version: 1.0.0
+version: 1.1.0
 checklist: []
 ---
 
@@ -13,11 +13,11 @@ checklist: []
 
 The user has finished a workflow worth repeating and wants it captured, or asks
 directly for a new skill. A skill is a markdown recipe retrieved by
-`list_skills`, and it can live in either of two places: the user's own
-`~/.config/biopb/skills/`, available to them immediately, or the curated catalog
-that ships inside biopb-mcp, which a maintainer reviews and which goes live on
-the next release. Same file either way — the destination is the user's choice,
-made at the end (step 7).
+`list_skills`, and it can live in either of two places: the user's own local
+skills dir, available to them immediately, or the curated catalog that ships
+inside biopb-mcp, which a maintainer reviews and which goes live on the next
+release. Same file either way — the destination is the user's choice, made at
+the end (step 7).
 
 A skill is worth writing when the procedure is **multi-step**, has **decisions
 between the steps**, and is **standard practice in bioimaging rather than in
@@ -62,7 +62,7 @@ The frontmatter fields, and how to determine each:
    | Amount | Ships as | The body carries |
    |---|---|---|
    | ≲ 30 lines | Inline code fences | The code itself |
-   | 30–150 lines | A kernel plugin (`biopb_mcp/plugins/`, seeded to `~/.config/biopb/kernel/`) | The call signature — qualified by the plugin's module name — and what the parameters mean |
+   | 30–150 lines | A kernel plugin (`biopb_mcp/plugins/`, seeded to the plugin dir `server_status` reports under `## Kernel plugins`) | The call signature — qualified by the plugin's module name — and what the parameters mean |
    | A published algorithm | A `pip install` pointer | The install command and the degraded path when it is absent |
 
    **Do not restate the install mechanics.** Which command to quote, why never a
@@ -190,11 +190,20 @@ The frontmatter fields, and how to determine each:
 7. **Deliver the draft** *(blocking)*. Show the complete file in the
    conversation. Then ask what the user wants done with it:
 
-   - **Keep it for themselves** — save it as
-     `~/.config/biopb/skills/<id>.md` (this is an explicit filesystem request, so
-     it is allowed). It is picked up on the next `list_skills`, with no restart,
-     and reported as `origin: local` so later sessions can tell it apart from a
-     reviewed skill. Editing the file takes effect immediately too.
+   - **Keep it for themselves** — save it as `<local skills dir>/<id>.md`
+     (this is an explicit filesystem request, so it is allowed). It is picked up
+     on the next `list_skills`, with no restart, and reported as `origin: local`
+     so later sessions can tell it apart from a reviewed skill. Editing the file
+     takes effect immediately too.
+
+     Take the dir from `server_status`, section `## Skills`, and write the file
+     **from the kernel** with `execute_code`: `~/.config/biopb/skills` is only a
+     default (`services.skills_local_dir` and the config-tree env vars move it),
+     and it resolves in the *kernel's* environment, not in yours — which on a
+     remote session is not even the same machine. Markdown is hostile to Python
+     string literals (backticks, fenced blocks, `"""`), so pick a raw-string
+     delimiter absent from the body and read the file back before telling the
+     user it is saved.
    - **Get it into the public catalog** — the catalog is `mcp/_skills_data/` in
      the `biopb` repository, so promotion is a pull request moving this identical
      file there, reviewed by the biopb maintainers. Offer to write a short
@@ -214,15 +223,15 @@ The frontmatter fields, and how to determine each:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| A saved skill never appears in `list_skills` | Saved outside `~/.config/biopb/skills`, or the filename starts with `_` (private), or skills are switched off | Check the path and `services.skills_enabled` |
+| A saved skill never appears in `list_skills` | Saved outside the local skills dir (it is configurable — `~/.config/biopb/skills` is only the default), or the filename starts with `_` (private), or skills are switched off | Compare the path written against `## Skills` in `server_status`; check `services.skills_enabled` |
 | Section written as bold text or a deeper heading | Required sections are `##` headings | Use `## ` with the exact section names |
 | The body is long but every line reads as necessary | Never ablated — obviousness is invisible from the inside | Diff it against a cold model run (step 6) |
 
 ## Next steps
 
-- A skill saved to `~/.config/biopb/skills` is live on the next `list_skills`,
-  and stays personal and unreviewed (`origin: local`). Tell the user where it
-  went, so they can edit or delete it without asking.
+- A skill saved to the local skills dir is live on the next `list_skills`, and
+  stays personal and unreviewed (`origin: local`). Tell the user the **resolved**
+  path it went to, so they can edit or delete it without asking.
 - A skill accepted by the maintainers ships with the **next biopb-mcp release**,
   not on a site deploy — CI validates the frontmatter and the required sections
   on the pull request. Keeping the local copy is what covers the gap until then.
