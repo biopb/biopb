@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import sys
 
 import pytest
 from biopb import _locations as L
@@ -33,9 +34,11 @@ def _clean_env(tmp_path, monkeypatch):
         "BIOPB_CONFIG_HOME",
         "BIOPB_STATE_HOME",
         "BIOPB_DATA_HOME",
+        "BIOPB_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv(L.SESSIONS_DIR_ENV, raising=False)
@@ -47,6 +50,19 @@ class TestBaseTrees:
         assert L.config_dir() == tmp_path / ".config" / "biopb"
         assert L.state_dir() == tmp_path / ".local" / "state" / "biopb"
         assert L.data_dir() == tmp_path / ".local" / "share" / "biopb"
+
+    def test_cache_tree_is_the_one_that_diverges_on_windows(self, tmp_path):
+        """Config/state/data hold kilobytes and share one layout everywhere. The
+        cache tree is sized for tens of GB, which is exactly what Windows keeps
+        out of roaming profiles via %LOCALAPPDATA% -- so only this one splits."""
+        if sys.platform == "win32":
+            assert L.cache_dir() == tmp_path / "AppData" / "Local" / "biopb" / "Cache"
+        else:
+            assert L.cache_dir() == tmp_path / ".cache" / "biopb"
+
+    def test_cache_env_honored_when_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BIOPB_CACHE_HOME", str(tmp_path / "xc"))
+        assert L.cache_dir() == tmp_path / "xc" / "biopb"
 
     def test_biopb_env_honored_when_absolute(self, tmp_path, monkeypatch):
         monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "xs"))
@@ -62,6 +78,7 @@ class TestBaseTrees:
             ("BIOPB_CONFIG_HOME", "config_dir"),
             ("BIOPB_STATE_HOME", "state_dir"),
             ("BIOPB_DATA_HOME", "data_dir"),
+            ("BIOPB_CACHE_HOME", "cache_dir"),
         ],
     )
     def test_relative_value_is_rejected(self, monkeypatch, var, accessor):
