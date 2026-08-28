@@ -196,6 +196,17 @@ def test_agent_launch_cmd_falls_back_to_opencode(stub_bin, tmp_path):
     )
 
 
+def test_agent_launch_cmd_falls_back_to_codex_before_cursor(stub_bin, tmp_path):
+    """`codex` is a terminal agent; `cursor` is the GUI editor, so codex ranks first."""
+    make, path = stub_bin
+    make("codex")
+    make("cursor")
+    assert (
+        bash("_agent_launch_cmd", path=path, env={"HOME": str(tmp_path)}).stdout
+        == "codex\n"
+    )
+
+
 def test_agent_launch_cmd_accepts_a_config_dir_without_a_binary(stub_bin, tmp_path):
     """opencode installed but not on this shell's PATH still counts."""
     _, path = stub_bin
@@ -246,14 +257,27 @@ def test_detect_agents_finds_each_kind(stub_bin, tmp_path):
     make, path = stub_bin
     make("claude")
     (tmp_path / ".config" / "Claude").mkdir(parents=True)
+    make("codex")
     (tmp_path / ".cursor").mkdir()
     (tmp_path / ".config" / "opencode").mkdir(parents=True)
     assert _detect(path, tmp_path) == [
         "Claude Code",
         "Claude Desktop",
+        "Codex CLI",
         "Cursor",
         "opencode",
     ]
+
+
+def test_detect_agents_ignores_a_leftover_codex_home(stub_bin, tmp_path):
+    """~/.codex outlives an uninstall, so it must not count as an agent.
+
+    Counting it would print "AI agent detected: Codex CLI" and skip the offer to
+    install one, leaving a machine with no working agent and no prompt.
+    """
+    _, path = stub_bin
+    (tmp_path / ".codex").mkdir()
+    assert _detect(path, tmp_path) == []
 
 
 def test_detect_agents_looks_in_the_platform_specific_place(stub_bin, tmp_path):
