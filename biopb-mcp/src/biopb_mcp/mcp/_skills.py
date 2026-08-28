@@ -277,6 +277,32 @@ def _local_dir() -> Path | None:
         return None
 
 
+def local_dir_status() -> str:
+    """The body of the ``## Skills`` section of ``server_status``.
+
+    The local dir is a default, not a constant -- ``services.skills_local_dir``
+    and the config-tree env vars both move it -- and this is the only place an
+    agent can read where a skill it writes has to land. Formatted here rather
+    than in the status assembly so it is unit-testable.
+    """
+    directory = _local_dir()
+    if directory is None:
+        return "  local_dir: (unresolvable — biopb core SDK missing)"
+    line = f"  local_dir: {directory}"
+    try:
+        if not directory.is_dir():
+            # Not created on access anywhere in biopb, so an agent writing the
+            # first local skill has to mkdir it -- say so rather than let a
+            # write_text fail on a path the report just showed as the right one.
+            return line + " (does not exist yet — mkdir it to write the first skill)"
+        n = sum(
+            1 for p in directory.glob("*.md") if p.is_file() and is_skill_file(p.name)
+        )
+    except OSError:
+        return line + " (unreadable)"
+    return line + f" ({n} skill{'' if n == 1 else 's'})"
+
+
 def _local_entry(path: Path) -> dict | None:
     """One local file → a catalog-shaped entry, or ``None`` if unusable."""
     try:
