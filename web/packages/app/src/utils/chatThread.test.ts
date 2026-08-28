@@ -325,10 +325,11 @@ describe("applyLiveOutput", () => {
       busy,
     );
 
-  const live = (stdout: string) => ({
+  const live = (stdout: string, dropped = 0) => ({
     jobId: "job-1",
     stdout,
-    truncated: false,
+    truncated: dropped > 0,
+    stdoutLen: stdout.length + dropped,
   });
 
   it("shows a running cell's output on the call that is running it", () => {
@@ -337,6 +338,29 @@ describe("applyLiveOutput", () => {
     const items = applyLiveOutput(running(), live("step 1\n"));
     expect(toolText(calls(items)[0]!)).toBe("step 1\n");
     expect(calls(items)[0]!.live).toBe(true);
+  });
+
+  it("says so when the live buffer has already dropped its head", () => {
+    // The job record marks its own truncation once the cell finishes. Before
+    // this the *running* view of the same cell showed a tail as though it were
+    // the whole output -- one pane, one cell, two honesty levels.
+    const items = applyLiveOutput(running(), live("tail\n", 120));
+    expect(toolText(calls(items)[0]!)).toBe(
+      "...(120 earlier chars dropped)...\ntail\n",
+    );
+  });
+
+  it("marks nothing when nothing was dropped", () => {
+    expect(toolText(calls(applyLiveOutput(running(), live("all\n")))[0]!)).toBe(
+      "all\n",
+    );
+  });
+
+  it("leaves the collapsed view's newest line alone", () => {
+    // Collapsed is the default, and it shows only latestLine(). A marker at the
+    // head must not become the line the user sees.
+    const items = applyLiveOutput(running(), live("a\nnewest\n", 120));
+    expect(latestLine(toolText(calls(items)[0]!))).toBe("newest");
   });
 
   it("replaces rather than accumulates", () => {
