@@ -638,6 +638,32 @@ def test_an_undocumented_plugin_is_still_listed(mock_home, plugin_catalog):
     assert "inspect_object" in row["description"]
 
 
+def test_an_entry_point_installed_since_startup_is_listed(
+    mock_home, plugin_catalog, monkeypatch
+):
+    """The entry-point scan is read fresh, like every other catalog source.
+
+    `entry_points()` re-scans in a live process, so `pip install`ing a plugin
+    package is visible without restarting this one -- and the next
+    `restart_kernel` *will* bind it, because a new kernel is a new process.
+    Caching the scan here made `list_skills` report a set `server_status`'s
+    `## Kernel plugins` had already picked up, so the two disagreed about the
+    same plugin.
+    """
+    import biopb._kernel_plugins as kp
+
+    installed: list[dict] = []
+    monkeypatch.setattr(kp, "entry_point_plugins", lambda: list(installed))
+
+    assert _skills.list_skills(["labshop"]) == []
+
+    installed.append({"name": "labshop", "dist": "labshop-tools 1.0"})
+
+    (row,) = _skills.list_skills(["labshop"])
+    assert row["kind"] == "plugin"
+    assert row["handle"] == "labshop"
+
+
 def test_private_files_are_not_plugins(mock_home, plugin_catalog):
     _plugin(plugin_catalog, "_helpers", "Not a plugin.")
     assert _skills.list_skills([]) == []

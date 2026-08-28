@@ -427,26 +427,6 @@ def _plugin_entry(
     }
 
 
-_entry_point_rows: list[dict] | None = None
-
-
-def _entry_point_plugins(_kernel_plugins) -> list[dict]:
-    """`entry_point_plugins()`, read once per process.
-
-    The uncached call is the expensive half of a catalog read by an order of
-    magnitude -- it stats and parses the metadata of *every* installed
-    distribution -- and unlike the plugin *files* beside it, its answer cannot
-    change while this interpreter runs: an entry point arrives with an install,
-    which the running kernel would not pick up either. So the catalog stays
-    live where liveness is real (a dropped-in ``.py``) and stops re-deriving
-    where it is not.
-    """
-    global _entry_point_rows
-    if _entry_point_rows is None:
-        _entry_point_rows = _kernel_plugins.entry_point_plugins()
-    return _entry_point_rows
-
-
 def _scan_plugins() -> list[dict]:
     """Kernel plugins as catalog entries. Fail-open, like every other source.
 
@@ -479,7 +459,14 @@ def _scan_plugins() -> list[dict]:
         logger.debug("skills: plugin-file scan failed (fail-open)", exc_info=True)
 
     try:
-        for row in _entry_point_plugins(_kernel_plugins):
+        # Read fresh, like every other source (see load_catalog). Tempting to
+        # cache -- it is the expensive half of a catalog read -- but the answer
+        # does change in a live process: `entry_points()` re-scans, so a
+        # `pip install` of a plugin package is visible without restarting this
+        # one. A cache here would leave `list_skills` reporting a set the next
+        # `restart_kernel` has already picked up, so `server_status` and the
+        # catalog would disagree about the same plugin.
+        for row in _kernel_plugins.entry_point_plugins():
             # No docstring here by construction: reading one would mean importing
             # the module, which this side does not do.
             entry = _plugin_entry(
