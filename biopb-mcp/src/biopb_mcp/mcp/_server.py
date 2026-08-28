@@ -1,196 +1,37 @@
-"""FastMCP server exposing the napari viewer through a child Jupyter kernel.
+"""FastMCP tool and resource surface, over a child Jupyter kernel.
 
 The server runs in the foreground (uvicorn, streamable-http on
-127.0.0.1:<port>/mcp) and owns a :class:`~biopb_mcp.mcp._kernel.KernelHost`.
+127.0.0.1:<port>/mcp) and drives the :class:`KernelHost` that ``_app`` owns.
 Every tool call is a round-trip into that kernel, where the napari viewer,
 dask, and the TensorFlightClient live.  The kernel can be interrupted or
 hard-restarted independently of this process.
+
+What is *not* here, and why: the app object and the launcher-set state are in
+``_app``, the kernel round trip in ``_kernel_rpc``, and the one-agent claim and
+foreign-activity digest in ``_writers``.  Each had two or three consumers
+outside this module -- the observe page, the chat loop, the shared HTTP guard --
+which had to reach in through a dozen private names to get at them.  What is
+left is the agent-facing surface: the snippets its tools run, the job
+submit/await client they share, and the tools and resources themselves.
 """
 
-import contextvars
-import json
 import logging
 import os
 import time
 from typing import Annotated
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent, TextContent
 from pydantic import Field
 
-from . import _resources, _skills
-from ._kernel import KernelHost
+from . import _app, _kernel_rpc, _resources, _skills, _writers
+from ._app import mcp
 
 logger = logging.getLogger(__name__)
-
-_kernel_host: KernelHost | None = None
-
-# Seconds execute_code waits for a job to finish before returning a job handle
-# instead of an inline result (set from config by the launcher).
-_promote_after: float = 10.0
-
-# Whether the curated-skills catalog is advertised to the agent (mirrors
-# `services.skills_enabled`, on by default). Set by the launcher
-# (set_skills_enabled); gates the _SKILLS_INSTRUCTIONS fragment in the handshake.
-# test_mcp_server pins this literal to the config default so the two can't drift.
-_skills_enabled: bool = True
-
-# This process's logfile path (set by the launcher), surfaced by server_status so
-# an agent can find its own log. None when output goes to a terminal (foreground
-# `--transport http` / `biopb mcp view`) rather than a file.
-_session_log_path: str | None = None
-
-# Handed to the client in the initialize handshake (the only handshake-time
-# carrier MCP defines). Clients that honor it inject it into the model's
-# context from the first turn (compliance is up to the client/agent), so this
-# field carries the guidance that must hold on *every* turn — the operation
-# guardrails.
-_BASE_INSTRUCTIONS = (
-    "This biopb-mcp session drives a live napari viewer through a child IPython "
-    "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
-    "for detail before non-trivial work: guide://kernel (namespace, skill "
-    "requirements, long-running jobs & cancellation), guide://data (how arrays are "
-    "represented here -- pyramids, laziness, axis order and rank -- and the traps), "
-    "guide://client (the `client` handle: catalog, load, upload), "
-    "guide://viewer (layers/camera/dims, annotation layers), "
-    "guide://ops (server-side image-processing ops).\n"
-    "\n"
-    "The napari kernel does NOT auto-start. Call `start_kernel` once at the "
-    "start of the session (and again to recover after a failure or after the "
-    "user closes the viewer window); it blocks until the kernel is ready.\n"
-    "\n"
-    "Operation guardrails (apply on every turn):\n"
-    "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
-    "explicitly asks.\n"
-    '- Browse the catalog with `client.query_sources(sql, format="pandas")` '
-    "(server-side DuckDB, complete), not `client.list_sources()` "
-    "(server-capped for large catalogs); the `sources` columns are source_id, "
-    "source_url, source_type, dtype, indexed_at, metadata_json, "
-    "shape_summary, data_resident, and `tensors` (a LIST of "
-    "STRUCT(array_id, dim_labels, shape, dtype), one per tensor -- "
-    "query per-tensor with UNNEST(tensors) or list_filter; the scalar "
-    "dtype/shape_summary only describe tensors[0]). Unresolved (cloud / "
-    "synced-folder) sources "
-    "have NULL dtype/shape_summary, so a predicate like `WHERE dtype='uint8'` "
-    "silently drops them; filter on `data_resident` to opt them in/out on "
-    "purpose (`WHERE NOT data_resident` finds what hasn't been resolved yet).\n"
-    "- Prefer lazy dask operations; only `.compute()` the final result.\n"
-    "- Put intermediate results back on `viewer` for the user to validate at "
-    "each step.\n"
-    "- Do not assume — ask the user to clarify uncertainties; they know the "
-    "data better than you do."
-)
-
-# Appended to _BASE_INSTRUCTIONS only when the skills catalog is enabled
-# (`services.skills_enabled`, on by default). Kept out of the base so an install
-# that switches skills off neither points the agent at `list_skills` (which would
-# return nothing) nor prompts it to author skills — set_skills_enabled owns the
-# field.
-_SKILLS_INSTRUCTIONS = (
-    "At the start of a task, call `list_skills` to check for a curated workflow "
-    "before improvising; read the matching `skill://<id>` resource for the "
-    "steps. Results marked `origin: local` are the user's own unreviewed skills "
-    "from ~/.config/biopb/skills; prefer a curated one when both fit. After "
-    "accomplishing a task, ask the user whether a new skill should be generated "
-    "and added to the agent's toolbox for future use.\n"
-    "\n"
-    "Skills name three checkpoint types in their steps; honor them:\n"
-    "- confirm-input: ask before computing, but only for facts the data cannot "
-    "give you (voxel spacing, which channel is which, expected object size).\n"
-    "- visual checklist: put the intermediate on the viewer and report two or three "
-    "numbers with it -- never a screenshot alone, and report the numbers alone "
-    "when the data is too large to show usefully.\n"
-    "- validate-and-gate: stop and get the user's agreement before anything "
-    "expensive or hard to walk back.\n"
-    "Destructive steps always ask first, whatever a skill says: restarting the "
-    "kernel, interrupting a running job, overwriting a layer, or writing files."
-)
-
-# DNS-rebinding / cross-origin protection (review finding A2).  execute_code is
-# a full kernel (RCE by design), so the only thing standing between a malicious
-# page in the user's own browser and the loopback port is Host/Origin
-# validation.  The MCP SDK enforces these lists; we set them explicitly rather
-# than relying on its implicit loopback auto-enable so the control can't
-# silently regress.  Wildcard ports mean the configured port never matters.
-_LOOPBACK_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-_LOOPBACK_ORIGINS = [
-    "http://127.0.0.1:*",
-    "http://localhost:*",
-    "http://[::1]:*",
-]
-
-
-def build_transport_security(
-    extra_origins=(), extra_hosts=()
-) -> TransportSecuritySettings:
-    """Build DNS-rebinding protection settings for the loopback server.
-
-    The loopback allowlists are always enforced; ``extra_origins`` /
-    ``extra_hosts`` (from ``transport.allowed_origins`` /
-    ``transport.allowed_hosts``) are appended so an admin fronting the server
-    with a reverse proxy can permit the proxy's Host/Origin.
-    """
-    return TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=_LOOPBACK_HOSTS + list(extra_hosts),
-        allowed_origins=_LOOPBACK_ORIGINS + list(extra_origins),
-    )
-
-
-mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
-
-# FastMCP built the low-level server with instructions=None at import; seed the
-# always-on base guidance now so it is present even if set_skills_enabled is
-# never called (e.g. tests, or a standalone import), which recomposes from this
-# base.
-mcp._mcp_server.instructions = _BASE_INSTRUCTIONS
-
-_PNG_DELIM = "<<PNG_B64>>"
-
-# Delimiter for the single-line JSON payload the in-kernel job runner prints in
-# reply to a submit/poll/cancel/list snippet (mirrors the _PNG_DELIM pattern).
-_JOB_DELIM = "<<JOB_JSON>>"
-
-# Sentinel printed by the screenshot snippet when the napari window has been
-# closed (the viewer survives in the namespace, but its canvas is destroyed).
-_WINDOW_CLOSED_DELIM = "<<WINDOW_CLOSED>>"
-
-# Appended to a result when the agent's code ran but the viewer window is closed,
-# so the silent no-op of viewer mutations is surfaced rather than read as success.
-_WINDOW_CLOSED_NOTE = (
-    "\n\n⚠ The napari viewer window is closed — viewer layers won't be "
-    "displayed (data/compute results are still valid). Call restart_kernel to "
-    "restore the viewer."
-)
-
-
-def _job_snippet(call: str) -> str:
-    """Build a snippet that prints ``_jobs.<call>``'s result as delimited JSON.
-
-    ``call`` is a fully-formed call expression with arguments already embedded
-    via ``repr`` by the caller (agent code is RCE by design, but embedding via
-    ``repr`` keeps the payload a valid literal regardless of its contents).
-
-    The payload is ``{"r": <call result>, "w": <viewer window alive?>}`` so the
-    same round-trip also reports whether the viewer window is still open (a
-    user-closed window turns viewer mutations into silent no-ops). The liveness
-    probe is auxiliary, so a kernel that never bound ``_viewer_window_alive``
-    (e.g. a partial/test bootstrap) reports ``w: null`` rather than breaking the
-    job round-trip.
-    """
-    return (
-        "import json as _json\n"
-        "print('" + _JOB_DELIM + "' + _json.dumps("
-        "{'r': _jobs." + call + ", "
-        "'w': globals().get('_viewer_window_alive', lambda: None)()}))\n"
-    )
-
 
 _SCREENSHOT_SNIPPET = (
     "import base64 as _b64, cv2 as _cv2\n"
     "if not _viewer_window_alive():\n"
-    "    print('" + _WINDOW_CLOSED_DELIM + "')\n"
+    "    print('" + _kernel_rpc._WINDOW_CLOSED_DELIM + "')\n"
     "else:\n"
     # Under async slicing, force-sync the current view so the capture reflects
     # the state the agent just set, not a pre-load frame. No-op when async is
@@ -199,7 +40,9 @@ _SCREENSHOT_SNIPPET = (
     "    _arr = viewer.screenshot(canvas_only={canvas_only})\n"
     "    _bgra = _cv2.cvtColor(_arr, _cv2.COLOR_RGBA2BGRA)\n"
     "    _ok, _buf = _cv2.imencode('.png', _bgra)\n"
-    "    print('" + _PNG_DELIM + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
+    "    print('"
+    + _kernel_rpc._PNG_DELIM
+    + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
 )
 
 # Self-contained inspection snippet.  Built by string concatenation (no
@@ -350,367 +193,32 @@ except Exception as _e:
 """
 
 
-def set_kernel_host(host: KernelHost):
-    """Register the kernel host the tools dispatch to.
+# Whether psutil's CPU counter has a previous reading to measure against.
+_cpu_primed = False
 
-    A different host is a different kernel, so the mirrored one-agent claim goes
-    with the old one rather than being inherited by the new.
+
+def _cpu_percent(psutil):
+    """System CPU usage, without a 100 ms sleep in every ``server_status``.
+
+    ``interval=0.1`` blocks for a tenth of a second by definition, and this tool
+    is called at session start and repeatedly through an agent run. The
+    non-blocking form reports usage since the *previous* call, which for a tool
+    called repeatedly is the more meaningful number anyway -- it just needs one
+    reading to subtract from, so the first call still pays the sample.
     """
-    global _kernel_host
-    _kernel_host = host
-    clear_claim()
+    global _cpu_primed
+    if _cpu_primed:
+        return psutil.cpu_percent(interval=None)
+    _cpu_primed = True
+    return psutil.cpu_percent(interval=0.1)
 
 
-def set_promote_after(seconds: float):
-    """Set how long execute_code waits inline before returning a job handle."""
-    global _promote_after
-    _promote_after = float(seconds)
-
-
-def set_session_log_path(path: str | None):
-    """Record this process's logfile path for server_status to report."""
-    global _session_log_path
-    _session_log_path = path
-
-
-def _recompose_instructions():
-    """Rebuild the handshake ``instructions`` from ``_BASE_INSTRUCTIONS`` plus
-    whichever optional fragments the current mode enables (skills).
-
-    Recomposing from the base in both directions is idempotent, so flipping any
-    dimension back off can't leave a stale fragment in the handshake while
-    preserving the always-on base guidance. The low-level Server holds the
-    `instructions` returned in the handshake.
-    """
-    parts = [_BASE_INSTRUCTIONS]
-    if _skills_enabled:
-        parts.append(_SKILLS_INSTRUCTIONS)
-    mcp._mcp_server.instructions = "\n\n".join(parts)
-
-
-def set_skills_enabled(enabled: bool):
-    """Advertise (or hide) the curated-skills catalog in the agent's initialize
-    ``instructions``. On by default; switching skills off also drops the
-    directive, so the agent is never pointed at ``list_skills`` when it would
-    return nothing."""
-    global _skills_enabled
-    _skills_enabled = bool(enabled)
-    _recompose_instructions()
-
-
-def _format_execute_result(res: dict) -> str:
-    status = res.get("status")
-    stdout = res.get("stdout", "")
-    result_text = res.get("result_text", "")
-    error_text = res.get("error_text", "")
-
-    if status == "ok":
-        out = stdout
-        if result_text:
-            out += result_text
-        return out or "(no output)"
-
-    parts = []
-    if stdout:
-        parts.append(stdout)
-    if error_text:
-        parts.append(error_text)
-    return "\n".join(parts) if parts else f"(status: {status})"
-
-
-def _extract_delimited(text: str, delimiter: str) -> str | None:
-    for line in text.splitlines():
-        if line.startswith(delimiter):
-            return line[len(delimiter) :]
-    return None
-
-
-def _extract_json(text: str):
-    """Parse the single-line ``<<JOB_JSON>>`` payload from a job snippet."""
-    payload = _extract_delimited(text, _JOB_DELIM)
-    if payload is None:
-        return None
-    try:
-        return json.loads(payload)
-    except (ValueError, TypeError):
-        return None
-
-
-def _run_job_call(host, call: str):
-    """Run a ``_jobs.<call>`` snippet.
-
-    Returns ``(result, raw_result, window_alive)`` where ``result`` is the
-    parsed ``_jobs.<call>`` value (None if the snippet failed) and
-    ``window_alive`` is the viewer-window liveness flag carried in the same
-    payload (None when unknown, e.g. the snippet did not run cleanly).
-    """
-    res = host.execute(_job_snippet(call))
-    if res.get("status") != "ok":
-        return None, res, None
-    payload = _extract_json(res.get("stdout", ""))
-    if payload is None:
-        return None, res, None
-    return payload.get("r"), res, payload.get("w")
-
-
-def _window_note(window_alive) -> str:
-    """Closed-window warning to append when a result returns with no viewer.
-
-    ``window_alive`` is None when liveness is unknown -> no note.
-    """
-    if window_alive is False:
-        return _WINDOW_CLOSED_NOTE
-    return ""
-
-
-# This process's mirror of the kernel's one-agent claim: the last client whose
-# code the kernel actually accepted, or None while unclaimed.
-#
-# The kernel owns the claim -- ``_jobs.submit`` is the choke point and the only
-# thing that can enforce it atomically. But ``restart_kernel`` cannot be gated
-# from inside the kernel it destroys, and asking the kernel who owns it first is
-# both a check-then-act race and *fail-open on a busy kernel*: a round trip that
-# comes back "busy" would read as "no owner", and a kernel busy running the
-# holder's job is exactly when a stray restart costs the most. Every claim
-# passes through this process, so mirroring it here answers the question with no
-# round trip and no window.
-#
-# Set from the kernel's own decision wherever a reply arrives: any submit the
-# kernel did not refuse came from the holder, and a refusal names the holder
-# outright, so assigning on both keeps the mirror true through a restart that
-# happened somewhere else (the observe page's, which clears it explicitly).
-#
-# **Recorded before the submit is sent, not after.** A reply can be lost while
-# the kernel goes on to claim and run the code anyway -- ``execute_interactive``
-# hands the request over before it starts its clock, so a timed-out call is still
-# queued and executes when the main thread frees up. Setting the mirror only on
-# the way back would leave it empty while the kernel is genuinely held, and an
-# empty mirror lets a stranger restart the session that just started. The window
-# is claimed first and corrected from whatever the kernel says, so the failure
-# direction is "held by the client that asked" rather than "held by nobody".
-_claimed_by: str | None = None
-
-
-def _note_claim(writer):
-    """Record that the kernel is held by *writer* (ignores ``None``)."""
-    global _claimed_by
-    if writer is not None:
-        _claimed_by = writer
-
-
-def _presume_claim(writer):
-    """Take the claim for *writer* only if this process has not seen one.
-
-    Guarded on "not seen": a client the kernel is about to refuse must never
-    overwrite a holder already known here, and it will be corrected by the
-    refusal in any case.
-    """
-    if _claimed_by is None:
-        _note_claim(writer)
-
-
-def clear_claim():
-    """Forget the mirrored claim, for a caller that just replaced the kernel."""
-    global _claimed_by
-    _claimed_by = None
-
-
-def claim_holder():
-    """Who holds this kernel, as far as this process has seen, or ``None``.
-
-    A read for a caller deciding whether an action is worth offering at all --
-    the chat pane's engine switch, which would otherwise hand the session to a
-    second client that the kernel then refuses on its first cell. Mirrored, so
-    it can be stale in the safe direction only: it is set from what the kernel
-    actually said (:func:`_note_claim`), and cleared when the kernel is replaced.
-    """
-    return _claimed_by
-
-
-# Refusal for a client that does not hold this kernel's one-agent claim
-# (_jobs.submit). Shared by every state-changing tool so the agent gets one
-# explanation rather than three, and so the recovery named is the same in all of
-# them: the person at the machine, never a second agent.
-_NOT_OWNER_MSG = (
-    "This kernel is already in use by another client{held_by}, and only one "
-    "agent runs code in a session. Two of you writing to the same namespace and "
-    "viewer would order the writes without either being able to see what the "
-    "other believes is there. Reading tools (poll_job, server_status, "
-    "take_screenshot, inspect_object) still work, so you can watch. You cannot "
-    "take the session over — restarting it is the user's to do, from the observe "
-    "page. Tell them what you wanted and let them decide."
-)
-
-
-# Identity for a caller that reaches the tools without an MCP request at all --
-# the in-process chat loop, which is a client of this server in every sense that
-# matters but arrives as a plain function call. Set for the length of one
-# dispatch (``_chat``), so every tool gates it the way it gates a remote client
-# instead of letting it through as "no identity".
-_local_identity: contextvars.ContextVar = contextvars.ContextVar(
-    "biopb_local_identity", default=None
-)
-
-# The job origin this caller submits under, which is also the point of view the
-# foreign-activity digest is read from: "someone else's cell" is a relation, not
-# a property of the cell. Defaults to the remote clients this server was written
-# for; the in-process chat loop sets it for the length of a dispatch, beside its
-# identity above.
-_local_origin: contextvars.ContextVar = contextvars.ContextVar(
-    "biopb_local_origin", default="mcp"
-)
-
-
-def _client_identity():
-    """``(id, label)`` for the client behind this call, or ``(None, "")``.
-
-    The streamable-http transport mints a per-connection ``mcp-session-id``, so
-    two clients reaching one session child are distinguishable even though the
-    tool surface itself is stateless — this is the id the kernel's one-agent
-    claim is keyed on (``_jobs.submit``). ``clientInfo.name`` from the initialize
-    handshake rides along as a label, purely so a refusal can name who holds the
-    kernel.
-
-    Read through ``mcp.get_context()`` rather than a ``Context`` tool parameter:
-    the parameter form is excluded from the advertised input schema, but it also
-    makes the function uncallable without one, and every in-process caller (the
-    tests today, an in-process chat loop later) has no request at all. Outside a
-    request this yields no identity, which ``submit`` reads as "nothing to claim
-    with" and lets through -- unless an in-process caller has announced itself
-    through :data:`_local_identity`, which takes precedence over the request
-    because it *is* the caller; a loop dispatching tools has no request of its
-    own to be found.
-    """
-    local = _local_identity.get()
-    if local is not None:
-        return local
-    try:
-        rc = mcp.get_context().request_context
-    except Exception:  # noqa: BLE001 - no request, or an SDK shape we don't know
-        return None, ""
-    request = getattr(rc, "request", None)
-    ident = request.headers.get("mcp-session-id") if request is not None else None
-    session = getattr(rc, "session", None)
-    if not ident and session is not None:
-        # A client that negotiated no transport session still gets one identity
-        # per connection: the ServerSession object is per-connection and lives
-        # as long as it does, which is all the claim needs.
-        ident = f"conn-{id(session):x}"
-    params = getattr(session, "client_params", None)
-    label = getattr(getattr(params, "clientInfo", None), "name", "") or ""
-    return ident, label
-
-
-def _foreign_digest(host) -> list:
-    """The cells run by another writer that the agent has not been told about,
-    or ``[]``.
-
-    "Another writer" is relative to :data:`_local_origin`, so the chat loop is
-    not handed its own cells.
-
-    A pure read — see :func:`_ack_foreign_digest` for why the ack is a second call.
-    Auxiliary, like the window-liveness probe: a kernel that answers with
-    anything but the expected list yields no digest rather than breaking the
-    result the agent actually asked for.
-    """
-    digest, _res, _w = _run_job_call(
-        host, "foreign_digest(" + repr(_local_origin.get()) + ")"
-    )
-    if not digest or not isinstance(digest, list):
-        return []
-    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
-        return []
-    return digest
-
-
-def _ack_foreign_digest(host, digest, writer=None) -> None:
-    """Retire the *terminal* entries of *digest*, once the note carrying them is
-    on its way back to the agent.
-
-    Split from the read because acking inside it consumed notices that were
-    never delivered: ``execute_interactive`` sends the request before it starts
-    its timeout clock, so a probe that times out is still queued at the kernel
-    and runs when the main thread frees up — setting the flag for a note nobody
-    received. Acking only after this process has parsed a reply keeps the
-    guarantee that a notice is deferred, never dropped.
-
-    Running entries are excluded here rather than in the kernel: they were
-    reported as ``running``, which is not the final status the agent is promised,
-    so they must stay pending even if they have finished since.
-
-    *writer* is the asking client, passed through so the kernel can refuse an ack
-    from a client that does not hold it: a second client's ``poll_job`` may
-    *read* the digest, but discharging a notice the holder has not received
-    would defeat the exactly-once promise this split exists to keep.
-    """
-    ids = [d["job_id"] for d in digest if d.get("status") != "running"]
-    if ids:
-        _run_job_call(
-            host,
-            "ack_foreign_digest(" + repr(ids) + ", writer=" + repr(writer) + ")",
-        )
-
-
-def _render_foreign_note(digest) -> str:
-    """The digest as a line appended to an agent-facing result, or ``""``.
-
-    The agent is not the only writer of this namespace: a person can run code
-    from the observe page, through the same job runner (``docs/user-console.md``).
-    That leaves the agent's picture of the namespace stale with nothing in its
-    own results to say so — hence this note, appended at the same seam as
-    ``_window_note``, which is how every other user-attributed fact already
-    reaches the agent (``cancel_reason``, ``teardown_reason``).
-
-    Deliberately says *that* something changed, not *what*: the agent is told to
-    re-verify, which is cheap and cannot go stale itself. It names **no** job id
-    in the instruction either — pointing at one of several invites an agent to
-    read that one, call the notice discharged, and never see the rest, which it
-    will not be offered again.
-    """
-    if not digest:
-        return ""
-    # Older kernels' digest entries carry no origin; they could only ever have
-    # been user cells, so read a missing one as "user" rather than dropping the
-    # attribution.
-    origins = {(d.get("origin") or "user") for d in digest}
-    if origins == {"user"}:
-        who = "The user"
-        listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
-    else:
-        who = "Another writer"
-        listed = ", ".join(
-            f"{d['job_id']} ({d.get('status')}, {d.get('origin') or 'user'})"
-            for d in digest
-        )
-    return (
-        f"\n\nⓘ {who} ran code in this kernel: "
-        f"{listed}. A finished cell is reported once; a running one repeats "
-        "until it ends, so a repeat is not a new cell. Read them with poll_job. "
-        "Variables and layers may have changed — re-check with dir() / "
-        "viewer.layers rather than trusting what you last saw."
-    )
-
-
-def _foreign_activity_note(host) -> str:
-    """Read, render, and retire the activity notice, in that order.
-
-    Retiring is the holder's alone (see :func:`_ack_foreign_digest`): a second
-    client reaching a read-only tool still gets shown what ran, but does not
-    consume the notice out from under the agent actually working here.
-    """
-    digest = _foreign_digest(host)
-    note = _render_foreign_note(digest)
-    if note:
-        _ack_foreign_digest(host, digest, _client_identity()[0])
-    return note
-
-
-def _start_job(host, args: str):
+def _start_job(host, code, **kwargs):
     """Submit a job and resolve everything that can happen before it runs.
 
-    *args* is :func:`_jobs.submit`'s argument list with the caller's own
-    arguments already repr-embedded. The client identity is appended here rather
-    than passed in, because claiming the kernel is this function's business:
+    *code* and *kwargs* are :func:`_jobs.submit`'s own arguments, passed as
+    values. The client identity is added here rather than passed in, because
+    claiming the kernel is this function's business:
     every submitting tool answers "am I the holder?" and "is something already
     running?" the same way, and a second answer to either is a second policy.
 
@@ -721,81 +229,100 @@ def _start_job(host, args: str):
     because the submit round trip carries it too, and with a promote window of
     zero it is the only one there will be.
     """
-    writer, writer_label = _client_identity()
+    writer, _label = _writers._client_identity()
 
     # Read once at entry, append to whichever path returns below.
-    digest = _foreign_digest(host)
-    foreign_note = _render_foreign_note(digest)
+    digest = _writers._foreign_digest(host)
+    foreign_note = _writers._render_foreign_note(digest)
     if foreign_note:
-        _ack_foreign_digest(host, digest, writer)
+        _writers._ack_foreign_digest(host, digest, writer)
 
+    job_id, message, drop_note, window_alive = _submit_job(
+        host, code, digest, _tool_busy_message, **kwargs
+    )
+    if drop_note:
+        foreign_note = ""
+    if message is not None:
+        return None, foreign_note, window_alive, message + foreign_note
+    return job_id, foreign_note, window_alive, None
+
+
+def _tool_busy_message(running, running_origin) -> str:
+    """An MCP tool's reply when the kernel already has a job running.
+
+    Whose job is running decides the advice. Telling the agent to "stop it with
+    interrupt_kernel" while *someone else* is running a cell would have it kill
+    their work; interrupt_kernel refuses that anyway (_jobs.interrupt_current),
+    so the wording must not send it there.
+    """
+    if running_origin and running_origin != "mcp":
+        who = "The user" if running_origin == "user" else "Another writer"
+        return (
+            f"{who} is running a cell ({running}) in this kernel. Only one "
+            f"job runs at a time — wait for it and poll_job('{running}'); do "
+            "not interrupt it."
+        )
+    return (
+        f"A job ({running}) is already running. Poll it with "
+        f"poll_job('{running}'), or stop it with interrupt_kernel / "
+        "restart_kernel before starting another."
+    )
+
+
+def _submit_job(host, code, digest, busy_message, **kwargs):
+    """Claim the kernel, submit *code*, and classify whatever comes back.
+
+    The claim protocol -- presume before the call, then believe the kernel's
+    answer -- is the same for every writer of this namespace, and it is a
+    security-relevant one, so it is written once here. Both the MCP tools (via
+    :func:`_start_job`) and the in-process chat loop go through it.
+
+    What legitimately differs between those surfaces is only how a busy kernel
+    is described: a tool caller gets a job handle it can poll, the chat loop
+    never does (its path has no promote window), so it must not be told to poll
+    one. Hence *busy_message*, a ``(running_job_id, running_origin) -> str``.
+
+    Returns ``(job_id, message, drop_note, window_alive)``; exactly one of
+    *job_id* and *message* is not None. *drop_note* asks the caller to suppress
+    its foreign-activity note: a running foreign job stays in the digest by
+    design, so the note would report the very job the refusal already reports.
+    Keep it when other cells also finished -- those were acked and will not be
+    offered again.
+    """
+    writer, writer_label = _writers._client_identity()
     # Before the call, not after: a lost reply must not leave the kernel claimed
     # while this process still reads as unclaimed. See _claimed_by.
-    _presume_claim(writer)
-    submitted, res, window_alive = _run_job_call(
-        host,
-        "submit("
-        + args
-        + ", writer="
-        + repr(writer)
-        + ", writer_label="
-        + repr(writer_label)
-        + ")",
+    _writers._presume_claim(writer)
+    submitted, res, window_alive = _kernel_rpc._run_job_call(
+        host, "submit", code, writer=writer, writer_label=writer_label, **kwargs
     )
     if submitted is None:
-        return (
-            None,
-            foreign_note,
-            window_alive,
-            _format_execute_result(res) + foreign_note,
-        )
+        return None, _kernel_rpc._format_execute_result(res), False, window_alive
     if submitted.get("error") == "not_owner":
         # The authority speaking: whatever this process presumed above, the
         # kernel just named the real holder.
-        _note_claim(submitted.get("owner_id"))
+        _writers._note_claim(submitted.get("owner_id"))
         held_by = submitted.get("owner") or ""
         held_by = f" ({held_by})" if held_by else ""
         return (
             None,
-            foreign_note,
+            _writers._NOT_OWNER_MSG.format(held_by=held_by),
+            False,
             window_alive,
-            _NOT_OWNER_MSG.format(held_by=held_by) + foreign_note,
         )
     # Anything the kernel did not refuse came from the holder, "busy" included:
     # submit() decides the claim before it looks at what is running.
-    _note_claim(writer)
+    _writers._note_claim(writer)
     if submitted.get("error") == "busy":
         running = submitted.get("running_job_id")
-        # Whose job is running decides the advice. Telling the agent to
-        # "stop it with interrupt_kernel" while *someone else* is running a cell
-        # would have it kill their work; interrupt_kernel refuses that anyway
-        # (_jobs.interrupt_current), so the wording must not send it there.
-        running_origin = submitted.get("running_job_origin")
-        if running_origin and running_origin != "mcp":
-            # A running foreign job stays in the digest by design, so the note is
-            # about to report the very job this branch is reporting. Drop it
-            # when that is *all* it says; keep it when other cells also finished,
-            # since those were acked above and will not be offered again.
-            if [d.get("job_id") for d in digest] == [running]:
-                foreign_note = ""
-            who = "The user" if running_origin == "user" else "Another writer"
-            return (
-                None,
-                foreign_note,
-                window_alive,
-                f"{who} is running a cell ({running}) in this kernel. Only one "
-                f"job runs at a time — wait for it and poll_job('{running}'); do "
-                "not interrupt it." + foreign_note,
-            )
+        drop_note = [d.get("job_id") for d in digest] == [running]
         return (
             None,
-            foreign_note,
+            busy_message(running, submitted.get("running_job_origin")),
+            drop_note,
             window_alive,
-            f"A job ({running}) is already running. Poll it with "
-            f"poll_job('{running}'), or stop it with interrupt_kernel / "
-            "restart_kernel before starting another." + foreign_note,
         )
-    return submitted["job_id"], foreign_note, window_alive, None
+    return submitted["job_id"], None, False, window_alive
 
 
 def _await_job(host, job_id, window_alive=None):
@@ -809,11 +336,11 @@ def _await_job(host, job_id, window_alive=None):
     *window_alive* seeds the flag with the submit round trip's, so a promote
     window short enough to poll zero times still reports a closed viewer.
     """
-    deadline = time.monotonic() + _promote_after
+    deadline = time.monotonic() + _app._promote_after
     snap, res = {"status": "running"}, None
     while time.monotonic() < deadline:
         time.sleep(0.4)
-        snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
+        snap, res, window_alive = _kernel_rpc._run_job_call(host, "poll", job_id)
         if snap is None:
             return None, res, None
         if snap.get("status") != "running":
@@ -902,7 +429,7 @@ def _format_job_status(snap: dict) -> str:
     record = snap.get("verify")
     if record and status != "running":
         return header + "\n" + _format_verification(record, job_id)
-    body = _format_execute_result(snap)
+    body = _kernel_rpc._format_execute_result(snap)
     if status == "running":
         return header + "\nPartial output:\n" + (body or "(none yet)")
     return header + "\n" + body
@@ -922,7 +449,7 @@ def get_kernel_guide() -> str:
     return a ``checklist:``, so the section would document an unreachable
     tool -- the same gate the handshake instructions use.
     """
-    if _skills_enabled:
+    if _app._skills_enabled:
         return _resources.GUIDE + _resources.SKILL_REQUIREMENTS
     return _resources.GUIDE
 
@@ -956,9 +483,9 @@ def get_skill(skill_id: str) -> str:
     """Full workflow body for a curated skill; discover ids with `list_skills`.
 
     The catalog (metadata) is served separately via the `list_skills` tool; this
-    resource lazily fetches one skill's markdown body, verifies it against the
-    catalog checksum, and caches it. Fail-open: returns a short explanatory
-    string rather than erroring when a skill is unknown or unreachable.
+    resource reads one skill's markdown body from the file the catalog named.
+    Fail-open: returns a short explanatory string rather than erroring when a
+    skill is unknown or its file is unreadable.
     """
     return _skills.get_skill_body(skill_id)
 
@@ -1012,10 +539,10 @@ def list_skills(keywords: list[str] | None = None) -> list:
     installing, seeding a plugin, restarting the kernel all need their consent —
     but naming it up front beats failing halfway through.
 
-    Fail-open: returns an empty list (never errors) when the catalog is
-    unreachable and nothing is cached or bundled.
+    Fail-open: returns an empty list (never errors) rather than reporting a
+    catalog that could not be read.
     """
-    return _skills.find_skills(keywords or ())
+    return _skills.list_skills(keywords or ())
 
 
 @mcp.tool()
@@ -1028,13 +555,18 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     Returns a PNG screenshot as an image content block.
     """
-    host = _kernel_host
-    if host is None:
-        return [TextContent(type="text", text="Kernel host not initialized")]
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return [TextContent(type="text", text=err)]
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
     res = host.execute(snippet)
-    if _extract_delimited(res.get("stdout", ""), _WINDOW_CLOSED_DELIM) is not None:
+    if (
+        _kernel_rpc._extract_delimited(
+            res.get("stdout", ""), _kernel_rpc._WINDOW_CLOSED_DELIM
+        )
+        is not None
+    ):
         return [
             TextContent(
                 type="text",
@@ -1045,7 +577,7 @@ def take_screenshot(canvas_only: bool = True) -> list:
                 ),
             )
         ]
-    data = _extract_delimited(res.get("stdout", ""), _PNG_DELIM)
+    data = _kernel_rpc._extract_delimited(res.get("stdout", ""), _kernel_rpc._PNG_DELIM)
     if data is None:
         detail = res.get("error_text") or res.get("stdout") or res.get("status")
         return [TextContent(type="text", text=f"Screenshot failed: {detail}")]
@@ -1130,30 +662,34 @@ def execute_code(
       `layer.data[0] if layer.multiscale else layer.data`, and read
       guide://data before measuring or computing from a layer.
     """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
 
     job_id, foreign_note, window_alive, msg = _start_job(
-        host, repr(python_code) + ", intent=" + repr(intent)
+        host, python_code, intent=intent
     )
     if msg is not None:
         return msg
 
     snap, res, window_alive = _await_job(host, job_id, window_alive)
     if snap is None:
-        return _format_execute_result(res) + foreign_note
+        return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") != "running":
-        return _format_execute_result(snap) + _window_note(window_alive) + foreign_note
+        return (
+            _kernel_rpc._format_execute_result(snap)
+            + _kernel_rpc._window_note(window_alive)
+            + foreign_note
+        )
 
     partial = snap.get("stdout", "") if snap else ""
     return (
-        f"Job {job_id} is still running after {_promote_after:.0f}s. "
+        f"Job {job_id} is still running after {_app._promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
         f"server_status; stop with interrupt_kernel or restart_kernel.\n"
         "Partial output:\n"
         + (partial or "(none yet)")
-        + _window_note(window_alive)
+        + _kernel_rpc._window_note(window_alive)
         + foreign_note
     )
 
@@ -1197,41 +733,44 @@ def verify_workflow(
         title: what the workflow does, in a few words. Names the saved file and
             titles the notebook.
     """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
     if not cells:
         return "verify_workflow needs at least one cell."
 
     job_id, foreign_note, window_alive, msg = _start_job(
         host,
-        repr("")
-        + ", intent="
-        + repr(f"verify workflow: {title}" if title else "verify workflow")
-        + ", verify_cells="
-        + repr(list(cells))
-        + ", verify_title="
-        + repr(title),
+        "",
+        intent=f"verify workflow: {title}" if title else "verify workflow",
+        verify_cells=list(cells),
+        verify_title=title,
     )
     if msg is not None:
         return msg
 
     snap, res, window_alive = _await_job(host, job_id, window_alive)
     if snap is None:
-        return _format_execute_result(res) + foreign_note
+        return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") == "running":
         return (
             f"Verification {job_id} is still running after "
-            f"{_promote_after:.0f}s. Poll it with poll_job('{job_id}') — the "
+            f"{_app._promote_after:.0f}s. Poll it with poll_job('{job_id}') — the "
             "per-cell record is in the result." + foreign_note
         )
     record = snap.get("verify")
     if not record:
         # A kernel that predates verify_cells, or a submit that never built the
         # record: report the job the ordinary way rather than invent a verdict.
-        return _format_execute_result(snap) + _window_note(window_alive) + foreign_note
+        return (
+            _kernel_rpc._format_execute_result(snap)
+            + _kernel_rpc._window_note(window_alive)
+            + foreign_note
+        )
     return (
-        _format_verification(record, job_id) + _window_note(window_alive) + foreign_note
+        _format_verification(record, job_id)
+        + _kernel_rpc._window_note(window_alive)
+        + foreign_note
     )
 
 
@@ -1243,17 +782,21 @@ def poll_job(job_id: str) -> str:
     output so far (full output once terminal). Job records persist until the
     kernel is restarted (older terminal jobs are eventually evicted).
     """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
 
-    foreign_note = _foreign_activity_note(host)
-    snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
+    foreign_note = _writers._foreign_activity_note(host)
+    snap, res, window_alive = _kernel_rpc._run_job_call(host, "poll", job_id)
     if snap is None:
-        return _format_execute_result(res) + foreign_note
+        return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") == "unknown":
         return f"No such job '{job_id}'." + foreign_note
-    note = _window_note(window_alive) if snap.get("status") != "running" else ""
+    note = (
+        _kernel_rpc._window_note(window_alive)
+        if snap.get("status") != "running"
+        else ""
+    )
     return _format_job_status(snap) + note + foreign_note
 
 
@@ -1264,9 +807,9 @@ def inspect_object(object_path: str) -> str:
     Returns the type, docstring, and public methods/attributes.
     Example: inspect_object("viewer.layers") or inspect_object("viewer.camera")
     """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
 
     snippet = _INSPECT_TEMPLATE.replace("__PATH__", repr(object_path))
     res = host.execute(snippet)
@@ -1294,17 +837,17 @@ def interrupt_kernel() -> str:
     the user's running cell, variables and layers along with yours. Wait, or ask
     them.
     """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
-    writer, _label = _client_identity()
-    data, res, _w = _run_job_call(
-        host, "interrupt_current(requester='mcp', writer=" + repr(writer) + ")"
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
+    writer, _label = _writers._client_identity()
+    data, res, _w = _kernel_rpc._run_job_call(
+        host, "interrupt_current", requester="mcp", writer=writer
     )
     if data is None:
-        return _format_execute_result(res)
+        return _kernel_rpc._format_execute_result(res)
     if data.get("refused") == "not_owner":
-        return _NOT_OWNER_MSG.format(held_by="")
+        return _writers._NOT_OWNER_MSG.format(held_by="")
     if data.get("refused") == "foreign_job":
         running = data.get("job_id")
         # "Foreign" is not a synonym for "the user's": it is anything this agent
@@ -1342,9 +885,9 @@ def start_kernel() -> str:
     (which tears the kernel down to idle), call start_kernel again to rebuild.
     (restart_kernel is for hard-restarting an already-running kernel.)
     """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
     result = host.ensure_started()
     if result.get("state") == "ready":
         return (
@@ -1376,21 +919,22 @@ def restart_kernel() -> str:
     It is also not the way past a kernel held by another client: if you do not
     hold this one, this is refused too, and restarting it is the user's to do.
     """
-    host = _kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
     # Gated like every other state change, and this is the sharpest of them: a
     # restart discards the holder's whole session. Decided against the local
     # mirror (_claimed_by) rather than a round trip to the kernel, so a kernel
     # too busy to answer cannot be mistaken for an unclaimed one.
-    writer, _label = _client_identity()
-    if _claimed_by is not None and writer is not None and writer != _claimed_by:
-        return _NOT_OWNER_MSG.format(held_by="")
+    writer, _label = _writers._client_identity()
+    held = _writers.claim_holder()
+    if held is not None and writer is not None and writer != held:
+        return _writers._NOT_OWNER_MSG.format(held_by="")
     try:
         host.restart()
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
-    clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
+    _writers.clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
@@ -1406,9 +950,9 @@ def server_status() -> str:
     """
     import psutil
 
-    host = _kernel_host
+    host = _app._kernel_host
 
-    cpu_percent = psutil.cpu_percent(interval=0.1)
+    cpu_percent = _cpu_percent(psutil)
     mem = psutil.virtual_memory()
     process = psutil.Process(os.getpid())
     proc_mem = process.memory_info()
@@ -1421,7 +965,7 @@ def server_status() -> str:
         f"  memory_available: {mem.available / (1024**3):.1f} GB",
         f"  memory_used_percent: {mem.percent}%",
         f"  process_rss: {proc_mem.rss / (1024**2):.0f} MB",
-        f"  log_file: {_session_log_path or 'stdout (not file-logged)'}",
+        f"  log_file: {_app._session_log_path or 'stdout (not file-logged)'}",
         "",
     ]
 
@@ -1441,7 +985,7 @@ def server_status() -> str:
     # Where a skill the agent writes has to land. Server-process state (the
     # catalog is scanned here, not in the kernel), and the path is configurable,
     # so a hard-coded ~/.config/biopb/skills in a skill body can be wrong.
-    if _skills_enabled:
+    if _app._skills_enabled:
         lines.append("## Skills")
         lines.append(_skills.local_dir_status())
         lines.append("")
@@ -1507,7 +1051,7 @@ def server_status() -> str:
 
     # Only on this path: the early returns above are all "kernel not usable",
     # where the digest round-trip cannot land anyway.
-    return "\n".join(lines) + _foreign_activity_note(host)
+    return "\n".join(lines) + _writers._foreign_activity_note(host)
 
 
 # ---------------------------------------------------------------------------
@@ -1531,7 +1075,7 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=(), *, sock=None):
     (``streamable_http_app``), so a plain uvicorn run drives it — identical to
     the ``mcp.run`` path, only with the socket pre-bound.
     """
-    mcp.settings.transport_security = build_transport_security(
+    mcp.settings.transport_security = _app.build_transport_security(
         allowed_origins, allowed_hosts
     )
     mcp.settings.host = "127.0.0.1"

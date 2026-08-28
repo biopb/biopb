@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from biopb_mcp.mcp import _chat, _server
+from biopb_mcp.mcp import _app, _chat, _kernel_rpc, _server, _writers
 
 _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
 
@@ -20,7 +20,7 @@ _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
 def _envelope(value, window_alive=True):
     """A kernel reply carrying the job runner's ``<<JOB_JSON>>`` payload."""
     return {
-        "stdout": _server._JOB_DELIM
+        "stdout": _kernel_rpc._JOB_DELIM
         + json.dumps({"r": value, "w": window_alive})
         + "\n",
         "result_text": "",
@@ -96,9 +96,9 @@ def chat_host():
         if "_jobs.ack_foreign_digest(" in code:
             host.acked.append(code)
             return _envelope(len(host._digest))
-        if _server._PNG_DELIM in code or "screenshot" in code:
+        if _kernel_rpc._PNG_DELIM in code or "screenshot" in code:
             return {
-                "stdout": _server._PNG_DELIM + _PNG + "\n",
+                "stdout": _kernel_rpc._PNG_DELIM + _PNG + "\n",
                 "result_text": "",
                 "error_text": "",
                 "status": "ok",
@@ -107,15 +107,15 @@ def chat_host():
 
     host.execute.side_effect = execute
 
-    old_host, old_poll = _server._kernel_host, _chat._POLL_INTERVAL
-    _server.set_kernel_host(host)
+    old_host, old_poll = _app._kernel_host, _chat._POLL_INTERVAL
+    _app.set_kernel_host(host)
     _chat._POLL_INTERVAL = 0.0  # the stream is scripted; no reason to wait on it
     _chat.reset()
     yield host
     _chat.reset()
     _chat._POLL_INTERVAL = old_poll
-    _server._kernel_host = old_host
-    _server.clear_claim()
+    _app._kernel_host = old_host
+    _writers.clear_claim()
 
 
 def _call(name, **arguments):
@@ -308,7 +308,7 @@ class TestToolSurface:
     def test_the_payload_is_generated_from_the_live_registry(self, chat_host):
         payload = asyncio.run(_chat.tool_payload())
         names = {t["function"]["name"] for t in payload}
-        listed = {t.name for t in asyncio.run(_server.mcp.list_tools())}
+        listed = {t.name for t in asyncio.run(_app.mcp.list_tools())}
         # Every registered tool, and exactly one thing that is not one: the
         # resource reader, which has no registry entry to generate from. Pinned
         # as equality so a second hand-written tool cannot creep in unnoticed.
@@ -394,9 +394,9 @@ class TestResources:
         assert len(reader) == 1
         described = reader[0]["function"]["description"]
         # Generated from the registry, so it cannot drift from what exists.
-        for res in asyncio.run(_server.mcp.list_resources()):
+        for res in asyncio.run(_app.mcp.list_resources()):
             assert str(res.uri) in described
-        for tpl in asyncio.run(_server.mcp.list_resource_templates()):
+        for tpl in asyncio.run(_app.mcp.list_resource_templates()):
             assert tpl.uriTemplate in described
 
     def test_a_guide_reads_back(self, chat_host):
@@ -648,7 +648,7 @@ class TestExecuteCode:
         assert "already in use by another client (claude-code)" in tool_msg["content"]
         # The refusal names the real holder, so the mirror is corrected rather
         # than left guessing at the loop.
-        assert _server._claimed_by == "sess-A"
+        assert _writers._claimed_by == "sess-A"
 
 
 class TestConcurrency:
@@ -728,13 +728,13 @@ class TestGuards:
         seen = {}
 
         async def model(messages, tools):
-            seen["identity"] = _server._client_identity()
+            seen["identity"] = _writers._client_identity()
             return {"content": "ok"}
 
         asyncio.run(_chat.run_turn("hi", model))
         assert seen["identity"] == ("biopb-chat", "chat")
         # ...and only for the duration of the turn.
-        assert _server._client_identity() == (None, "")
+        assert _writers._client_identity() == (None, "")
 
     def test_a_model_that_never_answers_ends_the_turn(self, chat_host):
         # A tool-call loop that does not converge is not an error the model can

@@ -2,7 +2,7 @@
 
 A reminder, not a self-applying updater: it tells the user a newer release is
 available and shows the install/upgrade command to run (with a one-click copy);
-it never installs anything itself (see ``_update_apply`` for why). Opt-out is
+it never installs anything itself (see ``_update`` for why). Opt-out is
 per-version ("Skip vX.Y.Z") or total ("Stop checking").
 
 Shown only when a napari window exists (the bootstrap fires the check solely on
@@ -34,7 +34,7 @@ def show_update_popup(info, on_choice, viewer=None):
     from qtpy.QtCore import Qt
     from qtpy.QtWidgets import QApplication, QMessageBox
 
-    from ._update_apply import upgrade_command
+    from ._update import upgrade_command
 
     parent = None
     if viewer is not None:

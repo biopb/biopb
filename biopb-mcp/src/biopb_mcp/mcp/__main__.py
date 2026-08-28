@@ -316,7 +316,7 @@ def _serve_http(config, port, view=False):
     first ``start_kernel`` tool call.
     """
     from .._config import get_setting
-    from . import _server, _xvfb
+    from . import _app, _server, _xvfb
     from ._cluster import DaskClusterHost
     from ._kernel import KernelHost
 
@@ -438,11 +438,11 @@ def _serve_http(config, port, view=False):
     # whether a kernel is attached — the one thing that makes a teardown safe.
     cluster_host.set_kernel_alive(host.is_alive)
     cluster_host.start_reaper()
-    _server.set_kernel_host(host)
-    _server.set_promote_after(get_setting(config, "kernel.promote_after"))
+    _app.set_kernel_host(host)
+    _app.set_promote_after(get_setting(config, "kernel.promote_after"))
     # Advertise the curated-skills catalog only when it is enabled (off by
     # default) — mirrors what list_skills / the skill:// resource actually serve.
-    _server.set_skills_enabled(get_setting(config, "services.skills_enabled"))
+    _app.set_skills_enabled(get_setting(config, "services.skills_enabled"))
 
     # Tell server_status where this process's log lives, so an agent can find it.
     #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
@@ -459,7 +459,7 @@ def _serve_http(config, port, view=False):
         session_log = str(get_daemon_log_file(config))
     else:
         session_log = None
-    _server.set_session_log_path(session_log)
+    _app.set_session_log_path(session_log)
 
     # On-demand start: the kernel is NOT launched here. The server stays cheap
     # and idle (no viewer window pops, no Qt abort on a display-less server)

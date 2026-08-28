@@ -9,7 +9,7 @@ build) — so no network is touched and the fail-open contract is exercised.
 import pytest
 
 from biopb_mcp._config import CONFIG, get_default_config
-from biopb_mcp.mcp import _update, _update_apply
+from biopb_mcp.mcp import _update
 
 
 def _release(tag, *, prerelease=False, draft=False, url="https://example/r"):
@@ -229,24 +229,24 @@ class TestHandleChoice:
 
     def test_skip_persists_skipped_version(self, info):
         # conftest isolates CONFIG to a tmp dir, so this write-through is hermetic.
-        _update_apply.handle_choice("skip", info, get_default_config())
+        _update.handle_choice("skip", info, get_default_config())
         assert CONFIG.get("update.skipped_version") == "0.7.0"
         # skip is per-version; the check stays enabled.
         assert CONFIG.get("update.enabled") is True
 
     def test_disable_turns_check_off(self, info):
-        _update_apply.handle_choice("disable", info, get_default_config())
+        _update.handle_choice("disable", info, get_default_config())
         assert CONFIG.get("update.enabled") is False
         # disable is not a per-version skip.
         assert CONFIG.get("update.skipped_version") == ""
 
     def test_later_does_nothing(self, info):
-        _update_apply.handle_choice("later", info, get_default_config())
+        _update.handle_choice("later", info, get_default_config())
         assert CONFIG.get("update.skipped_version") == ""
         assert CONFIG.get("update.enabled") is True
 
     def test_unknown_action_is_noop(self, info):
-        _update_apply.handle_choice("bogus", info, get_default_config())
+        _update.handle_choice("bogus", info, get_default_config())
         assert CONFIG.get("update.skipped_version") == ""
         assert CONFIG.get("update.enabled") is True
 
@@ -254,9 +254,9 @@ class TestHandleChoice:
         def _boom(*a, **k):
             raise RuntimeError("config blew up")
 
-        monkeypatch.setattr(_update_apply, "_persist_skip", _boom)
+        monkeypatch.setattr(_update, "_persist_skip", _boom)
         # Must not raise — it runs inside a Qt slot.
-        _update_apply.handle_choice("skip", info, get_default_config())
+        _update.handle_choice("skip", info, get_default_config())
 
 
 class TestUpgradeCommand:
@@ -264,11 +264,11 @@ class TestUpgradeCommand:
     # os.name="nt" on a POSIX runner makes pathlib pick WindowsPath, which raises
     # on Python < 3.12 and crashes pytest's own location reporting mid-test.
     def test_posix_uses_curl_pipe_bash(self, monkeypatch):
-        monkeypatch.setattr(_update_apply, "_is_windows", lambda: False)
-        cmd = _update_apply.upgrade_command()
+        monkeypatch.setattr(_update, "_is_windows", lambda: False)
+        cmd = _update.upgrade_command()
         assert cmd.startswith("curl ") and "install.sh" in cmd
 
     def test_windows_uses_irm_iex(self, monkeypatch):
-        monkeypatch.setattr(_update_apply, "_is_windows", lambda: True)
-        cmd = _update_apply.upgrade_command()
+        monkeypatch.setattr(_update, "_is_windows", lambda: True)
+        cmd = _update.upgrade_command()
         assert "irm " in cmd and "install.ps1" in cmd

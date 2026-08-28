@@ -75,6 +75,12 @@ _MAX_RETAINED_JOBS = 200
 # still means "there is more in the record" rather than "the record ends here".
 _MAX_JOB_OUTPUT_CHARS = 200_000
 
+# How much of the front of a stream `write_output` copies aside so that
+# `output_head` can find the first line without rebuilding the buffer. Two
+# orders of magnitude above the 80-char line it has to find, so the only text
+# it can miss is a first line already too long to survive the cap anyway.
+_HEAD_SCAN_CHARS = 4096
+
 # Attribution for a KeyboardInterrupt this runner did not raise (see _run). The
 # kernel ignores SIGINT except while servicing a message (ipykernel installs
 # default_int_handler only between its pre/post handler hooks), so the realistic
@@ -111,11 +117,13 @@ _owner_label = ""
 # the session has bound since.
 _baseline_names = None
 
-# Names a scratch namespace falls back to when no baseline was recorded: a
-# partial bootstrap, or a unit test driving this runner directly. A floor under
-# mark_baseline(), not a substitute -- it knows the built-in handles and cannot
-# know a plugin's.
-_SCRATCH_FALLBACK_NAMES = frozenset(
+# What the bootstrap binds into the kernel namespace. Two readers need exactly
+# this list -- a scratch run seeds from it (below), and `_bootstrap` refuses to
+# let a user plugin shadow any of it (#92) -- so it is named once here rather
+# than written out in both. `_bootstrap` is the one that binds them, but `_jobs`
+# is the module it already imports, and a set defined in the importer would make
+# the dependency point the wrong way.
+KERNEL_HANDLE_NAMES = frozenset(
     {
         "viewer",
         "client",
@@ -129,17 +137,33 @@ _SCRATCH_FALLBACK_NAMES = frozenset(
         "_dask_attach_done",
         "_viewer_window_alive",
         "_resync_view",
-        "get_ipython",
-        "__name__",
-        "__builtins__",
     }
 )
+
+# Names a scratch namespace falls back to when no baseline was recorded: a
+# partial bootstrap, or a unit test driving this runner directly. A floor under
+# mark_baseline(), not a substitute -- it knows the built-in handles and cannot
+# know a plugin's.
+_SCRATCH_FALLBACK_NAMES = KERNEL_HANDLE_NAMES | {
+    "get_ipython",
+    "__name__",
+    "__builtins__",
+}
 
 # The last verification whose every cell ran (see :func:`verified`). Module
 # state rather than a job field because it outlives the job that produced it:
 # it is the session's answer to "which program is known to work", and a later
 # failed run does not un-verify it.
 _verified = None
+
+
+def _dropped_marker(n):
+    """The line `output` prepends once the cap has discarded a head.
+
+    One spelling, because `output_head` has to recognise the same sentence it
+    would otherwise have to re-derive from the rebuilt text.
+    """
+    return f"...({n} earlier chars dropped)..."
 
 
 class _OutputBuffer:
@@ -153,7 +177,7 @@ class _OutputBuffer:
     way a job does without either having to remember to.
     """
 
-    __slots__ = ("stdout", "stdout_dropped", "result_text")
+    __slots__ = ("stdout", "stdout_dropped", "result_text", "head_prefix")
 
     def __init__(self):
         self.stdout = io.StringIO()
@@ -162,6 +186,9 @@ class _OutputBuffer:
         # a number that only ever increases (see `output_total`).
         self.stdout_dropped = 0
         self.result_text = ""
+        # A bounded copy of the start of the stream, so `output_head` never has
+        # to rebuild the whole buffer to answer with one line. See there.
+        self.head_prefix = ""
 
     def write_output(self, s):
         """Append captured output, keeping at most the newest cap-worth.
@@ -175,6 +202,8 @@ class _OutputBuffer:
         thread), so no lock: a reader racing the swap gets the pre-compaction
         buffer, which is longer but never torn.
         """
+        if len(self.head_prefix) < _HEAD_SCAN_CHARS:
+            self.head_prefix += s[: _HEAD_SCAN_CHARS - len(self.head_prefix)]
         n = self.stdout.write(s)
         if self.stdout.tell() > 2 * _MAX_JOB_OUTPUT_CHARS:
             text = self.stdout.getvalue()
@@ -196,15 +225,35 @@ class _OutputBuffer:
         text = self.stdout.getvalue()
         if not self.stdout_dropped:
             return text
-        return f"...({self.stdout_dropped} earlier chars dropped)...\n" + text
+        return _dropped_marker(self.stdout_dropped) + "\n" + text
 
     def output_total(self):
         """Everything this buffer has ever taken, including what was dropped.
 
         Monotonic, which `len(stdout)` is not once the cap compacts. A reader
         streaming the output as it grows has to diff against this.
+
+        `tell()` rather than `len(getvalue())`: the buffer is append-only, so
+        the two agree, but `getvalue()` copies it -- and `jobs_summary` asks
+        every retained job for this on each ~1s observe poll.
         """
-        return self.stdout_dropped + len(self.stdout.getvalue())
+        return self.stdout_dropped + self.stdout.tell()
+
+    def output_head(self, limit=80):
+        """First non-blank line of :meth:`output`, without rebuilding it.
+
+        `_one_line(self.output())` would copy the whole capped buffer (up to
+        `_MAX_JOB_OUTPUT_CHARS`) to keep 80 characters, once per cell per poll
+        while a verification runs. `write_output` keeps the first
+        `_HEAD_SCAN_CHARS` instead, which is where a first line short enough to
+        survive `limit` must be. An opening run of whitespace longer than that
+        scan reports no head rather than a later line -- a preview field, and
+        nothing prints 4 KB of blanks before its first word.
+        """
+        if self.stdout_dropped:
+            # The real head is gone; say so, the way `output` does.
+            return _one_line(_dropped_marker(self.stdout_dropped), limit)
+        return _one_line(self.head_prefix, limit)
 
 
 class _Job(_OutputBuffer):
@@ -223,6 +272,8 @@ class _Job(_OutputBuffer):
         "started_wall",
         "finished",
         "verify",
+        "code_preview",
+        "intent_preview",
     )
 
     def __init__(self, job_id, code="", origin="mcp", intent=""):
@@ -276,6 +327,11 @@ class _Job(_OutputBuffer):
         # cell. Set at submit and never after: it decides which namespace the
         # job runs in, so a job cannot become a verification once started.
         self.verify = None
+        # The one-liners `jobs_summary` shows, cut once here rather than on
+        # every observe poll: `code` and `intent` are fixed at submit, and the
+        # summary re-split every retained job's full source at ~1 Hz.
+        self.code_preview = _one_line(code)
+        self.intent_preview = _one_line(intent)
 
     def elapsed(self):
         end = self.finished if self.finished is not None else time.monotonic()
@@ -358,7 +414,7 @@ class _Cell(_OutputBuffer):
             "error_text": self.error_text,
             "elapsed": self.elapsed(),
             "stdout_len": self.output_total(),
-            "stdout_head": _one_line(self.output()),
+            "stdout_head": self.output_head(),
         }
         if full:
             snap["stdout"] = self.output()
@@ -832,12 +888,14 @@ def poll(job_id):
     return job.snapshot()
 
 
-def _cancel(job_id, reason=None):
-    job = _jobs.get(job_id)
-    if job is None:
-        return {"job_id": job_id, "cancelled": False, "status": "unknown"}
-    if job.status != "running":
-        return {"job_id": job_id, "cancelled": False, "status": job.status}
+def _cancel_dask_futures(job, reason=None):
+    """Stop *job*'s in-flight dask work, tagging why.
+
+    Takes the job rather than its id: the one caller
+    (:func:`interrupt_current`) has already resolved it and established that it
+    is running, and re-deriving both here only created return values -- an
+    "unknown" job, a non-running one -- that no caller could observe.
+    """
     # Set the reason before cancelling futures: the job only unwinds after the
     # future-cancel makes its gather raise, so its finalizer is guaranteed to
     # see the reason.
@@ -861,7 +919,6 @@ def _cancel(job_id, reason=None):
                 dc.cancel([Future(k, dc) for k in keys], force=True)
         except Exception:  # noqa: BLE001 - cancel is best-effort
             logger.debug("distributed cancel failed", exc_info=True)
-    return {"job_id": job_id, "cancelled": True, "status": job.status}
 
 
 def _running_job():
@@ -946,7 +1003,7 @@ def interrupt_current(reason=None, requester="user", writer=None):
             "origin": job.origin,
         }
     job.interrupted = True  # finalize as "interrupted"
-    _cancel(job.job_id, reason=reason)
+    _cancel_dask_futures(job, reason=reason)
     ident = job.thread.ident if job.thread is not None else None
     raised = _raise_in_thread(ident, KeyboardInterrupt)
     return {"job_id": job.job_id, "interrupted": bool(raised)}
@@ -973,12 +1030,12 @@ def jobs_summary():
             "origin": j.origin,
             "elapsed": j.elapsed(),
             "stdout_len": j.output_total(),
-            "code_preview": _one_line(j.code),
+            "code_preview": j.code_preview,
             # Why the cell was run, when whoever ran it said. The observe list
             # prefers it over the code line: "isolate the nuclei channel" tells
             # the person watching what is happening to their data, and
             # `arr = arr[..., 1]` makes them reconstruct it.
-            "intent_preview": _one_line(j.intent),
+            "intent_preview": j.intent_preview,
         }
         for j in _jobs.values()
     ]

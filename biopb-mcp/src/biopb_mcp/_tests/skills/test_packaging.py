@@ -2,7 +2,7 @@
 
 Every other test in this suite reads the checkout, so all of them pass whether
 or not the skills ship. If they stop shipping, imports still work, this suite is
-still green, and `find_skills` quietly returns only whatever is in the user's own
+still green, and `list_skills` quietly returns only whatever is in the user's own
 directory. The runtime deliberately cannot catch that -- it is on the agent's
 path and must degrade rather than raise (`_skills._warn_empty_once` leaves a
 breadcrumb, nothing more) -- so it is caught here, by building the thing that

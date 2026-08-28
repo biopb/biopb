@@ -2,7 +2,7 @@
 
 Two entry points are wired into ``_server.py``:
 
-* :func:`find_skills` — the ``find_skills`` tool: query the catalog metadata and
+* :func:`list_skills` — the ``list_skills`` tool: query the catalog metadata and
   return a tailored subset (each carrying its ``skill://<id>`` URI).
 * :func:`get_skill_body` — the ``skill://{id}`` resource read: the skill's full
   markdown body, frontmatter stripped.
@@ -196,7 +196,7 @@ def _shipped_text(name: str) -> str | None:
 
 
 # One warning per process, not per call: load_catalog() runs on every
-# find_skills, and a broken install would otherwise fill the session log.
+# list_skills, and a broken install would otherwise fill the session log.
 _warned_empty = False
 
 
@@ -222,7 +222,7 @@ def _warn_empty_once(detail: str) -> None:
     _warned_empty = True
     logger.warning(
         "skills: no skills found in the package (%s). This is an install or "
-        "packaging problem, not a configuration one -- find_skills will only "
+        "packaging problem, not a configuration one -- list_skills will only "
         "return skills from %s.",
         detail,
         _local_dir() or "the local skills dir",
@@ -374,7 +374,7 @@ def _merge_local(shipped: list[dict]) -> list[dict]:
 # only as bare names, and a *name* says nothing about capability: across eight
 # benchmark arms, five were shown `## Kernel plugins  files: <name>` and not one
 # followed it up, while all three that reached the same plugin through a skill
-# body called it. So the thing that has to reach `find_skills` is the sentence
+# body called it. So the thing that has to reach `list_skills` is the sentence
 # the module already carries.
 #
 # The docstring is that sentence, and reading it here keeps the rule the plugin
@@ -459,6 +459,13 @@ def _scan_plugins() -> list[dict]:
         logger.debug("skills: plugin-file scan failed (fail-open)", exc_info=True)
 
     try:
+        # Read fresh, like every other source (see load_catalog). Tempting to
+        # cache -- it is the expensive half of a catalog read -- but the answer
+        # does change in a live process: `entry_points()` re-scans, so a
+        # `pip install` of a plugin package is visible without restarting this
+        # one. A cache here would leave `list_skills` reporting a set the next
+        # `restart_kernel` has already picked up, so `server_status` and the
+        # catalog would disagree about the same plugin.
         for row in _kernel_plugins.entry_point_plugins():
             # No docstring here by construction: reading one would mean importing
             # the module, which this side does not do.
@@ -545,7 +552,7 @@ def _search_text(s: dict) -> str:
 
     The ``id`` is in it, with hyphens opened out to spaces, because a user who
     names the skill ("flatfield") is making the most specific request there is;
-    matching only prose would miss it. Everything else is what the ``find_skills``
+    matching only prose would miss it. Everything else is what the ``list_skills``
     docstring advertises: title, description, tags.
 
     A plugin row adds ``_blurb`` — its docstring's opening paragraph — and needs
@@ -584,7 +591,12 @@ def search_terms(keywords: Sequence[str] | str) -> list[str]:
     return [term for k in keywords for term in str(k).lower().split()]
 
 
-def find_skills(keywords: Sequence[str] | str = ()) -> list[dict]:
+def _matches(haystack: str, terms: Sequence[str]) -> bool:
+    """Every term present in *haystack* — the narrowing filter list_skills documents."""
+    return all(t in haystack for t in terms)
+
+
+def list_skills(keywords: Sequence[str] | str = ()) -> list[dict]:
     """Filter the catalog by *keywords* over id/title/description/tags.
 
     Empty returns everything. **Every keyword must appear** somewhere in that
@@ -609,7 +621,9 @@ def find_skills(keywords: Sequence[str] | str = ()) -> list[dict]:
     skills = load_catalog()
     terms = search_terms(keywords)
     if terms:
-        skills = [s for s in skills if all(t in _search_text(s) for t in terms)]
+        # The haystack once per skill, not once per (skill, term): `search_terms`
+        # splits phrases, so the term count is not the caller's list length.
+        skills = [s for s in skills if _matches(_search_text(s), terms)]
     out = []
     for s in sorted(
         skills, key=lambda s: (s.get("kind") != KIND_SKILL, s["title"].lower())
@@ -646,11 +660,11 @@ def get_skill_body(skill_id: str) -> str:
     if entry is None:
         return (
             f"No skill '{skill_id}' in the catalog. "
-            "Call find_skills to list available skills."
+            "Call list_skills to list available skills."
         )
 
     if entry.get("kind") == KIND_PLUGIN:
-        # Reachable: find_skills returns plugins too, and a `skill://<id>` read
+        # Reachable: list_skills returns plugins too, and a `skill://<id>` read
         # is the habit that row is sitting next to. Say what it is instead of
         # reporting it missing -- it exists, it is just not a document.
         handle = entry.get("handle", skill_id)
