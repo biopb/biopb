@@ -11,10 +11,16 @@ description = "BioPB Tensor Arrow Flight server for multi-dimensional array stor
 readme = "README.md"
 license = "MIT"
 dependencies = [
-  # Floor: the cache ProcessLock imports biopb._lifecycle.proc (process identity primitive),
-  # first shipped in biopb 0.7.0. The uv workspace already pairs versions from the
-  # tree, so this floor is documentation for any non-workspace install path.
-  "biopb >= 0.7.0",
+  # Floor: the server imports several stdlib-only primitives out of the SDK's
+  # private core -- _lifecycle.proc/file_lock/deathwatch, _locations, the
+  # _config_* validators, _web_auth, and _fs_detect. The binding one is the
+  # newest: cli.py imports biopb._fs_detect (the cache-dir storage classifier,
+  # moved down from this package so the SDK's own disk chunk cache can share one
+  # mount-table parser), which first ships in biopb 0.10.0. These are plain
+  # module imports at startup, so an SDK below the floor is an ImportError, not a
+  # degraded path. The uv workspace already pairs versions from the tree, so this
+  # floor is documentation for any non-workspace install path.
+  "biopb >= 0.10.0",
   # Floor verified for the file cache's Windows zero-copy segment read (#572):
   # the cache hands out batches that alias the segment mmap and unlinks the file
   # (on eviction) while a caller still holds one. That is safe only if
