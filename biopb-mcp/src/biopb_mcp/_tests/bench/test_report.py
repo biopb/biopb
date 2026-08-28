@@ -619,7 +619,7 @@ def test_the_catalog_probe_asks_for_the_whole_catalog(monkeypatch):
             return SimpleNamespace(text=json.dumps([{"id": "flatfield"}]))
 
     assert read_catalog(FakeSession()) == ("flatfield",)
-    assert calls == [("find_skills", {})], (
+    assert calls == [("list_skills", {})], (
         "the probe filtered the catalog; it asks whether one was offered at all"
     )
 

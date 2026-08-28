@@ -374,16 +374,16 @@ class ServicesConfig:
     skills_enabled: bool = _h(
         True,
         "Master switch for skills discovery/retrieval. On by default: the agent is "
-        "told to consult find_skills, which resolves the curated workflows shipped "
+        "told to consult list_skills, which resolves the curated workflows shipped "
         "with this package plus the user's own (skills_local_dir). Set false to keep "
-        "the subsystem dormant -- find_skills returns nothing and the agent is not "
+        "the subsystem dormant -- list_skills returns nothing and the agent is not "
         "told about skills.",
     )
     skills_local_dir: str = _h(
         "",
         "Directory of user-authored skill files (*.md) merged into the catalog "
         "beside the shipped ones; empty -> ~/.config/biopb/skills. Personal and "
-        "unreviewed (find_skills reports them as origin=local), re-read on every "
+        "unreviewed (list_skills reports them as origin=local), re-read on every "
         "discovery so an edit is live without a restart. Since the curated set now "
         "arrives only with a release, this is also the only way a skill reaches a "
         "machine out of band. Off with skills_enabled like the rest of the "
@@ -391,7 +391,7 @@ class ServicesConfig:
     )
     skills_index_plugins: bool = _h(
         True,
-        "Also return kernel plugins from find_skills, described by their module "
+        "Also return kernel plugins from list_skills, described by their module "
         "docstring (read with ast, never imported). Without this a plugin is "
         "discoverable only as a bare name in server_status, which conveys nothing "
         "about what it does -- measured: five benchmark arms were shown the name "

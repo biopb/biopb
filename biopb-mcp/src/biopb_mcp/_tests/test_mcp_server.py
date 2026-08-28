@@ -207,7 +207,7 @@ class TestResources:
         assert "restart_kernel" in section
 
     def test_guide_skill_section_gated_on_the_catalog_switch(self):
-        # With the catalog off there is no find_skills to hand back a
+        # With the catalog off there is no list_skills to hand back a
         # `checklist:`, so the section documents a tool the agent cannot
         # call -- the gate the handshake instructions already use.
         _server.set_skills_enabled(False)
@@ -314,8 +314,8 @@ class TestInstructions:
         assert 'format="pandas"' in base
         assert "source_url" in base
         # Skills stay a separate fragment: the base guidance must not point the
-        # agent at find_skills, which returns nothing once the catalog is off.
-        assert "find_skills" not in base
+        # agent at list_skills, which returns nothing once the catalog is off.
+        assert "list_skills" not in base
         # And the base alone is the handshake when skills are off.
         _server.set_skills_enabled(False)
         assert _server.mcp._mcp_server.instructions == base
@@ -328,14 +328,14 @@ class TestInstructions:
         assert _server._skills_enabled is DEFAULT_CONFIG["services"]["skills_enabled"]
 
     def test_skills_directive_gated_on_enable(self):
-        # Off: no find_skills mention in the handshake.
+        # Off: no list_skills mention in the handshake.
         _server.set_skills_enabled(False)
-        assert "find_skills" not in _server.mcp._mcp_server.instructions
+        assert "list_skills" not in _server.mcp._mcp_server.instructions
         # On: the skills fragment is appended to the base guidance.
         _server.set_skills_enabled(True)
         instr = _server.mcp._mcp_server.instructions
         assert instr.startswith(_server._BASE_INSTRUCTIONS)
-        assert "find_skills" in instr
+        assert "list_skills" in instr
         assert "skill://" in instr
         # Back off: no stale fragment left behind.
         _server.set_skills_enabled(False)
@@ -1336,7 +1336,7 @@ class TestToolReturnShape:
     Which shape a tool yields is decided by its **return annotation**: an
     annotation FastMCP can build an output schema from gets the tuple, and one
     it cannot gets the bare list. That makes the split easy to change by
-    accident — retyping ``find_skills`` from ``list`` to ``list[dict]`` would
+    accident — retyping ``list_skills`` from ``list`` to ``list[dict]`` would
     silently move it, and reshape what an in-process caller receives without
     touching a line of that caller. It is also the wire contract: the same
     annotation decides whether an ``outputSchema`` is advertised to real MCP
@@ -1349,7 +1349,7 @@ class TestToolReturnShape:
 
     #: (tool, minimal kwargs, declares an outputSchema / returns the tuple)
     SHAPES = [
-        ("find_skills", {}, False),
+        ("list_skills", {}, False),
         ("take_screenshot", {}, False),
         ("execute_code", {"python_code": "1"}, True),
         ("poll_job", {"job_id": "job-1"}, True),

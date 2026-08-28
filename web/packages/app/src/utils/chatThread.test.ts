@@ -250,10 +250,10 @@ describe("groupThread", () => {
       fromChatHistory([
         user("m-1", "go"),
         assistant("m-2", "", [
-          { id: "c1", name: "find_skills" },
+          { id: "c1", name: "list_skills" },
           { id: "c2", name: "execute_code" },
         ]),
-        toolResult("m-3", "c1", "find_skills", "a"),
+        toolResult("m-3", "c1", "list_skills", "a"),
         toolResult("m-4", "c2", "execute_code", "b"),
         assistant("m-5", "done"),
       ]),
@@ -405,7 +405,7 @@ describe("applyLiveOutput", () => {
   it("ignores a call that cannot be running a cell", () => {
     // Only execute_code submits one; anything else in progress does not print.
     const items = fromChatHistory(
-      [assistant("m-1", "", [{ id: "c1", name: "find_skills" }])],
+      [assistant("m-1", "", [{ id: "c1", name: "list_skills" }])],
       true,
     );
     applyLiveOutput(items, live("noise"));

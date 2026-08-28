@@ -62,7 +62,7 @@ ORIGIN = "chat"
 #: Name of the synthesized tool that reads ``guide://`` and ``skill://``.
 #: Resources are an MCP concept with no function-calling equivalent, so a model
 #: driven by this loop cannot reach them unless one is invented -- and the
-#: session instructions and ``find_skills`` both send it there, so without this
+#: session instructions and ``list_skills`` both send it there, so without this
 #: the agent is told to read documents it has no way to open.
 RESOURCE_TOOL = "read_resource"
 
@@ -228,7 +228,7 @@ async def _resource_tool():
     An MCP client reads ``guide://kernel`` through ``resources/read``; a model
     speaking function-calling has no such verb, so the loop hands it one. This
     is not a convenience — ``_BASE_INSTRUCTIONS`` tells the agent to read the
-    guides before non-trivial work and ``find_skills`` answers with
+    guides before non-trivial work and ``list_skills`` answers with
     ``skill://<id>``, so an agent without it is instructed to open documents it
     cannot reach, and will answer from guesswork instead.
 
@@ -249,7 +249,7 @@ async def _resource_tool():
                 "what the session instructions mean by 'read guide://...' — read "
                 "the relevant one before non-trivial work rather than guessing "
                 "at the API. A curated workflow's steps come from "
-                "skill://<skill_id>, and find_skills is what gives you the id.\n"
+                "skill://<skill_id>, and list_skills is what gives you the id.\n"
                 + "\n".join(lines)
             ),
             "parameters": {

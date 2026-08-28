@@ -87,7 +87,7 @@ def test_the_benchmark_ran_and_wrote_its_report(run: Run):
 def test_the_catalog_matched_the_switch(run: Run):
     """Whether the report means anything at all.
 
-    Checked on what the catalog *returned*, not on whether `find_skills` was
+    Checked on what the catalog *returned*, not on whether `list_skills` was
     called: the tool stays registered either way and it is `load_catalog()` that
     gates, so a `--bench-skills=false` run can call it and get an empty list.
 

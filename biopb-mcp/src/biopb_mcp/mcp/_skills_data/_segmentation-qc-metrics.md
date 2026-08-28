@@ -13,7 +13,7 @@ checklist: [viewer, tensor, plugin:segmentation_qc, pkg:biopb-mcp>=0.13.0]
 > eight passed — three that read this body and used `segmentation_qc`, five that
 > never saw it and hand-rolled a matcher, agreeing to machine epsilon
 > (`f1_err` 1.1e-16 against a 0.01 limit). The only function it was demonstrably
-> performing was making the plugin discoverable, and `find_skills` now indexes
+> performing was making the plugin discoverable, and `list_skills` now indexes
 > kernel plugins directly, so `segmentation_qc` is reachable without it.
 >
 > **What that evidence does not cover**, and what would justify promoting this

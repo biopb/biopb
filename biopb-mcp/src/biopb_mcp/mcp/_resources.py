@@ -119,12 +119,12 @@ and the round trip for data too large to hold: `guide://data`.
 # Appended to GUIDE only when the skills catalog is enabled
 # (``services.skills_enabled``, on by default; see _server.get_kernel_guide).
 # An install with skills off has no `checklist:` to resolve and no
-# `find_skills` to get them from, so this section would describe a tool the
+# `list_skills` to get them from, so this section would describe a tool the
 # agent cannot call -- the same reasoning as _SKILLS_INSTRUCTIONS.
 SKILL_REQUIREMENTS = """\
 
 ## Skill requirements
-A curated skill from `find_skills` carries a `checklist:`. **Resolve it before you start the
+A curated skill from `list_skills` carries a `checklist:`. **Resolve it before you start the
 skill** — one that assumes a plugin or package it doesn't have fails partway through, after
 the user has already waited.
 
