@@ -335,6 +335,48 @@ def test_console_submits_as_the_user(client, host):
     assert "viewer.layers" in snippet  # embedded via repr
 
 
+def test_console_records_the_users_reason(client, host):
+    # The field that makes the export symmetric. The agent states why through
+    # execute_code's `intent`; before this the human had no way to, so the audit
+    # recorded a reason for every writer except the person at the machine.
+    host.execute.return_value = _reply({"job_id": "job-5", "status": "running"})
+    r = client.post(
+        "/console/execute",
+        json={"code": "viewer.layers", "intent": "  see what the agent loaded  "},
+    )
+    assert r.status_code == 200
+    # Stripped, so a note that is only whitespace cannot read as one that exists.
+    assert "intent='see what the agent loaded'" in host.execute.call_args[0][0]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"code": "1"},  # absent
+        {"code": "1", "intent": "   "},  # blank
+        {"code": "1", "intent": 7},  # not a string
+    ],
+)
+def test_console_without_a_reason_still_runs(client, host, body):
+    # Nobody owes a reason for one line that reads a variable, so none of these
+    # is a bad request -- the cell runs and simply carries no intent, exactly as
+    # every console cell did before the field existed.
+    host.execute.return_value = _reply({"job_id": "job-6", "status": "running"})
+    assert client.post("/console/execute", json=body).status_code == 200
+    assert "intent=''" in host.execute.call_args[0][0]
+
+
+def test_console_truncates_an_overlong_reason_rather_than_refusing_it(client, host):
+    # Refusing would cost the user the run over a label. The row shows one line
+    # of it and the export renders it as a sentence, so the tail is not missed.
+    host.execute.return_value = _reply({"job_id": "job-7", "status": "running"})
+    r = client.post("/console/execute", json={"code": "1", "intent": "x" * 5000})
+    assert r.status_code == 200
+    snippet = host.execute.call_args[0][0]
+    assert "x" * _observe._MAX_INTENT_CHARS in snippet
+    assert "x" * (_observe._MAX_INTENT_CHARS + 1) not in snippet
+
+
 def test_console_requires_a_json_content_type(client):
     # Restored on this route only (the sibling POSTs keep the exemption, see
     # test_post_without_json_content_type_ok): a cross-site form POST cannot set

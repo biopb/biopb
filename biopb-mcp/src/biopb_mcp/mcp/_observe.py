@@ -85,6 +85,12 @@ logger = logging.getLogger(__name__)
 # not it — stopped the work.
 _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 
+# Cap on the console's optional "why" note. A label, not the payload -- the job
+# row shows one line of it and the export renders it as a sentence -- so it is
+# truncated rather than refused: rejecting a cell because its note ran long
+# would cost the user the run, which is the part that matters.
+_MAX_INTENT_CHARS = 500
+
 # Launcher-tunable settings (defaults mirror _config DEFAULT_CONFIG). Set by
 # configure() before the routes are registered/served.
 _max_output_chars = 20000
@@ -393,6 +399,11 @@ async def _console_execute(request):
     · job-7 (agent)") rather than as a failed action. There is no preemption and
     no queue: a person who wants the kernel now uses Interrupt, which is theirs
     to use and attributes the stop to them.
+
+    The optional ``intent`` is the same field the agent fills through
+    ``execute_code``: why this cell is being run. It is what lets the notebook
+    export say why a *human's* cell ran rather than only showing its code --
+    without it the audit records a reason for every writer except the person.
     """
     host, err = _require_host()
     if err is not None:
@@ -404,9 +415,16 @@ async def _console_execute(request):
     code = payload.get("code") if isinstance(payload, dict) else None
     if not isinstance(code, str) or not code.strip():
         return JSONResponse({"error": "missing 'code'"}, status_code=400)
+    # Optional, and unlike the agent's it is nobody's obligation: someone running
+    # one line to look at a variable owes no reason for it. So absent, blank and
+    # not-a-string all mean "no intent" rather than a bad request -- the job
+    # simply carries none, exactly as it does today.
+    raw = payload.get("intent") if isinstance(payload, dict) else None
+    intent = raw.strip()[:_MAX_INTENT_CHARS] if isinstance(raw, str) else ""
 
     submitted, res, _w = _server._run_job_call(
-        host, "submit(" + repr(code) + ", origin='user')"
+        host,
+        "submit(" + repr(code) + ", origin='user', intent=" + repr(intent) + ")",
     )
     if submitted is None:
         # Distinct from the job-busy case below: this is the kernel *lock*, held

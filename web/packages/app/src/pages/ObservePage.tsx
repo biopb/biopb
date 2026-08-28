@@ -353,7 +353,7 @@ export default function ObservePage() {
   const running = jobs?.find((j) => j.status === "running") ?? null;
 
   const runCell = useCallback(
-    async (code: string): Promise<string | null> => {
+    async (code: string, intent: string): Promise<string | null> => {
       let r: Response;
       try {
         r = await sessionFetch(base + "/console/execute", {
@@ -362,7 +362,7 @@ export default function ObservePage() {
           // cannot set, and the child requires it on this route for exactly
           // that reason. `sessionFetch` adds the bearer token alongside it.
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code }),
+          body: JSON.stringify({ code, intent }),
         });
       } catch (e) {
         return String(e);
@@ -523,14 +523,15 @@ export default function ObservePage() {
  * not as an error after the click. A rejected cell is the serialization rule
  * working, and showing it as a red failure would train the user to reach for
  * Interrupt reflexively. */
-function ConsolePanel({
+export function ConsolePanel({
   running,
   onRun,
 }: {
   running: JobSummary | null;
-  onRun: (code: string) => Promise<string | null>;
+  onRun: (code: string, intent: string) => Promise<string | null>;
 }) {
   const [code, setCode] = useState("");
+  const [intent, setIntent] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const busy = running !== null;
@@ -538,9 +539,15 @@ function ConsolePanel({
   const submit = useCallback(async () => {
     if (!code.trim() || busy || submitting) return;
     setSubmitting(true);
-    setError(await onRun(code));
+    const err = await onRun(code, intent);
+    setError(err);
+    // Cleared on success while the code is kept. The note describes the cell
+    // that just ran; carried over it would silently label the *next* one, which
+    // is the provenance failure the field exists to prevent. The code stays
+    // because editing and re-running it is the ordinary next move.
+    if (err === null) setIntent("");
     setSubmitting(false);
-  }, [code, busy, submitting, onRun]);
+  }, [code, intent, busy, submitting, onRun]);
 
   const label = busy
     ? `kernel busy · ${running!.job_id} (${writerName(running!.origin)})`
@@ -555,7 +562,32 @@ function ConsolePanel({
           line it cost came off the job list. The error sits between them, where
           there was nothing but empty space. */}
       <div className="console-head">
-        <span className="label">your cell — runs in this session&apos;s kernel</span>
+        <span
+          className="label"
+          title="Runs in this session's kernel, serialized against the agent"
+        >
+          your cell
+        </span>
+        {/* On the head row, not a row of its own: this column is a fixed height
+            and a new line would come straight off the job list. It takes the
+            space the panel's explanatory prose had, which the label's tooltip
+            still carries. Optional by design — a cell run to look at a variable
+            needs no reason — but without it the export records a stated reason
+            for every writer except the person at the machine. */}
+        <input
+          className="console-why"
+          value={intent}
+          placeholder="why? (optional)"
+          spellCheck={false}
+          title="Recorded with the cell and written into the notebook export"
+          onChange={(e) => setIntent(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
         <span className="console-err">{error || ""}</span>
         <button
           className="primary"
@@ -795,8 +827,15 @@ const OBS_CSS = `
   .obs-page .console-head { display: flex; align-items: center; gap: 10px;
              margin-bottom: 6px; }
   .obs-page .console-head .label { margin: 0; flex: 0 0 auto; }
-  .obs-page .console-head .console-err { flex: 1; min-width: 0; text-align: right;
+  .obs-page .console-head .console-err { flex: 0 1 auto; min-width: 0;
+             text-align: right;
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* #bcd and not monospace, matching the job row's .intent: the same words are
+     shown in both places and should read as the same kind of thing. */
+  .obs-page .console-head .console-why { flex: 1; min-width: 0; background: #0c0c0c;
+             color: #bcd; border: 1px solid #333; border-radius: 4px;
+             padding: 4px 8px; font-size: 12px; font-family: inherit; }
+  .obs-page .console-head .console-why:focus { outline: none; border-color: #2a5; }
   .obs-page .console button:disabled { opacity: .55; cursor: default; background: #222; }
   .obs-page .console-err { color: #f99; font-size: 12px; }
   .obs-page .ended { border: 1px solid #744; background: #241a1a; color: #fbb;

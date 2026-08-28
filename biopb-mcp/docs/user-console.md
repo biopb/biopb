@@ -180,6 +180,14 @@ consequence of that one field.
 **The notebook export becomes a real audit.** Cell provenance is recorded rather than
 implied, and the interleaving is already correct — `export()` is job-ordered.
 
+> **Since:** the console carries an optional `intent` too — the same field the agent
+> fills through `execute_code`, typed beside the Run button. Without it the export
+> could state a reason for every writer *except* the person at the machine, who is
+> the one writer whose reasoning nothing else in the record can reconstruct: an
+> agent's cells sit in a conversation, a human's sit alone. Optional by design (a
+> cell run to look at a variable owes no explanation) and truncated rather than
+> refused, because refusing would cost someone the run over a label.
+
 **The busy message must branch.** `execute_code` today tells the agent: *"A job (job-7)
 is already running… stop it with interrupt_kernel / restart_kernel"* (`_server.py:647`).
 An agent reading that while a **human's** cell is running will cheerfully kill it. Split

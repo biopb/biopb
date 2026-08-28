@@ -111,3 +111,21 @@ def test_ordering_and_count_in_intro():
 def test_suggested_filename():
     assert _notebook.suggested_filename().endswith(".ipynb")
     assert _notebook.suggested_filename().startswith("biopb-mcp-session-")
+
+
+def test_a_user_cell_carries_its_stated_reason_into_the_export():
+    # The console gained a "why" field for this: before it, the export could say
+    # why every cell ran except the ones a person ran, which is the one writer
+    # whose reasoning the record cannot reconstruct from anywhere else.
+    nb = _notebook.build_notebook(
+        [_snap(origin="user", intent="checking the threshold the agent picked")]
+    )
+    note = "".join(
+        [c for c in nb["cells"] if c["cell_type"] == "markdown"][-1]["source"]
+    )
+    assert "user" in note
+    assert "checking the threshold the agent picked" in note
+    job = [c for c in nb["cells"] if c["cell_type"] == "code"][-1]
+    assert (
+        job["metadata"]["biopb"]["intent"] == "checking the threshold the agent picked"
+    )

@@ -37,7 +37,8 @@ describe("JobRow", () => {
   });
 
   it("falls back to the code line when nobody said", () => {
-    // The user console submits no intent, and neither does an older child.
+    // A console cell whose author left the reason blank, or an older child
+    // that has no such field at all.
     for (const j of [job(), job({ intent_preview: "" })]) {
       expect(render(j)).toContain("print(1)");
     }
