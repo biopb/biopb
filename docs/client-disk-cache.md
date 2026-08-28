@@ -1,6 +1,7 @@
 # A client-side disk chunk cache
 
-**Status:** design — **not implemented**. Written 2026-08-28 against `e90271ee`.
+**Status:** implemented, **off by default** — set `BIOPB_CHUNK_CACHE` to a size
+to enable. Written 2026-08-28; landed on `feat/client-disk-cache`.
 **Component:** `biopb.tensor` SDK (`_pool.py`); needs nothing new from the server.
 **Related:** [`localhost-fast-path.md`](localhost-fast-path.md) (the sibling path
 this one complements), [`biopb-tensor-server/docs/remote-tensor-cache.md`](../biopb-tensor-server/docs/remote-tensor-cache.md)
@@ -98,9 +99,18 @@ over sampled shards instead of globally ordering every file.
 
 **`/tmp` is the wrong default.** On many systems it is `tmpfs`, which would turn
 "unbounded disk" into unevictable RAM plus an mmap that is also RAM — strictly
-worse than the LRU being replaced. Default to the XDG cache dir, and demote or
-refuse a `tmpfs` or network directory the same way the server already demotes a
-network `cache_dir` to its memory backend (biopb/biopb#571).
+worse than the LRU being replaced.
+
+The root is `cache_dir() / "chunks"` — `~/.cache/biopb`, and
+`%LOCALAPPDATA%\biopb\Cache` on Windows. That Windows split is the only place
+`_locations.py` diverges from its one-layout-everywhere rule, and this tree is
+why: the other three hold kilobytes, while this one is sized for tens of GB,
+which is exactly what `%LOCALAPPDATA%` exists to keep out of roaming profiles and
+Folder Redirection. `BIOPB_CHUNK_CACHE_DIR` relocates it.
+
+Still outstanding: demoting or refusing a `tmpfs` or network directory the way
+the server already demotes a network `cache_dir` to its memory backend
+(biopb/biopb#571). See *Open questions*.
 
 ## Eviction
 
@@ -121,11 +131,17 @@ dies**, which matters when the N processes are dask workers that get killed. A
 sweep is `file_lock(cache_dir/"sweep.lock", timeout=0)`; the winner sweeps, the
 losers pay one failed `flock` and move on. No daemon.
 
-**Trigger on work, not wall-clock.** A process attempts the lock once at startup,
-and thereafter only once it has itself written K bytes since its last attempt.
-Sweep rate then tracks write rate rather than process count — 32 idle workers
-never sweep, and a burst of misses is swept by whichever worker crosses the
-threshold first.
+**Trigger on work, not wall-clock.** A process attempts the lock only once it has
+itself written K bytes since its last attempt (`_SWEEP_AFTER_BYTES_MIN`, or a
+sixteenth of the budget, whichever is larger). Sweep rate then tracks write rate
+rather than process count — 32 idle workers never sweep, and a burst of misses is
+swept by whichever worker crosses the threshold first.
+
+The byte counter is not optional, and an earlier draft of this doc was wrong to
+say the TTL removes it. The TTL removes the need for a *timer* — nothing has to
+wake up on a schedule to reclaim idle bytes. But the free-space floor is one
+`statvfs` while the byte budget cannot be known without a full scan, so the scan
+still needs something to trigger it. Written-bytes is that trigger.
 
 ### There is no free recency signal
 
@@ -138,6 +154,37 @@ The cheap recovery is **hand-rolled relatime**: the reader already `stat`s the f
 before mmap, so `os.utime()` it only when its mtime is older than ~1h. That is one
 metadata write per chunk per hour instead of per hit, and it recovers most of
 LRU's value over plain FIFO. Eviction is then oldest-mtime-first.
+
+### A TTL, but a generous one
+
+Byte budget and TTL bound different things, and only the budget bounds the one
+that matters: a TTL's ceiling is `fetch_rate × TTL`, so at even 12 MB/s a 24-hour
+TTL admits ~1 TB, and at 1 GbE ~9.7 TB. Any TTL long enough to be useful for
+revisits admits far more than a laptop has.
+
+It is also the wrong shape for image access specifically. Pyramids make the
+access distribution extremely skewed — the overview level is touched on every
+navigation and its miss blanks the viewport — and a TTL is the one policy blind
+to skew, expiring the hot set on the same schedule as a chunk seen once. Worse,
+it discards under *no pressure*: your session's chunks die because you went to
+lunch, even with the cache 3% full. Budget eviction is relative, so it only
+discards when something is actually competing for the space. And the working set
+here is denominated in bytes (the demand-tier warm extent is ~20 GB on a
+timelapse), not in seconds — a budget's parameter falls out of the workload, a
+TTL's does not.
+
+So the TTL is not doing hit-rate work. Its job is the one thing a budget cannot
+do: a budget is a target the cache rises to and *stays at*, so without a TTL
+biopb permanently occupies N GB of a dataset the user finished with in March.
+`_TTL_DEFAULT` is 7 days — comfortably past any plausible revisit, so it never
+fires inside a session and cannot do the skew-blind damage above. It only
+collects abandoned datasets.
+
+It is enforced in both places, and needs to be. Lazily on the read path, free off
+the `stat` that precedes the mmap — but that only reclaims files someone touches,
+and the files never touched again are exactly a single-pass scan's garbage. So
+the pressure sweep applies it too, which costs nothing since it is stat-ing
+everything anyway.
 
 ### A free-space floor, not just a budget
 
@@ -245,6 +292,16 @@ This is reachable, not hypothetical: biopb-mcp's `dask.cache_budget` documents
 "`0` disables" and `_register_cache_plugin` passes `budget // n_workers` straight
 into `configure_cache`. Keep the semantic rather than special-casing it, but say so
 plainly at the config surface.
+
+## Not yet done
+
+- **The `tmpfs` / network-filesystem guard.** `biopb_tensor_server.core.fs_detect`
+  already does exactly this classification, stdlib-only and metadata-only, but the
+  SDK cannot import the server. Moving `fs_detect` down into core `biopb` (the
+  same reasoning that put `file_lock` and `_config_*` there) and adding a memory-fs
+  check beside its network/cloud one is the fix.
+- **Config surface.** Environment variables only so far; nothing plumbs this
+  through biopb-mcp's `dask.*` config the way `cache_budget` is plumbed.
 
 ## Open questions
 

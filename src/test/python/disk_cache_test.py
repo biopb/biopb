@@ -371,3 +371,75 @@ def test_fork_reset_drops_the_memoized_settings(pool):
     assert pool._disk_cache_for("grpc://remote-host.invalid:8815") is not None
     pool._reset_pools_after_fork()
     assert pool._disk_cache_settings.cache_info().currsize == 0
+
+
+# --- the fetch path end to end -------------------------------------------- #
+
+
+class FakeReader:
+    def __init__(self, batch):
+        self._batch = batch
+
+    def read_all(self):
+        return pa.Table.from_batches([self._batch])
+
+
+class FakeFlightClient:
+    """Counts do_get calls so a disk hit is distinguishable from a refetch."""
+
+    def __init__(self, batch):
+        self._batch = batch
+        self.do_get_calls = 0
+
+    def do_get(self, _ticket, options=None):
+        self.do_get_calls += 1
+        return FakeReader(self._batch)
+
+
+@pytest.fixture
+def fetch(pool, monkeypatch):
+    """`_fetch_chunk_distributed` wired to a fake server, with caches bypassed.
+
+    The strong and weak caches are per-process and would mask the disk cache,
+    which is exactly the cross-process case under test -- so they are cleared
+    between calls to stand in for a second worker.
+    """
+    arr = np.arange(256, dtype="<u2")
+    client = FakeFlightClient(unified_batch(arr))
+    monkeypatch.setattr(
+        pool, "_get_worker_resources", lambda *a, **k: (client, None, None)
+    )
+
+    def call(location=LOC):
+        pool._VIEW_CACHE.clear()
+        return pool._fetch_chunk_distributed(location, None, b"cid", (0,), (256,), 0)
+
+    return call, client, arr
+
+
+def test_second_worker_reads_from_disk_instead_of_refetching(fetch):
+    call, client, arr = fetch
+    assert np.array_equal(call(), arr)
+    assert client.do_get_calls == 1
+
+    assert np.array_equal(call(), arr)  # a fresh process would land here
+    assert client.do_get_calls == 1, "the second read should have hit the disk cache"
+
+
+def test_localhost_still_refetches_every_time(fetch, monkeypatch):
+    """The remote-only gate: localhost must not grow a second copy on disk."""
+    call, client, _arr = fetch
+    monkeypatch.setattr("biopb.tensor._pool._should_try_cachefile", lambda _loc: False)
+    call("grpc://localhost:8815")
+    call("grpc://localhost:8815")
+    assert client.do_get_calls == 2
+
+
+def test_a_disk_hit_is_weak_cached_not_strong_cached(pool, fetch, tmp_path):
+    """Holding a private RAM copy of bytes already in the page cache is
+    double-buffering, N-fold across N workers -- so a view goes in the weak cache
+    and the strong one stays empty for the fallback case it now exists for."""
+    call, _client, _arr = fetch
+    held = call()  # a weak entry only survives while some holder keeps the array
+    assert list(tmp_path.rglob(f"*{dc._SUFFIX}"))
+    assert pool._view_cache_get(LOC, None, b"cid".hex()) is held
