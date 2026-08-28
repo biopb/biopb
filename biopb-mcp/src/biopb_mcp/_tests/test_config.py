@@ -487,6 +487,12 @@ class TestValidation:
         assert get_setting(config, "transport.kind") == "stdio"
         assert get_setting(config, "dask.scheduler") == "distributed"
 
+    def test_bad_review_mode_clamped_to_default(self, mock_config_dir):
+        config = _write_and_load(
+            mock_config_dir, {"observe": {"review_mode": "always"}}
+        )
+        assert get_setting(config, "observe.review_mode") == "auto"
+
     def test_port_out_of_range_clamped(self, mock_config_dir):
         config = _write_and_load(mock_config_dir, {"transport": {"port": 99999}})
         assert get_setting(config, "transport.port") == 8765

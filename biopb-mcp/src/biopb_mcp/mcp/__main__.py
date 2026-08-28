@@ -186,6 +186,7 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
             console_enabled=get_setting(config, "observe.console_enabled"),
+            review_mode=get_setting(config, "observe.review_mode"),
             allowed_origins=get_setting(config, "transport.allowed_origins"),
             allowed_hosts=get_setting(config, "transport.allowed_hosts"),
         )

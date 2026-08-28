@@ -313,7 +313,14 @@ def _describe(tool):
     description = tool.description or ""
     if tool.name != "execute_code":
         return description
-    return description.replace(_server.PROMOTE_PARAGRAPH, _CHAT_RUN_PARAGRAPH)
+    described = description.replace(_server.PROMOTE_PARAGRAPH, _CHAT_RUN_PARAGRAPH)
+    # Review-aware wire guidance is intentionally shorter than the historical
+    # promote paragraph, so still state this loop's wait-and-stream behavior.
+    return (
+        described
+        if described != description
+        else description + "\n\n" + _CHAT_RUN_PARAGRAPH
+    )
 
 
 async def tool_payload():
@@ -410,6 +417,29 @@ async def _run_code(arguments, on_progress):
             return text
         _pending_notice = digest
         return text + foreign_note
+
+    from . import _observe, _review
+
+    if _observe.active_review_mode() == "review":
+        review = _review.registry.create(code, intent, ORIGIN)
+        if on_progress is not None:
+            on_progress("Waiting for user code review approval…\n")
+        # Yield to the event loop while the observe page polls and decides. This
+        # leaves the chat turn visibly waiting without blocking API handlers.
+        try:
+            while True:
+                await asyncio.sleep(_POLL_INTERVAL)
+                review = _review.registry.get(review["review_id"])
+                if review is None or review["state"] == "rejected":
+                    return deliver("User rejected this code review; no code ran.")
+                if review["state"] == "approved":
+                    _review.registry.begin_submission(review["review_id"])
+                    break
+        except asyncio.CancelledError:
+            # A cancelled turn owns no future submission. Reject only while it
+            # is pending, so a user's concurrent approval still wins cleanly.
+            _review.registry.decide(review["review_id"], "rejected")
+            raise
 
     # Claimed before the call, and mirrored, for the same reason execute_code
     # does it: a lost reply must not leave the kernel held while this process

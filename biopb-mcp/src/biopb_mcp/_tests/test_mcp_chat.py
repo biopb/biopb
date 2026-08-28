@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from biopb_mcp.mcp import _chat, _server
+from biopb_mcp.mcp import _chat, _observe, _review, _server
 
 _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
 
@@ -426,6 +426,55 @@ class TestResources:
 
 
 class TestExecuteCode:
+    def test_review_waits_for_approval_before_submitting(self, chat_host):
+        old_policy = _observe._review_policy
+        old_mode = _observe._active_review_mode
+        _observe.configure(review_mode="review")
+        _review.registry.clear()
+
+        async def run():
+            task = asyncio.create_task(_chat._run_code({"python_code": "x = 1"}, None))
+            while not _review.registry.pending():
+                await asyncio.sleep(0)
+            review = _review.registry.pending()[0]
+            assert not any(
+                "_jobs.submit(" in c[0][0] for c in chat_host.execute.call_args_list
+            )
+            _review.registry.decide(review["review_id"], "approved")
+            return await task
+
+        try:
+            assert "(no output)" in asyncio.run(run())
+        finally:
+            _observe._review_policy = old_policy
+            _observe._active_review_mode = old_mode
+            _review.registry.clear()
+
+    def test_cancelling_a_review_wait_removes_the_pending_card(self, chat_host):
+        old_policy = _observe._review_policy
+        old_mode = _observe._active_review_mode
+        _observe.configure(review_mode="review")
+        _review.registry.clear()
+
+        async def run():
+            task = asyncio.create_task(_chat._run_code({"python_code": "x = 1"}, None))
+            while not _review.registry.pending():
+                await asyncio.sleep(0)
+            review = _review.registry.pending()[0]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return review
+
+        try:
+            review = asyncio.run(run())
+            assert _review.registry.pending() == []
+            assert _review.registry.get(review["review_id"])["state"] == "rejected"
+        finally:
+            _observe._review_policy = old_policy
+            _observe._active_review_mode = old_mode
+            _review.registry.clear()
+
     def test_submitted_as_chat_with_no_promote_window(self, chat_host):
         model = _scripted(
             {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},

@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from biopb_mcp.mcp import _server
+from biopb_mcp.mcp import _observe, _review, _server
 
 
 def _result(stdout="", result_text="", error_text="", status="ok"):
@@ -96,8 +96,14 @@ def reset_server_state():
     old_promote = _server._promote_after
     old_skills = _server._skills_enabled
     old_instructions = _server.mcp._mcp_server.instructions
+    old_review_policy = _observe._review_policy
+    old_active_review_mode = _observe._active_review_mode
+    _review.registry.clear()
     yield
     _server._kernel_host = old_host
+    _observe._review_policy = old_review_policy
+    _observe._active_review_mode = old_active_review_mode
+    _review.registry.clear()
     _server._promote_after = old_promote
     _server._skills_enabled = old_skills
     _server.mcp._mcp_server.instructions = old_instructions
@@ -383,6 +389,18 @@ class TestExecuteCode:
         assert "print('hi')" in snippet  # code embedded via repr
         assert "job-1" in result  # job handle returned
 
+    def test_review_rejection_never_submits_code(self, server_with_host):
+        _observe.configure(review_mode="review")
+        handle = _server.execute_code("print('no')", intent="test review")
+        assert "review-1" in handle and "no code ran" in handle
+        record, changed = _review.registry.decide("review-1", "rejected")
+        assert changed and record["state"] == "rejected"
+        result = _server.poll_job("review-1")
+        assert "rejected by the user" in result and "no code ran" in result
+        assert not any(
+            "_jobs.submit(" in c[0][0] for c in server_with_host.execute.call_args_list
+        )
+
     def test_intent_rides_the_submit_snippet(self, server_with_host):
         # The job runner lives in the kernel, so the field only reaches the
         # record if it is marshaled into the submit snippet -- and it must be
@@ -536,6 +554,17 @@ class TestExecuteCode:
 
 
 class TestJobTools:
+    def test_poll_job_does_not_claim_a_chat_review(self, server_with_host):
+        review = _review.registry.create("x = 1", "", "chat")
+        _review.registry.decide(review["review_id"], "approved")
+        assert (
+            _server.poll_job(review["review_id"])
+            == f"No such job '{review['review_id']}'."
+        )
+        assert not any(
+            "_jobs.submit(" in c[0][0] for c in server_with_host.execute.call_args_list
+        )
+
     def test_poll_job_formats_status(self, server_with_host):
         _install_replies(
             server_with_host,

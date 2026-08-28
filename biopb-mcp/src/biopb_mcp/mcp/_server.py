@@ -884,8 +884,7 @@ PROMOTE_PARAGRAPH = """Code runs in a background thread so it does not block the
     runs at a time."""
 
 
-@mcp.tool()
-def execute_code(
+def _execute_now(
     python_code: str,
     intent: Annotated[str, Field(description=_INTENT_DESC)] = "",
 ) -> str:
@@ -1031,6 +1030,34 @@ def execute_code(
 
 
 @mcp.tool()
+def execute_code(
+    python_code: str,
+    intent: Annotated[str, Field(description=_INTENT_DESC)] = "",
+) -> str:
+    """Execute Python code in the napari kernel.
+
+    The kernel namespace includes viewer, client, np, da, and ops; use
+    ``client.query_sources(sql, format="pandas")`` for catalog queries; its
+    ``sources`` rows use ``source_url`` (not ``url``). Use
+    ``viewer.add_tensor(array_id)`` to show data.
+
+    When review mode is enabled, this creates a review handle without running
+    code. Poll the handle with poll_job until the user approves or rejects it.
+    On approval poll_job submits the original code through the normal job flow;
+    on rejection no code ran.
+    """
+    from . import _observe, _review
+
+    if _observe.active_review_mode() == "review":
+        record = _review.registry.create(python_code, intent, "mcp")
+        return (
+            f"Review {record['review_id']} awaits user approval; no code ran. "
+            f"Poll it with poll_job('{record['review_id']}')."
+        )
+    return _execute_now(python_code, intent)
+
+
+@mcp.tool()
 def poll_job(job_id: str) -> str:
     """Get the status and output of a job started by execute_code.
 
@@ -1038,6 +1065,30 @@ def poll_job(job_id: str) -> str:
     output so far (full output once terminal). Job records persist until the
     kernel is restarted (older terminal jobs are eventually evicted).
     """
+    from . import _review
+
+    review = _review.registry.get(job_id)
+    if review is not None:
+        # Review handles are process-local ids, but their submitter is not
+        # interchangeable: chat owns its own wait-and-submit lifecycle.
+        if review.get("origin") != "mcp":
+            return f"No such job '{job_id}'."
+        state = review["state"]
+        if state == "pending":
+            return f"{job_id}: pending review; no code ran."
+        if state == "rejected":
+            return f"{job_id}: rejected by the user; no code ran."
+        if state == "approved":
+            review, submit = _review.registry.begin_submission(job_id)
+            if submit:
+                result = _execute_now(review["code"], review["intent"])
+                _review.registry.finish_submission(job_id, result)
+                return result
+        if state == "submitting":
+            return f"{job_id}: approval received; submission is in progress."
+        if state == "submitted":
+            return review.get("result", f"{job_id}: submitted.")
+
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"

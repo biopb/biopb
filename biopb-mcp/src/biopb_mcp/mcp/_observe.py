@@ -65,6 +65,7 @@ import asyncio
 import functools
 import json
 import logging
+import threading
 
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.applications import Starlette
@@ -76,7 +77,7 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
-from . import _notebook, _server
+from . import _notebook, _review, _server
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,11 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 _max_output_chars = 20000
 _poll_interval_ms = 3000
 _console_enabled = True
+# The policy is fixed at launch; active mode is session state shared by all
+# observe tabs and both execution paths.
+_review_policy = "auto"
+_active_review_mode = "observe"
+_review_mode_lock = threading.Lock()
 # Whether the built-in chat client is actually mounted on this session. Not a
 # config mirror: chat is served only on an agentless `biopb mcp view` session
 # and only when enabled, so `_setup_chat`'s verdict is the one truth. Set by
@@ -125,6 +131,7 @@ def configure(
     max_output_chars=None,
     poll_interval_ms=None,
     console_enabled=None,
+    review_mode=None,
     allowed_origins=(),
     allowed_hosts=(),
 ):
@@ -140,6 +147,7 @@ def configure(
     this is set.
     """
     global _max_output_chars, _poll_interval_ms, _console_enabled
+    global _review_policy, _active_review_mode
     global _extra_origins, _extra_hosts
     global _mw
     if max_output_chars is not None:
@@ -148,6 +156,10 @@ def configure(
         _poll_interval_ms = int(poll_interval_ms)
     if console_enabled is not None:
         _console_enabled = bool(console_enabled)
+    if review_mode is not None:
+        with _review_mode_lock:
+            _review_policy = review_mode
+            _active_review_mode = "review" if review_mode == "review" else "observe"
     _extra_origins = tuple(allowed_origins)
     _extra_hosts = tuple(allowed_hosts)
     _mw = None  # rebuilt with the new extras on next request
@@ -176,6 +188,19 @@ def set_chat_enabled(enabled):
     """
     global _chat_enabled
     _chat_enabled = bool(enabled)
+
+
+def active_review_mode():
+    """The shared current mode, read by both execution paths."""
+    with _review_mode_lock:
+        return _active_review_mode
+
+
+def set_active_review_mode(mode):
+    """Set the shared current mode after the API has validated it."""
+    global _active_review_mode
+    with _review_mode_lock:
+        _active_review_mode = mode
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +480,50 @@ async def _api_status(request):
             "poll_interval_ms": _poll_interval_ms,
             "console_enabled": _console_enabled,
             "chat_enabled": _chat_enabled,
+            "review_policy": _review_policy,
+            "review_mode": active_review_mode(),
+            "pending_review_count": len(_review.registry.pending()),
             # Two different questions, both read by the control's dashboard off
             # this one probe: chat_enabled says what the page leads with,
             # agentless says who owns the reap -- and so whether to offer a stop.
             "agentless": _agentless,
         }
     )
+
+
+async def _api_reviews(_request):
+    pending = _review.registry.pending()
+    return JSONResponse({"reviews": pending, "count": len(pending)})
+
+
+async def _api_review_mode(request):
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed body is the client's error
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    mode = payload.get("mode") if isinstance(payload, dict) else None
+    if mode not in ("observe", "review"):
+        return JSONResponse(
+            {"error": "mode must be 'observe' or 'review'"}, status_code=400
+        )
+    set_active_review_mode(mode)
+    return JSONResponse({"review_policy": _review_policy, "review_mode": mode})
+
+
+async def _api_review_decision(request):
+    review_id = request.path_params["review_id"]
+    decision = request.path_params["decision"]
+    if decision not in ("approve", "reject"):
+        return JSONResponse({"error": "invalid review decision"}, status_code=404)
+    decision += "ed"
+    record, changed = _review.registry.decide(review_id, decision)
+    if record is None:
+        return JSONResponse({"error": "no such review", "review_id": review_id}, 404)
+    if not changed:
+        return JSONResponse(
+            {"error": "stale review decision", "review_id": review_id}, status_code=409
+        )
+    return JSONResponse({"review": record})
 
 
 # How long the stop route waits before tearing the process down. The teardown
@@ -506,6 +569,13 @@ _ROUTES = [
     ("/api/kernel/interrupt", ["POST"], _route(_api_interrupt)),
     ("/api/kernel/restart", ["POST"], _route(_api_restart)),
     ("/api/status", ["GET"], _route(_api_status)),
+    ("/api/reviews", ["GET"], _route(_api_reviews)),
+    ("/api/review-mode", ["POST"], _json_route(_api_review_mode)),
+    (
+        "/api/reviews/{review_id}/{decision}",
+        ["POST"],
+        _json_route(_api_review_decision),
+    ),
 ]
 
 # Served only where this session owns its own reap. Under ``api`` rather than a

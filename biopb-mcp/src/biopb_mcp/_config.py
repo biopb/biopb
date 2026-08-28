@@ -446,6 +446,11 @@ class ObserveConfig:
         "user's own provider credits; the model and endpoint are in `chat`. "
         "Like the console, this can only narrow the surface.",
     )
+    review_mode: str = _h(
+        "auto",
+        "Code review policy: 'auto' shows review when chat is visible, 'observe' "
+        "always starts in observe mode, and 'review' always requires approval.",
+    )
 
 
 @dataclass
@@ -609,6 +614,7 @@ _CONSTRAINTS = {
         "acp_agent": Enum({"opencode"}),
         "acp_permission": Enum({"ask", "allow"}),
     },
+    "ObserveConfig": {"review_mode": Enum({"auto", "observe", "review"})},
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
         "port": Range(min=1, max=65535),

@@ -60,6 +60,14 @@ interface JobDetail {
   error_text?: string;
 }
 
+interface ReviewRequest {
+  review_id: string;
+  code: string;
+  intent: string;
+  origin: string;
+  created: number;
+}
+
 async function jpost(url: string): Promise<{ [k: string]: unknown }> {
   try {
     const r = await sessionFetch(url, { method: "POST" });
@@ -84,6 +92,9 @@ export default function ObservePage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("…");
   const [pollMs, setPollMs] = useState(3000);
+  const [reviewPolicy, setReviewPolicy] = useState<"auto" | "observe" | "review">("auto");
+  const [reviewMode, setReviewMode] = useState<"observe" | "review">("observe");
+  const [reviews, setReviews] = useState<ReviewRequest[]>([]);
   // The console is offered only when BOTH the control will proxy it (it is
   // loopback-bound) and this session child serves it (observe.console_enabled).
   // Either half false means every submit would 404, so render no editor at all.
@@ -200,6 +211,23 @@ export default function ObservePage() {
     }
   }, [base, fetchDetail]);
 
+  const pollReviews = useCallback(async () => {
+    try {
+      const r = await sessionFetch(base + "/api/reviews");
+      if (sessionVerdict(r.status) !== "live") return;
+      const data: { reviews?: unknown } = await r.json().catch(() => ({}));
+      if (Array.isArray(data.reviews)) {
+        setReviews(data.reviews.filter((r): r is ReviewRequest =>
+          typeof r === "object" && r !== null &&
+          typeof (r as ReviewRequest).review_id === "string" &&
+          typeof (r as ReviewRequest).code === "string",
+        ));
+      }
+    } catch {
+      /* keep last */
+    }
+  }, [base]);
+
   const pollStatus = useCallback(async () => {
     let r: Response;
     try {
@@ -228,6 +256,12 @@ export default function ObservePage() {
       // This is static config, not state: absent means unknown, not off.
       if (typeof s.console_enabled === "boolean")
         setChildConsole(s.console_enabled);
+      if (s.review_policy === "auto" || s.review_policy === "observe" || s.review_policy === "review")
+        setReviewPolicy(s.review_policy);
+      // Server state is authoritative: this also converges another observe tab
+      // after it changes the mode.
+      if (s.review_mode === "observe" || s.review_mode === "review")
+        setReviewMode(s.review_mode);
       const bits = [s.alive ? "alive" : "dead"];
       if (s.busy) bits.push("busy");
       if (!s.ready) bits.push("starting");
@@ -263,14 +297,17 @@ export default function ObservePage() {
   useEffect(() => {
     if (ended) return; // the record is pruned; there is nothing left to ask
     poll();
+    pollReviews();
     pollStatus();
     const a = setInterval(poll, pollMs);
+    const c = setInterval(pollReviews, pollMs);
     const b = setInterval(pollStatus, pollMs);
     return () => {
       clearInterval(a);
+      clearInterval(c);
       clearInterval(b);
     };
-  }, [poll, pollStatus, pollMs, ended]);
+  }, [poll, pollReviews, pollStatus, pollMs, ended]);
 
   const toggle = useCallback(
     (id: string) => {
@@ -411,6 +448,38 @@ export default function ObservePage() {
     poll();
   }, [base, poll]);
 
+  const decideReview = useCallback(async (id: string, decision: "approve" | "reject") => {
+    try {
+      await sessionFetch(base + "/api/reviews/" + encodeURIComponent(id) + "/" + decision, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } finally {
+      pollReviews();
+    }
+  }, [base, pollReviews]);
+
+  const changeReviewMode = useCallback(async (mode: "observe" | "review") => {
+    try {
+      const r = await sessionFetch(base + "/api/review-mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      const data: { review_mode?: unknown } = await r.json().catch(() => ({}));
+      if (r.ok && (data.review_mode === "observe" || data.review_mode === "review")) {
+        setReviewMode(data.review_mode);
+        return;
+      }
+    } catch {
+      /* status polling below restores the server value */
+    }
+    pollStatus();
+  }, [base, pollStatus]);
+
+  const showReviewToggle = reviewPolicy !== "auto" || showChat;
+
   return (
     <div className="obs-page">
       <header>
@@ -422,6 +491,15 @@ export default function ObservePage() {
         />
         <h1>BioPB mcp - observe</h1>
         <span id="status">{status}</span>
+        {showReviewToggle ? (
+          <label className="review-toggle">
+            <span>mode</span>
+            <select value={reviewMode} onChange={(e) => changeReviewMode(e.target.value as "observe" | "review")}>
+              <option value="observe">observe</option>
+              <option value="review">review</option>
+            </select>
+          </label>
+        ) : null}
         {/* Both act on the child, so both 404 once it is gone. A dead button is
             how the page told the user nothing was wrong. */}
         {ended ? null : (
@@ -488,6 +566,20 @@ export default function ObservePage() {
         <div className="work">
           {showConsole ? (
             <ConsolePanel running={running} onRun={runCell} />
+          ) : null}
+          {reviews.length ? (
+            <section className="reviews">
+              <div className="reviews-head">{reviews.length} pending review{reviews.length === 1 ? "" : "s"}</div>
+              {reviews.map((review) => (
+                <div className="review" key={review.review_id}>
+                  <div><strong>{review.review_id}</strong> · {writerName(review.origin)}</div>
+                  {review.intent ? <div className="intent-full">{review.intent}</div> : null}
+                  <pre className="code">{review.code}</pre>
+                  <button className="primary" onClick={() => decideReview(review.review_id, "approve")}>Approve</button>
+                  <button className="danger" onClick={() => decideReview(review.review_id, "reject")}>Reject</button>
+                </div>
+              ))}
+            </section>
           ) : null}
           <div id="jobs">
             {jobs == null ? (
@@ -710,6 +802,8 @@ const OBS_CSS = `
            display: flex; align-items: center; gap: 12px; position: sticky; top: 0; }
   .obs-page h1 { font-size: 15px; margin: 0; font-weight: 600; }
   .obs-page #status { font-size: 12px; color: #9aa; margin-right: auto; }
+  .obs-page .review-toggle { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #9aa; }
+  .obs-page .review-toggle select { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px; }
   .obs-page button { font: inherit; padding: 4px 10px; border: 1px solid #444; border-radius: 4px;
            background: #222; color: #ddd; cursor: pointer; }
   .obs-page button:hover { background: #2c2c2c; }
@@ -799,6 +893,11 @@ const OBS_CSS = `
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .obs-page .console button:disabled { opacity: .55; cursor: default; background: #222; }
   .obs-page .console-err { color: #f99; font-size: 12px; }
+  .obs-page .reviews { border: 1px solid #665; border-radius: 5px; padding: 10px 12px; margin-bottom: 12px; background: #1b1912; }
+  .obs-page .reviews-head { color: #edc; font-weight: 600; margin-bottom: 8px; }
+  .obs-page .review { border-top: 1px solid #443; padding: 8px 0; }
+  .obs-page .review:first-of-type { border-top: 0; padding-top: 0; }
+  .obs-page .review button { margin-right: 6px; }
   .obs-page .ended { border: 1px solid #744; background: #241a1a; color: #fbb;
              border-radius: 5px; padding: 10px 12px; margin-bottom: 12px; }
   .obs-page .ended strong { color: #fdd; }

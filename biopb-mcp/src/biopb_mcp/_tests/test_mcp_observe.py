@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _observe, _server
+from biopb_mcp.mcp import _observe, _review, _server
 
 
 def _reply(r, window_alive=True):
@@ -65,16 +65,24 @@ def observe_state(host):
     old_max = _observe._max_output_chars
     old_poll = _observe._poll_interval_ms
     old_console = _observe._console_enabled
+    old_review_policy = _observe._review_policy
+    old_active_review_mode = _observe._active_review_mode
     old_mounted = _observe._mounted_http
     _server.set_kernel_host(host)
     _observe.configure(
-        max_output_chars=20000, poll_interval_ms=3000, console_enabled=True
+        max_output_chars=20000,
+        poll_interval_ms=3000,
+        console_enabled=True,
+        review_mode="auto",
     )
+    _review.registry.clear()
     yield
     _server._kernel_host = old_host
     _observe._max_output_chars = old_max
     _observe._poll_interval_ms = old_poll
     _observe._console_enabled = old_console
+    _observe._review_policy = old_review_policy
+    _observe._active_review_mode = old_active_review_mode
     _observe._mounted_http = old_mounted
     _observe._mw = None
 
@@ -229,6 +237,37 @@ def test_api_status(client):
     # The observe SPA (served by the control, so unable to be server-templated)
     # reads the launcher-tuned poll cadence off the status payload.
     assert body["poll_interval_ms"] == 3000
+    assert body["review_policy"] == "auto"
+    assert body["review_mode"] == "observe"
+    assert body["pending_review_count"] == 0
+
+
+def test_review_api_lists_and_decides_atomically(client):
+    review = _review.registry.create("x = 1", "measure", "mcp")
+    body = client.get("/api/reviews").json()
+    assert body["count"] == 1 and body["reviews"][0]["review_id"] == review["review_id"]
+    approved = client.post(f"/api/reviews/{review['review_id']}/approve", json={})
+    assert approved.status_code == 200
+    assert client.get("/api/reviews").json()["count"] == 0
+    assert (
+        client.post(f"/api/reviews/{review['review_id']}/reject", json={}).status_code
+        == 409
+    )
+
+
+def test_review_mode_api_changes_the_shared_active_mode(client):
+    _observe.configure(review_mode="review")
+    assert client.get("/api/status").json()["review_mode"] == "review"
+    r = client.post("/api/review-mode", json={"mode": "observe"})
+    assert r.status_code == 200
+    assert r.json() == {"review_policy": "review", "review_mode": "observe"}
+    # A separate page reaches the same process-local source of truth.
+    assert client.get("/api/status").json()["review_mode"] == "observe"
+
+
+@pytest.mark.parametrize("body", [{}, {"mode": "auto"}, {"mode": 7}])
+def test_review_mode_api_validates_mode(client, body):
+    assert client.post("/api/review-mode", json=body).status_code == 400
 
 
 # -- no kernel host ---------------------------------------------------------
@@ -529,3 +568,4 @@ def test_config_defaults():
     assert get_setting({}, "observe.max_output_chars") == 20000
     assert get_setting({}, "observe.poll_interval_ms") == 3000
     assert get_setting({}, "observe.console_enabled") is True  # opt-out
+    assert get_setting({}, "observe.review_mode") == "auto"
