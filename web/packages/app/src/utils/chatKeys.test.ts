@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { escAction, sendsOnEnter } from "./chatKeys";
+import { escAction, recallAction, sendsOnEnter } from "./chatKeys";
 
 const key = (over: Partial<Parameters<typeof sendsOnEnter>[0]> = {}) => ({
   key: "Enter",
@@ -94,5 +94,87 @@ describe("escAction", () => {
     expect(escAction(state({ permissionOpen: true, busy: false }))).toBe(
       "refuse-permission",
     );
+  });
+});
+
+describe("recallAction", () => {
+  // A one-line draft with the caret at its end: the shape almost every prompt
+  // has, and where both arrows have to walk.
+  const press = (
+    over: Partial<Parameters<typeof recallAction>[0]> = {},
+  ): Parameters<typeof recallAction>[0] => {
+    const value = over.value ?? "count the cells";
+    return {
+      key: "ArrowUp",
+      shiftKey: false,
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      selectionStart: value.length,
+      selectionEnd: value.length,
+      ...over,
+      value,
+    };
+  };
+
+  it("walks back on Up and forward on Down", () => {
+    expect(recallAction(press())).toBe("older");
+    expect(recallAction(press({ key: "ArrowDown" }))).toBe("newer");
+  });
+
+  it("walks from an empty composer", () => {
+    expect(recallAction(press({ value: "", selectionStart: 0, selectionEnd: 0 }))).toBe(
+      "older",
+    );
+  });
+
+  it("ignores any other key", () => {
+    expect(recallAction(press({ key: "ArrowLeft" }))).toBe("none");
+    expect(recallAction(press({ key: "a" }))).toBe("none");
+  });
+
+  it("leaves a multi-line draft its caret", () => {
+    // The whole reason the rule is positional: taking the arrows outright would
+    // make a two-line prompt uneditable.
+    const value = "first line\nsecond line";
+    const onSecond = { value, selectionStart: value.length, selectionEnd: value.length };
+    expect(recallAction(press({ key: "ArrowUp", ...onSecond }))).toBe("none");
+    const onFirst = { value, selectionStart: 3, selectionEnd: 3 };
+    expect(recallAction(press({ key: "ArrowDown", ...onFirst }))).toBe("none");
+  });
+
+  it("still walks off the near edge of a multi-line draft", () => {
+    const value = "first line\nsecond line";
+    expect(
+      recallAction(press({ key: "ArrowUp", value, selectionStart: 3, selectionEnd: 3 })),
+    ).toBe("older");
+    expect(
+      recallAction(
+        press({
+          key: "ArrowDown",
+          value,
+          selectionStart: value.length,
+          selectionEnd: value.length,
+        }),
+      ),
+    ).toBe("newer");
+  });
+
+  it("leaves the modified arrows to the platform", () => {
+    // Shift extends a selection; Alt/Ctrl/Cmd are word- and line-wise motions.
+    expect(recallAction(press({ shiftKey: true }))).toBe("none");
+    expect(recallAction(press({ altKey: true }))).toBe("none");
+    expect(recallAction(press({ ctrlKey: true }))).toBe("none");
+    expect(recallAction(press({ metaKey: true }))).toBe("none");
+  });
+
+  it("does not walk over a selection", () => {
+    expect(recallAction(press({ selectionStart: 0, selectionEnd: 5 }))).toBe("none");
+  });
+
+  it("leaves the arrows to an IME candidate list", () => {
+    // Same guard as Enter, for the same reason: the candidate list is driven by
+    // these keys, and walking there would replace the composer mid-word.
+    expect(recallAction(press({ isComposing: true }))).toBe("none");
   });
 });
