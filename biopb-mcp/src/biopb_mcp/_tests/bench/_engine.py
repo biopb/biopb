@@ -513,7 +513,7 @@ def where_for(case: Case) -> Path:
 
 
 def catalog_ids(text: str) -> tuple[str, ...]:
-    """Which skills `find_skills` returned, from the text an agent sees.
+    """Which skills `list_skills` returned, from the text an agent sees.
 
     Parsed rather than pattern-counted: whether the ablation took effect is the
     one thing that would silently make a whole table meaningless, so it must not
@@ -585,7 +585,7 @@ def read_catalog(session) -> tuple[str, ...]:
     verified nothing — the exact hole #738 was written to close.
     """
     try:
-        return catalog_ids(session.call("find_skills").text)
+        return catalog_ids(session.call("list_skills").text)
     except Exception:  # noqa: BLE001 -- provenance is best-effort, the run is not
         return CATALOG_UNREAD
 
@@ -703,7 +703,7 @@ def run_one(
         tensor_url=plane.url if plane is not None else "",
     ) as session:
         # Read here rather than inferred from behaviour: the agent may well call
-        # `find_skills` under `--bench-skills=false` and simply get nothing back,
+        # `list_skills` under `--bench-skills=false` and simply get nothing back,
         # and `load_catalog()` is what gates, not whether the tool was registered.
         result.catalog = read_catalog(session)
         load_fixture(session, case, fixture, ids)

@@ -23,7 +23,7 @@ package no longer imports the skills layout, reads ``_skills_data``, or knows
 which entries ship. Promoting or banking a skill is a change to the catalog and
 to nothing here, and a case's namespace stays put whether or not a skill by that
 name exists. What remains is one assertion that the catalog matched the switch
-it was run under, which reads what ``find_skills`` returned at runtime and never
+it was run under, which reads what ``list_skills`` returned at runtime and never
 names an entry.
 """
 

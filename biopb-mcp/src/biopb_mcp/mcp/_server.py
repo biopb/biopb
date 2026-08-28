@@ -84,11 +84,11 @@ _BASE_INSTRUCTIONS = (
 
 # Appended to _BASE_INSTRUCTIONS only when the skills catalog is enabled
 # (`services.skills_enabled`, on by default). Kept out of the base so an install
-# that switches skills off neither points the agent at `find_skills` (which would
+# that switches skills off neither points the agent at `list_skills` (which would
 # return nothing) nor prompts it to author skills — set_skills_enabled owns the
 # field.
 _SKILLS_INSTRUCTIONS = (
-    "At the start of a task, call `find_skills` to check for a curated workflow "
+    "At the start of a task, call `list_skills` to check for a curated workflow "
     "before improvising; read the matching `skill://<id>` resource for the "
     "steps. Results marked `origin: local` are the user's own unreviewed skills "
     "from ~/.config/biopb/skills; prefer a curated one when both fit. After "
@@ -391,7 +391,7 @@ def _recompose_instructions():
 def set_skills_enabled(enabled: bool):
     """Advertise (or hide) the curated-skills catalog in the agent's initialize
     ``instructions``. On by default; switching skills off also drops the
-    directive, so the agent is never pointed at ``find_skills`` when it would
+    directive, so the agent is never pointed at ``list_skills`` when it would
     return nothing."""
     global _skills_enabled
     _skills_enabled = bool(enabled)
@@ -726,7 +726,7 @@ def get_kernel_guide() -> str:
     """Overview: available namespaces, helper functions, resource URIs.
 
     The skill-requirements section is appended only when the catalog is enabled
-    (``services.skills_enabled``): with it off there is no ``find_skills`` to
+    (``services.skills_enabled``): with it off there is no ``list_skills`` to
     return a ``checklist:``, so the section would document an unreachable
     tool -- the same gate the handshake instructions use.
     """
@@ -761,9 +761,9 @@ def get_ops_guide() -> str:
 
 @mcp.resource("skill://{skill_id}")
 def get_skill(skill_id: str) -> str:
-    """Full workflow body for a curated skill; discover ids with `find_skills`.
+    """Full workflow body for a curated skill; discover ids with `list_skills`.
 
-    The catalog (metadata) is served separately via the `find_skills` tool; this
+    The catalog (metadata) is served separately via the `list_skills` tool; this
     resource lazily fetches one skill's markdown body, verifies it against the
     catalog checksum, and caches it. Fail-open: returns a short explanatory
     string rather than erroring when a skill is unknown or unreachable.
@@ -777,7 +777,7 @@ def get_skill(skill_id: str) -> str:
 
 
 @mcp.tool()
-def find_skills(keywords: list[str] | None = None) -> list:
+def list_skills(keywords: list[str] | None = None) -> list:
     """Discover curated biopb workflows ("skills"). Call at the start of a task.
 
     Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure

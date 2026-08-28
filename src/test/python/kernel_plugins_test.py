@@ -57,7 +57,7 @@ class TestStartupFiles:
         ]
 
     def test_blurb_is_the_opening_paragraph_because_a_first_line_is_thin(self, home):
-        """`blurb` is what a keyword index matches on (biopb-mcp's find_skills
+        """`blurb` is what a keyword index matches on (biopb-mcp's list_skills
         lists plugins by it). A first line names the subject and often not the
         verb, so a two-term query would miss on the second term; the paragraph
         after it usually carries the rest, and stopping there keeps a long

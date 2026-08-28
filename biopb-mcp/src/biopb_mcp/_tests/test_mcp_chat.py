@@ -320,10 +320,13 @@ class TestToolSurface:
 
     def test_both_call_tool_shapes_collapse(self, chat_host):
         # server_status has an output schema and returns (blocks, structured);
-        # find_skills has none and returns a bare block list. The loop is below
+        # list_skills has none and returns a bare block list. The loop is below
         # the layer that collapses them, so it does that job -- and must, for
         # both, or one whole class of tool comes back as a tuple.
-        for name, args in (("server_status", {}), ("find_skills", {"task": "drift"})):
+        for name, args in (
+            ("server_status", {}),
+            ("list_skills", {"keywords": ["drift"]}),
+        ):
             text, images = asyncio.run(_chat._dispatch(name, args, None))
             assert isinstance(text, str) and text
             assert images == []
@@ -381,7 +384,7 @@ class TestResources:
     """The resource surface, which function-calling has no verb for.
 
     Both halves of the borrowed system prompt point at it -- the guides by URI
-    and, through find_skills, the skills -- so an agent that cannot reach it is
+    and, through list_skills, the skills -- so an agent that cannot reach it is
     being told to open documents it has no way to open.
     """
 
@@ -404,7 +407,7 @@ class TestResources:
         assert text == _server.get_data_guide()
 
     def test_the_skill_template_resolves(self, chat_host):
-        # find_skills answers with ids and nothing else, so this is the half
+        # list_skills answers with ids and nothing else, so this is the half
         # that makes a curated workflow reachable at all.
         from biopb_mcp.mcp import _skills
 

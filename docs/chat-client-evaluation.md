@@ -67,7 +67,7 @@ conversation loop, trace. It is benchmark-shaped, not product-shaped — see
 process (`mcp/_kernel.py` spawns it via `jupyter_client`), so a widget docked in
 the kernel's napari can reach `_jobs`, `_conn`, `ops` and the `viewer` proxy as
 live objects — `mcp/_bootstrap.py:805-818` binds exactly those — but **not** the
-tools, `find_skills`, or the `skill://` / `guide://` resources, which are defined
+tools, `list_skills`, or the `skill://` / `guide://` resources, which are defined
 in the parent. Two further facts make it the wrong home:
 
 - `restart_kernel` is a tool the agent can call, and closing the napari window
@@ -128,7 +128,7 @@ them.** `_tool_manager.call_tool(..., convert_result=True)` yields a bare
 `list[ContentBlock]` for a tool with no structured output schema, and a
 `(blocks, structured)` tuple for one that has it. The split follows the return
 annotation exactly: the seven `-> str` tools carry an `outputSchema` and return
-the tuple; `find_skills` and `take_screenshot` (`-> list`) do not.
+the tuple; `list_skills` and `take_screenshot` (`-> list`) do not.
 
 This is the layer's declared contract, not a defect and not undocumented —
 `lowlevel/server.py:105-106` names both halves (`UnstructuredContent`,
@@ -744,7 +744,7 @@ from `mcp.list_tools()`, resources through `mcp.read_resource`.
 ```
 
 **Resources resolve, and the handshake `instructions` work as a system prompt.**
-Asked whether a drift workflow existed, the agent called `find_skills`,
+Asked whether a drift workflow existed, the agent called `list_skills`,
 dereferenced `skill://drift-correction`, quoted step 1 verbatim, and then asked
 permission before acting — the behaviour those instructions were written to
 produce. Feeding `mcp._mcp_server.instructions` in directly is all that took;

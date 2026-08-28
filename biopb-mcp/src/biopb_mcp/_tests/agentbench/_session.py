@@ -327,7 +327,7 @@ class ToolSpec:
 #: standing in for a capability every shipped MCP client already has.
 #:
 #: A skill body and a `guide://` page are MCP **resources**, and a resource is
-#: not a tool. `find_skills` returns metadata plus a `uri`, the handshake
+#: not a tool. `list_skills` returns metadata plus a `uri`, the handshake
 #: instructions say to read that uri, and `_bridge` translates *tools* onto a
 #: chat-completions API — so before this existed the agent was handed a pointer
 #: it had no verb to dereference. Measured on the 2026-08-03 sweep, that cost
@@ -358,7 +358,7 @@ CLIENT_TOOLS: tuple[ToolSpec, ...] = (
         description=(
             "Read one MCP resource and return its text. `uri` is a full "
             "resource URI — for example `skill://drift-correction` (the `uri` "
-            "field of a `find_skills` result, whose body holds the actual "
+            "field of a `list_skills` result, whose body holds the actual "
             "step-by-step workflow) or `guide://kernel`."
         ),
         input_schema={
@@ -589,7 +589,7 @@ def _write_config(
     """A config tree of our own, so neither the developer's settings nor their
     personal skills reach the child.
 
-    ``skills_enabled=False`` is what **`--bench-skills=false`** sets: the ``find_skills`` tool
+    ``skills_enabled=False`` is what **`--bench-skills=false`** sets: the ``list_skills`` tool
     stays registered but ``load_catalog()`` returns an empty list, so the agent
     can call it and get nothing back, while the kernel, napari, dask and every
     library stay exactly as they were. That is §5's rule — disclose the
