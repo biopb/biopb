@@ -129,6 +129,18 @@ toggles the read-only attribute, and the default root under `%LOCALAPPDATA%` is
 already owner-only by inherited ACL. The mode check is POSIX-only, matching
 `_credentials`.
 
+**A tree created before this hardening keeps its old modes.** The startup check
+looks at the root only, and nothing walks the existing subdirectories to
+retighten them, so a cache dir first written by an earlier build stays at the
+umask default even though new directories under it are `0o700`. There is no
+migration: delete the tree and let it refill. It holds nothing but regenerable
+chunks, which is the same property that makes `unlink`-anything-that-does-not-
+parse the whole recovery story.
+
+```sh
+rm -rf ~/.cache/biopb/chunks     # %LOCALAPPDATA%\biopb\Cache\chunks on Windows
+```
+
 ### Layout and location
 
 `<cache_root>/<hash(location)>/<ab>/<cdef…>.arrow`, one Arrow IPC message per
