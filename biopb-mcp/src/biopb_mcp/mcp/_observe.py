@@ -319,8 +319,13 @@ async def _api_job_detail(request):
         return JSONResponse({"error": "no such job", "job_id": job_id}, 404)
     shown, truncated, full_len = _truncate_tail(snap.get("stdout", ""))
     snap["stdout"] = shown
-    snap["truncated"] = truncated
-    snap["stdout_len"] = full_len
+    # Two truncations can apply: this view's tail cap, and the job record's own
+    # output cap upstream of it. `stdout_len` is what the cell actually printed,
+    # so it comes from the record's total rather than from what survived here --
+    # otherwise a capped job reports its kept tail as its full size.
+    total = snap.get("stdout_total", full_len)
+    snap["truncated"] = truncated or total > full_len
+    snap["stdout_len"] = total
     snap["window_alive"] = win
     return JSONResponse(snap)
 

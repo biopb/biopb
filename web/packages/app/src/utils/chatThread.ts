@@ -80,6 +80,8 @@ export interface LiveOutput {
   stdout: string;
   /** Older output was dropped; `stdout` is the tail. */
   truncated: boolean;
+  /** Everything the cell has printed, including what the tail cap dropped. */
+  stdoutLen: number;
 }
 
 /** The wire shape of one `/api/chat/history` message. */
@@ -285,8 +287,19 @@ export function applyLiveOutput(
     // finishes. Written so re-applying it is a no-op -- the render path rebuilds
     // the items each time, but a function that only works once because of that
     // is one bug away from repeating a cell's output twice a second.
+    // Marked the way the finished record marks itself. The buffer behind this
+    // is tail-capped, so an *expanded* running cell showed a tail as though it
+    // were the whole output, while the same cell once finished said its head
+    // had been dropped -- one pane, one cell, two honesty levels. The collapsed
+    // view is unaffected: it shows the newest line, which a prefix cannot
+    // displace.
+    const dropped = Math.max(0, live.stdoutLen - live.stdout.length);
+    const text =
+      live.truncated && dropped
+        ? `...(${dropped} earlier chars dropped)...\n${live.stdout}`
+        : live.stdout;
     item.blocks = [
-      { type: "text", text: live.stdout },
+      { type: "text", text },
       ...item.blocks.filter((b) => b.type !== "text"),
     ];
     item.live = true;

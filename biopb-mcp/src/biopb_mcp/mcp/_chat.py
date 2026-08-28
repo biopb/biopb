@@ -466,9 +466,19 @@ async def _run_code(arguments, on_progress):
                 _running_job_id = None
                 return deliver(_server._format_execute_result(res))
             out = snap.get("stdout") or ""
-            if on_progress is not None and len(out) > seen:
-                on_progress(out[seen:])
-                seen = len(out)
+            # Diffed against the job's monotonic total, not against `len(out)`:
+            # the output cap compacts the buffer from the front mid-cell, so a
+            # plain offset into it would stop matching and the pane would fall
+            # silent for the rest of the run. `total - seen` is how much is
+            # genuinely new; it comes off the end of the window we still hold,
+            # bounded by that window when the new text was itself partly capped.
+            total = snap.get("stdout_total")
+            if total is None:
+                total = seen + max(0, len(out) - seen)
+            if on_progress is not None and total > seen:
+                fresh = min(total - seen, len(out))
+                on_progress(out[len(out) - fresh :])
+            seen = max(seen, total)
             if snap.get("status") != "running":
                 _running_job_id = None
                 return deliver(_server._format_execute_result(snap))

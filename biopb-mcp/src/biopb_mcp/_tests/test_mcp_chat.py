@@ -37,7 +37,13 @@ class _Kernel(MagicMock):
         self._submit = reply
 
     def script_job(self, states):
-        """Answer successive polls with ``(status, stdout)`` from *states*."""
+        """Answer successive polls with ``(status, stdout)`` from *states*.
+
+        A third element sets ``stdout_total`` -- everything the cell has ever
+        printed, which diverges from ``len(stdout)`` once the job's output cap
+        compacts the buffer from the front. Omitted, the reply carries no such
+        field, which is what an older child looks like.
+        """
         self._states = list(states)
 
 
@@ -70,19 +76,18 @@ def chat_host():
                 return _envelope(host._submit)
             return _envelope({"job_id": "job-1", "status": "running"})
         if "_jobs.poll(" in code:
-            status, out = (
-                host._states.pop(0) if len(host._states) > 1 else host._states[0]
-            )
-            return _envelope(
-                {
-                    "job_id": "job-1",
-                    "status": status,
-                    "stdout": out,
-                    "result_text": "",
-                    "error_text": "",
-                    "elapsed": 0.1,
-                }
-            )
+            state = host._states.pop(0) if len(host._states) > 1 else host._states[0]
+            snap = {
+                "job_id": "job-1",
+                "status": state[0],
+                "stdout": state[1],
+                "result_text": "",
+                "error_text": "",
+                "elapsed": 0.1,
+            }
+            if len(state) > 2:
+                snap["stdout_total"] = state[2]
+            return _envelope(snap)
         if "_jobs.interrupt_current(" in code:
             host.interrupts.append(code)
             return _envelope({"job_id": "job-1", "interrupted": True, "status": "ok"})
@@ -594,6 +599,38 @@ class TestExecuteCode:
         asyncio.run(_chat.run_turn("go", model, on_progress=seen.append))
         # Deltas, not the whole buffer each time.
         assert seen == ["step 1\n", "step 2\n", "done\n"]
+
+    def test_streaming_survives_the_output_cap_moving_the_window(self, chat_host):
+        # The job record keeps only a tail, so a loud cell's buffer *shrinks*
+        # mid-run while it is still printing. An offset into that buffer stops
+        # pointing where it did, and diffing against it left the pane silent for
+        # the rest of the cell -- so the diff is against the monotonic total.
+        chat_host.script_job(
+            [
+                ("running", "aaa", 3),
+                ("running", "bbb", 6),  # window moved on: "aaa" is gone
+                ("ok", "ccc", 9),
+            ]
+        )
+        seen = []
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="go()")]},
+            {"content": "finished"},
+        )
+        asyncio.run(_chat.run_turn("go", model, on_progress=seen.append))
+        assert seen == ["aaa", "bbb", "ccc"]
+
+    def test_only_what_is_still_held_is_reported(self, chat_host):
+        # More was printed than the window kept, so the delta cannot be
+        # produced. Report the window rather than inventing the gap.
+        chat_host.script_job([("running", "aaa", 3), ("ok", "zzz", 99)])
+        seen = []
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="go()")]},
+            {"content": "finished"},
+        )
+        asyncio.run(_chat.run_turn("go", model, on_progress=seen.append))
+        assert seen == ["aaa", "zzz"]
 
     def test_a_kernel_held_by_another_client_is_reported_not_retried(self, chat_host):
         chat_host.script_submit(

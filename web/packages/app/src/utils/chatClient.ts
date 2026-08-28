@@ -273,7 +273,15 @@ function readLive(raw: unknown): LiveOutput | null {
   if (!raw || typeof raw !== "object") return null;
   const p = raw as Record<string, unknown>;
   if (typeof p.job_id !== "string" || typeof p.stdout !== "string") return null;
-  return { jobId: p.job_id, stdout: p.stdout, truncated: !!p.truncated };
+  return {
+    jobId: p.job_id,
+    stdout: p.stdout,
+    truncated: !!p.truncated,
+    // What the cell has printed in total, which is more than `stdout` once the
+    // buffer is tail-capped. Defaulted rather than required: an older child
+    // sends no such field, and that must read as "nothing was dropped".
+    stdoutLen: typeof p.stdout_len === "number" ? p.stdout_len : p.stdout.length,
+  };
 }
 
 /** Start a turn. Returns an error to show, or null when it was accepted.

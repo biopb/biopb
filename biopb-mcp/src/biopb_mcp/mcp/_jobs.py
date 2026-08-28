@@ -62,6 +62,13 @@ _REFRESH_PREFIX = "client = _conn.client\n"
 # Keep at most this many terminal job records before evicting the oldest.
 _MAX_RETAINED_JOBS = 32
 
+# Keep at most this many characters of one job's captured output. This is the
+# bound _MAX_RETAINED_JOBS is not: that caps how many records are kept, while a
+# single cell printing in a loop grew its buffer without limit, so 32 records
+# bounded nothing. Well above observe's 20k display cap, so a truncated *view*
+# still means "there is more in the record" rather than "the record ends here".
+_MAX_JOB_OUTPUT_CHARS = 200_000
+
 # Attribution for a KeyboardInterrupt this runner did not raise (see _run). The
 # kernel ignores SIGINT except while servicing a message (ipykernel installs
 # default_int_handler only between its pre/post handler hooks), so the realistic
@@ -99,6 +106,7 @@ class _Job:
         "code",
         "status",
         "stdout",
+        "stdout_dropped",
         "result_text",
         "error_text",
         "cancel_reason",
@@ -120,6 +128,10 @@ class _Job:
         # running | ok | error | interrupted
         self.status = "running"
         self.stdout = io.StringIO()
+        # Characters the cap has discarded from the front of `stdout`. Kept so
+        # the record can say it is partial and so a reader tracking growth has
+        # a number that only ever increases (see `output_total`).
+        self.stdout_dropped = 0
         self.result_text = ""
         self.error_text = ""
         # Set by interrupt_current(): the job was force-stopped with a
@@ -165,12 +177,57 @@ class _Job:
         end = self.finished if self.finished is not None else time.monotonic()
         return round(end - self.started, 3)
 
+    def write_output(self, s):
+        """Append captured output, keeping at most the newest cap-worth.
+
+        The tail survives, for the reason the detail view keeps the tail: while
+        a cell is still running the newest output is the informative part.
+
+        Compacted at twice the cap rather than on every write, so the rewrite
+        happens once per cap-worth of output instead of once per print. Only the
+        job's own worker thread writes here (`_jobs_by_thread` is keyed by
+        thread), so no lock: a reader racing the swap gets the pre-compaction
+        buffer, which is longer but never torn.
+        """
+        n = self.stdout.write(s)
+        if self.stdout.tell() > 2 * _MAX_JOB_OUTPUT_CHARS:
+            text = self.stdout.getvalue()
+            keep = text[-_MAX_JOB_OUTPUT_CHARS:]
+            self.stdout_dropped += len(text) - len(keep)
+            buf = io.StringIO()
+            buf.write(keep)
+            self.stdout = buf
+        return n
+
+    def output(self):
+        """The captured output, marked when the cap dropped its head.
+
+        The marker is added on read rather than stored, so it cannot itself be
+        compacted away later, and so every consumer -- the agent's poll, the
+        observe detail, the notebook cell -- says the same thing without each
+        having to remember to.
+        """
+        text = self.stdout.getvalue()
+        if not self.stdout_dropped:
+            return text
+        return f"...({self.stdout_dropped} earlier chars dropped)...\n" + text
+
+    def output_total(self):
+        """Everything this job has ever printed, including what was dropped.
+
+        Monotonic, which `len(stdout)` is not once the cap compacts. A reader
+        streaming the output as it grows has to diff against this.
+        """
+        return self.stdout_dropped + len(self.stdout.getvalue())
+
     def snapshot(self):
         return {
             "job_id": self.job_id,
             "code": self.code,
             "status": self.status,
-            "stdout": self.stdout.getvalue(),
+            "stdout": self.output(),
+            "stdout_dropped": self.stdout_dropped,
+            "stdout_total": self.output_total(),
             "result_text": self.result_text,
             "error_text": self.error_text,
             "cancel_reason": self.cancel_reason,
@@ -194,7 +251,7 @@ class _JobStream:
     def write(self, s):
         job = _jobs_by_thread.get(threading.get_ident())
         if job is not None:
-            return job.stdout.write(s)
+            return job.write_output(s)
         return self._real.write(s)
 
     def flush(self):
@@ -592,7 +649,7 @@ def jobs_summary():
             "status": j.status,
             "origin": j.origin,
             "elapsed": j.elapsed(),
-            "stdout_len": len(j.stdout.getvalue()),
+            "stdout_len": j.output_total(),
             "code_preview": _one_line(j.code),
             # Why the cell was run, when whoever ran it said. The observe list
             # prefers it over the code line: "isolate the nuclei channel" tells
