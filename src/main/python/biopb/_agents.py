@@ -77,21 +77,31 @@ class AgentError(Exception):
 class AgentSpec:
     """Static per-client knowledge.
 
-    ``manager`` selects how register/unregister act: ``"json"`` edits a config
-    file directly (atomic merge/delete under ``parent_key``), ``"claude-cli"``
-    shells out to the ``claude`` CLI, ``"codex-cli"`` to the ``codex`` CLI (whose
-    config is TOML we only ever read). ``entry_style`` selects the MCP entry shape
-    for JSON clients: ``"stdio"`` is the canonical ``{command, args}`` form every
-    ``mcpServers`` client accepts; ``"opencode"`` is opencode's
-    ``{type: "local", command: [...]}`` form. ``parent_key`` is the top-level key
-    the biopb entry lives under (``mcpServers`` for most, ``mcp`` for opencode).
+    Four independent axes, one field each — they do not co-vary, and conflating
+    any two is what lets a client be written in the wrong format (see the
+    dispatch tables below, none of which has a default branch):
+
+    - ``manager`` — how to **write**: ``"json"`` edits the config directly
+      (atomic merge/delete under ``parent_key``), ``"claude-cli"`` and
+      ``"codex-cli"`` shell out to that client's own CLI.
+    - ``config_format`` — how to **read** it back for status: ``"json"`` (which
+      also tolerates a ``.jsonc``) or ``"toml"``. Independent of ``manager``: a
+      CLI-managed client still has a config we parse, and Codex's is TOML.
+    - ``parent_key`` — the container the biopb entry lives under, named in that
+      format's terms: a JSON object key (``mcpServers``, or ``mcp`` for
+      opencode) or a TOML table (``mcp_servers``).
+    - ``entry_style`` — the entry's **shape**: ``"stdio"`` is the canonical
+      ``{command, args}`` form every ``mcpServers`` client accepts; ``"opencode"``
+      is opencode's ``{type: "local", command: [...]}`` form. Used when writing
+      the entry and when reading the command back out of it for drift.
     """
 
     id: str
     name: str
-    manager: str  # "json" | "claude-cli" | "codex-cli"
+    manager: str  # a key of _WRITERS
+    config_format: str  # a key of _READERS
     parent_key: str  # "mcpServers" | "mcp" | "mcp_servers"
-    entry_style: str  # "stdio" | "opencode"
+    entry_style: str  # a key of _SHAPES
 
 
 # The catalog — consistent with the installer (install/install.sh,
@@ -99,11 +109,15 @@ class AgentSpec:
 # ever prints a manual YAML snippet for it (it will not edit YAML), so it can
 # never reach `registered` through a button — not worth a dead row.
 _SPECS: tuple[AgentSpec, ...] = (
-    AgentSpec("claude-code", "Claude Code", "claude-cli", "mcpServers", "stdio"),
-    AgentSpec("claude-desktop", "Claude Desktop", "json", "mcpServers", "stdio"),
-    AgentSpec("codex-cli", "Codex CLI", "codex-cli", "mcp_servers", "stdio"),
-    AgentSpec("cursor", "Cursor", "json", "mcpServers", "stdio"),
-    AgentSpec("opencode", "opencode", "json", "mcp", "opencode"),
+    AgentSpec(
+        "claude-code", "Claude Code", "claude-cli", "json", "mcpServers", "stdio"
+    ),
+    AgentSpec(
+        "claude-desktop", "Claude Desktop", "json", "json", "mcpServers", "stdio"
+    ),
+    AgentSpec("codex-cli", "Codex CLI", "codex-cli", "toml", "mcp_servers", "stdio"),
+    AgentSpec("cursor", "Cursor", "json", "json", "mcpServers", "stdio"),
+    AgentSpec("opencode", "opencode", "json", "json", "mcp", "opencode"),
 )
 
 _SPECS_BY_ID = {s.id: s for s in _SPECS}
@@ -379,6 +393,76 @@ def _toml_string(raw: str) -> Optional[str]:
     return None
 
 
+def _read_json_entry(path: Path, parent_key: str) -> Optional[dict]:
+    """The biopb entry from a JSON (or ``.jsonc``) config, or ``None``."""
+    data = _load_json_tolerant(path)
+    if not isinstance(data, dict):
+        return None
+    parent = data.get(parent_key)
+    if isinstance(parent, dict):
+        entry = parent.get("biopb")
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+#: config_format -> reader. Every read goes through this; there is deliberately
+#: no default, so a client whose format we have not implemented raises instead
+#: of being silently parsed as JSON.
+_READERS = {
+    "json": _read_json_entry,
+    "toml": _read_toml_entry,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Entry shapes
+# --------------------------------------------------------------------------- #
+# Each style pairs a builder (what to write) with an extractor (how to read the
+# executable back out for drift). They must stay inverses of each other, which
+# is why they are defined as a pair rather than in the read and write halves.
+
+
+def _stdio_entry(command: str) -> dict:
+    # Canonical mcpServers stdio form: bare command+args, no "type" (a stray
+    # "type" trips stricter validators — matches the installer's choice).
+    return {"command": command, "args": list(_MCP_ARGS)}
+
+
+def _stdio_command(entry: dict) -> Optional[str]:
+    command = entry.get("command")
+    return command if isinstance(command, str) else None
+
+
+def _opencode_entry(command: str) -> dict:
+    return {"type": "local", "command": [command, *_MCP_ARGS], "enabled": True}
+
+
+def _opencode_command(entry: dict) -> Optional[str]:
+    command = entry.get("command")
+    if isinstance(command, list) and command:
+        return command[0] if isinstance(command[0], str) else None
+    return None
+
+
+#: entry_style -> (builder, extractor). No default branch, for the same reason
+#: as _READERS: an unknown style must not silently get the stdio shape.
+_SHAPES = {
+    "stdio": (_stdio_entry, _stdio_command),
+    "opencode": (_opencode_entry, _opencode_command),
+}
+
+
+def _dispatch(table: dict, key: str, spec: AgentSpec, axis: str):
+    """Look ``key`` up in ``table``, or raise :class:`AgentError` naming the
+    client and the axis. The single place a missing implementation is caught —
+    every dispatch in this module goes through it rather than an ``else``."""
+    try:
+        return table[key]
+    except KeyError:
+        raise AgentError(f"{spec.name}: unsupported {axis} {key!r}")
+
+
 def _jsonc_unmergeable(path: Path) -> bool:
     """True when ``path`` is a ``.jsonc`` our strict-JSON writer must not edit:
     it parses only after comment/trailing-comma stripping, so rewriting it would
@@ -419,25 +503,21 @@ def _manual_edit_message(spec: AgentSpec, path: Path, *, removing: bool) -> str:
 def _read_entry(spec: AgentSpec, path: Optional[Path]) -> Optional[dict]:
     """The biopb MCP entry currently in the client's config, or ``None``.
 
-    A read-only, exception-tolerant probe used for status (unlike
-    :func:`_load_json_object` it never raises — a malformed config simply reads as
-    "not registered" for display, and the write path reports the parse error).
-    Reads ``.jsonc`` tolerantly so a commented opencode config is still detected as
+    A read-only probe used for status. Tolerant of the *user's* data: unlike
+    :func:`_load_json_object`, a malformed config simply reads as "not
+    registered" for display, and the write path reports the parse error. Reads
+    ``.jsonc`` tolerantly so a commented opencode config is still detected as
     registered rather than silently reading as "installed" (biopb/biopb#536).
+
+    It does raise on a malformed *catalog* — a ``config_format`` with no reader —
+    because that is our bug, not the user's, and the alternative is parsing the
+    file as something it is not. ``test_every_spec_axis_has_an_implementation``
+    keeps a shipped spec from ever reaching it.
     """
     if path is None or not path.exists():
         return None
-    if spec.manager == "codex-cli":
-        return _read_toml_entry(path, spec.parent_key)
-    data = _load_json_tolerant(path)
-    if not isinstance(data, dict):
-        return None
-    parent = data.get(spec.parent_key)
-    if isinstance(parent, dict):
-        entry = parent.get("biopb")
-        if isinstance(entry, dict):
-            return entry
-    return None
+    reader = _dispatch(_READERS, spec.config_format, spec, "config format")
+    return reader(path, spec.parent_key)
 
 
 def _entry_command(spec: AgentSpec, entry: dict) -> Optional[str]:
@@ -447,12 +527,8 @@ def _entry_command(spec: AgentSpec, entry: dict) -> Optional[str]:
     ``command`` as a list whose first element is the executable. ``None`` when the
     entry has no recognizable command (treated as drift so a malformed prior entry
     prompts a Re-register)."""
-    command = entry.get("command")
-    if spec.entry_style == "opencode":
-        if isinstance(command, list) and command:
-            return command[0] if isinstance(command[0], str) else None
-        return None
-    return command if isinstance(command, str) else None
+    _, extract = _dispatch(_SHAPES, spec.entry_style, spec, "entry style")
+    return extract(entry)
 
 
 def status(spec_id: str) -> dict:
@@ -500,17 +576,8 @@ def statuses() -> list[dict]:
 
 def _mcp_entry(spec: AgentSpec) -> dict:
     """The MCP server entry to write for ``spec``, in its client's shape."""
-    command = _mcp_command()
-    if spec.entry_style == "opencode":
-        # opencode: {type:"local", command:[exe, ...args], enabled:true}
-        return {
-            "type": "local",
-            "command": [command, *_MCP_ARGS],
-            "enabled": True,
-        }
-    # Canonical mcpServers stdio form: bare command+args, no "type" (a stray
-    # "type" trips stricter validators — matches the installer's choice).
-    return {"command": command, "args": list(_MCP_ARGS)}
+    build, _ = _dispatch(_SHAPES, spec.entry_style, spec, "entry style")
+    return build(_mcp_command())
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
@@ -602,7 +669,7 @@ def _unregister_json(spec: AgentSpec) -> None:
         _write_json_atomic(path, data)
 
 
-def _register_claude() -> None:
+def _register_claude(spec: AgentSpec) -> None:
     # Idempotent: drop any existing entry, then add (matches the installer). The
     # remove is best-effort (a not-yet-registered client returns non-zero), the
     # add must succeed.
@@ -616,11 +683,11 @@ def _register_claude() -> None:
         raise AgentError(f"`claude mcp add` failed: {out.strip()}")
 
 
-def _unregister_claude() -> None:
+def _unregister_claude(spec: AgentSpec) -> None:
     _run_client_cli("claude", ["mcp", "remove", "biopb", "-s", "user"], required=True)
 
 
-def _register_codex() -> None:
+def _register_codex(spec: AgentSpec) -> None:
     # `codex mcp add` overwrites an existing server of the same name and exits 0,
     # so unlike Claude Code no remove-then-add dance is needed for idempotence.
     code, out = _run_client_cli(
@@ -632,12 +699,22 @@ def _register_codex() -> None:
         raise AgentError(f"`codex mcp add` failed: {out.strip()}")
 
 
-def _unregister_codex() -> None:
+def _unregister_codex(spec: AgentSpec) -> None:
     # Removing an absent server is not an error for codex (it exits 0), so this
     # is idempotent without tolerating a failure that is real.
     code, out = _run_client_cli("codex", ["mcp", "remove", "biopb"], required=True)
     if code != 0:
         raise AgentError(f"`codex mcp remove` failed: {out.strip()}")
+
+
+#: manager -> (register, unregister). The write path's dispatch: no default, so
+#: a client whose manager is unimplemented raises rather than falling through to
+#: the JSON writer and emitting a JSON document into a TOML/YAML config.
+_WRITERS = {
+    "json": (_register_json, _unregister_json),
+    "claude-cli": (_register_claude, _unregister_claude),
+    "codex-cli": (_register_codex, _unregister_codex),
+}
 
 
 def register(spec_id: str) -> dict:
@@ -649,12 +726,8 @@ def register(spec_id: str) -> dict:
     :class:`AgentError` on any failure — the caller renders it.
     """
     spec = _spec(spec_id)
-    if spec.manager == "claude-cli":
-        _register_claude()
-    elif spec.manager == "codex-cli":
-        _register_codex()
-    else:
-        _register_json(spec)
+    do_register, _ = _dispatch(_WRITERS, spec.manager, spec, "manager")
+    do_register(spec)
     logger.info("registered biopb with %s", spec.name)
     return status(spec_id)
 
@@ -662,11 +735,7 @@ def register(spec_id: str) -> dict:
 def unregister(spec_id: str) -> dict:
     """Remove biopb from the client and return its fresh status. Idempotent."""
     spec = _spec(spec_id)
-    if spec.manager == "claude-cli":
-        _unregister_claude()
-    elif spec.manager == "codex-cli":
-        _unregister_codex()
-    else:
-        _unregister_json(spec)
+    _, do_unregister = _dispatch(_WRITERS, spec.manager, spec, "manager")
+    do_unregister(spec)
     logger.info("unregistered biopb from %s", spec.name)
     return status(spec_id)

@@ -47,6 +47,75 @@ def test_catalog_is_the_installer_set_minus_hermes():
     assert "hermes" not in ids
 
 
+def test_every_spec_axis_has_an_implementation():
+    """Each dispatch axis must resolve for every shipped client.
+
+    The dispatch tables have no default branch on purpose, so this is what keeps
+    a new client (or a typo in one) from reaching a user: an unimplemented axis
+    fails here rather than in someone's config file.
+    """
+    for spec in _agents.supported():
+        assert spec.manager in _agents._WRITERS, spec.id
+        assert spec.config_format in _agents._READERS, spec.id
+        assert spec.entry_style in _agents._SHAPES, spec.id
+
+
+def _inject(monkeypatch, **overrides):
+    """A catalog entry with one axis set to something unimplemented."""
+    base = {
+        "id": "ghost",
+        "name": "Ghost Client",
+        "manager": "json",
+        "config_format": "json",
+        "parent_key": "mcpServers",
+        "entry_style": "stdio",
+    }
+    spec = _agents.AgentSpec(**{**base, **overrides})
+    monkeypatch.setitem(_agents._SPECS_BY_ID, "ghost", spec)
+    return spec
+
+
+def test_unimplemented_manager_raises_instead_of_writing_json(home, monkeypatch):
+    """The regression this dispatch exists for.
+
+    A manager with no writer used to fall through to the JSON writer, which
+    happily emitted a JSON document at whatever path the client used — a
+    ``cordis.yml`` or a ``config.toml``. It must raise and touch nothing.
+    """
+    _inject(monkeypatch, manager="yaml")
+    cfg = home / "cordis.yml"
+    monkeypatch.setattr(_agents, "_config_path", lambda spec: cfg)
+    with pytest.raises(_agents.AgentError):
+        _agents.register("ghost")
+    assert not cfg.exists()
+
+
+def test_unimplemented_manager_raises_on_unregister(home, monkeypatch):
+    _inject(monkeypatch, manager="yaml")
+    monkeypatch.setattr(_agents, "_config_path", lambda spec: home / "cordis.yml")
+    with pytest.raises(_agents.AgentError):
+        _agents.unregister("ghost")
+
+
+def test_unimplemented_config_format_raises_rather_than_guessing(home, monkeypatch):
+    """A format with no reader must not be parsed as JSON on the status path."""
+    _inject(monkeypatch, config_format="yaml")
+    cfg = home / "cordis.yml"
+    cfg.write_text("mcpServers:\n  biopb:\n    command: x\n")
+    monkeypatch.setattr(_agents, "_config_path", lambda spec: cfg)
+    with pytest.raises(_agents.AgentError):
+        _agents.status("ghost")
+
+
+def test_unimplemented_entry_style_raises_rather_than_writing_stdio(home, monkeypatch):
+    _inject(monkeypatch, entry_style="cordis")
+    cfg = home / "config.json"
+    monkeypatch.setattr(_agents, "_config_path", lambda spec: cfg)
+    with pytest.raises(_agents.AgentError):
+        _agents.register("ghost")
+    assert not cfg.exists()
+
+
 def test_unknown_client_raises():
     with pytest.raises(_agents.AgentError):
         _agents.status("nope")
