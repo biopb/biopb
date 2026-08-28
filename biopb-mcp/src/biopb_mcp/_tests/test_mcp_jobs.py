@@ -566,6 +566,64 @@ print('JOBS_READY')
 """
 
 
+class TestJobOutputCap:
+    """The bound ``_MAX_RETAINED_JOBS`` is not.
+
+    That caps how many records are kept, not how large one gets, so a single
+    cell printing in a loop grew one record without limit and 32 of them
+    bounded nothing.
+    """
+
+    _wait = staticmethod(_wait_job)
+
+    @pytest.fixture
+    def small_cap(self, monkeypatch):
+        """A tiny cap, so a test does not have to print 200k characters."""
+        monkeypatch.setattr(_jobs, "_MAX_JOB_OUTPUT_CHARS", 100)
+        return 100
+
+    #: 100 iterations x ("xxx" + "\n") -- print writes the text and the end
+    #: separately, so this is 400 characters through a cap of 100.
+    LOUD = "for i in range(100): print('x' * 3)"
+
+    def test_output_under_the_cap_is_untouched(self, runner, small_cap):
+        jid = _jobs.submit("print('hi')")["job_id"]
+        snap = self._wait(jid)
+        assert snap["stdout"] == "hi\n"
+        assert snap["stdout_dropped"] == 0
+        assert snap["stdout_total"] == 3
+
+    def test_a_runaway_cell_keeps_only_its_tail(self, runner, small_cap):
+        snap = self._wait(_jobs.submit(self.LOUD)["job_id"])
+        assert snap["stdout_dropped"] > 0
+        assert len(snap["stdout"]) < 400
+        # The newest output survives: while a cell is running that is the part
+        # worth having, which is why the detail view keeps the tail too.
+        assert snap["stdout"].endswith("xxx\n")
+
+    def test_the_record_says_it_is_partial(self, runner, small_cap):
+        snap = self._wait(_jobs.submit(self.LOUD)["job_id"])
+        # Marked on read rather than stored -- a marker written into the buffer
+        # would itself be compacted away by the next rewrite.
+        assert "earlier chars dropped" in snap["stdout"]
+
+    def test_the_total_stays_monotonic_across_compaction(self, runner, small_cap):
+        # What a reader streaming output as it grows has to diff against:
+        # len(stdout) goes *down* when the window moves, and diffing against
+        # that is what would leave the chat pane silent for the rest of a cell.
+        snap = self._wait(_jobs.submit(self.LOUD)["job_id"])
+        assert snap["stdout_total"] == 400
+        assert snap["stdout_total"] > len(snap["stdout"])
+
+    def test_the_row_reports_what_was_printed_not_what_was_kept(
+        self, runner, small_cap
+    ):
+        jid = _jobs.submit(self.LOUD)["job_id"]
+        self._wait(jid)
+        row = next(j for j in _jobs.jobs_summary() if j["job_id"] == jid)
+        assert row["stdout_len"] == 400
+
+
 class TestJobConcurrency:
     @pytest.fixture
     def kernel(self):
