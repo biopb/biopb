@@ -48,6 +48,18 @@ interface JobSummary {
    * child, and empty for a cell nobody explained (the console's, typically). */
   intent_preview?: string;
 }
+/** The verified workflow this session has, if any — a clean program an agent
+ * rewrote from the transcript and proved by running in a scratch namespace.
+ * Absent on an older child, and null until something is verified. */
+interface WorkflowSummary {
+  title?: string;
+  cells: number;
+  created?: number;
+}
+/** Which document to download. Not a flag inside one: the audit export is every
+ * job that ran, the workflow export is the verified program someone rewrote
+ * from it. Different questions, so the reader chooses. */
+type NotebookKind = "audit" | "workflow";
 interface JobDetail {
   code?: string;
   intent?: string;
@@ -80,6 +92,7 @@ export default function ObservePage() {
   );
 
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
+  const [workflow, setWorkflow] = useState<WorkflowSummary | null>(null);
   const [details, setDetails] = useState<Record<string, JobDetail>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("…");
@@ -171,10 +184,13 @@ export default function ObservePage() {
     // pollStatus below owns the diagnosis; all this has to do is not overwrite
     // a good job list with the empty one an error body parses as.
     if (sessionVerdict(r.status) !== "live") return;
-    const data: { busy?: boolean; jobs?: JobSummary[] } = await r
-      .json()
-      .catch(() => ({}));
+    const data: {
+      busy?: boolean;
+      jobs?: JobSummary[];
+      workflow?: WorkflowSummary | null;
+    } = await r.json().catch(() => ({}));
     if (data.busy) return; // transient; keep current render
+    setWorkflow(data.workflow ?? null);
     const list = data.jobs || [];
     if (!list.length) {
       setJobs([]);
@@ -287,10 +303,12 @@ export default function ObservePage() {
     [fetchDetail],
   );
 
-  const saveNotebook = useCallback(async () => {
+  const saveNotebook = useCallback(async (kind: NotebookKind = "audit") => {
     let r: Response;
     try {
-      r = await sessionFetch(base + "/api/notebook");
+      r = await sessionFetch(
+        base + "/api/notebook" + (kind === "workflow" ? "?workflow=1" : ""),
+      );
     } catch (e) {
       alert("Save failed: " + e);
       return;
@@ -426,7 +444,18 @@ export default function ObservePage() {
             how the page told the user nothing was wrong. */}
         {ended ? null : (
           <>
-            <button className="primary" onClick={saveNotebook}>
+            {workflow ? (
+              <button
+                className="primary"
+                title={`${workflow.title || "Verified workflow"} — ${
+                  workflow.cells
+                } cell(s), verified in a scratch namespace`}
+                onClick={() => saveNotebook("workflow")}
+              >
+                ⤓ Save workflow
+              </button>
+            ) : null}
+            <button className="primary" onClick={() => saveNotebook("audit")}>
               ⤓ Save notebook
             </button>
             <button className="danger" onClick={restart}>

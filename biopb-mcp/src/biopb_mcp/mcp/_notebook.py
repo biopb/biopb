@@ -1,4 +1,13 @@
-"""Serialize a recorded ``execute_code`` session to a Jupyter notebook.
+"""Serialize a kernel session to a Jupyter notebook — two documents, one writer.
+
+:func:`build_notebook` is the **audit export**: every retained job in order,
+faithfully, dead ends included. :func:`build_workflow_notebook` is the
+**workflow export**: the cells of a verified workflow (``_jobs`` verification
+run), which are a *rewrite* of that transcript rather than a selection from it,
+and which are known to run because they just did.
+
+The two answer different questions — "what happened here?" and "what should I
+run again?" — and neither substitutes for the other, so both ship.
 
 Runs in the *MCP server process* (no kernel/Qt imports): the observe UI rounds a
 :func:`biopb_mcp.mcp._jobs.export` read off the kernel main thread, then hands
@@ -188,6 +197,33 @@ def _job_cell(snap):
     )
 
 
+_WORKFLOW_INTRO = (
+    "Verified {ts}{ncells}.\n\n"
+    "Each cell below ran, in this order, in a **scratch namespace** — one seeded "
+    "with the kernel's own handles (`np`, `da`, `client`, `ops`, `viewer`) and "
+    "nothing the session had bound since it started. That is what the first code "
+    "cell rebuilds, so this notebook asks of a fresh kernel only what the "
+    "verification run was given.\n\n"
+    "**What the run proves.** Every cell executed without raising, and no cell "
+    "leaned on a variable it did not itself create — the defect that makes a "
+    "session transcript unrunnable. It is not a claim that the numbers are "
+    "right; that is the reader's to check, and the outputs are kept below so "
+    "there is something to check against.\n\n"
+    "**What it does not prove.** A scratch namespace isolates *bindings*, not "
+    "the world: the napari viewer, `sys.modules`, and anything mutated in place "
+    "were shared with the live session. A cell that reads an existing layer by "
+    "name found one there, and will not on a fresh kernel. External state is "
+    "unchanged by any of this — tensor-server source ids still have to exist, "
+    "and `auto_connect()` still needs a running control (`biopb control start`) "
+    "or `$BIOPB_TENSOR_URL`.{layers}"
+)
+
+_LAYERS_NOTE = (
+    "\n\n**Layers this run added to the live viewer:** {names}. Shared viewer, "
+    "so these are real additions, not a sandbox's."
+)
+
+
 _TITLE = "# biopb-mcp session — audit export\n"
 
 _INTRO = (
@@ -247,6 +283,69 @@ def build_notebook(jobs):
     }
 
 
+def _workflow_cell(cell):
+    """One verified cell: its source, and the output it produced when verified.
+
+    No provenance header comment, unlike :func:`_job_cell`. An audit cell needs
+    one because a reader has to know who ran it; a workflow cell has one author
+    and one purpose, and a banner on every cell is noise in a document someone
+    is meant to read and edit.
+    """
+    outputs = []
+    stdout = cell.get("stdout") or ""
+    if stdout:
+        outputs.append(
+            {"output_type": "stream", "name": "stdout", "text": _lines(stdout)}
+        )
+    result_text = cell.get("result_text") or ""
+    if result_text:
+        outputs.append(
+            {
+                "output_type": "execute_result",
+                "execution_count": None,
+                "data": {"text/plain": _lines(result_text)},
+                "metadata": {},
+            }
+        )
+    return _code_cell(cell.get("code") or "", outputs=outputs)
+
+
+def build_workflow_notebook(record):
+    """Build an nbformat-v4 notebook from a verification record.
+
+    *record* is ``_jobs.verified()`` — a fully-successful run, since a partial
+    one is a report rather than a document (``_jobs._run``). Returns a plain
+    dict ready to ``json.dumps``.
+    """
+    record = record or {}
+    cells_in = record.get("cells") or []
+    title = (record.get("title") or "").strip() or "Verified workflow"
+    added = record.get("added_layers") or []
+    intro = _WORKFLOW_INTRO.format(
+        ts=_fmt_ts(record.get("created")),
+        ncells=f" · {len(cells_in)} cell(s)" if cells_in else "",
+        layers=_LAYERS_NOTE.format(names=", ".join(f"`{n}`" for n in added))
+        if added
+        else "",
+    )
+
+    cells = [_markdown_cell(f"# {title}\n\n" + intro), _code_cell(BOOTSTRAP_SRC)]
+    cells.extend(_workflow_cell(c) for c in cells_in)
+    return {
+        "cells": cells,
+        "metadata": {
+            "language_info": {"name": "python"},
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+
+
 def _now_epoch():
     """Current epoch seconds (own helper so tests can monkeypatch the stamp)."""
     return datetime.datetime.now().timestamp()
@@ -256,3 +355,29 @@ def suggested_filename():
     """``biopb-mcp-session-YYYYMMDD-HHMMSS.ipynb`` for the download."""
     stamp = datetime.datetime.fromtimestamp(_now_epoch()).strftime("%Y%m%d-%H%M%S")
     return f"biopb-mcp-session-{stamp}.ipynb"
+
+
+def _slug(title, limit=48):
+    """A filename-safe stem from a workflow title, or ``""`` when there is none.
+
+    Conservative: lowercase, and anything that is not a letter, digit, or dash
+    becomes a dash. A title is free text typed by whoever ran the verification
+    and this becomes a filename on their disk.
+    """
+    out = []
+    for ch in (title or "").strip().lower():
+        out.append(ch if ch.isalnum() and ch.isascii() else "-")
+    slug = "-".join(part for part in "".join(out).split("-") if part)
+    return slug[:limit].strip("-")
+
+
+def suggested_workflow_filename(title=""):
+    """``biopb-<title>-YYYYMMDD-HHMMSS.ipynb`` for the workflow download.
+
+    The stamp stays even with a title: a workflow is verified more than once
+    while it is being worked on, and two downloads of the same title must not
+    silently be the same file.
+    """
+    stamp = datetime.datetime.fromtimestamp(_now_epoch()).strftime("%Y%m%d-%H%M%S")
+    slug = _slug(title)
+    return f"biopb-{slug}-{stamp}.ipynb" if slug else f"biopb-workflow-{stamp}.ipynb"

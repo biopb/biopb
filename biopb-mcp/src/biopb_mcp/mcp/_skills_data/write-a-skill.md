@@ -3,7 +3,7 @@ id: write-a-skill
 title: Write a new biopb skill file
 description: Turn a workflow the user has just validated into a reviewed skill file for the biopb catalog.
 tags: [workflow, authoring]
-version: 1.0.0
+version: 1.1.0
 checklist: []
 ---
 
@@ -35,7 +35,11 @@ general Python** — the recipe an agent would otherwise improvise wrongly.
   not confirmed on real data. A skill is a claim that the procedure works; an
   unverified one teaches every future session the same mistake.
 - **It is specific to one dataset.** Particular file names, hard-coded crops, or
-  one experiment's channel order belong in the conversation, not the catalog.
+  one experiment's channel order belong in a **notebook**, not the catalog:
+  rewrite the session into a clean program, check it with `verify_workflow`, and
+  the user saves it from the observe page. A skill is the procedure minus the
+  dataset, re-derived by an agent on new data; a notebook is this run on this
+  data, re-run and edited by the user. Different artifacts, not competing ones.
 
 ## Parameters
 
@@ -157,6 +161,12 @@ The frontmatter fields, and how to determine each:
    run — and where a *Failure modes* row is earned. Then read the draft for
    hidden state: every variable and layer it uses must be created by its own
    steps, not left over from this conversation.
+
+   The hidden-state check has a mechanism: put the draft's code cells through
+   `verify_workflow`, which runs them in a namespace holding the kernel's
+   handles and nothing this session bound. A leftover variable raises `NameError`
+   there instead of quietly working. It costs no restart, so there is nothing to
+   ask about first.
 
    A genuinely clean-room run needs `restart_kernel`, which **destroys the
    namespace, every layer, and any running job**. That is a *validate-and-gate*:

@@ -54,7 +54,7 @@ def host():
         "recent_respawns": 0,
         "watchdog_running": True,
     }
-    h.execute.return_value = _reply([])  # jobs_summary() default: empty
+    h.execute.return_value = _reply({"jobs": [], "workflow": None})  # jobs_view()
     return h
 
 
@@ -97,15 +97,18 @@ def test_observe_page_is_not_served_by_the_child(client):
 
 def test_api_jobs_lists_summary(client, host):
     host.execute.return_value = _reply(
-        [
-            {
-                "job_id": "job-1",
-                "status": "running",
-                "elapsed": 1.2,
-                "stdout_len": 5,
-                "code_preview": "print('hi')",
-            }
-        ]
+        {
+            "jobs": [
+                {
+                    "job_id": "job-1",
+                    "status": "running",
+                    "elapsed": 1.2,
+                    "stdout_len": 5,
+                    "code_preview": "print('hi')",
+                }
+            ],
+            "workflow": None,
+        }
     )
     r = client.get("/api/jobs")
     assert r.status_code == 200
@@ -184,6 +187,48 @@ def test_api_notebook_downloads_ipynb(client, host):
     assert "interrupted" in "".join(job2["source"])
     assert job2["metadata"]["biopb"]["status"] == "interrupted"
     assert any(o.get("name") == "stderr" for o in job2["outputs"])
+
+
+def test_api_notebook_workflow_serves_the_verified_run(client, host):
+    host.execute.return_value = _reply(
+        {
+            "title": "Count foci per cell",
+            "created": 1_700_000_000.0,
+            "status": "ok",
+            "added_layers": [],
+            "cells": [
+                {
+                    "code": "a = 2",
+                    "status": "ok",
+                    "stdout": "",
+                    "result_text": "",
+                    "error_text": "",
+                    "elapsed": 0.1,
+                }
+            ],
+        }
+    )
+    r = client.get("/api/notebook?workflow=1")
+    assert r.status_code == 200
+    # A different document, so a different read: the verified program, not the
+    # transcript it was rewritten from.
+    assert "verified()" in host.execute.call_args[0][0]
+    assert r.headers["X-Filename"].startswith("biopb-count-foci-per-cell-")
+    assert "Count foci per cell" in r.text
+
+
+def test_api_notebook_workflow_404s_when_nothing_is_verified(client, host):
+    host.execute.return_value = _reply(None)
+    r = client.get("/api/notebook?workflow=1")
+    assert r.status_code == 404
+
+
+def test_api_notebook_defaults_to_the_audit_export(client, host):
+    # The default is unchanged, so a bookmarked URL and an older page both still
+    # get the document they asked for.
+    host.execute.return_value = _reply([])
+    assert client.get("/api/notebook").status_code == 200
+    assert "export()" in host.execute.call_args[0][0]
 
 
 def test_api_notebook_empty_session(client, host):

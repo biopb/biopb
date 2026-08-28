@@ -301,10 +301,13 @@ async def _api_jobs(request):
     host, err = _require_host()
     if err is not None:
         return err
-    result, res, _w = _server._run_job_call(host, "jobs_summary()")
+    # jobs_view(), not jobs_summary(): the page redraws from the job list *and*
+    # from whether a verified workflow is available to download, and this poll
+    # runs about once a second for the life of the session.
+    result, res, _w = _server._run_job_call(host, "jobs_view()")
     if result is None:
         return _kernel_error(res)
-    return JSONResponse({"jobs": result})
+    return JSONResponse(result)
 
 
 async def _api_job_detail(request):
@@ -331,9 +334,28 @@ async def _api_job_detail(request):
 
 
 async def _api_notebook(request):
+    """The session as a notebook: the audit export, or ``?workflow=1`` for the
+    verified one.
+
+    Two documents rather than one with a flag inside it, because they answer
+    different questions and a reader wants to have chosen. The default is
+    unchanged, so an older page (and a bookmarked URL) still gets the audit.
+    """
     host, err = _require_host()
     if err is not None:
         return err
+    if request.query_params.get("workflow"):
+        record, res, _w = _server._run_job_call(host, "verified()")
+        if record is None:
+            # No verified workflow *and* a failed read look the same from here;
+            # the kernel error is the more specific answer, so prefer it.
+            if res.get("status") != "ok":
+                return _kernel_error(res)
+            return JSONResponse({"error": "no verified workflow in this session"}, 404)
+        nb = _notebook.build_workflow_notebook(record)
+        filename = _notebook.suggested_workflow_filename(record.get("title", ""))
+        return _notebook_response(nb, filename)
+
     # Read the full job history on the kernel main thread (a plain read like
     # jobs_summary(), no background job thread), then serialize to a notebook in
     # this process.
@@ -342,6 +364,10 @@ async def _api_notebook(request):
         return _kernel_error(res)
     nb = _notebook.build_notebook(jobs)
     filename = _notebook.suggested_filename()
+    return _notebook_response(nb, filename)
+
+
+def _notebook_response(nb, filename):
     return Response(
         json.dumps(nb, indent=1),
         media_type="application/x-ipynb+json",

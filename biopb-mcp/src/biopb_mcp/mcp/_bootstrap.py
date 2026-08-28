@@ -838,3 +838,11 @@ def _bootstrap_impl():
         )
     except Exception:
         logger.exception("Failed to start source watcher")
+
+    # 9. The scratch-run baseline: the namespace as this bootstrap leaves it.
+    #    Last, so it holds the built-in handles *and* the plugins and nothing
+    #    else -- everything bound after this point belongs to the session, and
+    #    is exactly what a verification run is defined not to see. Cheap (a key
+    #    set) and unconditional: a session that never verifies anything pays for
+    #    one frozenset.
+    _jobs.mark_baseline()
