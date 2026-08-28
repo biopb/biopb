@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 _TREE_ENV_CONFIG = "BIOPB_CONFIG_HOME"
 _TREE_ENV_STATE = "BIOPB_STATE_HOME"
 _TREE_ENV_DATA = "BIOPB_DATA_HOME"
+_TREE_ENV_CACHE = "BIOPB_CACHE_HOME"
 
 # One warning per (biopb var) per process: relocating via XDG used to work, so a
 # stale deployment must be told its tree moved back to the default rather than
@@ -172,6 +174,38 @@ def state_dir() -> Path:
 def data_dir() -> Path:
     """Data tree (``~/.local/share/biopb``): portable assets (webapp bundle, samples)."""
     return _tree(_TREE_ENV_DATA, "XDG_DATA_HOME", ".local/share")
+
+
+def cache_dir() -> Path:
+    """Cache tree: regenerable bytes, safe to delete.
+
+    ``~/.cache/biopb``, and ``%LOCALAPPDATA%\\biopb\\Cache`` on Windows.
+
+    Distinct from :func:`state_dir` precisely because everything here can be
+    thrown away without losing anything -- the SDK's on-disk chunk cache is the
+    first tenant, and its recovery story is "unlink whatever does not parse". A
+    user (or a distro's cache janitor) may empty this tree at any time.
+
+    **The one tree that is not the same layout on every platform.** The other
+    three hold kilobytes of config, state, and assets, so a uniform dotted layout
+    costs nothing. This one is sized to hold tens of gigabytes, which is exactly
+    what Windows separates ``%LOCALAPPDATA%`` (non-roaming, not backed up) from
+    the profile root to keep out of roaming profiles and Folder Redirection.
+    Syncing a chunk cache across a network profile is the harm; the divergence
+    buys avoiding it, and only here because only here is the tree big.
+
+    ``AppData/Local`` is derived from :func:`Path.home`, not read from
+    ``%LOCALAPPDATA%``. Trusting an inherited environment variable to place a
+    base tree is precisely the biopb/biopb#790 bug, and nothing about that lesson
+    changes for a variable Windows happens to own by convention.
+    """
+    if sys.platform == "win32":
+        raw = os.environ.get(_TREE_ENV_CACHE)
+        if raw:
+            _require_absolute(_TREE_ENV_CACHE, raw)
+            return Path(raw) / "biopb"
+        return Path.home() / "AppData" / "Local" / "biopb" / "Cache"
+    return _tree(_TREE_ENV_CACHE, "XDG_CACHE_HOME", ".cache")
 
 
 # --- config file (location + format) ------------------------------------- #

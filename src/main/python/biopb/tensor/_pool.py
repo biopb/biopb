@@ -42,6 +42,7 @@ from dask.delayed import delayed
 from dask.highlevelgraph import HighLevelGraph
 from dask.utils import parse_bytes
 
+from biopb.tensor import _diskcache
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.ticket_pb2 import TensorTicket
 
@@ -227,6 +228,39 @@ def _should_try_cachefile(location: str) -> bool:
     if not _is_localhost_location(location):
         return False
     return _cachefile_supported(location) is not False
+
+
+# ------------------------------------------------------------------------------
+# The remote counterpart: our own on-disk chunk cache (docs/client-disk-cache.md)
+# ------------------------------------------------------------------------------
+#
+# Same shape as the fast path above -- a chunk lives in a file we can mmap -- and
+# differing only in who wrote the file. The two are mutually exclusive by
+# location, so a chunk is never stored twice and the concept stays one sentence.
+
+
+@cache
+def _disk_cache_settings() -> Optional[_diskcache.Settings]:
+    """Process-wide on-disk chunk-cache policy, or None when it is disabled.
+
+    Memoized because it is consulted on every chunk fetch; the at-fork handler
+    clears it alongside the pools so a child re-reads its own environment.
+    """
+    return _diskcache.load_settings()
+
+
+def _disk_cache_for(location: str) -> Optional[_diskcache.Settings]:
+    """The on-disk cache policy for ``location``, or None to skip it.
+
+    **Remote only.** On localhost the server's segment already holds this chunk
+    warm and ``_try_cachefile_transfer`` reads it in ~1 ms, so writing a second
+    copy would cost several times the miss it saves. That asymmetry is the whole
+    reason the gate exists -- it confines the write to the regime where the miss
+    is a network round trip and the write is a memcpy beside it.
+    """
+    if _is_localhost_location(location):
+        return None
+    return _disk_cache_settings()
 
 
 def _decode_unified_batch(batch: pa.RecordBatch) -> Tuple[np.ndarray, pa.Buffer]:
@@ -657,6 +691,10 @@ def _reset_pools_after_fork() -> None:
     _pinned_segments.clear()
     _pinned_total = 0
     _THREAD_LOCAL.clients = {}
+    # The child re-reads its own environment, and inherits none of the parent's
+    # progress toward a sweep (both processes would otherwise sweep at once).
+    _disk_cache_settings.cache_clear()
+    _diskcache.reset_write_accounting()
 
 
 # fork inherits this module's pools into the child; register_at_fork fires for
@@ -961,7 +999,17 @@ def _fetch_chunk_distributed(
         if result is not None:
             arr, is_view = result
 
-    # Fallback to do_get if the fast path wasn't attempted or failed
+    # Our own on-disk copy, mmapped -- the remote counterpart of the fast path
+    # above (never both: _disk_cache_for gates on location).
+    disk = _disk_cache_for(location)
+    if arr is None and disk is not None:
+        batch = _diskcache.read_batch(disk, location, chunk_id)
+        if batch is not None:
+            logger.debug(f"fetch_chunk_distributed: disk hit for {cache_key[:16]}")
+            arr = _array_from_unified_batch(batch, copy=False)
+            is_view = True
+
+    # Fallback to do_get if neither cache had it
     if arr is None:
         ticket = TensorTicket(chunk_id=chunk_id)
         reader = client.do_get(
@@ -975,13 +1023,30 @@ def _fetch_chunk_distributed(
         # (biopb/biopb#571). The mmap fast path above hands out a view too, but
         # for a different reason: there the buffer aliases the segment *mapping*,
         # which Arrow refcounts so it outlives that path's local ``mm.close()``.
-        # Both paths return a read-only array. This one is a private in-memory
-        # buffer, not a shared mmap view, so it is NOT a view for caching purposes.
-        arr = _array_from_unified_batch(reader.read_all().to_batches()[0], copy=False)
+        # Both paths return a read-only array. This buffer is private and
+        # in-memory, so it is NOT a view for caching purposes -- unless the disk
+        # cache below swaps it for a mapping, which is exactly what that does.
+        batch = reader.read_all().to_batches()[0]
+        # Persist for the *next* process. This one gains nothing -- it already
+        # holds the decoded array -- so the payoff is entirely cross-process and
+        # cross-session. Reading the stored file back costs no extra copy (the
+        # in-memory buffer is dropped for a view onto the mapping) and lands the
+        # chunk in the same representation every other path produces.
+        if disk is not None:
+            stored = _diskcache.write_batch(disk, location, chunk_id, batch)
+            if stored is not None:
+                batch = stored
+                is_view = True
+        arr = _array_from_unified_batch(batch, copy=False)
 
-    # Route the result to the matching cache: mmap views cost ~no client RAM and
-    # pin server disk, so weak-cache them (free, self-evicting, uncounted); copies
-    # cost real RAM, so strong-cache them under the byte budget (skipped if off).
+    # Route the result to the matching cache: mmap views cost ~no client RAM (they
+    # pin disk instead -- the server's, or our own cache dir), so weak-cache them
+    # (free, self-evicting, uncounted); copies cost real RAM, so strong-cache them
+    # under the byte budget (skipped if off). With the disk cache healthy nothing
+    # reaches the strong cache on a remote read, which is the point: holding a
+    # private RAM copy of bytes already in the page cache is double-buffering,
+    # N-fold across N workers. It stays as the fallback for when the disk cache
+    # is unavailable -- see docs/client-disk-cache.md.
     if is_view:
         _view_cache_put(location, token, cache_key, arr)
     elif cache is not None:

@@ -498,7 +498,7 @@ debugging) than on a tuning dial.
   compute on band N overlaps readahead of band N+1, but it is not measured).
   And the flag is keyed on the adapter class while the cost model is really about
   *storage*: an ND2 on NFS — which is what biopb.org runs — is still mmap-able,
-  but a band read there is not free. `core/fs_detect.py` already classifies this
+  but a band read there is not free. `biopb._fs_detect` already classifies this
   (`network_filesystem_type`), and the band decision should consult it before this
   is turned on for a network-backed source.
 

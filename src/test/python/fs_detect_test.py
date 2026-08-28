@@ -15,8 +15,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from biopb_tensor_server.core import fs_detect
-from biopb_tensor_server.core.fs_detect import (
+from biopb import _fs_detect as fs_detect
+from biopb._fs_detect import (
     _classify_fstype,
     _cloud_path_hint,
     _is_unc,
@@ -220,3 +220,70 @@ class TestUnsafeCacheDirReason:
                 assert "cifs" in reason
                 # Short-circuits: cloud probe not even consulted.
                 assert not cloud.called
+
+
+class TestMemoryFilesystem:
+    """RAM-backed storage: mmap-safe, but the wrong place for a cache whose whole
+    job is keeping bytes out of RAM (biopb/biopb docs/client-disk-cache.md)."""
+
+    def test_tmpfs_is_reported(self):
+        with patch.object(fs_detect, "_raw_fstype", return_value="tmpfs"):
+            assert fs_detect.memory_filesystem_type("/dev/shm/x") == "tmpfs"
+
+    @pytest.mark.parametrize("fstype", ["ramfs", "devtmpfs", "TMPFS"])
+    def test_other_ram_backed_types(self, fstype):
+        with patch.object(fs_detect, "_raw_fstype", return_value=fstype):
+            assert fs_detect.memory_filesystem_type("/x") == fstype.lower()
+
+    @pytest.mark.parametrize("fstype", ["ext4", "xfs", "btrfs", "apfs", None])
+    def test_real_storage_is_not_memory(self, fstype):
+        with patch.object(fs_detect, "_raw_fstype", return_value=fstype):
+            assert fs_detect.memory_filesystem_type("/x") is None
+
+    def test_never_raises(self):
+        with patch.object(fs_detect, "_raw_fstype", side_effect=OSError("boom")):
+            assert fs_detect.memory_filesystem_type("/x") is None
+
+
+class TestRejectMemoryIsOptIn:
+    """The two tenants disagree: the server's fallback for an unusable cache_dir
+    IS memory, so demoting a tmpfs dir would trade RAM for the same RAM."""
+
+    def test_default_ignores_a_ram_backed_dir(self):
+        with patch.object(fs_detect, "memory_filesystem_type", return_value="tmpfs"):
+            with patch.object(fs_detect, "network_filesystem_type", return_value=None):
+                with patch.object(fs_detect, "cloud_sync_hint", return_value=None):
+                    assert fs_detect.unsafe_cache_dir_reason("/dev/shm/x") is None
+
+    def test_opt_in_rejects_it(self):
+        with patch.object(fs_detect, "memory_filesystem_type", return_value="tmpfs"):
+            with patch.object(fs_detect, "network_filesystem_type", return_value=None):
+                with patch.object(fs_detect, "cloud_sync_hint", return_value=None):
+                    reason = fs_detect.unsafe_cache_dir_reason(
+                        "/dev/shm/x", reject_memory=True
+                    )
+        assert reason is not None and "tmpfs" in reason
+
+    def test_network_still_wins_over_memory(self):
+        with patch.object(fs_detect, "network_filesystem_type", return_value="nfs4"):
+            with patch.object(
+                fs_detect, "memory_filesystem_type", return_value="tmpfs"
+            ):
+                reason = fs_detect.unsafe_cache_dir_reason("/x", reject_memory=True)
+        assert "nfs4" in reason
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux mountinfo")
+class TestRawFstypeOnThisMachine:
+    def test_shm_is_ram_backed(self):
+        if not Path("/dev/shm").exists():
+            pytest.skip("no /dev/shm")
+        assert fs_detect.memory_filesystem_type("/dev/shm") is not None
+
+    def test_tmp_path_is_not_ram_backed_unless_it_really_is(self, tmp_path):
+        # Only asserts the probe agrees with the mount table, not what /tmp is.
+        raw = fs_detect._raw_fstype(tmp_path)
+        expected = (
+            raw.lower() if raw and raw.lower() in fs_detect._MEMORY_FSTYPES else None
+        )
+        assert fs_detect.memory_filesystem_type(tmp_path) == expected
