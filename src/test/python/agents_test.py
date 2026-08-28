@@ -47,70 +47,70 @@ def test_catalog_is_the_installer_set_minus_hermes():
     assert "hermes" not in ids
 
 
-def test_every_spec_axis_has_an_implementation():
+def test_every_client_axis_has_an_implementation():
     """Each dispatch axis must resolve for every shipped client.
 
     The dispatch tables have no default branch on purpose, so this is what keeps
     a new client (or a typo in one) from reaching a user: an unimplemented axis
     fails here rather than in someone's config file.
     """
-    for spec in _agents.supported():
-        assert spec.manager in _agents._WRITERS, spec.id
-        assert spec.config_format in _agents._READERS, spec.id
-        assert spec.entry_style in _agents._SHAPES, spec.id
+    for client in _agents.supported():
+        assert client.config_format in _agents._READERS, client.id
+        assert client.entry_style in _agents._SHAPES, client.id
 
 
-def _inject(monkeypatch, **overrides):
-    """A catalog entry with one axis set to something unimplemented."""
-    base = {
-        "id": "ghost",
-        "name": "Ghost Client",
-        "manager": "json",
-        "config_format": "json",
-        "parent_key": "mcpServers",
-        "entry_style": "stdio",
-    }
-    spec = _agents.AgentSpec(**{**base, **overrides})
-    monkeypatch.setitem(_agents._SPECS_BY_ID, "ghost", spec)
-    return spec
+def test_a_backend_without_a_write_path_cannot_exist():
+    """The regression the backend model exists for.
 
-
-def test_unimplemented_manager_raises_instead_of_writing_json(home, monkeypatch):
-    """The regression this dispatch exists for.
-
-    A manager with no writer used to fall through to the JSON writer, which
-    happily emitted a JSON document at whatever path the client used — a
-    ``cordis.yml`` or a ``config.toml``. It must raise and touch nothing.
+    register/unregister used to be an `if manager == ... else JSON` chain, so a
+    client we had not implemented did not fail -- it fell through to the JSON
+    writer and emitted a JSON document at whatever path that client used (a
+    cordis.yml, a config.toml). They are abstract now, so the omission is a
+    TypeError at construction and no such backend can reach the catalog.
     """
-    _inject(monkeypatch, manager="yaml")
-    cfg = home / "cordis.yml"
-    monkeypatch.setattr(_agents, "_config_path", lambda spec: cfg)
-    with pytest.raises(_agents.AgentError):
-        _agents.register("ghost")
-    assert not cfg.exists()
+
+    class Halfling(_agents.ClientBackend):
+        id, name, parent_key = "halfling", "Halfling", "mcpServers"
+
+        def config_path(self):
+            return None
+
+        def is_installed(self):
+            return False
+
+        # register/unregister deliberately missing
+
+    with pytest.raises(TypeError):
+        Halfling()
 
 
-def test_unimplemented_manager_raises_on_unregister(home, monkeypatch):
-    _inject(monkeypatch, manager="yaml")
-    monkeypatch.setattr(_agents, "_config_path", lambda spec: home / "cordis.yml")
-    with pytest.raises(_agents.AgentError):
-        _agents.unregister("ghost")
+def _ghost(monkeypatch, cfg, **attrs):
+    """Put a client in the catalog whose config_path is `cfg`, with `attrs`
+    overriding one axis to something we have no implementation for."""
+
+    class Ghost(_agents.JsonConfigClient):
+        id, name, parent_key = "ghost", "Ghost Client", "mcpServers"
+
+        def config_path(self):
+            return cfg
+
+    for key, value in attrs.items():
+        setattr(Ghost, key, value)
+    monkeypatch.setitem(_agents._CLIENTS_BY_ID, "ghost", Ghost())
 
 
 def test_unimplemented_config_format_raises_rather_than_guessing(home, monkeypatch):
     """A format with no reader must not be parsed as JSON on the status path."""
-    _inject(monkeypatch, config_format="yaml")
     cfg = home / "cordis.yml"
     cfg.write_text("mcpServers:\n  biopb:\n    command: x\n")
-    monkeypatch.setattr(_agents, "_config_path", lambda spec: cfg)
+    _ghost(monkeypatch, cfg, config_format="yaml")
     with pytest.raises(_agents.AgentError):
         _agents.status("ghost")
 
 
 def test_unimplemented_entry_style_raises_rather_than_writing_stdio(home, monkeypatch):
-    _inject(monkeypatch, entry_style="cordis")
     cfg = home / "config.json"
-    monkeypatch.setattr(_agents, "_config_path", lambda spec: cfg)
+    _ghost(monkeypatch, cfg, entry_style="cordis")
     with pytest.raises(_agents.AgentError):
         _agents.register("ghost")
     assert not cfg.exists()
@@ -288,7 +288,7 @@ def test_opencode_fresh_install_creates_json(home):
     # Neither file exists -> canonical opencode.json is the create target.
     _opencode_dir(home)
     _agents.register("opencode")
-    path = _agents._config_path(_agents._spec("opencode"))
+    path = _agents._client("opencode").config_path()
     assert path.name == "opencode.json"
     assert path.exists()
 
@@ -355,15 +355,15 @@ def test_opencode_unregister_commented_jsonc_without_entry_is_silent(home):
 
 
 def test_claude_desktop_config_paths(home, monkeypatch):
-    spec = _agents._spec("claude-desktop")
+    client = _agents._client("claude-desktop")
     monkeypatch.setattr(_agents.sys, "platform", "linux")
     assert (
-        _agents._config_path(spec)
+        client.config_path()
         == home / ".config" / "Claude" / "claude_desktop_config.json"
     )
     monkeypatch.setattr(_agents.sys, "platform", "darwin")
     assert (
-        _agents._config_path(spec)
+        client.config_path()
         == home
         / "Library"
         / "Application Support"
@@ -373,7 +373,7 @@ def test_claude_desktop_config_paths(home, monkeypatch):
     monkeypatch.setattr(_agents.sys, "platform", "win32")
     monkeypatch.setenv("APPDATA", str(home / "Roaming"))
     assert (
-        _agents._config_path(spec)
+        client.config_path()
         == home / "Roaming" / "Claude" / "claude_desktop_config.json"
     )
 
