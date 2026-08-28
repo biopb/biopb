@@ -32,7 +32,17 @@ import {
   type PermissionItem,
   type ToolCallItem,
 } from "../utils/chatThread";
-import { escAction, sendsOnEnter } from "../utils/chatKeys";
+import { escAction, recallAction, sendsOnEnter } from "../utils/chatKeys";
+import {
+  abandon,
+  noHistory,
+  pastPrompts,
+  recall,
+  remember,
+  seed,
+  type PromptHistory,
+  type Recall,
+} from "../utils/promptHistory";
 import {
   acpContextReport,
   contextReport,
@@ -86,6 +96,12 @@ export default function ChatPane({
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [text, setText] = useState("");
+  // What has already been asked, for the arrow keys to walk back through.
+  // Local to the pane and not sent anywhere: it is a typing convenience, and
+  // the thread below is the record. Kept across a reset and across an engine
+  // switch for the same reason -- the prompts are still worth retyping less,
+  // whichever conversation they were first said in.
+  const [history, setHistory] = useState<PromptHistory>(noHistory);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [zoom, setZoom] = useState<ImageBlock | null>(null);
@@ -198,6 +214,7 @@ export default function ChatPane({
       return;
     }
     setText(""); // cleared only once it was accepted, so nothing is lost
+    setHistory((h) => remember(h, body));
     setNotice(null); // a context report describes the thread as it was
     setBusy(true); // poll faster immediately rather than after one slow tick
     poll();
@@ -348,6 +365,10 @@ export default function ChatPane({
       return;
     }
     setText("");
+    // A command is a prompt as far as the composer is concerned: it was typed
+    // here, it is worth not retyping, and `/model gpt-5` is exactly the kind of
+    // line someone runs twice.
+    setHistory((h) => remember(h, text));
     setError(null);
     if (parsed.name === "context") {
       // Answered from what the pane already holds. Nothing is sent, so this
@@ -399,6 +420,23 @@ export default function ChatPane({
   const matches = matchCommands(text, engine);
   const isCommand = parseCommand(text, engine, commands).kind === "command";
 
+  // One step back or forward through the prompt buffer. Returns whether the
+  // keystroke was used, because an unused one has to go back to the textarea as
+  // an ordinary caret move.
+  //
+  // The buffer seeds itself here rather than on load: the thread on screen is
+  // the same list of prompts, so copying it before anyone asks buys nothing,
+  // and doing it on first use is what makes a reloaded page still remember.
+  // `seed` no-ops once the buffer holds anything, so this stays a walk after
+  // the first press.
+  const walk = (dir: Recall): boolean => {
+    const from = seed(history, pastPrompts(thread));
+    const step = recall(from, dir, text);
+    setHistory(step ? step.history : from);
+    if (!step) return false;
+    setText(step.text);
+    return true;
+  };
 
   // Stick to the newest message unless the reader has scrolled up to read.
   const scroller = useRef<HTMLDivElement | null>(null);
@@ -543,8 +581,29 @@ export default function ChatPane({
             placeholder={
               status.ready ? "Ask about this session…" : "chat is unavailable"
             }
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              setHistory(abandon);
+            }}
             onKeyDown={(e) => {
+              const dir = recallAction({
+                key: e.key,
+                shiftKey: e.shiftKey,
+                altKey: e.altKey,
+                ctrlKey: e.ctrlKey,
+                metaKey: e.metaKey,
+                isComposing: e.nativeEvent.isComposing,
+                value: e.currentTarget.value,
+                selectionStart: e.currentTarget.selectionStart ?? 0,
+                selectionEnd: e.currentTarget.selectionEnd ?? 0,
+              });
+              // Only a walk that happened takes the key. At the far end of the
+              // buffer, or with nothing in it, the arrow stays an arrow rather
+              // than becoming a key that silently does nothing.
+              if (dir !== "none" && walk(dir)) {
+                e.preventDefault();
+                return;
+              }
               if (!sendsOnEnter(e)) return;
               e.preventDefault();
               onEnter();
@@ -576,7 +635,8 @@ export default function ChatPane({
           ) : (
             <span className="chat-hint">
               <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a
-              newline · <kbd>/</kbd> for commands
+              newline · <kbd>↑</kbd> for an earlier prompt · <kbd>/</kbd> for
+              commands
             </span>
           )}
           {error ? <span className="chat-err">{error}</span> : null}

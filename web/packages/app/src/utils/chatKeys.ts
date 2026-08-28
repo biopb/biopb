@@ -66,3 +66,50 @@ export function escAction(state: {
   if (state.permissionOpen) return "refuse-permission";
   return state.busy ? "cancel-turn" : "none";
 }
+
+/** Whether this keydown in the composer walks the prompt buffer, and which way.
+ *
+ * The composer is a textarea, so the arrows already mean something: move the
+ * caret. Taking them outright would make a two-line draft uneditable. So the
+ * walk gets them only where the caret motion is a no-op anyway -- Up on the
+ * first line, Down on the last -- which for a one-line prompt, the shape almost
+ * every prompt has, is everywhere in it.
+ *
+ * That rule is also what keeps a walk through multi-line entries sane. Setting
+ * the composer's value leaves the caret at the end, so a recalled one-line
+ * prompt is still on both its first and last line and the next press keeps
+ * walking; a recalled multi-line one puts the caret on its last line, where Up
+ * edits it instead of walking past it.
+ *
+ * Three things are already spoken for:
+ *
+ * - **Modifiers.** Shift extends a selection, Alt/Ctrl/Cmd are word- and
+ *   line-wise motions in every text field on the platform.
+ * - **A selection.** An arrow with text selected collapses it, and the reader
+ *   holding a selection is working on the draft, not leaving it.
+ * - **Composing.** An IME candidate list is driven by the arrow keys. Walking
+ *   there would replace the whole composer mid-word.
+ */
+export type RecallKey = "older" | "newer" | "none";
+
+export function recallAction(e: {
+  key: string;
+  shiftKey: boolean;
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  isComposing?: boolean;
+  value: string;
+  selectionStart: number;
+  selectionEnd: number;
+}): RecallKey {
+  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return "none";
+  if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return "none";
+  if (e.isComposing) return "none";
+  if (e.selectionStart !== e.selectionEnd) return "none";
+  if (e.key === "ArrowUp")
+    return e.value.lastIndexOf("\n", e.selectionStart - 1) === -1
+      ? "older"
+      : "none";
+  return e.value.indexOf("\n", e.selectionStart) === -1 ? "newer" : "none";
+}
