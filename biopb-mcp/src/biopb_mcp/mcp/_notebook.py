@@ -19,9 +19,11 @@ top-to-bottom works only for self-contained, in-namespace computation: external
 state is *not* captured — tensor-server source ids and napari viewer layers from
 the live session do not exist on a fresh kernel, so source-chaining / viewer
 cells need the same live server (or hand edits). The bootstrap cell rebuilds
-``np``/``da``/``client``/``ops`` and an empty viewer (via the ``%gui qt`` magic)
-on a best-effort basis. ``nbformat`` is intentionally not a dependency — the v4
-schema is small and hand-built here.
+``np``/``da``/``client``/``ops``, an empty viewer (via the ``%gui qt`` magic),
+and the user's kernel plugins, on a best-effort basis — the plugins from *this*
+machine's `~/.config/biopb/kernel`, which need not be the ones the session had.
+``nbformat`` is intentionally not a dependency — the v4 schema is small and
+hand-built here.
 """
 
 import datetime
@@ -72,6 +74,22 @@ try:
 except Exception as _exc:  # noqa: BLE001 - audit notebook tolerates no display
     viewer = None
     print("napari viewer unavailable (audit notebook):", _exc)
+
+# User kernel plugins (~/.config/biopb/kernel/*.py and biopb_mcp.namespace entry
+# points), loaded by the kernel's own loader so a cell calling one of them --
+# `rolling_ball.subtract_background(...)` -- resolves the same name it did in the
+# session. Last, like the kernel's step 7b, so a plugin can reference the handles
+# above. Fail-open per plugin, as in the kernel; a plugin this machine does not
+# have simply does not bind, and the cell using it fails where it is used.
+try:
+    from biopb_mcp.mcp import _requires
+    from biopb_mcp.mcp._bootstrap import _load_namespace_plugins
+
+    _load_namespace_plugins(get_ipython(), config)
+    _bound = _requires._LOADED_FILES + _requires._LOADED_ENTRY_POINTS
+    print("kernel plugins:", ", ".join(_bound) if _bound else "(none)")
+except Exception as _exc:  # noqa: BLE001 - a plugin gap must not stop the rebuild
+    print("kernel plugins not loaded:", _exc)
 """
 
 
@@ -201,9 +219,13 @@ _WORKFLOW_INTRO = (
     "Verified {ts}{ncells}.\n\n"
     "Each cell below ran, in this order, in a **scratch namespace** — one seeded "
     "with the kernel's own handles (`np`, `da`, `client`, `ops`, `viewer`) and "
-    "nothing the session had bound since it started. That is what the first code "
-    "cell rebuilds, so this notebook asks of a fresh kernel only what the "
-    "verification run was given.\n\n"
+    "the loaded kernel plugins, and nothing the session had bound since it "
+    "started. That is what the first code cell rebuilds, so this notebook asks of "
+    "a fresh kernel only what the verification run was given — with one gap worth "
+    "naming: plugins are loaded from *the reader's* "
+    "`~/.config/biopb/kernel`, so a workflow calling a plugin this machine does "
+    "not have binds nothing, and the cell using it raises `NameError`. The "
+    "bootstrap cell prints what bound.\n\n"
     "**What the run proves.** Every cell executed without raising, and no cell "
     "leaned on a variable it did not itself create — the defect that makes a "
     "session transcript unrunnable. It is not a claim that the numbers are "
@@ -229,8 +251,9 @@ _TITLE = "# biopb-mcp session — audit export\n"
 _INTRO = (
     "Exported {ts} · {n} job(s).\n\n"
     "This notebook is an **audit record** of an `execute_code` session. The "
-    "first code cell rebuilds the namespace (`np`, `da`, `client`, `ops`, and an "
-    "empty `viewer`) on a best-effort basis; each cell below is one job, with its "
+    "first code cell rebuilds the namespace (`np`, `da`, `client`, `ops`, an "
+    "empty `viewer`, and this machine's kernel plugins) on a best-effort basis; "
+    "each cell below is one job, with its "
     "recorded output. A job that was submitted with a stated intent carries it "
     "as the markdown note above the code — the only record of *why* a cell was "
     "run, and present only where whoever ran it supplied one.\n\n"

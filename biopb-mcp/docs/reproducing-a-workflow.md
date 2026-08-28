@@ -84,7 +84,29 @@ A verification is kept as *the* workflow (`_jobs.verified()`) only when every
 cell ran — a partial run is a report, which the job record already is. A later
 failure does not un-verify what passed; a kernel restart does.
 
-## 5. Two exports
+## 5. Plugins, and where the two ends have to agree
+
+The scratch namespace holds the user's kernel plugins, because `mark_baseline()`
+runs after step 7b and a fresh biopb kernel has them. The notebook's bootstrap
+cell **did not rebuild them** — a pre-existing gap that this feature made
+expensive: a workflow calling `rolling_ball.subtract_background(...)` verified
+green and then died on `NameError` in the saved notebook, with the intro
+claiming the cell rebuilt what the run was given.
+
+So `BOOTSTRAP_SRC` now calls the kernel's own `_load_namespace_plugins`, last,
+as step 7b is last. **The remaining asymmetry is real and is stated in the
+intro**: the plugins come from *the reader's* `~/.config/biopb/kernel`, which
+need not be the author's. A missing one binds nothing (the loader is fail-open)
+and the cell using it raises `NameError` where it is used. The bootstrap cell
+prints what bound, so the reader can tell that case from a bug in the workflow.
+
+The general rule this is an instance of: **whatever the scratch namespace is
+seeded with, the bootstrap cell has to rebuild.** They are two halves of one
+claim — "this ran against a fresh kernel's namespace, and here is that
+namespace" — and a name in one but not the other turns a passing verification
+into a false promise.
+
+## 6. Two exports
 
 `/api/notebook` is unchanged: the **audit** export, every retained job in order,
 dead ends included, with per-cell provenance headers. `?workflow=1` serves the
@@ -93,7 +115,7 @@ the run proved and what it did not. The observe page shows *Save workflow*
 beside *Save notebook* only once something is verified, learning that from the
 `workflow` key `jobs_view()` added to the poll it already makes.
 
-## 6. Why the retained-job cap went up
+## 7. Why the retained-job cap went up
 
 `_MAX_RETAINED_JOBS` was 32 and is now 200. The rewrite in §2 is done by reading
 the transcript, so eviction takes away the source material for the one step

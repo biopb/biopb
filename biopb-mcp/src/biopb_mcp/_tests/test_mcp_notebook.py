@@ -195,3 +195,31 @@ def test_suggested_workflow_filename_slugs_the_title():
     # A title that slugs to nothing must still give a usable filename.
     assert _notebook.suggested_workflow_filename("///").startswith("biopb-workflow-")
     assert _notebook.suggested_workflow_filename("").startswith("biopb-workflow-")
+
+
+def test_the_bootstrap_cell_is_valid_python():
+    # It is shipped as a string and never imported, so nothing else would catch
+    # a syntax error in it until someone opened the notebook.
+    compile(_notebook.BOOTSTRAP_SRC, "<bootstrap>", "exec")
+
+
+def test_the_bootstrap_cell_loads_kernel_plugins_after_the_handles():
+    # A workflow calling `rolling_ball.subtract_background(...)` verified fine —
+    # the scratch namespace has the plugins, because they are in the bootstrap
+    # baseline — and then failed on a fresh kernel, because this cell rebuilt
+    # every handle except them. Ordered last, like the kernel's own step 7b, so
+    # a plugin can reference the handles above it.
+    src = _notebook.BOOTSTRAP_SRC
+    assert "_load_namespace_plugins" in src
+    assert src.index("napari.Viewer()") < src.index("_load_namespace_plugins")
+
+
+def test_both_intros_say_the_plugins_come_from_the_reader_s_machine():
+    audit = "".join(_notebook.build_notebook([])["cells"][0]["source"])
+    workflow = "".join(
+        _notebook.build_workflow_notebook(_record())["cells"][0]["source"]
+    )
+    assert "kernel plugins" in audit
+    # The workflow export claims reproducibility, so it owes the sharper note:
+    # the plugins are the reader's, not the session's.
+    assert "~/.config/biopb/kernel" in workflow and "NameError" in workflow
