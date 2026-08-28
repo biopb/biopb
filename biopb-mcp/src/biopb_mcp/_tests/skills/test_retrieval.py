@@ -15,7 +15,7 @@ about the right thing: entries name a skill id, and an id that no longer ships
 is reported as a stale table rather than a retrieval bug.
 
 **Kernel plugins get the same treatment** at the bottom of this file, because
-`find_skills` returns them too. Their descriptions are module docstrings rather
+`list_skills` returns them too. Their descriptions are module docstrings rather
 than a curated `description:` field, which makes the pinning more necessary, not
 less: nobody writes a docstring for a search index, and the fix for a miss is an
 edit to load-bearing documentation.
@@ -30,7 +30,7 @@ from biopb_mcp.mcp import _skills
 
 @pytest.fixture
 def shipped_only(monkeypatch, tmp_path):
-    """find_skills over the shipped set alone -- no local dir, whatever the
+    """list_skills over the shipped set alone -- no local dir, whatever the
     machine running this happens to have in ~/.config/biopb/skills."""
     monkeypatch.setattr(
         _skills,
@@ -47,7 +47,7 @@ def shipped_only(monkeypatch, tmp_path):
     )
 
 
-# The **agent's** vocabulary, not the user's. `find_skills` is called by the
+# The **agent's** vocabulary, not the user's. `list_skills` is called by the
 # agent at the start of a task, so the query is a domain term it chose after
 # reading the request -- "drift correction", not "my stage moved". Chasing user
 # idiom instead pushes synonyms into the description until it stops reading as a
@@ -196,7 +196,7 @@ REJECTS = [
 
 
 def _require_shipped(skill_id: str) -> None:
-    if skill_id not in {s["id"] for s in _skills.find_skills("")}:
+    if skill_id not in {s["id"] for s in _skills.list_skills("")}:
         pytest.fail(
             f"the phrasing table names {skill_id!r}, which no longer ships. "
             "Update RETRIEVES/REJECTS -- this is a stale table, not a "
@@ -207,14 +207,14 @@ def _require_shipped(skill_id: str) -> None:
 @pytest.mark.parametrize("query,expected", RETRIEVES)
 def test_shipped_skill_is_retrieved_for(shipped_only, query, expected):
     _require_shipped(expected)
-    got = [s["id"] for s in _skills.find_skills(query)]
+    got = [s["id"] for s in _skills.list_skills(query)]
     assert expected in got, f"{query!r} did not surface {expected}; got {got}"
 
 
 @pytest.mark.parametrize("query,unwanted", REJECTS)
 def test_shipped_skill_is_not_retrieved_for(shipped_only, query, unwanted):
     _require_shipped(unwanted)
-    got = [s["id"] for s in _skills.find_skills(query)]
+    got = [s["id"] for s in _skills.list_skills(query)]
     assert unwanted not in got, f"{query!r} wrongly surfaced {unwanted}; got {got}"
 
 
@@ -222,9 +222,9 @@ def test_every_shipped_skill_is_retrievable_by_its_own_name(shipped_only):
     """No skill is stranded. The one retrieval check that needs no table and
     can never go stale: each id, read as words, retrieves that skill and only
     that skill. A new skill inherits it for free."""
-    for s in _skills.find_skills(""):
+    for s in _skills.list_skills(""):
         query = s["id"].replace("-", " ")
-        got = [r["id"] for r in _skills.find_skills(query)]
+        got = [r["id"] for r in _skills.list_skills(query)]
         assert got == [s["id"]], f"{query!r} -> {got}"
 
 
@@ -263,11 +263,11 @@ def test_too_many_keywords_find_nothing_and_fewer_recover(
     recovery it prescribes actually works.
     """
     _require_shipped(expected)
-    assert _skills.find_skills([typed]) == [], (
+    assert _skills.list_skills([typed]) == [], (
         f"{typed!r} now retrieves; the trap this documents is gone and the "
         "docstring's advice should be revisited"
     )
-    got = [s["id"] for s in _skills.find_skills([shorter])]
+    got = [s["id"] for s in _skills.list_skills([shorter])]
     assert expected in got, f"{shorter!r} did not recover {expected}; got {got}"
 
 
@@ -279,8 +279,8 @@ def test_a_phrase_inside_one_keyword_is_split(shipped_only):
     list-shaped parameter is meant to make unlikely — not one it should
     introduce.
     """
-    assert [s["id"] for s in _skills.find_skills(["stitch tiles"])] == ["stitch-tiles"]
-    assert _skills.find_skills(["stitch tiles"]) == _skills.find_skills(
+    assert [s["id"] for s in _skills.list_skills(["stitch tiles"])] == ["stitch-tiles"]
+    assert _skills.list_skills(["stitch tiles"]) == _skills.list_skills(
         ["stitch", "tiles"]
     )
 
@@ -289,10 +289,10 @@ def test_no_keywords_returns_the_whole_catalog(shipped_only):
     """The escape hatch the docstring points at when a search comes back empty.
     Every spelling of "nothing" has to reach it, since that is the call an agent
     makes after being told to widen."""
-    everything = _skills.find_skills(())
+    everything = _skills.list_skills(())
     assert len(everything) > 1
     for nothing in ([], "", (), [""]):
-        assert _skills.find_skills(nothing) == everything
+        assert _skills.list_skills(nothing) == everything
 
 
 def test_every_shipped_skill_appears_in_the_phrasing_table(shipped_only):
@@ -300,7 +300,7 @@ def test_every_shipped_skill_appears_in_the_phrasing_table(shipped_only):
     can find. Cheap to satisfy, and the alternative is a table that quietly
     stops covering the catalog."""
     covered = {expected for _, expected in RETRIEVES}
-    shipped = {s["id"] for s in _skills.find_skills("")}
+    shipped = {s["id"] for s in _skills.list_skills("")}
     assert shipped <= covered, f"no phrasings for: {sorted(shipped - covered)}"
 
 
@@ -308,7 +308,7 @@ def test_every_shipped_skill_appears_in_the_phrasing_table(shipped_only):
 # The same question, asked of the kernel plugins
 # --------------------------------------------------------------------------- #
 #
-# `find_skills` returns plugins too, described by their module docstring rather
+# `list_skills` returns plugins too, described by their module docstring rather
 # than by a curated `description:`. That makes retrieval a property of prose
 # nobody wrote for a search index -- a docstring is written for someone already
 # reading the file -- so it needs pinning exactly like the skills above, and for
@@ -398,7 +398,7 @@ PLUGIN_REJECTS = [
 
 
 def _require_seeded(handle: str) -> None:
-    seeded = {s["id"] for s in _skills.find_skills("") if s["kind"] == "plugin"}
+    seeded = {s["id"] for s in _skills.list_skills("") if s["kind"] == "plugin"}
     if handle not in seeded:
         pytest.fail(
             f"the phrasing table names the plugin {handle!r}, which is no longer "
@@ -410,7 +410,7 @@ def _require_seeded(handle: str) -> None:
 @pytest.mark.parametrize("query,expected", PLUGIN_RETRIEVES)
 def test_seeded_plugin_is_retrieved_for(shipped_with_plugins, query, expected):
     _require_seeded(expected)
-    got = [s["id"] for s in _skills.find_skills(query)]
+    got = [s["id"] for s in _skills.list_skills(query)]
     assert expected in got, (
         f"{query!r} did not surface the {expected} plugin; got {got}. Fix this in "
         "the module docstring's opening paragraph, which is what is indexed."
@@ -420,7 +420,7 @@ def test_seeded_plugin_is_retrieved_for(shipped_with_plugins, query, expected):
 @pytest.mark.parametrize("query,unwanted", PLUGIN_REJECTS)
 def test_seeded_plugin_is_not_retrieved_for(shipped_with_plugins, query, unwanted):
     _require_seeded(unwanted)
-    got = [s["id"] for s in _skills.find_skills(query)]
+    got = [s["id"] for s in _skills.list_skills(query)]
     assert unwanted not in got, f"{query!r} wrongly surfaced {unwanted}; got {got}"
 
 
@@ -428,11 +428,11 @@ def test_every_seeded_plugin_is_retrievable_by_its_own_handle(shipped_with_plugi
     """No plugin is stranded, and the check needs no table so it cannot go
     stale: the handle read as words retrieves that plugin and nothing else. A
     new plugin inherits it by being seeded."""
-    for entry in _skills.find_skills(""):
+    for entry in _skills.list_skills(""):
         if entry["kind"] != "plugin":
             continue
         query = entry["handle"].replace("_", " ")
-        got = [r["id"] for r in _skills.find_skills(query)]
+        got = [r["id"] for r in _skills.list_skills(query)]
         assert got == [entry["id"]], f"{query!r} -> {got}"
 
 
@@ -440,6 +440,6 @@ def test_a_plugin_is_found_by_the_name_the_agent_would_call_it(shipped_with_plug
     """The handle is what goes in `execute_code`, so it is the one string an
     agent is guaranteed to have seen -- from `server_status`, or from a skill's
     `checklist: plugin:<name>`. Retrieval on it must be exact, not fuzzy."""
-    got = _skills.find_skills(["segmentation_qc"])
+    got = _skills.list_skills(["segmentation_qc"])
     assert [s["id"] for s in got] == ["segmentation_qc"]
     assert got[0]["handle"] == "segmentation_qc"

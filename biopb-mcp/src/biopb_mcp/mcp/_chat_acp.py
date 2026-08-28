@@ -141,7 +141,6 @@ class AcpNotConfigured(RuntimeError):
 # Module state, like ``_chat`` and ``_jobs``: it belongs to the session, outlives
 # kernel restarts, and dies with this process.
 _items: list = []
-_by_id: dict = {}
 _seq = 0
 _rev = 0
 # The revision at the last reset. A view whose watermark predates it is holding
@@ -162,7 +161,6 @@ def _new_item(kind, **fields):
     item = {"id": f"i-{_seq}", "kind": kind, "rev": _bump(), "ts": time.time()}
     item.update(fields)
     _items.append(item)
-    _by_id[item["id"]] = item
     return item
 
 
@@ -1012,38 +1010,48 @@ def _own_mcp_url():
     return None
 
 
-async def shutdown():
-    """Stop the harness. Idempotent, and safe to call on a dead one."""
+def _drop_session():
+    """Forget the live session, returning its ``(conn, child)`` to be reaped.
+
+    Clearing the globals *before* the teardown, and in one place, is what makes
+    both callers idempotent: a second entrant finds nothing to stop. The model
+    goes with them -- left behind it would name a model nothing is running on.
+    """
     global _child, _conn, _session_id, _model_choices, _model_current
-    _cancel_pending()
     conn, child = _conn, _child
     _conn, _child, _session_id = None, None, None
-    # The model belonged to that session. Left behind it would name a model
-    # nothing is running on.
     _model_choices, _model_current = [], None
+    return conn, child
+
+
+def _stop_child(child):
+    """Reap the harness process, best-effort -- we are tearing down either way."""
+    if child is not None:
+        try:
+            child.stop()
+        except Exception:  # noqa: BLE001
+            logger.debug("stopping the ACP agent failed", exc_info=True)
+
+
+async def shutdown():
+    """Stop the harness. Idempotent, and safe to call on a dead one."""
+    _cancel_pending()
+    conn, child = _drop_session()
     if conn is not None:
         try:
             await conn.close()
         except Exception:  # noqa: BLE001 - we are tearing down either way
             logger.debug("closing the ACP connection failed", exc_info=True)
-    if child is not None:
-        try:
-            child.stop()
-        except Exception:  # noqa: BLE001
-            logger.debug("stopping the ACP agent failed", exc_info=True)
+    _stop_child(child)
 
 
 def stop_sync():
-    """Reap the harness from a non-async caller (``atexit``, ``_shutdown``)."""
-    global _child, _conn, _session_id, _model_choices, _model_current
-    child = _child
-    _conn, _child, _session_id = None, None, None
-    _model_choices, _model_current = [], None
-    if child is not None:
-        try:
-            child.stop()
-        except Exception:  # noqa: BLE001
-            logger.debug("stopping the ACP agent failed", exc_info=True)
+    """Reap the harness from a non-async caller (``atexit``, ``_shutdown``).
+
+    No ``conn.close()``: that is a coroutine and there is no loop to run it on.
+    The child's death closes the pipe underneath it anyway.
+    """
+    _stop_child(_drop_session()[1])
 
 
 def cleanup_cwd():
@@ -1190,7 +1198,6 @@ async def reset():
         raise TurnInProgress("a turn is running in this session")
     _cancel_pending()
     _items.clear()
-    _by_id.clear()
     _open_message.clear()
     _usage.clear()
     # Ids are *not* restarted, for the reason `_chat.reset` gives: a view's

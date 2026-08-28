@@ -14,6 +14,8 @@ import logging
 import os
 import traceback
 
+from ._jobs import KERNEL_HANDLE_NAMES
+
 logger = logging.getLogger(__name__)
 
 
@@ -225,8 +227,7 @@ def _start_update_check(viewer, config):
     def _worker():
         try:
             from ._jobs import run_on_main
-            from ._update import check_for_update
-            from ._update_apply import handle_choice
+            from ._update import check_for_update, handle_choice
             from ._update_popup import show_update_popup
 
             info = check_for_update(config)
@@ -250,22 +251,10 @@ def _start_update_check(viewer, config):
 # Load-bearing namespace names a user plugin (#92) must not shadow. A plugin now
 # contributes exactly one binding -- its module -- so this is a single check per
 # plugin rather than a sweep over everything it happened to define (#664).
-_RESERVED_NAMES = frozenset(
-    {
-        "viewer",
-        "client",
-        "np",
-        "da",
-        "ops",
-        "run_on_main",
-        "_conn",
-        "_jobs",
-        "_dask_client",
-        "_dask_attach_done",
-        "_viewer_window_alive",
-        "_resync_view",
-    }
-)
+# The list itself is `_jobs.KERNEL_HANDLE_NAMES`, which a scratch verification
+# also seeds from: a handle added here and not there would be verified against a
+# namespace that lacks it.
+_RESERVED_NAMES = KERNEL_HANDLE_NAMES
 # Plugin modules live under this prefix in ``sys.modules``, never under their bare
 # stem: a user file named ``skimage.py`` must not be able to claim
 # ``sys.modules["skimage"]`` for everything imported after it. The prefix is a key,
@@ -605,7 +594,6 @@ def bootstrap():
 
 
 def _bootstrap_impl():
-    from biopb import _algorithms
     from IPython import get_ipython
 
     from .._config import get_setting, load_config
@@ -637,7 +625,7 @@ def _bootstrap_impl():
 
     from .._connection import TensorConnection
     from . import _jobs
-    from ._process_ops import build_ops
+    from ._process_ops import build_ops_from_config
 
     # 2. Data-access service (dask-free), shared by the widget and the agent
     #    namespace. Created before dask so the viewer can come up without waiting
@@ -760,19 +748,8 @@ def _bootstrap_impl():
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
     #    client is picked up at call time.
-    max_msg_bytes = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
-    channel_options = [
-        ("grpc.max_receive_message_length", max_msg_bytes),
-        ("grpc.max_send_message_length", max_msg_bytes),
-    ]
     try:
-        ops = build_ops(
-            client_getter=lambda: conn.client,
-            server_urls=_algorithms.servers_from_config(config),
-            op_names_timeout=get_setting(config, "timeout.get_op_names"),
-            run_timeout=get_setting(config, "timeout.process_image"),
-            channel_options=channel_options,
-        )
+        ops = build_ops_from_config(config, lambda: conn.client)
     except Exception:
         logger.exception("Failed to build ProcessImage ops")
         ops = {}

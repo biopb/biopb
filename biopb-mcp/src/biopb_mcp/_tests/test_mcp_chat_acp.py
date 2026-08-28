@@ -21,7 +21,6 @@ from biopb_mcp.mcp import _chat_acp, _chat_api, _server
 def fresh():
     """A cleared transcript around every case; it is module state by design."""
     _chat_acp._items.clear()
-    _chat_acp._by_id.clear()
     _chat_acp._open_message.clear()
     _chat_acp._pending.clear()
     _chat_acp._commands.clear()

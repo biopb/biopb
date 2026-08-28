@@ -132,7 +132,7 @@ def test_parse_frontmatter_tolerates_what_it_cannot_read():
 def test_find_skills_empty_when_both_sources_are_empty(mock_home, skills_cfg):
     # No shipped files, no local dir: discovery returns nothing rather than
     # raising.
-    assert _skills.find_skills("") == []
+    assert _skills.list_skills("") == []
 
 
 def test_find_skills_query_filters(mock_home, skills_cfg, monkeypatch, tmp_path):
@@ -149,9 +149,9 @@ def test_find_skills_query_filters(mock_home, skills_cfg, monkeypatch, tmp_path)
             {"id": "measure", "title": "Measure", "description": "a table"},
         ],
     )
-    assert [s["id"] for s in _skills.find_skills("cells")] == ["segment-cells"]
-    assert [s["id"] for s in _skills.find_skills("segmentation")] == ["segment-cells"]
-    assert _skills.find_skills("no-such-term-xyz") == []
+    assert [s["id"] for s in _skills.list_skills("cells")] == ["segment-cells"]
+    assert [s["id"] for s in _skills.list_skills("segmentation")] == ["segment-cells"]
+    assert _skills.list_skills("no-such-term-xyz") == []
 
 
 def test_find_skills_disabled_returns_empty(local_skills, skills_cfg, mock_home):
@@ -160,10 +160,10 @@ def test_find_skills_disabled_returns_empty(local_skills, skills_cfg, mock_home)
     (local_skills / "mine.md").write_text(
         "---\ndescription: local one\n---\n\n# Mine\n", encoding="utf-8"
     )
-    assert [s["id"] for s in _skills.find_skills("")] == ["mine"]
+    assert [s["id"] for s in _skills.list_skills("")] == ["mine"]
 
     skills_cfg["skills_enabled"] = False
-    assert _skills.find_skills("") == []
+    assert _skills.list_skills("") == []
 
 
 def test_shipped_skill_entry_is_built_from_its_frontmatter(
@@ -183,7 +183,7 @@ def test_shipped_skill_entry_is_built_from_its_frontmatter(
         "---\n\n# T\n\nbody\n",
         encoding="utf-8",
     )
-    (found,) = _skills.find_skills("")
+    (found,) = _skills.list_skills("")
     assert found["tags"] == ["a", "b"]
     assert found["version"] == "2.1.0"
     assert found["checklist"] == ["viewer", "pkg:biopb-mcp>=0.13.0"]
@@ -204,7 +204,7 @@ def test_the_old_key_name_still_reads_for_a_users_own_skill(
         "---\n\n# T\n\nbody\n",
         encoding="utf-8",
     )
-    (found,) = _skills.find_skills("")
+    (found,) = _skills.list_skills("")
     assert found["checklist"] == ["viewer"]
 
 
@@ -218,17 +218,17 @@ def test_an_empty_shipped_set_warns_because_it_is_always_a_bug(
     # "offline", and quietly returning [] was the right answer.
     monkeypatch.setattr(_skills, "_warned_empty", False)
     with caplog.at_level("WARNING"):
-        assert _skills.find_skills("") == []
+        assert _skills.list_skills("") == []
     assert "packaging problem" in caplog.text
 
 
 def test_the_empty_warning_does_not_repeat(mock_home, skills_cfg, monkeypatch, caplog):
-    # load_catalog() runs on every find_skills; a broken install must not fill
+    # load_catalog() runs on every list_skills; a broken install must not fill
     # the session log.
     monkeypatch.setattr(_skills, "_warned_empty", False)
     with caplog.at_level("WARNING"):
         for _ in range(3):
-            _skills.find_skills("")
+            _skills.list_skills("")
     assert caplog.text.count("packaging problem") == 1
 
 
@@ -240,7 +240,7 @@ def test_files_present_but_none_usable_warns_too(
     (d / "broken.md").write_bytes(b"\xff\xfe\x00 not utf-8")
     monkeypatch.setattr(_skills, "_warned_empty", False)
     with caplog.at_level("WARNING"):
-        assert _skills.find_skills("") == []
+        assert _skills.list_skills("") == []
     assert "none usable" in caplog.text
 
 
@@ -251,7 +251,7 @@ def test_unreadable_shipped_file_is_skipped_not_fatal(
     (d / "undecodable.md").write_bytes(b"\xff\xfe\x00 not utf-8")
     (d / "_private.md").write_text("# Private\n\nprose\n", encoding="utf-8")
     (d / "notes.txt").write_text("not markdown", encoding="utf-8")
-    assert [s["id"] for s in _skills.find_skills("")] == ["good"]
+    assert [s["id"] for s in _skills.list_skills("")] == ["good"]
 
 
 # --------------------------------------------------------------------------- #
@@ -262,15 +262,15 @@ def test_unreadable_shipped_file_is_skipped_not_fatal(
 # authoring gate; this file stops at the loader and the matcher.
 # --------------------------------------------------------------------------- #
 def test_the_shipped_skills_load(mock_home, real_skills):
-    # The package always answers find_skills with something -- there is no
+    # The package always answers list_skills with something -- there is no
     # fetch to fail and no cache to be cold.
-    ids = [s["id"] for s in _skills.find_skills("")]
+    ids = [s["id"] for s in _skills.list_skills("")]
     assert "write-a-skill" in ids, ids
-    assert all(s["origin"] == "catalog" for s in _skills.find_skills(""))
+    assert all(s["origin"] == "catalog" for s in _skills.list_skills(""))
 
 
 def test_every_shipped_skill_has_a_readable_body(mock_home, real_skills):
-    for s in _skills.find_skills(""):
+    for s in _skills.list_skills(""):
         body = _skills.get_skill_body(s["id"])
         assert body.startswith("# "), s["id"]
         assert not body.lstrip().startswith("---")  # frontmatter stripped
@@ -307,7 +307,7 @@ def test_local_skill_is_discovered_with_frontmatter(local_skills, mock_home):
         "\n# My workflow\n\nSteps here.\n",
         encoding="utf-8",
     )
-    (found,) = _skills.find_skills("")
+    (found,) = _skills.list_skills("")
     assert found["id"] == "my-workflow"
     assert found["title"] == "My workflow"
     assert found["description"] == "does the thing"
@@ -326,7 +326,7 @@ def test_local_skill_without_frontmatter_still_loads(local_skills, mock_home):
     (local_skills / "bare-notes.md").write_text(
         "# Bare notes\n\nHow I do the thing.\n", encoding="utf-8"
     )
-    (found,) = _skills.find_skills("")
+    (found,) = _skills.list_skills("")
     assert found["id"] == "bare-notes"
     assert found["title"] == "Bare notes"
     assert found["description"] == "How I do the thing."
@@ -337,7 +337,7 @@ def test_local_skill_bad_file_is_skipped_not_fatal(local_skills, mock_home):
     (local_skills / "undecodable.md").write_bytes(b"\xff\xfe\x00 not utf-8")
     (local_skills / "_private.md").write_text("# Private\n\nprose\n", encoding="utf-8")
     (local_skills / "notes.txt").write_text("not markdown", encoding="utf-8")
-    assert [s["id"] for s in _skills.find_skills("")] == ["good"]
+    assert [s["id"] for s in _skills.list_skills("")] == ["good"]
 
 
 def test_local_skill_shadows_shipped_entry(
@@ -351,7 +351,7 @@ def test_local_skill_shadows_shipped_entry(
     (local_skills / "shared.md").write_text(
         "---\ndescription: my edited copy\n---\n\n# Mine\n\nbody\n", encoding="utf-8"
     )
-    (found,) = _skills.find_skills("")
+    (found,) = _skills.list_skills("")
     assert found["description"] == "my edited copy"
     assert found["origin"] == "local"
 
@@ -365,7 +365,7 @@ def test_local_and_shipped_skills_merge(local_skills, mock_home, monkeypatch, tm
         [{"id": "curated", "title": "Curated", "description": "d"}],
     )
     (local_skills / "mine.md").write_text("# Mine\n\nprose\n", encoding="utf-8")
-    found = {s["id"]: s["origin"] for s in _skills.find_skills("")}
+    found = {s["id"]: s["origin"] for s in _skills.list_skills("")}
     assert found == {"curated": "catalog", "mine": "local"}
 
 
@@ -382,7 +382,7 @@ def test_local_body_is_read_fresh_every_time(local_skills, mock_home):
 
     # Deleting the file retracts the skill on the next call, for the same reason.
     path.unlink()
-    assert _skills.find_skills("") == []
+    assert _skills.list_skills("") == []
 
 
 def test_local_body_gone_at_read_time_reports_instead_of_raising(
@@ -439,7 +439,7 @@ def test_every_term_must_match_not_just_one(
             {"id": "b", "title": "Stitch nothing", "description": "unrelated"},
         ],
     )
-    assert [s["id"] for s in _skills.find_skills("stitch mosaic")] == ["a"]
+    assert [s["id"] for s in _skills.list_skills("stitch mosaic")] == ["a"]
 
 
 def test_terms_match_in_any_order_and_across_fields(
@@ -452,8 +452,8 @@ def test_terms_match_in_any_order_and_across_fields(
         tmp_path,
         [{"id": "a", "title": "Stitch a grid", "description": "overlapping tiles"}],
     )
-    assert [s["id"] for s in _skills.find_skills("stitch tiles")] == ["a"]
-    assert [s["id"] for s in _skills.find_skills("tiles stitch")] == ["a"]
+    assert [s["id"] for s in _skills.list_skills("stitch tiles")] == ["a"]
+    assert [s["id"] for s in _skills.list_skills("tiles stitch")] == ["a"]
 
 
 def test_query_matches_the_skill_id(mock_home, skills_cfg, monkeypatch, tmp_path):
@@ -470,7 +470,7 @@ def test_query_matches_the_skill_id(mock_home, skills_cfg, monkeypatch, tmp_path
             }
         ],
     )
-    assert [s["id"] for s in _skills.find_skills("flatfield")] == [
+    assert [s["id"] for s in _skills.list_skills("flatfield")] == [
         "flatfield-and-stitch"
     ]
 
@@ -481,7 +481,7 @@ def test_query_is_case_insensitive(mock_home, skills_cfg, monkeypatch, tmp_path)
         tmp_path,
         [{"id": "a", "title": "Segment Nuclei", "description": "DAPI channel"}],
     )
-    assert [s["id"] for s in _skills.find_skills("SEGMENT dapi")] == ["a"]
+    assert [s["id"] for s in _skills.list_skills("SEGMENT dapi")] == ["a"]
 
 
 def test_terms_match_inside_words(mock_home, skills_cfg, monkeypatch, tmp_path):
@@ -491,7 +491,7 @@ def test_terms_match_inside_words(mock_home, skills_cfg, monkeypatch, tmp_path):
         tmp_path,
         [{"id": "a", "title": "Object measurements", "description": "d"}],
     )
-    assert [s["id"] for s in _skills.find_skills("measure")] == ["a"]
+    assert [s["id"] for s in _skills.list_skills("measure")] == ["a"]
 
 
 def test_matching_a_tag_retrieves(mock_home, skills_cfg, monkeypatch, tmp_path):
@@ -500,7 +500,7 @@ def test_matching_a_tag_retrieves(mock_home, skills_cfg, monkeypatch, tmp_path):
         tmp_path,
         [{"id": "a", "title": "T", "description": "d", "tags": ["quantification"]}],
     )
-    assert [s["id"] for s in _skills.find_skills("quantification")] == ["a"]
+    assert [s["id"] for s in _skills.list_skills("quantification")] == ["a"]
 
 
 def test_a_whole_phrase_that_matched_before_still_matches(
@@ -513,14 +513,14 @@ def test_a_whole_phrase_that_matched_before_still_matches(
         tmp_path,
         [{"id": "a", "title": "T", "description": "segment nuclei in 3d"}],
     )
-    assert [s["id"] for s in _skills.find_skills("segment nuclei")] == ["a"]
+    assert [s["id"] for s in _skills.list_skills("segment nuclei")] == ["a"]
 
 
 def test_unmatched_query_returns_empty_not_everything(
     mock_home, skills_cfg, monkeypatch, tmp_path
 ):
     _ship(monkeypatch, tmp_path, [{"id": "a", "title": "T", "description": "d"}])
-    assert _skills.find_skills("stitch") == []
+    assert _skills.list_skills("stitch") == []
 
 
 def test_empty_and_whitespace_query_return_the_whole_catalog(
@@ -534,8 +534,8 @@ def test_empty_and_whitespace_query_return_the_whole_catalog(
             {"id": "b", "title": "B", "description": "d"},
         ],
     )
-    assert len(_skills.find_skills("")) == 2
-    assert len(_skills.find_skills("   ")) == 2
+    assert len(_skills.list_skills("")) == 2
+    assert len(_skills.list_skills("   ")) == 2
 
 
 def test_results_are_sorted_by_title(mock_home, skills_cfg, monkeypatch, tmp_path):
@@ -550,7 +550,7 @@ def test_results_are_sorted_by_title(mock_home, skills_cfg, monkeypatch, tmp_pat
             {"id": "b", "title": "mango", "description": "shared"},
         ],
     )
-    assert [s["title"] for s in _skills.find_skills("shared")] == [
+    assert [s["title"] for s in _skills.list_skills("shared")] == [
         "Apple",
         "mango",
         "zebra",
@@ -565,7 +565,7 @@ def plugin_catalog(skills_cfg, monkeypatch, tmp_path):
     """Turn plugin indexing on, pointed at a tmp plugin dir this test owns.
 
     Returns the dir, so a test writes ``*.py`` into it and calls
-    ``find_skills``. ``mcp_plugin_dir`` is patched at its source rather than via
+    ``list_skills``. ``mcp_plugin_dir`` is patched at its source rather than via
     ``$HOME``, because it reads ``$BIOPB_CONFIG_HOME`` first.
     """
     import biopb._locations as locations
@@ -585,7 +585,7 @@ def _plugin(d, name, doc):
 
 def test_a_plugin_is_discoverable_by_its_docstring(mock_home, plugin_catalog):
     _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
-    (row,) = _skills.find_skills(["rolling"])
+    (row,) = _skills.list_skills(["rolling"])
     assert row["id"] == "rolling_ball"
     assert row["kind"] == "plugin"
     assert row["description"] == "Rolling-ball background subtraction."
@@ -596,7 +596,7 @@ def test_a_plugin_row_offers_a_handle_and_no_skill_uri(mock_home, plugin_catalog
     reads `skill://rolling_ball` gets nothing, and one that calls a skill's id
     as a namespace handle gets a NameError."""
     _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
-    (row,) = _skills.find_skills(["rolling"])
+    (row,) = _skills.list_skills(["rolling"])
     assert row["handle"] == "rolling_ball"
     assert "uri" not in row
 
@@ -605,7 +605,7 @@ def test_a_skill_row_still_carries_its_uri_and_kind(
     mock_home, skills_cfg, monkeypatch, tmp_path
 ):
     _ship(monkeypatch, tmp_path, [{"id": "flatfield", "description": "even out"}])
-    (row,) = _skills.find_skills(["flatfield"])
+    (row,) = _skills.list_skills(["flatfield"])
     assert row["kind"] == "skill"
     assert row["uri"] == "skill://flatfield"
     assert "handle" not in row
@@ -623,24 +623,24 @@ def test_the_opening_paragraph_is_searched_not_just_the_first_line(
         "Labels are linked across every chunk seam.\n\n"
         "Implementation notes nobody should retrieve on: pixiedust.",
     )
-    assert [s["id"] for s in _skills.find_skills(["seam"])] == ["chunked_label"]
+    assert [s["id"] for s in _skills.list_skills(["seam"])] == ["chunked_label"]
     # ...and it stops at the *first* blank line after that, so the rest of a long
     # docstring is not dumped into the haystack.
-    assert _skills.find_skills(["pixiedust"]) == []
+    assert _skills.list_skills(["pixiedust"]) == []
 
 
 def test_an_undocumented_plugin_is_still_listed(mock_home, plugin_catalog):
     """Excluding it would hide a working third-party tool entirely. The row says
     plainly that it has to be inspected."""
     (plugin_catalog / "mystery.py").write_text("def go():\n    return 1\n")
-    (row,) = _skills.find_skills(["mystery"])
+    (row,) = _skills.list_skills(["mystery"])
     assert row["kind"] == "plugin"
     assert "inspect_object" in row["description"]
 
 
 def test_private_files_are_not_plugins(mock_home, plugin_catalog):
     _plugin(plugin_catalog, "_helpers", "Not a plugin.")
-    assert _skills.find_skills([]) == []
+    assert _skills.list_skills([]) == []
 
 
 def test_plugins_are_off_when_the_catalog_is(mock_home, plugin_catalog, skills_cfg):
@@ -649,7 +649,7 @@ def test_plugins_are_off_when_the_catalog_is(mock_home, plugin_catalog, skills_c
     the assertion *and* hand the ablated arm back a form of discovery."""
     _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
     skills_cfg["skills_enabled"] = False
-    assert _skills.find_skills([]) == []
+    assert _skills.list_skills([]) == []
 
 
 def test_plugins_are_off_when_they_will_not_be_loaded(
@@ -658,7 +658,7 @@ def test_plugins_are_off_when_they_will_not_be_loaded(
     """Nothing binds them into the namespace, so the handle would not resolve."""
     _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
     skills_cfg["namespace_enabled"] = False
-    assert _skills.find_skills([]) == []
+    assert _skills.list_skills([]) == []
 
 
 def test_a_skill_shadows_a_plugin_of_the_same_name(
@@ -668,7 +668,7 @@ def test_a_skill_shadows_a_plugin_of_the_same_name(
     artifact wins."""
     _plugin(plugin_catalog, "flatfield", "A plugin that happens to share the name.")
     _ship(monkeypatch, tmp_path, [{"id": "flatfield", "description": "the skill"}])
-    (row,) = _skills.find_skills(["flatfield"])
+    (row,) = _skills.list_skills(["flatfield"])
     assert row["kind"] == "skill"
 
 
@@ -677,11 +677,11 @@ def test_skills_sort_before_plugins(mock_home, plugin_catalog, monkeypatch, tmp_
     not depend on the alphabet."""
     _plugin(plugin_catalog, "aaa_plugin", "shared term here.")
     _ship(monkeypatch, tmp_path, [{"id": "zzz-skill", "description": "shared term"}])
-    assert [s["kind"] for s in _skills.find_skills(["shared"])] == ["skill", "plugin"]
+    assert [s["kind"] for s in _skills.list_skills(["shared"])] == ["skill", "plugin"]
 
 
 def test_reading_a_plugin_as_a_skill_body_explains_itself(mock_home, plugin_catalog):
-    """Reachable, because find_skills lists plugins beside skills and reading
+    """Reachable, because list_skills lists plugins beside skills and reading
     `skill://<id>` is the habit that row sits next to."""
     _plugin(plugin_catalog, "rolling_ball", "Rolling-ball background subtraction.")
     body = _skills.get_skill_body("rolling_ball")
@@ -693,4 +693,4 @@ def test_an_unreadable_plugin_dir_is_not_fatal(mock_home, plugin_catalog, monkey
     import biopb._kernel_plugins as kp
 
     monkeypatch.setattr(kp, "startup_files", lambda *a, **k: 1 / 0)
-    assert _skills.find_skills([]) == []
+    assert _skills.list_skills([]) == []

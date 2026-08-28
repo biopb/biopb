@@ -62,21 +62,15 @@ to ``biopb-control``.
 """
 
 import asyncio
-import functools
 import json
 import logging
 
-from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
-from starlette.responses import (
-    JSONResponse,
-    PlainTextResponse,
-    Response,
-)
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import _notebook, _server
+from . import _http, _notebook, _server
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +103,6 @@ _agentless = False
 # same single path Ctrl-C and SIGTERM take, so a stop from the web de-registers,
 # reaps the kernel and closes the cluster in exactly the same order.
 _shutdown_hook = None
-_extra_origins = ()
-_extra_hosts = ()
-
-# Lazily-built Host/Origin validator.
-_mw = None
-
 # Whether the routes were mounted on the MCP app (for server_status). Stays
 # False when observe is disabled, in stdio mode, or if registration failed.
 _mounted_http = False
@@ -140,17 +128,13 @@ def configure(
     this is set.
     """
     global _max_output_chars, _poll_interval_ms, _console_enabled
-    global _extra_origins, _extra_hosts
-    global _mw
     if max_output_chars is not None:
         _max_output_chars = int(max_output_chars)
     if poll_interval_ms is not None:
         _poll_interval_ms = int(poll_interval_ms)
     if console_enabled is not None:
         _console_enabled = bool(console_enabled)
-    _extra_origins = tuple(allowed_origins)
-    _extra_hosts = tuple(allowed_hosts)
-    _mw = None  # rebuilt with the new extras on next request
+    _http.configure(allowed_origins, allowed_hosts)
 
 
 def set_session_owns_its_reap(agentless, on_shutdown=None):
@@ -178,106 +162,15 @@ def set_chat_enabled(enabled):
     _chat_enabled = bool(enabled)
 
 
-# ---------------------------------------------------------------------------
-# Host/Origin guard (own copy — custom routes are NOT covered by FastMCP's)
-# ---------------------------------------------------------------------------
-
-
-def _get_mw():
-    global _mw
-    if _mw is None:
-        _mw = TransportSecurityMiddleware(
-            _server.build_transport_security(_extra_origins, _extra_hosts)
-        )
-    return _mw
-
-
-def _check_origin(request):
-    """Return an error Response if Host/Origin is disallowed, else None.
-
-    Reuses the SDK validators (same loopback allowlist as ``/mcp``) but skips
-    its content-type rule — our control POSTs carry no JSON body.
-    """
-    mw = _get_mw()
-    if not mw._validate_host(request.headers.get("host")):
-        return PlainTextResponse("Invalid Host header", status_code=421)
-    if not mw._validate_origin(request.headers.get("origin")):
-        return PlainTextResponse("Invalid Origin header", status_code=403)
-    return None
-
-
-def _route(fn):
-    """Wrap a handler with the Host/Origin guard + a catch-all 500.
-
-    Applied to every route so a new one can't forget the guard, and a wedged
-    kernel surfaces a clean JSON 500 instead of leaking a traceback.
-    """
-
-    @functools.wraps(fn)
-    async def wrapper(request):
-        denied = _check_origin(request)
-        if denied is not None:
-            return denied
-        try:
-            return await fn(request)
-        except Exception as exc:  # noqa: BLE001 - report, never crash
-            logger.exception("observe handler error")
-            return JSONResponse(
-                {"error": "internal error", "detail": str(exc)},
-                status_code=500,
-            )
-
-    return wrapper
-
-
-def _json_route(fn):
-    """:func:`_route` plus the SDK's ``Content-Type: application/json`` rule.
-
-    :func:`_check_origin` deliberately skips that rule because the other control
-    POSTs carry no body — but a JSON content-type is one a cross-site form POST
-    **cannot** set (it is not a CORS-simple value, so it preflights), which makes
-    it a real CSRF defense on the one route that submits code. Restored here
-    rather than added to ``_route`` so the exemption above stays true of the
-    routes it describes, and so a body-carrying route cannot inherit the
-    body-less guard by accident.
-    """
-    guarded = _route(fn)
-
-    @functools.wraps(fn)
-    async def wrapper(request):
-        if not _get_mw()._validate_content_type(request.headers.get("content-type")):
-            return PlainTextResponse("Invalid Content-Type header", status_code=400)
-        return await guarded(request)
-
-    return wrapper
-
-
-def _require_host():
-    """Return ``(host, None)`` or ``(None, 503 response)`` if no kernel host."""
-    host = _server._kernel_host
-    if host is None:
-        return None, JSONResponse(
-            {"error": "kernel host not initialized"}, status_code=503
-        )
-    return host, None
-
-
-def _kernel_error(res):
-    """Map a non-ok job round-trip to a response.
-
-    A ``busy`` kernel is transient (another quick call holds the lock) -> 200
-    with a ``busy`` marker the UI retries on; anything else -> 502.
-    """
-    status = res.get("status")
-    if status == "busy":
-        return JSONResponse({"busy": True, "jobs": []})
-    return JSONResponse(
-        {
-            "error": status or "kernel error",
-            "detail": _server._format_execute_result(res),
-        },
-        status_code=502,
-    )
+# The shared HTTP-surface layer lives in `_http`: the Host/Origin guard, the
+# catch-all 500, the JSON-body parse and the kernel-host/error mapping are the
+# same for the chat routes, so they are not this page's to own. Aliased rather
+# than re-spelled at each use so the route tables below stay readable.
+_route = _http.route
+_json_route = _http.json_route
+_check_origin = _http.check_origin
+_require_host = _http.require_host
+_kernel_error = _http.kernel_error
 
 
 def _truncate_tail(text):
@@ -304,7 +197,7 @@ async def _api_jobs(request):
     # jobs_view(), not jobs_summary(): the page redraws from the job list *and*
     # from whether a verified workflow is available to download, and this poll
     # runs about once a second for the life of the session.
-    result, res, _w = _server._run_job_call(host, "jobs_view()")
+    result, res, _w = _server._run_job_call(host, "jobs_view")
     if result is None:
         return _kernel_error(res)
     return JSONResponse(result)
@@ -315,7 +208,7 @@ async def _api_job_detail(request):
     if err is not None:
         return err
     job_id = request.path_params["job_id"]
-    snap, res, win = _server._run_job_call(host, "poll(" + repr(job_id) + ")")
+    snap, res, win = _server._run_job_call(host, "poll", job_id)
     if snap is None:
         return _kernel_error(res)
     if snap.get("status") == "unknown":
@@ -345,7 +238,7 @@ async def _api_notebook(request):
     if err is not None:
         return err
     if request.query_params.get("workflow"):
-        record, res, _w = _server._run_job_call(host, "verified()")
+        record, res, _w = _server._run_job_call(host, "verified")
         if record is None:
             # No verified workflow *and* a failed read look the same from here;
             # the kernel error is the more specific answer, so prefer it.
@@ -359,7 +252,7 @@ async def _api_notebook(request):
     # Read the full job history on the kernel main thread (a plain read like
     # jobs_summary(), no background job thread), then serialize to a notebook in
     # this process.
-    jobs, res, _w = _server._run_job_call(host, "export()")
+    jobs, res, _w = _server._run_job_call(host, "export")
     if jobs is None:
         return _kernel_error(res)
     nb = _notebook.build_notebook(jobs)
@@ -387,7 +280,7 @@ async def _api_interrupt(request):
     # Force a KeyboardInterrupt into the running job's worker thread (SIGINT only
     # reaches the kernel main thread, not the job), attributed to the user.
     data, res, _w = _server._run_job_call(
-        host, "interrupt_current(" + repr(_USER_INTERRUPT_MSG) + ")"
+        host, "interrupt_current", _USER_INTERRUPT_MSG
     )
     if data is None:
         return _kernel_error(res)
@@ -428,17 +321,14 @@ async def _console_execute(request):
     host, err = _require_host()
     if err is not None:
         return err
-    try:
-        payload = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is the client's error
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    code = payload.get("code") if isinstance(payload, dict) else None
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return err
+    code = payload.get("code")
     if not isinstance(code, str) or not code.strip():
         return JSONResponse({"error": "missing 'code'"}, status_code=400)
 
-    submitted, res, _w = _server._run_job_call(
-        host, "submit(" + repr(code) + ", origin='user')"
-    )
+    submitted, res, _w = _server._run_job_call(host, "submit", code, origin="user")
     if submitted is None:
         # Distinct from the job-busy case below: this is the kernel *lock*, held
         # by another quick snippet for a moment. Transient, so retryable.

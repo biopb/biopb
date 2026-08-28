@@ -132,7 +132,7 @@ class TestJobRunnerUnit:
         runner["_dask_client"] = _StubClient()
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         time.sleep(0.05)
-        _jobs._cancel(jid)
+        _jobs._cancel_dask_futures(_jobs._jobs[jid])
         passed = calls["futures"]
         assert passed and all(isinstance(f, Future) for f in passed)
         assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)

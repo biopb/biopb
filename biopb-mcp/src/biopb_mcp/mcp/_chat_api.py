@@ -33,7 +33,7 @@ import logging
 from starlette.responses import JSONResponse
 
 from .._config import get_setting
-from . import _chat, _chat_acp, _model, _observe, _server
+from . import _chat, _chat_acp, _http, _model, _observe, _server
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,39 @@ def _acp():
     return _engine == "acp"
 
 
+def _mod():
+    """The engine module driving the pane.
+
+    `_chat` and `_chat_acp` implement the same names (`busy`, `history`,
+    `reset`, `run_turn`, `check_ready`, `current_model`, `model_choices`,
+    `TurnInProgress`), so a handler that only needs *an* engine asks for one
+    here instead of re-deciding which. The handlers that branch below are the
+    ones where the two genuinely differ -- compaction is builtin-only,
+    permission questions are ACP-only -- and branching there now means the
+    difference is policy, visibly, rather than dispatch.
+    """
+    return _chat_acp if _acp() else _chat
+
+
+def _busy_409(message="a turn is running; cancel it first"):
+    """The "a turn is in flight" refusal.
+
+    State, not a failed action -- the same shape the console reports a busy
+    kernel with, so the view renders it as "wait" rather than "retry". One
+    builder because the wording is a thing the pane shows, and six hand-written
+    copies had already drifted into three versions of it.
+    """
+    return JSONResponse({"error": message, "busy": True}, status_code=409)
+
+
+def _not_ready_503(engine=None):
+    """The engine-cannot-run refusal, carrying `_readiness`'s reason."""
+    ready, reason = _readiness(engine)
+    if ready:
+        return None
+    return JSONResponse({"error": reason}, status_code=503)
+
+
 def _readiness(engine=None):
     """``(ready, reason)`` — why the engine cannot run, if it cannot.
 
@@ -161,7 +194,7 @@ async def _api_chat_status(request):
 
 
 def _busy():
-    return _chat_acp.busy() if _acp() else _chat.busy()
+    return _mod().busy()
 
 
 def _who(ready):
@@ -246,21 +279,17 @@ async def _chat_model(request):
     future viewer. It does reach every window of *this* session -- the pane
     reads the model beside the engine on every poll.
     """
-    try:
-        payload = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is the client's error
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    wanted = payload.get("model") if isinstance(payload, dict) else None
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return err
+    wanted = payload.get("model")
     if not isinstance(wanted, str) or not wanted.strip():
         return JSONResponse(
             {"error": "model must be a non-empty string"}, status_code=400
         )
     wanted = wanted.strip()
     if _in_flight():
-        return JSONResponse(
-            {"error": "a turn is running; cancel it first", "busy": True},
-            status_code=409,
-        )
+        return _busy_409()
     key = "acp_model" if _acp() else "model"
     if _acp():
         # Starts the agent if it is not up. Only a running session can say which
@@ -406,7 +435,7 @@ def _partial():
 
 async def _run_turn(text):
     """Run one turn, recording a failure in the thread rather than losing it."""
-    engine = _chat_acp if _acp() else _chat
+    engine = _mod()
     try:
         if _acp():
             await _chat_acp.run_turn(text, _config)
@@ -445,23 +474,18 @@ def _in_flight():
 
 async def _chat_turn(request):
     """Accept a message and start the turn; the view polls for the answer."""
-    ready, reason = _readiness()
-    if not ready:
-        return JSONResponse({"error": reason}, status_code=503)
-    try:
-        payload = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is the client's error
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    text = payload.get("text") if isinstance(payload, dict) else None
+    err = _not_ready_503()
+    if err is not None:
+        return err
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return err
+    text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
         return JSONResponse({"error": "missing 'text'"}, status_code=400)
 
     if _in_flight():
-        # State, not a failed action -- the same shape the console reports a busy
-        # kernel with, so the view renders it as "wait" rather than "retry".
-        return JSONResponse(
-            {"error": "a turn is already running", "busy": True}, status_code=409
-        )
+        return _busy_409()
 
     global _turn_task
     _turn_task = asyncio.create_task(_run_turn(text))
@@ -533,10 +557,7 @@ async def _chat_reset(request):
     work it did -- and the kernel namespace it built is still live.
     """
     if _in_flight():
-        return JSONResponse(
-            {"error": "a turn is running; cancel it first", "busy": True},
-            status_code=409,
-        )
+        return _busy_409()
     global _turn_task, _live_job, _live_text, _live_len
     if _acp():
         # Also ends the harness's session, not just our transcript. Half a reset
@@ -545,10 +566,7 @@ async def _chat_reset(request):
         try:
             await _chat_acp.reset()
         except _chat_acp.TurnInProgress:
-            return JSONResponse(
-                {"error": "a turn is running; cancel it first", "busy": True},
-                status_code=409,
-            )
+            return _busy_409()
     else:
         _chat.reset()
     _turn_task = None
@@ -592,21 +610,16 @@ async def _chat_summary(request):
             },
             status_code=400,
         )
-    ready, reason = _readiness()
-    if not ready:
-        return JSONResponse({"error": reason}, status_code=503)
+    err = _not_ready_503()
+    if err is not None:
+        return err
     if _in_flight():
-        return JSONResponse(
-            {"error": "a turn is running; wait for it or cancel it", "busy": True},
-            status_code=409,
-        )
+        return _busy_409()
     before = _chat.summary_state()[1]
     try:
         compacted = await _chat.compact(_model.make_model(_config))
     except _chat.TurnInProgress:
-        return JSONResponse(
-            {"error": "a turn is already running", "busy": True}, status_code=409
-        )
+        return _busy_409()
     except Exception as exc:  # noqa: BLE001 - a provider failure is the answer
         logger.warning("chat compaction failed: %s", exc)
         return JSONResponse({"error": f"could not summarise: {exc}"}, status_code=502)
@@ -630,12 +643,9 @@ async def _chat_permission(request):
             {"error": "the built-in loop asks no permission questions"},
             status_code=400,
         )
-    try:
-        payload = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is the client's error
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    if not isinstance(payload, dict):
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return err
     request_id = payload.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         return JSONResponse({"error": "missing 'request_id'"}, status_code=400)
@@ -671,11 +681,10 @@ async def _chat_engine(request):
     re-aim every future viewer from a click in one of them.
     """
     global _engine, _turn_task
-    try:
-        payload = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is the client's error
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    wanted = payload.get("engine") if isinstance(payload, dict) else None
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return err
+    wanted = payload.get("engine")
     if wanted not in ("builtin", "acp"):
         return JSONResponse(
             {"error": "engine must be 'builtin' or 'acp'"}, status_code=400
@@ -683,13 +692,10 @@ async def _chat_engine(request):
     if wanted == _engine:
         return JSONResponse({"engine": _engine, "changed": False})
     if _in_flight():
-        return JSONResponse(
-            {"error": "a turn is running; cancel it first", "busy": True},
-            status_code=409,
-        )
-    ready, reason = _readiness(wanted)
-    if not ready:
-        return JSONResponse({"error": reason}, status_code=503)
+        return _busy_409()
+    err = _not_ready_503(wanted)
+    if err is not None:
+        return err
     holder = _server.claim_holder()
     if holder is not None:
         return JSONResponse(
@@ -715,17 +721,17 @@ async def _chat_engine(request):
 # Reads under `api` (always proxied), the writes under `chat` (proxied only by a
 # loopback-bound control, and POST-only, which that gate enforces).
 _ROUTES = [
-    ("/api/chat/status", ["GET"], _observe._route(_api_chat_status)),
-    ("/api/chat/history", ["GET"], _observe._route(_api_chat_history)),
-    ("/api/chat/engine", ["GET"], _observe._route(_api_chat_engine)),
-    ("/api/chat/models", ["GET"], _observe._route(_api_chat_models)),
-    ("/chat/turn", ["POST"], _observe._json_route(_chat_turn)),
-    ("/chat/cancel", ["POST"], _observe._json_route(_chat_cancel)),
-    ("/chat/reset", ["POST"], _observe._json_route(_chat_reset)),
-    ("/chat/summary", ["POST"], _observe._json_route(_chat_summary)),
-    ("/chat/permission", ["POST"], _observe._json_route(_chat_permission)),
-    ("/chat/engine", ["POST"], _observe._json_route(_chat_engine)),
-    ("/chat/model", ["POST"], _observe._json_route(_chat_model)),
+    ("/api/chat/status", ["GET"], _http.route(_api_chat_status)),
+    ("/api/chat/history", ["GET"], _http.route(_api_chat_history)),
+    ("/api/chat/engine", ["GET"], _http.route(_api_chat_engine)),
+    ("/api/chat/models", ["GET"], _http.route(_api_chat_models)),
+    ("/chat/turn", ["POST"], _http.json_route(_chat_turn)),
+    ("/chat/cancel", ["POST"], _http.json_route(_chat_cancel)),
+    ("/chat/reset", ["POST"], _http.json_route(_chat_reset)),
+    ("/chat/summary", ["POST"], _http.json_route(_chat_summary)),
+    ("/chat/permission", ["POST"], _http.json_route(_chat_permission)),
+    ("/chat/engine", ["POST"], _http.json_route(_chat_engine)),
+    ("/chat/model", ["POST"], _http.json_route(_chat_model)),
 ]
 
 
@@ -745,6 +751,4 @@ def register_http_routes():
 
 
 def _server_custom_route(path, methods):
-    from . import _server
-
     return _server.mcp.custom_route(path, methods=methods)

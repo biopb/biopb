@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _observe, _server
+from biopb_mcp.mcp import _http, _observe, _server
 
 
 def _reply(r, window_alive=True):
@@ -76,7 +76,7 @@ def observe_state(host):
     _observe._poll_interval_ms = old_poll
     _observe._console_enabled = old_console
     _observe._mounted_http = old_mounted
-    _observe._mw = None
+    _http._mw = None
 
 
 @pytest.fixture
@@ -521,8 +521,8 @@ def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
     # one fact without dropping others.
     _observe.configure(allowed_origins=("https://front",), allowed_hosts=("front",))
     _observe.set_chat_enabled(True)
-    assert _observe._extra_origins == ("https://front",)
-    assert _observe._extra_hosts == ("front",)
+    assert _http._extra_origins == ("https://front",)
+    assert _http._extra_hosts == ("front",)
 
 
 # -- busy kernel ------------------------------------------------------------

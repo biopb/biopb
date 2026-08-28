@@ -186,6 +186,18 @@ def history():
     return list(_messages)
 
 
+def _image_url(msg):
+    """The ``data:`` URL for an image message.
+
+    Stored on the message at append time; recomputed only for one written before
+    that field existed, or by a test building a message by hand.
+    """
+    url = msg.get("image_url")
+    if url:
+        return url
+    return f"data:{msg['mime']};base64,{msg['image']}"
+
+
 def _last_user_text():
     for msg in reversed(_messages):
         if msg["role"] == "user" and not msg.get("image"):
@@ -198,7 +210,7 @@ def _last_user_text():
 # ---------------------------------------------------------------------------
 
 
-async def _job_call(host, snippet):
+async def _job_call(host, name, *args, **kwargs):
     """``_server._run_job_call`` off the event loop.
 
     The round trip blocks: it waits on the kernel's lock (up to
@@ -209,7 +221,7 @@ async def _job_call(host, snippet):
     host already expects -- its lock exists because the tools and the observe
     API already reach it concurrently.
     """
-    return await asyncio.to_thread(_server._run_job_call, host, snippet)
+    return await asyncio.to_thread(_server._run_job_call, host, name, *args, **kwargs)
 
 
 def _clean_schema(schema):
@@ -358,6 +370,24 @@ async def _dispatch(name, arguments, on_progress):
     return text, [b for b in blocks if isinstance(b, ImageContent)]
 
 
+def _busy_message(running, running_origin) -> str:
+    """This loop's reply when the kernel already has a job running.
+
+    Deliberately not `_server._tool_busy_message`: that one hands the agent a
+    `poll_job('<id>')` to wait on, and this path never returns a job handle for
+    the model to poll (there is no promote window here -- `_run_code` streams
+    the cell to its end). Naming who is running it still helps, and costs
+    nothing the model can act wrongly on.
+    """
+    who = {"user": "The user", "chat": "This session"}.get(
+        running_origin, "Another writer"
+    )
+    return (
+        f"{who} is running a cell ({running}) in this kernel; only one job runs "
+        "at a time. Wait for it to finish."
+    )
+
+
 async def _run_code(arguments, on_progress):
     """``execute_code`` without the promote window, streaming partial output.
 
@@ -377,9 +407,9 @@ async def _run_code(arguments, on_progress):
     never learned that the person at the machine had run any. Read once at
     entry, appended to whichever branch returns.
     """
-    host = _server._kernel_host
-    if host is None:
-        return "Error: kernel host not initialized"
+    host, err = _server._require_kernel_host()
+    if err is not None:
+        return err
     code = arguments.get("python_code") or ""
     intent = arguments.get("intent") or _last_user_text()
 
@@ -411,48 +441,26 @@ async def _run_code(arguments, on_progress):
         _pending_notice = digest
         return text + foreign_note
 
-    # Claimed before the call, and mirrored, for the same reason execute_code
-    # does it: a lost reply must not leave the kernel held while this process
-    # reads as unclaimed.
-    _server._presume_claim(WRITER_ID)
-    submitted, res, _w = await _job_call(
+    # The claim protocol is `_server._submit_job`'s, not a copy of it: presume
+    # the claim, submit, believe whatever the kernel answers. `_local_identity`
+    # is set for this whole dispatch, so `_client_identity()` inside it already
+    # resolves to this loop's writer. Off the loop, like every other kernel
+    # round trip here.
+    job_id, message, drop_note, _w = await asyncio.to_thread(
+        _server._submit_job,
         host,
-        "submit("
-        + repr(code)
-        + ", origin="
-        + repr(ORIGIN)
-        + ", intent="
-        + repr(intent)
-        + ", writer="
-        + repr(WRITER_ID)
-        + ", writer_label="
-        + repr(WRITER_LABEL)
-        + ")",
+        code,
+        digest,
+        _busy_message,
+        origin=ORIGIN,
+        intent=intent,
     )
-    if submitted is None:
-        return deliver(_server._format_execute_result(res))
-    if submitted.get("error") == "not_owner":
-        held = submitted.get("owner") or ""
-        _server._note_claim(submitted.get("owner_id"))
-        return deliver(
-            _server._NOT_OWNER_MSG.format(held_by=f" ({held})" if held else "")
-        )
-    _server._note_claim(WRITER_ID)
-    if submitted.get("error") == "busy":
-        running = submitted.get("running_job_id")
-        # A running foreign job stays in the digest by design, so the note is
-        # about to report the very cell this branch reports. Drop it when that
-        # is all it says, and keep it when other cells also finished -- those
-        # were acked above and will not be offered again.
-        if [d.get("job_id") for d in digest] == [running]:
-            foreign_note = ""
-        return deliver(
-            f"A job ({running}) is already running in this "
-            "kernel; wait for it to finish."
-        )
+    if drop_note:
+        foreign_note = ""
+    if message is not None:
+        return deliver(message)
 
     global _running_job_id
-    job_id = submitted["job_id"]
     # Recorded so a cancelled turn can name the cell it walked away from. It
     # means "the cell being polled right now", and every way of ceasing to poll
     # clears it except the one where the statement stays true.
@@ -461,7 +469,7 @@ async def _run_code(arguments, on_progress):
     try:
         while True:
             await asyncio.sleep(_POLL_INTERVAL)
-            snap, res, _w = await _job_call(host, "poll(" + repr(job_id) + ")")
+            snap, res, _w = await _job_call(host, "poll", job_id)
             if snap is None:
                 _running_job_id = None
                 return deliver(_server._format_execute_result(res))
@@ -523,9 +531,7 @@ def _llm_messages():
                         {"type": "text", "text": msg["content"]},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{msg['mime']};base64,{msg['image']}"
-                            },
+                            "image_url": {"url": _image_url(msg)},
                         },
                     ],
                 }
@@ -807,6 +813,11 @@ async def _run_turn(user_text, model, on_progress):
                     f"(image returned by {name})",
                     image=img.data,
                     mime=img.mimeType,
+                    # Built once, here. `_llm_messages` runs per tool round, and
+                    # a canvas PNG is a few hundred KB of base64 -- rebuilding
+                    # the URL each round rebuilt every screenshot in the thread,
+                    # every round, for nothing.
+                    image_url=f"data:{img.mimeType};base64,{img.data}",
                 )
         else:
             # Not an error the model can be told about mid-turn: it is the turn

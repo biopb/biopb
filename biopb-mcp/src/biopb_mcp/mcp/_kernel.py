@@ -39,6 +39,18 @@ ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 _WINDOW_ALIVE_PROBE = "print(_viewer_window_alive())"
 _WINDOW_PROBE_TIMEOUT = 10.0
 
+
+def _status_result(status: str, error_text: str) -> dict:
+    """An execute-shaped result carrying only a status and why.
+
+    Every "the kernel could not run this" answer has the same two empty output
+    fields, present so `_format_execute_result` finds the keys it reads on the
+    success path. Naming them once leaves each caller showing the one thing
+    that distinguishes it -- which of the states it is.
+    """
+    return {"stdout": "", "result_text": "", "error_text": error_text, "status": status}
+
+
 # A token-report pipe used to carry the connected (url, token) back to this
 # process so a kernel restart could re-inject it (issue #86). It is gone with
 # biopb/biopb#628: every token a kernel can now use is re-derivable at connect
@@ -472,48 +484,32 @@ class KernelHost:
         reason = self._teardown_reason
         suffix = f" ({reason})" if reason else ""
         if self._start_error is not None:
-            return {
-                "stdout": "",
-                "result_text": "",
-                "error_text": (
-                    "Kernel startup failed: "
-                    + self._start_error
-                    + " The kernel is not running; call start_kernel to retry."
-                    + suffix
-                ),
-                "status": "error",
-            }
+            return _status_result(
+                "error",
+                "Kernel startup failed: "
+                + self._start_error
+                + " The kernel is not running; call start_kernel to retry."
+                + suffix,
+            )
         if self._dead:
-            return {
-                "stdout": "",
-                "result_text": "",
-                "error_text": (
-                    "Kernel is dead (respawn budget exhausted). Call "
-                    "start_kernel to launch a fresh kernel." + suffix
-                ),
-                "status": "error",
-            }
+            return _status_result(
+                "error",
+                "Kernel is dead (respawn budget exhausted). Call "
+                "start_kernel to launch a fresh kernel." + suffix,
+            )
         if self.is_alive():
             # A kernel exists but its bootstrap/health probe hasn't passed yet
             # (e.g. a watchdog respawn in flight) — booting, not idle.
-            return {
-                "stdout": "",
-                "result_text": "",
-                "error_text": (
-                    "Kernel is still starting (napari viewer / dask bring-up). "
-                    "Poll server_status or retry in a few seconds."
-                ),
-                "status": "starting",
-            }
-        return {
-            "stdout": "",
-            "result_text": "",
-            "error_text": (
-                "Kernel not started. Call start_kernel first, then poll "
-                "server_status until it reports ready." + suffix
-            ),
-            "status": "not_started",
-        }
+            return _status_result(
+                "starting",
+                "Kernel is still starting (napari viewer / dask bring-up). "
+                "Poll server_status or retry in a few seconds.",
+            )
+        return _status_result(
+            "not_started",
+            "Kernel not started. Call start_kernel first, then poll "
+            "server_status until it reports ready." + suffix,
+        )
 
     def _execute_internal(self, code: str, timeout: Optional[float] = None) -> dict:
         """Lock-guarded execution, bypassing the readiness wait.
@@ -526,15 +522,11 @@ class KernelHost:
 
         acquired = self._lock.acquire(timeout=self._busy_lock_timeout)
         if not acquired:
-            return {
-                "stdout": "",
-                "result_text": "",
-                "error_text": (
-                    "Kernel is busy with another execution. Wait for it to "
-                    "finish, or call restart_kernel to force-stop it."
-                ),
-                "status": "busy",
-            }
+            return _status_result(
+                "busy",
+                "Kernel is busy with another execution. Wait for it to "
+                "finish, or call restart_kernel to force-stop it.",
+            )
         try:
             return self._execute_locked(code, timeout)
         finally:
@@ -542,12 +534,7 @@ class KernelHost:
 
     def _execute_locked(self, code: str, timeout: float) -> dict:
         if self._kc is None:
-            return {
-                "stdout": "",
-                "result_text": "",
-                "error_text": "Kernel is not running.",
-                "status": "error",
-            }
+            return _status_result("error", "Kernel is not running.")
 
         res = self._run_once(code, timeout)
         # A preceding interrupt/error aborts requests already queued at the
@@ -794,6 +781,15 @@ class KernelHost:
             return  # EOF: kernel died via another path; nothing to do
         if self._stopping:
             return  # a restart/shutdown is already tearing the kernel down
+        self._teardown_after_window_close()
+
+    def _teardown_after_window_close(self):
+        """Take the kernel down to idle because the viewer window went away.
+
+        Shared by the POSIX pipe signal and the Windows poll: the reason is the
+        sentence the agent reads back in `server_status` and in any abandoned
+        job's error, so the two paths must not be able to word it differently.
+        """
         self._teardown_reason = (
             "the user closed the napari viewer window; the kernel was shut "
             "down and any running job was stopped"
@@ -837,14 +833,7 @@ class KernelHost:
             return False  # alive, or an inconclusive (busy/timeout/error) probe
         if self._stopping or self._window_poll_stop.is_set():
             return False  # a concurrent restart/shutdown started -- don't race it
-        self._teardown_reason = (
-            "the user closed the napari viewer window; the kernel was shut "
-            "down and any running job was stopped"
-        )
-        try:
-            self.shutdown()
-        except Exception:
-            logger.exception("teardown after window close failed")
+        self._teardown_after_window_close()
         return True
 
     # -- liveness watchdog (issue #13, failure mode 2) ------------------

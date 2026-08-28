@@ -42,27 +42,16 @@ BOOTSTRAP_SRC = """\
 import numpy as np
 import dask.array as da
 
-from biopb import _algorithms
-from biopb_mcp._config import load_config, get_setting
+from biopb_mcp._config import load_config
 from biopb_mcp._connection import TensorConnection
-from biopb_mcp.mcp._process_ops import build_ops
+from biopb_mcp.mcp._process_ops import build_ops_from_config
 
 config = load_config()
 _conn = TensorConnection()
 _conn.auto_connect()          # synchronous best-effort connect (audit; no async service)
 client = _conn.client
 
-_mb = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
-ops = build_ops(
-    client_getter=lambda: _conn.client,
-    server_urls=_algorithms.servers_from_config(config),
-    op_names_timeout=get_setting(config, "timeout.get_op_names"),
-    run_timeout=get_setting(config, "timeout.process_image"),
-    channel_options=[
-        ("grpc.max_receive_message_length", _mb),
-        ("grpc.max_send_message_length", _mb),
-    ],
-)
+ops = build_ops_from_config(config, lambda: _conn.client)
 
 # Best-effort empty viewer via the Qt magic; degrades to None when headless
 # (e.g. `nbconvert --execute` with no display), in which case viewer cells fail.
@@ -126,6 +115,28 @@ def _fmt_ts(epoch):
         return datetime.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, OSError, OverflowError):
         return "?"
+
+
+def _notebook(cells):
+    """Wrap *cells* in the nbformat-v4 envelope both builders emit.
+
+    The session export and the workflow export differ in their cells and in
+    nothing else; written twice, a metadata change would have to be noticed in
+    the other one.
+    """
+    return {
+        "cells": cells,
+        "metadata": {
+            "language_info": {"name": "python"},
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
 
 
 def _job_outputs(snap):
@@ -291,19 +302,7 @@ def build_notebook(jobs):
     else:
         cells.append(_markdown_cell("_No jobs were recorded in this session._"))
 
-    return {
-        "cells": cells,
-        "metadata": {
-            "language_info": {"name": "python"},
-            "kernelspec": {
-                "display_name": "Python 3",
-                "language": "python",
-                "name": "python3",
-            },
-        },
-        "nbformat": 4,
-        "nbformat_minor": 5,
-    }
+    return _notebook(cells)
 
 
 def _workflow_cell(cell):
@@ -313,24 +312,13 @@ def _workflow_cell(cell):
     one because a reader has to know who ran it; a workflow cell has one author
     and one purpose, and a banner on every cell is noise in a document someone
     is meant to read and edit.
+
+    A verification cell carries the same output keys a job snapshot does, so it
+    renders through :func:`_job_outputs`. Its ``error_text`` is empty by
+    construction -- ``verified()`` only yields fully-successful runs -- and if
+    one ever were not, showing it beats dropping it.
     """
-    outputs = []
-    stdout = cell.get("stdout") or ""
-    if stdout:
-        outputs.append(
-            {"output_type": "stream", "name": "stdout", "text": _lines(stdout)}
-        )
-    result_text = cell.get("result_text") or ""
-    if result_text:
-        outputs.append(
-            {
-                "output_type": "execute_result",
-                "execution_count": None,
-                "data": {"text/plain": _lines(result_text)},
-                "metadata": {},
-            }
-        )
-    return _code_cell(cell.get("code") or "", outputs=outputs)
+    return _code_cell(cell.get("code") or "", outputs=_job_outputs(cell))
 
 
 def build_workflow_notebook(record):
@@ -354,19 +342,7 @@ def build_workflow_notebook(record):
 
     cells = [_markdown_cell(f"# {title}\n\n" + intro), _code_cell(BOOTSTRAP_SRC)]
     cells.extend(_workflow_cell(c) for c in cells_in)
-    return {
-        "cells": cells,
-        "metadata": {
-            "language_info": {"name": "python"},
-            "kernelspec": {
-                "display_name": "Python 3",
-                "language": "python",
-                "name": "python3",
-            },
-        },
-        "nbformat": 4,
-        "nbformat_minor": 5,
-    }
+    return _notebook(cells)
 
 
 def _now_epoch():
@@ -374,9 +350,14 @@ def _now_epoch():
     return datetime.datetime.now().timestamp()
 
 
+def _stamp():
+    """``YYYYMMDD-HHMMSS`` for a suggested download filename."""
+    return datetime.datetime.fromtimestamp(_now_epoch()).strftime("%Y%m%d-%H%M%S")
+
+
 def suggested_filename():
     """``biopb-mcp-session-YYYYMMDD-HHMMSS.ipynb`` for the download."""
-    stamp = datetime.datetime.fromtimestamp(_now_epoch()).strftime("%Y%m%d-%H%M%S")
+    stamp = _stamp()
     return f"biopb-mcp-session-{stamp}.ipynb"
 
 
@@ -401,6 +382,6 @@ def suggested_workflow_filename(title=""):
     while it is being worked on, and two downloads of the same title must not
     silently be the same file.
     """
-    stamp = datetime.datetime.fromtimestamp(_now_epoch()).strftime("%Y%m%d-%H%M%S")
+    stamp = _stamp()
     slug = _slug(title)
     return f"biopb-{slug}-{stamp}.ipynb" if slug else f"biopb-workflow-{stamp}.ipynb"
