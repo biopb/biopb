@@ -86,6 +86,49 @@ size-preserving write that also preserves mtime is invisible — is the same bet
 server's own persistent file cache already takes across restarts. This design does
 not add staleness risk; it inherits a decision made once, in #178.
 
+### The security boundary is the OS user, not the token
+
+The key drops something the in-process caches keep: `_CACHE_POOL`, `_VIEW_CACHE`
+and `_CALL_OPTS_POOL` are all keyed `(location, token)`, while this cache is
+keyed on location and chunk_id alone. **Two tokens used by one OS account
+against one server share cached chunks.**
+
+That is deliberate, and it is sound only because the isolation moves one level
+down, to the filesystem. The tree is created **owner-only** — `0o700`
+directories, `0o600` files — so the unit of separation is the OS account. Under a
+default umask it would otherwise be `0o755`/`0o644`, and on the many distributions
+that ship `0o755` home directories every cached pixel would be readable by any
+other local account. That is not a hypothetical umask nitpick; it was the state
+of the first implementation, and the mode is now asserted in tests.
+
+Keying on the token instead would be worse on both counts:
+
+- **It adds no boundary.** A second principal able to read this directory already
+  has the OS account, and can read the files whatever they are named. The key
+  only separates principals that the filesystem does not, and biopb has no such
+  sub-account boundary.
+- **It breaks the cache.** Tokens rotate; content does not. Keying a *persistent*
+  store on a credential orphans every entry at each re-authentication and
+  re-fetches the whole working set. In-process that cost is invisible, because a
+  process outlives its token — persisted, it is a cache-invalidation bug.
+
+Hashing a bearer credential into a path name that appears in directory listings,
+backups, and error messages is also worth avoiding on its own.
+
+**A shared cache directory breaks the model**, and the interesting risk is
+integrity rather than confidentiality: an account that can *write* into the tree
+can plant a well-formed Arrow file at a key this process will read, and it will
+be decoded as pixels. `BIOPB_CHUNK_CACHE_DIR` pointed at shared scratch is
+therefore warned about loudly at startup — warned rather than refused, because a
+shared filesystem used by one person is legitimate and indistinguishable from a
+genuinely shared one, and rather than silently tightened, because a directory the
+user handed us may not be ours to chmod.
+
+Windows is covered by location instead of mode bits: `os.chmod` there only
+toggles the read-only attribute, and the default root under `%LOCALAPPDATA%` is
+already owner-only by inherited ACL. The mode check is POSIX-only, matching
+`_credentials`.
+
 ### Layout and location
 
 `<cache_root>/<hash(location)>/<ab>/<cdef…>.arrow`, one Arrow IPC message per

@@ -29,12 +29,37 @@ Three properties carry the design:
 **Remote locations only.** On localhost the server's own segment already holds
 the chunk warm and the existing fast path reads it in ~1 ms; writing a second
 copy would cost more than the miss it saves. ``_pool`` owns that gate.
+
+Security boundary: the OS user, not the token
+---------------------------------------------
+The cache key is ``sha256(chunk_id)`` under a *location* digest. The bearer
+token is deliberately NOT part of it, unlike the in-process pools, which are
+keyed ``(location, token)``. So two tokens used by one OS user against one
+server share cached chunks.
+
+That is sound only because the isolation is enforced one level down, by the
+filesystem: the tree is created owner-only (``0o700``), so the unit of
+separation is the OS account. Anything that breaks that assumption breaks the
+model -- which is why a root that is group- or world-accessible is warned about
+loudly rather than quietly used (see :func:`_ensure_owner_only`).
+
+Keying on the token instead would be worse on both counts. It would not add a
+boundary: a second principal able to read this cache dir already has the OS
+account, and could read the files whatever they are named. And it would break
+the cache, because *tokens rotate and content does not* -- re-authenticating
+would orphan every entry and re-fetch the whole working set. In-process that
+cost is invisible (a process outlives its token); persisted, it is a
+cache-invalidation bug. Hashing a bearer credential into a path name that shows
+up in directory listings, backups, and error messages is also a thing to avoid
+on its own.
 """
 
 import hashlib
 import logging
 import os
 import shutil
+import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -117,6 +142,52 @@ class Settings:
         self.sweep_after = max(_SWEEP_AFTER_BYTES_MIN, budget // 16)
 
 
+# Mode for every directory this module creates. Not subject to umask trouble: a
+# umask only clears bits, and 0o700 has no group/other bits to clear.
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
+
+
+def _ensure_owner_only(root: Path) -> None:
+    """Create *root* owner-only, and complain if an existing one is not.
+
+    The directory bit is what actually enforces the boundary: with the root at
+    ``0o700`` nobody else can traverse into it, whatever the individual files are
+    set to. A default umask would otherwise leave this ``0o755`` under a
+    ``0o755`` home -- i.e. every cached pixel readable by any local account.
+
+    A pre-existing wide root is warned about, not fixed and not refused. Not
+    fixed because tightening a directory the user pointed us at (via
+    ``BIOPB_CHUNK_CACHE_DIR``) may not be ours to tighten; not refused because a
+    shared scratch filesystem used by one person is legitimate, and we cannot
+    tell it apart from a genuinely shared one. The warning names the risk that
+    matters most, which is not the read: another account able to write here can
+    plant a well-formed Arrow file at a key we will read, and we would decode it
+    as pixels.
+
+    Windows has no POSIX mode bits (``os.chmod`` there only toggles read-only),
+    and the default root under ``%LOCALAPPDATA%`` is already owner-only by
+    inherited ACL, so the check is POSIX-only -- matching ``_credentials``.
+    """
+    existed = root.is_dir()
+    root.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
+    if sys.platform == "win32" or not existed:
+        return
+    try:
+        mode = stat.S_IMODE(root.stat().st_mode)
+    except OSError:
+        return
+    if mode & 0o077:
+        logger.warning(
+            "Chunk cache dir %s is mode %o, not owner-only. Cached pixel data is "
+            "readable by other local accounts, and any account that can write "
+            "here can plant a chunk this process will decode as image data. "
+            "Use a directory only you can access (chmod 700).",
+            root,
+            mode,
+        )
+
+
 def _parse_bytes_or(raw: Optional[str], default: Optional[int]) -> Optional[int]:
     if raw is None or not raw.strip():
         return default
@@ -170,6 +241,12 @@ def load_settings(env=None) -> Optional[Settings]:
             reason,
             ENV_DIR,
         )
+        return None
+
+    try:
+        _ensure_owner_only(root)
+    except OSError as e:
+        logger.warning("Chunk cache disabled: cannot create %s: %s", root, e)
         return None
 
     return Settings(
@@ -284,10 +361,21 @@ def write_batch(
     path = chunk_path(settings.root, location, chunk_id)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # One level at a time: Path.mkdir applies `mode` only to the FINAL
+        # component, so a parents=True call would leave the location dir at the
+        # umask default. The 0o700 root blocks traversal either way, but the
+        # tree should not depend on one directory's mode for the whole boundary.
+        shard = path.parent
+        shard.parent.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
+        shard.mkdir(mode=_DIR_MODE, exist_ok=True)
         with pa.OSFile(str(tmp), "wb") as sink:
             with pa.ipc.new_stream(sink, batch.schema) as writer:
                 writer.write_batch(batch)
+        # Defence in depth behind the 0o700 root: one chmod on a path that just
+        # wrote megabytes, and it keeps the file owner-only even if the root's
+        # mode is later widened. POSIX only -- see _ensure_owner_only.
+        if sys.platform != "win32":
+            os.chmod(tmp, _FILE_MODE)
         os.rename(tmp, path)
     except OSError as e:
         # ENOSPC, a read-only mount, a vanished parent: the cache is a bonus, so

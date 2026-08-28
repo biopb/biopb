@@ -1,6 +1,7 @@
 """Tests for the client-side on-disk chunk cache (docs/client-disk-cache.md)."""
 
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -472,3 +473,83 @@ def test_guard_asks_for_memory_rejection(tmp_path, monkeypatch):
     )
     dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(tmp_path)})
     assert seen == {"reject_memory": True}
+
+
+# --- the security boundary ------------------------------------------------ #
+#
+# The token is deliberately not in the key, so the isolation is the OS account
+# and the filesystem has to actually enforce it.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_every_directory_and_file_is_owner_only(tmp_path):
+    """A default umask would leave these 0o755/0o644 under a 0o755 home -- every
+    cached pixel readable by any other local account."""
+    root = tmp_path / "chunks"
+    s = dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(root)})
+    dc.write_batch(s, LOC, b"c", unified_batch(np.zeros(8, dtype="u1")))
+
+    path = dc.chunk_path(root, LOC, b"c")
+    for d in (root, path.parent.parent, path.parent):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_intermediate_location_dir_is_not_left_at_the_umask_default(tmp_path):
+    """Path.mkdir applies `mode` only to the final component, so a parents=True
+    call would leave the location digest dir wide open."""
+    root = tmp_path / "chunks"
+    s = dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(root)})
+    dc.write_batch(s, LOC, b"c", unified_batch(np.zeros(8, dtype="u1")))
+    assert stat.S_IMODE((root / dc.location_key(LOC)).stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_a_group_or_world_accessible_root_warns(tmp_path, caplog):
+    """Warned, not refused: a shared scratch filesystem used by one person is
+    legitimate and indistinguishable from a genuinely shared one."""
+    root = tmp_path / "shared"
+    root.mkdir()
+    os.chmod(root, 0o777)
+    with caplog.at_level("WARNING"):
+        s = dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(root)})
+    assert s is not None
+    assert "not owner-only" in caplog.text
+    assert "decode as image data" in caplog.text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_a_freshly_created_root_does_not_warn(tmp_path, caplog):
+    with caplog.at_level("WARNING"):
+        s = dc.load_settings(
+            env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(tmp_path / "fresh")}
+        )
+    assert s is not None
+    assert caplog.text == ""
+
+
+def test_two_tokens_share_one_entry(pool, monkeypatch, tmp_path):
+    """By design, and pinned here so it is a decision rather than an oversight.
+
+    The in-process pools are keyed (location, token); this cache is not. The
+    boundary is the OS account, enforced by the 0o700 tree above -- a second
+    principal able to read this dir already has the account and could read the
+    files whatever they are named. Keying on the token would add no boundary and
+    would orphan every entry at each re-auth, since tokens rotate and content
+    does not.
+    """
+    arr = np.arange(64, dtype="<u2")
+    client = FakeFlightClient(unified_batch(arr))
+    monkeypatch.setattr(
+        pool, "_get_worker_resources", lambda *a, **k: (client, None, None)
+    )
+
+    def fetch_as(token):
+        pool._VIEW_CACHE.clear()
+        return pool._fetch_chunk_distributed(LOC, token, b"cid", (0,), (64,), 0)
+
+    assert np.array_equal(fetch_as("token-a"), arr)
+    assert client.do_get_calls == 1
+    assert np.array_equal(fetch_as("token-b"), arr)
+    assert client.do_get_calls == 1, "a second token reuses the first token's file"
