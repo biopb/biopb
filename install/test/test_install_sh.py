@@ -257,7 +257,7 @@ def test_detect_agents_finds_each_kind(stub_bin, tmp_path):
     make, path = stub_bin
     make("claude")
     (tmp_path / ".config" / "Claude").mkdir(parents=True)
-    (tmp_path / ".codex").mkdir()
+    make("codex")
     (tmp_path / ".cursor").mkdir()
     (tmp_path / ".config" / "opencode").mkdir(parents=True)
     assert _detect(path, tmp_path) == [
@@ -269,22 +269,15 @@ def test_detect_agents_finds_each_kind(stub_bin, tmp_path):
     ]
 
 
-def test_detect_agents_honors_codex_home(stub_bin, tmp_path):
-    """$CODEX_HOME relocates the Codex home, so ~/.codex is not the only signal."""
+def test_detect_agents_ignores_a_leftover_codex_home(stub_bin, tmp_path):
+    """~/.codex outlives an uninstall, so it must not count as an agent.
+
+    Counting it would print "AI agent detected: Codex CLI" and skip the offer to
+    install one, leaving a machine with no working agent and no prompt.
+    """
     _, path = stub_bin
-    elsewhere = tmp_path / "relocated"
-    elsewhere.mkdir()
-    out = bash(
-        "_detect_agents\n"
-        'if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then printf "%s\\n" "${DETECTED_AGENTS[@]}"; fi\n',
-        path=path,
-        env={
-            "HOME": str(tmp_path),
-            "PLATFORM": "Linux",
-            "CODEX_HOME": str(elsewhere),
-        },
-    )
-    assert out.stdout.splitlines() == ["Codex CLI"]
+    (tmp_path / ".codex").mkdir()
+    assert _detect(path, tmp_path) == []
 
 
 def test_detect_agents_looks_in_the_platform_specific_place(stub_bin, tmp_path):

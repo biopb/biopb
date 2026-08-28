@@ -237,7 +237,10 @@ _detect_agents() {
         macOS)     [ -d "$HOME/Library/Application Support/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
         Linux|WSL) [ -d "$HOME/.config/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
     esac
-    { command -v codex &>/dev/null || [ -d "${CODEX_HOME:-$HOME/.codex}" ]; } && DETECTED_AGENTS+=("Codex CLI")
+    # PATH only: `codex` is how biopb registers, and ~/.codex outlives an
+    # uninstall (it holds auth, history and logs), so the directory would keep
+    # claiming an agent is present and suppress the offer to install one.
+    command -v codex &>/dev/null && DETECTED_AGENTS+=("Codex CLI")
     [ -d "$HOME/.cursor" ] && DETECTED_AGENTS+=("Cursor")
     { command -v opencode &>/dev/null || [ -d "$HOME/.config/opencode" ]; } && DETECTED_AGENTS+=("opencode")
     return 0

@@ -504,11 +504,24 @@ def test_codex_state_transitions(home, monkeypatch):
     assert s["state"] == "registered" and s["drifted"] is False
 
 
-def test_codex_home_dir_alone_counts_as_installed(home, monkeypatch):
-    """A Codex install we can't see on PATH still shows up by its home dir."""
+def test_codex_home_dir_alone_is_not_installed(home, monkeypatch):
+    """A leftover ~/.codex must not report an uninstalled Codex as present.
+
+    The directory outlives the binary -- it holds auth.json, history and logs --
+    so treating it as an install signal would show `installed` forever and offer
+    a Register button that can only raise, since `codex` is the write path.
+    """
     _no_binaries(monkeypatch)
     (home / ".codex").mkdir()
-    assert _agents.status("codex-cli")["state"] == "installed"
+    assert _agents.status("codex-cli")["state"] == "not_installed"
+
+
+def test_codex_registered_survives_a_binary_off_path(home, monkeypatch):
+    """Detection tightening must not hide an existing registration: the config
+    entry is ground truth, checked before the install signal."""
+    _no_binaries(monkeypatch)
+    _write_codex_config(home)
+    assert _agents.status("codex-cli")["state"] == "registered"
 
 
 def test_codex_honors_codex_home_env(home, monkeypatch):

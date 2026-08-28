@@ -457,9 +457,12 @@ class ClientBackend(ABC):
     def is_installed(self) -> bool:
         """Whether the client appears present -- the same signals the installer
         uses. Deliberately cheap and subprocess-free: a binary on PATH or a
-        well-known config directory. A false negative (a portable/flatpak
-        install we can't see) just shows ``not_installed``; register still works
-        as an escape hatch."""
+        well-known config directory, per the policy each base sets.
+
+        A false negative (a portable/flatpak install we can't see) just shows
+        ``not_installed``. For a :class:`JsonConfigClient` register is still an
+        escape hatch that works anyway; for a :class:`CliManagedClient` it is
+        not, which is why that base detects the binary and nothing else."""
 
     @abstractmethod
     def register(self) -> None:
@@ -576,6 +579,16 @@ class CliManagedClient(ClientBackend):
     exe: str
 
     def is_installed(self) -> bool:
+        """On PATH or not detected — deliberately no config-directory fallback.
+
+        For these clients the binary *is* the write path, so PATH presence is a
+        precondition rather than a hint: without it ``register`` can only raise.
+        A leftover config directory (``~/.codex`` keeps auth, history and logs
+        long after the binary is uninstalled) would otherwise report
+        ``installed`` forever and offer a Register button that cannot work.
+        A client that is registered still reads as ``registered`` either way —
+        :func:`status` takes the entry as ground truth before asking us.
+        """
         return shutil.which(self.exe) is not None
 
 
@@ -654,10 +667,6 @@ class CodexCli(CliManagedClient):
         # read at call time so a test can point it at a tmp dir.
         base = os.environ.get("CODEX_HOME")
         return (Path(base) if base else Path.home() / ".codex") / "config.toml"
-
-    def is_installed(self) -> bool:
-        # A Codex we can't see on PATH still shows up by its home dir.
-        return super().is_installed() or self.config_path().parent.is_dir()
 
     def register(self) -> None:
         # `codex mcp add` overwrites an existing server of the same name and
