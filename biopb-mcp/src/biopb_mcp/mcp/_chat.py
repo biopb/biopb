@@ -22,7 +22,7 @@ Design notes
   the stream says nothing. :func:`_run_code` submits with no window and reports
   partial output as it arrives.
 * **The loop is a client like any other.** It announces itself through
-  ``_server._local_identity`` for the length of a dispatch, so the kernel's
+  ``_writers._local_identity`` for the length of a dispatch, so the kernel's
   one-agent claim covers it: a chat session and an attached MCP harness are
   mutually exclusive, and neither can quietly write into the other's namespace.
 * **A cancel stops the turn, not the cell.** ``execute_code`` over MCP hands
@@ -44,7 +44,7 @@ import time
 
 from mcp.types import ImageContent, TextContent
 
-from . import _server
+from . import _app, _kernel_rpc, _server, _writers
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ WRITER_ID = "biopb-chat"
 WRITER_LABEL = "chat"
 
 #: The job origin this loop submits under. Also the point of view its
-#: foreign-activity digest is read from (``_server._local_origin``): a cell is
+#: foreign-activity digest is read from (``_writers._local_origin``): a cell is
 #: someone *else's* only relative to whoever is asking.
 ORIGIN = "chat"
 
@@ -211,7 +211,7 @@ def _last_user_text():
 
 
 async def _job_call(host, name, *args, **kwargs):
-    """``_server._run_job_call`` off the event loop.
+    """``_kernel_rpc._run_job_call`` off the event loop.
 
     The round trip blocks: it waits on the kernel's lock (up to
     ``kernel.busy_lock_timeout``) and then on the reply. One of those in an
@@ -221,7 +221,9 @@ async def _job_call(host, name, *args, **kwargs):
     host already expects -- its lock exists because the tools and the observe
     API already reach it concurrently.
     """
-    return await asyncio.to_thread(_server._run_job_call, host, name, *args, **kwargs)
+    return await asyncio.to_thread(
+        _kernel_rpc._run_job_call, host, name, *args, **kwargs
+    )
 
 
 def _clean_schema(schema):
@@ -248,8 +250,8 @@ async def _resource_tool():
     same reason the tool list is: a hand-kept copy is what silently stops
     matching what is registered.
     """
-    listed = await _server.mcp.list_resources()
-    templates = await _server.mcp.list_resource_templates()
+    listed = await _app.mcp.list_resources()
+    templates = await _app.mcp.list_resource_templates()
     lines = [f"- {r.uri} — {r.description or ''}".rstrip() for r in listed]
     lines += [f"- {t.uriTemplate} — {t.description or ''}".rstrip() for t in templates]
     return {
@@ -285,7 +287,7 @@ async def _read_resource(uri):
     turn's end -- so it comes back as a tool result like any other.
     """
     try:
-        parts = list(await _server.mcp.read_resource(uri))
+        parts = list(await _app.mcp.read_resource(uri))
     except Exception as exc:  # noqa: BLE001 - unknown uri, or the reader raised
         return f"Could not read {uri!r}: {exc}"
     out = []
@@ -345,7 +347,7 @@ async def tool_payload():
                 "parameters": _clean_schema(tool.inputSchema),
             },
         }
-        for tool in await _server.mcp.list_tools()
+        for tool in await _app.mcp.list_tools()
     ]
 
 
@@ -362,7 +364,7 @@ async def _dispatch(name, arguments, on_progress):
         return await _read_resource(arguments.get("uri") or ""), []
     if name == "execute_code":
         return await _run_code(arguments, on_progress), []
-    result = await _server.mcp._tool_manager.call_tool(
+    result = await _app.mcp._tool_manager.call_tool(
         name, arguments, convert_result=True
     )
     blocks = result[0] if isinstance(result, tuple) and len(result) == 2 else result
@@ -407,7 +409,7 @@ async def _run_code(arguments, on_progress):
     never learned that the person at the machine had run any. Read once at
     entry, appended to whichever branch returns.
     """
-    host, err = _server._require_kernel_host()
+    host, err = _app._require_kernel_host()
     if err is not None:
         return err
     code = arguments.get("python_code") or ""
@@ -416,8 +418,8 @@ async def _run_code(arguments, on_progress):
     # Off the loop, like every other kernel round trip here. The context copy
     # carries `_local_origin`, which is what keeps this loop's own cells out of
     # its own digest.
-    digest = await asyncio.to_thread(_server._foreign_digest, host)
-    foreign_note = _server._render_foreign_note(digest)
+    digest = await asyncio.to_thread(_writers._foreign_digest, host)
+    foreign_note = _writers._render_foreign_note(digest)
 
     def deliver(text):
         """Attach the notice, and hold the digest for discharge.
@@ -472,7 +474,7 @@ async def _run_code(arguments, on_progress):
             snap, res, _w = await _job_call(host, "poll", job_id)
             if snap is None:
                 _running_job_id = None
-                return deliver(_server._format_execute_result(res))
+                return deliver(_kernel_rpc._format_execute_result(res))
             out = snap.get("stdout") or ""
             # Diffed against the job's monotonic total, not against `len(out)`:
             # the output cap compacts the buffer from the front mid-cell, so a
@@ -489,7 +491,7 @@ async def _run_code(arguments, on_progress):
             seen = max(seen, total)
             if snap.get("status") != "running":
                 _running_job_id = None
-                return deliver(_server._format_execute_result(snap))
+                return deliver(_kernel_rpc._format_execute_result(snap))
     except asyncio.CancelledError:
         # The one case that keeps it: the cell really is still running, and the
         # turn's handler is about to name it. That handler clears it.
@@ -513,7 +515,7 @@ def _llm_messages():
     things: the views want ids and timestamps, the model wants neither and does
     want a system message the views should not render.
     """
-    out = [{"role": "system", "content": _server.mcp._mcp_server.instructions or ""}]
+    out = [{"role": "system", "content": _app.mcp._mcp_server.instructions or ""}]
     if _summary:
         # Its own system message rather than a user turn, because it is not
         # something anyone said: a user turn would be answerable, and a model
@@ -574,10 +576,10 @@ async def _discharge_notice():
     """
     global _pending_notice
     digest, _pending_notice = _pending_notice, None
-    host = _server._kernel_host
+    host = _app._kernel_host
     if not digest or host is None:
         return
-    await asyncio.to_thread(_server._ack_foreign_digest, host, digest, WRITER_ID)
+    await asyncio.to_thread(_writers._ack_foreign_digest, host, digest, WRITER_ID)
 
 
 #: Framing for the compacted prefix, so the model reads it as the record it is
@@ -755,8 +757,8 @@ async def _run_turn(user_text, model, on_progress):
     # message and *then* awaiting outside the handler left the one state a view
     # cannot read: its own message, followed by nothing, forever.
     start = len(_messages)
-    token = _server._local_identity.set((WRITER_ID, WRITER_LABEL))
-    origin_token = _server._local_origin.set(ORIGIN)
+    token = _writers._local_identity.set((WRITER_ID, WRITER_LABEL))
+    origin_token = _writers._local_origin.set(ORIGIN)
     try:
         # Before the first await: the user's own turn is one of the new messages
         # a view has to render, not context it already had.
@@ -857,7 +859,7 @@ async def _run_turn(user_text, model, on_progress):
         _running_job_id = None
         raise
     finally:
-        _server._local_identity.reset(token)
-        _server._local_origin.reset(origin_token)
+        _writers._local_identity.reset(token)
+        _writers._local_origin.reset(origin_token)
 
     return _messages[start:]

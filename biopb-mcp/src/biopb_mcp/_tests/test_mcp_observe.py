@@ -19,14 +19,14 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _http, _observe, _server
+from biopb_mcp.mcp import _app, _http, _kernel_rpc, _observe
 
 
 def _reply(r, window_alive=True):
     """A kernel ``execute`` result whose stdout carries ``{"r": r, "w": ...}``."""
     env = {"r": r, "w": window_alive}
     return {
-        "stdout": _server._JOB_DELIM + json.dumps(env) + "\n",
+        "stdout": _kernel_rpc._JOB_DELIM + json.dumps(env) + "\n",
         "result_text": "",
         "error_text": "",
         "status": "ok",
@@ -61,17 +61,17 @@ def host():
 @pytest.fixture(autouse=True)
 def observe_state(host):
     """Install the mock host + snapshot/restore _observe + _server globals."""
-    old_host = _server._kernel_host
+    old_host = _app._kernel_host
     old_max = _observe._max_output_chars
     old_poll = _observe._poll_interval_ms
     old_console = _observe._console_enabled
     old_mounted = _observe._mounted_http
-    _server.set_kernel_host(host)
+    _app.set_kernel_host(host)
     _observe.configure(
         max_output_chars=20000, poll_interval_ms=3000, console_enabled=True
     )
     yield
-    _server._kernel_host = old_host
+    _app._kernel_host = old_host
     _observe._max_output_chars = old_max
     _observe._poll_interval_ms = old_poll
     _observe._console_enabled = old_console
@@ -280,7 +280,7 @@ def test_api_status(client):
 
 
 def test_api_503_without_host(client):
-    _server._kernel_host = None
+    _app._kernel_host = None
     for method, path in [
         ("get", "/api/jobs"),
         ("get", "/api/jobs/job-1"),

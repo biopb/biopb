@@ -14,7 +14,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _chat_acp, _chat_api, _server
+from biopb_mcp.mcp import _chat_acp, _chat_api, _writers
 
 
 @pytest.fixture(autouse=True)
@@ -396,7 +396,7 @@ class TestHttpSurface:
             },
             agentless=True,
         )
-        monkeypatch.setattr(_server, "_claimed_by", None, raising=False)
+        monkeypatch.setattr(_writers, "_claimed_by", None, raising=False)
         app = Starlette(
             routes=[Route(p, h, methods=m) for p, m, h in _chat_api._ROUTES]
         )
@@ -495,7 +495,7 @@ class TestHttpSurface:
         """Switching into a kernel someone else holds gives a session that
         answers questions and then refuses every cell -- with the refusal buried
         in a tool result, which is the worst place to find out."""
-        monkeypatch.setattr(_server, "_claimed_by", "some-other-client")
+        monkeypatch.setattr(_writers, "_claimed_by", "some-other-client")
         r = self.post(acp_client, "/chat/engine", {"engine": "builtin"})
         assert r.status_code == 409
         assert r.json()["claimed_by"] == "some-other-client"

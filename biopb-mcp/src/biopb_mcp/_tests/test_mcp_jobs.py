@@ -24,13 +24,13 @@ import pytest
 pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
-from biopb_mcp.mcp import _jobs, _server  # noqa: E402
+from biopb_mcp.mcp import _app, _jobs, _kernel_rpc, _server  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
 def _job_result(stdout):
     """Unwrap the ``{"r": result, "w": window_alive}`` job-snippet envelope."""
-    payload = _server._extract_json(stdout)
+    payload = _kernel_rpc._extract_json(stdout)
     return payload["r"] if payload else None
 
 
@@ -334,7 +334,7 @@ class TestJobOrigin:
             # Reading never consumes, so a running cell stays reported:
             # otherwise the agent would hear that a cell started and never
             # learn how it ended. (Excluding it from the ack is the *caller's*
-            # job -- _server._ack_foreign_digest filters on the reported status,
+            # job -- _writers._ack_foreign_digest filters on the reported status,
             # because re-reading it here is the race this split closes.)
             assert _jobs.foreign_digest()[0]["status"] == "running"
             assert _jobs.foreign_digest()[0]["status"] == "running"
@@ -636,13 +636,13 @@ class TestJobConcurrency:
 
     def _submit(self, kernel, code):
         res = kernel.execute(
-            _server._job_snippet("submit(" + repr(code) + ")"), timeout=15.0
+            _kernel_rpc._job_snippet("submit(" + repr(code) + ")"), timeout=15.0
         )
         return _job_result(res["stdout"])
 
     def _poll(self, kernel, job_id):
         res = kernel.execute(
-            _server._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
+            _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
         )
         return _job_result(res["stdout"])
 
@@ -694,17 +694,17 @@ class TestNapariJobs:
             startup_timeout=120.0,
         )
         host.start()
-        _server.set_kernel_host(host)
-        old_promote = _server._promote_after
+        _app.set_kernel_host(host)
+        old_promote = _app._promote_after
         yield host
-        _server._promote_after = old_promote
+        _app._promote_after = old_promote
         host.shutdown()
 
     def _poll_until_done(self, host, job_id, timeout=20.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             res = host.execute(
-                _server._job_snippet("poll(" + repr(job_id) + ")"),
+                _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"),
                 timeout=15.0,
             )
             snap = _job_result(res["stdout"])
@@ -718,7 +718,7 @@ class TestNapariJobs:
         # main thread (no crash) and the layer must appear.
         before = napari_kernel.execute("print(len(viewer.layers))")["stdout"]
         sub = napari_kernel.execute(
-            _server._job_snippet(
+            _kernel_rpc._job_snippet(
                 "submit("
                 + repr("viewer.add_image(np.zeros((8, 8)), name='t'); 'ok'")
                 + ")"
@@ -731,7 +731,7 @@ class TestNapariJobs:
         assert int(after.strip()) == int(before.strip()) + 1
 
     def test_screenshot_and_status_during_job(self, napari_kernel):
-        _server.set_promote_after(0.5)
+        _app.set_promote_after(0.5)
         handle = _server.execute_code("import time; time.sleep(4.0); print('done')")
         assert "still running" in handle  # promoted to a job
 
@@ -744,12 +744,14 @@ class TestNapariJobs:
 
     def test_restart_clears_jobs(self, napari_kernel):
         sub = napari_kernel.execute(
-            _server._job_snippet("submit(" + repr("import time; time.sleep(30)") + ")")
+            _kernel_rpc._job_snippet(
+                "submit(" + repr("import time; time.sleep(30)") + ")"
+            )
         )
         job_id = _job_result(sub["stdout"])["job_id"]
         napari_kernel.restart()  # respawns + re-bootstraps (resets jobs)
         res = napari_kernel.execute(
-            _server._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
+            _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
         )
         snap = _job_result(res["stdout"])
         assert snap["status"] == "unknown"

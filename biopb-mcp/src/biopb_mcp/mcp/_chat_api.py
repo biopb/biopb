@@ -33,7 +33,7 @@ import logging
 from starlette.responses import JSONResponse
 
 from .._config import get_setting
-from . import _chat, _chat_acp, _http, _model, _observe, _server
+from . import _app, _chat, _chat_acp, _http, _model, _observe, _writers
 
 logger = logging.getLogger(__name__)
 
@@ -696,7 +696,7 @@ async def _chat_engine(request):
     err = _not_ready_503(wanted)
     if err is not None:
         return err
-    holder = _server.claim_holder()
+    holder = _writers.claim_holder()
     if holder is not None:
         return JSONResponse(
             {
@@ -751,4 +751,4 @@ def register_http_routes():
 
 
 def _server_custom_route(path, methods):
-    return _server.mcp.custom_route(path, methods=methods)
+    return _app.mcp.custom_route(path, methods=methods)

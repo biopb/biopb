@@ -19,7 +19,7 @@ import logging
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
 
-from . import _server
+from . import _app, _kernel_rpc
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def _get_mw():
     global _mw
     if _mw is None:
         _mw = TransportSecurityMiddleware(
-            _server.build_transport_security(_extra_origins, _extra_hosts)
+            _app.build_transport_security(_extra_origins, _extra_hosts)
         )
     return _mw
 
@@ -111,7 +111,7 @@ def json_route(fn):
 
 def require_host():
     """Return ``(host, None)`` or ``(None, 503 response)`` if no kernel host."""
-    host = _server._kernel_host
+    host = _app._kernel_host
     if host is None:
         return None, JSONResponse(
             {"error": "kernel host not initialized"}, status_code=503
@@ -146,7 +146,7 @@ def kernel_error(res):
     return JSONResponse(
         {
             "error": status or "kernel error",
-            "detail": _server._format_execute_result(res),
+            "detail": _kernel_rpc._format_execute_result(res),
         },
         status_code=502,
     )
