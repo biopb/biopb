@@ -237,6 +237,7 @@ _detect_agents() {
         macOS)     [ -d "$HOME/Library/Application Support/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
         Linux|WSL) [ -d "$HOME/.config/Claude" ] && DETECTED_AGENTS+=("Claude Desktop") ;;
     esac
+    { command -v codex &>/dev/null || [ -d "${CODEX_HOME:-$HOME/.codex}" ]; } && DETECTED_AGENTS+=("Codex CLI")
     [ -d "$HOME/.cursor" ] && DETECTED_AGENTS+=("Cursor")
     { command -v opencode &>/dev/null || [ -d "$HOME/.config/opencode" ]; } && DETECTED_AGENTS+=("opencode")
     return 0
@@ -250,6 +251,8 @@ _agent_launch_cmd() {
         echo "claude"
     elif command -v opencode &>/dev/null || [ -d "$HOME/.config/opencode" ]; then
         echo "opencode"
+    elif command -v codex &>/dev/null; then
+        echo "codex"
     elif command -v cursor &>/dev/null || [ -d "$HOME/.cursor" ]; then
         echo "cursor"
     fi
@@ -1694,7 +1697,7 @@ install_biopb() {
     if [ -n "$agent_cmd" ]; then
         _cmd "$agent_cmd"
     else
-        _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
+        _info "your AI agent (e.g. Claude Code, opencode, Codex CLI)"
     fi
     _info "Then prompt it:"
     _cmd "start biopb and report status"
@@ -1753,9 +1756,9 @@ PY
 }
 
 # Unregister biopb from every MCP client the installer can wire it into: Claude
-# Code via its CLI, and the JSON-config clients (Claude Desktop, Cursor,
-# opencode) via _mcp_unmerge. Requires PLATFORM to be set (Claude Desktop's
-# config path is OS-specific).
+# Code and Codex CLI via their own CLIs, and the JSON-config clients (Claude
+# Desktop, Cursor, opencode) via _mcp_unmerge. Requires PLATFORM to be set
+# (Claude Desktop's config path is OS-specific).
 _unregister_agents() {
     local removed_any=0
 
@@ -1765,6 +1768,15 @@ _unregister_agents() {
         if claude mcp remove biopb -s user &>/dev/null \
             || claude mcp remove biopb &>/dev/null; then
             _ok "Claude Code: unregistered biopb"
+            removed_any=1
+        fi
+    fi
+
+    # Codex CLI — its config is TOML, so removal goes through `codex mcp remove`
+    # rather than _mcp_unmerge (which only speaks JSON). Absent server: exits 0.
+    if command -v codex &>/dev/null; then
+        if codex mcp remove biopb &>/dev/null; then
+            _ok "Codex CLI: unregistered biopb"
             removed_any=1
         fi
     fi

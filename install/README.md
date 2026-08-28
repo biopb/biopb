@@ -77,7 +77,7 @@ are produced.
   default browser. Set `BIOPB_INSTALL_SHORTCUT=0` to skip creating it. You can
   run `biopb dashboard` from a terminal at any time instead.
 - The installer also registers the biopb MCP server with any detected agent
-  (Claude Code/Desktop, Cursor, opencode) and can install opencode if
+  (Claude Code/Desktop, Codex CLI, Cursor, opencode) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
   `biopb-mcp --transport stdio` itself — there is no separate server to start by
   hand. The napari viewer does not open with it: it comes up on the first
@@ -152,7 +152,8 @@ and `irm|iex` paths alike.
 
 `install.sh` takes an `--uninstall` flag (mirrors the Windows installer's
 Add/Remove Programs entry). It stops the data and MCP servers, unregisters biopb
-from any detected agent (Claude Code/Desktop, Cursor, opencode), and removes the
+from any detected agent (Claude Code/Desktop, Codex CLI, Cursor, opencode), and
+removes the
 shared `uv` tool environment. Add `--purge` to also delete config and cached
 data — your **image data is never touched**.
 

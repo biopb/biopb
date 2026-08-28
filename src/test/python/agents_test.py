@@ -24,6 +24,9 @@ def home(tmp_path, monkeypatch):
     # Claude Desktop reads %APPDATA% on Windows; point it inside the tmp home so a
     # real Claude Desktop install on the test machine can't leak in.
     monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+    # Codex reads $CODEX_HOME ahead of ~/.codex; drop it so a developer who has
+    # one set can't have a real Codex install leak into these assertions.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(_agents, "_mcp_executable", lambda: _CMD)
     return tmp_path
 
@@ -40,7 +43,7 @@ def _no_binaries(monkeypatch):
 
 def test_catalog_is_the_installer_set_minus_hermes():
     ids = [s.id for s in _agents.supported()]
-    assert ids == ["claude-code", "claude-desktop", "cursor", "opencode"]
+    assert ids == ["claude-code", "claude-desktop", "codex-cli", "cursor", "opencode"]
     assert "hermes" not in ids
 
 
@@ -104,6 +107,7 @@ def test_statuses_covers_all_clients_not_installed(home, monkeypatch):
     assert [r["id"] for r in rows] == [
         "claude-code",
         "claude-desktop",
+        "codex-cli",
         "cursor",
         "opencode",
     ]
@@ -393,3 +397,199 @@ def test_register_never_calls_claude_get_or_list(home, monkeypatch):
     _agents.register("claude-code")
     verbs = [a[1] for a in seen]  # the mcp subcommand
     assert "get" not in verbs and "list" not in verbs
+
+
+# --------------------------------------------------------------------------- #
+# Codex CLI (TOML config, read-only; writes go through the `codex` CLI)
+# --------------------------------------------------------------------------- #
+
+
+def _codex_on_path(monkeypatch):
+    monkeypatch.setattr(
+        _agents.shutil,
+        "which",
+        lambda name: "/usr/bin/codex" if name == "codex" else None,
+    )
+
+
+def _write_codex_config(home, command=_CMD, extra=""):
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        extra + f'[mcp_servers.biopb]\ncommand = "{command}"\n'
+        'args = ["--transport", "stdio"]\n'
+    )
+    return cfg
+
+
+def test_codex_state_transitions(home, monkeypatch):
+    # No ~/.codex and no binary -> not installed.
+    _no_binaries(monkeypatch)
+    assert _agents.status("codex-cli")["state"] == "not_installed"
+    # On PATH, no entry -> installed.
+    _codex_on_path(monkeypatch)
+    assert _agents.status("codex-cli")["state"] == "installed"
+    # The biopb table -> registered, and the command matches so no drift.
+    _write_codex_config(home)
+    s = _agents.status("codex-cli")
+    assert s["state"] == "registered" and s["drifted"] is False
+
+
+def test_codex_home_dir_alone_counts_as_installed(home, monkeypatch):
+    """A Codex install we can't see on PATH still shows up by its home dir."""
+    _no_binaries(monkeypatch)
+    (home / ".codex").mkdir()
+    assert _agents.status("codex-cli")["state"] == "installed"
+
+
+def test_codex_honors_codex_home_env(home, monkeypatch):
+    """$CODEX_HOME relocates the whole Codex home, config.toml included."""
+    elsewhere = home / "relocated"
+    elsewhere.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(elsewhere))
+    assert _agents.status("codex-cli")["config_path"] == str(elsewhere / "config.toml")
+    (elsewhere / "config.toml").write_text(f'[mcp_servers.biopb]\ncommand = "{_CMD}"\n')
+    assert _agents.status("codex-cli")["state"] == "registered"
+
+
+def test_codex_registered_is_drift_when_command_differs(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home, command="/somewhere/else/biopb-mcp")
+    s = _agents.status("codex-cli")
+    assert s["state"] == "registered" and s["drifted"] is True
+
+
+def test_codex_status_ignores_malformed_toml(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text("[mcp_servers.biopb\ncommand = ")
+    assert _agents.status("codex-cli")["state"] == "installed"
+
+
+def test_codex_status_ignores_a_sibling_server(home, monkeypatch):
+    """Another MCP server in the file is not biopb."""
+    _codex_on_path(monkeypatch)
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text('[mcp_servers.other]\ncommand = "npx"\n')
+    assert _agents.status("codex-cli")["state"] == "installed"
+
+
+def test_codex_register_adds_via_cli(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return _Result(returncode=0)
+
+    monkeypatch.setattr(_agents.subprocess, "run", fake_run)
+    _agents.register("codex-cli")
+    # One call: `codex mcp add` overwrites in place, so no remove-then-add.
+    assert len(calls) == 1
+    assert calls[0][1:5] == ["mcp", "add", "biopb", "--"]
+    assert _CMD in calls[0]
+    assert "--transport" in calls[0] and "stdio" in calls[0]
+
+
+def test_codex_unregister_removes_via_cli(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        _agents.subprocess,
+        "run",
+        lambda argv, **kw: (calls.append(argv), _Result(0))[1],
+    )
+    _agents.unregister("codex-cli")
+    assert calls[0][1:4] == ["mcp", "remove", "biopb"]
+
+
+def test_codex_register_raises_when_add_fails(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    monkeypatch.setattr(
+        _agents.subprocess, "run", lambda argv, **kw: _Result(1, stderr="boom")
+    )
+    with pytest.raises(_agents.AgentError):
+        _agents.register("codex-cli")
+
+
+def test_codex_register_raises_when_cli_missing(home, monkeypatch):
+    _no_binaries(monkeypatch)
+    with pytest.raises(_agents.AgentError):
+        _agents.register("codex-cli")
+
+
+def test_codex_never_calls_mcp_get_or_list(home, monkeypatch):
+    # Same rule as Claude Code: status stays subprocess-free, and neither write
+    # probes with `mcp get`/`list` (a live connection test spawning biopb-mcp).
+    _codex_on_path(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        _agents.subprocess,
+        "run",
+        lambda argv, **kw: (seen.append(argv[1:]), _Result(0))[1],
+    )
+    _agents.status("codex-cli")  # no subprocess at all
+    _agents.register("codex-cli")
+    _agents.unregister("codex-cli")
+    verbs = [a[1] for a in seen]
+    assert "get" not in verbs and "list" not in verbs
+
+
+# --- the 3.10 fallback (no tomllib) ---------------------------------------- #
+
+
+@pytest.fixture
+def no_tomllib(monkeypatch):
+    """Force the hand-rolled scanner that stands in for tomllib on 3.10."""
+    monkeypatch.setattr(_agents, "tomllib", None)
+
+
+def test_scanner_reads_the_biopb_command(home, monkeypatch, no_tomllib):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home)
+    s = _agents.status("codex-cli")
+    assert s["state"] == "registered" and s["drifted"] is False
+
+
+def test_scanner_stops_at_the_next_table(home, monkeypatch, no_tomllib):
+    """A command in a LATER table must not be read as biopb's."""
+    _codex_on_path(monkeypatch)
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(
+        "[mcp_servers.biopb]\n"
+        'args = ["--transport", "stdio"]\n'
+        "\n[mcp_servers.other]\n"
+        f'command = "{_CMD}"\n'
+    )
+    # biopb's own table has no command -> unreadable, so not registered.
+    assert _agents.status("codex-cli")["state"] == "installed"
+
+
+def test_scanner_skips_a_preceding_table(home, monkeypatch, no_tomllib):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(
+        home, extra='model = "gpt-5"\n\n[mcp_servers.other]\ncommand = "npx"\n\n'
+    )
+    assert _agents.status("codex-cli")["state"] == "registered"
+
+
+def test_scanner_reads_a_literal_string(home, monkeypatch, no_tomllib):
+    """Windows paths land in a literal string, where backslashes are verbatim."""
+    _codex_on_path(monkeypatch)
+    monkeypatch.setattr(_agents, "_mcp_executable", lambda: r"C:\biopb\biopb-mcp.exe")
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text("[mcp_servers.biopb]\ncommand = 'C:\\biopb\\biopb-mcp.exe'\n")
+    s = _agents.status("codex-cli")
+    assert s["state"] == "registered" and s["drifted"] is False
+
+
+def test_scanner_gives_up_on_an_unquoted_value(home, monkeypatch, no_tomllib):
+    _codex_on_path(monkeypatch)
+    cfg = home / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text("[mcp_servers.biopb]\ncommand = biopb-mcp\n")
+    assert _agents.status("codex-cli")["state"] == "installed"

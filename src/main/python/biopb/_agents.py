@@ -25,7 +25,10 @@ Three things it does per client:
   Cursor, opencode) get an atomic read-merge-replace that preserves every other
   key. Claude Code goes through its ``claude`` CLI (``mcp add --scope user``):
   ``~/.claude.json`` is a busy file Claude Code rewrites constantly, so we let it
-  serialize its own writes rather than race it with our merge.
+  serialize its own writes rather than race it with our merge. Codex CLI goes
+  through ``codex mcp add`` for a different reason: its config is TOML, and only
+  Codex's own editor keeps the user's comments and sibling servers intact — we
+  have no TOML writer and want none (see :func:`_read_toml_entry`).
 - **unregister** — the inverse; idempotent (removing an absent entry is fine).
 
 The registered command is the **absolute path** to ``biopb-mcp`` (resolved beside
@@ -47,6 +50,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+try:  # tomllib is 3.11+; on 3.10 (our floor) _scan_toml_entry stands in
+    import tomllib
+except ImportError:  # pragma: no cover - only reached on 3.10
+    tomllib = None  # type: ignore[assignment]
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -70,7 +79,8 @@ class AgentSpec:
 
     ``manager`` selects how register/unregister act: ``"json"`` edits a config
     file directly (atomic merge/delete under ``parent_key``), ``"claude-cli"``
-    shells out to the ``claude`` CLI. ``entry_style`` selects the MCP entry shape
+    shells out to the ``claude`` CLI, ``"codex-cli"`` to the ``codex`` CLI (whose
+    config is TOML we only ever read). ``entry_style`` selects the MCP entry shape
     for JSON clients: ``"stdio"`` is the canonical ``{command, args}`` form every
     ``mcpServers`` client accepts; ``"opencode"`` is opencode's
     ``{type: "local", command: [...]}`` form. ``parent_key`` is the top-level key
@@ -79,8 +89,8 @@ class AgentSpec:
 
     id: str
     name: str
-    manager: str  # "json" | "claude-cli"
-    parent_key: str  # "mcpServers" | "mcp"
+    manager: str  # "json" | "claude-cli" | "codex-cli"
+    parent_key: str  # "mcpServers" | "mcp" | "mcp_servers"
     entry_style: str  # "stdio" | "opencode"
 
 
@@ -91,6 +101,7 @@ class AgentSpec:
 _SPECS: tuple[AgentSpec, ...] = (
     AgentSpec("claude-code", "Claude Code", "claude-cli", "mcpServers", "stdio"),
     AgentSpec("claude-desktop", "Claude Desktop", "json", "mcpServers", "stdio"),
+    AgentSpec("codex-cli", "Codex CLI", "codex-cli", "mcp_servers", "stdio"),
     AgentSpec("cursor", "Cursor", "json", "mcpServers", "stdio"),
     AgentSpec("opencode", "opencode", "json", "mcp", "opencode"),
 )
@@ -149,7 +160,7 @@ def _config_path(spec: AgentSpec) -> Optional[Path]:
     if spec.id == "claude-code":
         # Claude Code stores user-scope MCP servers in ~/.claude.json under the
         # top-level `mcpServers` key. We only READ this for status; register/
-        # unregister go through the `claude` CLI (see _run_claude).
+        # unregister go through the `claude` CLI (see _run_client_cli).
         return home / ".claude.json"
     if spec.id == "claude-desktop":
         if sys.platform == "win32":
@@ -165,6 +176,11 @@ def _config_path(spec: AgentSpec) -> Optional[Path]:
                 / "claude_desktop_config.json"
             )
         return home / ".config" / "Claude" / "claude_desktop_config.json"
+    if spec.id == "codex-cli":
+        # $CODEX_HOME relocates the whole Codex home (config.toml included);
+        # read at call time so a test can point it at a tmp dir.
+        base = os.environ.get("CODEX_HOME")
+        return (Path(base) if base else home / ".codex") / "config.toml"
     if spec.id == "cursor":
         return home / ".cursor" / "mcp.json"
     if spec.id == "opencode":
@@ -200,6 +216,11 @@ def _is_installed(spec: AgentSpec) -> bool:
         if shutil.which("opencode") is not None:
             return True
         return (Path.home() / ".config" / "opencode").is_dir()
+    if spec.id == "codex-cli":
+        if shutil.which("codex") is not None:
+            return True
+        path = _config_path(spec)
+        return path is not None and path.parent.is_dir()
     # Claude Desktop / Cursor: the app owns a config directory; its presence is
     # the install signal (the config file itself may not exist until first use).
     path = _config_path(spec)
@@ -287,6 +308,77 @@ def _load_json_tolerant(path: Path) -> Optional[dict]:
     return None
 
 
+def _read_toml_entry(path: Path, parent_key: str) -> Optional[dict]:
+    """The biopb table from Codex's ``config.toml``, shaped like a JSON stdio
+    entry (``{command, args}``) so :func:`_entry_command` and :func:`status` need
+    no TOML-specific branch.
+
+    Read-only on purpose. Writes go through ``codex mcp add``/``remove``, which
+    edit the table surgically and leave the user's comments and sibling servers
+    alone; a re-emit from a parsed dict would drop the comments, the same trap
+    ``.jsonc`` set for opencode (biopb/biopb#536). ``None`` (never raises) on any
+    problem, like :func:`_load_json_tolerant`: a config we cannot parse simply
+    reads as "not registered".
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if tomllib is None:  # pragma: no cover - only on 3.10; forced in tests
+        return _scan_toml_entry(text, parent_key)
+    try:
+        data = tomllib.loads(text)
+    except ValueError:
+        return None
+    parent = data.get(parent_key)
+    if isinstance(parent, dict):
+        entry = parent.get("biopb")
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _scan_toml_entry(text: str, parent_key: str) -> Optional[dict]:
+    """``_read_toml_entry`` for Python 3.10, which has no ``tomllib``.
+
+    Pulls just ``command`` — the one value status and drift need — out of the
+    ``[<parent_key>.biopb]`` table, stopping at the next table header.
+    Deliberately narrow: it reads the shape ``codex mcp add`` writes (one
+    quoted string per line) and gives up on anything else, which reads as "not
+    registered" like every other config we cannot parse.
+    """
+    header = re.compile(r"^\s*\[\s*" + re.escape(parent_key) + r"\s*\.\s*biopb\s*\]")
+    in_table = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            if in_table:
+                break  # the next table ends ours
+            in_table = bool(header.match(line))
+            continue
+        if not in_table:
+            continue
+        key, sep, raw = line.partition("=")
+        if sep and key.strip() == "command":
+            value = _toml_string(raw.strip())
+            return None if value is None else {"command": value}
+    return None
+
+
+def _toml_string(raw: str) -> Optional[str]:
+    """A single-line TOML basic (``"..."``, escapes decoded) or literal
+    (``'...'``, verbatim) string, or ``None`` if ``raw`` is neither. A trailing
+    comment is not stripped — it makes the value unparseable, which fails safe
+    to "not registered" rather than guessing where a ``#`` inside a path ends."""
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1]
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        try:
+            return json.loads(raw)  # TOML basic escapes are a subset of JSON's
+        except ValueError:
+            return None
+    return None
+
+
 def _jsonc_unmergeable(path: Path) -> bool:
     """True when ``path`` is a ``.jsonc`` our strict-JSON writer must not edit:
     it parses only after comment/trailing-comma stripping, so rewriting it would
@@ -335,6 +427,8 @@ def _read_entry(spec: AgentSpec, path: Optional[Path]) -> Optional[dict]:
     """
     if path is None or not path.exists():
         return None
+    if spec.manager == "codex-cli":
+        return _read_toml_entry(path, spec.parent_key)
     data = _load_json_tolerant(path)
     if not isinstance(data, dict):
         return None
@@ -440,20 +534,23 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         raise
 
 
-def _run_claude(args: list[str], *, required: bool) -> tuple[int, str]:
-    """Run ``claude <args>`` windowless, returning ``(returncode, output)``.
+def _run_client_cli(
+    exe_name: str, args: list[str], *, required: bool
+) -> tuple[int, str]:
+    """Run ``<exe_name> <args>`` windowless, returning ``(returncode, output)``.
 
-    ``required`` distinguishes the two callers: the ``mcp add`` that must succeed
-    (``required=True`` → a missing ``claude`` is an :class:`AgentError`) from the
-    best-effort ``mcp remove`` we run before an add to stay idempotent
-    (``required=False`` → tolerate a non-zero code, i.e. "wasn't registered").
-    We never call ``claude mcp get``/``list`` — those run a live connection test
-    that would spawn ``biopb-mcp``.
+    Shared by the two CLI-managed clients (``claude``, ``codex``). ``required``
+    distinguishes a call that must succeed (``True`` → a missing binary is an
+    :class:`AgentError`) from a best-effort one, like the ``mcp remove`` Claude
+    Code runs before an add to stay idempotent (``False`` → tolerate a non-zero
+    code, i.e. "wasn't registered"). We never call either client's ``mcp
+    get``/``list`` — those run a live connection test that would spawn
+    ``biopb-mcp``.
     """
-    exe = shutil.which("claude")
+    exe = shutil.which(exe_name)
     if exe is None:
         if required:
-            raise AgentError("the `claude` CLI is not on PATH")
+            raise AgentError(f"the `{exe_name}` CLI is not on PATH")
         return 1, ""
     kwargs: dict = {}
     if sys.platform == "win32":
@@ -468,7 +565,7 @@ def _run_claude(args: list[str], *, required: bool) -> tuple[int, str]:
             **kwargs,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise AgentError(f"`claude {' '.join(args)}` failed: {exc}")
+        raise AgentError(f"`{exe_name} {' '.join(args)}` failed: {exc}")
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -509,8 +606,9 @@ def _register_claude() -> None:
     # Idempotent: drop any existing entry, then add (matches the installer). The
     # remove is best-effort (a not-yet-registered client returns non-zero), the
     # add must succeed.
-    _run_claude(["mcp", "remove", "biopb", "-s", "user"], required=False)
-    code, out = _run_claude(
+    _run_client_cli("claude", ["mcp", "remove", "biopb", "-s", "user"], required=False)
+    code, out = _run_client_cli(
+        "claude",
         ["mcp", "add", "--scope", "user", "biopb", "--", _mcp_command(), *_MCP_ARGS],
         required=True,
     )
@@ -519,7 +617,27 @@ def _register_claude() -> None:
 
 
 def _unregister_claude() -> None:
-    _run_claude(["mcp", "remove", "biopb", "-s", "user"], required=True)
+    _run_client_cli("claude", ["mcp", "remove", "biopb", "-s", "user"], required=True)
+
+
+def _register_codex() -> None:
+    # `codex mcp add` overwrites an existing server of the same name and exits 0,
+    # so unlike Claude Code no remove-then-add dance is needed for idempotence.
+    code, out = _run_client_cli(
+        "codex",
+        ["mcp", "add", "biopb", "--", _mcp_command(), *_MCP_ARGS],
+        required=True,
+    )
+    if code != 0:
+        raise AgentError(f"`codex mcp add` failed: {out.strip()}")
+
+
+def _unregister_codex() -> None:
+    # Removing an absent server is not an error for codex (it exits 0), so this
+    # is idempotent without tolerating a failure that is real.
+    code, out = _run_client_cli("codex", ["mcp", "remove", "biopb"], required=True)
+    if code != 0:
+        raise AgentError(f"`codex mcp remove` failed: {out.strip()}")
 
 
 def register(spec_id: str) -> dict:
@@ -533,6 +651,8 @@ def register(spec_id: str) -> dict:
     spec = _spec(spec_id)
     if spec.manager == "claude-cli":
         _register_claude()
+    elif spec.manager == "codex-cli":
+        _register_codex()
     else:
         _register_json(spec)
     logger.info("registered biopb with %s", spec.name)
@@ -544,6 +664,8 @@ def unregister(spec_id: str) -> dict:
     spec = _spec(spec_id)
     if spec.manager == "claude-cli":
         _unregister_claude()
+    elif spec.manager == "codex-cli":
+        _unregister_codex()
     else:
         _unregister_json(spec)
     logger.info("unregistered biopb from %s", spec.name)

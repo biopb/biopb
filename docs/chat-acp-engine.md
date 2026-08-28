@@ -56,12 +56,13 @@ The bridge is worth building only for a harness that does not advertise
 
 ## Why only opencode
 
-Of the four MCP clients `biopb._agents` knows, three cannot fill this role:
+Of the five MCP clients `biopb._agents` knows, four cannot fill this role:
 
 | client | as an ACP agent |
 |---|---|
 | **opencode** | `opencode acp`, native. Advertises `mcpCapabilities {http, sse}` and connects what it is handed. |
 | Claude Code | no native `acp` subcommand; needs `npx @zed-industries/claude-agent-acp`, so Node plus a first-run network fetch |
+| Codex CLI | no `acp` subcommand (checked against 0.147.0); `codex mcp-server` is the inverse — Codex *as* an MCP server, not a client we can hand a server to |
 | Cursor | `cursor-agent acp` exists, but is reported to ignore `session/new` `mcpServers` — which is the entire mechanism here |
 | Claude Desktop | no headless agent at all |
 
