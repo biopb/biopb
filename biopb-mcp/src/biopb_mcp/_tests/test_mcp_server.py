@@ -343,6 +343,149 @@ class TestInstructions:
 
 
 # -----------------------------------------------------------------------
+# verify_workflow
+# -----------------------------------------------------------------------
+
+
+def _verify_snapshot(status="ok", cells=None, added_layers=(), **kw):
+    """A job snapshot carrying a verification record, as the kernel returns it."""
+    cells = cells or [
+        {
+            "code": "a = 2",
+            "status": "ok",
+            "stdout_head": "",
+            "stdout_len": 0,
+            "error_text": "",
+            "elapsed": 0.1,
+        }
+    ]
+    snap = _snapshot(status="ok" if status == "ok" else "error", **kw)
+    snap["verify"] = {
+        "title": "Count foci per cell",
+        "created": 1_700_000_000.0,
+        "status": status,
+        "added_layers": list(added_layers),
+        "cells": cells,
+    }
+    return snap
+
+
+class TestVerifyWorkflow:
+    @pytest.fixture(autouse=True)
+    def _fast_sleep(self, monkeypatch):
+        monkeypatch.setattr(_server.time, "sleep", lambda *a, **k: None)
+
+    def test_returns_error_when_no_host(self):
+        _server._kernel_host = None
+        assert "not initialized" in _server.verify_workflow(["1"])
+
+    def test_no_cells_is_refused_before_the_kernel_is_touched(self, server_with_host):
+        assert "at least one cell" in _server.verify_workflow([])
+        assert not server_with_host.execute.called
+
+    def test_cells_and_title_ride_the_submit_snippet(self, server_with_host):
+        # The runner is in the kernel, so the record only exists if both are
+        # marshaled into the snippet -- repr'd, like the code execute_code sends.
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-1", status="running")
+        )
+        _server.set_promote_after(0.0)
+        _server.verify_workflow(["a = 2", "print(a)"], title="Count foci")
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "_jobs.submit(" in c[0][0]
+        ]
+        assert "verify_cells=['a = 2', 'print(a)']" in snippet
+        assert "verify_title='Count foci'" in snippet
+
+    def test_a_clean_run_reports_the_verdict_and_where_to_save(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            queue=[_job_reply(job_id="job-1", status="running")],
+            returns=_job_reply(**_verify_snapshot()),
+        )
+        _server.set_promote_after(1.0)
+        result = _server.verify_workflow(["a = 2"], title="Count foci")
+        assert "Verified" in result
+        assert "scratch namespace" in result
+        # The agent must hand the save to the user, not write a file itself.
+        assert "Save workflow" in result
+
+    def test_a_failure_names_the_cell_and_quotes_its_traceback(self, server_with_host):
+        cells = [
+            {
+                "code": "a = 2",
+                "status": "ok",
+                "stdout_head": "",
+                "stdout_len": 0,
+                "error_text": "",
+                "elapsed": 0.1,
+            },
+            {
+                "code": "print(leftover)",
+                "status": "error",
+                "stdout_head": "",
+                "stdout_len": 0,
+                "error_text": "NameError: name 'leftover' is not defined",
+                "elapsed": 0.0,
+            },
+            {
+                "code": "print('never')",
+                "status": "skipped",
+                "stdout_head": "",
+                "stdout_len": 0,
+                "error_text": "",
+                "elapsed": 0.0,
+            },
+        ]
+        _install_replies(
+            server_with_host,
+            queue=[_job_reply(job_id="job-1", status="running")],
+            returns=_job_reply(**_verify_snapshot(status="error", cells=cells)),
+        )
+        _server.set_promote_after(1.0)
+        result = _server.verify_workflow([c["code"] for c in cells])
+        assert "NOT verified" in result
+        assert "cell 2" in result
+        assert "leftover" in result
+        # The cascade is named as skipped rather than silently absent.
+        assert "skipped" in result
+
+    def test_added_layers_are_reported_back(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            queue=[_job_reply(job_id="job-1", status="running")],
+            returns=_job_reply(**_verify_snapshot(added_layers=["foci"])),
+        )
+        _server.set_promote_after(1.0)
+        result = _server.verify_workflow(["a = 2"])
+        assert "foci" in result
+        assert "isolates variables, not the viewer" in result
+
+    def test_a_kernel_without_the_record_falls_back_to_the_job_result(
+        self, server_with_host
+    ):
+        # An older kernel, or a submit that never built one: report the job the
+        # ordinary way rather than invent a verdict.
+        _install_replies(
+            server_with_host,
+            queue=[_job_reply(job_id="job-1", status="running")],
+            returns=_job_reply(**_snapshot(status="ok", stdout="hi\n")),
+        )
+        _server.set_promote_after(1.0)
+        assert "hi" in _server.verify_workflow(["a = 2"])
+
+    def test_a_long_verification_hands_back_a_job_handle(self, server_with_host):
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-1", status="running")
+        )
+        _server.set_promote_after(0.0)
+        result = _server.verify_workflow(["a = 2"])
+        assert "still running" in result and "poll_job('job-1')" in result
+
+
+# -----------------------------------------------------------------------
 # execute_code
 # -----------------------------------------------------------------------
 
@@ -1352,6 +1495,7 @@ class TestToolReturnShape:
         ("list_skills", {}, False),
         ("take_screenshot", {}, False),
         ("execute_code", {"python_code": "1"}, True),
+        ("verify_workflow", {"cells": ["1"]}, True),
         ("poll_job", {"job_id": "job-1"}, True),
         ("inspect_object", {"object_path": "np"}, True),
         ("interrupt_kernel", {}, True),
@@ -1427,3 +1571,33 @@ class TestClientIdentity:
         # An in-process call (these tests; a chat loop later) has no client, and
         # submit() reads that as "nothing to claim with" rather than refusing.
         assert _server._client_identity() == (None, "")
+
+
+class TestPollJobRendersAVerification:
+    """poll_job is where a long verification is collected, so it must render the
+    ledger rather than the flattened output of the job that produced it."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_sleep(self, monkeypatch):
+        monkeypatch.setattr(_server.time, "sleep", lambda *a, **k: None)
+
+    def test_a_terminal_verification_polls_as_its_report(self, server_with_host):
+        _install_replies(server_with_host, returns=_job_reply(**_verify_snapshot()))
+        result = _server.poll_job("job-1")
+        assert "job-1: ok" in result
+        assert "Verified" in result and "Save workflow" in result
+
+    def test_a_running_verification_still_shows_partial_output(self, server_with_host):
+        snap = _verify_snapshot()
+        snap["status"] = "running"
+        snap["stdout"] = "one\n"
+        _install_replies(server_with_host, returns=_job_reply(**snap))
+        result = _server.poll_job("job-1")
+        assert "Partial output" in result and "one" in result
+
+    def test_an_ordinary_job_is_unaffected(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(**_snapshot(status="ok", stdout="hi\n")),
+        )
+        assert "hi" in _server.poll_job("job-1")

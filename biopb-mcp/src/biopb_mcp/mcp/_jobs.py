@@ -59,8 +59,14 @@ logger = logging.getLogger(__name__)
 # tensor connection service (mirrors the old _server._REFRESH_PREFIX).
 _REFRESH_PREFIX = "client = _conn.client\n"
 
-# Keep at most this many terminal job records before evicting the oldest.
-_MAX_RETAINED_JOBS = 32
+# Keep at most this many terminal job records before evicting the oldest. The
+# ceiling is what a workflow can be *reconstructed* from: rewriting a session
+# into a clean program (:func:`submit` with ``verify_cells``) reads the
+# transcript, so eviction takes away the source material for the one step
+# nothing can automate. Raised from 32 once _MAX_JOB_OUTPUT_CHARS bounded a
+# single record -- until then one runaway cell grew without limit and a record
+# count bounded nothing.
+_MAX_RETAINED_JOBS = 200
 
 # Keep at most this many characters of one job's captured output. This is the
 # bound _MAX_RETAINED_JOBS is not: that caps how many records are kept, while a
@@ -99,15 +105,113 @@ _lock = threading.RLock()
 _owner = None
 _owner_label = ""
 
+# The namespace's key set as the bootstrap left it -- the seed for a scratch run
+# (:func:`_scratch_ns`). Recorded by :func:`mark_baseline` at the end of the
+# bootstrap, so it names the built-in handles and the loaded plugins and nothing
+# the session has bound since.
+_baseline_names = None
 
-class _Job:
+# Names a scratch namespace falls back to when no baseline was recorded: a
+# partial bootstrap, or a unit test driving this runner directly. A floor under
+# mark_baseline(), not a substitute -- it knows the built-in handles and cannot
+# know a plugin's.
+_SCRATCH_FALLBACK_NAMES = frozenset(
+    {
+        "viewer",
+        "client",
+        "np",
+        "da",
+        "ops",
+        "run_on_main",
+        "_conn",
+        "_jobs",
+        "_dask_client",
+        "_dask_attach_done",
+        "_viewer_window_alive",
+        "_resync_view",
+        "get_ipython",
+        "__name__",
+        "__builtins__",
+    }
+)
+
+# The last verification whose every cell ran (see :func:`verified`). Module
+# state rather than a job field because it outlives the job that produced it:
+# it is the session's answer to "which program is known to work", and a later
+# failed run does not un-verify it.
+_verified = None
+
+
+class _OutputBuffer:
+    """Capped stdout capture, plus the last expression's repr.
+
+    Shared by a job and by one cell of a verification run, because the two are
+    written to through the same two doors: :class:`_JobStream` routes a thread's
+    prints to whichever is bound to that thread, and :func:`_exec_capture`
+    stores the last expression's repr on whatever it is handed. One cap, one
+    dropped-head marker, one monotonic total -- so a cell reports its output the
+    way a job does without either having to remember to.
+    """
+
+    __slots__ = ("stdout", "stdout_dropped", "result_text")
+
+    def __init__(self):
+        self.stdout = io.StringIO()
+        # Characters the cap has discarded from the front of `stdout`. Kept so
+        # the record can say it is partial and so a reader tracking growth has
+        # a number that only ever increases (see `output_total`).
+        self.stdout_dropped = 0
+        self.result_text = ""
+
+    def write_output(self, s):
+        """Append captured output, keeping at most the newest cap-worth.
+
+        The tail survives, for the reason the detail view keeps the tail: while
+        a cell is still running the newest output is the informative part.
+
+        Compacted at twice the cap rather than on every write, so the rewrite
+        happens once per cap-worth of output instead of once per print. Only the
+        job's own worker thread writes here (`_jobs_by_thread` is keyed by
+        thread), so no lock: a reader racing the swap gets the pre-compaction
+        buffer, which is longer but never torn.
+        """
+        n = self.stdout.write(s)
+        if self.stdout.tell() > 2 * _MAX_JOB_OUTPUT_CHARS:
+            text = self.stdout.getvalue()
+            keep = text[-_MAX_JOB_OUTPUT_CHARS:]
+            self.stdout_dropped += len(text) - len(keep)
+            buf = io.StringIO()
+            buf.write(keep)
+            self.stdout = buf
+        return n
+
+    def output(self):
+        """The captured output, marked when the cap dropped its head.
+
+        The marker is added on read rather than stored, so it cannot itself be
+        compacted away later, and so every consumer -- the agent's poll, the
+        observe detail, the notebook cell -- says the same thing without each
+        having to remember to.
+        """
+        text = self.stdout.getvalue()
+        if not self.stdout_dropped:
+            return text
+        return f"...({self.stdout_dropped} earlier chars dropped)...\n" + text
+
+    def output_total(self):
+        """Everything this buffer has ever taken, including what was dropped.
+
+        Monotonic, which `len(stdout)` is not once the cap compacts. A reader
+        streaming the output as it grows has to diff against this.
+        """
+        return self.stdout_dropped + len(self.stdout.getvalue())
+
+
+class _Job(_OutputBuffer):
     __slots__ = (
         "job_id",
         "code",
         "status",
-        "stdout",
-        "stdout_dropped",
-        "result_text",
         "error_text",
         "cancel_reason",
         "interrupted",
@@ -118,21 +222,17 @@ class _Job:
         "started",
         "started_wall",
         "finished",
+        "verify",
     )
 
     def __init__(self, job_id, code="", origin="mcp", intent=""):
+        super().__init__()
         self.job_id = job_id
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
         self.code = code
         # running | ok | error | interrupted
         self.status = "running"
-        self.stdout = io.StringIO()
-        # Characters the cap has discarded from the front of `stdout`. Kept so
-        # the record can say it is partial and so a reader tracking growth has
-        # a number that only ever increases (see `output_total`).
-        self.stdout_dropped = 0
-        self.result_text = ""
         self.error_text = ""
         # Set by interrupt_current(): the job was force-stopped with a
         # KeyboardInterrupt raised into its thread, so its finalizer labels the
@@ -172,53 +272,14 @@ class _Job:
         # notebook export (`started` is monotonic and not displayable).
         self.started_wall = time.time()
         self.finished = None
+        # The candidate workflow this job is verifying, or None for an ordinary
+        # cell. Set at submit and never after: it decides which namespace the
+        # job runs in, so a job cannot become a verification once started.
+        self.verify = None
 
     def elapsed(self):
         end = self.finished if self.finished is not None else time.monotonic()
         return round(end - self.started, 3)
-
-    def write_output(self, s):
-        """Append captured output, keeping at most the newest cap-worth.
-
-        The tail survives, for the reason the detail view keeps the tail: while
-        a cell is still running the newest output is the informative part.
-
-        Compacted at twice the cap rather than on every write, so the rewrite
-        happens once per cap-worth of output instead of once per print. Only the
-        job's own worker thread writes here (`_jobs_by_thread` is keyed by
-        thread), so no lock: a reader racing the swap gets the pre-compaction
-        buffer, which is longer but never torn.
-        """
-        n = self.stdout.write(s)
-        if self.stdout.tell() > 2 * _MAX_JOB_OUTPUT_CHARS:
-            text = self.stdout.getvalue()
-            keep = text[-_MAX_JOB_OUTPUT_CHARS:]
-            self.stdout_dropped += len(text) - len(keep)
-            buf = io.StringIO()
-            buf.write(keep)
-            self.stdout = buf
-        return n
-
-    def output(self):
-        """The captured output, marked when the cap dropped its head.
-
-        The marker is added on read rather than stored, so it cannot itself be
-        compacted away later, and so every consumer -- the agent's poll, the
-        observe detail, the notebook cell -- says the same thing without each
-        having to remember to.
-        """
-        text = self.stdout.getvalue()
-        if not self.stdout_dropped:
-            return text
-        return f"...({self.stdout_dropped} earlier chars dropped)...\n" + text
-
-    def output_total(self):
-        """Everything this job has ever printed, including what was dropped.
-
-        Monotonic, which `len(stdout)` is not once the cap compacts. A reader
-        streaming the output as it grows has to diff against this.
-        """
-        return self.stdout_dropped + len(self.stdout.getvalue())
 
     def snapshot(self):
         return {
@@ -235,6 +296,116 @@ class _Job:
             "intent": self.intent,
             "elapsed": self.elapsed(),
             "created": self.started_wall,
+            # Present only on a verification run, so an ordinary poll is
+            # unchanged and a client that predates this ignores the key. Light:
+            # a job snapshot is the *polled* shape, and the cells' output is
+            # already here once, in `stdout` (see _Cell.snapshot).
+            "verify": self.verify.snapshot() if self.verify is not None else None,
+        }
+
+
+class _Cell(_OutputBuffer):
+    """One cell of a verification run: its source, its outcome, its output.
+
+    Prints are teed to the owning job as well as kept here, because the two
+    readers want different cuts of the same stream: the notebook needs the
+    output split per cell, and ``poll_job`` on a long verification needs the
+    whole run's output accumulating in one place, the way it does for any other
+    job.
+    """
+
+    __slots__ = ("code", "status", "error_text", "job", "started", "finished")
+
+    def __init__(self, code, job):
+        super().__init__()
+        self.code = code
+        self.job = job
+        # pending | ok | error | skipped
+        self.status = "pending"
+        self.error_text = ""
+        self.started = None
+        self.finished = None
+
+    def write_output(self, s):
+        self.job.write_output(s)
+        return super().write_output(s)
+
+    def elapsed(self):
+        if self.started is None:
+            return 0.0
+        end = self.finished if self.finished is not None else time.monotonic()
+        return round(end - self.started, 3)
+
+    def snapshot(self, full=False):
+        """This cell's outcome; *full* adds the captured output.
+
+        The output is the expensive half, and not because building the dict
+        costs anything -- it is that this crosses a JSON round trip out of the
+        kernel every 0.4s while a verification runs. Shipping every cell's
+        output there sends the same bytes the job's own teed buffer already
+        carries, once more per cell: a 20-cell run polled 1.2 MB where an
+        ordinary job polls 200 KB, growing linearly with the workflow.
+
+        So the polled snapshot carries a one-line head and a length, the way
+        :func:`jobs_summary` does for a job, and the text is read once with
+        ``full=True`` by :func:`verified` when the notebook is built. The
+        ledger a report prints needs no more than the head; the notebook needs
+        all of it, and asks for it exactly once.
+        """
+        snap = {
+            "code": self.code,
+            "status": self.status,
+            "error_text": self.error_text,
+            "elapsed": self.elapsed(),
+            "stdout_len": self.output_total(),
+            "stdout_head": _one_line(self.output()),
+        }
+        if full:
+            snap["stdout"] = self.output()
+            snap["result_text"] = self.result_text
+        return snap
+
+
+class _Verification:
+    """A candidate workflow, its cells, and what running them in a scratch
+    namespace did.
+
+    The record a workflow notebook is built from. It is deliberately *not* a
+    list of job ids: the program that works is a rewrite of the transcript, not
+    a selection from it — a cell that created a variable and a later cell that
+    corrected its value merge into one, and neither keeping nor dropping either
+    original gives a runnable document. So the cells here are the agent's own
+    text, and what makes them trustworthy is that they ran.
+    """
+
+    __slots__ = ("title", "cells", "added_layers", "created")
+
+    def __init__(self, title, cells, job):
+        self.title = title
+        self.cells = [_Cell(code, job) for code in cells]
+        # Layers this run put in the *live* viewer. A scratch namespace isolates
+        # variables and nothing else (see _scratch_ns), so this is the residual
+        # made visible rather than left for the user to find.
+        self.added_layers = []
+        self.created = time.time()
+
+    def status(self):
+        """``ok`` once every cell ran, ``error`` at the first failure."""
+        if any(c.status == "error" for c in self.cells):
+            return "error"
+        if self.cells and all(c.status == "ok" for c in self.cells):
+            return "ok"
+        return "running"
+
+    def snapshot(self, full=False):
+        """The record; *full* carries each cell's captured output (see
+        :meth:`_Cell.snapshot`)."""
+        return {
+            "title": self.title,
+            "created": self.created,
+            "status": self.status(),
+            "added_layers": list(self.added_layers),
+            "cells": [c.snapshot(full=full) for c in self.cells],
         }
 
 
@@ -346,11 +517,134 @@ def _exec_capture(code, ns, job):
             job.result_text = repr(value)
 
 
+def mark_baseline():
+    """Record the post-bootstrap namespace as the seed for scratch runs.
+
+    Called at the end of the bootstrap, after the built-in handles are bound and
+    the user plugins are loaded — i.e. once ``user_ns`` holds exactly what a
+    fresh kernel holds. Everything bound after this point is the session's, and
+    is what a scratch run is defined to *not* see.
+    """
+    global _baseline_names
+    if _ip is not None:
+        _baseline_names = frozenset(_ip.user_ns)
+
+
+def _scratch_ns():
+    """A namespace with the bootstrap's names and none of the session's.
+
+    A clean *namespace*, not a clean *process*: it costs no ``restart_kernel``,
+    so verifying a workflow does not destroy the viewer, the layers, the dask
+    cluster, or the session that just produced the result worth keeping.
+
+    The values are read live, so ``client`` and ``ops`` are the connected ones —
+    a verification runs against the real server, not a stub. What it isolates is
+    the *bindings*: a cell that reads a variable it never created raises
+    ``NameError`` here instead of quietly succeeding on session leftovers, which
+    is the whole class of defect that makes a transcript unrunnable.
+
+    **The residual, stated rather than hidden.** The viewer, ``sys.modules``,
+    and anything a cell mutates in place are shared with the live session. So a
+    cell reading ``viewer.layers['nuclei']`` still finds a layer this workflow
+    never added, an import with side effects has already happened, and layers the
+    run adds are added for real (reported as ``added_layers``). Variable hygiene
+    is enforced; layer and module hygiene is not.
+    """
+    ns = _ip.user_ns if _ip is not None else {}
+    keep = _baseline_names if _baseline_names is not None else _SCRATCH_FALLBACK_NAMES
+    return {k: v for k, v in ns.items() if k in keep}
+
+
+def _layer_names():
+    """Names of the live viewer's layers, or ``None`` when there is no viewer.
+
+    ``viewer`` is the main-thread marshaling proxy, so this is safe to read from
+    a job thread. Best-effort: a verification must not fail over its own
+    bookkeeping.
+    """
+    ns = _ip.user_ns if _ip is not None else {}
+    viewer = ns.get("viewer")
+    if viewer is None:
+        return None
+    try:
+        return [str(layer.name) for layer in viewer.layers]
+    except Exception:  # noqa: BLE001 - bookkeeping, never the run's problem
+        return None
+
+
+def _added_layers(before, after):
+    """Layer names in *after* that *before* did not account for.
+
+    Counted rather than set-differenced: napari does not promise unique layer
+    names, so adding a second "nuclei" beside an existing one is an addition
+    this has to report.
+    """
+    if before is None or after is None:
+        return []
+    remaining = {}
+    for name in before:
+        remaining[name] = remaining.get(name, 0) + 1
+    added = []
+    for name in after:
+        if remaining.get(name):
+            remaining[name] -= 1
+        else:
+            added.append(name)
+    return added
+
+
+def _exec_cells(job, verification):
+    """Run *verification*'s cells in order in one scratch namespace.
+
+    **Stops at the first failure.** The cells after it were written against the
+    state the failed one was supposed to produce, so running them anyway reports
+    a cascade of consequences as if they were separate defects. The remainder is
+    marked ``skipped`` rather than dropped, so the report says how far the
+    workflow got.
+
+    Prints route to the current cell — teed to the job — by rebinding this
+    thread's ``_jobs_by_thread`` entry around each one. The failure is re-raised
+    so the job's own finalizer sets the status and does the interrupt
+    attribution; there is one place that decides how a job ended, and this is
+    not it.
+    """
+    ident = threading.get_ident()
+    ns = _scratch_ns()
+    before = _layer_names()
+    try:
+        for cell in verification.cells:
+            _jobs_by_thread[ident] = cell
+            cell.started = time.monotonic()
+            try:
+                _exec_capture(_REFRESH_PREFIX + cell.code, ns, cell)
+                cell.status = "ok"
+            except BaseException:
+                cell.status = "error"
+                cell.error_text = traceback.format_exc()
+                raise
+            finally:
+                cell.finished = time.monotonic()
+                _jobs_by_thread[ident] = job
+    finally:
+        # Whatever ended the run -- a failing cell, an interrupt -- the cells it
+        # never reached are still `pending`. Relabel them here rather than in the
+        # loop, which the raise leaves for good the moment there is anything to
+        # relabel.
+        for cell in verification.cells:
+            if cell.status == "pending":
+                cell.status = "skipped"
+        verification.added_layers = _added_layers(before, _layer_names())
+
+
 def _run(job, code):
+    global _verified
     _jobs_by_thread[threading.get_ident()] = job
     exc = None
     try:
-        _exec_capture(_REFRESH_PREFIX + code, _ip.user_ns, job)
+        if job.verify is not None:
+            _exec_cells(job, job.verify)
+        else:
+            _exec_capture(_REFRESH_PREFIX + code, _ip.user_ns, job)
     except KeyboardInterrupt:
         exc = True
         job.error_text = traceback.format_exc()
@@ -389,6 +683,12 @@ def _run(job, code):
                 if not job.error_text
                 else job.cancel_reason + "\n" + job.error_text
             )
+        # A verification is kept only when every cell ran. What it is kept *for*
+        # is the workflow document, and a document is not a partial run: half a
+        # workflow that stops at a NameError is a report, which the job record
+        # already is.
+        if job.verify is not None and job.status == "ok":
+            _verified = job.verify
 
 
 def _has_running_job():
@@ -431,10 +731,26 @@ def _prune():
         del _jobs[terminal.pop(0)]
 
 
-def submit(code, origin="mcp", intent="", writer=None, writer_label=""):
+def submit(
+    code,
+    origin="mcp",
+    intent="",
+    writer=None,
+    writer_label="",
+    verify_cells=None,
+    verify_title="",
+):
     """Start *code* in a background thread; return ``{"job_id": ...}`` or, if a
     job is already running, ``{"error": "busy", "running_job_id": ...,
     "running_job_origin": ...}``.
+
+    **Verification runs come through this same door.** With *verify_cells* — a
+    list of cell sources — the job runs them in order in a scratch namespace
+    (:func:`_scratch_ns`) instead of running *code* in the session's, and
+    carries a :class:`_Verification` record. Same claim check, same
+    one-at-a-time rule, same interrupt: a verification touches the one shared
+    viewer like any other job, so it is not a second kind of thing that would
+    need its own answer to each of those questions.
 
     *origin* and *intent* are recorded on the job and never acted on beyond the
     rules in :class:`_Job`; see there for the origin vocabulary. The busy return
@@ -491,7 +807,14 @@ def submit(code, origin="mcp", intent="", writer=None, writer_label=""):
                 }
         _job_seq += 1
         job_id = f"job-{_job_seq}"
+        if verify_cells is not None:
+            # The record's cells are the source of truth; `code` is derived from
+            # them so the audit view of this job cannot disagree with the
+            # workflow view of it.
+            code = "\n\n# ---\n\n".join(verify_cells)
         job = _Job(job_id, code, origin=origin, intent=intent)
+        if verify_cells is not None:
+            job.verify = _Verification(verify_title, verify_cells, job)
         _jobs[job_id] = job
         _prune()
         thread = threading.Thread(
@@ -743,6 +1066,41 @@ def export():
     return [j.snapshot() for j in _jobs.values()]
 
 
+def verified():
+    """The most recent verification whose every cell ran, or ``None``.
+
+    What the workflow notebook export serializes. Kept across later runs: a
+    verification that fails afterwards does not un-verify the one that passed,
+    and the user may well be mid-way through a second attempt when they decide
+    to save the first.
+    """
+    return _verified.snapshot(full=True) if _verified is not None else None
+
+
+def verified_summary():
+    """A one-line description of :func:`verified`, or ``None``.
+
+    Carried on the observe poll so the page can offer the workflow download
+    without a second round trip per second for a value that changes rarely.
+    """
+    if _verified is None:
+        return None
+    return {
+        "title": _verified.title,
+        "cells": len(_verified.cells),
+        "created": _verified.created,
+    }
+
+
+def jobs_view():
+    """``{"jobs": [...], "workflow": {...} or None}`` for the observe poll.
+
+    One round trip for the two things the page redraws from, rather than two:
+    the poll runs about once a second for the life of a session.
+    """
+    return {"jobs": jobs_summary(), "workflow": verified_summary()}
+
+
 def owner():
     """``{"owner": <id or None>, "label": <str>}`` — who holds this kernel."""
     with _lock:
@@ -750,18 +1108,22 @@ def owner():
 
 
 def reset():
-    """Drop all job records and release the kernel's agent claim (used on kernel
-    restart / re-bootstrap).
+    """Drop all job records, the verified workflow, and the kernel's agent claim
+    (used on kernel restart / re-bootstrap).
 
     Releasing here is what makes the claim last exactly one kernel lifetime:
     :func:`install` calls this on every bootstrap, and a hard restart replaces
-    the process and its module state outright.
+    the process and its module state outright. The verified workflow goes with
+    them: it is a claim about a namespace that no longer exists, and the
+    baseline it was checked against is about to be recorded again.
     """
-    global _owner, _owner_label
+    global _owner, _owner_label, _verified, _baseline_names
     with _lock:
         _jobs.clear()
         _jobs_by_thread.clear()
         _owner, _owner_label = None, ""
+        _verified = None
+        _baseline_names = None
 
 
 # -- viewer wrapping --------------------------------------------------------

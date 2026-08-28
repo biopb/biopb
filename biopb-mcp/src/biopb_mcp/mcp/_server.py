@@ -705,11 +705,203 @@ def _foreign_activity_note(host) -> str:
     return note
 
 
+def _start_job(host, args: str):
+    """Submit a job and resolve everything that can happen before it runs.
+
+    *args* is :func:`_jobs.submit`'s argument list with the caller's own
+    arguments already repr-embedded. The client identity is appended here rather
+    than passed in, because claiming the kernel is this function's business:
+    every submitting tool answers "am I the holder?" and "is something already
+    running?" the same way, and a second answer to either is a second policy.
+
+    Returns ``(job_id, foreign_note, window_alive, message)``. Exactly one of
+    *job_id* and *message* is not None — *message* is the finished tool reply
+    for every outcome that never started a job, and *foreign_note* is what the
+    caller appends to whatever it returns instead. *window_alive* rides along
+    because the submit round trip carries it too, and with a promote window of
+    zero it is the only one there will be.
+    """
+    writer, writer_label = _client_identity()
+
+    # Read once at entry, append to whichever path returns below.
+    digest = _foreign_digest(host)
+    foreign_note = _render_foreign_note(digest)
+    if foreign_note:
+        _ack_foreign_digest(host, digest, writer)
+
+    # Before the call, not after: a lost reply must not leave the kernel claimed
+    # while this process still reads as unclaimed. See _claimed_by.
+    _presume_claim(writer)
+    submitted, res, window_alive = _run_job_call(
+        host,
+        "submit("
+        + args
+        + ", writer="
+        + repr(writer)
+        + ", writer_label="
+        + repr(writer_label)
+        + ")",
+    )
+    if submitted is None:
+        return (
+            None,
+            foreign_note,
+            window_alive,
+            _format_execute_result(res) + foreign_note,
+        )
+    if submitted.get("error") == "not_owner":
+        # The authority speaking: whatever this process presumed above, the
+        # kernel just named the real holder.
+        _note_claim(submitted.get("owner_id"))
+        held_by = submitted.get("owner") or ""
+        held_by = f" ({held_by})" if held_by else ""
+        return (
+            None,
+            foreign_note,
+            window_alive,
+            _NOT_OWNER_MSG.format(held_by=held_by) + foreign_note,
+        )
+    # Anything the kernel did not refuse came from the holder, "busy" included:
+    # submit() decides the claim before it looks at what is running.
+    _note_claim(writer)
+    if submitted.get("error") == "busy":
+        running = submitted.get("running_job_id")
+        # Whose job is running decides the advice. Telling the agent to
+        # "stop it with interrupt_kernel" while *someone else* is running a cell
+        # would have it kill their work; interrupt_kernel refuses that anyway
+        # (_jobs.interrupt_current), so the wording must not send it there.
+        running_origin = submitted.get("running_job_origin")
+        if running_origin and running_origin != "mcp":
+            # A running foreign job stays in the digest by design, so the note is
+            # about to report the very job this branch is reporting. Drop it
+            # when that is *all* it says; keep it when other cells also finished,
+            # since those were acked above and will not be offered again.
+            if [d.get("job_id") for d in digest] == [running]:
+                foreign_note = ""
+            who = "The user" if running_origin == "user" else "Another writer"
+            return (
+                None,
+                foreign_note,
+                window_alive,
+                f"{who} is running a cell ({running}) in this kernel. Only one "
+                f"job runs at a time — wait for it and poll_job('{running}'); do "
+                "not interrupt it." + foreign_note,
+            )
+        return (
+            None,
+            foreign_note,
+            window_alive,
+            f"A job ({running}) is already running. Poll it with "
+            f"poll_job('{running}'), or stop it with interrupt_kernel / "
+            "restart_kernel before starting another." + foreign_note,
+        )
+    return submitted["job_id"], foreign_note, window_alive, None
+
+
+def _await_job(host, job_id, window_alive=None):
+    """Poll *job_id* until it is terminal or the promote window runs out.
+
+    Returns ``(snap, res, window_alive)``. *snap* is None when a poll round trip
+    failed, and *res* is the raw kernel reply to report instead. Otherwise a
+    ``status`` of ``running`` means the window expired and the caller hands back
+    a job handle rather than a result.
+
+    *window_alive* seeds the flag with the submit round trip's, so a promote
+    window short enough to poll zero times still reports a closed viewer.
+    """
+    deadline = time.monotonic() + _promote_after
+    snap, res = {"status": "running"}, None
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
+        if snap is None:
+            return None, res, None
+        if snap.get("status") != "running":
+            break
+    return snap, res, window_alive
+
+
+def _format_verification(record: dict, job_id: str) -> str:
+    """The verification report: the verdict, then the per-cell ledger.
+
+    Written for an agent about to decide between "save it" and "fix cell 4",
+    so the failing cell's own traceback is quoted in full and the cells after it
+    are named as skipped rather than silently absent — otherwise a cascade reads
+    as a workflow that mysteriously got shorter.
+    """
+    cells = record.get("cells") or []
+    status = record.get("status")
+    lines = []
+
+    if status == "ok":
+        lines.append(
+            f"Verified: all {len(cells)} cell(s) ran in a scratch namespace "
+            "(the kernel's own handles, none of this session's variables)."
+        )
+    else:
+        failed = next(
+            (i for i, c in enumerate(cells) if c.get("status") == "error"), None
+        )
+        where = f"cell {failed + 1}" if failed is not None else "the run"
+        lines.append(
+            f"NOT verified — {where} failed, so the cells after it were "
+            "skipped rather than run against state it never produced."
+        )
+
+    for i, cell in enumerate(cells, 1):
+        # The head, not the output: a verification's record is polled, and the
+        # full text of every cell belongs to the notebook, not to a ledger line
+        # (see _jobs._Cell.snapshot).
+        head = (cell.get("stdout_head") or "").strip()
+        lines.append(
+            f"  {i}. {cell.get('status')} · {cell.get('elapsed')}s"
+            + (f" · {head}" if head else "")
+        )
+
+    for i, cell in enumerate(cells, 1):
+        if cell.get("status") == "error":
+            lines.append(f"\nCell {i}:\n{cell.get('code', '')}")
+            lines.append(f"\n{cell.get('error_text', '')}")
+            break
+
+    added = record.get("added_layers") or []
+    if added:
+        lines.append(
+            "\nLayers this run added to the live viewer: "
+            + ", ".join(added)
+            + ". A scratch namespace isolates variables, not the viewer — remove "
+            "them if they are duplicates of what was already there."
+        )
+
+    if status == "ok":
+        lines.append(
+            "\nThe user can now save this workflow as a notebook from the "
+            "observe page ('Save workflow'). Tell them it is there; do not write "
+            "the file yourself."
+        )
+    else:
+        lines.append(
+            f"\nFix the cell and call verify_workflow again. Full record: "
+            f"poll_job('{job_id}')."
+        )
+    return "\n".join(lines)
+
+
 def _format_job_status(snap: dict) -> str:
-    """Render a job snapshot (poll_job output)."""
+    """Render a job snapshot (poll_job output).
+
+    A verification job renders as its report once it is terminal, because that
+    is what its caller was told to poll for: ``verify_workflow`` hands back this
+    job id when the run outlives the promote window, and a per-cell ledger
+    flattened into one blob of output would not answer the question it was
+    handed back for.
+    """
     job_id = snap.get("job_id", "?")
     status = snap.get("status")
     header = f"{job_id}: {status} ({snap.get('elapsed', '?')}s)"
+    record = snap.get("verify")
+    if record and status != "running":
+        return header + "\n" + _format_verification(record, job_id)
     body = _format_execute_result(snap)
     if status == "running":
         return header + "\nPartial output:\n" + (body or "(none yet)")
@@ -942,82 +1134,18 @@ def execute_code(
     if host is None:
         return "Error: kernel host not initialized"
 
-    writer, writer_label = _client_identity()
-
-    # Read once at entry, append to whichever path returns below.
-    digest = _foreign_digest(host)
-    foreign_note = _render_foreign_note(digest)
-    if foreign_note:
-        _ack_foreign_digest(host, digest, writer)
-
-    # Before the call, not after: a lost reply must not leave the kernel claimed
-    # while this process still reads as unclaimed. See _claimed_by.
-    _presume_claim(writer)
-    submitted, res, window_alive = _run_job_call(
-        host,
-        "submit("
-        + repr(python_code)
-        + ", intent="
-        + repr(intent)
-        + ", writer="
-        + repr(writer)
-        + ", writer_label="
-        + repr(writer_label)
-        + ")",
+    job_id, foreign_note, window_alive, msg = _start_job(
+        host, repr(python_code) + ", intent=" + repr(intent)
     )
-    if submitted is None:
+    if msg is not None:
+        return msg
+
+    snap, res, window_alive = _await_job(host, job_id, window_alive)
+    if snap is None:
         return _format_execute_result(res) + foreign_note
-    if submitted.get("error") == "not_owner":
-        # The authority speaking: whatever this process presumed above, the
-        # kernel just named the real holder.
-        _note_claim(submitted.get("owner_id"))
-        held_by = submitted.get("owner") or ""
-        held_by = f" ({held_by})" if held_by else ""
-        return _NOT_OWNER_MSG.format(held_by=held_by) + foreign_note
-    # Anything the kernel did not refuse came from the holder, "busy" included:
-    # submit() decides the claim before it looks at what is running.
-    _note_claim(writer)
-    if submitted.get("error") == "busy":
-        running = submitted.get("running_job_id")
-        # Whose job is running decides the advice. Telling the agent to
-        # "stop it with interrupt_kernel" while *someone else* is running a cell
-        # would have it kill their work; interrupt_kernel refuses that anyway
-        # (_jobs.interrupt_current), so the wording must not send it there.
-        running_origin = submitted.get("running_job_origin")
-        if running_origin and running_origin != "mcp":
-            # A running foreign job stays in the digest by design, so the note is
-            # about to report the very job this branch is reporting. Drop it
-            # when that is *all* it says; keep it when other cells also finished,
-            # since those were acked above and will not be offered again.
-            if [d.get("job_id") for d in digest] == [running]:
-                foreign_note = ""
-            who = "The user" if running_origin == "user" else "Another writer"
-            return (
-                f"{who} is running a cell ({running}) in this kernel. Only one "
-                f"job runs at a time — wait for it and poll_job('{running}'); do "
-                "not interrupt it." + foreign_note
-            )
-        return (
-            f"A job ({running}) is already running. Poll it with "
-            f"poll_job('{running}'), or stop it with interrupt_kernel / "
-            "restart_kernel before starting another." + foreign_note
-        )
+    if snap.get("status") != "running":
+        return _format_execute_result(snap) + _window_note(window_alive) + foreign_note
 
-    job_id = submitted["job_id"]
-    deadline = time.monotonic() + _promote_after
-    snap = submitted
-    while time.monotonic() < deadline:
-        time.sleep(0.4)
-        snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
-        if snap is None:
-            return _format_execute_result(res) + foreign_note
-        if snap.get("status") != "running":
-            # terminal: inline result
-            return (
-                _format_execute_result(snap) + _window_note(window_alive) + foreign_note
-            )
-
-    # Still running after promote_after: hand back a job handle.
     partial = snap.get("stdout", "") if snap else ""
     return (
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
@@ -1027,6 +1155,83 @@ def execute_code(
         + (partial or "(none yet)")
         + _window_note(window_alive)
         + foreign_note
+    )
+
+
+@mcp.tool()
+def verify_workflow(
+    cells: list[str],
+    title: str = "",
+) -> str:
+    """Check that a candidate workflow runs on its own, in a scratch namespace.
+
+    Use this when the user wants a workflow they have just proven kept as a
+    document. Rewrite the session into a clean program — one entry in *cells*
+    per notebook cell — and verify it here; on success the user can save it as a
+    notebook from the observe page.
+
+    **Rewrite it, do not select from it.** The program that works is almost
+    never a subsequence of what was run: a cell that created a variable and a
+    later cell that corrected its value have to merge into one, and dead ends,
+    retries, and debugging prints drop out. Read the session with poll_job and
+    write the cells you *mean*, in the order a reader would want them.
+
+    Each cell runs in order in a namespace seeded with the kernel's own handles
+    (np, da, client, ops, viewer) and nothing this session has bound since it
+    started. The run stops at the first failure; the cells after it are reported
+    as skipped.
+
+    **This costs no restart.** The live session — its variables, its layers, its
+    dask cluster — is untouched, so there is nothing to ask the user about
+    before calling this.
+
+    **What it proves:** every cell ran, and no cell leaned on a variable it did
+    not itself create. That is the defect that makes a transcript unrunnable.
+    **What it does not:** the numbers are right (check them), and the viewer and
+    imported modules are shared — a cell that reads an existing layer by name
+    will find one here and not on a fresh kernel. Layers the run adds are added
+    to the real viewer, and are reported back so you can say so.
+
+    Args:
+        cells: the workflow's cells, in order, each a complete piece of Python.
+        title: what the workflow does, in a few words. Names the saved file and
+            titles the notebook.
+    """
+    host = _kernel_host
+    if host is None:
+        return "Error: kernel host not initialized"
+    if not cells:
+        return "verify_workflow needs at least one cell."
+
+    job_id, foreign_note, window_alive, msg = _start_job(
+        host,
+        repr("")
+        + ", intent="
+        + repr(f"verify workflow: {title}" if title else "verify workflow")
+        + ", verify_cells="
+        + repr(list(cells))
+        + ", verify_title="
+        + repr(title),
+    )
+    if msg is not None:
+        return msg
+
+    snap, res, window_alive = _await_job(host, job_id, window_alive)
+    if snap is None:
+        return _format_execute_result(res) + foreign_note
+    if snap.get("status") == "running":
+        return (
+            f"Verification {job_id} is still running after "
+            f"{_promote_after:.0f}s. Poll it with poll_job('{job_id}') — the "
+            "per-cell record is in the result." + foreign_note
+        )
+    record = snap.get("verify")
+    if not record:
+        # A kernel that predates verify_cells, or a submit that never built the
+        # record: report the job the ordinary way rather than invent a verdict.
+        return _format_execute_result(snap) + _window_note(window_alive) + foreign_note
+    return (
+        _format_verification(record, job_id) + _window_note(window_alive) + foreign_note
     )
 
 

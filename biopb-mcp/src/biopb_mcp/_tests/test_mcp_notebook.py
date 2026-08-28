@@ -111,3 +111,115 @@ def test_ordering_and_count_in_intro():
 def test_suggested_filename():
     assert _notebook.suggested_filename().endswith(".ipynb")
     assert _notebook.suggested_filename().startswith("biopb-mcp-session-")
+
+
+def _record(**kw):
+    base = {
+        "title": "Count foci per cell",
+        "created": 1_700_000_000.0,
+        "status": "ok",
+        "added_layers": [],
+        "cells": [
+            {
+                "code": "a = 2",
+                "status": "ok",
+                "stdout": "",
+                "result_text": "",
+                "error_text": "",
+                "elapsed": 0.1,
+            },
+            {
+                "code": "print(a * 3)\na * 3",
+                "status": "ok",
+                "stdout": "6\n",
+                "result_text": "6",
+                "error_text": "",
+                "elapsed": 0.2,
+            },
+        ],
+    }
+    base.update(kw)
+    return base
+
+
+def test_workflow_notebook_is_title_bootstrap_then_the_cells():
+    nb = _notebook.build_workflow_notebook(_record())
+    json.dumps(nb)
+    assert [c["cell_type"] for c in nb["cells"]] == ["markdown", "code", "code", "code"]
+    assert "Count foci per cell" in "".join(nb["cells"][0]["source"])
+    assert "build_ops" in "".join(nb["cells"][1]["source"])
+
+
+def test_a_workflow_cell_carries_no_audit_header():
+    # An audit cell needs provenance because a reader has to know who ran it; a
+    # workflow has one author, and a banner per cell is noise in a document
+    # someone is meant to read and edit.
+    nb = _notebook.build_workflow_notebook(_record())
+    src = "".join(nb["cells"][-1]["source"])
+    assert src == "print(a * 3)\na * 3"
+    kinds = {o["output_type"] for o in nb["cells"][-1]["outputs"]}
+    assert kinds == {"stream", "execute_result"}
+
+
+def test_the_intro_states_what_the_run_did_and_did_not_prove():
+    intro = "".join(_notebook.build_workflow_notebook(_record())["cells"][0]["source"])
+    assert "scratch namespace" in intro
+    assert "2 cell(s)" in intro
+    # The residual is named, not hidden.
+    assert "viewer" in intro and "sys.modules" in intro
+
+
+def test_added_layers_are_reported_when_there_are_any():
+    plain = "".join(_notebook.build_workflow_notebook(_record())["cells"][0]["source"])
+    assert "added to the live viewer" not in plain
+    noted = "".join(
+        _notebook.build_workflow_notebook(_record(added_layers=["foci", "nuclei"]))[
+            "cells"
+        ][0]["source"]
+    )
+    assert "`foci`, `nuclei`" in noted
+
+
+def test_an_empty_record_still_builds():
+    # The export route 404s on a missing record, so this is defence against a
+    # shape that arrived anyway rather than a path anyone takes.
+    nb = _notebook.build_workflow_notebook(None)
+    json.dumps(nb)
+    assert "Verified workflow" in "".join(nb["cells"][0]["source"])
+
+
+def test_suggested_workflow_filename_slugs_the_title():
+    name = _notebook.suggested_workflow_filename("Count Foci / cell (v2)")
+    assert name.startswith("biopb-count-foci-cell-v2-")
+    assert name.endswith(".ipynb")
+    # A title that slugs to nothing must still give a usable filename.
+    assert _notebook.suggested_workflow_filename("///").startswith("biopb-workflow-")
+    assert _notebook.suggested_workflow_filename("").startswith("biopb-workflow-")
+
+
+def test_the_bootstrap_cell_is_valid_python():
+    # It is shipped as a string and never imported, so nothing else would catch
+    # a syntax error in it until someone opened the notebook.
+    compile(_notebook.BOOTSTRAP_SRC, "<bootstrap>", "exec")
+
+
+def test_the_bootstrap_cell_loads_kernel_plugins_after_the_handles():
+    # A workflow calling `rolling_ball.subtract_background(...)` verified fine —
+    # the scratch namespace has the plugins, because they are in the bootstrap
+    # baseline — and then failed on a fresh kernel, because this cell rebuilt
+    # every handle except them. Ordered last, like the kernel's own step 7b, so
+    # a plugin can reference the handles above it.
+    src = _notebook.BOOTSTRAP_SRC
+    assert "_load_namespace_plugins" in src
+    assert src.index("napari.Viewer()") < src.index("_load_namespace_plugins")
+
+
+def test_both_intros_say_the_plugins_come_from_the_reader_s_machine():
+    audit = "".join(_notebook.build_notebook([])["cells"][0]["source"])
+    workflow = "".join(
+        _notebook.build_workflow_notebook(_record())["cells"][0]["source"]
+    )
+    assert "kernel plugins" in audit
+    # The workflow export claims reproducibility, so it owes the sharper note:
+    # the plugins are the reader's, not the session's.
+    assert "~/.config/biopb/kernel" in workflow and "NameError" in workflow

@@ -753,3 +753,157 @@ class TestNapariJobs:
         )
         snap = _job_result(res["stdout"])
         assert snap["status"] == "unknown"
+
+
+class TestVerification:
+    """A candidate workflow run in a scratch namespace (``submit(verify_cells=)``).
+
+    The mechanism behind ``verify_workflow``: an agent rewrites a session into a
+    clean program and proves it runs without leaning on the session's leftovers
+    — which a *filter* over the transcript cannot do, since the correct program
+    is a rewrite of it and not a subsequence.
+    """
+
+    def test_a_cell_leaning_on_session_state_fails(self, runner):
+        runner["leftover"] = 42
+        snap = _wait_job(_jobs.submit("", verify_cells=["print(leftover)"])["job_id"])
+        cell = snap["verify"]["cells"][0]
+        assert snap["status"] == "error"
+        assert cell["status"] == "error"
+        assert "NameError" in cell["error_text"]
+
+    def test_the_bootstrap_handles_are_still_there(self, runner):
+        # A scratch namespace isolates the *session's* bindings, not the kernel's
+        # own: a workflow that cannot reach `client` would verify nothing.
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["print(_conn is not None)"])["job_id"]
+        )
+        assert snap["status"] == "ok"
+        assert snap["verify"]["cells"][0]["stdout_head"] == "True"
+
+    def test_cells_run_in_order_and_share_one_namespace(self, runner):
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["a = 2", "print(a * 3)\na * 3"])["job_id"]
+        )
+        cells = _jobs.verified()["cells"]
+        assert snap["verify"]["status"] == "ok"
+        assert cells[1]["stdout"] == "6\n"
+        assert cells[1]["result_text"] == "6"
+
+    def test_a_verification_does_not_write_the_session_namespace(self, runner):
+        _wait_job(_jobs.submit("", verify_cells=["scratch_only = 1"])["job_id"])
+        assert "scratch_only" not in runner
+
+    def test_cells_after_a_failure_are_skipped_not_dropped(self, runner):
+        # Dropping them would report a workflow that mysteriously got shorter;
+        # running them would report the cascade as separate defects.
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["1 / 0", "print('a')", "print('b')"])[
+                "job_id"
+            ]
+        )
+        assert [c["status"] for c in snap["verify"]["cells"]] == [
+            "error",
+            "skipped",
+            "skipped",
+        ]
+
+    def test_output_is_split_per_cell_and_teed_to_the_job(self, runner):
+        # The notebook needs the split; poll_job on a long verification needs
+        # the whole run accumulating where it always does.
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["print('one')", "print('two')"])["job_id"]
+        )
+        assert [c["stdout"] for c in _jobs.verified()["cells"]] == ["one\n", "two\n"]
+        assert snap["stdout"] == "one\ntwo\n"
+
+    def test_the_polled_record_carries_a_head_not_the_output(self, runner):
+        # The polled snapshot crosses a JSON round trip every 0.4s while a
+        # verification runs; carrying every cell's output there would ship the
+        # bytes `stdout` already holds, once more per cell, growing with the
+        # workflow. The full text is read once, by verified(), for the notebook.
+        big = "print('x' * 40_000)"
+        snap = _wait_job(_jobs.submit("", verify_cells=[big] * 5)["job_id"])
+        polled = snap["verify"]["cells"]
+        assert all("stdout" not in c for c in polled)
+        assert all(c["stdout_len"] == 40_001 for c in polled)
+        assert all(c["stdout_head"] == "x" * 79 + "…" for c in polled)
+        # ...and the notebook still gets all of it.
+        assert all(len(c["stdout"]) == 40_001 for c in _jobs.verified()["cells"])
+
+    def test_the_polled_record_does_not_grow_with_what_the_cells_printed(self, runner):
+        # The property, stated as a shape rather than a number: the polled
+        # record scales with the *workflow* -- a line per cell, which is the
+        # point of a ledger -- and not with its output.
+        import json
+
+        def polled_size(chars):
+            jid = _jobs.submit("", verify_cells=[f"print('y' * {chars})"] * 5)["job_id"]
+            return len(json.dumps(_wait_job(jid)["verify"]))
+
+        # ~495,000 more characters printed across the five cells; the record
+        # moves by the digits of a length and the source that names them.
+        assert polled_size(100_000) - polled_size(1_000) < 100
+
+    def test_only_a_complete_run_is_kept_as_the_verified_workflow(self, runner):
+        _wait_job(
+            _jobs.submit("", verify_cells=["1 / 0"], verify_title="bad")["job_id"]
+        )
+        assert _jobs.verified() is None
+        assert _jobs.verified_summary() is None
+
+    def test_a_later_failure_does_not_unverify_what_passed(self, runner):
+        _wait_job(_jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"])
+        _wait_job(
+            _jobs.submit("", verify_cells=["1 / 0"], verify_title="bad")["job_id"]
+        )
+        assert _jobs.verified()["title"] == "good"
+        assert _jobs.verified_summary() == {
+            "title": "good",
+            "cells": 1,
+            "created": _jobs.verified()["created"],
+        }
+
+    def test_reset_drops_the_verified_workflow(self, runner):
+        _wait_job(_jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"])
+        _jobs.reset()
+        assert _jobs.verified() is None
+
+    def test_the_job_code_is_derived_from_the_cells(self, runner):
+        # The audit view of this job must not disagree with the workflow view.
+        snap = _wait_job(_jobs.submit("", verify_cells=["a = 1", "a"])["job_id"])
+        assert "a = 1" in snap["code"] and snap["code"].endswith("a")
+
+    def test_an_ordinary_job_carries_no_verification(self, runner):
+        assert _jobs.poll(_jobs.submit("1 + 1")["job_id"])["verify"] is None
+
+    def test_jobs_view_carries_both_in_one_round_trip(self, runner):
+        jid = _jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"]
+        _wait_job(jid)
+        view = _jobs.jobs_view()
+        assert [j["job_id"] for j in view["jobs"]] == [jid]
+        assert view["workflow"]["title"] == "good"
+
+    def test_the_baseline_is_the_namespace_the_bootstrap_left(self, runner):
+        # Without mark_baseline() the fallback names are the floor; with it, a
+        # plugin bound at bootstrap is visible to a scratch run and a variable
+        # bound afterwards is not.
+        runner["myplugin"] = "loaded"
+        _jobs.mark_baseline()
+        runner["session_var"] = 1
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["print(myplugin)", "print(session_var)"])[
+                "job_id"
+            ]
+        )
+        cells = snap["verify"]["cells"]
+        assert cells[0]["stdout_head"] == "loaded"
+        assert cells[1]["status"] == "error"
+        assert "NameError" in cells[1]["error_text"]
+
+    def test_added_layers_are_counted_not_set_differenced(self):
+        # napari does not promise unique layer names, so a second "nuclei"
+        # beside an existing one is an addition this has to report.
+        assert _jobs._added_layers(["a", "b"], ["a", "b", "a", "c"]) == ["a", "c"]
+        assert _jobs._added_layers(["a"], ["a"]) == []
+        assert _jobs._added_layers(None, ["a"]) == []
