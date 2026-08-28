@@ -779,13 +779,13 @@ class TestVerification:
             _jobs.submit("", verify_cells=["print(_conn is not None)"])["job_id"]
         )
         assert snap["status"] == "ok"
-        assert snap["verify"]["cells"][0]["stdout"] == "True\n"
+        assert snap["verify"]["cells"][0]["stdout_head"] == "True"
 
     def test_cells_run_in_order_and_share_one_namespace(self, runner):
         snap = _wait_job(
             _jobs.submit("", verify_cells=["a = 2", "print(a * 3)\na * 3"])["job_id"]
         )
-        cells = snap["verify"]["cells"]
+        cells = _jobs.verified()["cells"]
         assert snap["verify"]["status"] == "ok"
         assert cells[1]["stdout"] == "6\n"
         assert cells[1]["result_text"] == "6"
@@ -814,8 +814,36 @@ class TestVerification:
         snap = _wait_job(
             _jobs.submit("", verify_cells=["print('one')", "print('two')"])["job_id"]
         )
-        assert [c["stdout"] for c in snap["verify"]["cells"]] == ["one\n", "two\n"]
+        assert [c["stdout"] for c in _jobs.verified()["cells"]] == ["one\n", "two\n"]
         assert snap["stdout"] == "one\ntwo\n"
+
+    def test_the_polled_record_carries_a_head_not_the_output(self, runner):
+        # The polled snapshot crosses a JSON round trip every 0.4s while a
+        # verification runs; carrying every cell's output there would ship the
+        # bytes `stdout` already holds, once more per cell, growing with the
+        # workflow. The full text is read once, by verified(), for the notebook.
+        big = "print('x' * 40_000)"
+        snap = _wait_job(_jobs.submit("", verify_cells=[big] * 5)["job_id"])
+        polled = snap["verify"]["cells"]
+        assert all("stdout" not in c for c in polled)
+        assert all(c["stdout_len"] == 40_001 for c in polled)
+        assert all(c["stdout_head"] == "x" * 79 + "…" for c in polled)
+        # ...and the notebook still gets all of it.
+        assert all(len(c["stdout"]) == 40_001 for c in _jobs.verified()["cells"])
+
+    def test_the_polled_record_does_not_grow_with_what_the_cells_printed(self, runner):
+        # The property, stated as a shape rather than a number: the polled
+        # record scales with the *workflow* -- a line per cell, which is the
+        # point of a ledger -- and not with its output.
+        import json
+
+        def polled_size(chars):
+            jid = _jobs.submit("", verify_cells=[f"print('y' * {chars})"] * 5)["job_id"]
+            return len(json.dumps(_wait_job(jid)["verify"]))
+
+        # ~495,000 more characters printed across the five cells; the record
+        # moves by the digits of a length and the source that names them.
+        assert polled_size(100_000) - polled_size(1_000) < 100
 
     def test_only_a_complete_run_is_kept_as_the_verified_workflow(self, runner):
         _wait_job(
@@ -869,7 +897,7 @@ class TestVerification:
             ]
         )
         cells = snap["verify"]["cells"]
-        assert cells[0]["stdout"] == "loaded\n"
+        assert cells[0]["stdout_head"] == "loaded"
         assert cells[1]["status"] == "error"
         assert "NameError" in cells[1]["error_text"]
 

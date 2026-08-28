@@ -849,11 +849,13 @@ def _format_verification(record: dict, job_id: str) -> str:
         )
 
     for i, cell in enumerate(cells, 1):
-        out = (cell.get("stdout") or "").strip()
-        first = out.splitlines()[0][:60] if out else ""
+        # The head, not the output: a verification's record is polled, and the
+        # full text of every cell belongs to the notebook, not to a ledger line
+        # (see _jobs._Cell.snapshot).
+        head = (cell.get("stdout_head") or "").strip()
         lines.append(
             f"  {i}. {cell.get('status')} · {cell.get('elapsed')}s"
-            + (f" · {first}" if first else "")
+            + (f" · {head}" if head else "")
         )
 
     for i, cell in enumerate(cells, 1):

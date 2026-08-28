@@ -80,6 +80,15 @@ Output is captured per cell and teed to the job: the notebook needs the split,
 `poll_job` on a long verification needs the whole run accumulating where it
 always does. Both use the same capped buffer (`_OutputBuffer`).
 
+**The record has a polled shape and a full one**, the way a job already has
+`jobs_summary()` and `poll()`. A job snapshot crosses a JSON round trip out of
+the kernel every 0.4 s while a verification runs, and carrying every cell's
+output there ships the bytes `stdout` already holds, once more per cell — a
+20-cell run polled 1.2 MB where an ordinary job polls 200 KB, growing with the
+workflow. So `_Cell.snapshot()` carries a one-line head and a length, and only
+`verified()` asks for `full=True`, once, when the notebook is built. The ledger
+a report prints never needed more than the head.
+
 A verification is kept as *the* workflow (`_jobs.verified()`) only when every
 cell ran — a partial run is a report, which the job record already is. A later
 failure does not un-verify what passed; a kernel restart does.

@@ -297,7 +297,9 @@ class _Job(_OutputBuffer):
             "elapsed": self.elapsed(),
             "created": self.started_wall,
             # Present only on a verification run, so an ordinary poll is
-            # unchanged and a client that predates this ignores the key.
+            # unchanged and a client that predates this ignores the key. Light:
+            # a job snapshot is the *polled* shape, and the cells' output is
+            # already here once, in `stdout` (see _Cell.snapshot).
             "verify": self.verify.snapshot() if self.verify is not None else None,
         }
 
@@ -334,15 +336,34 @@ class _Cell(_OutputBuffer):
         end = self.finished if self.finished is not None else time.monotonic()
         return round(end - self.started, 3)
 
-    def snapshot(self):
-        return {
+    def snapshot(self, full=False):
+        """This cell's outcome; *full* adds the captured output.
+
+        The output is the expensive half, and not because building the dict
+        costs anything -- it is that this crosses a JSON round trip out of the
+        kernel every 0.4s while a verification runs. Shipping every cell's
+        output there sends the same bytes the job's own teed buffer already
+        carries, once more per cell: a 20-cell run polled 1.2 MB where an
+        ordinary job polls 200 KB, growing linearly with the workflow.
+
+        So the polled snapshot carries a one-line head and a length, the way
+        :func:`jobs_summary` does for a job, and the text is read once with
+        ``full=True`` by :func:`verified` when the notebook is built. The
+        ledger a report prints needs no more than the head; the notebook needs
+        all of it, and asks for it exactly once.
+        """
+        snap = {
             "code": self.code,
             "status": self.status,
-            "stdout": self.output(),
-            "result_text": self.result_text,
             "error_text": self.error_text,
             "elapsed": self.elapsed(),
+            "stdout_len": self.output_total(),
+            "stdout_head": _one_line(self.output()),
         }
+        if full:
+            snap["stdout"] = self.output()
+            snap["result_text"] = self.result_text
+        return snap
 
 
 class _Verification:
@@ -376,13 +397,15 @@ class _Verification:
             return "ok"
         return "running"
 
-    def snapshot(self):
+    def snapshot(self, full=False):
+        """The record; *full* carries each cell's captured output (see
+        :meth:`_Cell.snapshot`)."""
         return {
             "title": self.title,
             "created": self.created,
             "status": self.status(),
             "added_layers": list(self.added_layers),
-            "cells": [c.snapshot() for c in self.cells],
+            "cells": [c.snapshot(full=full) for c in self.cells],
         }
 
 
@@ -1051,7 +1074,7 @@ def verified():
     and the user may well be mid-way through a second attempt when they decide
     to save the first.
     """
-    return _verified.snapshot() if _verified is not None else None
+    return _verified.snapshot(full=True) if _verified is not None else None
 
 
 def verified_summary():
