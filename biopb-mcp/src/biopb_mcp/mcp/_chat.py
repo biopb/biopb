@@ -186,18 +186,6 @@ def history():
     return list(_messages)
 
 
-def _image_url(msg):
-    """The ``data:`` URL for an image message.
-
-    Stored on the message at append time; recomputed only for one written before
-    that field existed, or by a test building a message by hand.
-    """
-    url = msg.get("image_url")
-    if url:
-        return url
-    return f"data:{msg['mime']};base64,{msg['image']}"
-
-
 def _last_user_text():
     for msg in reversed(_messages):
         if msg["role"] == "user" and not msg.get("image"):
@@ -533,7 +521,17 @@ def _llm_messages():
                         {"type": "text", "text": msg["content"]},
                         {
                             "type": "image_url",
-                            "image_url": {"url": _image_url(msg)},
+                            # Built here rather than stored on the message:
+                            # `history()` hands these dicts to the views
+                            # unfiltered, so a precomputed URL would ship a
+                            # second copy of every screenshot's base64 to each
+                            # browser poll -- which the pane discards, since it
+                            # builds its own from `image`/`mime`. The concat is
+                            # transient; the request that follows copies these
+                            # bytes anyway.
+                            "image_url": {
+                                "url": f"data:{msg['mime']};base64,{msg['image']}"
+                            },
                         },
                     ],
                 }
@@ -815,11 +813,6 @@ async def _run_turn(user_text, model, on_progress):
                     f"(image returned by {name})",
                     image=img.data,
                     mime=img.mimeType,
-                    # Built once, here. `_llm_messages` runs per tool round, and
-                    # a canvas PNG is a few hundred KB of base64 -- rebuilding
-                    # the URL each round rebuilt every screenshot in the thread,
-                    # every round, for nothing.
-                    image_url=f"data:{img.mimeType};base64,{img.data}",
                 )
         else:
             # Not an error the model can be told about mid-turn: it is the turn
