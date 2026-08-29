@@ -475,8 +475,8 @@ def test_status_advertises_whether_chat_is_mounted(host):
 
 def test_status_advertises_who_owns_the_reap(host):
     # The control's dashboard offers a stop only where the session ends itself.
-    # Distinct from chat_enabled: chat is a config switch that is off by
-    # default, and a viewer with chat off still owns its reap.
+    # Distinct from chat_enabled: chat is a config switch, and a viewer with
+    # chat off still owns its reap.
     old = (_observe._agentless, _observe._shutdown_hook)
     try:
         for agentless in (True, False):

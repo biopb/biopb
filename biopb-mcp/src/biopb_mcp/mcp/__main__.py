@@ -211,9 +211,10 @@ def _is_agentless_viewer(view, shim_owned):
 def _setup_chat(config, agentless):
     """Wire up the built-in chat client.
 
-    Off by default (``observe.chat_enabled``, beside the console's switch): it
-    spends the user's own provider credits, so an install must not turn it on
-    for them. Guarded like observe — a chat failure logs and is swallowed rather
+    Switched by ``observe.chat_enabled``, beside the console's. On by default,
+    which costs nothing: without a model and key in ``chat`` the pane is inert,
+    so it never spends the user's provider credits uninvited. Guarded like
+    observe — a chat failure logs and is swallowed rather
     than blocking the MCP server, which is the surface an already-working
     harness depends on. Returns True if mounted.
 

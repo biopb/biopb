@@ -87,7 +87,9 @@ class TestReadiness:
         # A default would bill the user for a model they never chose, and would
         # silently be the wrong one for whatever gateway they pointed at.
         assert McpConfig().chat.model == ""
-        assert McpConfig().observe.chat_enabled is False
+        # The pane is offered by default; the model is what stays unset, so a
+        # default install serves an inert pane rather than billing anyone.
+        assert McpConfig().observe.chat_enabled is True
 
 
 class _FakeClient:

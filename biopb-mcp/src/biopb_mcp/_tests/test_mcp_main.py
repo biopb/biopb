@@ -258,7 +258,8 @@ class TestSetupChat:
         assert mounted == []
 
     def test_it_mounts_nothing_when_the_switch_is_off(self, mounted):
-        assert _setup_chat({"observe": {"enabled": True}}, agentless=True) is False
+        cfg = {"observe": {"enabled": True, "chat_enabled": False}}
+        assert _setup_chat(cfg, agentless=True) is False
         assert mounted == []
 
     @pytest.mark.parametrize(
@@ -266,7 +267,7 @@ class TestSetupChat:
         [
             ({"observe": {"enabled": True, "chat_enabled": True}}, True, True),
             ({"observe": {"enabled": True, "chat_enabled": True}}, False, False),
-            ({"observe": {"enabled": True}}, True, False),
+            ({"observe": {"enabled": True, "chat_enabled": False}}, True, False),
         ],
     )
     def test_it_publishes_the_verdict_on_api_status(
