@@ -331,16 +331,46 @@ costs*), network side still arithmetic from the nominal link rate:
 | localhost `chunk_locate` + mmap | ~1 ms (measured, `localhost-fast-path.md`) |
 
 **The write costs one to two orders of magnitude more than the memcpy argument
-above predicts.** Median throughput is ~0.7 GB/s (0.69 / 0.80 / 0.65 GB/s at 1 /
-8 / 64 MB) against a 33–36 GB/s DRAM ceiling. Essentially all of it is `pa.ipc`
-serialisation plus the `OSFile` write; the rename, the `chmod` and the mmap-back
-re-read together are under 0.2 ms at every size.
+above predicts** — ~0.7 GB/s median against a 33–36 GB/s DRAM ceiling.
 
-**Quote the order of magnitude, not the number.** The write arm is genuinely
-noisy on this box — a 5x spread within one 31-repeat run at 64 MB (best 1.8 GB/s,
-worst 0.32) — because the cache root shares an 88%-full LV that stripes a SATA
-MX500 with an NVMe, and writeback from earlier repeats lands on the later ones.
-The read arm shows nothing like it.
+### Which "write" that is, and why it is slow
+
+`write_batch` does not `fsync`, so the figure is *time until the kernel owns the
+bytes*; the device is still writing after it returns. That is the cost the fetch
+path actually pays, but it is worth knowing what it excludes. At 64 MB:
+
+| | time | GB/s |
+|---|---|---|
+| `write_batch`, buffered — what the fetch path pays | 94 ms | 0.72 |
+| + `fsync`, i.e. durable on the device | 117 ms | 0.58 |
+| sustained: 4.3 GB of distinct chunks, including a full drain | 6.4 s | 0.68 |
+
+**Nothing much is hiding behind the missing `fsync`.** Durable is 1.2x buffered at
+64 MB (2.3x at 1 MB, where fsync's fixed cost dominates), and sustained multi-GB
+traffic holds the same ~0.7 GB/s instead of falling to media speed — a 64 MB burst
+fits the SSD's own write cache, and buffered writeback issues deep batched I/O.
+
+**But ~0.7 GB/s is not the memcpy, the serialisation, or the device.** It is the
+cost of allocating a *fresh* file. Same 64 MB payload, nothing below waiting on a
+device:
+
+| | time | GB/s |
+|---|---|---|
+| `pa.ipc` serialise into an in-memory buffer | 7.9 ms | 8.5 |
+| buffered write over an **existing** extent | 13 ms | 5.0 |
+| buffered write to a **fresh** file | 92 ms | 0.73 |
+
+Same bytes and the same syscall, 7x apart on nothing but whether the pages and
+blocks already exist. The on-path cost is per-page allocation and first touch for
+a new inode, which `write_batch` pays on every miss because it writes a fresh temp
+file and renames. Serialisation is ~9% of the total; the rename, the `chmod` and
+the mmap-back re-read together are under 0.2 ms at every size.
+
+**Quote the order of magnitude, not the number.** A 31-repeat run at 64 MB without
+quiescing spread 37–209 ms (best 1.8 GB/s, worst 0.32); quiescing with `os.sync`
+between repeats gives a p50 of 94 ms, close to that run's 103 ms. The cache root
+shares an 88%-full LV striping a SATA MX500 with an NVMe. The read arm shows no
+comparable spread.
 
 Even at the optimistic end the conclusion changes from the estimate: the write is
 **~10–25% of a 1 GbE miss**, not ~1%, and at p50 it is *nearly twice* a 10 GbE
@@ -433,10 +463,12 @@ plainly at the config surface.
 - The `do_get` rows are still arithmetic. The disk-side rows are measured now
   (*What a hit costs*), but no real remote fetch has been timed end to end, so
   the 10 GbE conclusion rests on a nominal link rate rather than a wire.
-- The write arm's 5x spread is attributed to the dev box's shared, near-full,
-  two-device LV, but that is inference from the hardware, not a controlled
-  result. Re-time it on a single quiet device before treating ~0.7 GB/s as the
-  code's own throughput.
+- If the fresh-file allocation cost is worth attacking, the lever is reusing temp
+  extents rather than anything in Arrow — but that trades the rename's atomicity
+  guarantee, so it needs its own design pass, and ~90 ms on a miss that cost
+  570 ms to fetch may never be worth it.
+- The write arm's spread is attributed to the dev box's shared, near-full,
+  two-device LV; that is inference from the hardware, not a controlled result.
 - `UnresolvedSourceAdapter` (the URL-only cloud model in
   `cloud-storage-support.md`) sets no `_content_version`. Confirm it never serves
   chunks; if it can, its chunk_ids are unversioned and must not be persisted.
