@@ -269,7 +269,10 @@ a SATA MX500 and an NVMe, pyarrow 24.0.0), medians over the cache's own
 | `read_batch` (the lookup), warm | 64 µs | 63 µs | 66 µs | 118 µs |
 | + decode and touch every byte, warm | 150 µs | 282 µs | 1.5 ms | 12 ms |
 | + decode and touch every byte, cold | 1.2 ms | 1.7 ms | 6.2 ms | 98 ms |
-| `write_batch`, on the miss path | 0.5 ms | 1.5 ms | 7.3 ms | 93 ms |
+| `write_batch`, on the miss path | 0.5 ms | 1.5 ms | 10 ms | 103 ms |
+
+The read rows are stable across runs; **the write row is not** — see *What the
+write costs*, where it is given as a distribution rather than a number.
 
 **The lookup is flat and small** — ~66 µs, near-independent of chunk size, because
 the mmap is lazy and nothing here touches a pixel: 4 µs of keying (two sha256s),
@@ -280,9 +283,11 @@ in for on remote (~290 µs, `localhost-fast-path.md`). On a hit the client's own
 file is not merely competitive with the server fast path — it is the cheaper of
 the two, because it has no RPC in it.
 
-Size appears only when the caller faults pages in. Cold reads run 0.5–1.4 GB/s;
-that spread is this box's LV striping two devices of different speeds, not a
-property of the code, so read the cold row as an order of magnitude.
+Size appears only when the caller faults pages in. Cold reads run ~0.6–1.4 GB/s
+at 1 MB and above (below that they are latency-bound and a throughput figure means
+nothing — 256 KB cold is 1.2 ms, barely under the 1 MB number). That spread is
+this box's LV striping two devices of different speeds, not a property of the
+code, so read the cold row as an order of magnitude.
 
 ### A hit does not care how big the cache is
 
@@ -322,22 +327,27 @@ costs*), network side still arithmetic from the nominal link rate:
 |---|---|
 | `do_get` over 1 GbE | ~570 ms (arithmetic) |
 | `do_get` over 10 GbE | ~58 ms (arithmetic) |
-| `write_batch` | **93 ms (measured)** |
+| `write_batch` | **~100 ms (measured p50; 37–209 ms over 31 repeats)** |
 | localhost `chunk_locate` + mmap | ~1 ms (measured, `localhost-fast-path.md`) |
 
-**The write costs about ten times what the memcpy argument above predicts.**
-Measured throughput is ~1 GB/s (0.7–1.4 GB/s across sizes, plus ~0.4 ms fixed per
-write), not the 33–36 GB/s DRAM ceiling, and it is flat from 1 MB up — so this is
-per-byte cost in Arrow serialisation and the `write` copy, not dirty-page
-throttling, and not something a smaller chunk escapes.
+**The write costs one to two orders of magnitude more than the memcpy argument
+above predicts.** Median throughput is ~0.7 GB/s (0.69 / 0.80 / 0.65 GB/s at 1 /
+8 / 64 MB) against a 33–36 GB/s DRAM ceiling. Essentially all of it is `pa.ipc`
+serialisation plus the `OSFile` write; the rename, the `chmod` and the mmap-back
+re-read together are under 0.2 ms at every size.
 
-The conclusion survives but with a thinner margin than claimed: the write is
-**~15% of a 1 GbE miss**, not 1%, and over 10 GbE it is *larger* than the miss it
-rides on — a 64 MB chunk would cost 58 ms to fetch and 93 ms to persist. Remote-
-only scoping is still load-bearing (on localhost the write is a ~90x regression
-against the existing fast path), but on a fast LAN "nearly free" is the wrong
-word for it. What justifies the write there is the cross-process payoff below,
-not its size.
+**Quote the order of magnitude, not the number.** The write arm is genuinely
+noisy on this box — a 5x spread within one 31-repeat run at 64 MB (best 1.8 GB/s,
+worst 0.32) — because the cache root shares an 88%-full LV that stripes a SATA
+MX500 with an NVMe, and writeback from earlier repeats lands on the later ones.
+The read arm shows nothing like it.
+
+Even at the optimistic end the conclusion changes from the estimate: the write is
+**~10–25% of a 1 GbE miss**, not ~1%, and at p50 it is *nearly twice* a 10 GbE
+one — 58 ms to fetch a 64 MB chunk and ~100 ms to persist it. Remote-only scoping
+is still load-bearing (on localhost the write is a ~100x regression against the
+existing fast path), but on a fast LAN "nearly free" is the wrong word for it.
+What justifies the write there is the cross-process payoff below, not its size.
 
 **Rejected: populate on second miss.** Knowing a miss is the second one requires a
 persistent record of the first — itself a write, so the cost being avoided is paid
@@ -423,6 +433,10 @@ plainly at the config surface.
 - The `do_get` rows are still arithmetic. The disk-side rows are measured now
   (*What a hit costs*), but no real remote fetch has been timed end to end, so
   the 10 GbE conclusion rests on a nominal link rate rather than a wire.
+- The write arm's 5x spread is attributed to the dev box's shared, near-full,
+  two-device LV, but that is inference from the hardware, not a controlled
+  result. Re-time it on a single quiet device before treating ~0.7 GB/s as the
+  code's own throughput.
 - `UnresolvedSourceAdapter` (the URL-only cloud model in
   `cloud-storage-support.md`) sets no `_content_version`. Confirm it never serves
   chunks; if it can, its chunk_ids are unversioned and must not be persisted.
