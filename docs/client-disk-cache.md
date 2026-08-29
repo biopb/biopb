@@ -327,57 +327,70 @@ costs*), network side still arithmetic from the nominal link rate:
 |---|---|
 | `do_get` over 1 GbE | ~570 ms (arithmetic) |
 | `do_get` over 10 GbE | ~58 ms (arithmetic) |
-| `write_batch` | **~100 ms (measured p50; 37–209 ms over 31 repeats)** |
+| `write_batch`, burst | **37 ms (measured p50, 36–62 ms)** |
+| `write_batch`, sustained past the dirty budget | **~130 ms (measured)** |
 | localhost `chunk_locate` + mmap | ~1 ms (measured, `localhost-fast-path.md`) |
 
-**The write costs one to two orders of magnitude more than the memcpy argument
-above predicts** — ~0.7 GB/s median against a 33–36 GB/s DRAM ceiling.
+**The estimate's conclusion holds for a burst and fails under sustained load.**
+A 64 MB chunk writes in 37 ms at 1.8 GB/s — ~7% of a 1 GbE miss, inside the
+"1–20%" the arithmetic claimed. Keep streaming and it degrades to ~0.5 GB/s,
+~130 ms, ~22% of that miss and more than twice a 10 GbE one.
 
-### Which "write" that is, and why it is slow
+### Which "write" that is
 
-`write_batch` does not `fsync`, so the figure is *time until the kernel owns the
-bytes*; the device is still writing after it returns. That is the cost the fetch
-path actually pays, but it is worth knowing what it excludes. At 64 MB:
-
-| | time | GB/s |
-|---|---|---|
-| `write_batch`, buffered — what the fetch path pays | 94 ms | 0.72 |
-| + `fsync`, i.e. durable on the device | 117 ms | 0.58 |
-| sustained: 4.3 GB of distinct chunks, including a full drain | 6.4 s | 0.68 |
-
-**Nothing much is hiding behind the missing `fsync`.** Durable is 1.2x buffered at
-64 MB (2.3x at 1 MB, where fsync's fixed cost dominates), and sustained multi-GB
-traffic holds the same ~0.7 GB/s instead of falling to media speed — a 64 MB burst
-fits the SSD's own write cache, and buffered writeback issues deep batched I/O.
-
-**But ~0.7 GB/s is not the memcpy, the serialisation, or the device.** It is the
-cost of allocating a *fresh* file. Same 64 MB payload, nothing below waiting on a
-device:
+`write_batch` does not `fsync`, so the burst figure is *time until the kernel owns
+the bytes* — the device is still writing after it returns. What it excludes, at
+64 MB:
 
 | | time | GB/s |
 |---|---|---|
-| `pa.ipc` serialise into an in-memory buffer | 7.9 ms | 8.5 |
-| buffered write over an **existing** extent | 13 ms | 5.0 |
-| buffered write to a **fresh** file | 92 ms | 0.73 |
+| buffered burst — what one miss on an idle client pays | 37 ms | 1.79 |
+| + `fsync` per chunk, i.e. durable before returning | 101 ms | 0.66 |
+| sustained: 6.4 GB of distinct chunks, incl. a full drain | 13.2 s | 0.49 |
 
-Same bytes and the same syscall, 7x apart on nothing but whether the pages and
-blocks already exist. The on-path cost is per-page allocation and first touch for
-a new inode, which `write_batch` pays on every miss because it writes a fresh temp
-file and renames. Serialisation is ~9% of the total; the rename, the `chmod` and
-the mmap-back re-read together are under 0.2 ms at every size.
+**The device is genuinely hidden, and shows up once the stream outruns the dirty
+budget.** This box allows ~3 GB dirty (`dirty_ratio` 20% of 15 GB), so a burst of
+a few chunks never waits on the SSD and reports 1.8 GB/s; 6.4 GB of misses in a
+row settles at 0.49 GB/s, 3.6x slower. A dask fan-out streaming a dataset is the
+sustained regime, not the burst one — so **quote 0.5 GB/s for a scan and 1.8 GB/s
+for an interactive miss**, and never the burst number for both.
 
-**Quote the order of magnitude, not the number.** A 31-repeat run at 64 MB without
-quiescing spread 37–209 ms (best 1.8 GB/s, worst 0.32); quiescing with `os.sync`
-between repeats gives a p50 of 94 ms, close to that run's 103 ms. The cache root
-shares an 88%-full LV striping a SATA MX500 with an NVMe. The read arm shows no
-comparable spread.
+Even sustained, this is ~20x below the 33–36 GB/s DRAM ceiling the memcpy argument
+assumed, so "a memcpy into page cache" was always the wrong model for the cost.
 
-Even at the optimistic end the conclusion changes from the estimate: the write is
-**~10–25% of a 1 GbE miss**, not ~1%, and at p50 it is *nearly twice* a 10 GbE
-one — 58 ms to fetch a 64 MB chunk and ~100 ms to persist it. Remote-only scoping
-is still load-bearing (on localhost the write is a ~100x regression against the
-existing fast path), but on a fast LAN "nearly free" is the wrong word for it.
-What justifies the write there is the cross-process payoff below, not its size.
+### Two measurement traps
+
+Both inflate the write arm ~2.4x, and both were hit while producing this table:
+
+- **Re-writing one `chunk_id`.** Every rename then unlinks a same-size
+  predecessor, work no real miss stream does. Distinct keys: 37 ms at 64 MB;
+  one key repeated: 91 ms. Always write distinct keys.
+- **Reading a throughput off a fresh file and calling it the code's speed.** A
+  buffered write over an *existing* extent runs at 5.0 GB/s versus 1.8 GB/s to a
+  new one, so the shape of the file matters as much as the bytes. For reference,
+  `pa.ipc` serialisation into memory is 8.5 GB/s — about 5% of the burst cost, so
+  Arrow is not where the time goes. The rename, the `chmod` and the mmap-back
+  re-read together are under 0.2 ms at every size.
+
+### Why a file per chunk, and not the server's segments
+
+The server's `ArrowFileBackend` appends chunks into an open segment file
+(`_pool_writers`), so it pays no per-chunk `open`/`chmod`/`rename`. That the
+client does not do the same is worth ~10–40%, measured writing the same payload
+both ways:
+
+| | 1 MB x512 | 8 MB x128 | 64 MB x24 |
+|---|---|---|---|
+| file per chunk (this design) | 1.39 GB/s | 1.70 GB/s | 1.36 GB/s |
+| append into an open segment | 1.93 GB/s | 1.82 GB/s | 1.69 GB/s |
+| segment's advantage | 1.4x | 1.1x | 1.2x |
+
+Real but small, because at these payload sizes the byte copy dominates the file
+metadata. And the client is buying something concrete with it: a file per chunk
+is what makes the key a pure `sha256` path lookup with no index to keep, eviction
+a plain `unlink` with no compaction, and a torn write recoverable by deleting one
+file. The segment shape needs an index, a sweeper that rewrites live entries, and
+the WAL the server carries — for 10–40% of a cost that is itself ~7% of the miss.
 
 **Rejected: populate on second miss.** Knowing a miss is the second one requires a
 persistent record of the first — itself a write, so the cost being avoided is paid
