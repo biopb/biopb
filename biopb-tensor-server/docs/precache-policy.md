@@ -412,6 +412,12 @@ downscale?) needs eyes on real data and is not yet done.
    live plane: a synthesized scale-16 tile is bit-identical to a direct read
    at that scale, and answers in 10 ms against 143 ms for the warm level.
 
+5. ~~**Browser 3-D**~~ — **done**. `POST /api/slice` takes
+   `scale_policy: "volume"` and resolves the scale server-side, so the browser
+   reads the same coarsest level napari 3-D does instead of guessing one that
+   shares no chunk_id with it. `/api/tile_info` carries a `volume` block saying
+   what that resolves to. See docs/volume-rendering.md.
+
 ## 11. Validation
 
 - The §5.1 table as a gate/footprint parametrisation: assert the verdict and the

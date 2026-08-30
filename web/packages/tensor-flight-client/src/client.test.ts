@@ -352,6 +352,37 @@ describe("TensorHttpClient.slice", () => {
     expect(body.slice_start).toEqual([0, 0, 0]);
   });
 
+  it("passes scale_policy through instead of a scale_hint", async () => {
+    const buf = makeBuffer(4);
+    mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.slice({ array_id: "s/t", scale_policy: "volume" });
+    const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(opts.body as string);
+    expect(body.scale_policy).toBe("volume");
+    expect(body.scale_hint).toBeUndefined();
+  });
+
+  it("reads back the scale the server actually read at", async () => {
+    // Load-bearing under scale_policy: the caller did not choose the scale, so
+    // this header is the only statement of what it got.
+    const buf = makeBuffer(4);
+    const res = binaryResponse(buf, [1, 1, 1], "uint8", []);
+    res.headers.set("X-Scale-Hint", "4,4,4");
+    mockFetch.mockResolvedValueOnce(res);
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.slice({ array_id: "s/t", scale_policy: "volume" });
+    expect(result.scaleHint).toEqual([4, 4, 4]);
+  });
+
+  it("reports an empty scale against a server that does not send the header", async () => {
+    const buf = makeBuffer(4);
+    mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.slice({ array_id: "s/t" });
+    expect(result.scaleHint).toEqual([]);
+  });
+
   it("throws TensorApiError on 502", async () => {
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ detail: "Flight error: RuntimeError" }), {

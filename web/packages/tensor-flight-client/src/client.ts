@@ -626,5 +626,6 @@ async function readNdArray(res: Response): Promise<TypedNdArray> {
   const shape = (res.headers.get("X-Shape") ?? "").split(",").filter(Boolean).map(Number);
   const dtype = res.headers.get("X-Dtype") ?? "";
   const dimLabels = (res.headers.get("X-Dim-Labels") ?? "").split(",").filter(Boolean);
-  return { buffer: await res.arrayBuffer(), shape, dtype, dimLabels };
+  const scaleHint = (res.headers.get("X-Scale-Hint") ?? "").split(",").filter(Boolean).map(Number);
+  return { buffer: await res.arrayBuffer(), shape, dtype, dimLabels, scaleHint };
 }

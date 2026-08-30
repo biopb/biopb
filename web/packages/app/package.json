@@ -23,6 +23,7 @@
     "@luma.gl/engine": "~9.3.3",
     "@luma.gl/shadertools": "~9.3.3",
     "@luma.gl/webgl": "~9.3.3",
+    "@math.gl/core": "~4.1.0",
     "@uiw/react-json-view": "2.0.0-alpha.42",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

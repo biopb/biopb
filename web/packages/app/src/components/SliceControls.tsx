@@ -33,6 +33,8 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const getChannelColor = useAppStore((s) => s.getChannelColor);
   const setChannelColor = useAppStore((s) => s.setChannelColor);
   const loadChannelNames = useAppStore((s) => s.loadChannelNames);
+  const render3d = useAppStore((s) => s.render3d);
+  const setRender3d = useAppStore((s) => s.setRender3d);
 
   // Track custom color picker state (separate from preset dropdown)
   const [useCustomColor, setUseCustomColor] = useState(false);
@@ -162,7 +164,38 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   return (
     <section className="slice-controls">
       <div className="slice-grid" style={{ display: "grid", gap: 8 }}>
-        {axes.map((axis) => {
+        {/* Which viewer is mounted, not which pixels it asks for. Offered
+            unconditionally: whether this tensor has a volume is the server's
+            answer (`tile_info.volume`), and the 3-D pane is the thing that
+            asks — disabling the toggle here would mean fetching that a second
+            time just to grey out a button. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ width: 20, fontSize: 11, color: "#64748b" }}>View</span>
+          {([false, true] as const).map((mode) => (
+            <button
+              key={String(mode)}
+              onClick={() => setRender3d(mode)}
+              disabled={render3d === mode}
+              style={{
+                padding: "2px 8px",
+                fontSize: 10,
+                cursor: render3d === mode ? "default" : "pointer",
+                background: render3d === mode ? "#4a5568" : "#2d3748",
+                border: "1px solid #4a5568",
+                borderRadius: 4,
+                color: "#e2e8f0",
+              }}
+            >
+              {mode ? "3D" : "2D"}
+            </button>
+          ))}
+        </div>
+
+        {axes
+          // Z is the volume's depth in 3-D, read whole — there is no plane to
+          // step through, so a slider for it would move nothing.
+          .filter((axis) => !(render3d && axis.named === "z"))
+          .map((axis) => {
           const max = Math.max(0, axis.extent - 1);
           const value = localAxes[axis.key] ?? 0;
           return (

@@ -604,8 +604,13 @@ def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
     return ndim - 2, ndim - 1
 
 
-def _precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
+def precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
     """Index of the z axis or None, agreeing with biopb-mcp's ``_resolve_axes``.
+
+    Public because the HTTP sidecar resolves the same axis for its volume plan
+    (``http_server._volume_plan``) and the two must not be able to disagree:
+    the depth the sidecar advertises has to be the axis this planner did or did
+    not scale.
 
     Prefers a z-labeled axis (by synonym; absent label => no depth axis, never a
     positional guess -- an unlabeled leading axis may be T/C and must not be
@@ -680,7 +685,7 @@ def compute_pyramid_scale_hints(
     floor = min(pixel_budget_cubic_root, threshold)
 
     y_idx, x_idx = _precache_xy_indices(shape, dim_labels)
-    z_idx = _precache_z_index(shape, dim_labels)
+    z_idx = precache_z_index(shape, dim_labels)
     # A degenerate label set could map z onto an x/y axis; drop it if so.
     if z_idx is not None and z_idx in (x_idx, y_idx):
         z_idx = None

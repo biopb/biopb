@@ -15,9 +15,11 @@ Endpoints (token required):
   GET  /api/sources/{source_id}/metadata          — parsed metadata_json
   GET  /api/sources/{source_id}/ticket/{ticket_hex} — resolve a Flight ticket to bytes
   GET  /api/sources/{source_id}      — single DataSourceDescriptor
-  GET  /api/tile_info/{array_id}     — tile grid + pyramid levels for a tensor
+  GET  /api/tile_info/{array_id}     — tile grid, pyramid levels + volume plan
   GET  /api/tile/{array_id}          — one tile, cacheable (raw | png | jpeg)
-  POST /api/slice                    — fetch array slice as binary (body: array_id)
+  POST /api/slice                    — fetch array slice as binary (body: array_id);
+                                       `scale_policy` delegates the scale to the
+                                       server (3-D volumes)
   GET  /api/config                   — current config (secrets redacted)
   PUT  /api/config                   — update config (same-origin guarded)
   GET  /api/admin/status             — server/catalog status for the admin page
@@ -265,6 +267,10 @@ class SliceRequest(BaseModel):
     slice_start: Optional[List[int]] = None
     slice_stop: Optional[List[int]] = None
     scale_hint: Optional[List[int]] = None
+    # Let the SERVER pick the scale instead of naming one. Only "volume" today:
+    # the single scale a whole 3-D volume is kept warm at (see _volume_plan).
+    # Mutually exclusive with scale_hint -- two answers to one question.
+    scale_policy: Optional[str] = None
     reduction_method: Optional[str] = None
     pixel_budget: Optional[int] = None  # informational, stored in diagnostics
 
@@ -740,6 +746,178 @@ def _tile_warm_level(
         if (-(-height // scale)) * (-(-width // scale)) <= plane_max_pixels:
             return level
     return 24
+
+
+# -- Volume (3-D) -----------------------------------------------------------
+#
+# A volume is not a rung of either ladder: `XR3DLayer` and napari's 3-D mode
+# both upload one whole 3-D texture, so there is nothing to tile and nothing to
+# zoom between. What they need is the single scale the precache worker keeps a
+# whole volume warm at -- the Flight ladder's coarsest level (N1,
+# docs/precache-policy.md 3.2, 5). The server decides it; a client that guessed
+# would miss the warm chunks by a factor of two and pay a cold decode.
+
+
+def _volume_plan(
+    shape: Sequence[int], dim_labels: Sequence[str], dtype: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """``(plan, None)`` for a tensor that can be rendered as one volume, else
+    ``(None, reason)``.
+
+    The plan's ``scale_hint`` is the Flight ladder's coarsest level -- what
+    ``precache`` warms whole (5) and what ``scale_policy="volume"`` resolves to
+    on ``POST /api/slice``. Everything else in it is derived from that scale so
+    a client can size the read, and the VRAM it will cost, before issuing it.
+
+    Like :func:`_tile_warm_level`, the ladder is computed from the module
+    defaults rather than from a config file this sidecar may not own. The cost
+    of a retuned plane is one cold read, not a wrong answer.
+
+    The refusals are facts about the tensor, and each is a thing a 3-D renderer
+    cannot do rather than a thing this route declines to do:
+
+    - **no z axis, or z extent 1.** There is no depth to render. An unlabeled
+      leading axis is *not* promoted to z (``precache_z_index`` -- it may be T
+      or C, and guessing would render a timelapse as a solid block).
+    - **interleaved samples.** ``XR3DLayer`` takes one scalar volume per
+      channel; an interleaved RGB(A) axis is a per-voxel tuple, which would have
+      to be de-interleaved into three volumes. Refused rather than served as a
+      volume three times too wide.
+    """
+    from biopb_tensor_server.core.axes import plane_axes
+    from biopb_tensor_server.core.chunk import (
+        compute_pyramid_scale_hints,
+        estimate_chunk_bytes,
+        precache_z_index,
+    )
+    from biopb_tensor_server.core.downsample import ceil_div
+
+    shape = [int(d) for d in shape]
+    dim_labels = list(dim_labels)
+    if len(shape) < 3:
+        return None, f"tensor has {len(shape)} axes; a volume needs at least 3"
+
+    y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
+    if s_idx is not None:
+        return None, (
+            f"axis {s_idx} is an interleaved samples axis; 3-D rendering takes "
+            "one scalar volume per channel"
+        )
+
+    z_idx = precache_z_index(shape, dim_labels)
+    if z_idx is None or z_idx in (y_idx, x_idx):
+        return None, (
+            f"no z axis to give the volume depth (dim_labels {dim_labels}); "
+            "an unlabeled axis is not assumed to be z"
+        )
+    if shape[z_idx] <= 1:
+        return None, f"z axis (axis {z_idx}) has extent {shape[z_idx]}, not a volume"
+
+    scale = compute_pyramid_scale_hints(shape, dim_labels)[-1]
+    level_shape = [ceil_div(d, s) for d, s in zip(shape, scale, strict=True)]
+    depth, height, width = (
+        level_shape[z_idx],
+        level_shape[y_idx],
+        level_shape[x_idx],
+    )
+    return {
+        "axes": {"z": z_idx, "y": y_idx, "x": x_idx},
+        "scale_hint": scale,
+        "level_shape": level_shape,
+        "depth": depth,
+        "height": height,
+        "width": width,
+        # What the read returns, not what the GPU holds: Viv casts every volume
+        # to Float32 on upload regardless of source dtype (3.1), so VRAM is
+        # 4 bytes per voxel and the client sizes that from the extents.
+        "bytes": estimate_chunk_bytes((depth, height, width), dtype),
+    }, None
+
+
+def _volume_block(td: Any) -> Dict[str, Any]:
+    """The ``volume`` field of ``/api/tile_info``: what a 3-D read of *td* gets.
+
+    Always present, and always answers the availability question first --
+    ``available: false`` with a ``reason`` is the useful answer for a plain 2-D
+    tensor, and lets a viewer say why the 3-D toggle is off instead of offering
+    a button that 422s.
+
+    ``spacing`` is the physical extent of one voxel **of the returned volume**,
+    i.e. the descriptor's full-resolution ``physical_scale`` already multiplied
+    by this plan's per-axis scale. Publishing the product rather than the two
+    factors is deliberate: a renderer needs the anisotropy ratio, and deriving
+    it from the wrong one of the two (which is easy to do -- one is per-axis in
+    wire order, the other in z/y/x order) silently stretches the volume.
+    ``null`` when the source declares no physical size for all three axes;
+    a renderer then falls back to isotropic, which is what it would have to
+    assume anyway.
+    """
+    plan, reason = _volume_plan(td.shape, td.dim_labels, td.dtype)
+    if plan is None:
+        return {"available": False, "reason": reason}
+    axes = plan["axes"]
+    scale = plan["scale_hint"]
+    physical = [float(v) for v in td.physical_scale]
+    units = list(td.physical_unit)
+    spacing = None
+    if len(physical) == len(scale) and all(
+        physical[axes[a]] > 0 for a in ("z", "y", "x")
+    ):
+        spacing = {a: physical[axes[a]] * scale[axes[a]] for a in ("z", "y", "x")}
+    return {
+        "available": True,
+        "reason": None,
+        "axes": axes,
+        "scale_hint": scale,
+        "depth": plan["depth"],
+        "height": plan["height"],
+        "width": plan["width"],
+        "bytes": plan["bytes"],
+        "spacing": spacing,
+        "unit": (units[axes["x"]] if len(units) == len(scale) else "") or None,
+    }
+
+
+# The scale decisions a caller may delegate to the server. One today; named
+# rather than boolean because the warm set has two targets (2-D and 3-D,
+# docs/precache-policy.md 5) and "the warm scale" would not say which.
+_SCALE_POLICIES = ("volume",)
+
+
+def _resolve_scale(req: SliceRequest, td: Any) -> Optional[List[int]]:
+    """The per-axis scale a ``/api/slice`` read is issued at.
+
+    The caller's ``scale_hint`` unless it delegated the choice; see
+    :func:`slice_tensor` for why delegating is the only way to hit the warm
+    chunks for a volume.
+    """
+    policy = (req.scale_policy or "").strip().lower()
+    if not policy:
+        return req.scale_hint or None
+    if req.scale_hint:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"scale_policy={policy!r} and scale_hint={req.scale_hint} both "
+                "set; a read has one scale -- send one or the other"
+            ),
+        )
+    if policy not in _SCALE_POLICIES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"unknown scale_policy {policy!r} (known: {', '.join(_SCALE_POLICIES)})"
+            ),
+        )
+    plan, reason = _volume_plan(td.shape, td.dim_labels, td.dtype)
+    if plan is None:
+        # The same sentence /api/tile_info's `volume.reason` carries, so a
+        # client that skipped the info call is told the same thing.
+        raise HTTPException(
+            status_code=422,
+            detail=f"scale_policy='volume' does not apply to {td.array_id!r}: {reason}",
+        )
+    return list(plan["scale_hint"])
 
 
 def _resolve_tile_level(
@@ -1413,6 +1591,11 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
             "warm_level": _tile_warm_level(
                 shape, y_idx, x_idx, PRECACHE_PLANE_MAX_PIXELS
             ),
+            # Not a rung of this ladder -- a 3-D renderer takes one whole
+            # volume, not tiles -- but published here because this is the one
+            # call a viewer already makes before it can address the tensor at
+            # all. What it describes is the read `scale_policy="volume"` issues.
+            "volume": _volume_block(td),
         }
     )
 
@@ -1662,10 +1845,21 @@ async def get_tile(
 async def slice_tensor(req: SliceRequest, request: Request) -> Response:
     """Fetch a slice of a tensor and return raw bytes.
 
+    The scale is normally the caller's (``scale_hint``). ``scale_policy`` hands
+    that decision back to the server: ``"volume"`` reads at the one scale a
+    whole 3-D volume is kept warm at, which is the level napari 3-D and
+    ``XR3DLayer`` upload as a single texture (docs/precache-policy.md 5). A
+    client cannot compute that itself without reimplementing the pyramid
+    planner, and a guess that lands one rung away misses every warmed chunk and
+    pays a cold decode of the source instead. The two are mutually exclusive:
+    one read has one scale, and letting them disagree would make which one wins
+    a silent policy.
+
     Response headers:
       X-Shape     — comma-separated dimensions of the returned array
       X-Dtype     — numpy dtype string (e.g. "uint16", "float32")
       X-Dim-Labels — comma-separated semantic axis labels
+      X-Scale-Hint — comma-separated per-axis scale actually read at
 
     Response body:
       C-contiguous raw bytes of the numpy array (no framing).
@@ -1700,18 +1894,29 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
             )
 
         slice_hint = _build_slice_hint(req.slice_start, req.slice_stop)
+        scale_hint = _resolve_scale(req, td)
 
-        # Pass slice_hint to gRPC for optimized slicing (world coordinates)
-        arr_lazy = client.get_tensor(
-            # The array_id the descriptor above was read from, not a rebuilt one.
-            td.array_id,
-            slice_hint=slice_hint,
-            scale_hint=req.scale_hint or None,
-            reduction_method=req.reduction_method or None,
-        )
+        # Last chance to skip the read, and the one that matters most on this
+        # route: a scale_policy read is a whole volume, so the queue behind it
+        # can be seconds long.
+        await _abort_if_client_gone(request, ctx)
 
-        # Compute (blocking)
-        arr = _normalize_array(arr_lazy.compute())
+        def _read() -> np.ndarray:
+            # Pass slice_hint to gRPC for optimized slicing (world coordinates)
+            arr_lazy = client.get_tensor(
+                # The array_id the descriptor above was read from, not a rebuilt one.
+                td.array_id,
+                slice_hint=slice_hint,
+                scale_hint=scale_hint,
+                reduction_method=req.reduction_method or None,
+            )
+            return _normalize_array(arr_lazy.compute())
+
+        # Off the event loop for the same reason the tile route is: a blocking
+        # compute here starves the loop of the turn it needs to notice that
+        # *other* queued callers have hung up. A volume read makes that starve
+        # long enough to matter.
+        arr = await run_in_threadpool(_read)
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -1723,6 +1928,12 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
             "X-Shape": ",".join(str(d) for d in arr.shape),
             "X-Dtype": str(arr.dtype),
             "X-Dim-Labels": ",".join(td.dim_labels),
+            # Echoed always, not only under scale_policy: the point of the
+            # policy is that the caller did not choose, so the answer has to
+            # say what it got -- and a caller that did choose can assert it.
+            "X-Scale-Hint": ",".join(
+                str(v) for v in (scale_hint or [1] * len(td.shape))
+            ),
         }
 
         return Response(
@@ -1731,6 +1942,8 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
             headers=headers,
         )
 
+    except _ClientGone:
+        raise
     except HTTPException:
         raise
     except ValueError as exc:

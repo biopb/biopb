@@ -54,6 +54,15 @@ export interface AppState {
 
   // UI options
   showAdvancedOptions: boolean;
+  /**
+   * Render the active tensor as a volume rather than as a plane.
+   *
+   * Not part of `SliceState`: that object's identity drives the tiled viewer's
+   * refetches, and the render mode changes which viewer is mounted rather than
+   * which pixels it wants. Reset on a source change — the next tensor may have
+   * no volume to render, and a toggle stuck on would open it on an error.
+   */
+  render3d: boolean;
 
   // Channel colors (sourceId -> channelIdx -> color)
   channelColors: Record<string, Record<number, ColorValue>>;
@@ -70,6 +79,7 @@ export interface AppState {
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
   setShowAdvancedOptions: (value: boolean) => void;
+  setRender3d: (value: boolean) => void;
   getChannelColor: (sourceId: string, channelIdx: number) => ColorValue;
   setChannelColor: (sourceId: string, channelIdx: number, color: ColorValue) => void;
   loadChannelNames: (sourceId: string) => Promise<void>;
@@ -130,6 +140,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   showAdvancedOptions: false,
+  render3d: false,
 
   // Load persisted colors from localStorage on initialization
   channelColors: loadColorsFromStorage(),
@@ -181,7 +192,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { sources } = get();
     const src = sources.find((s) => s.source_id === sourceId);
     const tid = tensorId ?? src?.tensors[0]?.array_id ?? null;
-    set({ activeSourceId: sourceId, activeTensorId: tid });
+    set({ activeSourceId: sourceId, activeTensorId: tid, render3d: false });
     set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {} } }));
   },
 
@@ -191,6 +202,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setShowAdvancedOptions(value) {
     set({ showAdvancedOptions: value });
+  },
+
+  setRender3d(value) {
+    set({ render3d: value });
   },
 
   getChannelColor(sourceId, channelIdx) {

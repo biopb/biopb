@@ -1,12 +1,19 @@
 "use client";
 
 /**
- * Hosts the tiled viewer and says what happened when it cannot start.
+ * Hosts the viewer for the active tensor and says what happened when it cannot
+ * start.
  *
- * The tiled Viv viewer is the only viewer. It needs WebGL2, a dtype with a GPU
- * equivalent, and a server new enough to serve `/api/tile_info` — so there are
- * tensors and browsers it cannot show, and this pane's job is to name the reason
- * rather than to substitute a second viewer for it.
+ * Two viewers, chosen by the store's render mode, never substituted for each
+ * other: the tiled Viv viewer for planes, and the volume viewer for 3-D. Both
+ * need WebGL2, a dtype with a GPU equivalent, and a server new enough to serve
+ * `/api/tile_info` — so there are tensors and browsers neither can show, and
+ * this pane's job is to name the reason.
+ *
+ * 3-D refuses far more often than 2-D does (no z axis, a z extent of 1, an
+ * interleaved samples axis), and every one of those is a tensor the 2-D viewer
+ * shows perfectly well. So a 3-D refusal offers the way back rather than
+ * offering a retry that would fail identically.
  *
  * That reason splits two ways, and the split is what {@link ViewerErrorKind}
  * carries. A fact about the tensor or the browser stays decided: re-running the
@@ -16,11 +23,16 @@
 
 import { Component, Suspense, lazy, useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
+import { useAppStore } from "../store";
 
 // deck.gl + luma.gl are the app's largest dependency by a wide margin, and only
 // this pane uses them. Splitting them out keeps them off the admin and observe
 // routes entirely.
 const TileViewer = lazy(() => import("./TileViewer"));
+// Split for the same reason, and only that reason: the heavy dependency is the
+// shared deck.gl/Viv chunk, which both viewers pull in. This keeps the 3-D
+// component itself off the 2-D path, not the shaders.
+const VolumeViewer = lazy(() => import("./VolumeViewer"));
 
 interface ViewerPaneProps {
   sourceId: string;
@@ -95,18 +107,20 @@ const noWebGL2: ViewerError = {
 };
 
 export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
+  const render3d = useAppStore((s) => s.render3d);
+  const setRender3d = useAppStore((s) => s.setRender3d);
   const [failure, setFailure] = useState<ViewerError | null>(
     hasWebGL2() ? null : noWebGL2,
   );
-  // Bumped to remount the tiled viewer on a manual retry. The tensor has not
+  // Bumped to remount the viewer on a manual retry. The tensor has not
   // changed, so `key={tensorId}` alone would hand back the same instance.
   const [attempt, setAttempt] = useState(0);
 
-  // A new tensor gets a fresh verdict: the last one may have failed for a
-  // reason specific to it.
+  // A new tensor, or a new render mode, gets a fresh verdict: the last one may
+  // have failed for a reason specific to it.
   useEffect(() => {
     setFailure(hasWebGL2() ? null : noWebGL2);
-  }, [sourceId, tensorId]);
+  }, [sourceId, tensorId, render3d]);
 
   const onUnsupported = useCallback(
     (reason: string, kind: ViewerErrorKind) => setFailure({ reason, kind }),
@@ -128,6 +142,17 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
               Try again
             </button>
           </>
+        ) : render3d ? (
+          <>
+            This tensor cannot be shown in 3-D — {failure.reason}{" "}
+            <button
+              type="button"
+              className="viewer-retry"
+              onClick={() => setRender3d(false)}
+            >
+              Show 2D
+            </button>
+          </>
         ) : (
           <>This tensor cannot be displayed — {failure.reason}</>
         )}
@@ -135,18 +160,32 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
     );
   }
 
+  // Keyed on the mode as well as the tensor: the two viewers hold different
+  // state (a tile cache and a camera vs. a volume and an orbit), so switching
+  // mounts a fresh one rather than handing the old one different props.
+  const key = `${tensorId}#${render3d ? "3d" : "2d"}#${attempt}`;
+
   return (
-    <TileViewerBoundary key={`${tensorId}#${attempt}`} onError={onUnsupported}>
+    <TileViewerBoundary key={key} onError={onUnsupported}>
       <Suspense fallback={<div className="loading-overlay">Loading viewer…</div>}>
-        <TileViewer
-          // Remount per tensor: view state, contrast samples and the tile cache
-          // all belong to one image, and resetting them by hand is the kind of
-          // bookkeeping that goes stale.
-          key={`${tensorId}#${attempt}`}
-          sourceId={sourceId}
-          arrayId={tensorId}
-          onUnsupported={onUnsupported}
-        />
+        {render3d ? (
+          <VolumeViewer
+            key={key}
+            sourceId={sourceId}
+            arrayId={tensorId}
+            onUnsupported={onUnsupported}
+          />
+        ) : (
+          <TileViewer
+            // Remount per tensor: view state, contrast samples and the tile cache
+            // all belong to one image, and resetting them by hand is the kind of
+            // bookkeeping that goes stale.
+            key={key}
+            sourceId={sourceId}
+            arrayId={tensorId}
+            onUnsupported={onUnsupported}
+          />
+        )}
       </Suspense>
     </TileViewerBoundary>
   );

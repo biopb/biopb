@@ -20,6 +20,7 @@ from biopb_tensor_server.serving.http_server import (
     _tile_levels,
     _tile_warm_level,
     _versioned_array_id,
+    _volume_plan,
     create_app,
 )
 from fastapi.testclient import TestClient
@@ -41,13 +42,20 @@ def _make_tensor_desc(
     shape=(4, 8, 16),
     dtype: str = "uint16",
     dim_labels=None,
+    physical_scale=None,
+    physical_unit=None,
 ) -> SimpleNamespace:
+    # physical_scale / physical_unit are repeated proto fields: always present
+    # on a real descriptor, empty when the source declares no physical size.
+    # Spelled out here so a fake cannot be missing what the routes may read.
     return SimpleNamespace(
         array_id=array_id,
         shape=list(shape),
         chunk_shape=[max(1, s // 2) for s in shape],
         dtype=dtype,
         dim_labels=list(dim_labels or ["z", "y", "x"]),
+        physical_scale=list(physical_scale or []),
+        physical_unit=list(physical_unit or []),
     )
 
 
@@ -1391,6 +1399,8 @@ def _tile_source_desc(content_version: bytes | None = None) -> SimpleNamespace:
         chunk_shape=[1, 1, 1, 512, 512],
         dtype="uint16",
         dim_labels=["t", "c", "z", "y", "x"],
+        physical_scale=[],
+        physical_unit=[],
         content_version=content_version,
     )
     return SimpleNamespace(
@@ -2530,3 +2540,220 @@ class TestIntegrationLoneQualifiedTensor:
     def test_an_unknown_field_is_still_a_404(self):
         with self._tc() as tc:
             assert tc.get("/api/tile_info/lone/Nope").status_code == 404
+
+
+# ===========================================================================
+# Unit tests — the volume plan (3-D reads)
+# ===========================================================================
+
+
+class TestVolumePlan:
+    """The scale a 3-D read resolves to, and the tensors that have none.
+
+    The expected scales are docs/precache-policy.md 5.1's table: this plan IS
+    the Flight ladder's coarsest level, so a divergence here means the sidecar
+    and the precache worker have stopped agreeing about what is warm.
+    """
+
+    @pytest.mark.parametrize(
+        "shape,labels,scale,extent",
+        [
+            # cube: 2-D gate skipped (1.05 Mpx plane), 3-D gate fires alone.
+            ([1024, 1024, 1024], ["z", "y", "x"], [4, 4, 4], (256, 256, 256)),
+            # confocal: both gates, but Z is already under the 448 floor.
+            ([200, 2048, 2048], ["z", "y", "x"], [1, 4, 4], (200, 512, 512)),
+            ([1200, 2048, 2048], ["z", "y", "x"], [4, 8, 8], (300, 256, 256)),
+            ([1000, 6000, 6000], ["z", "y", "x"], [4, 16, 16], (250, 375, 375)),
+            # thin stack: neither gate fires, so the volume IS full resolution.
+            ([40, 1024, 1024], ["z", "y", "x"], [1, 1, 1], (40, 1024, 1024)),
+            # TCZYX: the non-volume axes are never scaled.
+            (
+                [3, 2, 181, 1024, 1024],
+                ["t", "c", "z", "y", "x"],
+                [1, 1, 1, 2, 2],
+                (181, 512, 512),
+            ),
+        ],
+    )
+    def test_the_plan_is_the_flight_ladders_coarsest_level(
+        self, shape, labels, scale, extent
+    ):
+        plan, reason = _volume_plan(shape, labels, "uint16")
+        assert reason is None
+        assert plan["scale_hint"] == scale
+        assert (plan["depth"], plan["height"], plan["width"]) == extent
+
+    def test_the_byte_count_is_the_wire_size_at_the_source_dtype(self):
+        plan, _ = _volume_plan([1024, 1024, 1024], ["z", "y", "x"], "uint16")
+        assert plan["bytes"] == 256 * 256 * 256 * 2
+
+    @pytest.mark.parametrize(
+        "shape,labels,expect",
+        [
+            # A plane has no depth.
+            ([100000, 100000], ["y", "x"], "at least 3"),
+            # An unlabeled or non-z third axis is NOT promoted to depth: a
+            # timelapse rendered as a solid block is worse than no 3-D at all.
+            ([4, 14234, 14234], ["c", "y", "x"], "no z axis"),
+            ([500, 2, 1024, 1024], ["t", "c", "y", "x"], "no z axis"),
+            # One plane is not a volume.
+            ([1, 2048, 2048], ["z", "y", "x"], "extent 1"),
+            # Interleaved RGB is a per-voxel tuple, not a scalar field.
+            ([10, 512, 512, 3], ["z", "y", "x", "s"], "interleaved samples"),
+        ],
+    )
+    def test_a_tensor_with_no_volume_is_refused_with_the_reason(
+        self, shape, labels, expect
+    ):
+        plan, reason = _volume_plan(shape, labels, "uint16")
+        assert plan is None
+        assert expect in reason
+
+    def test_the_volume_stays_within_the_pyramids_voxel_budget(self):
+        # 448**3, the measured GPU budget (9.1). The read is unbounded in
+        # principle -- slice_hint spans three whole axes -- so this is the only
+        # thing standing between a 3-D toggle and a multi-gigabyte response.
+        plan, _ = _volume_plan([4000, 8000, 8000], ["z", "y", "x"], "uint16")
+        voxels = plan["depth"] * plan["height"] * plan["width"]
+        assert voxels <= 448**3
+
+
+class TestVolumeOnTileInfo:
+    """`/api/tile_info` carries the plan, so a viewer needs no second call."""
+
+    def test_a_volumetric_tensor_publishes_its_plan(self, tile_client):
+        tc, _ = tile_client
+        volume = tc.get("/api/tile_info/tiled").json()["volume"]
+        assert volume["available"] is True
+        # TCZYX [1, 3, 16, 1024, 1024]: 16 Mvox, under every gate.
+        assert volume["axes"] == {"z": 2, "y": 3, "x": 4}
+        assert volume["scale_hint"] == [1, 1, 1, 1, 1]
+        assert (volume["depth"], volume["height"], volume["width"]) == (16, 1024, 1024)
+
+    def test_a_flat_tensor_says_why_instead_of_omitting_the_field(self):
+        # Always present: a viewer decides whether to offer 3-D from this, and
+        # an absent field would be indistinguishable from an older server.
+        td = _make_tensor_desc(
+            array_id="flat", shape=(4096, 4096), dim_labels=["y", "x"]
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="flat", tensors=[td]))
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                volume = tc.get("/api/tile_info/flat").json()["volume"]
+        assert volume["available"] is False
+        assert "at least 3" in volume["reason"]
+
+    def test_spacing_is_the_source_scale_times_the_plans_own(self):
+        # Published as the product because that is what a renderer needs; the
+        # two factors are in different orders and mixing them up stretches the
+        # volume silently.
+        td = _make_tensor_desc(
+            array_id="phys",
+            shape=(200, 2048, 2048),
+            dim_labels=["z", "y", "x"],
+            physical_scale=[0.5, 0.1, 0.1],
+            physical_unit=["micrometer"] * 3,
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="phys", tensors=[td]))
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                volume = tc.get("/api/tile_info/phys").json()["volume"]
+        # scale [1, 4, 4]: z keeps its 0.5 um step, x/y are four voxels wide.
+        assert volume["scale_hint"] == [1, 4, 4]
+        assert volume["spacing"] == {"z": 0.5, "y": 0.4, "x": 0.4}
+        assert volume["unit"] == "micrometer"
+
+    def test_spacing_is_null_when_the_source_declares_none(self, tile_client):
+        tc, _ = tile_client
+        volume = tc.get("/api/tile_info/tiled").json()["volume"]
+        assert volume["spacing"] is None
+        assert volume["unit"] is None
+
+
+class TestScalePolicyOnSlice:
+    """`scale_policy` hands the scale decision to the server."""
+
+    def _post(self, tc, **body):
+        return tc.post("/api/slice", json={"array_id": "tiled/Image:0", **body})
+
+    def test_the_server_reads_at_the_volume_plans_scale(self):
+        # A tensor whose plan actually scales something, so "the server chose"
+        # is distinguishable from "nothing was passed".
+        td = _make_tensor_desc(
+            array_id="big/Image:0",
+            shape=(1024, 1024, 1024),
+            dim_labels=["z", "y", "x"],
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="big", tensors=[td]))
+        lazy = MagicMock()
+        lazy.compute.return_value = np.zeros((256, 256, 256), dtype=np.uint16)
+        mock_fc.get_tensor.return_value = lazy
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.post(
+                    "/api/slice",
+                    json={"array_id": "big/Image:0", "scale_policy": "volume"},
+                )
+        assert r.status_code == 200, r.text
+        assert mock_fc.get_tensor.call_args.kwargs["scale_hint"] == [4, 4, 4]
+        # Echoed, because the caller did not choose it: this header is the only
+        # statement of what it got.
+        assert r.headers["X-Scale-Hint"] == "4,4,4"
+
+    def test_a_caller_that_chose_gets_its_own_scale_echoed(self, tile_client):
+        tc, mock_fc = tile_client
+        r = self._post(tc, scale_hint=[1, 1, 1, 2, 2])
+        assert r.status_code == 200, r.text
+        assert mock_fc.get_tensor.call_args.kwargs["scale_hint"] == [1, 1, 1, 2, 2]
+        assert r.headers["X-Scale-Hint"] == "1,1,1,2,2"
+
+    def test_an_unscaled_read_still_says_so(self, tile_client):
+        tc, _ = tile_client
+        r = self._post(tc)
+        assert r.headers["X-Scale-Hint"] == "1,1,1,1,1"
+
+    def test_naming_a_scale_and_delegating_it_is_refused(self, tile_client):
+        # Not last-wins: one read has one scale, and letting the two disagree
+        # would make which one applies a silent policy.
+        tc, mock_fc = tile_client
+        r = self._post(tc, scale_policy="volume", scale_hint=[1, 1, 1, 2, 2])
+        assert r.status_code == 422
+        assert "one scale" in r.json()["detail"]
+        mock_fc.get_tensor.assert_not_called()
+
+    def test_an_unknown_policy_names_the_ones_that_exist(self, tile_client):
+        tc, mock_fc = tile_client
+        r = self._post(tc, scale_policy="coarsest")
+        assert r.status_code == 422
+        assert "volume" in r.json()["detail"]
+        mock_fc.get_tensor.assert_not_called()
+
+    def test_a_tensor_with_no_volume_gets_the_same_reason_tile_info_gives(self):
+        td = _make_tensor_desc(
+            array_id="flat", shape=(4096, 4096), dim_labels=["y", "x"]
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="flat", tensors=[td]))
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.post(
+                    "/api/slice", json={"array_id": "flat", "scale_policy": "volume"}
+                )
+        assert r.status_code == 422
+        assert "at least 3" in r.json()["detail"]
+        mock_fc.get_tensor.assert_not_called()
