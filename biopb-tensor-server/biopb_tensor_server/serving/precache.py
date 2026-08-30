@@ -335,7 +335,14 @@ class PrecacheWorker:
     def _process_tensor(
         self, source_adapter, td, cache_manager, backlog: bool = False
     ) -> bool:
-        """Warm one tensor's coarsest level. Return True if preempted (backlog)."""
+        """Warm every level of this tensor's plan. Return True if preempted.
+
+        "Every level" is at most two -- the 2-D target and the 3-D one -- because
+        the plan is sparse (``compute_pyramid_scale_hints``). A tensor with both
+        needs both warmed: they are gated independently (precache-policy.md
+        §5.1), the 3-D one scales Z so it cannot serve a 2-D plane read, and the
+        2-D one is what the browser's tile route anchors on.
+        """
         # The client passes the descriptor's array_id verbatim as tensor_id
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
@@ -365,11 +372,19 @@ class PrecacheWorker:
             logger.exception("precache: get_tensor_descriptor failed for %s", tensor_id)
             return False
 
-        # Warm the coarsest level of the same plan the server advertises (a
-        # non-native source: native ones are skipped above), so the warmed
-        # chunk_ids are exactly what the client fetches on open.
+        # Warm every non-full-resolution level of the same plan the server
+        # advertises (a non-native source: native ones are skipped above), so the
+        # warmed chunk_ids are exactly what a client fetches on open.
+        #
+        # An empty list is the skip: the plan emits a level only where a gate
+        # passed, so "no levels but full resolution" already means warming would
+        # cache the source 1:1 and save an open nothing. Deferring to the planner
+        # rather than applying a pixel threshold here keeps precache from warming
+        # chunk_ids no client requests. Biggest effect is on long timelapses: the
+        # plan scores Lx*Ly*Lz only, so T is never scaled and a many-frame series
+        # is both the costliest warm and the one warming cannot help.
         cfg = self._pyramid_cfg
-        coarsest = build_pyramid_plan(
+        targets = build_pyramid_plan(
             list(base_desc.shape),
             list(base_desc.dim_labels),
             reduction_method=cfg.reduction_method,
@@ -377,23 +392,28 @@ class PrecacheWorker:
             downscale_factor=cfg.downscale_factor,
             pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
             plane_max_pixels=cfg.plane_max_pixels,
-        )[-1]
+        )[1:]
 
-        # Nothing to precompute when the coarsest level is full resolution:
-        # warming caches the source 1:1 and saves an open nothing.
-        #
-        # Test the planner's scale_hint rather than a pixel threshold of our
-        # own -- it is already the answer to "is the spatial extent worth a
-        # level?", and tying the gate to it keeps precache from warming
-        # chunk_ids no client requests. Biggest effect is on long timelapses:
-        # the plan scores Lx*Ly*Lz only, so T is never scaled and a many-frame
-        # series is both the costliest warm and the one warming cannot help.
-        if all(int(s) == 1 for s in coarsest.scale_hint):
+        if not targets:
             logger.debug(
-                "precache: skipping tensor %s (coarsest level is full resolution)",
+                "precache: skipping tensor %s (no level below full resolution)",
                 tensor_id,
             )
             return False
+
+        for target in targets:
+            if self._stop.is_set():
+                return False
+            if self._warm_level(
+                tensor_adapter, base_desc, tensor_id, target, cache_manager, backlog
+            ):
+                return True
+        return False
+
+    def _warm_level(
+        self, tensor_adapter, base_desc, tensor_id, level, cache_manager, backlog
+    ) -> bool:
+        """Warm every chunk of one pyramid level. Return True if preempted."""
 
         # Build the request descriptor exactly as get_flight_info does, so the
         # read plan's scaled chunk_ids match what the client will fetch.
@@ -404,8 +424,8 @@ class PrecacheWorker:
             chunk_shape=base_desc.chunk_shape,
             dtype=base_desc.dtype,
         )
-        request_desc.scale_hint[:] = list(coarsest.scale_hint)
-        request_desc.reduction_method = coarsest.reduction_method
+        request_desc.scale_hint[:] = list(level.scale_hint)
+        request_desc.reduction_method = level.reduction_method
 
         try:
             read_plan = tensor_adapter.get_read_plan(request_desc)
@@ -441,7 +461,7 @@ class PrecacheWorker:
             warmed,
             len(endpoints),
             tensor_id,
-            list(coarsest.scale_hint),
+            list(level.scale_hint),
             " (backlog)" if backlog else "",
         )
         return False

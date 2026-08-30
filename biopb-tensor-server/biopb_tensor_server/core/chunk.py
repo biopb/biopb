@@ -626,24 +626,38 @@ def compute_pyramid_scale_hints(
     pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
     plane_max_pixels: int = PRECACHE_PLANE_MAX_PIXELS,
 ) -> List[List[int]]:
-    """Per-axis scale_hint for *every* level of a computed pyramid.
+    """Per-axis scale_hint for each level of a computed pyramid: **at most three**.
 
-    Two phases, because the two renderers want different things (see
-    ``docs/precache-policy.md`` §4.1):
+    Full resolution, then the two levels the precache worker warms (see
+    ``docs/precache-policy.md`` §4.1, §5):
 
-    - **2-D rungs**, X and Y only, halving by ``downscale_factor`` until the
+    - **the 2-D target**, X and Y only, halved by ``downscale_factor`` until the
       plane fits ``plane_max_pixels`` (and X/Y fit ``threshold``). Z is left
-      alone: a 2-D view displays one slice, so scaling Z on these rungs discards
-      depth resolution to save nothing.
-    - **one final 3-D rung**, continuing from the last 2-D rung and scaling X, Y
-      *and* Z until the volume fits ``pixel_budget_cubic_root**3``. napari's 3-D
-      mode reads ``len(levels) - 1`` whole (``layers/_scalar_field/_slice.py``),
-      so the coarsest level is what a renderer uploads as one texture and the
-      budget is what bounds it. Appended only when the volume actually exceeds
-      the budget, so a 2-D tensor never grows one.
+      alone: a 2-D view displays one slice, so scaling Z here discards depth
+      resolution to save nothing.
+    - **the 3-D target**, continuing from the 2-D one and scaling X, Y *and* Z
+      until the volume fits ``pixel_budget_cubic_root**3``. napari's 3-D mode
+      reads ``len(levels) - 1`` whole (``layers/_scalar_field/_slice.py``), so
+      the coarsest level is what a renderer uploads as one texture and the
+      budget is what bounds it.
 
-    Starting the 3-D phase from the last 2-D rung rather than from full
-    resolution gives per-axis monotonicity for free, which napari requires of
+    Each target is emitted only if it actually shrinks something, so the two
+    gates of §5.1 fall out of the list length: a tensor may qualify for either,
+    both or neither, and one that qualifies for neither gets a single
+    full-resolution level. Nothing downstream has to re-derive the gates.
+
+    **The intermediate rungs are deliberately absent.** They cost a client the
+    same read as full resolution and save it nothing: measured on a 5032² ND2
+    with a cold page cache and no inherited mmap, ``get_decimated_data`` costs
+    0.14-0.24 s at *every* step from 1 to 16, with no monotonic trend -- the
+    decimation skips bytes only once the pages are resident. Advertising a level
+    with no warmed data behind it therefore just asks the client to pay a
+    level-0 read for a blurrier picture, so a client that zooms past the 2-D
+    target should go to level 0. One that wants finer steps can interpolate them
+    itself; the server will not imply they are cheap.
+
+    Starting the 3-D phase from the 2-D target rather than from full resolution
+    gives per-axis monotonicity for free, which napari requires of
     ``downsample_factors`` (``layers/utils/layer_utils.py``).
 
     ``ceil_div(L, s)`` is the server's own ``logical_shape`` (adapter_base.py),
@@ -686,7 +700,8 @@ def compute_pyramid_scale_hints(
             ceil_div(shape[z_idx], sz) if z_idx is not None else 1,
         )
 
-    # Phase 1 -- 2-D rungs: X and Y only.
+    # Phase 1 -- the 2-D target: X and Y only. The intermediate steps are walked
+    # but not emitted; only where the halving lands is a level.
     sx = sy = sz = 1
     scales = [_scale_vector(sx, sy, sz)]  # level 0: full resolution
     while True:
@@ -698,11 +713,12 @@ def compute_pyramid_scale_hints(
         if (nsx, nsy) == (sx, sy):
             break  # nothing left to shrink; avoid an infinite loop
         sx, sy = nsx, nsy
+    if (sx, sy) != (1, 1):
         scales.append(_scale_vector(sx, sy, sz))
 
-    # Phase 2 -- one 3-D rung, only if the volume still exceeds the budget.
-    # Continues from the last 2-D rung, so its factors can only be >= that
-    # rung's on every axis.
+    # Phase 2 -- the 3-D target, only if the volume still exceeds the budget.
+    # Continues from the 2-D target, so its factors can only be >= that level's
+    # on every axis.
     tx, ty, tz = sx, sy, sz
     while True:
         lx, ly, lz = _extent(tx, ty, tz)
@@ -730,8 +746,27 @@ def compute_precache_scale_hint(
     The last entry of :func:`compute_pyramid_scale_hints` (``threshold`` /
     ``downscale_factor`` / ``pixel_budget_cubic_root`` forwarded through) -- a
     named thin wrapper so there is one pyramid loop, not two.
+
+    This is what napari opens at, **not** the whole warm set: a tensor with both
+    targets has two levels to warm and this names only the second. Precache uses
+    :func:`compute_warm_scale_hints`.
     """
     return compute_pyramid_scale_hints(shape, dim_labels, **kwargs)[-1]
+
+
+def compute_warm_scale_hints(
+    shape: Sequence[int],
+    dim_labels=None,
+    **kwargs: int,
+) -> List[List[int]]:
+    """Every scale the precache worker should warm: at most two, possibly none.
+
+    :func:`compute_pyramid_scale_hints` without its full-resolution level, which
+    is exactly the 2-D target, the 3-D target, both or neither. An empty result
+    means the tensor passed neither gate and warming it would cache the source
+    1:1 -- the caller skips rather than testing scale vectors for all-ones.
+    """
+    return compute_pyramid_scale_hints(shape, dim_labels, **kwargs)[1:]
 
 
 def build_pyramid_plan(

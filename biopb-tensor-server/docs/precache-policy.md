@@ -160,6 +160,28 @@ The final rung must stay near-isotropic rather than merely adding Z to the 2-D
 rung: on a `[1024,1024,1024]` cube, "add Z" gives `[128,1024,1024]` — same voxel
 count, 8:1 sampling anisotropy, texture spent on XY detail 3-D cannot show.
 
+**The plan is sparse: full resolution, plus at most those two levels.** The
+halving steps between them are walked but not emitted. An unwarmed intermediate
+level costs a client the same read as level 0 and saves it nothing — measured on
+a 5032² ND2, cold page cache, fresh process per arm so no mmap survives to
+defeat `posix_fadvise(DONTNEED)`:
+
+| step | 1 | 2 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| cold, median of 3 | 0.154 s | 0.172 s | 0.159 s | 0.242 s | 0.144 s |
+| warm | 0.044 s | 0.023 s | 0.017 s | 0.011 s | 0.009 s |
+
+Flat, with no monotonic trend — step 8 is the slowest. `get_decimated_data`
+skips bytes only once the pages are resident, so cold it is the page-in that
+costs and the stride is free. Advertising a level with nothing warmed behind it
+therefore asks a client to pay a level-0 read for a blurrier picture; a client
+that zooms past the 2-D target should go to level 0, and one that wants finer
+steps can interpolate them itself. The server will not imply they are cheap.
+
+This is what makes §5's two gates disappear as code: a target is emitted only
+where it shrinks something, so the list length *is* the verdict, and
+`_process_tensor` warms every level but the first without re-deriving anything.
+
 ### 4.2 Tile ladder: synthesize the rungs below the warm target
 
 The tile ladder keeps its "stop when the plane fits one tile" rule, because that
@@ -381,7 +403,9 @@ downscale?) needs eyes on real data and is not yet done.
    total miss on its own.
 2. **§5.3 selection restriction** — bounds the warm set; unblocks re-enabling
    `enabled` by default.
-3. **§4.1 Flight ladder shape** + **§5 two targets with independent gates**.
+3. ~~**§4.1 Flight ladder shape** + **§5 two targets with independent gates**~~
+   — **done**. The plan is sparse (level 0 + at most two targets), so the gates
+   are the list length and `_process_tensor` warms `plan[1:]`.
 4. ~~**§4.2 tile-ladder alignment**~~ — **done**. `_tile_warm_level` is the
    coarsest level the tile route reads from the data plane; everything below
    it is reduced from it in-process, gated on `nearest`. Verified against a
