@@ -18,6 +18,7 @@ from biopb_tensor_server.serving.http_server import (
     _split_array_version,
     _tile_edge,
     _tile_levels,
+    _tile_warm_level,
     _versioned_array_id,
     create_app,
 )
@@ -1463,6 +1464,77 @@ class TestTileGeometry:
         levels = _tile_levels([1, 1000, 1000], 1, 2, 512)
         assert levels[0]["cols"] == 2 and levels[0]["rows"] == 2
 
+    @pytest.mark.parametrize(
+        "shape,expected",
+        [
+            # Already under the cap: level 0 is the warm level, so nothing above
+            # it is ever read directly.
+            ([1, 1024, 1024], 0),
+            # 14234**2 ND2 scene: 202 Mpx -> scale 8 is the first rung under 4 Mpx.
+            ([1, 14234, 14234], 3),
+            # 100000**2 WSI.
+            ([1, 100000, 100000], 6),
+            # Anisotropic: the cap is on the plane, not on either edge -- a
+            # 500x20000 strip is under it two rungs before either edge is small.
+            ([1, 500, 20000], 1),
+        ],
+    )
+    def test_warm_level_is_the_first_rung_under_the_cap(self, shape, expected):
+        assert _tile_warm_level(shape, 1, 2, 4_000_000) == expected
+        at = lambda lv: (  # noqa: E731
+            -(-shape[1] // (1 << lv)) * -(-shape[2] // (1 << lv))
+        )
+        assert at(expected) <= 4_000_000
+        assert expected == 0 or at(expected - 1) > 4_000_000
+
+    def test_warm_level_is_a_level_the_ladder_publishes(self):
+        # Synthesis anchors on it, so it must be addressable in its own right.
+        shape, edge = [1, 14234, 14234], 512
+        warm = _tile_warm_level(shape, 1, 2, 4_000_000)
+        assert warm < len(_tile_levels(shape, 1, 2, edge))
+
+
+class TestTileSynthesisIsExact:
+    """Reducing the warm level must equal a direct read at the coarser level.
+
+    The property docs/precache-policy.md 4.2 rests on: `nearest` is a strided
+    pick, so `data[::32]` and `data[::8][::4]` select the same elements and
+    `ceil(ceil(n/a)/b) == ceil(n/(a*b))` gives the same count. Ragged extents
+    included -- those are where a padding reducer would diverge.
+    """
+
+    @pytest.mark.parametrize("extent", [4096, 4000, 3999, 1001])
+    @pytest.mark.parametrize("warm,level", [(0, 1), (1, 2), (3, 5), (2, 5)])
+    def test_composition_is_bit_identical(self, extent, warm, level):
+        from biopb_tensor_server.core.downsample import downsample_block
+
+        rng = np.random.default_rng(0)
+        block = rng.integers(0, 65535, size=(extent, 7), dtype=np.uint16)
+
+        direct = downsample_block(block, (1 << level, 1), "nearest")
+        staged = downsample_block(
+            downsample_block(block, (1 << warm, 1), "nearest"),
+            (1 << (level - warm), 1),
+            "nearest",
+        )
+        assert staged.shape == direct.shape
+        assert np.array_equal(staged, direct)
+
+    def test_area_does_not_compose(self):
+        # Recorded deliberately: this is the coupling that makes `nearest` load
+        # bearing for the tile route, not merely the default (policy 6).
+        from biopb_tensor_server.core.downsample import downsample_block
+
+        rng = np.random.default_rng(0)
+        block = rng.integers(0, 65535, size=(4000, 7), dtype=np.uint16)
+
+        direct = downsample_block(block, (8, 1), "area")
+        staged = downsample_block(
+            downsample_block(block, (2, 1), "area"), (4, 1), "area"
+        )
+        assert staged.shape == direct.shape
+        assert not np.array_equal(staged, direct)
+
 
 class TestTileInfoEndpoint:
     def test_reports_grid_and_levels(self, tile_client):
@@ -1517,13 +1589,44 @@ class TestTileEndpoint:
         # Leading axes collapse to a single index so the payload is one plane.
         assert kwargs["slice_hint"][0] == slice(0, 1)
 
-    def test_a_coarser_level_covers_more_world_at_a_higher_scale(self, tile_client):
+    def test_a_coarser_level_covers_more_world(self, tile_client):
         tc, mock_fc = tile_client
         tc.get("/api/tile/tiled", params={"level": 1, "col": 0, "row": 0})
         kwargs = mock_fc.get_tensor.call_args.kwargs
-        # One level-1 tile spans 2x the world and downsamples it back to 512px.
+        # World bounds come from the level addressed, whatever level is read.
         assert kwargs["slice_hint"][4] == slice(0, 1024)
+        assert kwargs["slice_hint"][3] == slice(0, 1024)
+
+    def test_a_level_below_the_warm_one_is_read_at_the_warm_scale(self, tile_client):
+        # 1024x1024 fits plane_max_pixels, so the warm level is 0 and level 1 is
+        # synthesized: the data plane is asked for scale 1 and the reduction to
+        # scale 2 happens here, off the one warmed level (precache-policy.md 4.2).
+        tc, mock_fc = tile_client
+        r = tc.get("/api/tile/tiled", params={"level": 1, "col": 0, "row": 0})
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        assert kwargs["scale_hint"][3] == 1 and kwargs["scale_hint"][4] == 1
+        # The mock answers 512x512 whatever it is asked; halving it is the proof
+        # the in-process reduction ran.
+        assert r.headers["X-Shape"] == "1,1,1,256,256"
+
+    def test_area_keeps_reading_its_own_level(self, tile_client):
+        # Synthesis composes exactly only under `nearest`; `area` pads and
+        # re-averages, so a level below the warm one must still be read directly.
+        tc, mock_fc = tile_client
+        r = tc.get(
+            "/api/tile/tiled",
+            params={"level": 1, "col": 0, "row": 0, "reduction_method": "area"},
+        )
+        kwargs = mock_fc.get_tensor.call_args.kwargs
         assert kwargs["scale_hint"][3] == 2 and kwargs["scale_hint"][4] == 2
+        assert r.headers["X-Shape"] == "1,1,1,512,512"
+
+    def test_the_warm_level_itself_is_read_directly(self, tile_client):
+        tc, mock_fc = tile_client
+        r = tc.get("/api/tile/tiled", params={"level": 0, "col": 0, "row": 0})
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        assert kwargs["scale_hint"][3] == 1 and kwargs["scale_hint"][4] == 1
+        assert r.headers["X-Shape"] == "1,1,1,512,512"
 
     def test_edge_tile_is_clipped_to_the_plane(self, tile_client):
         tc, mock_fc = tile_client

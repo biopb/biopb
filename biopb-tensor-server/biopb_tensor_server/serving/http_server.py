@@ -716,6 +716,32 @@ def _tile_levels(
         level += 1
 
 
+def _tile_warm_level(
+    shape: Sequence[int], y_idx: int, x_idx: int, plane_max_pixels: int
+) -> int:
+    """Coarsest level still read from the data plane; below it, tiles are synthesized.
+
+    The precache worker warms the rung whose plane first fits
+    ``pyramid.plane_max_pixels`` (docs/precache-policy.md 5). That rung is far
+    finer than this ladder's coarsest -- scale 8 vs scale 32 on a 14234 ND2 --
+    so warming one of the two would leave the other cold. Instead the tile route
+    reads *at* the warm level and reduces in-process for everything coarser,
+    which is exact under ``nearest`` (4.2) and mints no second cache entry.
+
+    ``plane_max_pixels`` is passed as the module default rather than read from
+    the serving plane's config: this sidecar can address a Flight plane whose
+    config file it does not own, so the local file is not authoritative. A
+    retuned plane therefore costs one cold read at the anchor -- the level is
+    still a level, the reduction still exact -- not a wrong answer.
+    """
+    height, width = int(shape[y_idx]), int(shape[x_idx])
+    for level in range(25):
+        scale = 1 << level
+        if (-(-height // scale)) * (-(-width // scale)) <= plane_max_pixels:
+            return level
+    return 24
+
+
 def _resolve_tile_level(
     levels: List[Dict[str, int]], level: int, col: int, row: int
 ) -> Dict[str, int]:
@@ -958,6 +984,7 @@ def _tile_slices(
     col: int,
     row: int,
     resolved: Dict[int, int],
+    read_level: Optional[int] = None,
 ) -> Tuple[List[int], List[int], List[int]]:
     """``(slice_start, slice_stop, scale_hint)`` for one tile.
 
@@ -965,12 +992,19 @@ def _tile_slices(
     applied in, before scaling); ``scale_hint`` then downsamples Y/X by
     ``2**level`` so the returned plane is at most ``edge x edge``.
 
+    ``read_level`` (default ``level``) splits the two uses of the scale apart:
+    the *bounds* always come from the level being addressed, while the
+    ``scale_hint`` comes from the level actually read. Passing a finer
+    ``read_level`` asks for the same world region at a finer sampling, which the
+    caller then reduces the rest of the way -- see :func:`_tile_warm_level`.
+
     Assumes ``(level, col, row)`` already passed :func:`_resolve_tile_level` and
     the selection :func:`_resolve_tile_selection`; this derives geometry and does
     not re-check either.
     """
     shape = [int(d) for d in td.shape]
     scale = 1 << level
+    read_scale = 1 << (level if read_level is None else read_level)
     step = edge * scale
 
     y0, x0 = row * step, col * step
@@ -981,7 +1015,7 @@ def _tile_slices(
 
     start[y_idx], stop[y_idx] = y0, min(y0 + step, shape[y_idx])
     start[x_idx], stop[x_idx] = x0, min(x0 + step, shape[x_idx])
-    scale_hint[y_idx] = scale_hint[x_idx] = scale
+    scale_hint[y_idx] = scale_hint[x_idx] = read_scale
 
     # Every leading axis collapses to one index so the response is a single
     # plane; an axis left whole would silently multiply the payload.
@@ -1346,6 +1380,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
         )
 
     from biopb_tensor_server.core.axes import labeled_axis_index, plane_axes
+    from biopb_tensor_server.core.chunk import PRECACHE_PLANE_MAX_PIXELS
 
     shape = [int(d) for d in td.shape]
     dim_labels = list(td.dim_labels)
@@ -1372,6 +1407,12 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
                 dim_labels, shape, _plane_axes_set(y_idx, x_idx, s_idx)
             ),
             "levels": _tile_levels(shape, y_idx, x_idx, edge),
+            # Advisory: the level precache warms, and so the coarsest one this
+            # route reads from the data plane. Published for diagnosis -- the
+            # levels above are addressed identically either way.
+            "warm_level": _tile_warm_level(
+                shape, y_idx, x_idx, PRECACHE_PLANE_MAX_PIXELS
+            ),
         }
     )
 
@@ -1472,6 +1513,11 @@ async def get_tile(
         )
 
     from biopb_tensor_server.core.axes import plane_axes
+    from biopb_tensor_server.core.chunk import PRECACHE_PLANE_MAX_PIXELS
+    from biopb_tensor_server.core.downsample import (
+        downsample_block,
+        normalize_reduction_method,
+    )
 
     shape = [int(d) for d in td.shape]
     dim_labels = list(td.dim_labels)
@@ -1481,6 +1527,21 @@ async def get_tile(
         )
     y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
     edge = _tile_edge(shape, [int(d) for d in td.chunk_shape], y_idx, x_idx)
+
+    # Everything coarser than the warm level is reduced from it in-process
+    # rather than asking the data plane for a separate scaled read, so the one
+    # warmed level serves the whole tail of the ladder (precache-policy.md 4.2).
+    #
+    # Exact only under `nearest`, and only because the chunk grid is absolute:
+    # a tile origin is a multiple of `edge * 2**level`, hence on the sample grid
+    # at both scales, so `data[::32]` and `data[::8][::4]` pick the same
+    # elements and `ceil(ceil(n/a)/b) == ceil(n/(a*b))` gives the same count.
+    # `area` pads and re-averages, so it must keep reading its own level.
+    warm_level = _tile_warm_level(shape, y_idx, x_idx, PRECACHE_PLANE_MAX_PIXELS)
+    synthesized = level > warm_level and (
+        normalize_reduction_method(reduction_method or "") == "nearest"
+    )
+    read_level = warm_level if synthesized else level
 
     # Before the ETag, not after: a revalidation must not be able to answer 304
     # for a tile that does not exist, and an out-of-grid request should cost the
@@ -1535,7 +1596,7 @@ async def get_tile(
         return Response(status_code=304, headers=cache_headers)
 
     start, stop, scale_hint = _tile_slices(
-        td, y_idx, x_idx, s_idx, edge, level, col, row, resolved
+        td, y_idx, x_idx, s_idx, edge, level, col, row, resolved, read_level
     )
 
     # Last chance to skip the read: on a saturated loop this request may have sat
@@ -1551,7 +1612,12 @@ async def get_tile(
             scale_hint=scale_hint,
             reduction_method=reduction_method or None,
         )
-        return _normalize_array(arr_lazy.compute())
+        arr = _normalize_array(arr_lazy.compute())
+        if not synthesized:
+            return arr
+        factors = [1] * arr.ndim
+        factors[y_idx] = factors[x_idx] = 1 << (level - read_level)
+        return _normalize_array(downsample_block(arr, tuple(factors), "nearest"))
 
     try:
         # Off the event loop, and not only to keep this request responsive: a
