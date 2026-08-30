@@ -848,22 +848,28 @@ def _volume_block(td: Any) -> Dict[str, Any]:
     factors is deliberate: a renderer needs the anisotropy ratio, and deriving
     it from the wrong one of the two (which is easy to do -- one is per-axis in
     wire order, the other in z/y/x order) silently stretches the volume.
-    ``null`` when the source declares no physical size for all three axes;
-    a renderer then falls back to isotropic, which is what it would have to
-    assume anyway.
+
+    The three are reduced to **one unit** here, because the ratio compares them
+    against each other and ``physical_unit`` is per-axis. Adapters do not all
+    normalise: NIfTI reports whatever ``xyzt_units`` says (``m``/``mm``/``µm``,
+    and ``mm`` is the medical convention), and the EM readers pass rsciio's
+    units through untouched (``nm``, ``Å``). Both are volumetric formats, so
+    this is the path where it would bite. A z in ``nm`` beside an x/y in ``µm``
+    is a stack rendered a thousand times too deep, with nothing on screen to say
+    so.
+
+    ``null`` -- render isotropic -- when any of the three lacks a positive size,
+    or when they carry units that differ and cannot all be placed on a common
+    scale. Units that differ but *convert* are converted; units that are equal
+    are kept as they are, including when they are equally unknown, since a ratio
+    of like-for-like is valid whether or not we can name the unit.
     """
     plan, reason = _volume_plan(td.shape, td.dim_labels, td.dtype)
     if plan is None:
         return {"available": False, "reason": reason}
     axes = plan["axes"]
     scale = plan["scale_hint"]
-    physical = [float(v) for v in td.physical_scale]
-    units = list(td.physical_unit)
-    spacing = None
-    if len(physical) == len(scale) and all(
-        physical[axes[a]] > 0 for a in ("z", "y", "x")
-    ):
-        spacing = {a: physical[axes[a]] * scale[axes[a]] for a in ("z", "y", "x")}
+    spacing, unit = _volume_spacing(td, axes, scale)
     return {
         "available": True,
         "reason": None,
@@ -874,8 +880,39 @@ def _volume_block(td: Any) -> Dict[str, Any]:
         "width": plan["width"],
         "bytes": plan["bytes"],
         "spacing": spacing,
-        "unit": (units[axes["x"]] if len(units) == len(scale) else "") or None,
+        "unit": unit,
     }
+
+
+def _volume_spacing(
+    td: Any, axes: Dict[str, int], scale: Sequence[int]
+) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+    """``(spacing, unit)`` for :func:`_volume_block`, or ``(None, None)``.
+
+    Split out because the unit reconciliation is the whole of it; see that
+    function's docstring for why the three axes cannot be assumed to share one.
+    """
+    from biopb_tensor_server.adapters._scale import MICRON, unit_to_um
+
+    physical = [float(v) for v in td.physical_scale]
+    units = [str(u) for u in td.physical_unit]
+    order = ("z", "y", "x")
+    if len(physical) != len(scale) or len(units) != len(scale):
+        return None, None
+    if not all(physical[axes[a]] > 0 for a in order):
+        return None, None
+
+    raw = {a: physical[axes[a]] * scale[axes[a]] for a in order}
+    factors = {a: unit_to_um(units[axes[a]]) for a in order}
+    if all(factors[a] for a in order):
+        return {a: raw[a] * factors[a] for a in order}, MICRON
+    # Not all placeable on a common scale. Equal units still give a valid ratio
+    # -- including equally unknown ones, which is how a NIfTI with an unset
+    # `xyzt_units` keeps its anisotropy.
+    spellings = {units[axes[a]] for a in order}
+    if len(spellings) == 1:
+        return raw, spellings.pop() or None
+    return None, None
 
 
 # The scale decisions a caller may delegate to the server. One today; named

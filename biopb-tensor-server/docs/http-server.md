@@ -181,7 +181,11 @@ second round trip. It describes what a `scale_policy: "volume"` read (below)
 will return, or says `available: false` with a reason a viewer can show: no z
 axis, a z extent of 1, an interleaved samples axis. `spacing` is the physical
 extent of one voxel *of that volume* — the source's physical size already
-multiplied by `scale_hint` — or `null` when the source declares none.
+multiplied by `scale_hint`, and with the three axes reduced to one unit
+(`physical_unit` is per-axis and adapters do not all normalise: NIfTI reports
+`mm`, the EM readers `nm`). `null` when the source declares no size, or when
+the axes carry units that differ and cannot all be placed on a common scale —
+a plausible wrong ratio is worse than rendering isotropic.
 
 `selectable` gives the wire index of each **named** slider axis, or `null`.
 `sel_axes` is the converse and is the one worth reading: non-plane axes with

@@ -2656,6 +2656,7 @@ class TestVolumeOnTileInfo:
             shape=(200, 2048, 2048),
             dim_labels=["z", "y", "x"],
             physical_scale=[0.5, 0.1, 0.1],
+            # A spelling unit_to_um places, so it comes back canonicalised.
             physical_unit=["micrometer"] * 3,
         )
         mock_fc = _build_mock_client(_make_source_desc(source_id="phys", tensors=[td]))
@@ -2669,7 +2670,52 @@ class TestVolumeOnTileInfo:
         # scale [1, 4, 4]: z keeps its 0.5 um step, x/y are four voxels wide.
         assert volume["scale_hint"] == [1, 4, 4]
         assert volume["spacing"] == {"z": 0.5, "y": 0.4, "x": 0.4}
-        assert volume["unit"] == "micrometer"
+        assert volume["unit"] == "µm"
+
+    @pytest.mark.parametrize(
+        "units,expect_spacing,expect_unit",
+        [
+            # Mixed but placeable: the EM / OME case. A z in nm beside an x/y in
+            # um is a stack a thousand times too deep if the ratio is taken raw.
+            (["nm", "µm", "µm"], {"z": 0.0005, "y": 0.4, "x": 0.4}, "µm"),
+            # Uniform and placeable: converted, so the wire unit is always one
+            # thing when it is named at all.
+            (["mm", "mm", "mm"], {"z": 500.0, "y": 400.0, "x": 400.0}, "µm"),
+            # Uniform and NOT placeable: kept. A ratio of like-for-like is valid
+            # whether or not the unit can be named -- this is a NIfTI with
+            # xyzt_units unset, which would otherwise lose its anisotropy.
+            (["hogshead"] * 3, {"z": 0.5, "y": 0.4, "x": 0.4}, "hogshead"),
+            (["", "", ""], {"z": 0.5, "y": 0.4, "x": 0.4}, None),
+            # Mixed and not all placeable: refused. Guessing which axis the odd
+            # unit belongs to is exactly the silent stretch this avoids.
+            (["pixel", "µm", "µm"], None, None),
+        ],
+    )
+    def test_the_three_axes_are_reduced_to_one_unit(
+        self, units, expect_spacing, expect_unit
+    ):
+        # physical_unit is per-axis and adapters do not all normalise, but the
+        # ratio compares the three against each other.
+        td = _make_tensor_desc(
+            array_id="units",
+            shape=(200, 2048, 2048),
+            dim_labels=["z", "y", "x"],
+            physical_scale=[0.5, 0.1, 0.1],
+            physical_unit=units,
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="units", tensors=[td]))
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                volume = tc.get("/api/tile_info/units").json()["volume"]
+        if expect_spacing is None:
+            assert volume["spacing"] is None
+        else:
+            assert volume["spacing"] == pytest.approx(expect_spacing)
+        assert volume["unit"] == expect_unit
 
     def test_spacing_is_null_when_the_source_declares_none(self, tile_client):
         tc, _ = tile_client

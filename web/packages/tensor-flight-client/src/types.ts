@@ -311,9 +311,19 @@ export interface VolumeAvailable {
    * Physical extent of one voxel **of the returned volume** (source physical
    * size already multiplied by `scale_hint`), or null when the source declares
    * none — render isotropic then.
+   *
+   * All three are in the *same* unit, reconciled server-side: `physical_unit`
+   * is per-axis and adapters do not all normalise (NIfTI reports mm, the EM
+   * readers nm), so comparing them raw would stretch the volume by whatever the
+   * conversion factor was. Axes whose units differ and cannot be placed on a
+   * common scale come back null rather than as a plausible wrong ratio.
    */
   spacing: { z: number; y: number; x: number } | null;
-  /** Unit `spacing` is expressed in, e.g. "micrometer". Null when unknown. */
+  /**
+   * Unit `spacing` is expressed in — "µm" whenever the server could convert.
+   * Null when the axes agree on a unit it cannot name, which is still a valid
+   * ratio. Not needed to render: `spacing` is self-consistent either way.
+   */
   unit: string | null;
 }
 
