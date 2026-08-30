@@ -1839,7 +1839,25 @@ class TestSliceConversion:
         )
 
         assert list(level_slice.start) == [2, 10]  # 10//4=2, 20//2=10
-        assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
+        # Stop ceils: base 50 at factor 4 lands inside level pixel 12, which
+        # covers base 48..51, so a half-open range that stops at 12 would drop
+        # the two base rows the caller asked for.
+        assert list(level_slice.stop) == [13, 30]  # ceil(50/4)=13, ceil(60/2)=30
+
+    @pytest.mark.parametrize("stop", [999, 1000, 1001, 4097])
+    @pytest.mark.parametrize("factor", [2, 4, 8])
+    def test_the_level_extent_matches_what_decimating_would_return(self, stop, factor):
+        """The two read paths must agree on a ragged extent.
+
+        A computed read decimates (`data[::s]`) and returns `ceil(n/s)`; a
+        precompute read hands the level a translated slice. If they disagree,
+        the same region at the same scale has two answers depending only on
+        whether the tensor ships a pyramid (biopb/biopb#889).
+        """
+        from biopb_tensor_server.core.adapter_base import _convert_slice_to_level
+
+        level = _convert_slice_to_level(SliceHint(start=[0], stop=[stop]), [factor])
+        assert level.stop[0] - level.start[0] == len(range(0, stop, factor))
 
     def test_convert_slice_to_level_none_passthrough(self):
         from biopb_tensor_server.core.adapter_base import _convert_slice_to_level

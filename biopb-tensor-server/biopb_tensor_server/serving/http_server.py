@@ -718,7 +718,7 @@ _ADVERTISED_LOCK = threading.Lock()
 # array_id -> (version token, levels coarsest-first). Bounded by a flush rather
 # than an LRU: the entries are a handful of small tuples each, so the cap exists
 # only to keep an unbounded catalog from growing this forever.
-_ADVERTISED: Dict[str, Tuple[Optional[str], Tuple[_Level, ...]]] = {}
+_ADVERTISED: Dict[str, Tuple[str, Tuple[_Level, ...]]] = {}
 _ADVERTISED_MAX = 4096
 
 
@@ -752,16 +752,24 @@ def _advertised_levels(
     the ladder is a property of the stored content and cannot change while that
     does not.
 
+    **A tensor with no version is not memoized at all.** There is then nothing
+    that changes when the file does, so a stored ladder would outlive the content
+    it describes for the life of the process -- and a stale ladder is not a slow
+    tile, it is a read addressed to a level that may no longer be there. Such a
+    source pays one descriptor call per tile, which is the safe direction to err
+    and is what this route cost before any of this.
+
     Level 0 is dropped: an identity scale names full resolution, which is what a
     caller gets without asking for a level at all. A level whose arity does not
     match the shape is dropped rather than raised on -- a ladder this cannot read
     is one this route does not use, and the tile still has to be served.
     """
     key = td.array_id
-    with _ADVERTISED_LOCK:
-        hit = _ADVERTISED.get(key)
-    if hit is not None and hit[0] == version:
-        return hit[1]
+    if version is not None:
+        with _ADVERTISED_LOCK:
+            hit = _ADVERTISED.get(key)
+        if hit is not None and hit[0] == version:
+            return hit[1]
 
     ndim = len(td.shape)
     try:
@@ -792,10 +800,11 @@ def _advertised_levels(
     levels.sort(key=lambda level: _scale_magnitude(level.scale), reverse=True)
     result = tuple(levels)
 
-    with _ADVERTISED_LOCK:
-        if len(_ADVERTISED) >= _ADVERTISED_MAX:
-            _ADVERTISED.clear()
-        _ADVERTISED[key] = (version, result)
+    if version is not None:
+        with _ADVERTISED_LOCK:
+            if len(_ADVERTISED) >= _ADVERTISED_MAX:
+                _ADVERTISED.clear()
+            _ADVERTISED[key] = (version, result)
     return result
 
 
@@ -880,6 +889,29 @@ class _TileRead(NamedTuple):
     residual: Optional[List[int]]
 
 
+def _level_matches_grid(level: _Level, shape: Sequence[int]) -> bool:
+    """Whether *level*'s own extent is the one the tile grid derives.
+
+    :func:`_tile_levels` sizes every rung ``ceil(base / scale)``, and so does the
+    read path -- decimation returns ``ceil(extent / scale)``. A native level
+    whose writer **floored** its shape holds genuinely fewer pixels than that, so
+    routing a tile to it would promise a column the store does not have: a short
+    last tile at a ragged edge, and an *empty* one where the last tile is a
+    single pixel wide. Rather than reshape the published grid per rung, such a
+    level is left to the Flight clients that address it by name, and this route
+    reads the rung itself.
+
+    An unstated shape is not evidence of disagreement, so it passes: a computed
+    level is ceil by construction, and the check exists for on-disk levels.
+    """
+    if not level.shape:
+        return True
+    return len(level.shape) == len(shape) and all(
+        int(extent) == -(-int(base) // int(scale))
+        for base, scale, extent in zip(shape, level.scale, level.shape, strict=True)
+    )
+
+
 def _tile_read(
     shape: Sequence[int],
     y_idx: int,
@@ -910,6 +942,10 @@ def _tile_read(
     in-process reuses the level-0 chunks every other rung reads, where asking
     the data plane for the scale mints a second entry that nothing warmed.
 
+    A level whose stored extent disagrees with the grid's arithmetic is skipped
+    (:func:`_level_matches_grid`), so a rung never promises pixels the store does
+    not hold.
+
     Always a decimation, because a tile is the display path: it is read from
     whichever level of the server's pyramid is cheapest, and a stored level is
     the writer's downsampling whatever kernel the caller might have named. A
@@ -930,7 +966,9 @@ def _tile_read(
     """
     target = [1] * len(shape)
     target[y_idx] = target[x_idx] = 1 << level
-    picked = _pick_level(levels, target)
+    picked = _pick_level(
+        [entry for entry in levels if _level_matches_grid(entry, shape)], target
+    )
     if picked is not None:
         picked_level, residual = picked
         return _TileRead(

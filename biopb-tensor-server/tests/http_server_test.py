@@ -37,10 +37,10 @@ from fastapi.testclient import TestClient
 def _isolate_advertised_ladder():
     """The ladder memo is process-global and keyed on (array_id, version).
 
-    Two fixtures here reuse one array_id with different ladders and no content
-    version, which in production cannot happen -- ids are unique and a change of
-    content changes the token. In a test file it collides, and pytest-randomly
-    makes which way it collides depend on the seed.
+    Defensive: unversioned tensors are not memoized at all, and real ids are
+    unique, so a collision needs two fixtures sharing one array_id *and* one
+    version. Cheap enough to rule out rather than reason about per test, given
+    pytest-randomly decides the order.
     """
     _ADVERTISED.clear()
     yield
@@ -2511,14 +2511,12 @@ class TestTileResolutionCostsOneFetch:
             mock_fc.reset_mock()
             assert tc.get("/api/tile/multi/Image:1").status_code == 200
             mock_fc.list_sources.assert_not_called()
-            # Two fetches on first contact: the structural one this route makes
-            # per request by contract, and the pyramid ladder, which is memoized
-            # on the content version. What must not grow per tile is the second
-            # one -- so the next tile costs exactly one more.
-            first = mock_fc.get_descriptor.call_count
-            assert tc.get("/api/tile/multi/Image:1").status_code == 200
-            assert mock_fc.get_descriptor.call_count == first + 1
-            mock_fc.list_sources.assert_not_called()
+            # Two describes, no listing: the structural fetch this route makes
+            # per request by contract, and the pyramid ladder -- which this
+            # source pays for on every tile because it publishes no content
+            # version to memoize on. The catalog, the expensive half and the
+            # thing this class is about, is never touched.
+            assert mock_fc.get_descriptor.call_count == 2
 
     def test_a_bare_id_needs_no_listing_either(self):
         """bioio names a lone scene `<source>/Image:0`, so the server answers a
@@ -2915,7 +2913,9 @@ def _native_source_desc(plane=4096, scales=(2, 4)):
         dim_labels=["t", "c", "z", "y", "x"],
         physical_scale=[],
         physical_unit=[],
-        content_version=None,
+        # Versioned, so the ladder is memoizable -- an unversioned tensor is
+        # deliberately refetched every tile (see _advertised_levels).
+        content_version=b"native-v1",
         pyramid=[
             _pyramid_level(
                 [1, 1, 1, s, s],
@@ -3068,22 +3068,35 @@ class TestNativeLevelsOnTheTileRoute:
         ]
         assert all(entry["native"] for entry in pyramid)
 
+    @staticmethod
+    def _ladder_fetches(mock_fc):
+        return sum(
+            1
+            for call in mock_fc.get_descriptor.call_args_list
+            if call.kwargs.get("with_pyramid")
+        )
+
     def test_the_ladder_is_fetched_once_per_version(self, native_tile_client):
         tc, mock_fc = native_tile_client
-        before = sum(
-            1
-            for call in mock_fc.get_descriptor.call_args_list
-            if call.kwargs.get("with_pyramid")
-        )
+        before = self._ladder_fetches(mock_fc)
         for level in (1, 2, 3):
             tc.get("/api/tile/native", params={"level": level})
-        after = sum(
-            1
-            for call in mock_fc.get_descriptor.call_args_list
-            if call.kwargs.get("with_pyramid")
-        )
         # Memoized on the content version, so a tile burst pays for one.
-        assert after - before <= 1
+        assert self._ladder_fetches(mock_fc) - before == 1
+
+    def test_an_unversioned_tensor_refetches_the_ladder_every_tile(self, tile_client):
+        """No token means nothing changes when the file does.
+
+        Memoizing there would let a ladder outlive the content it describes for
+        the life of the process, and a stale ladder is not a slow tile -- it is
+        a read addressed to a level that may no longer exist. One descriptor
+        call per tile is the safe direction to err.
+        """
+        tc, mock_fc = tile_client
+        before = self._ladder_fetches(mock_fc)
+        for level in (0, 1):
+            tc.get("/api/tile/tiled", params={"level": level})
+        assert self._ladder_fetches(mock_fc) - before == 2
 
 
 class TestNativeLevelsOnTheVolumePath:
@@ -3117,3 +3130,69 @@ class TestNativeLevelsOnTheVolumePath:
         assert kwargs["scale_hint"] == [1, 1, 1, 4, 4]
         assert kwargs["reduction_method"] == "precompute"
         assert r.headers["X-Scale-Hint"] == "1,1,1,4,4"
+
+
+class TestRaggedPlanesComposeExactly:
+    """Both read paths must return the extent the published grid promises.
+
+    A rung served from a level and a rung read directly differ in where the bytes
+    come from, never in how many. On a ragged plane that is not automatic: the
+    grid is ceil, decimation is ceil, so the level slice has to be too. It
+    floored until biopb/biopb#889, which made the last tile one short -- and
+    where the last tile is a single pixel wide, empty.
+    """
+
+    EDGE = 512
+
+    @pytest.mark.parametrize(
+        "width", [2048, 2047, 1001, 1000, 999, 4095, 4097, 3000, 513]
+    )
+    @pytest.mark.parametrize("factor", [2, 4])
+    def test_the_last_tile_of_a_row_is_the_width_the_grid_published(
+        self, width, factor
+    ):
+        from biopb.tensor.descriptor_pb2 import SliceHint
+        from biopb_tensor_server.core.adapter_base import _convert_slice_to_level
+
+        grid = _tile_levels([1, 1, 1, width, width], 3, 4, self.EDGE)
+        for rung in grid:
+            scale = rung["scale"]
+            if scale % factor:
+                continue
+            col = rung["cols"] - 1
+            start = col * self.EDGE * scale
+            stop = min(start + self.EDGE * scale, width)
+            published = rung["width"] - col * self.EDGE
+
+            # Read the rung directly: the data plane decimates.
+            computed = len(range(0, stop - start, scale))
+            assert computed == published, f"computed, level {rung['level']}"
+
+            # Read a level and decimate the remainder here.
+            level = _convert_slice_to_level(
+                SliceHint(start=[start], stop=[stop]), [factor]
+            )
+            span = level.stop[0] - level.start[0]
+            assert len(range(0, span, scale // factor)) == published, (
+                f"via level, rung {rung['level']} factor {factor}"
+            )
+
+    def test_a_level_whose_writer_floored_its_shape_is_not_used(self):
+        """A floored store holds fewer pixels than the grid promises.
+
+        4097 at factor 2 is a 2049-wide rung; a level floored to 2048 cannot
+        serve its last tile. Left to the Flight clients that address it by name.
+        """
+        shape = [1, 1, 1, 4097, 4097]
+        floored = _Level((1, 1, 1, 2, 2), (1, 1, 1, 2048, 2048), "precompute", True)
+        assert _tile_read(shape, 3, 4, 1, [floored]).scale_hint is None
+
+        exact = _Level((1, 1, 1, 2, 2), (1, 1, 1, 2049, 2049), "precompute", True)
+        assert _tile_read(shape, 3, 4, 1, [exact]).scale_hint == [1, 1, 1, 2, 2]
+
+    def test_a_level_that_states_no_shape_is_still_usable(self):
+        # Computed levels are ceil by construction; the check exists for on-disk
+        # ones, and an unstated extent is not evidence of disagreement.
+        shape = [1, 1, 1, 4097, 4097]
+        unstated = _Level((1, 1, 1, 2, 2), (), "nearest", False)
+        assert _tile_read(shape, 3, 4, 1, [unstated]).scale_hint == [1, 1, 1, 2, 2]
