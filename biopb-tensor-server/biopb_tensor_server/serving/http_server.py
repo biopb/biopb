@@ -45,7 +45,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pyarrow.flight as flight
@@ -691,6 +691,158 @@ def _tile_edge(
     return max(1, min(edge, plane_max))
 
 
+# -- The advertised pyramid -------------------------------------------------
+#
+# The server decides the resolution ladder and publishes it on the descriptor,
+# one `PyramidLevel` per rung with the exact `scale_hint` its read path matches
+# on. Two kinds ride the same field:
+#
+# - **native** levels (OME-Zarr multiscales, QPTIFF): a real on-disk pyramid,
+#   `reduction_method="precompute"`. Reading one reads that level's own store.
+#   Reading the same scale any other way decimates full resolution on the fly,
+#   every time, which is what a pyramidal source used to get here
+#   (biopb/biopb#889).
+# - **computed** levels: what `build_pyramid_plan` emits and precache warms.
+#
+# Taking both from the descriptor is what lets this route stop *deriving* the
+# ladder. It used to recompute the warm rung from PRECACHE_PLANE_MAX_PIXELS and
+# admit in the docstring that a plane whose config this sidecar does not own
+# would cost a cold read. There is nothing left to be wrong about: the ladder
+# comes from the server that owns it.
+#
+# The tile ladder itself is untouched. Its rungs stay powers of two, which Viv's
+# PixelSource[] convention requires; what the descriptor decides is where a rung
+# is READ from.
+
+_ADVERTISED_LOCK = threading.Lock()
+# array_id -> (version token, levels coarsest-first). Bounded by a flush rather
+# than an LRU: the entries are a handful of small tuples each, so the cap exists
+# only to keep an unbounded catalog from growing this forever.
+_ADVERTISED: Dict[str, Tuple[str, Tuple[_Level, ...]]] = {}
+_ADVERTISED_MAX = 4096
+
+
+class _Level(NamedTuple):
+    """One rung of the server-advertised pyramid."""
+
+    scale: Tuple[int, ...]
+    shape: Tuple[int, ...]
+    method: str
+    native: bool
+
+
+def _scale_magnitude(scale: Sequence[int]) -> int:
+    """Product of a scale vector -- how much coarser than full resolution it is."""
+    total = 1
+    for value in scale:
+        total *= int(value)
+    return total
+
+
+def _advertised_levels(
+    client: TensorFlightClient, td: Any, version: Optional[str]
+) -> Tuple[_Level, ...]:
+    """The server's pyramid for *td*, coarsest first; ``()`` when it advertises none.
+
+    Fetched with a second ``get_descriptor`` rather than by flipping the
+    ``with_pyramid=False`` in :func:`_tensor_desc_by_array_id`: that one runs on
+    every request by contract ("fetch-per-call"), and per-level sizing is the
+    cost its mask exists to skip. Memoized on the tensor's content version
+    instead -- the same token the ETag already trusts, and the right one, since
+    the ladder is a property of the stored content and cannot change while that
+    does not.
+
+    **A tensor with no version is not memoized at all.** There is then nothing
+    that changes when the file does, so a stored ladder would outlive the content
+    it describes for the life of the process -- and a stale ladder is not a slow
+    tile, it is a read addressed to a level that may no longer be there. Such a
+    source pays one descriptor call per tile, which is the safe direction to err
+    and is what this route cost before any of this.
+
+    Level 0 is dropped: an identity scale names full resolution, which is what a
+    caller gets without asking for a level at all. A level whose arity does not
+    match the shape is dropped rather than raised on -- a ladder this cannot read
+    is one this route does not use, and the tile still has to be served.
+    """
+    key = td.array_id
+    if version is not None:
+        with _ADVERTISED_LOCK:
+            hit = _ADVERTISED.get(key)
+        if hit is not None and hit[0] == version:
+            return hit[1]
+
+    ndim = len(td.shape)
+    try:
+        pyramid = client.get_descriptor(key, with_pyramid=True).pyramid
+    except Exception:
+        # A ladder that could not be fetched is not a failed tile: fall back to
+        # reading the rung itself. Not cached, so a transient failure does not
+        # pin the tensor to the slow path for the life of the process.
+        logger.debug("tile: pyramid fetch failed for %s", key, exc_info=True)
+        return ()
+
+    levels = [
+        _Level(
+            scale=tuple(int(s) for s in level.scale_hint),
+            shape=tuple(int(d) for d in level.shape),
+            method=str(level.reduction_method or ""),
+            native=bool(level.native),
+        )
+        for level in pyramid
+    ]
+    levels = [
+        level
+        for level in levels
+        if len(level.scale) == ndim
+        and all(s >= 1 for s in level.scale)
+        and any(s > 1 for s in level.scale)
+    ]
+    levels.sort(key=lambda level: _scale_magnitude(level.scale), reverse=True)
+    result = tuple(levels)
+
+    if version is not None:
+        with _ADVERTISED_LOCK:
+            if len(_ADVERTISED) >= _ADVERTISED_MAX:
+                _ADVERTISED.clear()
+            _ADVERTISED[key] = (version, result)
+    return result
+
+
+def _pick_level(
+    levels: Sequence[_Level], target: Sequence[int]
+) -> Optional[Tuple[_Level, List[int]]]:
+    """``(level, residual)`` for the coarsest advertised level dividing *target*.
+
+    Coarsest by scale magnitude rather than by position, so the answer does not
+    depend on the order the levels arrive in -- picking a finer qualifying level
+    reads whole multiples more bytes for the same tile.
+
+    A level qualifies only if its factors divide the wanted scale on **every**
+    axis, which is what makes the residual whole. That also, for free, rules out
+    a level that downsamples an axis the caller wants kept: a 2-D tile request
+    carries 1 on z, and 1 % 2 != 0, so the 3-D target is never picked for a tile
+    while remaining the obvious pick for a volume.
+
+    The level's ``scale`` goes back to the caller verbatim because that is what
+    the read path matches on -- a native level's ``_find_level_for_scale``
+    compares for equality, so a recomputed-but-equivalent vector is a miss, not a
+    near miss; and a computed level's chunk_ids are the ones precache warmed.
+    """
+    best: Optional[_Level] = None
+    for level in levels:
+        if len(level.scale) != len(target):
+            continue
+        if not all(
+            int(t) % int(s) == 0 for s, t in zip(level.scale, target, strict=True)
+        ):
+            continue
+        if best is None or _scale_magnitude(level.scale) > _scale_magnitude(best.scale):
+            best = level
+    if best is None:
+        return None
+    return best, [int(t) // int(s) for s, t in zip(best.scale, target, strict=True)]
+
+
 def _tile_levels(
     shape: Sequence[int], y_idx: int, x_idx: int, edge: int
 ) -> List[Dict[str, int]]:
@@ -722,30 +874,114 @@ def _tile_levels(
         level += 1
 
 
-def _tile_warm_level(
-    shape: Sequence[int], y_idx: int, x_idx: int, plane_max_pixels: int
-) -> int:
-    """Coarsest level still read from the data plane; below it, tiles are synthesized.
+class _TileRead(NamedTuple):
+    """Where one rung is read from, and what is reduced afterwards.
 
-    The precache worker warms the rung whose plane first fits
-    ``pyramid.plane_max_pixels`` (docs/precache-policy.md 5). That rung is far
-    finer than this ladder's coarsest -- scale 8 vs scale 32 on a 14234 ND2 --
-    so warming one of the two would leave the other cold. Instead the tile route
-    reads *at* the warm level and reduces in-process for everything coarser,
-    which is exact under ``nearest`` (4.2) and mints no second cache entry.
-
-    ``plane_max_pixels`` is passed as the module default rather than read from
-    the serving plane's config: this sidecar can address a Flight plane whose
-    config file it does not own, so the local file is not authoritative. A
-    retuned plane therefore costs one cold read at the anchor -- the level is
-    still a level, the reduction still exact -- not a wrong answer.
+    ``scale_hint`` is an advertised level's vector, or ``None`` to read the rung
+    itself at ``read_level``. ``method`` is the ``reduction_method`` to send --
+    the chosen level's own -- or ``None`` to leave it to the server's default.
+    ``residual`` is the local decimation applied to the result, or ``None``.
     """
-    height, width = int(shape[y_idx]), int(shape[x_idx])
-    for level in range(25):
-        scale = 1 << level
-        if (-(-height // scale)) * (-(-width // scale)) <= plane_max_pixels:
-            return level
-    return 24
+
+    scale_hint: Optional[List[int]]
+    read_level: Optional[int]
+    method: Optional[str]
+    residual: Optional[List[int]]
+
+
+def _level_matches_grid(level: _Level, shape: Sequence[int]) -> bool:
+    """Whether *level*'s own extent is the one the tile grid derives.
+
+    :func:`_tile_levels` sizes every rung ``ceil(base / scale)``, and so does the
+    read path -- decimation returns ``ceil(extent / scale)``. A native level
+    whose writer **floored** its shape holds genuinely fewer pixels than that, so
+    routing a tile to it would promise a column the store does not have: a short
+    last tile at a ragged edge, and an *empty* one where the last tile is a
+    single pixel wide. Rather than reshape the published grid per rung, such a
+    level is left to the Flight clients that address it by name, and this route
+    reads the rung itself.
+
+    An unstated shape is not evidence of disagreement, so it passes: a computed
+    level is ceil by construction, and the check exists for on-disk levels.
+    """
+    if not level.shape:
+        return True
+    return len(level.shape) == len(shape) and all(
+        int(extent) == -(-int(base) // int(scale))
+        for base, scale, extent in zip(shape, level.scale, level.shape, strict=True)
+    )
+
+
+def _tile_read(
+    shape: Sequence[int],
+    y_idx: int,
+    x_idx: int,
+    level: int,
+    levels: Sequence[_Level],
+) -> _TileRead:
+    """Serve one rung from the coarsest advertised level that divides it.
+
+    The remainder is decimated in-process rather than asked of the data plane as
+    a separate scaled read, so one advertised level serves the whole tail of the
+    ladder above it (docs/precache-policy.md 4.2) and mints no second cache
+    entry. A rung *finer* than every advertised level reads full resolution,
+    which is the planner's own position: it omits the intermediate rungs because
+    they cost a client a level-0 read anyway and save it nothing.
+
+    What the level is decides what the read costs. A **computed** level is the
+    one precache warmed, so this is a warm read plus a decimation. A **native**
+    level is a read of that level's own store, which is the whole of
+    biopb/biopb#889 -- the same scale asked for any other way decimates full
+    resolution on the fly, every time.
+
+    A rung finer than every advertised level reads its own scale, with one
+    exception: a tensor whose ladder is *only* full resolution has no coarser
+    level to be finer than, so full resolution is itself the anchor and the tail
+    above it is still reduced from there. That is the shape the old
+    ``warm_level == 0`` case had, kept because it is the right one -- reducing
+    in-process reuses the level-0 chunks every other rung reads, where asking
+    the data plane for the scale mints a second entry that nothing warmed.
+
+    A level whose stored extent disagrees with the grid's arithmetic is skipped
+    (:func:`_level_matches_grid`), so a rung never promises pixels the store does
+    not hold.
+
+    Always a decimation, because a tile is the display path: it is read from
+    whichever level of the server's pyramid is cheapest, and a stored level is
+    the writer's downsampling whatever kernel the caller might have named. A
+    caller that wants a *specific* kernel wants ``POST /api/slice``, where
+    ``reduction_method`` is forwarded verbatim and is part of ``chunk_id``.
+
+    Exactness differs between the two kinds of level, and only the computed case
+    claims it: the
+    chunk grid is absolute, so a tile origin is a multiple of ``edge * 2**level``
+    and therefore on the sample grid at both scales -- ``data[::32]`` and
+    ``data[::8][::4]`` pick the same elements, and
+    ``ceil(ceil(n/a)/b) == ceil(n/(a*b))`` gives the same count. Reducing from a
+    **native** level does not reproduce a level-0 decimation, because the stored
+    level is the writer's downsampling and not ours. It reproduces what the
+    pyramid says the image looks like at that scale -- which is what every Flight
+    client following the advertised pyramid already gets, and the reason the
+    pyramid is worth reading at all.
+    """
+    target = [1] * len(shape)
+    target[y_idx] = target[x_idx] = 1 << level
+    picked = _pick_level(
+        [entry for entry in levels if _level_matches_grid(entry, shape)], target
+    )
+    if picked is not None:
+        picked_level, residual = picked
+        return _TileRead(
+            scale_hint=list(picked_level.scale),
+            read_level=None,
+            method=picked_level.method or None,
+            residual=residual if any(f > 1 for f in residual) else None,
+        )
+    if not levels and level > 0:
+        residual = [1] * len(shape)
+        residual[y_idx] = residual[x_idx] = 1 << level
+        return _TileRead([1] * len(shape), None, None, residual)
+    return _TileRead(None, level, None, None)
 
 
 # -- Volume (3-D) -----------------------------------------------------------
@@ -759,19 +995,34 @@ def _tile_warm_level(
 
 
 def _volume_plan(
-    shape: Sequence[int], dim_labels: Sequence[str], dtype: str
+    shape: Sequence[int],
+    dim_labels: Sequence[str],
+    dtype: str,
+    levels: Sequence[_Level],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """``(plan, None)`` for a tensor that can be rendered as one volume, else
     ``(None, reason)``.
 
-    The plan's ``scale_hint`` is the Flight ladder's coarsest level -- what
-    ``precache`` warms whole (5) and what ``scale_policy="volume"`` resolves to
-    on ``POST /api/slice``. Everything else in it is derived from that scale so
-    a client can size the read, and the VRAM it will cost, before issuing it.
+    The plan's ``scale_hint`` is the coarsest rung of ``levels`` -- the
+    server-advertised ladder, which is what ``precache`` warms whole (5) for a
+    computed pyramid and the coarsest stored level for a native one. It is what
+    ``scale_policy="volume"`` resolves to on ``POST /api/slice``. Everything
+    else in the plan is derived from that level so a client can size the read,
+    and the VRAM it will cost, before issuing it.
 
-    Like :func:`_tile_warm_level`, the ladder is computed from the module
-    defaults rather than from a config file this sidecar may not own. The cost
-    of a retuned plane is one cold read, not a wrong answer.
+    Taken from the descriptor rather than recomputed from the module defaults,
+    which is what this used to do: the plane's pyramid config belongs to the
+    Flight server, and this sidecar can address one whose config file it does
+    not own. A tensor that advertises no ladder at all gets full resolution --
+    the same answer, since there was no coarser level to find.
+
+    The one thing not taken on trust is the **size**. A server advertises a
+    native pyramid instead of its computed plan, so a ladder that downsamples
+    only Y/X leaves the 3-D voxel budget unapplied (biopb/biopb#891); this falls
+    back to the computed plan when that happens, and refuses when even that
+    cannot fit. The budget is the module default, which is the weaker half of
+    the same caveat -- but a ceiling from the wrong constant still bounds the
+    read, where no ceiling at all does not.
 
     The refusals are facts about the tensor, and each is a thing a 3-D renderer
     cannot do rather than a thing this route declines to do:
@@ -786,6 +1037,7 @@ def _volume_plan(
     """
     from biopb_tensor_server.core.axes import plane_axes
     from biopb_tensor_server.core.chunk import (
+        PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
         compute_pyramid_scale_hints,
         estimate_chunk_bytes,
         precache_z_index,
@@ -813,8 +1065,46 @@ def _volume_plan(
     if shape[z_idx] <= 1:
         return None, f"z axis (axis {z_idx}) has extent {shape[z_idx]}, not a volume"
 
-    scale = compute_pyramid_scale_hints(shape, dim_labels)[-1]
-    level_shape = [ceil_div(d, s) for d, s in zip(shape, scale, strict=True)]
+    # The coarsest advertised rung, or full resolution when nothing coarser is
+    # advertised. `level.shape` is the server's own extent for that level, which
+    # for a native level is the stored shape -- not necessarily `ceil_div(base,
+    # scale)`, since writers differ on how they round. Trust it where it is
+    # well-formed and fall back to the arithmetic where it is not.
+    coarsest = (
+        max(levels, key=lambda level: _scale_magnitude(level.scale)) if levels else None
+    )
+    scale = list(coarsest.scale) if coarsest is not None else [1] * len(shape)
+    method = (coarsest.method or None) if coarsest is not None else None
+    if coarsest is not None and len(coarsest.shape) == len(shape):
+        level_shape = list(coarsest.shape)
+    else:
+        level_shape = [ceil_div(d, s) for d, s in zip(shape, scale, strict=True)]
+    # Then bound it. A native pyramid is advertised *instead of* the computed
+    # plan (adapter_base._advertised_pyramid), and NGFF multiscales commonly
+    # downsample Y/X only -- so the coarsest level of a 3-D stack can be a
+    # full-depth volume with nothing having applied the 3-D budget at all
+    # (biopb/biopb#891). Unbounded here is not a slow render: an 11x-budget
+    # volume is gigabytes on the wire and gigabytes of VRAM after Viv's Float32
+    # upload, which kills the tab.
+    #
+    # The fallback is the server's own computed plan rather than a second
+    # planner living here -- this is a ceiling, not a choice of ladder. It costs
+    # a computed read (decimating full resolution, uncached) where the advertised
+    # level would have been cheap, which is the right trade against not
+    # rendering. Refuse only where Phase 2 itself cannot meet the budget, i.e.
+    # every axis already at the floor.
+    budget = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT**3
+    if level_shape[z_idx] * level_shape[y_idx] * level_shape[x_idx] > budget:
+        scale = list(compute_pyramid_scale_hints(shape, dim_labels)[-1])
+        method = None
+        level_shape = [ceil_div(d, s) for d, s in zip(shape, scale, strict=True)]
+        voxels = level_shape[z_idx] * level_shape[y_idx] * level_shape[x_idx]
+        if voxels > budget:
+            return None, (
+                f"the coarsest level this server can offer is {voxels:,} voxels, "
+                f"over the {budget:,} a 3-D texture holds"
+            )
+
     depth, height, width = (
         level_shape[z_idx],
         level_shape[y_idx],
@@ -823,6 +1113,10 @@ def _volume_plan(
     return {
         "axes": {"z": z_idx, "y": y_idx, "x": x_idx},
         "scale_hint": scale,
+        # The level's own reduction_method ("precompute" for a native level),
+        # sent verbatim: a native level is routed by exact scale match, so the
+        # method is half of the address, not a preference.
+        "reduction_method": method,
         "level_shape": level_shape,
         "depth": depth,
         "height": height,
@@ -834,7 +1128,7 @@ def _volume_plan(
     }, None
 
 
-def _volume_block(td: Any) -> Dict[str, Any]:
+def _volume_block(td: Any, levels: Sequence[_Level]) -> Dict[str, Any]:
     """The ``volume`` field of ``/api/tile_info``: what a 3-D read of *td* gets.
 
     Always present, and always answers the availability question first --
@@ -864,7 +1158,7 @@ def _volume_block(td: Any) -> Dict[str, Any]:
     are kept as they are, including when they are equally unknown, since a ratio
     of like-for-like is valid whether or not we can name the unit.
     """
-    plan, reason = _volume_plan(td.shape, td.dim_labels, td.dtype)
+    plan, reason = _volume_plan(td.shape, td.dim_labels, td.dtype, levels)
     if plan is None:
         return {"available": False, "reason": reason}
     axes = plan["axes"]
@@ -921,16 +1215,23 @@ def _volume_spacing(
 _SCALE_POLICIES = ("volume",)
 
 
-def _resolve_scale(req: SliceRequest, td: Any) -> Optional[List[int]]:
-    """The per-axis scale a ``/api/slice`` read is issued at.
+def _resolve_scale(
+    req: SliceRequest, td: Any, levels: Sequence[_Level]
+) -> Tuple[Optional[List[int]], Optional[str]]:
+    """``(scale, reduction_method)`` a ``/api/slice`` read is issued at.
 
     The caller's ``scale_hint`` unless it delegated the choice; see
     :func:`slice_tensor` for why delegating is the only way to hit the warm
     chunks for a volume.
+
+    The method rides along because under a policy the two are one answer: the
+    resolved level may be a **native** one, which is addressed by an exact
+    ``(scale_hint, "precompute")`` pair and would be missed by either half
+    alone. ``None`` means the caller's own method stands.
     """
     policy = (req.scale_policy or "").strip().lower()
     if not policy:
-        return req.scale_hint or None
+        return req.scale_hint or None, None
     if req.scale_hint:
         raise HTTPException(
             status_code=422,
@@ -946,7 +1247,7 @@ def _resolve_scale(req: SliceRequest, td: Any) -> Optional[List[int]]:
                 f"unknown scale_policy {policy!r} (known: {', '.join(_SCALE_POLICIES)})"
             ),
         )
-    plan, reason = _volume_plan(td.shape, td.dim_labels, td.dtype)
+    plan, reason = _volume_plan(td.shape, td.dim_labels, td.dtype, levels)
     if plan is None:
         # The same sentence /api/tile_info's `volume.reason` carries, so a
         # client that skipped the info call is told the same thing.
@@ -954,7 +1255,7 @@ def _resolve_scale(req: SliceRequest, td: Any) -> Optional[List[int]]:
             status_code=422,
             detail=f"scale_policy='volume' does not apply to {td.array_id!r}: {reason}",
         )
-    return list(plan["scale_hint"])
+    return list(plan["scale_hint"]), plan["reduction_method"]
 
 
 def _resolve_tile_level(
@@ -1200,6 +1501,7 @@ def _tile_slices(
     row: int,
     resolved: Dict[int, int],
     read_level: Optional[int] = None,
+    read_scale_hint: Optional[Sequence[int]] = None,
 ) -> Tuple[List[int], List[int], List[int]]:
     """``(slice_start, slice_stop, scale_hint)`` for one tile.
 
@@ -1211,7 +1513,13 @@ def _tile_slices(
     the *bounds* always come from the level being addressed, while the
     ``scale_hint`` comes from the level actually read. Passing a finer
     ``read_level`` asks for the same world region at a finer sampling, which the
-    caller then reduces the rest of the way -- see :func:`_tile_warm_level`.
+    caller then reduces the rest of the way -- see :func:`_tile_read`.
+
+    ``read_scale_hint`` overrides that derivation with a whole per-axis vector,
+    for the one source of a rung that is not a power of two on Y/X: a native
+    pyramid level, whose scale must go to the adapter exactly as advertised
+    (:func:`_pick_level`). It supersedes ``read_level``; the bounds are
+    unaffected either way.
 
     Assumes ``(level, col, row)`` already passed :func:`_resolve_tile_level` and
     the selection :func:`_resolve_tile_selection`; this derives geometry and does
@@ -1230,7 +1538,10 @@ def _tile_slices(
 
     start[y_idx], stop[y_idx] = y0, min(y0 + step, shape[y_idx])
     start[x_idx], stop[x_idx] = x0, min(x0 + step, shape[x_idx])
-    scale_hint[y_idx] = scale_hint[x_idx] = read_scale
+    if read_scale_hint is not None:
+        scale_hint = [int(s) for s in read_scale_hint]
+    else:
+        scale_hint[y_idx] = scale_hint[x_idx] = read_scale
 
     # Every leading axis collapses to one index so the response is a single
     # plane; an axis left whole would silently multiply the payload.
@@ -1582,6 +1893,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
         # delivery mechanism -- no new field, no client change (biopb/biopb#780).
         td, version = _tensor_desc_by_array_id(client, array_id)
         candidates = [] if td is not None else _tensor_candidates(client, array_id)
+        levels = () if td is None else _advertised_levels(client, td, version)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1595,7 +1907,6 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
         )
 
     from biopb_tensor_server.core.axes import labeled_axis_index, plane_axes
-    from biopb_tensor_server.core.chunk import PRECACHE_PLANE_MAX_PIXELS
 
     shape = [int(d) for d in td.shape]
     dim_labels = list(td.dim_labels)
@@ -1622,17 +1933,24 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
                 dim_labels, shape, _plane_axes_set(y_idx, x_idx, s_idx)
             ),
             "levels": _tile_levels(shape, y_idx, x_idx, edge),
-            # Advisory: the level precache warms, and so the coarsest one this
-            # route reads from the data plane. Published for diagnosis -- the
-            # levels above are addressed identically either way.
-            "warm_level": _tile_warm_level(
-                shape, y_idx, x_idx, PRECACHE_PLANE_MAX_PIXELS
-            ),
+            # Advisory: the ladder the SERVER advertises, which is what the rungs
+            # above are actually read from -- a native on-disk level where the
+            # source ships one, else the computed level precache warms. Published
+            # for diagnosis; the rungs are addressed identically either way.
+            "pyramid": [
+                {
+                    "scale_hint": list(level.scale),
+                    "shape": list(level.shape),
+                    "reduction_method": level.method,
+                    "native": level.native,
+                }
+                for level in levels
+            ],
             # Not a rung of this ladder -- a 3-D renderer takes one whole
             # volume, not tiles -- but published here because this is the one
             # call a viewer already makes before it can address the tensor at
             # all. What it describes is the read `scale_policy="volume"` issues.
-            "volume": _volume_block(td),
+            "volume": _volume_block(td, levels),
         }
     )
 
@@ -1704,9 +2022,29 @@ async def get_tile(
             ),
         )
 
+    if reduction_method:
+        from biopb_tensor_server.core.downsample import normalize_reduction_method
+
+        if normalize_reduction_method(reduction_method) != "nearest":
+            # 410 for the same reason `fmt` is: the form was valid and is now
+            # withdrawn, which a caller pinned to an older server needs told
+            # apart from a typo. A tile is the display path -- it is served from
+            # whichever level of the server's pyramid is cheapest, so what it
+            # once selected was a *store*, not a kernel. Aliases resolve first,
+            # so `decimate` is still `nearest` and still fine.
+            raise HTTPException(
+                status_code=410,
+                detail=(
+                    f"reduction_method={reduction_method!r} on a tile was "
+                    "withdrawn: tiles are read from the server's pyramid, whose "
+                    "levels carry their own reduction. Use POST /api/slice to "
+                    "choose a kernel"
+                ),
+            )
+
     # Cheapest possible bail-out, before any backend call: under a tile burst
     # this handler may have sat in the queue long enough for the browser to pan
-    # away and abort. Repeated below, once the geometry is known and the
+    # away and abort. Repeated below, once the tile is known to exist and the
     # expensive read is the next thing that would happen.
     await _abort_if_client_gone(request, ctx)
 
@@ -1733,11 +2071,7 @@ async def get_tile(
         )
 
     from biopb_tensor_server.core.axes import plane_axes
-    from biopb_tensor_server.core.chunk import PRECACHE_PLANE_MAX_PIXELS
-    from biopb_tensor_server.core.downsample import (
-        downsample_block,
-        normalize_reduction_method,
-    )
+    from biopb_tensor_server.core.downsample import downsample_block
 
     shape = [int(d) for d in td.shape]
     dim_labels = list(td.dim_labels)
@@ -1747,21 +2081,6 @@ async def get_tile(
         )
     y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
     edge = _tile_edge(shape, [int(d) for d in td.chunk_shape], y_idx, x_idx)
-
-    # Everything coarser than the warm level is reduced from it in-process
-    # rather than asking the data plane for a separate scaled read, so the one
-    # warmed level serves the whole tail of the ladder (precache-policy.md 4.2).
-    #
-    # Exact only under `nearest`, and only because the chunk grid is absolute:
-    # a tile origin is a multiple of `edge * 2**level`, hence on the sample grid
-    # at both scales, so `data[::32]` and `data[::8][::4]` pick the same
-    # elements and `ceil(ceil(n/a)/b) == ceil(n/(a*b))` gives the same count.
-    # `area` pads and re-averages, so it must keep reading its own level.
-    warm_level = _tile_warm_level(shape, y_idx, x_idx, PRECACHE_PLANE_MAX_PIXELS)
-    synthesized = level > warm_level and (
-        normalize_reduction_method(reduction_method or "") == "nearest"
-    )
-    read_level = warm_level if synthesized else level
 
     # Before the ETag, not after: a revalidation must not be able to answer 304
     # for a tile that does not exist, and an out-of-grid request should cost the
@@ -1787,7 +2106,6 @@ async def get_tile(
             # two cache entries for one tile, and a parameter the resolution
             # ignored must not vary the key at all.
             ("sel", ",".join(f"{i}:{v}" for i, v in sorted(resolved.items()))),
-            ("red", reduction_method or ""),
             ("edge", edge),
             # The source's CURRENT version, not the one the caller asked for.
             # The versioned URL already changes on a re-index; this is what
@@ -1815,29 +2133,48 @@ async def get_tile(
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=cache_headers)
 
-    start, stop, scale_hint = _tile_slices(
-        td, y_idx, x_idx, s_idx, edge, level, col, row, resolved, read_level
-    )
-
     # Last chance to skip the read: on a saturated loop this request may have sat
-    # in the queue long enough for the browser to pan away and abort it.
+    # in the queue long enough for the browser to pan away and abort it. The tile
+    # is already known to exist -- the resolution above refused an out-of-grid
+    # one -- so what is skipped here is only the expensive half.
     await _abort_if_client_gone(request, ctx)
 
     def _read() -> np.ndarray:
+        # Resolved here, not above: reading the ladder costs a Flight call on a
+        # cache miss (_advertised_levels) and this is the event loop. Nothing
+        # between the handler's entry and the read depends on the answer.
+        plan = _tile_read(
+            shape,
+            y_idx,
+            x_idx,
+            level,
+            _advertised_levels(client, td, current_version),
+        )
+        start, stop, scale_hint = _tile_slices(
+            td,
+            y_idx,
+            x_idx,
+            s_idx,
+            edge,
+            level,
+            col,
+            row,
+            resolved,
+            read_level=plan.read_level,
+            read_scale_hint=plan.scale_hint,
+        )
         arr_lazy = client.get_tensor(
             # The array_id the geometry above was read from, not a rebuilt one:
             # the two used to be derived separately and could disagree.
             td.array_id,
             slice_hint=_build_slice_hint(start, stop),
             scale_hint=scale_hint,
-            reduction_method=reduction_method or None,
+            reduction_method=plan.method,
         )
         arr = _normalize_array(arr_lazy.compute())
-        if not synthesized:
+        if plan.residual is None:
             return arr
-        factors = [1] * arr.ndim
-        factors[y_idx] = factors[x_idx] = 1 << (level - read_level)
-        return _normalize_array(downsample_block(arr, tuple(factors), "nearest"))
+        return _normalize_array(downsample_block(arr, tuple(plan.residual), "nearest"))
 
     try:
         # Off the event loop, and not only to keep this request responsive: a
@@ -1921,7 +2258,7 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         # The same resolution the tile routes use, so one id cannot mean two
         # tensors depending on which route asked. It also refuses a bare
         # source_id on a multi-tensor source rather than guessing (#75).
-        td, _ = _tensor_desc_by_array_id(client, req.array_id)
+        td, version = _tensor_desc_by_array_id(client, req.array_id)
         if td is None:
             raise HTTPException(
                 status_code=404,
@@ -1931,7 +2268,11 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
             )
 
         slice_hint = _build_slice_hint(req.slice_start, req.slice_stop)
-        scale_hint = _resolve_scale(req, td)
+        # Only a delegating read needs the ladder, and fetching it costs a
+        # descriptor call on a cold cache -- so a caller that named its own
+        # scale does not pay for one.
+        levels = _advertised_levels(client, td, version) if req.scale_policy else ()
+        scale_hint, scale_method = _resolve_scale(req, td, levels)
 
         # Last chance to skip the read, and the one that matters most on this
         # route: a scale_policy read is a whole volume, so the queue behind it
@@ -1945,7 +2286,7 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
                 td.array_id,
                 slice_hint=slice_hint,
                 scale_hint=scale_hint,
-                reduction_method=req.reduction_method or None,
+                reduction_method=scale_method or req.reduction_method or None,
             )
             return _normalize_array(arr_lazy.compute())
 

@@ -1503,11 +1503,25 @@ def _convert_slice_to_level(
     so it is a module function, not a method: it reads no adapter state, and
     ``TensorAdapter._plan_precomputed_read`` supplies the level's downsample
     factors from the per-format hook.
+
+    Start floors and stop **ceils**, so the half-open range covers every level
+    pixel the base range touches. Flooring both -- which this did until
+    biopb/biopb#889 -- drops the partial pixel at a ragged end, and that is not
+    a rounding taste: it disagrees with the computed path, which decimates with
+    ``data[::s]`` and therefore returns ``ceil(extent / s)``. The two must
+    agree, because the same region at the same scale is served either way
+    depending only on whether the tensor happens to ship a pyramid. Worked
+    through, a level read of ``[a, b)`` at factor ``f`` then reduced by ``r``
+    yields ``ceil(ceil((b-a)/f)/r) == ceil((b-a)/(f*r))`` -- the computed count
+    exactly. With a floored stop the identity breaks, and where the last tile is
+    one pixel wide the result is empty rather than short.
     """
     if slice_hint is None:
         return None
     level_start = [s // sc for s, sc in zip(slice_hint.start, level_scale, strict=True)]
-    level_stop = [s // sc for s, sc in zip(slice_hint.stop, level_scale, strict=True)]
+    level_stop = [
+        ceil_div(s, sc) for s, sc in zip(slice_hint.stop, level_scale, strict=True)
+    ]
     return SliceHint(start=level_start, stop=level_stop)
 
 

@@ -24,7 +24,6 @@ export interface SliceState {
    * the tensor in view", so it does not survive one.
    */
   axes: Record<string, number>;
-  reductionMethod: string;
   percentileScale: number;  // 0 = min-max, 1 = 1-99 percentile, 2 = 2-98 percentile
   useMinMax: boolean;  // When true, use full min-max range (0-100 percentile)
   // Display-only exponent applied to the normalized intensity, after the
@@ -144,7 +143,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     z: 0,
     c: 0,
     axes: {},
-    reductionMethod: "area",
     percentileScale: 1,  // Default 1-99 percentile
     useMinMax: false,
     gamma: 1,

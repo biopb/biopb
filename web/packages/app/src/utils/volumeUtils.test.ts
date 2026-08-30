@@ -3,6 +3,7 @@ import type { TileInfo, VolumeAvailable } from "@biopb/tensor-flight-client";
 import {
   DEFAULT_VOLUME_RENDER_MODE,
   VOLUME_MAX_BYTES,
+  VOLUME_MAX_VOXELS,
   VOLUME_RENDER_MODES,
   volumeCentre,
   volumeKey,
@@ -47,6 +48,12 @@ function makeInfo(over: Partial<TileInfo> = {}): TileInfo {
 }
 
 const AT_ORIGIN = { t: 0, z: 0, c: 0, axes: {} };
+
+/** Extents whose product is `voxels`, shaped like a deep stack. */
+function volumeOf(voxels: number) {
+  const plane = 512;
+  return { depth: Math.ceil(voxels / (plane * plane)), height: plane, width: plane };
+}
 
 describe("volumeRefusal", () => {
   it("passes a tensor the server says has a volume", () => {
@@ -197,5 +204,30 @@ describe("VOLUME_RENDER_MODES", () => {
     const keys = VOLUME_RENDER_MODES.map((m) => m.key);
     expect(new Set(keys).size).toBe(keys.length);
     expect(keys).toEqual(["mip", "additive", "minip"]);
+  });
+});
+
+describe("volumeRefusal — the voxel ceiling", () => {
+  // A native pyramid is advertised instead of the computed plan, so one that
+  // downsamples only Y/X leaves a full-depth volume with no 3-D budget applied
+  // (biopb/biopb#891). Bytes do not catch it: at uint8 a volume can be six
+  // times the server's voxel budget and still land under VOLUME_MAX_BYTES.
+  it("refuses a volume that would not fit in VRAM even when the bytes fit", () => {
+    const voxels = VOLUME_MAX_VOXELS * 2;
+    const bytes = voxels; // uint8: one byte per voxel
+    expect(bytes).toBeLessThan(VOLUME_MAX_BYTES);
+    const info = makeInfo({ volume: makeVolume({ ...volumeOf(voxels), bytes }) });
+    expect(volumeRefusal(info)).toMatch(/GPU memory/);
+  });
+
+  it("admits the server's own budget with headroom", () => {
+    // 448**3 is 343 MB at 4 bytes per voxel -- comfortably inside the ceiling,
+    // so the guard never refuses a plan the server actually bounded.
+    const voxels = 448 ** 3;
+    expect(voxels).toBeLessThan(VOLUME_MAX_VOXELS);
+    const info = makeInfo({
+      volume: makeVolume({ ...volumeOf(voxels), bytes: voxels * 2 }),
+    });
+    expect(volumeRefusal(info)).toBeNull();
   });
 });

@@ -374,6 +374,18 @@ class PrecacheWorker:
         # warming is wasted I/O. Per-tensor because pyramid support can vary
         # between tensors of one source (a pyramidal main series alongside flat
         # label/macro series).
+        #
+        # That premise is only true because something reads those levels, which
+        # was not so until biopb/biopb#889: the HTTP sidecar now routes each tile
+        # to the coarsest advertised level that divides it, and a native level is
+        # addressed by an exact (scale_hint, "precompute") pair. Before that a
+        # pyramidal source got neither its native levels nor a warm cache.
+        #
+        # Warming them anyway would be worse than useless. The cache is a bounded
+        # pool and the whole design constraint here is residency (see
+        # PrecacheConfig.enabled): every native chunk warmed evicts a computed one
+        # that costs far more to reproduce -- a computed level has to read all of
+        # level 0 to exist, where a native level is a read of its own store.
         try:
             if tensor_adapter.has_native_pyramid():
                 logger.debug(

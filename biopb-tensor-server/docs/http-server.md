@@ -166,12 +166,35 @@ a tile grid — shaped to drop into a Viv `PixelSource[]`:
   "selectable": {"t": 0, "c": 1, "z": 2},
   "sel_axes": [],
   "levels": [{"level":0,"scale":1,"height":512,"width":512,"cols":1,"rows":1}],
+  "pyramid": [{"scale_hint":[1,1,1,2,2],"shape":[1,3,16,256,256],
+               "reduction_method":"precompute","native":true}],
   "volume": {"available": true, "reason": null,
              "axes": {"z":2,"y":3,"x":4}, "scale_hint": [1,1,1,1,1],
              "depth": 16, "height": 512, "width": 512, "bytes": 8388608,
              "spacing": null, "unit": null}
 }
 ```
+
+`levels` is the ladder a client addresses — always powers of two, because Viv's
+`PixelSource[]` convention requires it. `pyramid` is the ladder the **server**
+advertises, and is what each rung is actually *read from*: a tile is served by
+the coarsest entry whose `scale_hint` divides the rung's scale, with the
+remainder decimated in-process. Level 0 is omitted (it names full resolution,
+which a caller gets without asking) and the list is coarsest first.
+
+Two kinds ride the same field. A **native** entry (`native: true`,
+`reduction_method: "precompute"`) is a real on-disk level — OME-Zarr
+multiscales, a pyramidal QPTIFF — and reading it reads that level's own store.
+A **computed** entry is what the precache worker warms. Either way the rungs are
+addressed identically, so `pyramid` is advisory: it is published for diagnosis,
+and because it is the only place a client can see *why* one source's tiles are
+cheap and another's are not.
+
+A tile always decimates. `reduction_method` used to be accepted here and is
+**withdrawn** (below): a tile is the display path, so what it selected in
+practice was a *store* — opt out of the pyramid, decimate full resolution —
+rather than a kernel, and a stored level carries the writer's downsampling
+whatever a caller names. `POST /api/slice` is where a kernel is a real choice.
 
 `volume` is the odd one out: it is not a rung of `levels` and does not belong to
 the tile grid at all. A 3-D renderer takes one whole volume rather than tiles, so
@@ -186,6 +209,15 @@ multiplied by `scale_hint`, and with the three axes reduced to one unit
 `mm`, the EM readers `nm`). `null` when the source declares no size, or when
 the axes carry units that differ and cannot all be placed on a common scale —
 a plausible wrong ratio is worse than rendering isotropic.
+
+`volume.scale_hint` is normally the coarsest entry of `pyramid`, but it is
+**bounded** rather than taken on trust. A native ladder is advertised instead of
+the server's computed plan, so one that downsamples only Y/X leaves a full-depth
+volume that no 3-D voxel budget has been applied to (biopb/biopb#891) — at
+gigabyte scale on the wire and in VRAM. Over the budget, the plan falls back to
+the computed scale and `reduction_method` comes back `null`, saying the read is
+no longer addressed to a stored level. Clients should read the extents rather
+than assume the plan matches a `pyramid` entry.
 
 `selectable` gives the wire index of each **named** slider axis, or `null`.
 `sel_axes` is the converse and is the one worth reading: non-plane axes with
@@ -244,6 +276,12 @@ publishes — a level the tensor does not have, or a tile outside that level's
 `fmt` accepts only `raw`. The server-composited `png` / `jpeg` forms were removed
 with the server-rendered viewer and now answer **410** — a deliberate refusal
 rather than silently handing raw bytes to a caller that asked for an image.
+
+`reduction_method` answers **410** for the same reason, unless it names the
+decimation tiles already do (`nearest`, or an alias of it such as `decimate`,
+which is accepted and ignored). Serving pixels reduced by a different kernel
+than the caller asked for is exactly the silent substitution the 410 exists to
+prevent. It is no longer part of the ETag: nothing about a tile varies with it.
 
 `t`/`z`/`c` are checked against the axis they name, not merely against `ge=0`: an
 index past the axis extent is **422**, and so is a *non-zero* index on an axis the
