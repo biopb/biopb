@@ -371,17 +371,23 @@ def test_empty_config_reproduces_dataclass_defaults():
             )
 
 
-def test_speculative_warming_ships_off():
-    """Precache defaults to off, and an explicit opt-in still turns it on.
+def test_speculative_warming_ships_on_and_bounded():
+    """Precache defaults to on, and an explicit opt-out still turns it off.
 
     Not a value the other defaults test can catch: it compares parse_config({})
     against the dataclass, so both halves flipping together stays green. The
-    shipped answer is a policy call -- speculative warming only pays off on a
-    cache large enough to keep what it warms, which the 4 GiB default is not --
-    so it is pinned here rather than left to whoever last edited the dataclass.
+    shipped answer is a policy call, so it is pinned here rather than left to
+    whoever last edited the dataclass.
+
+    It ships on because the warm set is now bounded -- at most two levels per
+    tensor, each capped by warm_budget_bytes over a centred window. That bound is
+    the whole premise, so the budget is pinned alongside it: warming defaults on
+    only for as long as it stays finite (biopb/biopb#826 turned it off when it
+    did not).
     """
-    assert parse_config({}).precache.enabled is False
-    assert parse_config({"precache": {"enabled": True}}).precache.enabled is True
+    assert parse_config({}).precache.enabled is True
+    assert parse_config({"precache": {"enabled": False}}).precache.enabled is False
+    assert parse_config({}).precache.warm_budget_bytes == 256 * 1024 * 1024
 
 
 def test_present_keys_override_defaults_only_where_set():

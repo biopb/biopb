@@ -11,7 +11,7 @@ import logging
 import os
 import struct
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
@@ -567,10 +567,17 @@ def estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
     return num_elements * np.dtype(dtype).itemsize
 
 
-# Defaults mirroring biopb-mcp's [pyramid] config (build_pyramid_levels). These
-# decide the coarsest pyramid level the client requests on open; the precache
-# worker must warm exactly that scale or its chunk_ids won't match. Keep in sync
-# with biopb-mcp/src/biopb_mcp/_config.py if that is retuned.
+# The policy, and now the only copy of it. These decide the coarsest level the
+# server advertises, which is the level a client opens at and the level the
+# precache worker warms -- one derivation, so the chunk_ids cannot fail to
+# match.
+#
+# They used to mirror biopb-mcp's [pyramid] config, which ran the same loop
+# client-side; "keep the two in sync" was the instruction. That loop is gone --
+# the client reads the advertised pyramid and computes nothing -- so retuning
+# these is a server-side change with no counterpart to update. (biopb-mcp's
+# pyramid.* keys still exist in its schema and admin UI with no consumer left
+# behind them; removing them is a separate, user-facing change.)
 PRECACHE_THRESHOLD = 4096
 PRECACHE_DOWNSCALE_FACTOR = 2
 # 448**3 = 90 Mvox. The coarsest level is uploaded whole as one 3-D texture by
@@ -626,12 +633,34 @@ def precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
 def compute_pyramid_scale_hints(
     shape: Sequence[int],
     dim_labels=None,
+    **kwargs: int,
+) -> List[List[int]]:
+    """Per-axis scale_hint for each level of a computed pyramid: **at most three**.
+
+    :func:`_pyramid_levels` without its phase provenance, which only the warm
+    planner needs.
+    """
+    return _pyramid_levels(shape, dim_labels, **kwargs)[0]
+
+
+def _pyramid_levels(
+    shape: Sequence[int],
+    dim_labels=None,
     threshold: int = PRECACHE_THRESHOLD,
     downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
     pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
     plane_max_pixels: int = PRECACHE_PLANE_MAX_PIXELS,
-) -> List[List[int]]:
-    """Per-axis scale_hint for each level of a computed pyramid: **at most three**.
+) -> Tuple[List[List[int]], List[bool]]:
+    """``(scales, volumetric)`` -- the pyramid, and which level is the 3-D target.
+
+    ``volumetric[i]`` is True for exactly the level Phase 2 produced, and only
+    when there is a depth axis for a renderer to consume whole. It is answered
+    here because only this function knows which phase emitted which level: a
+    plan of length 2 may be Phase 1's target *or* Phase 2's, and reading it off
+    the shape instead ("has a z axis") flags a 2-D target as volumetric, which
+    exempts its Z from the warm budget and lets one level warm past it.
+
+    Everything below documents the levels themselves.
 
     Full resolution, then the two levels the precache worker warms (see
     ``docs/precache-policy.md`` §4.1, §5):
@@ -679,7 +708,7 @@ def compute_pyramid_scale_hints(
     # also keeps build_pyramid_plan / get_flight_info from raising on 1-D (or 0-D)
     # tensors, where _precache_xy_indices has no X/Y to resolve.
     if ndim < 2:
-        return [[1] * ndim]
+        return [[1] * ndim], [False]
 
     budget = pixel_budget_cubic_root**3
     floor = min(pixel_budget_cubic_root, threshold)
@@ -735,10 +764,16 @@ def compute_pyramid_scale_hints(
         if (ntx, nty, ntz) == (tx, ty, tz):
             break  # every axis is at the floor; the budget cannot be met
         tx, ty, tz = ntx, nty, ntz
+    volumetric = [False] * len(scales)
     if (tx, ty, tz) != (sx, sy, sz):
         scales.append(_scale_vector(tx, ty, tz))
+        # Only THIS level is the 3-D target, and only when there is a depth axis
+        # for it to consume whole. Phase 2 can fire without scaling Z (Z already
+        # under the floor -- a 181-plane stack), so "did Z change" is not the
+        # question; provenance is, and only this loop knows it.
+        volumetric.append(z_idx is not None and int(shape[z_idx]) > 1)
 
-    return scales
+    return scales, volumetric
 
 
 def compute_precache_scale_hint(
@@ -759,19 +794,166 @@ def compute_precache_scale_hint(
     return compute_pyramid_scale_hints(shape, dim_labels, **kwargs)[-1]
 
 
+class WarmTarget(NamedTuple):
+    """One level the precache worker warms, and how Z is to be treated there.
+
+    ``volumetric`` marks the 3-D target. It decides whether Z is a *selection*
+    axis: a 2-D renderer displays one plane, so Z can be narrowed like T and C,
+    but napari's 3-D mode reads the coarsest level whole
+    (``layers/_scalar_field/_slice.py``) and a Z-narrowed warm would miss every
+    chunk of it. Provenance, not a property of the scale vector -- Phase 2 leaves
+    Z alone when it already sits under the per-axis floor (a 181-plane stack), so
+    "was Z scaled?" cannot answer this.
+    """
+
+    scale_hint: List[int]
+    volumetric: bool
+
+
+def compute_warm_targets(
+    shape: Sequence[int],
+    dim_labels=None,
+    **kwargs: int,
+) -> List[WarmTarget]:
+    """Every level the precache worker should warm: at most two, possibly none.
+
+    :func:`compute_pyramid_scale_hints` without its full-resolution level, each
+    tagged with whether it is the 3-D target. An empty result means the tensor
+    passed neither gate and warming it would cache the source 1:1 -- the caller
+    skips rather than testing scale vectors for all-ones.
+    """
+    scales, volumetric = _pyramid_levels(shape, dim_labels, **kwargs)
+    return [
+        WarmTarget(scale, is_3d)
+        for scale, is_3d in zip(scales[1:], volumetric[1:], strict=True)
+    ]
+
+
+# 256 MiB, per warm level. Not sized to make a catalog fit -- at a few hundred
+# tensors nothing in the hundreds of MiB does, and the backlog high-water gate is
+# what stops a full cache. What it bounds is one tensor eating the cache, and
+# above the first plane it buys *scrub headroom*: at this value a 200-plane
+# confocal keeps 128 of its Z planes rather than 32, so paging through the stack
+# stays warm instead of only the opening slab.
+PRECACHE_WARM_BUDGET_BYTES = 256 * 1024 * 1024
+
+# Order in which selection axes give up extent when a level is over budget.
+# Unnamed axes (a plate's POS, a sequence's `i`) go first and are not in this
+# tuple -- they are independent acquisitions like T, and a viewer opens on one.
+# Then T: frames are independent and a user views very few. Then Z: scrubbed,
+# but locally, so a contiguous slab keeps its value. C last: typically 2-4, so
+# keeping it whole is cheap, and toggling channels is the first thing a user
+# does after open.
+WARM_REDUCE_ORDER = ("t", "z", "c")
+
+
+def compute_warm_selection(
+    shape: Sequence[int],
+    dim_labels,
+    scale_hint: Sequence[int],
+    itemsize: int,
+    volumetric: bool = False,
+    budget_bytes: int = PRECACHE_WARM_BUDGET_BYTES,
+) -> Tuple[List[int], List[int]]:
+    """``(start, stop)`` in full-resolution coords for the part worth warming.
+
+    A warm level is a *plane* (or, when ``volumetric``, a volume) repeated across
+    every other axis. Warming the whole cross-product is what makes the warm set
+    unbounded -- 1000 planes at 1500² is 4.3 GiB where one is 4.3 MiB -- so the
+    plane is kept whole and the selection axes give up extent, in
+    :data:`WARM_REDUCE_ORDER`, until the level fits ``budget_bytes``.
+
+    **The window starts at index 0**, because that is where a viewer opens.
+
+    napari's own default is the middle -- ``_add_layer_from_data`` slices once at
+    the dims default and then calls ``dims._go_to_center_step()``
+    (``components/viewer_model.py``) -- but the tensor browser suppresses that
+    second move (``_tensor_utils._origin_initial_view``) precisely so the opening
+    slice and the slice already decoded are the same one. On a source with no
+    native pyramid each is a full-resolution decode, so letting them differ
+    doubles a cold open. The SPA opens its sliders at 0 for the same reason.
+
+    So all three say index 0 independently -- no client asks the server what is
+    warm, and none could. A centred window would spend the whole budget on
+    planes the only two clients do not display.
+
+    **``budget_bytes`` bounds what is asked for, not what lands on disk.** This
+    counts the logical extent of the window, but the cache stores whole chunks:
+    the read plan snaps the returned range to the transfer grid, so a window that
+    ends mid-chunk still writes that chunk entire, and the backend adds its own
+    per-chunk framing. The footprint therefore rounds *up*, by up to one chunk
+    per narrowed axis. Sizing a cache off this number is what it will not
+    support; bounding one tensor's share of it is what it is for.
+
+    Selection axes are never scaled -- Phase 1 touches only X/Y, and Phase 2's Z
+    belongs to the volume -- so a level index is a full-resolution index on
+    exactly these axes. The multiply below is therefore an identity today and
+    stays correct if that changes.
+    """
+    ndim = len(shape)
+    start = [0] * ndim
+    stop = [int(d) for d in shape]
+    if ndim < 2 or itemsize <= 0 or budget_bytes <= 0:
+        return start, stop
+
+    level = [ceil_div(int(d), int(s)) for d, s in zip(shape, scale_hint, strict=True)]
+    y_idx, x_idx = _precache_xy_indices(shape, dim_labels)
+    kept = {y_idx, x_idx}
+    s_idx = samples_axis(list(dim_labels or []), tuple(int(d) for d in shape))
+    if s_idx is not None:
+        kept.add(s_idx)
+    if volumetric:
+        z = precache_z_index(shape, dim_labels)
+        if z is not None and z not in (y_idx, x_idx):
+            kept.add(z)
+
+    selectable = [a for a in range(ndim) if a not in kept and level[a] > 1]
+    if not selectable:
+        return start, stop
+
+    named = {}
+    if dim_labels:
+        for axis in WARM_REDUCE_ORDER:
+            i = labeled_axis_index(dim_labels, axis)
+            if i is not None and i in selectable:
+                named[axis] = i
+    order = [a for a in selectable if a not in named.values()]  # unnamed first
+    order += [named[axis] for axis in WARM_REDUCE_ORDER if axis in named]
+
+    unit = itemsize
+    for a in kept:
+        unit *= level[a]
+    keep = {a: level[a] for a in selectable}
+
+    total = unit
+    for n in keep.values():
+        total *= n
+    for a in order:
+        if total <= budget_bytes:
+            break
+        others = total // keep[a]
+        k = max(1, min(keep[a], budget_bytes // max(1, others)))
+        keep[a] = k
+        total = others * k
+
+    for a in selectable:
+        k, n = keep[a], level[a]
+        if k >= n:
+            continue
+        # Centred on the index a fresh viewer opens at, clamped into the axis.
+        factor = max(1, int(scale_hint[a]))
+        start[a] = 0
+        stop[a] = min(int(shape[a]), k * factor)
+    return start, stop
+
+
 def compute_warm_scale_hints(
     shape: Sequence[int],
     dim_labels=None,
     **kwargs: int,
 ) -> List[List[int]]:
-    """Every scale the precache worker should warm: at most two, possibly none.
-
-    :func:`compute_pyramid_scale_hints` without its full-resolution level, which
-    is exactly the 2-D target, the 3-D target, both or neither. An empty result
-    means the tensor passed neither gate and warming it would cache the source
-    1:1 -- the caller skips rather than testing scale vectors for all-ones.
-    """
-    return compute_pyramid_scale_hints(shape, dim_labels, **kwargs)[1:]
+    """The scales of :func:`compute_warm_targets`, dropping the 3-D tag."""
+    return [t.scale_hint for t in compute_warm_targets(shape, dim_labels, **kwargs)]
 
 
 def build_pyramid_plan(

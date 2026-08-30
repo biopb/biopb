@@ -74,11 +74,6 @@ from dataclasses import MISSING as _DC_MISSING, dataclass, field, fields, replac
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-# The constraint primitives and the shared pyramid-knob bounds live in the core
-# biopb package so biopb-mcp (which cannot depend on this server package -- not
-# on PyPI) validates the same pyramid rows against the same rules, with no drift
-# (biopb/biopb#34, #182). `_Range`/`_Enum` stay as local aliases so the
-# `_CONSTRAINTS` table and config_schema keep their existing spelling.
 from biopb._config_constraints import (
     PYRAMID_CONSTRAINTS,
     Enum as _Enum,
@@ -108,6 +103,12 @@ from biopb._locations import (
     find_config as find_config,
 )
 
+# The constraint primitives and the shared pyramid-knob bounds live in the core
+# biopb package so biopb-mcp (which cannot depend on this server package -- not
+# on PyPI) validates the same pyramid rows against the same rules, with no drift
+# (biopb/biopb#34, #182). `_Range`/`_Enum` stay as local aliases so the
+# `_CONSTRAINTS` table and config_schema keep their existing spelling.
+from biopb_tensor_server.core.chunk import PRECACHE_WARM_BUDGET_BYTES
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     ClaimContext,
@@ -231,6 +232,9 @@ _CONSTRAINTS = {
     },
     "PrecacheConfig": {
         "idle_debounce_seconds": _Range(min=0),
+        # <= 0 would narrow every selection axis to a single index regardless of
+        # size, which is a different policy wearing a budget's name.
+        "warm_budget_bytes": _Range(min=1),
         "backlog_high_water": _Range(min=0.0, max=1.0),
         "backlog_idle_recheck_seconds": _Range(min=0),
     },
@@ -600,17 +604,19 @@ class PrecacheConfig:
     JSON Schema).
     """
 
-    # Off by default: the worker's payoff is *residency*, and on a cache the
-    # size of the shipped default (4 GiB) against the data it fronts, nothing it
-    # warms survives eviction -- leaving CPU burn (a local catalog takes ~30 min
-    # of it at startup) and a cache the live path is competing for. Operators
-    # with a cache large relative to their catalog turn it on deliberately.
+    # On by default again (biopb/biopb#826 turned it off). What made warming
+    # unaffordable was an unbounded warm set: every level of the ladder, over the
+    # whole T/C/Z cross-product, so nothing it warmed survived eviction on the
+    # shipped 4 GiB cache. The plan is now at most two levels
+    # (compute_warm_targets) and each is capped at warm_budget_bytes over a
+    # window from index 0 (compute_warm_selection), which is what makes residency
+    # reachable rather than aspirational.
     enabled: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": "Run the background pre-cache worker to warm new sources "
-            "(no-op on the memory backend). Off by default: speculative warming "
-            "only pays off on a cache large enough to keep what it warms."
+            "(no-op on the memory backend). Warms at most two levels per tensor, "
+            "each bounded by warm_budget_bytes."
         },
     )
     idle_debounce_seconds: float = field(
@@ -618,6 +624,19 @@ class PrecacheConfig:
         metadata={
             "help": "Quiet period after live traffic before the worker resumes "
             "(seconds)."
+        },
+    )
+    warm_budget_bytes: int = field(
+        default=PRECACHE_WARM_BUDGET_BYTES,
+        metadata={
+            "help": "Per warm level, the cap on the selection cross-product "
+            "(T/Z/C). Over it, those axes are narrowed to a window from index 0, "
+            "where a viewer opens. A budget on what is REQUESTED, not on disk: "
+            "the cache stores whole chunks, so a window that ends mid-chunk "
+            "still writes that chunk entire and the footprint rounds up. Does "
+            "not bound the plane or the 3-D volume themselves -- "
+            "pyramid.plane_max_pixels and pyramid.pixel_budget_cubic_root do "
+            "that."
         },
     )
     # Startup-backlog (existing sources) knobs.
@@ -1289,6 +1308,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     precache_kwargs: Dict[str, Any] = {}
     _carry(precache_kwargs, "enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "idle_debounce_seconds", precache_data, cast=float)
+    _carry(precache_kwargs, "warm_budget_bytes", precache_data, cast=int)
     _carry(precache_kwargs, "backlog_enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "backlog_high_water", precache_data, cast=float)
     _carry(precache_kwargs, "backlog_idle_recheck_seconds", precache_data, cast=float)

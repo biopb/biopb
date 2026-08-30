@@ -97,11 +97,11 @@ Two sources of pyramid specs (`TensorFlightServer._advertised_pyramid`):
   `TensorAdapter.get_native_pyramid_levels()` (`OmeZarrAdapter` and
   `QptiffAdapter`) to return one `native=True`, `reduction_method="precompute"`
   level per on-disk resolution.
-- **Computed** — everything else gets `chunk.build_pyramid_plan(...)`, a full
-  pyramid (level 0 → coarsest) generated from the authoritative `[pyramid]`
-  config knobs (`threshold` / `downscale_factor` / `pixel_budget_cubic_root`).
-  The precache worker warms the *coarsest* of this same plan (opt-in:
-  `[precache] enabled` ships off).
+- **Computed** — everything else gets `chunk.build_pyramid_plan(...)`: full
+  resolution plus at most two levels — a 2-D target and a 3-D one — from the
+  authoritative `[pyramid]` config knobs. The precache worker warms every level
+  of this same plan but the first, each over a centred window bounded by
+  `[precache] warm_budget_bytes`. On by default.
 
 ---
 
