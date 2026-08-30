@@ -46,17 +46,36 @@ export const DEFAULT_VOLUME_RENDER_MODE: VolumeRenderMode = "mip";
 /**
  * Wire bytes this viewer will accept in one volume.
  *
- * Not a GPU limit — the server already bounds the voxel count, and Viv casts
- * every volume to Float32 on upload so VRAM follows voxels, not dtype. This
- * bounds the *download and the transient copy*: the body lands as an
+ * Bounds the *download and the transient copy*: the body lands as an
  * ArrayBuffer, is viewed as its own dtype and then copied into a Float32Array,
  * so a float64 volume at the server's voxel budget would be ~720 MiB on the
  * wire and 1.4 GiB of live JS heap before the upload. That kills the tab.
  *
- * Every dtype the catalog actually carries stays far under this: the server's
- * 448³ voxel budget is 180 MiB at uint16, 90 MiB at uint8.
+ * This used to be the only size check here, on the reasoning that the server
+ * already bounded the voxel count. It does not always: a source shipping a
+ * native pyramid has that ladder advertised *instead of* the computed plan, so
+ * one that downsamples only Y/X leaves a full-depth volume with no 3-D budget
+ * applied (biopb/biopb#891). Bytes are a poor proxy for that — at uint8 a
+ * volume can be six times the voxel budget and still land under this cap — so
+ * {@link VOLUME_MAX_VOXELS} checks the quantity that actually decides VRAM.
  */
 export const VOLUME_MAX_BYTES = 512 * 1024 * 1024;
+
+/** Bytes per voxel once uploaded: Viv casts every volume to Float32. */
+const GPU_BYTES_PER_VOXEL = 4;
+
+/**
+ * Voxels this viewer will upload, expressed as a VRAM ceiling.
+ *
+ * Viv casts to Float32 regardless of source dtype, so VRAM follows the voxel
+ * count alone and nothing else about the volume changes it. Stated as a memory
+ * budget rather than as the server's 448³ so it is this viewer's own limit
+ * rather than a copy of a server constant — 448³ is 343 MiB at this width, so
+ * the ceiling clears the server's plan with headroom while still refusing the
+ * unbudgeted ones, which start at ~1.5 GiB.
+ */
+export const VOLUME_MAX_VRAM_BYTES = 512 * 1024 * 1024;
+export const VOLUME_MAX_VOXELS = VOLUME_MAX_VRAM_BYTES / GPU_BYTES_PER_VOXEL;
 
 /** The volume plan, if this tensor has one this viewer will render. */
 export function volumeRefusal(info: TileInfo): string | null {
@@ -69,6 +88,14 @@ export function volumeRefusal(info: TileInfo): string | null {
     return (
       `the volume is ${(volume.bytes / 1024 / 1024).toFixed(0)} MB at the ` +
       `server's coarsest scale, over this viewer's ${VOLUME_MAX_BYTES / 1024 / 1024} MB limit`
+    );
+  }
+  const voxels = volume.depth * volume.height * volume.width;
+  if (voxels > VOLUME_MAX_VOXELS) {
+    return (
+      `the volume is ${voxels.toLocaleString()} voxels at the server's coarsest ` +
+      `scale — ${((voxels * GPU_BYTES_PER_VOXEL) / 1024 / 1024).toFixed(0)} MB of GPU ` +
+      `memory once uploaded, over this viewer's ${VOLUME_MAX_VRAM_BYTES / 1024 / 1024} MB limit`
     );
   }
   return null;

@@ -3196,3 +3196,74 @@ class TestRaggedPlanesComposeExactly:
         shape = [1, 1, 1, 4097, 4097]
         unstated = _Level((1, 1, 1, 2, 2), (), "nearest", False)
         assert _tile_read(shape, 3, 4, 1, [unstated]).scale_hint == [1, 1, 1, 2, 2]
+
+
+class TestVolumeStaysWithinTheBudget:
+    """A native ladder is advertised instead of the computed plan, so nothing
+    upstream applies the 3-D voxel budget to it (biopb/biopb#891)."""
+
+    BUDGET = 448**3
+
+    @staticmethod
+    def _native(shape, scales):
+        """A Y/X-only native ladder, which is what NGFF writers usually emit."""
+        return tuple(
+            _Level(
+                scale=(1, s, s),
+                shape=(shape[0], -(-shape[1] // s), -(-shape[2] // s)),
+                method="precompute",
+                native=True,
+            )
+            for s in scales
+        )
+
+    def _voxels(self, plan):
+        return plan["depth"] * plan["height"] * plan["width"]
+
+    @pytest.mark.parametrize(
+        "shape,scales",
+        [
+            ([1500, 2048, 2048], (2, 4)),  # lightsheet: 4.4x budget unbounded
+            ([4000, 4096, 4096], (2, 4, 8)),  # EM: 11.7x
+            ([1800, 2048, 2048], (2, 4)),  # 5.2x, and under the client byte cap
+        ],
+    )
+    def test_a_yx_only_native_ladder_does_not_escape_the_budget(self, shape, scales):
+        plan, reason = _volume_plan(
+            shape, ["z", "y", "x"], "uint16", self._native(shape, scales)
+        )
+        assert reason is None
+        assert self._voxels(plan) <= self.BUDGET
+        # Fell back to the computed plan, so the read is no longer addressed to
+        # a stored level -- the method has to come off with the scale.
+        assert plan["reduction_method"] is None
+        assert plan["scale_hint"][0] > 1, "z must be scaled to fit a deep stack"
+
+    def test_a_ladder_that_already_fits_is_used_as_advertised(self):
+        # Deep enough in Y/X that the volume is bounded incidentally: 800x256x256
+        # is 0.6x the budget, so the native level stands and stays addressable.
+        shape = [800, 8192, 8192]
+        plan, reason = _volume_plan(
+            shape, ["z", "y", "x"], "uint16", self._native(shape, (2, 4, 8, 16, 32))
+        )
+        assert reason is None
+        assert plan["scale_hint"] == [1, 32, 32]
+        assert plan["reduction_method"] == "precompute"
+        assert self._voxels(plan) <= self.BUDGET
+
+    @pytest.mark.parametrize(
+        "shape", [[4000, 4000, 4000], [20000, 20000, 20000], [100000, 8192, 8192]]
+    )
+    def test_the_computed_fallback_cannot_come_back_over_budget(self, shape):
+        """Phase 2 stops each axis at the 448 floor, and 448**3 is the budget.
+
+        So the fallback always fits, however extreme the source. The refusal
+        beneath it in `_volume_plan` is therefore defensive -- kept because that
+        invariant lives in another module and nothing here would notice it
+        changing.
+        """
+        plan, reason = _volume_plan(
+            shape, ["z", "y", "x"], "uint16", self._native(shape, (2, 4, 8))
+        )
+        assert reason is None
+        assert self._voxels(plan) <= self.BUDGET

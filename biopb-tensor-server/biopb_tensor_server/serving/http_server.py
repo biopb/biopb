@@ -1016,6 +1016,14 @@ def _volume_plan(
     not own. A tensor that advertises no ladder at all gets full resolution --
     the same answer, since there was no coarser level to find.
 
+    The one thing not taken on trust is the **size**. A server advertises a
+    native pyramid instead of its computed plan, so a ladder that downsamples
+    only Y/X leaves the 3-D voxel budget unapplied (biopb/biopb#891); this falls
+    back to the computed plan when that happens, and refuses when even that
+    cannot fit. The budget is the module default, which is the weaker half of
+    the same caveat -- but a ceiling from the wrong constant still bounds the
+    read, where no ceiling at all does not.
+
     The refusals are facts about the tensor, and each is a thing a 3-D renderer
     cannot do rather than a thing this route declines to do:
 
@@ -1028,7 +1036,12 @@ def _volume_plan(
       volume three times too wide.
     """
     from biopb_tensor_server.core.axes import plane_axes
-    from biopb_tensor_server.core.chunk import estimate_chunk_bytes, precache_z_index
+    from biopb_tensor_server.core.chunk import (
+        PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+        compute_pyramid_scale_hints,
+        estimate_chunk_bytes,
+        precache_z_index,
+    )
     from biopb_tensor_server.core.downsample import ceil_div
 
     shape = [int(d) for d in shape]
@@ -1066,6 +1079,32 @@ def _volume_plan(
         level_shape = list(coarsest.shape)
     else:
         level_shape = [ceil_div(d, s) for d, s in zip(shape, scale, strict=True)]
+    # Then bound it. A native pyramid is advertised *instead of* the computed
+    # plan (adapter_base._advertised_pyramid), and NGFF multiscales commonly
+    # downsample Y/X only -- so the coarsest level of a 3-D stack can be a
+    # full-depth volume with nothing having applied the 3-D budget at all
+    # (biopb/biopb#891). Unbounded here is not a slow render: an 11x-budget
+    # volume is gigabytes on the wire and gigabytes of VRAM after Viv's Float32
+    # upload, which kills the tab.
+    #
+    # The fallback is the server's own computed plan rather than a second
+    # planner living here -- this is a ceiling, not a choice of ladder. It costs
+    # a computed read (decimating full resolution, uncached) where the advertised
+    # level would have been cheap, which is the right trade against not
+    # rendering. Refuse only where Phase 2 itself cannot meet the budget, i.e.
+    # every axis already at the floor.
+    budget = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT**3
+    if level_shape[z_idx] * level_shape[y_idx] * level_shape[x_idx] > budget:
+        scale = list(compute_pyramid_scale_hints(shape, dim_labels)[-1])
+        method = None
+        level_shape = [ceil_div(d, s) for d, s in zip(shape, scale, strict=True)]
+        voxels = level_shape[z_idx] * level_shape[y_idx] * level_shape[x_idx]
+        if voxels > budget:
+            return None, (
+                f"the coarsest level this server can offer is {voxels:,} voxels, "
+                f"over the {budget:,} a 3-D texture holds"
+            )
+
     depth, height, width = (
         level_shape[z_idx],
         level_shape[y_idx],

@@ -210,6 +210,15 @@ multiplied by `scale_hint`, and with the three axes reduced to one unit
 the axes carry units that differ and cannot all be placed on a common scale —
 a plausible wrong ratio is worse than rendering isotropic.
 
+`volume.scale_hint` is normally the coarsest entry of `pyramid`, but it is
+**bounded** rather than taken on trust. A native ladder is advertised instead of
+the server's computed plan, so one that downsamples only Y/X leaves a full-depth
+volume that no 3-D voxel budget has been applied to (biopb/biopb#891) — at
+gigabyte scale on the wire and in VRAM. Over the budget, the plan falls back to
+the computed scale and `reduction_method` comes back `null`, saying the read is
+no longer addressed to a stored level. Clients should read the extents rather
+than assume the plan matches a `pyramid` entry.
+
 `selectable` gives the wire index of each **named** slider axis, or `null`.
 `sel_axes` is the converse and is the one worth reading: non-plane axes with
 extent > 1 that `t`/`z`/`c` cannot *name* — an unlabelled axis
