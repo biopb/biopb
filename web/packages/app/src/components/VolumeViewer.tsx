@@ -157,7 +157,12 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
     let live = true;
     setReadError(null);
     client.http
-      .slice(request, { signal: controller.signal })
+      // Not the tile budget: a volume is up to three orders of magnitude
+      // larger, and the deadline covers the body download as well as the read.
+      .slice(request, {
+        signal: controller.signal,
+        timeoutMs: client.http.volumeTimeoutMs,
+      })
       .then((arr) => {
         if (!live) return;
         setVolume({ key: requestKey, data: asTypedArray(arr.buffer, vivDtype(arr.dtype)) });

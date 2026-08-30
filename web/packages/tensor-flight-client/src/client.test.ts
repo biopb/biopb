@@ -383,6 +383,31 @@ describe("TensorHttpClient.slice", () => {
     expect(result.scaleHint).toEqual([]);
   });
 
+  it("takes a per-call timeout override, so a volume is not held to the tile budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const c = new TensorHttpClient(BASE, TOKEN);
+      mockFetch.mockImplementationOnce((_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          );
+        }),
+      );
+      const p = c
+        .slice({ array_id: "s/t", scale_policy: "volume" }, { timeoutMs: 60_000 })
+        .catch((e) => e);
+      // Past the tile budget, which must not apply here.
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(41_000);
+      const err = await p;
+      expect(err).toBeInstanceOf(TensorApiError);
+      expect((err as TensorApiError).message).toContain("60000ms");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("throws TensorApiError on 502", async () => {
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ detail: "Flight error: RuntimeError" }), {
