@@ -416,7 +416,8 @@ downscale?) needs eyes on real data and is not yet done.
    `scale_policy: "volume"` and resolves the scale server-side, so the browser
    reads the same coarsest level napari 3-D does instead of guessing one that
    shares no chunk_id with it. `/api/tile_info` carries a `volume` block saying
-   what that resolves to. See docs/volume-rendering.md.
+   what that resolves to. §3.1 above is the standing record of why `XR3DLayer`
+   direct, and not Viv's packaged `VolumeViewer`.
 
 ## 11. Validation
 
