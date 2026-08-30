@@ -503,11 +503,18 @@ class TestValidation:
 
     def test_string_number_reset_to_default(self, mock_config_dir):
         """The no-coercion wrinkle: a JSON string where a number is expected fails
-        the Range check and is replaced by the numeric default."""
+        the Range check and is replaced by the numeric default.
+
+        The written value is deliberately *not* the default, so a pass means the
+        default won rather than the string having been coerced to its own value.
+        """
+        from biopb_mcp._config import PyramidConfig
+
+        default = PyramidConfig().downscale_factor
         config = _write_and_load(
-            mock_config_dir, {"pyramid": {"downscale_factor": "4"}}
+            mock_config_dir, {"pyramid": {"downscale_factor": "8"}}
         )
-        assert get_setting(config, "pyramid.downscale_factor") == 4
+        assert get_setting(config, "pyramid.downscale_factor") == default
         assert isinstance(get_setting(config, "pyramid.downscale_factor"), int)
 
     def test_zero_is_valid_where_it_disables(self, mock_config_dir):

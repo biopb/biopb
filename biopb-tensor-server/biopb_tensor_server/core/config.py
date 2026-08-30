@@ -219,9 +219,14 @@ _CONSTRAINTS = {
         "file_max_total_bytes": _Range(min=1),
     },
     "PyramidConfig": {
-        # reduction_method is server-local (on-the-fly reduction is a compute
-        # concern, not a biopb-mcp knob); the numeric rows are shared.
+        # reduction_method and plane_max_pixels are server-local: on-the-fly
+        # reduction is a compute concern, and biopb-mcp has no 2-D plane cap
+        # (its fallback plan scales X/Y/Z against one voxel budget). The rows
+        # both packages do share come from PYRAMID_CONSTRAINTS.
         "reduction_method": _Enum(_REDUCTION_METHODS, case_insensitive=True),
+        # <= 0 never satisfies the Phase 1 stop condition, so the ladder runs to
+        # the per-axis floor and the knob silently stops meaning what it says.
+        "plane_max_pixels": _Range(min=1),
         **PYRAMID_CONSTRAINTS,
     },
     "PrecacheConfig": {
@@ -546,10 +551,11 @@ class PyramidConfig:
     """
 
     reduction_method: str = field(
-        default="area",
+        default="nearest",
         metadata={
-            "help": "Downsampling method for computed levels ('area' = averaging). "
-            "Native on-disk levels are served precomputed regardless."
+            "help": "Downsampling method for computed levels ('nearest' = strided "
+            "pick, 'area' = averaging). Native on-disk levels are served "
+            "precomputed regardless."
         },
     )
     threshold: int = field(
@@ -557,14 +563,24 @@ class PyramidConfig:
         metadata={"help": "Maximum X/Y extent (pixels) of the coarsest level."},
     )
     downscale_factor: int = field(
-        default=4,
+        default=2,
         metadata={"help": "Per-level linear downsampling step, per spatial axis."},
     )
     pixel_budget_cubic_root: int = field(
-        default=512,
+        default=448,
         metadata={
             "help": "Cube root of the coarsest level's voxel budget "
             "(Lx*Ly*Lz <= this**3); bounds a whole-volume 3-D read."
+        },
+    )
+    plane_max_pixels: int = field(
+        default=4_000_000,
+        metadata={
+            "help": "Max X*Y pixels of the coarsest 2-D level. Also the gate on "
+            "whether a tensor gets 2-D levels at all: below it the plane is "
+            "already cheap to read whole. Values below "
+            "min(pixel_budget_cubic_root, threshold)**2 are unreachable -- the "
+            "rungs stop at that per-axis floor first."
         },
     )
 
@@ -1261,6 +1277,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         ("threshold", int),
         ("downscale_factor", int),
         ("pixel_budget_cubic_root", int),
+        ("plane_max_pixels", int),
     ):
         if _knob in pyramid_data:
             pyramid_kwargs[_knob] = _cast(pyramid_data[_knob])

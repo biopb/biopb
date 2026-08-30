@@ -150,15 +150,18 @@ class PyramidConfig:
         "criterion (coarsest level fits within threshold in x and y).",
     )
     downscale_factor: int = _h(
-        4,
-        "Linear downscale between successive levels. 4x (vs 2x) roughly halves the "
-        "level count and the per-level get_tensor round trips; napari infers level "
-        "ratios from shapes, so non-2x is fine.",
+        2,
+        "Linear downscale between successive levels. 2x keeps every level on the "
+        "dyadic grid the browser tile route also uses, and keeps napari's "
+        "level pick (the coarsest still above the canvas) from over-fetching by "
+        "up to 4x per axis.",
     )
     pixel_budget_cubic_root: int = _h(
-        512,
+        448,
         "Per-axis edge length of the coarsest level's 3D whole-volume read (#29); "
-        "the voxel budget is this value cubed. Default 512 -> ~134M voxels.",
+        "the voxel budget is this value cubed. 448 -> ~90M voxels, measured as "
+        "the point a float32 volume stays interactive (biopb-tensor-server "
+        "docs/precache-policy.md 9.1).",
     )
 
 
