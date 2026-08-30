@@ -572,8 +572,16 @@ def estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
 # worker must warm exactly that scale or its chunk_ids won't match. Keep in sync
 # with biopb-mcp/src/biopb_mcp/_config.py if that is retuned.
 PRECACHE_THRESHOLD = 4096
-PRECACHE_DOWNSCALE_FACTOR = 4
-PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 512
+PRECACHE_DOWNSCALE_FACTOR = 2
+# 448**3 = 90 Mvox. The coarsest level is uploaded whole as one 3-D texture by
+# both renderers, and Viv casts it to float32 -- measured on a Quadro P2000,
+# 90 Mvox holds 50 fps there where 512**3 (134 Mvox) drops to 17.
+# See docs/precache-policy.md 9.1.
+PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 448
+# 2048**2. Caps the 2-D rungs, and is chosen to land on the level deck.gl asks
+# for at fit-to-view in a ~1500-2000px window, so the warmed level is the one
+# the browser actually reads.
+PRECACHE_PLANE_MAX_PIXELS = 4_000_000
 
 
 def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
@@ -616,19 +624,31 @@ def compute_pyramid_scale_hints(
     threshold: int = PRECACHE_THRESHOLD,
     downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
     pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+    plane_max_pixels: int = PRECACHE_PLANE_MAX_PIXELS,
 ) -> List[List[int]]:
     """Per-axis scale_hint for *every* level of a computed pyramid.
 
-    A faithful port of biopb-mcp's ``build_pyramid_levels`` loop, emitting the
-    full sequence of levels (not just the coarsest): level 0 is full resolution
-    (all 1s), then X, Y and Z are downsampled individually (all other axes stay
-    at 1), each stopping at ``axis_floor = min(pixel_budget_cubic_root,
-    threshold)``, until the level satisfies ``Lx*Ly*Lz <=
-    pixel_budget_cubic_root**3`` and ``Lx, Ly <= threshold``. ``ceil_div(L, s)``
-    is the server's own ``logical_shape`` (adapter_base.py), so each scale matches the
-    client's level and the warmed chunk_ids line up exactly.
+    Two phases, because the two renderers want different things (see
+    ``docs/precache-policy.md`` §4.1):
 
-    A tensor with no z axis is treated as ``Lz = 1`` and never gets a z factor.
+    - **2-D rungs**, X and Y only, halving by ``downscale_factor`` until the
+      plane fits ``plane_max_pixels`` (and X/Y fit ``threshold``). Z is left
+      alone: a 2-D view displays one slice, so scaling Z on these rungs discards
+      depth resolution to save nothing.
+    - **one final 3-D rung**, continuing from the last 2-D rung and scaling X, Y
+      *and* Z until the volume fits ``pixel_budget_cubic_root**3``. napari's 3-D
+      mode reads ``len(levels) - 1`` whole (``layers/_scalar_field/_slice.py``),
+      so the coarsest level is what a renderer uploads as one texture and the
+      budget is what bounds it. Appended only when the volume actually exceeds
+      the budget, so a 2-D tensor never grows one.
+
+    Starting the 3-D phase from the last 2-D rung rather than from full
+    resolution gives per-axis monotonicity for free, which napari requires of
+    ``downsample_factors`` (``layers/utils/layer_utils.py``).
+
+    ``ceil_div(L, s)`` is the server's own ``logical_shape`` (adapter_base.py),
+    so each scale matches the client's level and the warmed chunk_ids line up
+    exactly. A tensor with no z axis is treated as ``Lz = 1``.
 
     Returns:
         Non-empty list of per-axis scale vectors, coarsest last.
@@ -659,21 +679,43 @@ def compute_pyramid_scale_hints(
             scale[z_idx] = sz
         return scale
 
+    def _extent(sx, sy, sz):
+        return (
+            ceil_div(shape[x_idx], sx),
+            ceil_div(shape[y_idx], sy),
+            ceil_div(shape[z_idx], sz) if z_idx is not None else 1,
+        )
+
+    # Phase 1 -- 2-D rungs: X and Y only.
     sx = sy = sz = 1
     scales = [_scale_vector(sx, sy, sz)]  # level 0: full resolution
     while True:
-        lx = ceil_div(shape[x_idx], sx)
-        ly = ceil_div(shape[y_idx], sy)
-        lz = ceil_div(shape[z_idx], sz) if z_idx is not None else 1
-        if lx * ly * lz <= budget and lx <= threshold and ly <= threshold:
+        lx, ly, _lz = _extent(sx, sy, sz)
+        if lx * ly <= plane_max_pixels and lx <= threshold and ly <= threshold:
             break
         nsx = sx * downscale_factor if lx > floor else sx
         nsy = sy * downscale_factor if ly > floor else sy
-        nsz = sz * downscale_factor if (z_idx is not None and lz > floor) else sz
-        if (nsx, nsy, nsz) == (sx, sy, sz):
+        if (nsx, nsy) == (sx, sy):
             break  # nothing left to shrink; avoid an infinite loop
-        sx, sy, sz = nsx, nsy, nsz
+        sx, sy = nsx, nsy
         scales.append(_scale_vector(sx, sy, sz))
+
+    # Phase 2 -- one 3-D rung, only if the volume still exceeds the budget.
+    # Continues from the last 2-D rung, so its factors can only be >= that
+    # rung's on every axis.
+    tx, ty, tz = sx, sy, sz
+    while True:
+        lx, ly, lz = _extent(tx, ty, tz)
+        if lx * ly * lz <= budget:
+            break
+        ntx = tx * downscale_factor if lx > floor else tx
+        nty = ty * downscale_factor if ly > floor else ty
+        ntz = tz * downscale_factor if (z_idx is not None and lz > floor) else tz
+        if (ntx, nty, ntz) == (tx, ty, tz):
+            break  # every axis is at the floor; the budget cannot be met
+        tx, ty, tz = ntx, nty, ntz
+    if (tx, ty, tz) != (sx, sy, sz):
+        scales.append(_scale_vector(tx, ty, tz))
 
     return scales
 
@@ -695,10 +737,11 @@ def compute_precache_scale_hint(
 def build_pyramid_plan(
     shape: Sequence[int],
     dim_labels=None,
-    reduction_method: str = "area",
+    reduction_method: str = "nearest",
     threshold: int = PRECACHE_THRESHOLD,
     downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
     pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+    plane_max_pixels: int = PRECACHE_PLANE_MAX_PIXELS,
 ) -> List[PyramidLevel]:
     """Server-advertised computed pyramid as a list of ``PyramidLevel`` protos.
 
@@ -718,6 +761,7 @@ def build_pyramid_plan(
         threshold=threshold,
         downscale_factor=downscale_factor,
         pixel_budget_cubic_root=pixel_budget_cubic_root,
+        plane_max_pixels=plane_max_pixels,
     )
     levels: List[PyramidLevel] = []
     for scale in scales:

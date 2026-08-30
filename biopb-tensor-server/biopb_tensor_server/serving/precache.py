@@ -376,6 +376,7 @@ class PrecacheWorker:
             threshold=cfg.threshold,
             downscale_factor=cfg.downscale_factor,
             pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
+            plane_max_pixels=cfg.plane_max_pixels,
         )[-1]
 
         # Nothing to precompute when the coarsest level is full resolution:

@@ -10,7 +10,7 @@ from biopb_tensor_server.core.chunk import (
     compute_precache_scale_hint,
     is_scaled_chunk,
 )
-from biopb_tensor_server.core.config import PrecacheConfig
+from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -90,8 +90,11 @@ class TestComputePrecacheScaleHint:
     @pytest.mark.parametrize(
         "shape,labels,expected",
         [
-            # Small 2-D: below threshold, no downsampling.
-            ([2048, 2048], ["y", "x"], [1, 1]),
+            # Clearly under the plane cap: no downsampling.
+            ([1500, 1500], ["y", "x"], [1, 1]),
+            # The boundary: 2048**2 = 4.19 Mpx just exceeds plane_max_pixels
+            # (4 Mpx), so it earns exactly one rung.
+            ([2048, 2048], ["y", "x"], [2, 2]),
             # Large 2-D: X/Y land in (1024, 4096].
             ([20000, 20000], ["y", "x"], [16, 16]),
             # Deep volume: the 512**3 voxel budget dominates, not the 4096 X/Y
@@ -255,7 +258,7 @@ class TestWarming:
             td = adapter.list_tensor_descriptors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
             scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
-            assert scale == [4, 4]
+            assert scale == [8, 8]
             from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
             req = TensorDescriptor(
@@ -266,7 +269,7 @@ class TestWarming:
                 dtype=td.dtype,
             )
             req.scale_hint[:] = scale
-            req.reduction_method = "area"
+            req.reduction_method = PyramidConfig().reduction_method
             plan = ta.get_read_plan(req)
             assert len(plan.chunk_endpoints) > 0
             for ce in plan.chunk_endpoints:
@@ -648,7 +651,7 @@ def _located_all(server, cache_manager, source_ids):
             dtype=td.dtype,
         )
         req.scale_hint[:] = scale
-        req.reduction_method = "area"
+        req.reduction_method = PyramidConfig().reduction_method
         plan = ta.get_read_plan(req)
         if not plan.chunk_endpoints:
             return False
@@ -1065,8 +1068,8 @@ class TestSkipUnscaledCoarsestLevel:
         assert self._warm_one_tensor(tmp_path, (1024, 1024), ("y", "x")) == 0
 
     def test_warms_tensor_that_has_a_scale_rung(self, tmp_path):
-        # The contrast case: 8192x8192 earns a 4x rung, so warming pays.
-        assert compute_precache_scale_hint([8192, 8192], ["y", "x"]) == [4, 4]
+        # The contrast case: 8192x8192 earns an 8x rung, so warming pays.
+        assert compute_precache_scale_hint([8192, 8192], ["y", "x"]) == [8, 8]
         assert self._warm_one_tensor(tmp_path, (8192, 8192), ("y", "x")) > 0
 
     def test_skips_long_timelapse_with_small_frames(self, tmp_path):
@@ -1109,7 +1112,7 @@ class TestBuildPyramidPlan:
         assert list(levels[0].scale_hint) == [1, 1]
         assert list(levels[0].shape) == [20000, 20000]
         assert levels[0].native is False
-        assert levels[0].reduction_method == "area"
+        assert levels[0].reduction_method == PyramidConfig().reduction_method
 
     def test_coarsest_matches_precache_helper(self):
         from biopb_tensor_server.core.chunk import build_pyramid_plan

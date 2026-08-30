@@ -1349,6 +1349,7 @@ class TensorAdapter(SourceAdapter):
                 threshold=cfg.threshold,
                 downscale_factor=cfg.downscale_factor,
                 pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
+                plane_max_pixels=cfg.plane_max_pixels,
             )
         return levels
 
