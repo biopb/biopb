@@ -257,30 +257,140 @@ regardless of budget. This is what keeps a bad guess from turning into *the user
 disk is full and nothing else on the box works* — the failure mode that would
 otherwise be unattributable to biopb.
 
+## What a hit costs
+
+Measured 2026-08-29 on the dev box (Ryzen 5 5600X, ext4 on an LVM volume spanning
+a SATA MX500 and an NVMe, pyarrow 24.0.0), medians over the cache's own
+`read_batch`/`write_batch`. **Warm** = the file's pages are resident; **cold** =
+`sync` then `POSIX_FADV_DONTNEED` on that file immediately before the read.
+
+| per chunk | 256 KB | 1 MB | 8 MB | 64 MB |
+|---|---|---|---|---|
+| `read_batch` (the lookup), warm | 64 µs | 63 µs | 66 µs | 118 µs |
+| + decode and touch every byte, warm | 150 µs | 282 µs | 1.5 ms | 12 ms |
+| + decode and touch every byte, cold | 1.2 ms | 1.7 ms | 6.2 ms | 98 ms |
+| `write_batch`, on the miss path | 0.5 ms | 1.5 ms | 10 ms | 103 ms |
+
+The read rows are stable across runs; **the write row is not** — see *What the
+write costs*, where it is given as a distribution rather than a number.
+
+**The lookup is flat and small** — ~66 µs, near-independent of chunk size, because
+the mmap is lazy and nothing here touches a pixel: 4 µs of keying (two sha256s),
+2 µs `stat`, 12 µs `memory_map`, 42 µs Arrow `open_stream`/`read_next_batch`.
+
+That is ~4x cheaper than the localhost `chunk_locate` round trip this path stands
+in for on remote (~290 µs, `localhost-fast-path.md`). On a hit the client's own
+file is not merely competitive with the server fast path — it is the cheaper of
+the two, because it has no RPC in it.
+
+Size appears only when the caller faults pages in. Cold reads run ~0.6–1.4 GB/s
+at 1 MB and above (below that they are latency-bound and a throughput figure means
+nothing — 256 KB cold is 1.2 ms, barely under the 1 MB number). That spread is
+this box's LV striping two devices of different speeds, not a property of the
+code, so read the cold row as an order of magnitude.
+
+### A hit does not care how big the cache is
+
+`sha256` → path → `open` does no directory listing, and ext4's htree absorbs the
+rest. Timed against a tree filled to N entries, re-reading one target chunk:
+
+| files in cache | 1 | 1 000 | 10 000 | 100 000 | 500 000 |
+|---|---|---|---|---|---|
+| warm `read_batch` | 69 µs | 68 µs | 67 µs | 65 µs | 68 µs |
+| `_scan` (the sweeper's full walk) | 0.2 ms | 11 ms | 67 ms | 765 ms | 5.0 s |
+
+**The sweeper is the O(N) piece**, ~10 µs per file, and `note_written` runs it
+synchronously inside `write_batch`. Amortised it is self-limiting and independent
+of both knobs: scanning `budget/chunk` files once per `budget/16` bytes written is
+**~160 µs per miss** at any budget and any chunk size — invisible beside the
+`do_get` that miss already paid for.
+
+The exposure is the tail, not the mean. Whichever worker crosses the threshold
+eats the entire walk, so a 64 GB budget of 256 KB chunks (256k files) stalls that
+worker ~2.5 s. `maybe_sweep` takes the lock with `timeout=0.0`, so only one worker
+pays and the others skip — that bounds the blast radius without shrinking it. If
+file counts ever reach that range the fix is sampling shards instead of ordering
+every file globally, which is what the one byte of sharding in the layout is for.
+
 ## What the write costs
 
 Less than it looks, and not what it looks like.
 
 **The write is never `fsync`ed.** A chunk file is regenerable from the server, so
 there is no durability requirement at all — crash recovery is "unlink anything
-that does not parse". The on-path cost is therefore a memcpy into page cache, with
-the actual writeback deferred to the kernel and off the fetch path.
+that does not parse". Writeback is deferred to the kernel and off the fetch path.
 
-Order-of-magnitude arithmetic for one `MAX_ARROW_BATCH_BYTES` (64 MB) chunk —
-**estimates, not measurements; both arms need timing under a stated cache regime
-before any of this is quoted as fact**:
+One `MAX_ARROW_BATCH_BYTES` (64 MB) chunk, disk side measured (*What a hit
+costs*), network side still arithmetic from the nominal link rate:
 
 | | 64 MB chunk |
 |---|---|
-| `do_get` over 1 GbE | ~570 ms |
-| `do_get` over 10 GbE | ~58 ms |
-| memcpy into page cache | ~7–13 ms (dev box DRAM ceiling is 33–36 GB/s; a copy is read+write) |
+| `do_get` over 1 GbE | ~570 ms (arithmetic) |
+| `do_get` over 10 GbE | ~58 ms (arithmetic) |
+| `write_batch`, burst | **37 ms (measured p50, 36–62 ms)** |
+| `write_batch`, sustained past the dirty budget | **~130 ms (measured)** |
 | localhost `chunk_locate` + mmap | ~1 ms (measured, `localhost-fast-path.md`) |
 
-So on the remote path the write is roughly **1–20% of the miss it rides on**, and
-the gap widens over a WAN. On localhost it would be a **~10x regression** against
-the existing fast path. That asymmetry is why the remote-only scoping above is
-load-bearing: it confines the write to the regime where it is nearly free.
+**The estimate's conclusion holds for a burst and fails under sustained load.**
+A 64 MB chunk writes in 37 ms at 1.8 GB/s — ~7% of a 1 GbE miss, inside the
+"1–20%" the arithmetic claimed. Keep streaming and it degrades to ~0.5 GB/s,
+~130 ms, ~22% of that miss and more than twice a 10 GbE one.
+
+### Which "write" that is
+
+`write_batch` does not `fsync`, so the burst figure is *time until the kernel owns
+the bytes* — the device is still writing after it returns. What it excludes, at
+64 MB:
+
+| | time | GB/s |
+|---|---|---|
+| buffered burst — what one miss on an idle client pays | 37 ms | 1.79 |
+| + `fsync` per chunk, i.e. durable before returning | 101 ms | 0.66 |
+| sustained: 6.4 GB of distinct chunks, incl. a full drain | 13.2 s | 0.49 |
+
+**The device is genuinely hidden, and shows up once the stream outruns the dirty
+budget.** This box allows ~3 GB dirty (`dirty_ratio` 20% of 15 GB), so a burst of
+a few chunks never waits on the SSD and reports 1.8 GB/s; 6.4 GB of misses in a
+row settles at 0.49 GB/s, 3.6x slower. A dask fan-out streaming a dataset is the
+sustained regime, not the burst one — so **quote 0.5 GB/s for a scan and 1.8 GB/s
+for an interactive miss**, and never the burst number for both.
+
+Even sustained, this is ~20x below the 33–36 GB/s DRAM ceiling the memcpy argument
+assumed, so "a memcpy into page cache" was always the wrong model for the cost.
+
+### Two measurement traps
+
+Both inflate the write arm ~2.4x, and both were hit while producing this table:
+
+- **Re-writing one `chunk_id`.** Every rename then unlinks a same-size
+  predecessor, work no real miss stream does. Distinct keys: 37 ms at 64 MB;
+  one key repeated: 91 ms. Always write distinct keys.
+- **Reading a throughput off a fresh file and calling it the code's speed.** A
+  buffered write over an *existing* extent runs at 5.0 GB/s versus 1.8 GB/s to a
+  new one, so the shape of the file matters as much as the bytes. For reference,
+  `pa.ipc` serialisation into memory is 8.5 GB/s — about 5% of the burst cost, so
+  Arrow is not where the time goes. The rename, the `chmod` and the mmap-back
+  re-read together are under 0.2 ms at every size.
+
+### Why a file per chunk, and not the server's segments
+
+The server's `ArrowFileBackend` appends chunks into an open segment file
+(`_pool_writers`), so it pays no per-chunk `open`/`chmod`/`rename`. That the
+client does not do the same is worth ~10–40%, measured writing the same payload
+both ways:
+
+| | 1 MB x512 | 8 MB x128 | 64 MB x24 |
+|---|---|---|---|
+| file per chunk (this design) | 1.39 GB/s | 1.70 GB/s | 1.36 GB/s |
+| append into an open segment | 1.93 GB/s | 1.82 GB/s | 1.69 GB/s |
+| segment's advantage | 1.4x | 1.1x | 1.2x |
+
+Real but small, because at these payload sizes the byte copy dominates the file
+metadata. And the client is buying something concrete with it: a file per chunk
+is what makes the key a pure `sha256` path lookup with no index to keep, eviction
+a plain `unlink` with no compaction, and a torn write recoverable by deleting one
+file. The segment shape needs an index, a sweeper that rewrites live entries, and
+the WAL the server carries — for 10–40% of a cost that is itself ~7% of the miss.
 
 **Rejected: populate on second miss.** Knowing a miss is the second one requires a
 persistent record of the first — itself a write, so the cost being avoided is paid
@@ -363,8 +473,15 @@ plainly at the config surface.
 
 ## Open questions
 
-- The write-cost table is arithmetic. Time both arms identically under a stated
-  cold/warm regime before relying on the 1–20% figure or the localhost ~10x.
+- The `do_get` rows are still arithmetic. The disk-side rows are measured now
+  (*What a hit costs*), but no real remote fetch has been timed end to end, so
+  the 10 GbE conclusion rests on a nominal link rate rather than a wire.
+- If the fresh-file allocation cost is worth attacking, the lever is reusing temp
+  extents rather than anything in Arrow — but that trades the rename's atomicity
+  guarantee, so it needs its own design pass, and ~90 ms on a miss that cost
+  570 ms to fetch may never be worth it.
+- The write arm's spread is attributed to the dev box's shared, near-full,
+  two-device LV; that is inference from the hardware, not a controlled result.
 - `UnresolvedSourceAdapter` (the URL-only cloud model in
   `cloud-storage-support.md`) sets no `_content_version`. Confirm it never serves
   chunks; if it can, its chunk_ids are unversioned and must not be persisted.
