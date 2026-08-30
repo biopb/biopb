@@ -437,13 +437,13 @@ class ObserveConfig:
         "unless it is loopback-bound, whatever this says.",
     )
     chat_enabled: bool = _h(
-        False,
+        True,
         "Offer the built-in chat client: a pane on the observe page that drives "
         "this session's kernel through a model. Lives here beside the console "
         "because it is the same kind of thing -- an execute-capable surface on "
         "this page -- and because it needs the page: chat routes served without "
-        "one have nothing to reach them. Off by default because it spends the "
-        "user's own provider credits; the model and endpoint are in `chat`. "
+        "one have nothing to reach them. On by default, but inert until the "
+        "model and key in `chat` are set, so it costs nothing to leave on. "
         "Like the console, this can only narrow the surface.",
     )
 

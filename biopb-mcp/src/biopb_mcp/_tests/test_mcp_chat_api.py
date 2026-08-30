@@ -14,7 +14,6 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from biopb_mcp._config import McpConfig
 from biopb_mcp.mcp import _chat, _chat_api, _model, _observe
 
 # The shape the launcher actually threads: `load_config()` returns a **dict**,
@@ -525,8 +524,8 @@ def test_routes_are_not_mounted_when_chat_is_off():
     # Off drops the surface entirely rather than serving a refusing one, the
     # same shape the console's gate takes: "is there a way to submit here?" has
     # one answer rather than a status code to interpret.
-    cfg = {}
-    assert McpConfig().observe.chat_enabled is False  # the default this relies on
+    cfg = chat_config()
+    cfg["observe"]["chat_enabled"] = False
     assert _chat_api.configure(cfg, agentless=True) is False
 
 
