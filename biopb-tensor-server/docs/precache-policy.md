@@ -486,11 +486,15 @@ downscale?) needs eyes on real data and is not yet done.
 3. ~~**§4.1 Flight ladder shape** + **§5 two targets with independent gates**~~
    — **done**. The plan is sparse (level 0 + at most two targets), so the gates
    are the list length and `_process_tensor` warms `plan[1:]`.
-4. ~~**§4.2 tile-ladder alignment**~~ — **done**. `_tile_warm_level` is the
-   coarsest level the tile route reads from the data plane; everything below
-   it is reduced from it in-process, gated on `nearest`. Verified against a
+4. ~~**§4.2 tile-ladder alignment**~~ — **done**. A tile is read from the
+   coarsest level the server *advertises* that divides its scale; everything
+   below is reduced from it in-process, gated on `nearest`. Verified against a
    live plane: a synthesized scale-16 tile is bit-identical to a direct read
    at that scale, and answers in 10 ms against 143 ms for the warm level.
+   The anchor was originally recomputed sidecar-side from
+   `PRECACHE_PLANE_MAX_PIXELS`, which could disagree with a plane whose config
+   the sidecar does not own; it now comes off the descriptor (biopb/biopb#889),
+   which also lets a native on-disk pyramid serve the ladder directly.
 
 5. ~~**Browser 3-D**~~ — **done**. `POST /api/slice` takes
    `scale_policy: "volume"` and resolves the scale server-side, so the browser

@@ -166,12 +166,34 @@ a tile grid — shaped to drop into a Viv `PixelSource[]`:
   "selectable": {"t": 0, "c": 1, "z": 2},
   "sel_axes": [],
   "levels": [{"level":0,"scale":1,"height":512,"width":512,"cols":1,"rows":1}],
+  "pyramid": [{"scale_hint":[1,1,1,2,2],"shape":[1,3,16,256,256],
+               "reduction_method":"precompute","native":true}],
   "volume": {"available": true, "reason": null,
              "axes": {"z":2,"y":3,"x":4}, "scale_hint": [1,1,1,1,1],
              "depth": 16, "height": 512, "width": 512, "bytes": 8388608,
              "spacing": null, "unit": null}
 }
 ```
+
+`levels` is the ladder a client addresses — always powers of two, because Viv's
+`PixelSource[]` convention requires it. `pyramid` is the ladder the **server**
+advertises, and is what each rung is actually *read from*: a tile is served by
+the coarsest entry whose `scale_hint` divides the rung's scale, with the
+remainder decimated in-process. Level 0 is omitted (it names full resolution,
+which a caller gets without asking) and the list is coarsest first.
+
+Two kinds ride the same field. A **native** entry (`native: true`,
+`reduction_method: "precompute"`) is a real on-disk level — OME-Zarr
+multiscales, a pyramidal QPTIFF — and reading it reads that level's own store.
+A **computed** entry is what the precache worker warms. Either way the rungs are
+addressed identically, so `pyramid` is advisory: it is published for diagnosis,
+and because it is the only place a client can see *why* one source's tiles are
+cheap and another's are not.
+
+The routing is `nearest`-only. An explicit `reduction_method=area` reads its own
+level: the remainder is a decimation, and a stored level is the writer's
+downsampling rather than the server's, so neither half of an `area` request
+would survive the trip.
 
 `volume` is the odd one out: it is not a rung of `levels` and does not belong to
 the tile grid at all. A 3-D renderer takes one whole volume rather than tiles, so

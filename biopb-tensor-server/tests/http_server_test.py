@@ -15,10 +15,13 @@ import numpy as np
 import pyarrow.flight as flight
 import pytest
 from biopb_tensor_server.serving.http_server import (
+    _ADVERTISED,
+    _advertised_levels,
+    _Level,
     _split_array_version,
     _tile_edge,
     _tile_levels,
-    _tile_warm_level,
+    _tile_read,
     _versioned_array_id,
     _volume_plan,
     create_app,
@@ -29,12 +32,34 @@ from fastapi.testclient import TestClient
 # Constants
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _isolate_advertised_ladder():
+    """The ladder memo is process-global and keyed on (array_id, version).
+
+    Two fixtures here reuse one array_id with different ladders and no content
+    version, which in production cannot happen -- ids are unique and a change of
+    content changes the token. In a test file it collides, and pytest-randomly
+    makes which way it collides depend on the seed.
+    """
+    _ADVERTISED.clear()
+    yield
+    _ADVERTISED.clear()
+
+
 _TOKEN = "test-token-valid-1234"
 _WRONG = "totally-wrong-token-xy"
 
 # ---------------------------------------------------------------------------
 # Stand-ins for protobuf descriptor objects
 # ---------------------------------------------------------------------------
+
+
+def _planned_pyramid(shape, dim_labels):
+    """The pyramid GetFlightInfo would advertise for a tensor of this shape."""
+    from biopb_tensor_server.core.chunk import build_pyramid_plan
+
+    return build_pyramid_plan(list(shape), list(dim_labels))
 
 
 def _make_tensor_desc(
@@ -44,18 +69,26 @@ def _make_tensor_desc(
     dim_labels=None,
     physical_scale=None,
     physical_unit=None,
+    pyramid=None,
 ) -> SimpleNamespace:
-    # physical_scale / physical_unit are repeated proto fields: always present
-    # on a real descriptor, empty when the source declares no physical size.
+    # physical_scale / physical_unit / pyramid are repeated proto fields: always
+    # present on a real descriptor, empty when the source declares none.
     # Spelled out here so a fake cannot be missing what the routes may read.
+    labels = list(dim_labels or ["z", "y", "x"])
     return SimpleNamespace(
         array_id=array_id,
         shape=list(shape),
         chunk_shape=[max(1, s // 2) for s in shape],
         dtype=dtype,
-        dim_labels=list(dim_labels or ["z", "y", "x"]),
+        dim_labels=labels,
         physical_scale=list(physical_scale or []),
         physical_unit=list(physical_unit or []),
+        # Defaults to what the Flight server would advertise for this shape --
+        # the sidecar reads the ladder off the descriptor rather than deriving
+        # it, so a fake without one is a tensor with no pyramid, which is a
+        # different tensor. Pass an explicit list (`[]` included) to say
+        # otherwise.
+        pyramid=_planned_pyramid(shape, labels) if pyramid is None else list(pyramid),
     )
 
 
@@ -1387,11 +1420,43 @@ class TestCreateAppSupervisedFromEnv:
 # ===========================================================================
 
 
-def _tile_source_desc(content_version: bytes | None = None) -> SimpleNamespace:
+def _pyramid_level(scale, shape, method="nearest", native=False) -> SimpleNamespace:
+    """A ``PyramidLevel`` as the descriptor carries it."""
+    return SimpleNamespace(
+        scale_hint=list(scale),
+        shape=list(shape),
+        reduction_method=method,
+        native=native,
+    )
+
+
+def _planned_levels(shape, labels):
+    """The ladder the Flight server advertises for *shape*, via the real reader.
+
+    The sidecar reads the ladder off the descriptor now instead of recomputing
+    it, so these hand it exactly what ``build_pyramid_plan`` puts on the wire.
+    """
+    from biopb_tensor_server.core.chunk import build_pyramid_plan
+
+    td = SimpleNamespace(array_id=f"planned/{list(shape)}", shape=list(shape))
+    client = MagicMock()
+    client.get_descriptor.return_value = SimpleNamespace(
+        pyramid=build_pyramid_plan(shape, list(labels))
+    )
+    return _advertised_levels(client, td, None)
+
+
+def _tile_source_desc(
+    content_version: bytes | None = None, pyramid=None
+) -> SimpleNamespace:
     """A realistic tiled tensor: TCZYX uint16, 1024x1024 plane, 512x512 chunks.
 
     ``content_version`` rides the TENSOR descriptor: it is a serving field,
     filled by GetFlightInfo and empty on a catalog listing entry.
+
+    ``pyramid`` is empty by default, which is what the real server advertises
+    for this tensor: a 1 Mpx plane is already under ``plane_max_pixels``, so the
+    planner emits full resolution and nothing else.
     """
     td = SimpleNamespace(
         array_id="tiled/Image:0",
@@ -1402,6 +1467,11 @@ def _tile_source_desc(content_version: bytes | None = None) -> SimpleNamespace:
         physical_scale=[],
         physical_unit=[],
         content_version=content_version,
+        pyramid=(
+            _planned_pyramid([1, 3, 16, 1024, 1024], ["t", "c", "z", "y", "x"])
+            if pyramid is None
+            else list(pyramid)
+        ),
     )
     return SimpleNamespace(
         source_id="tiled",
@@ -1477,31 +1547,26 @@ class TestTileGeometry:
     @pytest.mark.parametrize(
         "shape,expected",
         [
-            # Already under the cap: level 0 is the warm level, so nothing above
-            # it is ever read directly.
-            ([1, 1024, 1024], 0),
             # 14234**2 ND2 scene: 202 Mpx -> scale 8 is the first rung under 4 Mpx.
             ([1, 14234, 14234], 3),
             # 100000**2 WSI.
             ([1, 100000, 100000], 6),
-            # Anisotropic: the cap is on the plane, not on either edge -- a
-            # 500x20000 strip is under it two rungs before either edge is small.
-            ([1, 500, 20000], 1),
         ],
     )
-    def test_warm_level_is_the_first_rung_under_the_cap(self, shape, expected):
-        assert _tile_warm_level(shape, 1, 2, 4_000_000) == expected
-        at = lambda lv: (  # noqa: E731
-            -(-shape[1] // (1 << lv)) * -(-shape[2] // (1 << lv))
-        )
-        assert at(expected) <= 4_000_000
-        assert expected == 0 or at(expected - 1) > 4_000_000
+    def test_the_anchor_the_server_advertises_is_a_rung_this_ladder_has(
+        self, shape, expected
+    ):
+        """The anchor is read in its own right, so it must be addressable.
 
-    def test_warm_level_is_a_level_the_ladder_publishes(self):
-        # Synthesis anchors on it, so it must be addressable in its own right.
-        shape, edge = [1, 14234, 14234], 512
-        warm = _tile_warm_level(shape, 1, 2, 4_000_000)
-        assert warm < len(_tile_levels(shape, 1, 2, edge))
+        No longer recomputed here from PRECACHE_PLANE_MAX_PIXELS -- the sidecar
+        can address a plane whose config it does not own, so the ladder comes
+        from the server. This pins the two together: what the planner emits is a
+        power of two on Y/X, hence a rung of the tile grid.
+        """
+        levels = _planned_levels(shape, ["z", "y", "x"])
+        anchor = levels[-1]  # the 2-D target: finest non-identity rung
+        assert anchor.scale[1] == anchor.scale[2] == 1 << expected
+        assert expected < len(_tile_levels(shape, 1, 2, 512))
 
 
 class TestTileSynthesisIsExact:
@@ -1631,7 +1696,7 @@ class TestTileEndpoint:
         assert kwargs["scale_hint"][3] == 2 and kwargs["scale_hint"][4] == 2
         assert r.headers["X-Shape"] == "1,1,1,512,512"
 
-    def test_the_warm_level_itself_is_read_directly(self, tile_client):
+    def test_full_resolution_is_read_directly(self, tile_client):
         tc, mock_fc = tile_client
         r = tc.get("/api/tile/tiled", params={"level": 0, "col": 0, "row": 0})
         kwargs = mock_fc.get_tensor.call_args.kwargs
@@ -2432,7 +2497,14 @@ class TestTileResolutionCostsOneFetch:
         with _multi_tensor_client() as (tc, mock_fc):
             mock_fc.reset_mock()
             assert tc.get("/api/tile/multi/Image:1").status_code == 200
-            assert mock_fc.get_descriptor.call_count == 1
+            mock_fc.list_sources.assert_not_called()
+            # Two fetches on first contact: the structural one this route makes
+            # per request by contract, and the pyramid ladder, which is memoized
+            # on the content version. What must not grow per tile is the second
+            # one -- so the next tile costs exactly one more.
+            first = mock_fc.get_descriptor.call_count
+            assert tc.get("/api/tile/multi/Image:1").status_code == 200
+            assert mock_fc.get_descriptor.call_count == first + 1
             mock_fc.list_sources.assert_not_called()
 
     def test_a_bare_id_needs_no_listing_either(self):
@@ -2578,13 +2650,16 @@ class TestVolumePlan:
     def test_the_plan_is_the_flight_ladders_coarsest_level(
         self, shape, labels, scale, extent
     ):
-        plan, reason = _volume_plan(shape, labels, "uint16")
+        plan, reason = _volume_plan(
+            shape, labels, "uint16", _planned_levels(shape, labels)
+        )
         assert reason is None
         assert plan["scale_hint"] == scale
         assert (plan["depth"], plan["height"], plan["width"]) == extent
 
     def test_the_byte_count_is_the_wire_size_at_the_source_dtype(self):
-        plan, _ = _volume_plan([1024, 1024, 1024], ["z", "y", "x"], "uint16")
+        shape, labels = [1024, 1024, 1024], ["z", "y", "x"]
+        plan, _ = _volume_plan(shape, labels, "uint16", _planned_levels(shape, labels))
         assert plan["bytes"] == 256 * 256 * 256 * 2
 
     @pytest.mark.parametrize(
@@ -2605,7 +2680,8 @@ class TestVolumePlan:
     def test_a_tensor_with_no_volume_is_refused_with_the_reason(
         self, shape, labels, expect
     ):
-        plan, reason = _volume_plan(shape, labels, "uint16")
+        # The refusals are facts about the tensor, so the ladder is irrelevant.
+        plan, reason = _volume_plan(shape, labels, "uint16", ())
         assert plan is None
         assert expect in reason
 
@@ -2613,7 +2689,8 @@ class TestVolumePlan:
         # 448**3, the measured GPU budget (9.1). The read is unbounded in
         # principle -- slice_hint spans three whole axes -- so this is the only
         # thing standing between a 3-D toggle and a multi-gigabyte response.
-        plan, _ = _volume_plan([4000, 8000, 8000], ["z", "y", "x"], "uint16")
+        shape, labels = [4000, 8000, 8000], ["z", "y", "x"]
+        plan, _ = _volume_plan(shape, labels, "uint16", _planned_levels(shape, labels))
         voxels = plan["depth"] * plan["height"] * plan["width"]
         assert voxels <= 448**3
 
@@ -2803,3 +2880,238 @@ class TestScalePolicyOnSlice:
         assert r.status_code == 422
         assert "at least 3" in r.json()["detail"]
         mock_fc.get_tensor.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Native pyramid levels (biopb/biopb#889)
+# ---------------------------------------------------------------------------
+
+
+def _native_source_desc(plane=4096, scales=(2, 4)):
+    """A tiled tensor shipping a real on-disk pyramid over its Y/X plane.
+
+    Bigger than the plain tile fixture on purpose: a 1024 plane at edge 512 has
+    only two rungs, too few to tell "read the level" from "read the level and
+    reduce the rest".
+    """
+    td = SimpleNamespace(
+        array_id="native/Image:0",
+        shape=[1, 3, 16, plane, plane],
+        chunk_shape=[1, 1, 1, 512, 512],
+        dtype="uint16",
+        dim_labels=["t", "c", "z", "y", "x"],
+        physical_scale=[],
+        physical_unit=[],
+        content_version=None,
+        pyramid=[
+            _pyramid_level(
+                [1, 1, 1, s, s],
+                [1, 3, 16, plane // s, plane // s],
+                method="precompute",
+                native=True,
+            )
+            for s in (1, *scales)
+        ],
+    )
+    return SimpleNamespace(
+        source_id="native",
+        source_url="/data/native.zarr",
+        source_type="zarr",
+        metadata_json=None,
+        tensors=[td],
+    )
+
+
+@pytest.fixture()
+def native_tile_client():
+    """The tile fixture, but shipping a real 3-level on-disk pyramid."""
+    src = _native_source_desc()
+    mock_fc = _build_mock_client(src)
+    lazy = MagicMock()
+    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
+    mock_fc.get_tensor.return_value = lazy
+    with patch(
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        app = create_app(token=None)
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc, mock_fc
+
+
+class TestTileReadPicksALevel:
+    """Which advertised level backs a rung, and what is left to reduce."""
+
+    SHAPE = [1, 3, 16, 1024, 1024]
+
+    def _levels(self, *scales, native=True, method="precompute"):
+        return [
+            _Level(
+                scale=(1, 1, 1, s, s),
+                shape=(1, 3, 16, 1024 // s, 1024 // s),
+                method=method,
+                native=native,
+            )
+            for s in scales
+        ]
+
+    def test_an_exact_match_is_read_with_no_residual(self):
+        plan = _tile_read(self.SHAPE, 3, 4, 2, self._levels(4, 2), "nearest")
+        assert plan.scale_hint == [1, 1, 1, 4, 4]
+        assert plan.method == "precompute"
+        assert plan.residual is None
+
+    def test_a_dividing_level_is_read_and_the_rest_decimated(self):
+        # Rung 3 wants scale 8; the coarsest native level is 4, so 4 is read and
+        # the remaining 2 is done here. This is the case exact matching missed.
+        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(4, 2), "nearest")
+        assert plan.scale_hint == [1, 1, 1, 4, 4]
+        assert plan.residual == [1, 1, 1, 2, 2]
+
+    def test_the_coarsest_dividing_level_wins(self):
+        # Both 2 and 4 divide 8; picking 2 would read four times the bytes.
+        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(2, 4), "nearest")
+        assert plan.scale_hint == [1, 1, 1, 4, 4]
+
+    def test_a_rung_finer_than_every_level_reads_its_own_scale(self):
+        # Rung 0 is full resolution: no coarser level divides 1.
+        plan = _tile_read(self.SHAPE, 3, 4, 0, self._levels(4, 2), "nearest")
+        assert plan.scale_hint is None
+        assert plan.read_level == 0
+        assert plan.residual is None
+
+    def test_a_level_that_scales_z_is_never_picked_for_a_plane(self):
+        """The 3-D target must not serve a 2-D tile.
+
+        A tile carries 1 on z, and 1 % 2 != 0 -- so the divisibility test that
+        makes the residual whole also keeps the volumetric level out, with no
+        separate gate to keep in sync.
+        """
+        volumetric = [
+            _Level(
+                scale=(1, 1, 4, 4, 4),
+                shape=(1, 3, 4, 256, 256),
+                method="",
+                native=False,
+            )
+        ]
+        plan = _tile_read(self.SHAPE, 3, 4, 2, volumetric, "nearest")
+        assert plan.scale_hint is None
+        assert plan.read_level == 2
+
+    def test_area_is_not_routed_to_a_level(self):
+        # The residual is a decimation, and a stored level is the writer's
+        # kernel; neither half of an `area` request would survive the trip.
+        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(4), "area")
+        assert plan.scale_hint is None and plan.read_level == 3
+
+    def test_an_empty_ladder_still_anchors_on_full_resolution(self):
+        # No coarser level exists, so full resolution is the anchor and the tail
+        # is reduced from it -- what warm_level == 0 used to mean.
+        plan = _tile_read(self.SHAPE, 3, 4, 2, [], "nearest")
+        assert plan.scale_hint == [1, 1, 1, 1, 1]
+        assert plan.residual == [1, 1, 1, 4, 4]
+
+    def test_a_computed_level_carries_its_own_method(self):
+        plan = _tile_read(
+            self.SHAPE,
+            3,
+            4,
+            3,
+            self._levels(4, native=False, method="nearest"),
+            "nearest",
+        )
+        assert plan.method == "nearest"
+
+
+class TestNativeLevelsOnTheTileRoute:
+    """End to end: a pyramidal source stops decimating full resolution."""
+
+    def test_the_read_addresses_the_native_level(self, native_tile_client):
+        tc, mock_fc = native_tile_client
+        r = tc.get("/api/tile/native", params={"level": 2, "col": 0, "row": 0})
+        assert r.status_code == 200
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        # Both halves of the address: an exact scale AND `precompute`. Either
+        # one alone lands on a computed read of level 0.
+        assert kwargs["scale_hint"] == [1, 1, 1, 4, 4]
+        assert kwargs["reduction_method"] == "precompute"
+
+    def test_a_rung_past_the_ladder_reads_the_coarsest_level_and_reduces(
+        self, native_tile_client
+    ):
+        tc, mock_fc = native_tile_client
+        r = tc.get("/api/tile/native", params={"level": 3, "col": 0, "row": 0})
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        assert kwargs["scale_hint"] == [1, 1, 1, 4, 4]
+        # The mock answers 512x512 whatever it is asked; halving it is the proof
+        # the in-process residual ran.
+        assert r.headers["X-Shape"] == "1,1,1,256,256"
+
+    def test_world_bounds_still_come_from_the_rung_addressed(self, native_tile_client):
+        tc, mock_fc = native_tile_client
+        tc.get("/api/tile/native", params={"level": 2, "col": 0, "row": 0})
+        hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+        # Level 2 at edge 512 spans 2048 world units, whatever level is read.
+        assert hint[3] == slice(0, 2048) and hint[4] == slice(0, 2048)
+
+    def test_the_ladder_is_published_for_diagnosis(self, native_tile_client):
+        tc, _ = native_tile_client
+        pyramid = tc.get("/api/tile_info/native").json()["pyramid"]
+        # Coarsest first, level 0 dropped: it names full resolution, which is
+        # what a caller gets without asking for a level.
+        assert [entry["scale_hint"] for entry in pyramid] == [
+            [1, 1, 1, 4, 4],
+            [1, 1, 1, 2, 2],
+        ]
+        assert all(entry["native"] for entry in pyramid)
+
+    def test_the_ladder_is_fetched_once_per_version(self, native_tile_client):
+        tc, mock_fc = native_tile_client
+        before = sum(
+            1
+            for call in mock_fc.get_descriptor.call_args_list
+            if call.kwargs.get("with_pyramid")
+        )
+        for level in (1, 2, 3):
+            tc.get("/api/tile/native", params={"level": level})
+        after = sum(
+            1
+            for call in mock_fc.get_descriptor.call_args_list
+            if call.kwargs.get("with_pyramid")
+        )
+        # Memoized on the content version, so a tile burst pays for one.
+        assert after - before <= 1
+
+
+class TestNativeLevelsOnTheVolumePath:
+    """`scale_policy="volume"` resolves to a native level where one exists."""
+
+    def test_the_plan_takes_the_coarsest_native_level_and_its_method(self):
+        levels = (
+            _Level((1, 1, 1, 4, 4), (1, 3, 16, 256, 256), "precompute", True),
+            _Level((1, 1, 1, 2, 2), (1, 3, 16, 512, 512), "precompute", True),
+        )
+        plan, reason = _volume_plan(
+            [1, 3, 16, 1024, 1024], ["t", "c", "z", "y", "x"], "uint16", levels
+        )
+        assert reason is None
+        assert plan["scale_hint"] == [1, 1, 1, 4, 4]
+        assert plan["reduction_method"] == "precompute"
+        # The level's OWN extent, not ceil_div(base, scale): a writer that floors
+        # a level shape is still telling the truth about what the read returns.
+        assert (plan["depth"], plan["height"], plan["width"]) == (16, 256, 256)
+
+    def test_the_slice_read_carries_both_halves_of_the_address(
+        self, native_tile_client
+    ):
+        tc, mock_fc = native_tile_client
+        r = tc.post(
+            "/api/slice",
+            json={"array_id": "native/Image:0", "scale_policy": "volume"},
+        )
+        assert r.status_code == 200, r.text
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        assert kwargs["scale_hint"] == [1, 1, 1, 4, 4]
+        assert kwargs["reduction_method"] == "precompute"
+        assert r.headers["X-Scale-Hint"] == "1,1,1,4,4"
