@@ -60,6 +60,10 @@ def _default_of(section, field):
             "pixel_budget_cubic_root",
         ),
         ({"pyramid": {"threshold": 0}}, "pyramid", "threshold"),
+        # <= 0 can never satisfy the 2-D stop condition, so the rungs run to the
+        # per-axis floor and the cap silently stops being the cap.
+        ({"pyramid": {"plane_max_pixels": 0}}, "pyramid", "plane_max_pixels"),
+        ({"pyramid": {"plane_max_pixels": -1}}, "pyramid", "plane_max_pixels"),
         ({"pyramid": {"reduction_method": "bogus"}}, "pyramid", "reduction_method"),
         # "precompute" is protocol vocabulary (request a native on-disk level),
         # not a way to compute a pyramid level -- invalid as config.

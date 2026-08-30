@@ -219,9 +219,14 @@ _CONSTRAINTS = {
         "file_max_total_bytes": _Range(min=1),
     },
     "PyramidConfig": {
-        # reduction_method is server-local (on-the-fly reduction is a compute
-        # concern, not a biopb-mcp knob); the numeric rows are shared.
+        # reduction_method and plane_max_pixels are server-local: on-the-fly
+        # reduction is a compute concern, and biopb-mcp has no 2-D plane cap
+        # (its fallback plan scales X/Y/Z against one voxel budget). The rows
+        # both packages do share come from PYRAMID_CONSTRAINTS.
         "reduction_method": _Enum(_REDUCTION_METHODS, case_insensitive=True),
+        # <= 0 never satisfies the Phase 1 stop condition, so the ladder runs to
+        # the per-axis floor and the knob silently stops meaning what it says.
+        "plane_max_pixels": _Range(min=1),
         **PYRAMID_CONSTRAINTS,
     },
     "PrecacheConfig": {
@@ -573,7 +578,9 @@ class PyramidConfig:
         metadata={
             "help": "Max X*Y pixels of the coarsest 2-D level. Also the gate on "
             "whether a tensor gets 2-D levels at all: below it the plane is "
-            "already cheap to read whole."
+            "already cheap to read whole. Values below "
+            "min(pixel_budget_cubic_root, threshold)**2 are unreachable -- the "
+            "rungs stop at that per-axis floor first."
         },
     )
 
