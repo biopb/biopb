@@ -139,6 +139,15 @@ export interface RequestOptions {
    * it a viewer that pans away still pays for every tile it asked for.
    */
   signal?: AbortSignal;
+  /**
+   * Override the method's own timeout, in ms. `null` removes the deadline.
+   *
+   * For a caller whose payload is nothing like what the method's budget was
+   * sized for — a whole 3-D volume through `slice`, whose budget assumes a
+   * plane. Sizing one number for both would either abort the volume or leave a
+   * stalled tile hanging for a minute.
+   */
+  timeoutMs?: number | null;
 }
 
 interface ComposedSignal {
@@ -225,8 +234,23 @@ export class TensorHttpClient {
 
   /** Timeout for metadata / listing requests (ms). */
   metadataTimeoutMs = 3_000;
-  /** Timeout for binary chunk/slice requests (ms). */
+  /** Timeout for binary chunk/slice requests (ms). Sized for one tile. */
   chunkTimeoutMs = 8_000;
+  /**
+   * Timeout for a whole-volume `slice` read (ms).
+   *
+   * Independent of {@link chunkTimeoutMs} because the payloads are three orders
+   * of magnitude apart: that budget is sized for a 512 KB tile, where giving up
+   * at 8 s is right because a tile that slow is a symptom. A volume is up to
+   * `VOLUME_MAX_BYTES` on the wire, may be a cold read of a whole stack, and is
+   * a deliberate one-shot action the user just asked for.
+   *
+   * Generous on purpose. Too short does not degrade 3-D, it removes it —
+   * silently, on exactly the large volumetric data the mode exists for. Too
+   * long costs a wait the user can already end at any point by switching back
+   * to 2-D, which aborts the fetch. Given that, the asymmetry is not close.
+   */
+  volumeTimeoutMs = 120_000;
   /**
    * Timeout for `tile_info` (ms).
    *
@@ -320,7 +344,8 @@ export class TensorHttpClient {
     opts: RequestOptions | undefined,
     consume: (res: Response) => Promise<T>,
   ): Promise<T> {
-    const composed = composeSignal(timeoutMs, opts?.signal);
+    const effectiveTimeout = opts?.timeoutMs === undefined ? timeoutMs : (opts.timeoutMs ?? undefined);
+    const composed = composeSignal(effectiveTimeout, opts?.signal);
     try {
       let res: Response;
       try {
@@ -328,7 +353,7 @@ export class TensorHttpClient {
       } catch (e) {
         // The only rejection here that is unambiguously the network. The same
         // `TypeError` thrown while reading the response below would be ours.
-        const mapped = abortAwareError(e, path, timeoutMs, opts?.signal);
+        const mapped = abortAwareError(e, path, effectiveTimeout, opts?.signal);
         throw mapped instanceof Error && mapped === e
           ? new TensorNetworkError(path, e)
           : mapped;
@@ -336,7 +361,7 @@ export class TensorHttpClient {
       await assertOk(res);
       return await consume(res);
     } catch (e) {
-      throw abortAwareError(e, path, timeoutMs, opts?.signal);
+      throw abortAwareError(e, path, effectiveTimeout, opts?.signal);
     } finally {
       composed.cleanup();
     }
@@ -626,5 +651,6 @@ async function readNdArray(res: Response): Promise<TypedNdArray> {
   const shape = (res.headers.get("X-Shape") ?? "").split(",").filter(Boolean).map(Number);
   const dtype = res.headers.get("X-Dtype") ?? "";
   const dimLabels = (res.headers.get("X-Dim-Labels") ?? "").split(",").filter(Boolean);
-  return { buffer: await res.arrayBuffer(), shape, dtype, dimLabels };
+  const scaleHint = (res.headers.get("X-Scale-Hint") ?? "").split(",").filter(Boolean).map(Number);
+  return { buffer: await res.arrayBuffer(), shape, dtype, dimLabels, scaleHint };
 }

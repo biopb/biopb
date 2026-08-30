@@ -337,10 +337,13 @@ hardware — a single dimension above it fails outright, not gracefully. Per cha
 *Network:* 512³ `uint16` is 256 MB on the wire — ~40 s per channel at 50 Mbps. **The
 remote-viable budget is ~256³ per channel**, well under what the GPU would tolerate.
 
-So the server picks the level, not the client's GPU. Extend the existing
-`pixel_budget`/`scale_hint` mechanism as a `voxel_budget` on the slice path: the
-client asks for an ROI under a voxel count, the server resolves the pyramid level and
-returns the slab. Same concept, same code shape.
+So the server picks the level, not the client's GPU. **Shipped** as
+`scale_policy: "volume"` on `/api/slice` — the client sends the region and the
+server resolves the scale, which is the one the precache worker keeps a whole
+volume warm at. Not the `voxel_budget` this originally proposed: a budget the
+client names would land it a rung off the warm level, and `chunk_id` carries
+`scale_hint`, so a near-miss shares no cache entry. See `precache-policy.md` §5
+and `http-server.md`.
 
 **Consequences of no pyramid:**
 

@@ -73,7 +73,10 @@ export function vivDtype(numpyDtype: string): SupportedDtype {
  * No byte-swapping: the server normalises to native order before writing the
  * body, and every platform a browser runs on is little-endian.
  */
-function asTypedArray(buffer: ArrayBuffer, dtype: SupportedDtype): SupportedTypedArray {
+export function asTypedArray(
+  buffer: ArrayBuffer,
+  dtype: SupportedDtype,
+): SupportedTypedArray {
   return new TYPED_ARRAY_BY_DTYPE[dtype](buffer) as SupportedTypedArray;
 }
 

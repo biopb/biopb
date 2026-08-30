@@ -352,6 +352,62 @@ describe("TensorHttpClient.slice", () => {
     expect(body.slice_start).toEqual([0, 0, 0]);
   });
 
+  it("passes scale_policy through instead of a scale_hint", async () => {
+    const buf = makeBuffer(4);
+    mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.slice({ array_id: "s/t", scale_policy: "volume" });
+    const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(opts.body as string);
+    expect(body.scale_policy).toBe("volume");
+    expect(body.scale_hint).toBeUndefined();
+  });
+
+  it("reads back the scale the server actually read at", async () => {
+    // Load-bearing under scale_policy: the caller did not choose the scale, so
+    // this header is the only statement of what it got.
+    const buf = makeBuffer(4);
+    const res = binaryResponse(buf, [1, 1, 1], "uint8", []);
+    res.headers.set("X-Scale-Hint", "4,4,4");
+    mockFetch.mockResolvedValueOnce(res);
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.slice({ array_id: "s/t", scale_policy: "volume" });
+    expect(result.scaleHint).toEqual([4, 4, 4]);
+  });
+
+  it("reports an empty scale against a server that does not send the header", async () => {
+    const buf = makeBuffer(4);
+    mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.slice({ array_id: "s/t" });
+    expect(result.scaleHint).toEqual([]);
+  });
+
+  it("takes a per-call timeout override, so a volume is not held to the tile budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const c = new TensorHttpClient(BASE, TOKEN);
+      mockFetch.mockImplementationOnce((_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          );
+        }),
+      );
+      const p = c
+        .slice({ array_id: "s/t", scale_policy: "volume" }, { timeoutMs: 60_000 })
+        .catch((e) => e);
+      // Past the tile budget, which must not apply here.
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(41_000);
+      const err = await p;
+      expect(err).toBeInstanceOf(TensorApiError);
+      expect((err as TensorApiError).message).toContain("60000ms");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("throws TensorApiError on 502", async () => {
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ detail: "Flight error: RuntimeError" }), {

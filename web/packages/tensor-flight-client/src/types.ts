@@ -40,6 +40,18 @@ export interface SliceRequest {
   slice_stop?: number[];
   /** Per-dimension integer downsampling factors, e.g. [1, 8, 8]. */
   scale_hint?: number[];
+  /**
+   * Hand the scale decision to the server instead of naming one.
+   *
+   * `"volume"` reads at the single scale the server keeps a whole 3-D volume
+   * warm at — the level napari 3-D and `XR3DLayer` upload as one texture.
+   * There is no way to compute it client-side short of reimplementing the
+   * server's pyramid planner, and a guess one rung off misses every warmed
+   * chunk. `TileInfo.volume` says what it will resolve to for a given tensor.
+   *
+   * Mutually exclusive with `scale_hint`; sending both is a 422.
+   */
+  scale_policy?: "volume";
   /** "nearest" | "area" | "precompute" (server also accepts "stride", "decimate", "mean"). */
   reduction_method?: string;
   /** Informational: current viewport pixel budget (stored in diagnostics). */
@@ -56,6 +68,14 @@ export interface TypedNdArray {
   dtype: string;
   /** Semantic axis labels, e.g. ["t","z","y","x"]. Empty if not available. */
   dimLabels: string[];
+  /**
+   * Per-axis scale the server actually read at (`X-Scale-Hint`).
+   *
+   * Echoed on every slice, and load-bearing under `scale_policy`: there the
+   * caller did not choose, so this is the only statement of what it got. Empty
+   * against a server predating the header.
+   */
+  scaleHint: number[];
 }
 
 /** Parsed OME-NGFF multiscales metadata (minimal subset). */
@@ -245,6 +265,66 @@ export interface TileInfo {
    */
   sel_axes: TileAxis[];
   levels: TileLevel[];
+  /**
+   * What a 3-D read of this tensor gets, or why there isn't one.
+   *
+   * Not a rung of `levels`: a 3-D renderer takes one whole volume rather than
+   * tiles, so it leaves the tile ladder entirely (`XR3DLayer` has no `loader`
+   * prop). It rides this response because this is the one call a viewer
+   * already makes before it can address the tensor at all.
+   *
+   * Absent against a server predating it — treat that as unavailable.
+   */
+  volume?: VolumeInfo;
+}
+
+/** `TileInfo.volume`: the plan for a `scale_policy: "volume"` read. */
+export type VolumeInfo = VolumeAvailable | VolumeUnavailable;
+
+export interface VolumeUnavailable {
+  available: false;
+  /**
+   * Why, in a sentence meant to be shown: no z axis, a z extent of 1, an
+   * interleaved samples axis. A fact about the tensor, so it will not change
+   * on a retry.
+   */
+  reason: string;
+}
+
+export interface VolumeAvailable {
+  available: true;
+  reason: null;
+  /** Wire indices of the three volume axes. */
+  axes: { z: number; y: number; x: number };
+  /** Per-axis scale the server will read at. Full length, wire order. */
+  scale_hint: number[];
+  /** Extent of the returned volume along z / y / x, after `scale_hint`. */
+  depth: number;
+  height: number;
+  width: number;
+  /**
+   * Wire size of the volume at its own dtype. NOT the VRAM it costs: Viv casts
+   * every volume to Float32 on upload, so that is 4 bytes per voxel regardless.
+   */
+  bytes: number;
+  /**
+   * Physical extent of one voxel **of the returned volume** (source physical
+   * size already multiplied by `scale_hint`), or null when the source declares
+   * none — render isotropic then.
+   *
+   * All three are in the *same* unit, reconciled server-side: `physical_unit`
+   * is per-axis and adapters do not all normalise (NIfTI reports mm, the EM
+   * readers nm), so comparing them raw would stretch the volume by whatever the
+   * conversion factor was. Axes whose units differ and cannot be placed on a
+   * common scale come back null rather than as a plausible wrong ratio.
+   */
+  spacing: { z: number; y: number; x: number } | null;
+  /**
+   * Unit `spacing` is expressed in — "µm" whenever the server could convert.
+   * Null when the axes agree on a unit it cannot name, which is still a valid
+   * ratio. Not needed to render: `spacing` is self-consistent either way.
+   */
+  unit: string | null;
 }
 
 /** A non-plane axis addressed by its wire index, with the source's own name. */

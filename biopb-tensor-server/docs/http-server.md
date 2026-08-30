@@ -70,9 +70,9 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
-| `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels and selectable axes for one tensor |
+| `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels, selectable axes and the 3-D volume plan |
 | `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (raw bytes) |
-| `POST` | `/api/slice` | ✓ | Binary tensor sub-region |
+| `POST` | `/api/slice` | ✓ | Binary tensor sub-region; `scale_policy` delegates the scale |
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
@@ -165,9 +165,27 @@ a tile grid — shaped to drop into a Viv `PixelSource[]`:
   "plane": {"y": 3, "x": 4, "s": null},
   "selectable": {"t": 0, "c": 1, "z": 2},
   "sel_axes": [],
-  "levels": [{"level":0,"scale":1,"height":512,"width":512,"cols":1,"rows":1}]
+  "levels": [{"level":0,"scale":1,"height":512,"width":512,"cols":1,"rows":1}],
+  "volume": {"available": true, "reason": null,
+             "axes": {"z":2,"y":3,"x":4}, "scale_hint": [1,1,1,1,1],
+             "depth": 16, "height": 512, "width": 512, "bytes": 8388608,
+             "spacing": null, "unit": null}
 }
 ```
+
+`volume` is the odd one out: it is not a rung of `levels` and does not belong to
+the tile grid at all. A 3-D renderer takes one whole volume rather than tiles, so
+it leaves the ladder entirely — but this is the one call a viewer already makes
+before it can address the tensor, so the plan rides along rather than costing a
+second round trip. It describes what a `scale_policy: "volume"` read (below)
+will return, or says `available: false` with a reason a viewer can show: no z
+axis, a z extent of 1, an interleaved samples axis. `spacing` is the physical
+extent of one voxel *of that volume* — the source's physical size already
+multiplied by `scale_hint`, and with the three axes reduced to one unit
+(`physical_unit` is per-axis and adapters do not all normalise: NIfTI reports
+`mm`, the EM readers `nm`). `null` when the source declares no size, or when
+the axes carry units that differ and cannot all be placed on a common scale —
+a plausible wrong ratio is worse than rendering isotropic.
 
 `selectable` gives the wire index of each **named** slider axis, or `null`.
 `sel_axes` is the converse and is the one worth reading: non-plane axes with
@@ -271,12 +289,13 @@ caller has already hung up, counted as `cancelled_reads` in `/api/diagnostics`.
 This reclaims *queued* work only — neither the Flight read nor the dask graph is
 interruptible, so a client that leaves mid-compute is not noticed.
 
-`/api/tile` reads via `run_in_threadpool`. That is load-bearing for cancellation,
-not just for latency: a read blocking the event loop denies it the turn it needs
-to observe other callers' disconnects, which silently defeats the check for every
+Both read via `run_in_threadpool`. That is load-bearing for cancellation, not
+just for latency: a read blocking the event loop denies it the turn it needs to
+observe other callers' disconnects, which silently defeats the check for every
 request queued behind it (`remote-viewer-tiles.md` has the measurements).
-`/api/slice` still computes on the loop, so its check only fires when something
-else has yielded.
+`/api/slice` computed on the loop until volumes made that reachable in normal
+use — a `scale_policy` read is a whole 3-D block, so the queue behind it can be
+seconds long.
 
 ## Slice endpoint
 
@@ -288,6 +307,7 @@ else has yielded.
   "slice_start":      [0, 0, 0],
   "slice_stop":       [1, 512, 512],
   "scale_hint":       [1, 2, 2],
+  "scale_policy":     null,
   "reduction_method": "area",
   "pixel_budget":     1000000
 }
@@ -312,10 +332,30 @@ form. There is **no `"0"` sentinel** either: a single-tensor source's `array_id`
 - `X-Shape: 1,512,512`
 - `X-Dtype: uint16`
 - `X-Dim-Labels: z,y,x`
+- `X-Scale-Hint: 1,2,2` — the per-axis scale actually read at
 
 `scale_hint` and `reduction_method` are forwarded verbatim to
 `TensorFlightClient.get_tensor(...)`, which resolves the appropriate
 precomputed pyramid level (if available) or applies runtime downsampling.
+
+### `scale_policy` — letting the server choose the scale
+
+`scale_policy: "volume"` reads at the one scale the server keeps a whole 3-D
+volume warm at: the Flight ladder's coarsest level, which is what the precache
+worker warms and what napari's 3-D mode uploads as a single texture
+(`precache-policy.md` §5). `/api/tile_info`'s `volume` block says what it will
+resolve to for a given tensor, and a tensor with no volume is a **422** carrying
+that block's own `reason`.
+
+It exists because a client cannot compute that level without reimplementing the
+server's pyramid planner, and a guess one rung away misses every warmed chunk —
+`chunk_id` is `array_id + bounds + scale_hint + reduction_method`, so a
+neighbouring scale shares no cache entry and pays a cold read of the source.
+
+`scale_policy` and `scale_hint` are **mutually exclusive** (422): one read has one
+scale, and letting the two disagree would make which one applies a silent policy.
+`X-Scale-Hint` is echoed either way, but it is load-bearing here — the caller did
+not choose, so the header is the only statement of what it got.
 
 ## Diagnostics
 
