@@ -1684,17 +1684,30 @@ class TestTileEndpoint:
         # the in-process reduction ran.
         assert r.headers["X-Shape"] == "1,1,1,256,256"
 
-    def test_area_keeps_reading_its_own_level(self, tile_client):
-        # Synthesis composes exactly only under `nearest`; `area` pads and
-        # re-averages, so a level below the warm one must still be read directly.
+    def test_a_kernel_choice_on_a_tile_is_410(self, tile_client):
+        # Withdrawn, not ignored: silently serving different pixels is what a
+        # caller pinned to an older server cannot detect. A tile is the display
+        # path -- what the parameter selected was a store, not a kernel.
         tc, mock_fc = tile_client
+        mock_fc.reset_mock()
         r = tc.get(
             "/api/tile/tiled",
             params={"level": 1, "col": 0, "row": 0, "reduction_method": "area"},
         )
-        kwargs = mock_fc.get_tensor.call_args.kwargs
-        assert kwargs["scale_hint"][3] == 2 and kwargs["scale_hint"][4] == 2
-        assert r.headers["X-Shape"] == "1,1,1,512,512"
+        assert r.status_code == 410
+        assert "POST /api/slice" in r.json()["detail"]
+        # Refused before any backend call, like `fmt`.
+        mock_fc.get_tensor.assert_not_called()
+
+    @pytest.mark.parametrize("spelling", ["nearest", "decimate", "stride", "NEAREST"])
+    def test_the_kernel_that_tiles_already_use_is_still_accepted(
+        self, spelling, tile_client
+    ):
+        # Aliases resolve before the refusal, so a caller naming the behaviour it
+        # was already getting is not broken by the withdrawal.
+        tc, _ = tile_client
+        r = tc.get("/api/tile/tiled", params={"reduction_method": spelling})
+        assert r.status_code == 200
 
     def test_full_resolution_is_read_directly(self, tile_client):
         tc, mock_fc = tile_client
@@ -2956,7 +2969,7 @@ class TestTileReadPicksALevel:
         ]
 
     def test_an_exact_match_is_read_with_no_residual(self):
-        plan = _tile_read(self.SHAPE, 3, 4, 2, self._levels(4, 2), "nearest")
+        plan = _tile_read(self.SHAPE, 3, 4, 2, self._levels(4, 2))
         assert plan.scale_hint == [1, 1, 1, 4, 4]
         assert plan.method == "precompute"
         assert plan.residual is None
@@ -2964,18 +2977,18 @@ class TestTileReadPicksALevel:
     def test_a_dividing_level_is_read_and_the_rest_decimated(self):
         # Rung 3 wants scale 8; the coarsest native level is 4, so 4 is read and
         # the remaining 2 is done here. This is the case exact matching missed.
-        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(4, 2), "nearest")
+        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(4, 2))
         assert plan.scale_hint == [1, 1, 1, 4, 4]
         assert plan.residual == [1, 1, 1, 2, 2]
 
     def test_the_coarsest_dividing_level_wins(self):
         # Both 2 and 4 divide 8; picking 2 would read four times the bytes.
-        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(2, 4), "nearest")
+        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(2, 4))
         assert plan.scale_hint == [1, 1, 1, 4, 4]
 
     def test_a_rung_finer_than_every_level_reads_its_own_scale(self):
         # Rung 0 is full resolution: no coarser level divides 1.
-        plan = _tile_read(self.SHAPE, 3, 4, 0, self._levels(4, 2), "nearest")
+        plan = _tile_read(self.SHAPE, 3, 4, 0, self._levels(4, 2))
         assert plan.scale_hint is None
         assert plan.read_level == 0
         assert plan.residual is None
@@ -2995,31 +3008,20 @@ class TestTileReadPicksALevel:
                 native=False,
             )
         ]
-        plan = _tile_read(self.SHAPE, 3, 4, 2, volumetric, "nearest")
+        plan = _tile_read(self.SHAPE, 3, 4, 2, volumetric)
         assert plan.scale_hint is None
         assert plan.read_level == 2
-
-    def test_area_is_not_routed_to_a_level(self):
-        # The residual is a decimation, and a stored level is the writer's
-        # kernel; neither half of an `area` request would survive the trip.
-        plan = _tile_read(self.SHAPE, 3, 4, 3, self._levels(4), "area")
-        assert plan.scale_hint is None and plan.read_level == 3
 
     def test_an_empty_ladder_still_anchors_on_full_resolution(self):
         # No coarser level exists, so full resolution is the anchor and the tail
         # is reduced from it -- what warm_level == 0 used to mean.
-        plan = _tile_read(self.SHAPE, 3, 4, 2, [], "nearest")
+        plan = _tile_read(self.SHAPE, 3, 4, 2, [])
         assert plan.scale_hint == [1, 1, 1, 1, 1]
         assert plan.residual == [1, 1, 1, 4, 4]
 
     def test_a_computed_level_carries_its_own_method(self):
         plan = _tile_read(
-            self.SHAPE,
-            3,
-            4,
-            3,
-            self._levels(4, native=False, method="nearest"),
-            "nearest",
+            self.SHAPE, 3, 4, 3, self._levels(4, native=False, method="nearest")
         )
         assert plan.method == "nearest"
 

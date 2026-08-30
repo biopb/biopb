@@ -233,6 +233,17 @@ export interface TileLevel {
   rows: number;
 }
 
+/** One rung of the server-advertised pyramid (`TileInfo.pyramid`). */
+export interface TilePyramidLevel {
+  /** Per-axis factors vs full resolution, in wire order. */
+  scale_hint: number[];
+  /** The level's own extent -- not necessarily `ceil(base / scale)`. */
+  shape: number[];
+  /** "precompute" for a native level, else the kernel the server computes with. */
+  reduction_method: string;
+  native: boolean;
+}
+
 /** Everything needed to address a tensor as a tile grid (`GET /api/tile_info`). */
 export interface TileInfo {
   array_id: string;
@@ -265,6 +276,18 @@ export interface TileInfo {
    */
   sel_axes: TileAxis[];
   levels: TileLevel[];
+  /**
+   * The ladder the *server* advertises, which is what each rung of `levels` is
+   * read from: the coarsest entry whose `scale_hint` divides the rung's scale,
+   * with the remainder reduced server-side. Coarsest first, full resolution
+   * omitted.
+   *
+   * `native: true` is a real on-disk level (OME-Zarr multiscales, a pyramidal
+   * QPTIFF) rather than one computed on the fly. Advisory only -- the rungs are
+   * addressed identically either way -- but it is the one place a client can
+   * see why one source's tiles are cheap and another's are not.
+   */
+  pyramid?: TilePyramidLevel[];
   /**
    * What a 3-D read of this tensor gets, or why there isn't one.
    *
@@ -359,7 +382,6 @@ export interface TileRequest {
    * two spellings in one URL is two cache entries for one tile.
    */
   sel?: Array<[number, number]>;
-  reduction_method?: string;
 }
 
 /** A raw tile plus the grid the server actually served it from. */

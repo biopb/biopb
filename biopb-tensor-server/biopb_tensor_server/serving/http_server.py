@@ -869,9 +869,9 @@ class _TileRead(NamedTuple):
     """Where one rung is read from, and what is reduced afterwards.
 
     ``scale_hint`` is an advertised level's vector, or ``None`` to read the rung
-    itself at ``read_level``. ``method`` is the ``reduction_method`` to send, or
-    ``None`` to forward whatever the caller asked for. ``residual`` is the local
-    decimation applied to the result, or ``None`` for none.
+    itself at ``read_level``. ``method`` is the ``reduction_method`` to send --
+    the chosen level's own -- or ``None`` to leave it to the server's default.
+    ``residual`` is the local decimation applied to the result, or ``None``.
     """
 
     scale_hint: Optional[List[int]]
@@ -886,7 +886,6 @@ def _tile_read(
     x_idx: int,
     level: int,
     levels: Sequence[_Level],
-    method: str,
 ) -> _TileRead:
     """Serve one rung from the coarsest advertised level that divides it.
 
@@ -911,10 +910,14 @@ def _tile_read(
     in-process reuses the level-0 chunks every other rung reads, where asking
     the data plane for the scale mints a second entry that nothing warmed.
 
-    Gated on ``nearest`` because the residual is a decimation; ``area`` pads and
-    re-averages, so it must keep reading its own level.
+    Always a decimation, because a tile is the display path: it is read from
+    whichever level of the server's pyramid is cheapest, and a stored level is
+    the writer's downsampling whatever kernel the caller might have named. A
+    caller that wants a *specific* kernel wants ``POST /api/slice``, where
+    ``reduction_method`` is forwarded verbatim and is part of ``chunk_id``.
 
-    Exactness differs between the two, and only the computed case claims it: the
+    Exactness differs between the two kinds of level, and only the computed case
+    claims it: the
     chunk grid is absolute, so a tile origin is a multiple of ``edge * 2**level``
     and therefore on the sample grid at both scales -- ``data[::32]`` and
     ``data[::8][::4]`` pick the same elements, and
@@ -925,22 +928,21 @@ def _tile_read(
     client following the advertised pyramid already gets, and the reason the
     pyramid is worth reading at all.
     """
-    if method == "nearest":
-        target = [1] * len(shape)
-        target[y_idx] = target[x_idx] = 1 << level
-        picked = _pick_level(levels, target)
-        if picked is not None:
-            picked_level, residual = picked
-            return _TileRead(
-                scale_hint=list(picked_level.scale),
-                read_level=None,
-                method=picked_level.method or None,
-                residual=residual if any(f > 1 for f in residual) else None,
-            )
-        if not levels and level > 0:
-            residual = [1] * len(shape)
-            residual[y_idx] = residual[x_idx] = 1 << level
-            return _TileRead([1] * len(shape), None, None, residual)
+    target = [1] * len(shape)
+    target[y_idx] = target[x_idx] = 1 << level
+    picked = _pick_level(levels, target)
+    if picked is not None:
+        picked_level, residual = picked
+        return _TileRead(
+            scale_hint=list(picked_level.scale),
+            read_level=None,
+            method=picked_level.method or None,
+            residual=residual if any(f > 1 for f in residual) else None,
+        )
+    if not levels and level > 0:
+        residual = [1] * len(shape)
+        residual[y_idx] = residual[x_idx] = 1 << level
+        return _TileRead([1] * len(shape), None, None, residual)
     return _TileRead(None, level, None, None)
 
 
@@ -1943,6 +1945,26 @@ async def get_tile(
             ),
         )
 
+    if reduction_method:
+        from biopb_tensor_server.core.downsample import normalize_reduction_method
+
+        if normalize_reduction_method(reduction_method) != "nearest":
+            # 410 for the same reason `fmt` is: the form was valid and is now
+            # withdrawn, which a caller pinned to an older server needs told
+            # apart from a typo. A tile is the display path -- it is served from
+            # whichever level of the server's pyramid is cheapest, so what it
+            # once selected was a *store*, not a kernel. Aliases resolve first,
+            # so `decimate` is still `nearest` and still fine.
+            raise HTTPException(
+                status_code=410,
+                detail=(
+                    f"reduction_method={reduction_method!r} on a tile was "
+                    "withdrawn: tiles are read from the server's pyramid, whose "
+                    "levels carry their own reduction. Use POST /api/slice to "
+                    "choose a kernel"
+                ),
+            )
+
     # Cheapest possible bail-out, before any backend call: under a tile burst
     # this handler may have sat in the queue long enough for the browser to pan
     # away and abort. Repeated below, once the tile is known to exist and the
@@ -1972,10 +1994,7 @@ async def get_tile(
         )
 
     from biopb_tensor_server.core.axes import plane_axes
-    from biopb_tensor_server.core.downsample import (
-        downsample_block,
-        normalize_reduction_method,
-    )
+    from biopb_tensor_server.core.downsample import downsample_block
 
     shape = [int(d) for d in td.shape]
     dim_labels = list(td.dim_labels)
@@ -1985,13 +2004,6 @@ async def get_tile(
         )
     y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
     edge = _tile_edge(shape, [int(d) for d in td.chunk_shape], y_idx, x_idx)
-
-    # Which of the three sources serves this rung -- a native level, the warm
-    # level, or the rung itself -- is decided inside _read below rather than
-    # here, because learning whether the tensor ships a native pyramid costs a
-    # Flight call on a cache miss (_advertised_levels) and this is the loop.
-    # Nothing between here and the read depends on the answer.
-    method = normalize_reduction_method(reduction_method or "")
 
     # Before the ETag, not after: a revalidation must not be able to answer 304
     # for a tile that does not exist, and an out-of-grid request should cost the
@@ -2017,7 +2029,6 @@ async def get_tile(
             # two cache entries for one tile, and a parameter the resolution
             # ignored must not vary the key at all.
             ("sel", ",".join(f"{i}:{v}" for i, v in sorted(resolved.items()))),
-            ("red", reduction_method or ""),
             ("edge", edge),
             # The source's CURRENT version, not the one the caller asked for.
             # The versioned URL already changes on a re-index; this is what
@@ -2052,15 +2063,15 @@ async def get_tile(
     await _abort_if_client_gone(request, ctx)
 
     def _read() -> np.ndarray:
+        # Resolved here, not above: reading the ladder costs a Flight call on a
+        # cache miss (_advertised_levels) and this is the event loop. Nothing
+        # between the handler's entry and the read depends on the answer.
         plan = _tile_read(
             shape,
             y_idx,
             x_idx,
             level,
-            _advertised_levels(client, td, current_version)
-            if method == "nearest"
-            else (),
-            method,
+            _advertised_levels(client, td, current_version),
         )
         start, stop, scale_hint = _tile_slices(
             td,
@@ -2081,7 +2092,7 @@ async def get_tile(
             td.array_id,
             slice_hint=_build_slice_hint(start, stop),
             scale_hint=scale_hint,
-            reduction_method=plan.method or reduction_method or None,
+            reduction_method=plan.method,
         )
         arr = _normalize_array(arr_lazy.compute())
         if plan.residual is None:

@@ -597,7 +597,6 @@ export class TensorHttpClient {
       t: req.t,
       z: req.z,
       c: req.c,
-      reduction_method: req.reduction_method,
     };
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null) qs.set(k, String(v));

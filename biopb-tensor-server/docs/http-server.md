@@ -190,10 +190,11 @@ addressed identically, so `pyramid` is advisory: it is published for diagnosis,
 and because it is the only place a client can see *why* one source's tiles are
 cheap and another's are not.
 
-The routing is `nearest`-only. An explicit `reduction_method=area` reads its own
-level: the remainder is a decimation, and a stored level is the writer's
-downsampling rather than the server's, so neither half of an `area` request
-would survive the trip.
+A tile always decimates. `reduction_method` used to be accepted here and is
+**withdrawn** (below): a tile is the display path, so what it selected in
+practice was a *store* — opt out of the pyramid, decimate full resolution —
+rather than a kernel, and a stored level carries the writer's downsampling
+whatever a caller names. `POST /api/slice` is where a kernel is a real choice.
 
 `volume` is the odd one out: it is not a rung of `levels` and does not belong to
 the tile grid at all. A 3-D renderer takes one whole volume rather than tiles, so
@@ -266,6 +267,12 @@ publishes — a level the tensor does not have, or a tile outside that level's
 `fmt` accepts only `raw`. The server-composited `png` / `jpeg` forms were removed
 with the server-rendered viewer and now answer **410** — a deliberate refusal
 rather than silently handing raw bytes to a caller that asked for an image.
+
+`reduction_method` answers **410** for the same reason, unless it names the
+decimation tiles already do (`nearest`, or an alias of it such as `decimate`,
+which is accepted and ignored). Serving pixels reduced by a different kernel
+than the caller asked for is exactly the silent substitution the 410 exists to
+prevent. It is no longer part of the ETag: nothing about a tile varies with it.
 
 `t`/`z`/`c` are checked against the axis they name, not merely against `ge=0`: an
 index past the axis extent is **422**, and so is a *non-zero* index on an axis the
