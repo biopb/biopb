@@ -43,10 +43,14 @@ import queue
 import threading
 from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 
+import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.cache import ArrowFileBackend, CacheManager
-from biopb_tensor_server.core.chunk import build_pyramid_plan
+from biopb_tensor_server.core.chunk import (
+    compute_warm_selection,
+    compute_warm_targets,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
@@ -56,6 +60,19 @@ logger = logging.getLogger(__name__)
 
 # How often to re-check idle/stop while waiting for the server to quiesce.
 _POLL_INTERVAL_SECONDS = 0.2
+
+
+def _dtype_itemsize(dtype: str) -> int:
+    """Bytes per element, or 1 when the dtype string is unusable.
+
+    Degrading to 1 under-counts, so a level looks cheaper than it is and the
+    budget narrows less -- the safe direction: the alternative is refusing to
+    warm a tensor because its dtype string was odd.
+    """
+    try:
+        return int(np.dtype(dtype).itemsize)
+    except (TypeError, ValueError):
+        return 1
 
 
 class PrecacheWorker:
@@ -384,15 +401,14 @@ class PrecacheWorker:
         # plan scores Lx*Ly*Lz only, so T is never scaled and a many-frame series
         # is both the costliest warm and the one warming cannot help.
         cfg = self._pyramid_cfg
-        targets = build_pyramid_plan(
+        targets = compute_warm_targets(
             list(base_desc.shape),
             list(base_desc.dim_labels),
-            reduction_method=cfg.reduction_method,
             threshold=cfg.threshold,
             downscale_factor=cfg.downscale_factor,
             pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
             plane_max_pixels=cfg.plane_max_pixels,
-        )[1:]
+        )
 
         if not targets:
             logger.debug(
@@ -425,7 +441,30 @@ class PrecacheWorker:
             dtype=base_desc.dtype,
         )
         request_desc.scale_hint[:] = list(level.scale_hint)
-        request_desc.reduction_method = level.reduction_method
+        request_desc.reduction_method = self._pyramid_cfg.reduction_method
+
+        # A level is one plane (one volume, on the 3-D target) repeated across
+        # every other axis, and warming that whole cross-product is what makes
+        # the warm set unbounded. Narrow the selection axes to a window from
+        # index 0, where a viewer opens; the plane itself is never narrowed.
+        start, stop = compute_warm_selection(
+            list(base_desc.shape),
+            list(base_desc.dim_labels),
+            level.scale_hint,
+            itemsize=_dtype_itemsize(base_desc.dtype),
+            volumetric=level.volumetric,
+            budget_bytes=self._cfg.warm_budget_bytes,
+        )
+        narrowed = [
+            i
+            for i, (a, b) in enumerate(zip(start, stop, strict=True))
+            if (a, b) != (0, int(base_desc.shape[i]))
+        ]
+        if narrowed:
+            # Only when it actually narrows: an unset slice_hint is the
+            # documented "all chunks" form, and adapters may branch on presence.
+            request_desc.slice_hint.start[:] = start
+            request_desc.slice_hint.stop[:] = stop
 
         try:
             read_plan = tensor_adapter.get_read_plan(request_desc)
@@ -462,6 +501,11 @@ class PrecacheWorker:
             len(endpoints),
             tensor_id,
             list(level.scale_hint),
-            " (backlog)" if backlog else "",
+            (
+                ""
+                if not narrowed
+                else " sel=" + ",".join(f"{i}:{start[i]}-{stop[i]}" for i in narrowed)
+            )
+            + (" (backlog)" if backlog else ""),
         )
         return False

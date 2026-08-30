@@ -255,16 +255,94 @@ fires when the coarsest rung is full resolution — so lowering it admits *more*
 tensors. At 1 Mpx the `[T500,C2,1024²]` timelapse goes from skipped (0 MiB) to
 warmed (500 MiB), while the ND2 saves 18 MiB.
 
-### 5.3 Selection axes
+### 5.3 Selection axes: a budget, and a window from index 0
 
-A rung is XY-only, so **every non-XY axis is a selection axis** — T, C and, on the
-2-D target, Z. Warm one combination, not the cross-product. Without this, "warm
-the 2-D rung" on `[1000,6000,6000]` means 1000 planes at 1500² = 4.3 GiB
-instead of 4.3 MiB, and the `[T500,C2,2048²]` timelapse costs 2000 MiB instead
-of 2.0 MiB.
+A warm level is a *plane* — a volume, on the 3-D target — repeated across every
+other axis. Warming that whole cross-product is what makes the warm set
+unbounded: on `[1000,6000,6000]` the 2-D target is 1000 planes at 1500² = 4.3 GiB
+where one plane is 4.3 MiB, and a `[T500,C2,2048²]` timelapse is 2000 MiB where
+one plane is 2.0 MiB.
 
-The 3-D target is exempt on Z by N1 — the renderer consumes the volume whole —
-but still warms one T/C combination.
+**The rule.** The plane is never narrowed. Give the level a byte budget
+(`precache.warm_budget_bytes`, 64 MiB); while it is over, narrow the selection
+axes one at a time, in order:
+
+1. **unnamed axes** (a plate's `POS`, a sequence's `i`) — independent
+   acquisitions, and a viewer opens on one of them;
+2. **T** — frames are independent and a user views very few;
+3. **Z** — scrubbed, but locally, so what is kept keeps its value;
+4. **C** — last. Typically 2–4, so keeping it whole is cheap, and toggling
+   channels is the first thing a user does after opening.
+
+An axis is cut to the largest extent that still fits, floored at 1, before the
+next is touched.
+
+**The budget is on the request, not on disk.** It counts the window's logical
+extent; the cache stores whole chunks, so a window ending mid-chunk writes that
+chunk entire and the footprint rounds up — by up to one chunk per narrowed axis,
+plus the backend's per-chunk framing. The numbers below are therefore floors.
+This bounds one tensor's share of the cache; it does not size the cache. This subsumes the old "warm one combination" rule: that is what
+the budget produces when it is tight, and a tensor small enough to warm whole now
+does.
+
+**The window starts at index 0**, because that is where both clients land.
+
+napari's raw default is the middle, and this section originally centred the
+window to match it. That was wrong about the only path that matters:
+
+| | opens at | |
+|---|---|---|
+| napari, raw | `int((nsteps-1)/2)` | `dims._go_to_center_step()`, called from `viewer_model.py:924` for the first layer |
+| napari, via the tensor browser | **0** | `_tensor_utils._origin_initial_view` suppresses that call |
+| SPA | **0** | `store.ts`, re-zeroed on every source change |
+
+The override is not an accident to be removed. `_add_layer_from_data` slices
+once at the dims default and *then* moves to the centre — two slices, and on a
+source with no native pyramid each is a full-resolution decode, so letting them
+differ roughly doubles a cold open. Suppressing the move makes the displayed
+slice the one already decoded.
+
+That leaves three positions that must agree, none of which can ask the server
+what is warm — a client has no way to tell a warm read from a cold one. They
+agree by convention: all three say index 0.
+
+Dropping the override instead would have cost the double decode back and still
+paid the origin slice first, so it is strictly worse than moving the window.
+
+**The 3-D target is exempt on Z** by N1 — the renderer consumes the volume whole,
+so a Z-narrowed warm would miss every chunk of it. It still narrows T and C. That
+also means the budget does *not* bound a volume: a `[Z200,2048²]` confocal's 3-D
+target is 100 MiB with nothing to give up. `pixel_budget_cubic_root` is what
+bounds that (§9.1), and the budget bounds only the cross-product around it.
+
+The exemption belongs to **the level Phase 2 emitted**, which only the planner
+knows. It is not "the coarsest level of a tensor that has a z axis": a plan may
+be Phase 1's target alone (`[Z20,8000²]` busts the plane cap and not the voxel
+budget), and exempting that level's Z leaves nothing to narrow — 305 MiB against
+a 256 MiB budget, with the bound the whole policy rests on no longer binding. Nor
+is it "the level that scaled Z": Phase 2 scales an axis only while it is above
+the floor, so a 200-plane confocal's 3-D target is `[1,4,4]` with Z untouched and
+still consumed whole.
+
+Footprints at 256 MiB, uint16:
+
+| tensor | 2-D target | 3-D target | total |
+|---|---:|---:|---:|
+| ND2 `[C4,14234²]` | 24.2 MiB (whole) | — | 24.2 MiB |
+| WSI `[100000²]` | 4.7 MiB (whole) | — | 4.7 MiB |
+| cube `[1024³]` | — | 32.0 MiB | 32.0 MiB |
+| confocal `[Z200,2048²]` | 256.0 MiB (128 of 200 Z) | 100.0 MiB | 356.0 MiB |
+| lightsheet `[Z1200,2048²]` | 256.0 MiB (128 of 1200 Z) | 37.5 MiB | 293.5 MiB |
+| big3D `[1000,6000,6000]` | 253.2 MiB (59 of 1000 Z) | 67.1 MiB | 320.3 MiB |
+| timelapse `[T500,C2,1024²]` | — | — | 0 |
+
+The budget is not sized to make a catalog fit — at a few hundred tensors nothing
+in the hundreds of MiB does, and `backlog_high_water` is what stops a filling
+cache. What it bounds is one tensor eating the cache. Above the first plane it
+buys **scrub headroom**: 256 MiB keeps 128 of a confocal's 200 Z planes where
+64 MiB keeps 32, so paging through the stack stays warm instead of only the
+opening slab. It never binds on a 2-D catalog — every level of the 237-tensor
+ND2/OME-Zarr set here is 4.7–24.2 MiB, warmed whole either way.
 
 ## 6. Reduction method: `nearest`
 
@@ -311,9 +389,10 @@ so:
 - **`compose=True` in precache** — moot. It existed to make a coarse warm also
   populate full resolution; the 2-D target is now the level clients read.
 
-`enabled` stays a plain bool. It should default **true** again once §5 lands —
-it was flipped to false (#826) because the warm set was unbounded, which is the
-thing §5.3 fixes.
+`enabled` stays a plain bool, and now defaults **true** again — it was flipped to
+false (#826) because the warm set was unbounded, which §5.3 fixes. The bound is
+the whole premise, so `warm_budget_bytes` is pinned in the same test as the
+default: warming ships on only for as long as it stays finite.
 
 ## 8. Config
 
@@ -325,9 +404,8 @@ thing §5.3 fixes.
   "plane_max_pixels": 4000000    // 2-D rungs: cap, target and gate (§5.2)
 },
 "precache": {
-  "enabled": true,
-  "warm_selection": "first",     // §5.3: "first" | "all" over T/C (and Z in 2-D)
-  "warm_3d": true,               // §5: independent 3-D target
+  "enabled": true,               // §7: on again, now that §5.3 bounds the set
+  "warm_budget_bytes": 268435456,// §5.3: per level, caps the T/Z/C cross-product
   "defer_writes": false          // P5
 }
 ```
@@ -401,8 +479,10 @@ downscale?) needs eyes on real data and is not yet done.
    moves.
 1. **§6 `nearest`** — one constant, independent of everything else, fixes a
    total miss on its own.
-2. **§5.3 selection restriction** — bounds the warm set; unblocks re-enabling
-   `enabled` by default.
+2. ~~**§5.3 selection restriction**~~ — **done**. A per-level byte budget
+   narrows the selection axes to a window from index 0, which is where both the
+   tensor browser's napari and the SPA open. `enabled` can default true once
+   this has run on a real catalog.
 3. ~~**§4.1 Flight ladder shape** + **§5 two targets with independent gates**~~
    — **done**. The plan is sparse (level 0 + at most two targets), so the gates
    are the list length and `_process_tensor` warms `plan[1:]`.
