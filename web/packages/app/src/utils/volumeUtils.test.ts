@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { TileInfo, VolumeAvailable } from "@biopb/tensor-flight-client";
 import {
+  DEFAULT_VOLUME_RENDER_MODE,
   VOLUME_MAX_BYTES,
+  VOLUME_RENDER_MODES,
   volumeCentre,
   volumeKey,
   volumeRefusal,
@@ -177,5 +179,23 @@ describe("volumeZoom", () => {
 
   it("answers 0 rather than -Infinity before the pane is measured", () => {
     expect(volumeZoom(makeVolume(), { width: 0, height: 0 })).toBe(0);
+  });
+});
+
+describe("VOLUME_RENDER_MODES", () => {
+  it("defaults to maximum intensity projection", () => {
+    // Fluorescence is sparse signal on a dark ground: the brightest voxel along
+    // a ray is the structure. Additive sums the whole ray and hazes it out.
+    expect(DEFAULT_VOLUME_RENDER_MODE).toBe("mip");
+  });
+
+  it("offers the default first, so the leading button is the one in effect", () => {
+    expect(VOLUME_RENDER_MODES[0].key).toBe(DEFAULT_VOLUME_RENDER_MODE);
+  });
+
+  it("covers Viv's three rendering modes, with unique keys", () => {
+    const keys = VOLUME_RENDER_MODES.map((m) => m.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys).toEqual(["mip", "additive", "minip"]);
   });
 });

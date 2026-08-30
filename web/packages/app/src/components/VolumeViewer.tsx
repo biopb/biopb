@@ -50,6 +50,7 @@ import {
   volumeRequest,
   volumeScaleRatio,
   volumeZoom,
+  type VolumeRenderMode,
 } from "../utils/volumeUtils";
 
 interface VolumeViewerProps {
@@ -60,15 +61,23 @@ interface VolumeViewerProps {
 }
 
 /**
- * Module-level for the reason {@link TileViewer}'s `VIV_EXTENSIONS` is: deck.gl
- * treats a new array here as an extension change and recompiles the shader.
+ * One frozen array per mode, built once at module scope.
  *
- * Additive blending is also `XR3DLayer`'s own default, but it is named
- * explicitly because *something* must define `rendering._RENDER` — the layer
- * throws without it — and leaving that to a default is the kind of dependency
- * that breaks silently on a Viv bump.
+ * Both halves matter. deck.gl treats a *new* `extensions` array as an extension
+ * change and rebuilds the shader, so building these per render would recompile
+ * on every slider move — the same reason {@link TileViewer} hoists its
+ * `VIV_EXTENSIONS`. And switching mode is *supposed* to recompile, which is
+ * exactly what a different frozen array gets for free.
+ *
+ * The extension is the mechanism, not `XR3DLayer.renderingMode`: the layer
+ * reads `_BEFORE_RENDER` / `_RENDER` / `_AFTER_RENDER` off `extensions`
+ * (`getRenderingFromExtensions`) and throws if nothing defines them.
  */
-const VOLUME_EXTENSIONS = [new ColorPalette3DExtensions.AdditiveBlendExtension({})];
+const VOLUME_EXTENSIONS: Record<VolumeRenderMode, unknown[]> = {
+  mip: [new ColorPalette3DExtensions.MaximumIntensityProjectionExtension({})],
+  additive: [new ColorPalette3DExtensions.AdditiveBlendExtension({})],
+  minip: [new ColorPalette3DExtensions.MinimumIntensityProjectionExtension({})],
+};
 
 /** One entry, so `XR3DLayer.getNumChannels()` compiles a single-channel shader. */
 const ONE_CHANNEL = [{}];
@@ -82,6 +91,7 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   const slice = useAppStore((s) => s.slice);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
+  const renderMode = useAppStore((s) => s.volumeRenderMode);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
@@ -195,6 +205,7 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
           dtype={vivDtype(info.dtype)}
           contrastLimits={contrastLimits}
           color={color}
+          renderMode={renderMode}
           width={size.width}
           height={size.height}
         />
@@ -230,6 +241,7 @@ function VolumeStage({
   dtype,
   contrastLimits,
   color,
+  renderMode,
   width,
   height,
 }: {
@@ -238,6 +250,7 @@ function VolumeStage({
   dtype: ReturnType<typeof vivDtype>;
   contrastLimits: [number, number];
   color: [number, number, number];
+  renderMode: VolumeRenderMode;
   width: number;
   height: number;
 }) {
@@ -300,10 +313,19 @@ function VolumeStage({
         channelsVisible: [true],
         physicalSizeScalingMatrix,
         resolutionMatrix,
-        extensions: VOLUME_EXTENSIONS,
+        extensions: VOLUME_EXTENSIONS[renderMode],
       } as unknown as XR3DLayerProps),
     ],
-    [plan, data, dtype, contrastLimits, color, physicalSizeScalingMatrix, resolutionMatrix],
+    [
+      plan,
+      data,
+      dtype,
+      contrastLimits,
+      color,
+      renderMode,
+      physicalSizeScalingMatrix,
+      resolutionMatrix,
+    ],
   );
 
   return (

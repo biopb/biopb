@@ -16,6 +16,34 @@ import type { SliceRequest, TileInfo, VolumeAvailable } from "@biopb/tensor-flig
 import type { SliceIndices } from "./vivUtils";
 
 /**
+ * How the ray-cast combines the voxels it passes through.
+ *
+ * Viv's own three (`RENDERING_MODES` in `@vivjs/constants`), keyed short because
+ * these are button labels and a store field, not display strings. The mechanism
+ * is the layer's `extensions` array — `XR3DLayer` reads `_BEFORE_RENDER` /
+ * `_RENDER` / `_AFTER_RENDER` off it and rebuilds the shader; its
+ * `renderingMode` prop only triggers that rebuild and decides nothing.
+ *
+ * MIP first because it is the right default for most of what this serves.
+ * Fluorescence is sparse signal on a dark ground: the brightest voxel along a
+ * ray *is* the structure, and it survives the projection at full contrast.
+ * Additive sums the whole ray instead, so depth accumulates into a haze that
+ * washes out exactly the thin structures a z-stack was acquired to show, and it
+ * makes brightness a function of stack depth rather than of the sample.
+ */
+export const VOLUME_RENDER_MODES = [
+  { key: "mip", label: "MIP", title: "Maximum intensity projection" },
+  { key: "additive", label: "Add", title: "Additive blending" },
+  // Niche but not free to rebuild later: transmitted-light and absorbance
+  // stacks are dark signal on a bright ground, where max picks the background.
+  { key: "minip", label: "MinIP", title: "Minimum intensity projection" },
+] as const;
+
+export type VolumeRenderMode = (typeof VOLUME_RENDER_MODES)[number]["key"];
+
+export const DEFAULT_VOLUME_RENDER_MODE: VolumeRenderMode = "mip";
+
+/**
  * Wire bytes this viewer will accept in one volume.
  *
  * Not a GPU limit — the server already bounds the voxel count, and Viv casts

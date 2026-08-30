@@ -3,6 +3,10 @@ import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
+import {
+  DEFAULT_VOLUME_RENDER_MODE,
+  type VolumeRenderMode,
+} from "./utils/volumeUtils";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
@@ -63,6 +67,12 @@ export interface AppState {
    * no volume to render, and a toggle stuck on would open it on an error.
    */
   render3d: boolean;
+  /**
+   * How the 3-D ray-cast combines voxels. A viewing preference rather than a
+   * property of the tensor, so unlike `render3d` it survives a source change —
+   * someone who wants additive wants it for the next stack too.
+   */
+  volumeRenderMode: VolumeRenderMode;
 
   // Channel colors (sourceId -> channelIdx -> color)
   channelColors: Record<string, Record<number, ColorValue>>;
@@ -80,6 +90,7 @@ export interface AppState {
   setSlice: (partial: Partial<SliceState>) => void;
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
+  setVolumeRenderMode: (value: VolumeRenderMode) => void;
   getChannelColor: (sourceId: string, channelIdx: number) => ColorValue;
   setChannelColor: (sourceId: string, channelIdx: number, color: ColorValue) => void;
   loadChannelNames: (sourceId: string) => Promise<void>;
@@ -141,6 +152,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   showAdvancedOptions: false,
   render3d: false,
+  volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
 
   // Load persisted colors from localStorage on initialization
   channelColors: loadColorsFromStorage(),
@@ -206,6 +218,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setRender3d(value) {
     set({ render3d: value });
+  },
+
+  setVolumeRenderMode(value) {
+    set({ volumeRenderMode: value });
   },
 
   getChannelColor(sourceId, channelIdx) {
