@@ -19,20 +19,20 @@ RUN mkdir -p /root/.local/bin \
     && chmod +x /root/.local/bin/biopb-tensor-server
 
 # Pre-create config so step 5 says "preserved"
-RUN mkdir -p /root/.config/biopb && cat > /root/.config/biopb/biopb.toml << 'EOF'
-[server]
-host = "127.0.0.1"
-port = 8815
-
-[cache]
-backend = "file"
-file_max_segment_mb = 256
-file_max_total_gb = 128
-
-[[sources]]
-url = "/data"
-monitor = true
-EOF
+RUN mkdir -p /root/.config/biopb && printf '%s\n' \
+    '[server]' \
+    'host = "127.0.0.1"' \
+    'port = 8815' \
+    '' \
+    '[cache]' \
+    'backend = "file"' \
+    'file_max_segment_mb = 256' \
+    'file_max_total_gb = 128' \
+    '' \
+    '[[sources]]' \
+    'url = "/data"' \
+    'monitor = true' \
+    > /root/.config/biopb/biopb.toml
 
 # Pre-create a webapp version marker so step 4 says "already up to date"
 RUN mkdir -p /root/.local/share/biopb/webapp \

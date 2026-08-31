@@ -56,11 +56,14 @@ check() {
     else
         _fail "$what"
         if [ -n "$out" ]; then
-            # Indented and capped at 5 lines: enough to name the cause without
-            # burying the rest of the report under one command's stack trace.
+            # Indented and capped: enough to name the cause without burying the
+            # report under one command's stack trace. The cap takes the TAIL --
+            # a verdict lands at the end of the output, and a head-cap showed
+            # only the start: /verify_bioformats.sh spent its five lines on a
+            # JDK download progress bar and never displayed why it failed.
             while IFS= read -r line; do
                 printf '          | %s\n' "$line"
-            done <<<"$out" | head -5
+            done <<<"$out" | tail -10
         fi
     fi
 }
