@@ -903,8 +903,10 @@ def start_kernel() -> str:
 
     It is also the recovery path: after a failed start, a dead kernel, or the
     user closing the viewer window (which tears the kernel down to idle), call
-    it again to rebuild. Unlike restart_kernel -- which hard-restarts a running
-    kernel and discards the user's work -- this one destroys nothing.
+    it again to rebuild. A kernel that is already up is left untouched, so this
+    is not the way to clear a wedged or misbehaving one -- that is
+    interrupt_kernel (stop the running job) or restart_kernel (hard-restart,
+    discarding the user's work, which this never does).
     """
     host, err = _app._require_kernel_host()
     if err is not None:
