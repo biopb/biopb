@@ -1036,6 +1036,22 @@ def jobs_summary():
             # the person watching what is happening to their data, and
             # `arr = arr[..., 1]` makes them reconstruct it.
             "intent_preview": j.intent_preview,
+            # None for ordinary work; the record's headline for a verification
+            # re-run. A verification replays a workflow the session already ran,
+            # so without a structural marker its cells arrive in this list as
+            # ordinary code cells that happen to repeat earlier ones, and the
+            # page cannot tell the rehearsal from the take. The intent string
+            # ("verify workflow: ...") says the same thing, but a filter keyed
+            # on prose is a convention, not a fact about the job.
+            "verify": (
+                {
+                    "title": j.verify.title,
+                    "cells": len(j.verify.cells),
+                    "status": j.verify.status(),
+                }
+                if j.verify is not None
+                else None
+            ),
         }
         for j in _jobs.values()
     ]

@@ -49,6 +49,32 @@ describe("JobRow", () => {
     expect(render(job({ status: "running" }))).toContain("job-stop");
   });
 
+  it("marks a verification run and names the workflow, not the intent", () => {
+    // The server's intent for these reads "verify workflow: count nuclei",
+    // which would spend the row's one line restating the badge beside it.
+    const html = render(
+      job({
+        intent_preview: "verify workflow: count nuclei",
+        verify: { title: "count nuclei", cells: 3, status: "ok" },
+      }),
+    );
+    expect(html).toContain("badge verify");
+    expect(html).toContain("count nuclei");
+    expect(html).not.toContain("verify workflow: count nuclei");
+  });
+
+  it("leaves ordinary work unmarked", () => {
+    // The badge is the filter's ground truth, so it must not appear on a cell
+    // that merely mentions verification in its intent.
+    const html = render(job({ intent_preview: "check the verify step" }));
+    expect(html).not.toContain("badge verify");
+  });
+
+  it("names an untitled workflow rather than showing a blank line", () => {
+    const html = render(job({ verify: { title: "", cells: 1, status: "ok" } }));
+    expect(html).toContain("(untitled workflow)");
+  });
+
   it("offers it nowhere else", () => {
     // The kernel runs one cell at a time, so a row that is not running has
     // nothing to interrupt -- and a button that cannot act is how the old

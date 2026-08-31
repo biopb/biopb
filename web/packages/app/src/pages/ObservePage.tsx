@@ -16,6 +16,11 @@ import {
 } from "../utils/chatPaneWidth";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
+import {
+  filterJobs,
+  type JobFilter,
+  type VerificationMark,
+} from "../utils/jobFilter";
 
 // Per-session observe UI, ported from the buildless _OBSERVE_HTML that each MCP
 // session child used to serve at /observe. The child now serves only /api/*; the
@@ -47,6 +52,11 @@ interface JobSummary {
   /** Why the cell was run, when whoever ran it said why. Absent on an older
    * child, and empty for a cell nobody explained (the console's, typically). */
   intent_preview?: string;
+  /** Set only on a verification re-run, carrying that record's headline.
+   * Absent on an older child; null on ordinary work. A verification replays a
+   * workflow the session already ran, so without this its cells are just code
+   * cells that repeat earlier ones. */
+  verify?: VerificationMark | null;
 }
 /** The verified workflow this session has, if any — a clean program an agent
  * rewrote from the transcript and proved by running in a scratch namespace.
@@ -93,6 +103,7 @@ export default function ObservePage() {
 
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
   const [workflow, setWorkflow] = useState<WorkflowSummary | null>(null);
+  const [filter, setFilter] = useState<JobFilter>("all");
   const [details, setDetails] = useState<Record<string, JobDetail>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("…");
@@ -369,6 +380,10 @@ export default function ObservePage() {
   // so a collision is shown *before* the click rather than as a failed action:
   // one job runs at a time, and there is no preemption or queue.
   const running = jobs?.find((j) => j.status === "running") ?? null;
+  // Plain derivations rather than memos: this list is the handful of cells one
+  // session ran, and it is already rebuilt on every poll.
+  const verifyCount = jobs?.filter((j) => j.verify).length ?? 0;
+  const shown = filterJobs(jobs ?? [], filter);
 
   const runCell = useCallback(
     async (code: string): Promise<string | null> => {
@@ -518,6 +533,29 @@ export default function ObservePage() {
           {showConsole ? (
             <ConsolePanel running={running} onRun={runCell} />
           ) : null}
+          {/* Only once there is something to separate. A session that never
+              verified anything has one kind of row, and a filter offering to
+              hide none of them is furniture. */}
+          {verifyCount > 0 ? (
+            <div className="job-filter" role="group" aria-label="Show cells">
+              {(
+                [
+                  ["all", "All", jobs?.length ?? 0],
+                  ["work", "Session", (jobs?.length ?? 0) - verifyCount],
+                  ["verify", "Verification", verifyCount],
+                ] as [JobFilter, string, number][]
+              ).map(([id, label, n]) => (
+                <button
+                  key={id}
+                  className={filter === id ? "active" : ""}
+                  aria-pressed={filter === id}
+                  onClick={() => setFilter(id)}
+                >
+                  {label} <span className="n">{n}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
           <div id="jobs">
             {jobs == null ? (
               // Never fetched anything, and on an ended session never will:
@@ -525,9 +563,13 @@ export default function ObservePage() {
               ended ? null : <div className="empty">loading…</div>
             ) : jobs.length === 0 ? (
               <div className="empty">no jobs yet</div>
+            ) : shown.length === 0 ? (
+              // The filter is the reason, so say so rather than reuse "no jobs
+              // yet" -- which would read as the kernel having run nothing.
+              <div className="empty">nothing in this view</div>
             ) : (
               // newest-first
-              [...jobs].reverse().map((j) => (
+              [...shown].reverse().map((j) => (
                 <JobRow
                   key={j.job_id}
                   job={j}
@@ -667,11 +709,22 @@ export function JobRow({
           <span className="badge you">{writerName(job.origin)}</span>
         ) : null}
         <span className={"badge " + job.status}>{job.status}</span>
+        {job.verify ? <span className="badge verify">verify</span> : null}
         {/* Why over what: `arr = arr[..., 1]` is a fact about the code, and
             "isolate the nuclei channel" is a fact about the reader's data. The
             source is one click away either way, so the row spends its one line
             on the half that is not already reconstructable from the other. */}
-        {job.intent_preview ? (
+        {job.verify ? (
+          // The badge already says "verify", so the line carries the workflow's
+          // own name -- the server's intent for these reads "verify workflow:
+          // <title>", which spends the row restating the badge.
+          <span
+            className="intent"
+            title={`${job.verify.cells} cell(s), run in a scratch namespace`}
+          >
+            {job.verify.title || "(untitled workflow)"}
+          </span>
+        ) : job.intent_preview ? (
           <span className="intent" title={job.intent_preview}>
             {job.intent_preview}
           </span>
@@ -746,6 +799,11 @@ const OBS_CSS = `
   .obs-page button.primary { background: #1d6b3f; border-color: #2a5; color: #eafff0;
                    font-weight: 600; margin-right: 6px; }
   .obs-page button.primary:hover { background: #25804b; }
+  .obs-page .job-filter { display: flex; gap: 6px; margin-bottom: 10px; }
+  .obs-page .job-filter button { font-size: 12px; padding: 3px 10px; color: #9aa; }
+  .obs-page .job-filter button.active { border-color: #2a5; color: #7e7; background: #1a241d; }
+  .obs-page .job-filter .n { color: #667; margin-left: 2px; }
+  .obs-page .job-filter button.active .n { color: #5a7; }
   .obs-page main { padding: 12px 16px; }
   /* The thread beside the jobs it drives: a chat cell shows up in that list,
      and its live stdout is what stands in for the thread's missing stream. */
@@ -791,6 +849,7 @@ const OBS_CSS = `
   .obs-page .jid { font-weight: 600; }
   .obs-page .badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; text-transform: uppercase; }
   .obs-page .you { background: #34305a; color: #b9b0ff; }
+  .obs-page .verify { background: #3a3520; color: #e8cf8a; }
   .obs-page .running { background: #243; color: #7e7; }
   .obs-page .ok { background: #234; color: #8bf; }
   .obs-page .error { background: #422; color: #f99; }

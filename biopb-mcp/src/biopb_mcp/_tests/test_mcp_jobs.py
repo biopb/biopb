@@ -234,6 +234,39 @@ class TestJobRunnerUnit:
         assert summ[jid]["intent_preview"] == "isolate the nuclei channel"
         assert summ[bare]["intent_preview"] == ""
 
+    def test_jobs_summary_marks_verification_runs(self, runner):
+        """A verification row must be distinguishable from ordinary work.
+
+        The observe list showed both as plain code cells, so a workflow that had
+        just been verified appeared twice -- once as the session's own work and
+        once as the re-run -- with nothing to say which was which.
+        """
+        jid = _jobs.submit("x = 1", intent="isolate the nuclei channel")["job_id"]
+        self._wait(jid)
+        vid = _jobs.submit(
+            "", verify_cells=["a = 1", "b = a + 1"], verify_title="count nuclei"
+        )["job_id"]
+        self._wait(vid)
+        summ = {j["job_id"]: j for j in _jobs.jobs_summary()}
+        assert summ[jid]["verify"] is None
+        assert summ[vid]["verify"] == {
+            "title": "count nuclei",
+            "cells": 2,
+            "status": "ok",
+        }
+
+    def test_jobs_summary_verify_status_tracks_a_failed_cell(self, runner):
+        vid = _jobs.submit(
+            "",
+            verify_cells=["a = 1", "raise ValueError('boom')", "c = 3"],
+            verify_title="broken",
+        )["job_id"]
+        self._wait(vid)
+        row = {j["job_id"]: j for j in _jobs.jobs_summary()}[vid]
+        # Three cells were offered even though the run stopped at the second:
+        # the count is the workflow's length, not how far it got.
+        assert row["verify"] == {"title": "broken", "cells": 3, "status": "error"}
+
     def test_one_line_helper(self):
         assert _jobs._one_line("") == ""
         assert _jobs._one_line("\n\n  hello  \nworld") == "hello"
