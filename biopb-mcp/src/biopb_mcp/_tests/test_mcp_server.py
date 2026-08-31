@@ -122,6 +122,7 @@ def mock_kernel_host():
         "watchdog_running": True,
     }
     host.execute.return_value = _result()
+    host.virtual_display = None  # real display unless a test says otherwise
     return host
 
 
@@ -1137,6 +1138,32 @@ class TestStartKernel:
     def test_no_host(self):
         _app._kernel_host = None
         assert "not initialized" in _server.start_kernel()
+
+    def test_real_display_is_not_warned_about(self, server_with_host):
+        server_with_host.ensure_started.return_value = {"state": "ready"}
+        assert "WARNING" not in _server.start_kernel()
+
+    def test_virtual_display_warns_and_asks_the_agent_to_tell_the_user(
+        self, server_with_host
+    ):
+        # Xvfb is a silent degradation -- every downstream tool still works --
+        # so the only thing that reaches the user is the agent relaying it (#892).
+        server_with_host.ensure_started.return_value = {"state": "ready"}
+        server_with_host.virtual_display = ":2"
+        result = _server.start_kernel()
+        assert "Kernel ready" in result  # still the success path
+        assert ":2" in result
+        assert "TELL THE USER" in result
+
+    def test_virtual_display_is_not_reported_on_the_failure_path(
+        self, server_with_host
+    ):
+        server_with_host.ensure_started.return_value = {
+            "state": "error",
+            "error": "no Qt platform",
+        }
+        server_with_host.virtual_display = ":2"
+        assert "TELL THE USER" not in _server.start_kernel()
 
     def test_execute_code_when_not_started_points_to_start_kernel(
         self, server_with_host
