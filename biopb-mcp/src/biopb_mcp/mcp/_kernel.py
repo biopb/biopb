@@ -535,6 +535,15 @@ class KernelHost:
     def _execute_locked(self, code: str, timeout: float) -> dict:
         if self._kc is None:
             return _status_result("error", "Kernel is not running.")
+        # Never wait on a kernel whose process is gone. Its zmq channels stay
+        # open (they reconnect to nothing), so execute_interactive would block
+        # for the full `timeout` -- 120s by default -- holding the lifecycle
+        # lock throughout. With a polling client (the observe page fetches
+        # /api/jobs every ~3s) those waits overlap end to end, the lock is never
+        # free, and the watchdog cannot get it to respawn: the kernel stays dead
+        # and every poll 502s until someone restarts by hand.
+        if not self.is_alive():
+            return _status_result("error", "Kernel is not running.")
 
         res = self._run_once(code, timeout)
         # A preceding interrupt/error aborts requests already queued at the
@@ -860,20 +869,58 @@ class KernelHost:
             self._watchdog_thread = None
 
     def _watchdog_run(self):
+        # Armed once a ready host has been seen dead, and disarmed only by the
+        # respawn or by the kernel coming back. It has to survive across ticks
+        # because the death path withdraws _ready, which is the very flag the
+        # first tick tested to get here.
+        death_seen = False
+        starved_since = None
         # wait() returns True only when stop is set; False on each interval.
         while not self._watchdog_stop.wait(self._watchdog_interval):
             if self._stopping or self.is_alive():
+                death_seen = False
+                starved_since = None
                 continue
-            # Possible unexpected death: confirm and act under the lock so we
-            # never race an in-flight restart()/shutdown().
+            if not death_seen:
+                # Not ready means starting, not dying: start()/ensure_started()
+                # holds the lock across a cold bring-up (napari, Qt, dask) that
+                # legitimately outlasts several ticks, and a host that has never
+                # been up has nothing to respawn -- its failure is already
+                # reported through _start_error.
+                if not self._ready.is_set():
+                    continue
+                death_seen = True
+                # Withdraw readiness *before* contending for the lock. execute()
+                # gates on _ready without taking the lock, so clearing it here
+                # turns in-flight tool calls into structured not-ready results
+                # rather than more lock acquisitions -- otherwise the respawn
+                # deadlocks against the very traffic it exists to rescue.
+                self._ready.clear()
+            # Confirm and act under the lock so we never race an in-flight
+            # restart()/shutdown().
             if not self._lock.acquire(timeout=self._watchdog_interval):
+                # Once per episode. The failure this replaces was silent: a dead
+                # kernel, a 502 on every /api/jobs, and not one line in the log.
+                if starved_since is None:
+                    starved_since = time.monotonic()
+                    logger.warning(
+                        "Kernel died but the lifecycle lock is held; the "
+                        "respawn is waiting for it to free."
+                    )
                 continue  # busy (likely a restart); re-check next tick
             try:
                 if self._watchdog_stop.is_set() or self._stopping:
                     continue
                 if self.is_alive():
                     continue  # a restart finished while we waited — fine
+                if starved_since is not None:
+                    logger.warning(
+                        "Lifecycle lock freed after %.1fs; respawning now.",
+                        time.monotonic() - starved_since,
+                    )
+                    starved_since = None
                 self._handle_unexpected_death()
+                death_seen = False
             finally:
                 self._lock.release()
 
