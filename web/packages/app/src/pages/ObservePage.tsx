@@ -758,8 +758,12 @@ const OBS_CSS = `
              height: calc(100vh - 58px); box-sizing: border-box; overflow: hidden; }
   /* The fallback is the original rule, so an untouched pane is sized exactly as
      it was; --chat-w exists only once the splitter has been dragged. */
+  /* min-width:0 because a flex item's auto minimum is its content's min-content
+     width: without it a wide line of chat output widens the pane mid-turn, and
+     the width stops being the person's to set. Overflow belongs to the thread,
+     which scrolls. */
   .obs-page main.with-chat .chat { flex: 0 0 var(--chat-w, clamp(340px, 34%, 520px));
-             height: 100%; }
+             min-width: 0; height: 100%; }
   .obs-page main.with-chat .work { flex: 1; min-width: 0; height: 100%;
              display: flex; flex-direction: column; }
   /* The console keeps its natural height; only the job list scrolls. */
