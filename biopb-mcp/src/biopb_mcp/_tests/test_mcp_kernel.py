@@ -8,6 +8,7 @@ test runs the real napari bootstrap end-to-end.
 import os
 import signal
 import sys
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -468,6 +469,100 @@ class TestWatchdog:
             assert _wait_until(lambda: host._dead)
             assert not host.is_alive()
             assert host.health()["dead"] is True
+        finally:
+            host.shutdown()
+
+    def test_respawns_while_a_client_polls_the_dead_kernel(self):
+        """A polling client must not be able to starve the respawn.
+
+        The regression: a dead kernel leaves its zmq channels open, so every
+        execute() blocked for the full execute_timeout holding the lifecycle
+        lock. The observe page polls /api/jobs every few seconds, so those waits
+        overlapped end to end, the lock was never free, and the watchdog -- which
+        needs the same lock -- never got it. Observed in the wild as a kernel
+        that stayed dead for 11 minutes, 502ing every poll, silently.
+
+        Recovery is bounded by execute_timeout, not by how long clients keep
+        polling: the one call already in flight when the kernel died still waits
+        out its own timeout, but nothing queues behind it.
+        """
+        execute_timeout = 3.0
+        host = KernelHost(
+            health_probe_code=None,
+            watchdog_interval=0.3,
+            execute_timeout=execute_timeout,
+            parent_death_pipe=False,
+        )
+        host.start()
+        stop = threading.Event()
+        pollers = []
+
+        def _poll():
+            while not stop.is_set():
+                host.execute("pass")
+                stop.wait(0.2)
+
+        try:
+            pid1 = host._kernel_pid()
+            for _ in range(3):
+                t = threading.Thread(target=_poll, daemon=True)
+                t.start()
+                pollers.append(t)
+            os.kill(pid1, signal.SIGKILL)
+            assert _wait_until(
+                lambda: host.is_alive() and host._kernel_pid() != pid1,
+                timeout=execute_timeout + 25.0,
+            ), "watchdog never respawned while clients kept polling"
+            assert not host._dead
+        finally:
+            stop.set()
+            for t in pollers:
+                t.join(timeout=15.0)
+            host.shutdown()
+
+    def test_execute_on_a_dead_kernel_fails_fast(self):
+        """execute() must not wait out execute_timeout on a gone process."""
+        host = KernelHost(
+            health_probe_code=None,
+            # The watchdog would respawn and mask the block; this test is about
+            # the lock hold, so run without it.
+            watchdog_interval=0,
+            execute_timeout=60.0,
+            parent_death_pipe=False,
+        )
+        host.start()
+        try:
+            pid = host._kernel_pid()
+            os.kill(pid, signal.SIGKILL)
+            assert _wait_until(lambda: not host.is_alive())
+            started = time.monotonic()
+            res = host.execute("pass")
+            elapsed = time.monotonic() - started
+            assert res["status"] == "error"
+            assert elapsed < 5.0, f"blocked {elapsed:.1f}s on a dead kernel"
+        finally:
+            host.shutdown()
+
+    def test_cold_start_is_not_mistaken_for_a_death(self):
+        """A slow bring-up holds the lock while not alive; that is not a death.
+
+        The watchdog's death path withdraws _ready, so it must arm only on a
+        host that reached ready -- otherwise every cold start that outlasts a
+        tick would trip it.
+        """
+        host = KernelHost(
+            health_probe_code=None,
+            watchdog_interval=0.05,
+            parent_death_pipe=False,
+        )
+        host._start_watchdog()
+        try:
+            # Never started: not alive, never ready. Several ticks must pass
+            # with no respawn attempt and no dead marking.
+            time.sleep(0.5)
+            assert not host._dead
+            assert host._respawn_times == []
+            assert host._km is None
         finally:
             host.shutdown()
 
