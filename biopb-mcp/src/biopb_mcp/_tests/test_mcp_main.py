@@ -4,16 +4,23 @@ These exercise the pure plumbing in ``biopb_mcp.mcp.__main__`` (arg parsing
 and the stdio-vs-http dispatch) without starting a real kernel or viewer.
 """
 
+import dataclasses
+import os
 import sys
 
 import pytest
 
+from biopb_mcp._config import McpConfig
 from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
+    _is_agentless_viewer,
     _parse_args,
+    _register_view_session,
+    _setup_chat,
     _setup_observe,
+    _unregister_session,
     main,
 )
 
@@ -200,3 +207,208 @@ class TestSetupObserve:
         cfg = {"observe": {"enabled": True}}
         # An observe failure must never propagate out of the launcher.
         assert _setup_observe(cfg) is False
+
+
+class TestSetupChat:
+    """Chat mounts on the config the launcher actually threads.
+
+    This exists because it did not. `load_config()` returns a **dict**, and
+    `_chat_api.configure` read it with attribute access -- correct for the
+    `McpConfig` dataclass every test built, and an `AttributeError` on the real
+    thing. `_setup_chat` catches broadly so a chat failure can never take down
+    the MCP server, so the raise became one swallowed log line and chat simply
+    never appeared. Nothing was red.
+
+    Two lessons, both encoded here: exercise the launcher's own function rather
+    than the thing it calls, and feed it the launcher's own shape.
+    """
+
+    @pytest.fixture
+    def mounted(self, monkeypatch):
+        from biopb_mcp.mcp import _chat_api
+
+        calls = []
+        monkeypatch.setattr(_chat_api, "register_http_routes", lambda: calls.append(1))
+        return calls
+
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            # A file with only the switch in it -- get_setting fills the rest
+            # from DEFAULT_CONFIG, which is what a real mcp-config.json does.
+            {"observe": {"enabled": True, "chat_enabled": True}},
+            # And the fully-populated shape, as the admin page writes it.
+            {
+                **dataclasses.asdict(McpConfig()),
+                "observe": {
+                    **dataclasses.asdict(McpConfig().observe),
+                    "chat_enabled": True,
+                },
+            },
+        ],
+        ids=["partial", "full"],
+    )
+    def test_it_mounts_for_a_viewer(self, cfg, mounted):
+        assert _setup_chat(cfg, agentless=True) is True
+        assert mounted == [1]
+
+    def test_it_mounts_nothing_for_a_harness_session(self, mounted):
+        cfg = {"observe": {"enabled": True, "chat_enabled": True}}
+        assert _setup_chat(cfg, agentless=False) is False
+        assert mounted == []
+
+    def test_it_mounts_nothing_when_the_switch_is_off(self, mounted):
+        cfg = {"observe": {"enabled": True, "chat_enabled": False}}
+        assert _setup_chat(cfg, agentless=True) is False
+        assert mounted == []
+
+    @pytest.mark.parametrize(
+        "cfg, agentless, expected",
+        [
+            ({"observe": {"enabled": True, "chat_enabled": True}}, True, True),
+            ({"observe": {"enabled": True, "chat_enabled": True}}, False, False),
+            ({"observe": {"enabled": True, "chat_enabled": False}}, True, False),
+        ],
+    )
+    def test_it_publishes_the_verdict_on_api_status(
+        self, mounted, cfg, agentless, expected
+    ):
+        # The control's dashboard labels a session's link by what it serves, and
+        # reads that off /api/status. Set on every path, so a session that never
+        # mounted chat -- or failed to -- reads as off rather than stale.
+        from biopb_mcp.mcp import _observe
+
+        _observe.set_chat_enabled(not expected)  # a value that must be overwritten
+        assert _setup_chat(cfg, agentless=agentless) is expected
+        assert _observe._chat_enabled is expected
+
+    def test_setup_observe_hands_over_the_session_teardown(self, monkeypatch):
+        # The stop route runs the launcher's own `_shutdown`, so it has to be
+        # handed over at wiring time -- before the routes are registered, which
+        # happens inside this call.
+        from biopb_mcp.mcp import _observe
+
+        calls = []
+        _setup_observe(
+            {"observe": {"enabled": True}},
+            agentless=True,
+            on_shutdown=lambda: calls.append(1),
+        )
+        assert _observe._agentless is True
+        _observe._shutdown_hook()
+        assert calls == [1]
+        _observe.set_session_owns_its_reap(False)
+
+    def test_setup_observe_gives_a_shim_child_no_teardown(self, monkeypatch):
+        # A shim-owned child is its shim's to reap; handing it a teardown here
+        # would let the web end a session an MCP client is still bridging to.
+        from biopb_mcp.mcp import _observe
+
+        _setup_observe(
+            {"observe": {"enabled": True}},
+            agentless=False,
+            on_shutdown=lambda: None,
+        )
+        assert _observe._agentless is False
+        assert _observe._shutdown_hook is None
+
+    def test_a_failed_mount_reads_as_off(self, monkeypatch):
+        from biopb_mcp.mcp import _chat_api, _observe
+
+        monkeypatch.setattr(
+            _chat_api, "configure", lambda *a, **k: (_ for _ in ()).throw(RuntimeError)
+        )
+        _observe.set_chat_enabled(True)
+        cfg = {"observe": {"enabled": True, "chat_enabled": True}}
+        assert _setup_chat(cfg, agentless=True) is False
+        assert _observe._chat_enabled is False
+
+
+class TestAgentlessViewer:
+    """Which sessions count as a viewer a human opened.
+
+    Two things hang off this and must not drift apart: such a session publishes
+    itself to the registry, and it is the only kind served the built-in chat
+    loop. Pinned as a truth table rather than trusted to two inline expressions,
+    which is what they were.
+    """
+
+    @pytest.mark.parametrize(
+        "view,shim_owned,expected",
+        [
+            # `biopb mcp view`: a human opened a window; no agent is attached.
+            (True, False, True),
+            # A shim-owned child is serving an MCP client. It cannot reach here
+            # with view=True today, and must answer False if it ever does.
+            (True, True, False),
+            # The stdio shim's ordinary child.
+            (False, True, False),
+            # A direct `--transport http` launch: wired to something by its
+            # operator, and publishes no session, so it has no observe page.
+            (False, False, False),
+        ],
+    )
+    def test_only_a_shimless_viewer_counts(self, view, shim_owned, expected):
+        assert _is_agentless_viewer(view, shim_owned) is expected
+
+
+class TestViewSessionRegistration:
+    """`biopb mcp view` has no shim, so it publishes itself into the shared
+    registry the control reads (`biopb._sessions`). Without this an agentless
+    viewer is invisible: no dashboard entry, no observe page, no
+    `/session/<id>/*` proxying."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_registry(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
+
+    def test_registers_a_routable_record(self):
+        from biopb import _sessions
+
+        session_id = _register_view_session(45678)
+        assert session_id is not None
+        rec = _sessions.read_session(session_id)
+        # Everything the control needs to route /session/<id>/* here.
+        assert rec["port"] == 45678
+        assert rec["host"] == "127.0.0.1"
+        assert rec["pid"] == os.getpid()
+        assert rec["mcp_url"] == "http://127.0.0.1:45678/mcp"
+
+    def test_registered_session_is_listed_as_live(self):
+        from biopb import _sessions
+
+        session_id = _register_view_session(45678)
+        # Our own pid owns the record, so the liveness prune must keep it --
+        # this is what makes the session show up on the dashboard at all.
+        assert session_id in [r["session_id"] for r in _sessions.list_sessions()]
+
+    def test_unregister_removes_the_record(self):
+        from biopb import _sessions
+
+        session_id = _register_view_session(45678)
+        _unregister_session(session_id)
+        assert _sessions.read_session(session_id) is None
+
+    def test_unregister_none_is_a_noop(self):
+        # The teardown path runs on every exit, including one where the publish
+        # failed or never ran (Ctrl-C during the viewer's bring-up).
+        _unregister_session(None)
+
+    def test_publish_failure_costs_only_discoverability(self, monkeypatch):
+        from biopb import _sessions
+
+        def _boom(*a, **k):
+            raise OSError("read-only state dir")
+
+        monkeypatch.setattr(_sessions, "register", _boom)
+        # No exception out of the launcher, and nothing to de-register.
+        assert _register_view_session(45678) is None
+
+    def test_unregister_failure_does_not_break_teardown(self, monkeypatch):
+        from biopb import _sessions
+
+        def _boom(*a, **k):
+            raise OSError("gone")
+
+        monkeypatch.setattr(_sessions, "unregister", _boom)
+        _unregister_session("20260101-000000-1")

@@ -25,16 +25,28 @@ Chunk ID format:
 """
 
 import logging
+import math
 import os
 import threading
-from typing import TYPE_CHECKING, Any, List, Optional
+import time
+from itertools import product
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._handle_reaper import (
+    IdleHandleReaper,
+)
+from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    compute_transfer_chunk_size,
+    content_version_from_path,
+    default_transfer_chunk_shape,
+    estimate_chunk_bytes,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -51,6 +63,10 @@ if TYPE_CHECKING:
 # detect a plain TCZYX source (which it can shape from OME Pixels) versus an
 # RGB/samples one it must defer to scene switching.
 _CANONICAL_DIMS = "TCZYX"
+
+# "Not built yet" for the ND2 frame-index cache. Distinct from None, which is a
+# real cached answer meaning this scene's frames cannot be addressed by T/Z.
+_FRAME_INDEX_UNCACHED = object()
 
 
 GENERIC_IMAGE_EXTENSIONS = frozenset(
@@ -163,6 +179,7 @@ class _BioioAdapterBase(TensorAdapter):
 
     # Class-level source type (override in subclasses)
     SOURCE_TYPE: str = "aics"
+    RETAIN_SCENE_DASK = True
 
     @classmethod
     def create_from_config(
@@ -212,6 +229,8 @@ class _BioioAdapterBase(TensorAdapter):
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
+        metadata_cache: Optional[Any] = None,
+        shared_handle: Optional[Any] = None,
     ):
         """Initialize bioio adapter.
 
@@ -224,17 +243,20 @@ class _BioioAdapterBase(TensorAdapter):
             io_lock: Optional thread lock for IO serialization. Source-level
                      adapters create a new lock if None; scene-level adapters
                      receive the lock from the source-level adapter.
+            metadata_cache: Optional processed metadata shared by scene adapters.
         """
         self._bio_image = bio_image
         self.scene_index = scene_index
         self.source_id = source_id
 
-        # Thread lock for serializing IO operations
+        # Serializes every touch of the shared BioImage. Reentrant because the
+        # guarded methods nest -- list_tensor_descriptors reaches _bio_image
+        # both directly and through _metadata_for_listing.
         # Source-level creates lock, scene-level receives from source
         if io_lock is not None:
             self._io_lock = io_lock
         else:
-            self._io_lock = threading.Lock()
+            self._io_lock = threading.RLock()
 
         # Source-level metadata for DataSourceDescriptor
         if source_url:
@@ -249,8 +271,18 @@ class _BioioAdapterBase(TensorAdapter):
         # a documented blind spot. None (unresolved url) leaves it unversioned.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
+        self._metadata_cache = metadata_cache
 
         self._dask_data = None  # scene-level dask array, bound below
+        self._scene_descriptor = None
+        # (generation, frame map) -- the map is per SCENE, but it indexes into a
+        # reader shared by every scene of this source, so a reopen invalidates it.
+        self._nd2_frame_index_cache: Any = _FRAME_INDEX_UNCACHED
+        self._nd2_frame_index_generation = -1
+        # A reader/handle shared with this source's other scene adapters, for
+        # subclasses that keep one warm. None here means "not shared yet";
+        # whoever needs it makes it (see NikonAdapter._reader_handle).
+        self._shared_handle: Any = shared_handle
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -259,14 +291,31 @@ class _BioioAdapterBase(TensorAdapter):
         self._tensor_adapters: dict = {}
         if scene_index is not None:
             # Scene-level: bind this scene's bioio dask array eagerly.
-            self._bio_image.set_scene(scene_index)
-            self._dask_data = self._bio_image.dask_data
-            self.dim_labels = (
-                dim_labels if dim_labels else list(self._bio_image.dims.order)
-            )
+            with self._io_lock:
+                self._bio_image.set_scene(scene_index)
+                self._dask_data = self._bio_image.dask_data
+                self.dim_labels = (
+                    dim_labels if dim_labels else list(self._bio_image.dims.order)
+                )
+                if not self.RETAIN_SCENE_DASK:
+                    self._scene_descriptor = self._descriptor_from_dask(self._dask_data)
+                    self._dask_data = None
+                    self._release_bioio_dask_cache()
         else:
             # Source-level: no bound reader; dim_labels is the default for scenes.
             self.dim_labels = dim_labels
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The dask block -- the ``native=`` seed, and what a slice materialises.
+
+        ``get_data`` slices the scene's dask array, which computes whole blocks
+        whatever window is asked for. A subclass whose reader beats that -- one
+        that reads off a mapping rather than through Dask -- overrides this with
+        ``None``; see :class:`NikonAdapter`.
+        """
+        block = self._native_block(self._dask_data)
+        return tuple(int(size) for size in block) if block else None
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's bioio dask array.
@@ -295,24 +344,84 @@ class _BioioAdapterBase(TensorAdapter):
         Source-level (scene_index=None): the first scene's descriptor.
         """
         if self.scene_index is not None:
+            if self._scene_descriptor is not None:
+                result = TensorDescriptor()
+                result.CopyFrom(self._scene_descriptor)
+                # The snapshot is built in the constructor, before the
+                # source-level adapter assigns this scene's ``_tensor_name``.
+                # Bind identity at retrieval time so every scene gets its
+                # source-qualified array_id rather than the bare source_id.
+                result.array_id = self.array_id
+                return result
             dask_data = self._dask_data
-            chunk_shape = [max(c) for c in dask_data.chunks]
-            return TensorDescriptor(
-                array_id=self.array_id,
-                dim_labels=self.dim_labels if self.dim_labels else [],
-                shape=list(dask_data.shape),
-                chunk_shape=chunk_shape,
-                dtype=dask_data.dtype.str,
+            return self._descriptor_from_dask(dask_data)
+        # Source-level: the default (first) scene -- answered by the adapter
+        # bound to it, not read back off the catalog listing, which carries no
+        # transfer grid (biopb/biopb#812).
+        entries = self.list_tensor_descriptors()
+        if not entries:
+            raise TensorNotFound(
+                f"source {self.source_id!r} exposes no scenes",
+                reason="unknown_source",
             )
-        # Source-level: return first scene descriptor
-        return self.list_tensor_descriptors()[0]
+        return self.get_tensor_adapter(entries[0].array_id).get_tensor_descriptor()
+
+    def _native_block(self, dask_data: Any) -> Optional[List[int]]:
+        """The backend's own block, used to align the transfer grid.
+
+        Only an alignment seed: no read is issued at this granularity
+        (biopb/biopb#809). An adapter whose bytes sit on disk in a shape BioIO's
+        block does not describe overrides :meth:`_transfer_chunk_shape` instead.
+        """
+        return [max(c) for c in dask_data.chunks]
+
+    def _transfer_chunk_shape(
+        self, shape: List[int], dtype: str, dask_data: Any
+    ) -> List[int]:
+        """This tensor's transfer grid -- the meaning of ``chunk_shape`` (#809).
+
+        Only ever called on a scene-bound adapter, whose ``dask_data`` is that
+        scene's own array: the grid is a serving fact and the listing path does
+        not compute one (biopb/biopb#812).
+        """
+        return default_transfer_chunk_shape(
+            shape, dtype, self.dim_labels, native=self._native_block(dask_data)
+        )
+
+    def _descriptor_from_dask(self, dask_data: Any) -> TensorDescriptor:
+        """Snapshot the structural facts exposed by a scene Dask array."""
+        shape = list(dask_data.shape)
+        dtype = dask_data.dtype.str
+        return TensorDescriptor(
+            array_id=self.array_id,
+            dim_labels=self.dim_labels if self.dim_labels else [],
+            shape=shape,
+            chunk_shape=self._transfer_chunk_shape(shape, dtype, dask_data),
+            dtype=dtype,
+        )
+
+    def _release_bioio_dask_cache(self) -> None:
+        """Release BioIO's current-scene lazy array without clearing metadata."""
+        with self._io_lock:
+            self._bio_image._xarray_dask_data = None
+            self._bio_image._dims = None
+            reader = self._bio_image.reader
+            reader._xarray_dask_data = None
+            reader._dims = None
+
+    def _metadata_for_listing(self) -> Any:
+        """Return metadata used by the cheap multi-scene descriptor path."""
+        with self._io_lock:
+            return self._bio_image.ome_metadata
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """List all tensors (scenes) available in this source via bioio.
+        """List every scene as a structural catalog entry.
 
         Uses OME metadata for shapes without scene switching when possible, else
-        falls back to per-scene switching. Chunk info is NOT populated -- clients
-        call get_flight_info for accurate per-scene chunk/metadata details.
+        falls back to per-scene switching. The transfer grid is NOT populated: it
+        is a serving fact of the scene ``get_tensor_adapter`` binds, and the
+        fast path here has bound no scene to answer for it (biopb/biopb#812).
+        Clients call ``GetFlightInfo`` for the grid.
 
         Returns:
             List of TensorDescriptor for all scenes in this source
@@ -321,12 +430,22 @@ class _BioioAdapterBase(TensorAdapter):
         if self._cached_descriptors is not None:
             return self._cached_descriptors
 
+        with self._io_lock:
+            # Re-check: another thread may have built these while this one
+            # waited for the lock.
+            if self._cached_descriptors is not None:
+                return self._cached_descriptors
+            self._cached_descriptors = self._build_tensor_descriptors()
+        return self._cached_descriptors
+
+    def _build_tensor_descriptors(self) -> List[TensorDescriptor]:
+        """Enumerate every scene's descriptor. Caller holds ``_io_lock``."""
         descriptors = []
         scene_ids = list(self._bio_image.scenes)
 
         # Try OME metadata first (much faster - no scene switching)
         try:
-            ome_meta = self._bio_image.ome_metadata
+            ome_meta = self._metadata_for_listing()
             if (
                 ome_meta is not None
                 and hasattr(ome_meta, "images")
@@ -375,7 +494,6 @@ class _BioioAdapterBase(TensorAdapter):
                                 array_id=f"{self.source_id}/{scene_ids[i]}",
                                 dim_labels=list(labels),
                                 shape=shape,
-                                chunk_shape=[],  # Not populated - call get_flight_info for chunk info
                                 dtype=dtype,
                             )
                         )
@@ -388,23 +506,23 @@ class _BioioAdapterBase(TensorAdapter):
             for scene_id in scene_ids:
                 self._bio_image.set_scene(scene_id)
                 dask_data = self._bio_image.dask_data
+                labels = (
+                    list(self.dim_labels)
+                    if self.dim_labels
+                    else list(self._bio_image.dims.order)
+                )
 
                 descriptors.append(
                     TensorDescriptor(
                         # Globally-unique array_id = source_id/field (identity
                         # policy); the scene id is the within-source field.
                         array_id=f"{self.source_id}/{scene_id}",
-                        dim_labels=self.dim_labels
-                        if self.dim_labels
-                        else list(self._bio_image.dims.order),
+                        dim_labels=labels,
                         shape=list(dask_data.shape),
-                        chunk_shape=[],  # Not populated - call get_flight_info for chunk info
                         dtype=dask_data.dtype.str,
                     )
                 )
 
-        # Cache for future calls
-        self._cached_descriptors = descriptors
         return descriptors
 
     def _scene_index_for_field(self, field: Optional[str]) -> int:
@@ -423,7 +541,8 @@ class _BioioAdapterBase(TensorAdapter):
                 if self._within_source_field(d.array_id) == field:
                     return i
             raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
-        scene_ids = list(self._bio_image.scenes)
+        with self._io_lock:
+            scene_ids = list(self._bio_image.scenes)
         try:
             return scene_ids.index(field)
         except ValueError as e:
@@ -462,12 +581,23 @@ class _BioioAdapterBase(TensorAdapter):
             dim_labels=self.dim_labels,
             source_url=self._source_url,
             io_lock=self._io_lock,
+            metadata_cache=self._metadata_cache,
+            shared_handle=self._shared_handle_for_scenes(),
         )
         # Set tensor context in the adapter
         adapter._tensor_name = tensor_id
         self._tensor_adapters[tensor_id] = adapter
 
         return adapter
+
+    def _shared_handle_for_scenes(self) -> Any:
+        """The handle this source's scene adapters should share, if any.
+
+        None for every format that reopens per read. A subclass keeping one
+        reader warm returns it here so its scenes share one, rather than each
+        opening its own against the same file.
+        """
+        return None
 
     def get_metadata(self) -> dict:
         """Return OME metadata as a dict (bioio ``ome_metadata`` model_dump).
@@ -476,7 +606,8 @@ class _BioioAdapterBase(TensorAdapter):
             OME metadata as dict, or empty dict if unavailable.
         """
         try:
-            ome_meta = self._bio_image.ome_metadata
+            with self._io_lock:
+                ome_meta = self._bio_image.ome_metadata
             if ome_meta is None:
                 return {}
 
@@ -507,7 +638,8 @@ class _BioioAdapterBase(TensorAdapter):
         See ``TensorAdapter._physical_scale``.
         """
         try:
-            ome = self._bio_image.ome_metadata
+            with self._io_lock:
+                ome = self._bio_image.ome_metadata
             if ome is None or not getattr(ome, "images", None):
                 return None
 
@@ -530,7 +662,11 @@ class _BioioAdapterBase(TensorAdapter):
                 "z": (px.physical_size_z, _unit(px.physical_size_z_unit)),
             }
 
-            labels = self.dim_labels or list(self._bio_image.dims.order)
+            if self.dim_labels:
+                labels = self.dim_labels
+            else:
+                with self._io_lock:
+                    labels = list(self._bio_image.dims.order)
             scale, unit = [], []
             for lab in labels:
                 v, u = by_label.get(str(lab).lower(), (None, ""))
@@ -600,10 +736,487 @@ class LeicaAdapter(_BioioAdapterBase):
         return None
 
 
+# One pool for ND2 readers, separate from the OME-TIFF and NDTiff pools so each
+# is bounded on its own terms. See :mod:`_handle_reaper`.
+#
+# ND2 is the case that module's "reopen per read" default does not cover, and it
+# is also the case its long TTL does not fit. The default is argued from open
+# cost, and for ND2 the open really is free: 169 open/close pairs on a 21 GB file
+# measure 16 ms. What a held ND2 reader saves is not the open but the *mapping*.
+# ``nd2.read_frame`` returns a zero-copy view onto the reader's mmap, so a reopen
+# hands every call a fresh mapping with an empty page table, and the crop then
+# re-faults every row it touches even though the bytes are already in page cache.
+# The bill scales with rows revisited, not bytes delivered: tiling one
+# 14234x14234 scene on the 1182 transfer grid touches each row once per column of
+# tiles, and 169 reads that way cost 203k minor faults and 1.65 s warm where the
+# same pixels through one held reader cost 18.5k and 0.30 s.
+#
+# That is why the TTL is seconds rather than minutes. A warm page table is worth
+# only as long as the read that built it -- across an idle gap the next read
+# faults in whatever *it* touches regardless, so holding buys nothing and keeps a
+# whole-file mapping pinned. 5 s spans one logical read with margin: a full-scene
+# read of ND040 measures 4.4 s wall with the handle held.
+_ND2_READER_TTL = 5.0
+
+_nd2_reader_reaper = IdleHandleReaper(
+    _ND2_READER_TTL, "nd2-reader-reaper", max_handles=8
+)
+
+
+class _Nd2Reader:
+    """One ND2 reader, shared by every scene adapter of one source.
+
+    The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle` is
+    this object rather than the adapter because the handle is per *file* while
+    adapters are per scene. ND040 has 18 scenes, and a reader per scene would map
+    the same 21.8 GB file 18 times to serve reads that are already serialized
+    behind the one ``_io_lock`` they share.
+    """
+
+    def __init__(self, source_url: str, io_lock) -> None:
+        self._source_url = source_url
+        # The source's lock, shared with every scene adapter -- so the fence the
+        # reaper takes is the same one reads hold.
+        self._io_lock = io_lock
+        self._reader: Any = None
+        # Reads hold ``_io_lock`` end to end, so none is ever in flight when the
+        # reaper takes it.
+        self._active_reads = 0
+        self._persistent_last_access = 0.0
+        # Bumped on every open. A scene's frame map indexes into a specific
+        # reader; after a reap the offsets belong to a closed mapping, so the map
+        # is rebuilt rather than reused.
+        self.generation = 0
+
+    def acquire(self) -> Any:
+        """Open (or reuse) the reader. Caller holds ``_io_lock``."""
+        # Stamped before register, so this handle sorts newest and a cap eviction
+        # triggered by its own register never picks it.
+        self._persistent_last_access = time.monotonic()
+        if self._reader is None:
+            import nd2
+
+            self._reader = nd2.ND2File(self._source_url)
+            self.generation += 1
+            _nd2_reader_reaper.register(self)
+        return self._reader
+
+    def _release_persistent_handle(self) -> None:
+        """Close the reader and permit a later reopen.
+
+        Caller holds ``_io_lock`` (read path / reaper) or is the GC finalizer.
+        Safe to call repeatedly.
+        """
+        reader, self._reader = self._reader, None
+        _nd2_reader_reaper.discard(self)
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                logger.debug("error closing persistent ND2 reader", exc_info=True)
+
+    def __del__(self):
+        try:
+            self._release_persistent_handle()
+        except Exception:
+            pass
+
+
 class NikonAdapter(_BioioAdapterBase):
     """Adapter for Nikon ND2 files."""
 
     SOURCE_TYPE = "nikon"
+    RETAIN_SCENE_DASK = False
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """None: ``nd2.read_frame`` returns a view onto the reader's mmap.
+
+        The crop that follows copies only the rows asked for, so no part of a
+        frame is read to deliver another part. Deliberately *not* the whole C/Y/X
+        frame :meth:`_native_block` seeds the grid with -- that is the reader's
+        indexing granularity, not its I/O granularity, and flooring a tile there
+        would make every scaled read materialise a 1.1 GiB frame on a 14234^2
+        scene, which is the residency streaming exists to bound.
+        """
+        return None
+
+    def _processed_metadata(self) -> Any:
+        """Return BioIO's processed metadata, degrading to empty on failure."""
+        if self._metadata_cache is None:
+            with self._io_lock:
+                try:
+                    self._metadata_cache = self._bio_image.metadata
+                except Exception:
+                    self._metadata_cache = {}
+        return self._metadata_cache
+
+    def _metadata_for_listing(self) -> Any:
+        return self._processed_metadata()
+
+    def get_metadata(self) -> dict:
+        """Read and retain BioIO's processed metadata once for this ND2 source."""
+        return self._metadata_to_dict(self._processed_metadata())
+
+    @staticmethod
+    def _metadata_to_dict(metadata: Any) -> dict:
+        if metadata is None:
+            return {}
+        if hasattr(metadata, "model_dump"):
+            return metadata.model_dump(mode="json")
+        if hasattr(metadata, "dict"):
+            return metadata.dict(by_alias=False, exclude_none=False)
+        if hasattr(metadata, "__dict__"):
+            return {
+                key: value
+                for key, value in metadata.__dict__.items()
+                if not key.startswith("_")
+            }
+        return {}
+
+    def _physical_scale(self):
+        """Derive this scene's scale from the shared processed metadata cache."""
+        ome = self._processed_metadata()
+        if ome is None or not getattr(ome, "images", None):
+            return None
+        idx = self.scene_index if self.scene_index is not None else 0
+        if idx >= len(ome.images):
+            return None
+        px = ome.images[idx].pixels
+
+        def unit(value):
+            if value is None:
+                return ""
+            return str(getattr(value, "value", None) or value)
+
+        by_label = {
+            "x": (px.physical_size_x, unit(px.physical_size_x_unit)),
+            "y": (px.physical_size_y, unit(px.physical_size_y_unit)),
+            "z": (px.physical_size_z, unit(px.physical_size_z_unit)),
+        }
+        scale, units = [], []
+        for label in self.dim_labels or []:
+            value, axis_unit = by_label.get(str(label).lower(), (None, ""))
+            try:
+                numeric = float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                numeric = 0.0
+            scale.append(numeric if numeric > 0 else 0.0)
+            units.append(axis_unit if numeric > 0 else "")
+        return (scale, units) if any(scale) else None
+
+    def _native_block(self, dask_data: Any) -> Optional[List[int]]:
+        """Describe one ND2 sequence frame, preserving its pixel layout.
+
+        ``nd2.read_frame`` indexes the acquisition loops (T/Z and the scene's
+        position) and returns the complete C/Y/X[/S] frame. Some BioIO/Dask
+        arrays report several sequence frames as one chunk, which is not the
+        granularity available from the reader below. Keep any smaller pixel
+        tiling BioIO reports, but never combine T or Z frames in this seed.
+        """
+        block = super()._native_block(dask_data)
+        if block is None or len(block) != len(self.dim_labels or []):
+            return block
+        for axis, label in enumerate(self.dim_labels or []):
+            if label.upper() in {"T", "Z"}:
+                block[axis] = 1
+        return block
+
+    def _transfer_chunk_shape(
+        self, shape: List[int], dtype: str, dask_data: Any
+    ) -> List[int]:
+        """Never split an ND2's component axes -- they are inside the pixel.
+
+        ND2 has no planar variant. Every frame is materialised in one layout,
+        ``(Y, X, channel, RGB component)`` (``modern_reader._actual_frame_shape``),
+        so both C and S sit *below* X: one channel's bytes are ``itemsize`` of
+        every ``componentCount * itemsize``. A per-channel chunk therefore faults
+        in every page the other components occupy and discards what it did not
+        ask for, then the next channel repeats the read. Measured on a 4-channel
+        14234-wide uint16 file, full-width band, pages warm: all four channels in
+        one read cost 96.4 ms for 233.2 MB (0.41 ms/MB) against 43.9 ms for
+        58.3 MB (0.75 ms/MB) for one -- 4x the pixels for 2.2x the time
+        (biopb/biopb#806).
+
+        There is nothing to detect. An earlier version probed ``widthBytes ==
+        widthPx * componentCount * itemsize`` and treated a mismatch as planar,
+        but that identity is nd2's test for **row padding**, not for layout: when
+        it fails the reader keeps the same interleaved shape and uses
+        ``widthBytes`` as the row stride. So the probe read a padded row -- an
+        odd-width RGB camera -- as planar and handed C back to the generic
+        splitter, which is exactly the bug #806 is about.
+
+        The declared *unit* is one pixel's worth of every component. C and S are
+        inside it and so cannot be split, and nothing downstream re-shapes a
+        declared grid (biopb/biopb#809) -- which is what makes this stick, where
+        the old fixed divide/coalesce priority took C apart again. The plane is
+        left to the shared sizing, which grows Y and X coupled: a full-width band
+        reads better sequentially, but turns a 512x512 tile into one fetch per
+        band it crosses, and between C-whole aspect ratios the cold cost is
+        within scene-to-scene variance (a paired A/B of 1024x1024 against
+        512x2048 on untouched scenes ranged 0.73x to 4.2x in *both* directions).
+        Keeping the components together is where the measurable win is.
+        """
+        labels = [str(label).upper() for label in (self.dim_labels or [])]
+        if len(labels) != len(shape):
+            return super()._transfer_chunk_shape(shape, dtype, dask_data)
+        unit = [
+            int(size) if label in {"C", "S"} else 1
+            for label, size in zip(labels, shape, strict=True)
+        ]
+        # componentCount == 1: C and S are absent or singleton, so there is no
+        # interleaved run to protect and the backend's own block is the better
+        # seed. (nd2 reports C = componentCount for a mono file and C x S =
+        # componentCount for an RGB one, so this product IS componentCount.)
+        if math.prod(unit) <= 1:
+            return super()._transfer_chunk_shape(shape, dtype, dask_data)
+        # One pixel of every component already at or above the target leaves
+        # nothing to grow; declare it and let the Arrow clamp handle the rest.
+        if estimate_chunk_bytes(tuple(unit), dtype) >= (
+            chunk_policy.PREFERRED_ARROW_BATCH_BYTES
+        ):
+            return unit
+        return list(
+            compute_transfer_chunk_size(tuple(unit), tuple(shape), dtype, labels)
+        )
+
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read requested pixels directly from ND2 sequence frames.
+
+        BioIO remains authoritative for scenes and metadata. Pixel reads skip
+        its Dask graph because ``nd2.read_frame`` exposes the same frame-level
+        access directly. Only the requested subregion is copied, while the ND2
+        file is open, so no reader-backed view escapes this method.
+        """
+        return self._read(bounds, (1,) * len(bounds.start))
+
+    def get_decimated_data(
+        self, bounds: ChunkBounds, step: Tuple[int, ...]
+    ) -> Optional[np.ndarray]:
+        """The same read, strided -- the one place a scaled read skips bytes.
+
+        The step reaches two different things. On T and Z it selects *frames*,
+        so a scale-8 Z read decodes an eighth of them and the rest are never
+        touched at all. Inside a frame it is a stride into the mmap view, so the
+        crop copies one element per block instead of the block.
+
+        Correct for the same reason the unstrided read is: every element still
+        comes from the frame the sequence map puts it in, and the copy still
+        lands in this method's own output before the lock drops.
+        """
+        return self._read(bounds, step)
+
+    def _read(self, bounds: ChunkBounds, step: Tuple[int, ...]) -> np.ndarray:
+        """``bounds`` at ``step``; a step of ones is the plain read."""
+        if self.scene_index is None:
+            raise ValueError("Cannot get data from source-level adapter")
+
+        TensorAdapter.get_data(self, bounds)
+        if not self._source_url or not os.path.isfile(self._source_url):
+            return self._get_data_via_bioio(bounds, step)
+
+        desc = self.get_tensor_descriptor()
+        labels = [label.upper() for label in desc.dim_labels]
+        if len(labels) != len(desc.shape) or not {"Y", "X"}.issubset(labels):
+            return self._get_data_via_bioio(bounds, step)
+        if any(label not in {"T", "C", "Z", "Y", "X", "S"} for label in labels):
+            return self._get_data_via_bioio(bounds, step)
+        shape = tuple(int(dim) for dim in desc.shape)
+        starts = tuple(int(value) for value in bounds.start)
+        stops = tuple(int(value) for value in bounds.stop)
+        steps = tuple(max(1, int(size)) for size in step)
+        output = np.empty(
+            tuple(
+                len(range(start, stop, size))
+                for start, stop, size in zip(starts, stops, steps, strict=True)
+            ),
+            dtype=np.dtype(desc.dtype),
+        )
+
+        sequence_axes = [
+            axis for axis, label in enumerate(labels) if label in {"T", "Z"}
+        ]
+        sequence_ranges = [
+            range(starts[axis], stops[axis], steps[axis]) for axis in sequence_axes
+        ]
+        frame_shape = tuple(
+            1 if label in {"T", "Z"} else size
+            for label, size in zip(labels, shape, strict=True)
+        )
+
+        handle = self._reader_handle()
+        with self._io_lock:
+            reader = handle.acquire()
+            try:
+                output = self._read_frames_into(
+                    reader,
+                    handle,
+                    labels,
+                    starts,
+                    stops,
+                    steps,
+                    output,
+                    sequence_axes,
+                    sequence_ranges,
+                    frame_shape,
+                )
+            except Exception:
+                # A half-open reader is not reusable; drop it so the next read
+                # reopens rather than failing on the same handle.
+                handle._release_persistent_handle()
+                raise
+        fallback_to_bioio = output is None
+
+        if fallback_to_bioio:
+            return self._get_data_via_bioio(bounds, step)
+        return output
+
+    def _read_frames_into(
+        self,
+        reader,
+        handle,
+        labels,
+        starts,
+        stops,
+        steps,
+        output,
+        sequence_axes,
+        sequence_ranges,
+        frame_shape,
+    ):
+        """Copy the requested subregion out of ``reader``. None -> use BioIO.
+
+        Caller holds ``_io_lock``, which is also what fences the persistent
+        reader against the reaper: every view taken here is copied into
+        ``output`` before the lock is released, so no reader-backed memory
+        outlives the call even though the reader itself now does.
+        """
+        frame_indices = self._nd2_frame_indices(reader, handle)
+        requested_frames = []
+        for coordinates in product(*sequence_ranges):
+            coordinate_by_label = {
+                labels[axis]: coordinate
+                for axis, coordinate in zip(sequence_axes, coordinates, strict=True)
+            }
+            key = (
+                coordinate_by_label.get("T", 0),
+                coordinate_by_label.get("Z", 0),
+            )
+            requested_frames.append((coordinate_by_label, key))
+
+        # BioIO serves what the direct path cannot address: a scene whose
+        # frames have no T/Z map, or a coordinate the ND2 experiment never
+        # enumerated. Decided here but acted on below, once _io_lock is
+        # released -- _get_data_via_bioio takes that same lock.
+        fallback_to_bioio = frame_indices is None or any(
+            key not in frame_indices for _, key in requested_frames
+        )
+        if not fallback_to_bioio:
+            for coordinate_by_label, key in requested_frames:
+                frame_index = frame_indices[key]
+                frame = reader.read_frame(frame_index).reshape(frame_shape)
+
+                source_slices = []
+                output_slices = []
+                for axis, label in enumerate(labels):
+                    if label in {"T", "Z"}:
+                        # The coordinate is one the sequence range stepped to,
+                        # so this divides exactly.
+                        coordinate = coordinate_by_label[label]
+                        index = (coordinate - starts[axis]) // steps[axis]
+                        source_slices.append(slice(0, 1))
+                        output_slices.append(slice(index, index + 1))
+                    else:
+                        source_slices.append(
+                            slice(starts[axis], stops[axis], steps[axis])
+                        )
+                        output_slices.append(slice(None))
+                output[tuple(output_slices)] = frame[tuple(source_slices)]
+
+        return None if fallback_to_bioio else output
+
+    def _reader_handle(self) -> "_Nd2Reader":
+        """This source's shared reader, made on first use.
+
+        Scene adapters receive it from the source-level adapter
+        (``_shared_handle_for_scenes``); one constructed directly -- a test, a
+        benchmark -- makes its own.
+        """
+        if self._shared_handle is None:
+            self._shared_handle = _Nd2Reader(self._source_url, self._io_lock)
+        return self._shared_handle
+
+    def _shared_handle_for_scenes(self) -> Any:
+        return self._reader_handle()
+
+    def close(self) -> None:
+        """Release this source's reader, including its scene adapters'.
+
+        They share one, so closing it here closes it for all of them; the next
+        read on any of them reopens.
+        """
+        for adapter in list(self._tensor_adapters.values()):
+            close = getattr(adapter, "close", None)
+            if close is not None:
+                close()
+        if self._shared_handle is not None:
+            with self._io_lock:
+                self._shared_handle._release_persistent_handle()
+
+    def _get_data_via_bioio(
+        self, bounds: ChunkBounds, step: Optional[Tuple[int, ...]] = None
+    ) -> np.ndarray:
+        """Use an ephemeral BioIO Dask array for unsupported direct-read cases.
+
+        A step is honoured but not accelerated: dask materialises whichever
+        blocks the stride lands in. That keeps a decimated read correct on the
+        scenes the direct path cannot address, at the cost the caller would have
+        paid reading the extent and striding it.
+        """
+        slices = (
+            self._bounds_to_slices(bounds)
+            if step is None
+            else self._bounds_to_strided_slices(bounds, step)
+        )
+        with self._io_lock:
+            self._bio_image.set_scene(self.scene_index)
+            try:
+                return self._bio_image.dask_data[slices].compute()
+            finally:
+                self._release_bioio_dask_cache()
+
+    def _nd2_frame_indices(
+        self, reader: Any, handle: "_Nd2Reader"
+    ) -> Optional[dict[tuple[int, int], int]]:
+        """Map this BioIO scene's T/Z coordinates to ND2 sequence indices.
+
+        Returns None when two frames share a (T, Z) coordinate. An unknown or
+        custom acquisition loop collapses onto one T/Z pair, so the direct path
+        cannot tell those frames apart; the caller reads the scene through
+        BioIO rather than choosing one of them here.
+
+        Cached against the handle's generation: the map indexes into a specific
+        reader, so a reap between reads invalidates it. Rebuilding is one pass
+        over ``loop_indices``; reusing it against a remapped file would not fail,
+        it would read the wrong frames.
+        """
+        if (
+            self._nd2_frame_index_cache is not _FRAME_INDEX_UNCACHED
+            and self._nd2_frame_index_generation == handle.generation
+        ):
+            return self._nd2_frame_index_cache
+        self._nd2_frame_index_generation = handle.generation
+        result: dict[tuple[int, int], int] = {}
+        for frame_index, coordinates in enumerate(reader.loop_indices):
+            if int(coordinates.get("P", 0)) != self.scene_index:
+                continue
+            key = (int(coordinates.get("T", 0)), int(coordinates.get("Z", 0)))
+            if key in result:
+                self._nd2_frame_index_cache = None
+                return None
+            result[key] = frame_index
+        self._nd2_frame_index_cache = result
+        return result
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:

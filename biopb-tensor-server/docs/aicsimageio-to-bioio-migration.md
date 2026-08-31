@@ -28,15 +28,18 @@ bioio is the official successor from the same group (Allen Institute for Cell Sc
 
 | Subclass | `SOURCE_TYPE` | Claims | bioio plugin |
 |---|---|---|---|
-| `ZeissAdapter` | `zeiss` | `.czi`, `.lsm` | `bioio-czi`, `bioio-tifffile` |
+| `TiffAdapter` | `tiff` | local plain `.tif`, `.tiff` | native `tifffile` |
+| `LsmAdapter` | `lsm` | local `.lsm` | native `tifffile` |
+| `CziAdapter` | `czi` | local `.czi` | native `pylibCZIrw` |
+| `ZeissAdapter` | `zeiss` | remote `.czi` and `.lsm` | `bioio-czi` |
 | `LeicaAdapter` | `leica` | `.lif` | `bioio-lif` |
 | `NikonAdapter` | `nikon` | `.nd2` | `bioio-nd2` |
 | `DvAdapter` | `dv` | `.dv` | `bioio-dv` |
 | `OlympusAdapter` | `olympus` | `.oif`, `.oib` | `bioio-bioformats` |
 | `BioformatsAdapter` | `bioformats` | `.zvi`/`.lei`/`.vsi` (gated on `bioio_bioformats` importable) | `bioio-bioformats` |
-| `AicsImageIoAdapter` (fallback) | `aics` | plain `.tif`, microscopy/scientific exts, remote/exotic `.tif` OmeTiffAdapter declined | `bioio-tifffile`, `bioio-imageio` |
+| `AicsImageIoAdapter` (fallback) | `aics` | remote/exotic `.tif`, microscopy/scientific exts | `bioio-tifffile`, `bioio-imageio` |
 
-`SOURCE_TYPE` strings are kept verbatim for catalog back-compat. bioio *adds* a native SlideBook reader (`bioio-sldy`) aicsimageio lacked — not adopted (no users). OME-TIFF is **not** here: biopb reads it through its own pure-tifffile `OmeTiffAdapter` (biopb/biopb#213); the bioio fallback only sees a remote/exotic `.tif` that adapter declined.
+The generic BioIO source types remain available for remote and unsupported fallback paths. bioio *adds* a native SlideBook reader (`bioio-sldy`) aicsimageio lacked — not adopted (no users). OME-TIFF is **not** here: biopb reads it through its own pure-tifffile `OmeTiffAdapter` (biopb/biopb#213); the bioio fallback only sees a remote/exotic `.tif` that adapter declined.
 
 ## The pins that remain, and why
 
@@ -51,7 +54,7 @@ bioio is the official successor from the same group (Allen Institute for Cell Sc
 
 ### Extra layout (`[aics]`, `[czi]`, `[bioformats]`)
 
-- **`[aics]`** = `bioio>=3.0` + `bioio-lif`/`bioio-nd2`/`bioio-dv`/`bioio-tifffile`/`bioio-ome-tiff`/`bioio-imageio`. `bioio-tifffile` is **required, not optional** — without it `BioImage` cannot read plain non-OME `.tif` or `.lsm` (`bioio-ome-tiff` only claims OME-TIFF), so `ZeissAdapter`'s `.lsm` path and the generic fallback raise `UnsupportedFileFormatError`.
+- **`[aics]`** = `bioio>=3.0` + `bioio-lif`/`bioio-nd2`/`bioio-dv`/`bioio-tifffile`/`bioio-ome-tiff`/`bioio-imageio`. `bioio-tifffile` remains needed for remote/exotic TIFF and the generic fallback, but local plain TIFF and LSM no longer depend on it because Phase 1 uses native `tifffile`.
 - **`bioio-ome-zarr` deliberately excluded** — (1) redundant: biopb reads OME-Zarr/Zarr via its own `OmeZarrAdapter`/`ZarrAdapter`, which win in the registry ahead of the generic bioio fallback (a `.zarr` store never reaches a bioio reader); (2) it requires **zarr ≥ 3**, colliding with the `zarr<3` pin. The transitive closure of the `[aics]` plugins reaches neither it nor `ome-zarr`, so the lock stays on zarr 2.18.x.
 - **`[czi]`** = `bioio-czi`, carved out of `[aics]`. Its `pylibczirw` dep publishes arm64-macOS/Linux/Windows wheels but **no Intel-macOS wheel** (any version), so bundling it in the default set would source-build libCZI (cmake + compiler) and fail on every Intel Mac. Installers add `[czi]` on every platform except Intel macOS; a direct install wanting CZI everywhere uses `biopb-tensor-server[aics,czi]`. Also **no cp313 wheel** — one of the reasons for the `requires-python <3.13` cap.
 - **`[bioformats]`** = `bioio-bioformats` + `scyjava>=1.9.0` + `cjdk>=0.5.0`. Java Bio-Formats fallback for legacy formats with no pure-Python reader (ZVI the headline case); a JDK is downloaded lazily by scyjava/cjdk on first read, not a build/system dep.

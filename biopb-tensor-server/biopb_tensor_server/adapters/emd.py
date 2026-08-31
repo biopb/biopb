@@ -23,7 +23,7 @@ Chunk ID format:
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import dask.array as da
 import numpy as np
@@ -32,7 +32,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -158,35 +161,50 @@ class EmdAdapter(TensorAdapter):
         return str(index)
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """One descriptor per EMD signal, carrying the native HDF5 chunk grid."""
-        descriptors = []
-        for i, sig in enumerate(self._signals):
-            data = sig["data"]
-            descriptors.append(
-                TensorDescriptor(
-                    array_id=f"{self.source_id}/{self._field_for(i)}",
-                    dim_labels=self._labels_for(sig),
-                    shape=list(data.shape),
-                    # rsciio forwards the native HDF5 chunks; chunksize is the
-                    # per-dim max (single chunk per grid cell here).
-                    chunk_shape=list(data.chunksize),
-                    dtype=np.dtype(data.dtype).str,
-                )
+        """One structural entry per EMD signal (no grid -- biopb/biopb#812)."""
+        return [
+            TensorDescriptor(
+                array_id=f"{self.source_id}/{self._field_for(i)}",
+                dim_labels=self._labels_for(sig),
+                shape=list(sig["data"].shape),
+                dtype=np.dtype(sig["data"].dtype).str,
             )
-        return descriptors
+            for i, sig in enumerate(self._signals)
+        ]
+
+    def _serving_descriptor(self, index: int) -> TensorDescriptor:
+        """The full descriptor for signal ``index``, grid included.
+
+        Sized against that signal's own dtype, labels and native HDF5 chunks --
+        rsciio forwards those and ``chunksize`` is the per-dim max (a single
+        chunk per grid cell here), which seeds the transfer grid (#809).
+        """
+        sig = self._signals[index]
+        data = sig["data"]
+        labels = self._labels_for(sig)
+        return TensorDescriptor(
+            array_id=f"{self.source_id}/{self._field_for(index)}",
+            dim_labels=labels,
+            shape=list(data.shape),
+            chunk_shape=default_transfer_chunk_shape(
+                data.shape,
+                np.dtype(data.dtype).str,
+                labels,
+                native=data.chunksize,
+            ),
+            dtype=np.dtype(data.dtype).str,
+        )
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         if self.signal_index is not None:
-            data = self._data
-            return TensorDescriptor(
-                array_id=self.array_id,
-                dim_labels=self.dim_labels if self.dim_labels else [],
-                shape=list(data.shape),
-                chunk_shape=list(data.chunksize),
-                dtype=np.dtype(data.dtype).str,
-            )
-        # Source-level: first signal's descriptor.
-        return self.list_tensor_descriptors()[0]
+            desc = self._serving_descriptor(self.signal_index)
+            # This adapter's own identity: the bound field name is authoritative
+            # over the index-derived one.
+            desc.array_id = self.array_id
+            return desc
+        # Source-level: the default (first) signal, sized from that signal --
+        # not read back off the catalog listing, which carries no grid.
+        return self._serving_descriptor(0)
 
     def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Return a tensor-scoped adapter for a specific signal.
@@ -225,6 +243,12 @@ class EmdAdapter(TensorAdapter):
         adapter._tensor_name = field
         self._tensor_adapters[field] = adapter
         return adapter
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The dask block -- the ``native=`` seed of this field's grid."""
+        chunksize = getattr(self._data, "chunksize", None)
+        return tuple(int(size) for size in chunksize) if chunksize else None
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region from this signal's dask array (native h5py read)."""

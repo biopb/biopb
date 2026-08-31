@@ -1387,6 +1387,11 @@ def create_source_manager(
         # create_from_config.
         if source.credentials_profile:
             extra_config["credentials_profile"] = source.credentials_profile
+        # Same rebuild drops `alias`, which a tensor-server proxy needs as the
+        # display authority of its catalog source_url (biopb/biopb#788). The
+        # source_id is already namespaced by then, so this is display-only.
+        if source.alias:
+            extra_config["alias"] = source.alias
         # Store the canonical resolved form of a local config path (the same
         # resolve_local_path the source_id hash, the containment guard, and the
         # drop path all use) so its claim key compares equal to a drop that lands

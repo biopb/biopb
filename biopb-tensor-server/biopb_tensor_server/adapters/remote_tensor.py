@@ -50,6 +50,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorReadPlan,
+    catalog_entry,
     unpack_chunk_array,
 )
 from biopb_tensor_server.core.axes import noncanonical_order
@@ -338,18 +339,21 @@ class RemoteTensorAdapter(TensorAdapter):
         self._source_type = "tensor-server"
         self._tensor_name = tensor_name
         self._alias = alias
+        _parts = urlsplit(upstream_location)
+        # Display scheme: whatever the upstream was configured with (grpc://,
+        # grpcs://, grpc+tls://). Hardcoding grpc:// advertised a TLS upstream as
+        # plaintext (biopb/biopb#788).
+        self._scheme = _parts.scheme or "grpc"
         # Display authority for the catalog source_url: the alias, or the
         # host:port when there is none. (self._upstream_location keeps the real
         # endpoint for dialing.)
-        self._authority = alias or (
-            urlsplit(upstream_location).netloc or upstream_location
-        )
+        self._authority = alias or (_parts.netloc or upstream_location)
         # Display-friendly catalog source_url. Until the upstream's real path is
         # seeded (seed_catalog, biopb/biopb#297), fall back to the endpoint + the
         # upstream source_id -- grpc://lab:experiment1 (aliased) or
         # grpc://lab-store:8815:experiment1 (no alias) -- which is at least more
         # legible than the bare endpoint shared by every source of an upstream.
-        self._source_url = f"grpc://{self._authority}:{upstream_source_id}"
+        self._source_url = f"{self._scheme}://{self._authority}:{upstream_source_id}"
 
         self._upstream_location = upstream_location
         self._upstream_source_id = upstream_source_id
@@ -490,7 +494,8 @@ class RemoteTensorAdapter(TensorAdapter):
         """Build the catalog ``source_url`` so a browser can tree a mirror by path.
 
         Embeds the upstream source's REAL location under the (aliased) endpoint --
-        ``grpc://<authority>/<remote-path>`` -- so a client nests mirrored sources
+        ``<scheme>://<authority>/<remote-path>``, keeping the upstream's own
+        grpc/grpcs scheme -- so a client nests mirrored sources
         by their upstream filepath beneath an endpoint root, instead of collapsing
         every source of an upstream into a flat ``grpc:`` node (biopb/biopb#297).
         The upstream url is a normalized catalog url (e.g.
@@ -502,8 +507,8 @@ class RemoteTensorAdapter(TensorAdapter):
             parts = urlsplit(upstream_source_url)
             remote = (parts.netloc + parts.path).strip("/")
             if remote:
-                return f"grpc://{self._authority}/{remote}"
-        return f"grpc://{self._authority}:{self._upstream_source_id}"
+                return f"{self._scheme}://{self._authority}/{remote}"
+        return f"{self._scheme}://{self._authority}:{self._upstream_source_id}"
 
     def seed_catalog(
         self,
@@ -560,7 +565,6 @@ class RemoteTensorAdapter(TensorAdapter):
                     array_id=self._to_local_array_id(t["array_id"]),
                     dim_labels=t.get("dim_labels") or [],
                     shape=t.get("shape") or [],
-                    chunk_shape=t.get("chunk_shape") or [],
                     dtype=t.get("dtype") or "",
                 )
             )
@@ -680,7 +684,7 @@ class RemoteTensorAdapter(TensorAdapter):
             self._mark_unreachable(exc)
             return []  # unreachable / unresolved upstream -> placeholder row
         self._reachable = True
-        return [self._localize_descriptor(desc)]
+        return [catalog_entry(self._localize_descriptor(desc))]
 
     def is_resident(self) -> bool:
         """Best-effort residency of the mirrored source.
@@ -732,7 +736,10 @@ class RemoteTensorAdapter(TensorAdapter):
         self._require_canonical_upstream(plan.descriptor)
         return plan
 
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
+    def get_read_plan(
+        self,
+        request_desc: TensorDescriptor,
+    ) -> TensorReadPlan:
         """Plan a read, refusing a non-canonical upstream first (#596).
 
         The other read boundary besides ``plan_flight_info``: the precache warms
@@ -782,17 +789,29 @@ class RemoteTensorAdapter(TensorAdapter):
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Mirror the upstream tensor descriptor under the local array_id.
 
-        Served from the bulk-seeded cache when available (biopb/biopb#266 B2):
-        ``seed_catalog`` already localized every tensor's structural fields
-        (shape/chunk/dtype/dim_labels) from a single upstream ``query_sources``,
-        so the serve-path ``GetFlightInfo`` reads the descriptor locally instead
-        of a per-open ``get_descriptor`` RPC. This removes the last structural
-        upstream call on the serve path; together with metadata served from the
-        local catalog (#253 core) it leaves ``get_physical_scale`` as the only
-        residual ``GetFlightInfo`` RPC (dropped separately, #266/#274) before
-        ``do_get`` is the sole upstream contact. Falls back to a live fetch when
-        this tensor was not seeded (a single-source static remote, or a field
-        absent from the seed).
+        Structure comes from the bulk-seeded cache when available
+        (biopb/biopb#266 B2): ``seed_catalog`` already localized every tensor's
+        shape/dtype/dim_labels from a single upstream ``query_sources``, so the
+        serve path reads them locally instead of a per-open ``get_descriptor``
+        RPC. Together with metadata served from the local catalog (#253 core)
+        that leaves ``do_get`` as very nearly the only upstream contact.
+
+        The transfer grid is **not** in that seed and is not reconstructed here:
+        an upstream catalog publishes structure, not a serving plan
+        (biopb/biopb#812), and a proxy derives no grid of its own. It does not
+        need to. ``plan_flight_info`` forwards the whole upstream
+        ``GetFlightInfo`` (``forward_flight_info``), whose descriptor carries the
+        upstream's authoritative grid, and that path never routes through here.
+        What is left is the local-planner fallback, which runs only when the
+        upstream is unreachable -- so a probe for the grid at that moment would
+        fail too. A seeded descriptor therefore reports the structure it has and
+        an empty grid, and the planner falls back to the whole tensor split under
+        the Arrow ceiling, exactly as the catalog surface falls back to an empty
+        tensor list.
+
+        Falls back to a live fetch when this tensor was not seeded (a
+        single-source static remote, or a field absent from the seed); that IS an
+        upstream ``GetFlightInfo``, so it comes back with the grid.
         """
         if self._descriptors_cache is not None:
             for desc in self._descriptors_cache:
@@ -819,10 +838,11 @@ class RemoteTensorAdapter(TensorAdapter):
         The server's ``get_flight_info`` calls this for a proxy tensor *instead*
         of running its local read planner (biopb/biopb#295). A caching proxy
         re-derives **no** chunk grid, pyramid, or physical scale of its own (see
-        the module docstring); the default planner would guess a grid from the
-        seed's ``chunk_shape`` (advisory, and often empty for the aicsimageio/
-        OME-TIFF family), fall through to the 64 MB default grid, and
-        over-amplify a single-plane read ~125x. Instead, consult the upstream
+        the module docstring), and the bulk catalog seed carries no grid to reuse
+        either -- an upstream catalog publishes structure, not a serving plan
+        (biopb/biopb#812). This call IS how the grid arrives, and only the
+        upstream can answer for a *scaled* read's grid, its pyramid, or its
+        scaled ``chunk_id``s. So consult the upstream
         once for its **authoritative** ``GetFlightInfo`` -- carrying the native
         grid, the server-advertised pyramid when the request opted in via
         ``with_pyramid`` (a pyramidal OME-Zarr upstream's precompute levels

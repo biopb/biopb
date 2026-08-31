@@ -1315,6 +1315,14 @@ class TensorFlightServer(flight.FlightServerBase):
 
             source_adapter = self.sources.get(source_id)
 
+            # A serving field, filled from the bound adapter (biopb/biopb#780).
+            # Deliberately here rather than on the catalog listing: consumers use
+            # it to decide whether a cache entry is still valid, and this call is
+            # fetch-per-call by contract while a listing is a natural thing to
+            # cache. None stays unset -- absent is "no claim", not "unchanged".
+            if source_adapter is not None and source_adapter.content_version:
+                read_plan.descriptor.content_version = source_adapter.content_version
+
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
                 # One scheme (biopb/biopb#253): the source-level metadata is
@@ -1483,6 +1491,14 @@ class TensorFlightServer(flight.FlightServerBase):
                 location = cache_manager.locate_entry(cache_key)
                 if location is None:
                     adapter.resolve_chunk_data(chunk_id, cache_manager)
+                    # A deferred cache write returns before the bytes are on
+                    # disk, and this reply IS a byte range -- so unlike do_get,
+                    # which is happy with the entry in memory, this caller has to
+                    # wait for the write it just triggered. Without it, every
+                    # cold locate would answer "unavailable" and send the client
+                    # back for a do_get, retiring the fast path exactly where it
+                    # was meant to win.
+                    cache_manager.await_deferred_write(cache_key)
                     location = cache_manager.locate_entry(cache_key)
             except (OSError, ValueError) as e:
                 raise flight.FlightInternalError(

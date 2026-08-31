@@ -227,7 +227,7 @@ def test_no_body_names_a_specific_dataset(bodies):
 
 
 def test_descriptions_are_one_sentence_and_read_as_a_request(shipped):
-    """`description` is most of what `find_skills` matches on. Kept short and
+    """`description` is most of what `list_skills` matches on. Kept short and
     phrased as what the user wants, not as an implementation summary."""
     entries, _ = shipped
     for e in entries:

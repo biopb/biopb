@@ -553,7 +553,14 @@ class TestTiffSequenceStackAll:
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert adapter.is_tiled is True
             assert adapter._spatial_chunk == [16, 16]
-            assert adapter.chunk_shape == [1, 16, 16]
+            # chunk_shape is the transfer grid, aligned to the 16x16 tiles it was
+            # seeded from rather than equal to one (biopb/biopb#809).
+            assert all(
+                g % n == 0 and g <= s
+                for g, n, s in zip(
+                    adapter.chunk_shape, [1, 16, 16], [3, 32, 32], strict=True
+                )
+            )
 
 
 class TestCoherenceGate:

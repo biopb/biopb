@@ -22,8 +22,14 @@ from biopb_tensor_server.adapters._scale import (
     scale_by_label,
     unit_to_um,
 )
-from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
@@ -39,10 +45,6 @@ logger = logging.getLogger(__name__)
 # TIFF ResolutionUnit code -> micrometres per unit (2 = inch, 3 = centimetre).
 # Code 1 ("no absolute unit") carries only an aspect ratio and is excluded.
 _RESUNIT_TO_UM = {2: 25400.0, 3: 10000.0}
-
-# Sentinel for "physical scale not computed yet" -- distinct from a computed
-# ``None`` (no usable calibration), so the memoized result is never recomputed.
-_SCALE_UNSET = object()
 
 
 def _tiff_pixel_size_um(page, tag_name: str, imagej_unit_um) -> Optional[float]:
@@ -534,10 +536,6 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # serialize while reads of different files run in parallel, so one slow
         # read can't freeze every other frame.
         self._init_file_locks()
-        # Memoized physical scale: computing it reopens members[0], so cache the
-        # result (incl. a None) after the first call -- see _physical_scale.
-        self._physical_scale_cache: Any = _SCALE_UNSET
-
         # Gather every TIFF in the claimed directory. Unlike claim(), read does
         # NOT exclude OME names: the OME exclusion is a claim-time ownership
         # decision; by now the directory is claimed and its subtree pruned, so
@@ -589,6 +587,11 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
                         bool(page.is_tiled),
                         page.tilewidth,
                         page.tilelength,
+                        # The actual strile: (tilelength, tilewidth) tiled,
+                        # (rowsperstrip, width) striped. The strip height is not
+                        # derivable from the tile fields, and it is what a
+                        # striped page is really quantized to.
+                        tuple(int(size) for size in page.chunks[-2:]),
                     )
             except OSError:
                 raise  # transport / recall failure -- retryable, do not swallow
@@ -657,8 +660,9 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # Tile / chunk geometry from members[0] (best effort; tiling may vary
         # across members, but the chunk grid is only a hint -- get_data reads each
         # file's own zarr and pads to the requested extent regardless).
-        _, _, _, _, m0_tiled, m0_tw, m0_tl = probes[members[0]]
+        _, _, _, _, m0_tiled, m0_tw, m0_tl, m0_strile = probes[members[0]]
         self.is_tiled = m0_tiled
+        self._strile = list(m0_strile)
         if self.is_tiled:
             self.tile_width = m0_tw
             self.tile_length = m0_tl
@@ -682,6 +686,15 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             self.chunk_shape = [1] + self._spatial_chunk
             self.dim_labels = dim_labels if dim_labels else ["i", "y", "x"]
 
+        # chunk_shape is the transfer grid (biopb/biopb#809). The per-page block
+        # above -- one tile, or one whole page for a striped TIFF -- is only the
+        # alignment seed it grows from; a single page is usually well under the
+        # transfer target, and one endpoint per page is what biopb/biopb#684
+        # measured as too many.
+        self.chunk_shape = default_transfer_chunk_shape(
+            self.full_shape, self._dtype, self.dim_labels, native=self.chunk_shape
+        )
+
         # Total IFDs for coordinate mapping
         self._total_ifds = sum(n for _, n in self._file_ifd_map)
 
@@ -695,7 +708,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
 
     def _read_padded_plane(
         self,
@@ -731,6 +744,21 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             )
             plane[: ry - ys, : rx - xs] = data
         return plane
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One strile: the tile when tiled, one strip's rows when striped.
+
+        Not the ``native=`` seed, which is the coarser per-page block
+        (``_spatial_chunk``, a whole page for a striped file). Reads go through
+        ``series.aszarr()`` in its default chunkmode, whose chunk is the strile,
+        so that is what a read is really quantized to -- and reporting the page
+        instead would floor every tile at a whole plane and read one where a
+        band of strips was asked for.
+        """
+        return tuple(
+            [1] * (len(self.full_shape) - 2) + [int(size) for size in self._strile]
+        )
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.
@@ -841,14 +869,10 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (µm) from the first member's TIFF resolution tags.
 
-        Memoized: computing it reopens ``members[0]`` to read its page header, so
-        the result (a value *or* a ``None``) is cached after the first call and
-        every later open reuses it instead of reopening the TIFF. See
-        :meth:`_compute_physical_scale` for the projection itself.
+        The parent ``TensorAdapter`` memoizes the result when it fills a read
+        descriptor. See :meth:`_compute_physical_scale` for the projection itself.
         """
-        if self._physical_scale_cache is _SCALE_UNSET:
-            self._physical_scale_cache = self._compute_physical_scale()
-        return self._physical_scale_cache
+        return self._compute_physical_scale()
 
     def _compute_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Read the physical scale off ``members[0]`` (see :meth:`_physical_scale`).
@@ -1184,6 +1208,9 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             self._width = first_page.shape[1]
 
             # Tile info
+            # The strile is what a read is quantized to, tiled or striped; the
+            # transfer grid keeps seeding from the coarser per-page block.
+            self._strile = [int(size) for size in first_page.chunks[-2:]]
             if first_page.is_tiled:
                 self.is_tiled = True
                 self.tile_width = first_page.tilewidth
@@ -1251,6 +1278,11 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
                 self.dim_labels.append(label)
             self.dim_labels.extend(["y", "x"])
 
+        # Transfer grid, seeded by the tile/page block computed above (#809).
+        self.chunk_shape = default_transfer_chunk_shape(
+            self.full_shape, self._dtype, self.dim_labels, native=self.chunk_shape
+        )
+
         # Build index for efficient lookups
         self._build_file_index()
 
@@ -1283,7 +1315,22 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One strile: the tile when tiled, one strip's rows when striped.
+
+        Not the ``native=`` seed, which is the coarser per-page block
+        (``_spatial_chunk``, a whole page for a striped file). Reads go through
+        ``series.aszarr()`` in its default chunkmode, whose chunk is the strile,
+        so that is what a read is really quantized to -- and reporting the page
+        instead would floor every tile at a whole plane and read one where a
+        band of strips was asked for.
+        """
+        return tuple(
+            [1] * (len(self.full_shape) - 2) + [int(size) for size in self._strile]
+        )
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.

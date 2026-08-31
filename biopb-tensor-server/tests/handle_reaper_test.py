@@ -30,9 +30,11 @@ class _FakeReapable:
         self.released += 1
 
 
-def _reaper_with(adapter, ttl=10.0):
+def _reaper_with(adapter, ttl=10.0, max_handles=64):
     """A reaper tracking `adapter` WITHOUT starting its thread (add directly)."""
-    reaper = IdleHandleReaper(ttl_seconds=ttl, thread_name="test-reaper")
+    reaper = IdleHandleReaper(
+        ttl_seconds=ttl, thread_name="test-reaper", max_handles=max_handles
+    )
     reaper._adapters.add(adapter)
     return reaper
 
@@ -77,7 +79,7 @@ def test_sweep_skips_when_io_lock_is_held():
 
 def test_disabled_reaper_never_tracks_or_starts():
     # ttl <= 0 opts the pool out entirely: register is a no-op, no thread.
-    reaper = IdleHandleReaper(ttl_seconds=0.0, thread_name="off")
+    reaper = IdleHandleReaper(ttl_seconds=0.0, thread_name="off", max_handles=64)
     assert reaper.enabled is False
     reaper.register(_FakeReapable())
     assert reaper._started is False
@@ -85,33 +87,40 @@ def test_disabled_reaper_never_tracks_or_starts():
 
 
 def test_set_ttl_updates_ttl_and_enabled():
-    r = IdleHandleReaper(ttl_seconds=150.0, thread_name="tune")
+    r = IdleHandleReaper(ttl_seconds=150.0, thread_name="tune", max_handles=64)
     assert r.enabled is True
     r.set_ttl(0)  # <= 0 disables the pool
     assert r.enabled is False
     r.set_ttl(60)
-    assert r._ttl == 60.0
+    assert r.ttl == 60.0
     assert r.enabled is True
 
 
-def test_set_handle_reaper_ttl_retunes_every_pool(monkeypatch):
-    # The startup hook drives every constructed reaper from one config knob.
-    # Isolate to a fresh registry so the real OME-TIFF/NDTiff pools are untouched.
+def test_set_handle_reaper_ttl_caps_every_pool_and_never_raises_one(monkeypatch):
+    # The startup hook is a ceiling, not an assignment: it tightens a pool whose
+    # own TTL is longer and leaves a shorter one alone. A pool's TTL encodes what
+    # reopening THAT format costs, which the operator setting this cannot know.
     import biopb_tensor_server.adapters._handle_reaper as hr
 
     monkeypatch.setattr(hr, "_configured_reapers", weakref.WeakSet())
-    r1 = IdleHandleReaper(ttl_seconds=150.0, thread_name="pool-1")
-    r2 = IdleHandleReaper(ttl_seconds=150.0, thread_name="pool-2")
+    expensive = IdleHandleReaper(150.0, "pool-expensive", max_handles=64)
+    cheap = IdleHandleReaper(5.0, "pool-cheap", max_handles=64)
 
     set_handle_reaper_ttl(30.0)
-    assert r1._ttl == 30.0 and r2._ttl == 30.0
+    assert expensive.ttl == 30.0  # capped
+    assert cheap.ttl == 5.0  # already shorter, left alone
+
+    set_handle_reaper_ttl(600.0)  # a ceiling above both loosens neither
+    assert expensive.ttl == 150.0 and cheap.ttl == 5.0
 
     set_handle_reaper_ttl(0.0)  # disable everywhere
-    assert r1.enabled is False and r2.enabled is False
+    assert expensive.enabled is False and cheap.enabled is False
 
 
 def test_register_starts_one_daemon_thread_then_discard():
-    reaper = IdleHandleReaper(ttl_seconds=300.0, thread_name="lazy-start")
+    reaper = IdleHandleReaper(
+        ttl_seconds=300.0, thread_name="lazy-start", max_handles=64
+    )
     assert reaper._started is False
     a = _FakeReapable()
     reaper.register(a)
@@ -124,3 +133,50 @@ def test_register_starts_one_daemon_thread_then_discard():
     assert len([t for t in threading.enumerate() if t.name == "lazy-start"]) == 1
     reaper.discard(a)
     assert a not in list(reaper._adapters)
+
+
+def test_register_closes_the_least_recently_used_over_the_cap():
+    # An unbounded pool grows with the catalog. The cap is enforced on register,
+    # not on the next sweep, because a burst can open handles far faster than the
+    # sweep interval -- which is the case the cap exists for.
+    reaper = IdleHandleReaper(ttl_seconds=300.0, thread_name="capped", max_handles=2)
+    reaper._started = True  # no thread; register() only has to enforce the cap
+
+    handles = []
+    for age in (300, 200, 100):  # oldest first
+        h = _FakeReapable()
+        h._persistent_last_access = time.monotonic() - age
+        handles.append(h)
+        reaper.register(h)
+
+    oldest, middle, newest = handles
+    assert oldest.released == 1
+    assert middle.released == 0 and newest.released == 0
+
+
+def test_cap_never_evicts_the_handle_that_just_registered():
+    reaper = IdleHandleReaper(ttl_seconds=300.0, thread_name="capped", max_handles=1)
+    reaper._started = True
+    old = _FakeReapable()
+    old._persistent_last_access = time.monotonic() - 300
+    reaper.register(old)
+    fresh = _FakeReapable()  # stamped now, so it sorts newest
+    reaper.register(fresh)
+    assert old.released == 1 and fresh.released == 0
+
+
+def test_cap_skips_a_handle_mid_read_rather_than_blocking():
+    # The cap bounds idle pins. Waiting on a live read to enforce it would be the
+    # worse trade, so an in-flight handle is skipped and the next register retries.
+    reaper = IdleHandleReaper(ttl_seconds=300.0, thread_name="capped", max_handles=1)
+    reaper._started = True
+    busy = _FakeReapable()
+    busy._persistent_last_access = time.monotonic() - 300
+    reaper.register(busy)
+    with busy._io_lock:  # a read holding the lock across its decode
+        reaper.register(_FakeReapable())
+    assert busy.released == 0
+
+    # Once that read finishes, the next register collects it.
+    reaper.register(_FakeReapable())
+    assert busy.released == 1

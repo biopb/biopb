@@ -714,6 +714,13 @@ function Remove-McpClients {
         if ($LASTEXITCODE -eq 0) { Report-Ok "Claude Code: removed biopb" }
     }
 
+    # Codex CLI (via the CLI): its config is TOML, so it is not one of the
+    # JSON targets below.
+    if (Get-Command codex -ErrorAction SilentlyContinue) {
+        & codex mcp remove biopb *> $null
+        if ($LASTEXITCODE -eq 0) { Report-Ok "Codex CLI: removed biopb" }
+    }
+
     # JSON-config clients: delete the biopb entry under its container property.
     $targets = @(
         @{ File = (Join-Path $env:APPDATA "Claude\claude_desktop_config.json"); Prop = 'mcpServers'; Label = 'Claude Desktop' },

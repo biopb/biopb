@@ -78,7 +78,7 @@ in three collaborators it composes:
 
 | Method | Description |
 |--------|-------------|
-| `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto. Lean: leaves `TensorDescriptor.pyramid` and `metadata_json` empty |
+| `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto. Lean: each `TensorDescriptor` is the **structural** entry (`array_id`/`dim_labels`/`shape`/`dtype`) and leaves `chunk_shape`, `pyramid` and `metadata_json` empty |
 | `GetFlightInfo` | Returns query ticket for real data (pixel or metadata). Pixel data request respects `TensorReadOptions` and optionally fills `TensorDescriptor.pyramid` or `metadata_json` when asked |
 | `DoGet` | Fetches data by ticket, either a single pixel chunk or metadata query results; returns a `RecordBatch` stream |
 
@@ -97,10 +97,11 @@ Two sources of pyramid specs (`TensorFlightServer._advertised_pyramid`):
   `TensorAdapter.get_native_pyramid_levels()` (`OmeZarrAdapter` and
   `QptiffAdapter`) to return one `native=True`, `reduction_method="precompute"`
   level per on-disk resolution.
-- **Computed** — everything else gets `chunk.build_pyramid_plan(...)`, a full
-  pyramid (level 0 → coarsest) generated from the authoritative `[pyramid]`
-  config knobs (`threshold` / `downscale_factor` / `pixel_budget_cubic_root`).
-  The precache worker warms the *coarsest* of this same plan.
+- **Computed** — everything else gets `chunk.build_pyramid_plan(...)`: full
+  resolution plus at most two levels — a 2-D target and a 3-D one — from the
+  authoritative `[pyramid]` config knobs. The precache worker warms every level
+  of this same plan but the first, each over a centred window bounded by
+  `[precache] warm_budget_bytes`. On by default.
 
 ---
 
@@ -118,11 +119,32 @@ no tensors until it resolves.
 
 | Method | Returns |
 |--------|---------|
-| `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors |
+| `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors, as structural catalog entries |
 | `get_source_descriptor()` | `DataSourceDescriptor` proto |
-| `get_tensor_descriptor()` | `TensorDescriptor` proto |
+| `get_tensor_descriptor()` | `TensorDescriptor` proto — the full serving descriptor of one *bound* tensor |
 | `get_data(bounds)` | `np.ndarray` — decodes only the requested sub-region |
 | `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native pyramid levels |
+
+### Catalog entry vs serving descriptor (biopb/biopb#812)
+
+The two descriptor methods answer different questions, and the split runs all the
+way to the wire:
+
+- **Structural** — `array_id`, `dim_labels`, `shape`, `dtype`. Stable per tensor
+  and derivable from the container's index without opening one, so a *source*
+  answers for all its tensors at once. This is what `list_tensor_descriptors()`
+  returns, what the DuckDB `sources.tensors` STRUCT stores, and what
+  `ListFlights` publishes.
+- **Serving** — above all the transfer `chunk_shape`, plus `pyramid` and
+  `physical_scale`. These depend on the tensor actually being selected: the bound
+  scene's own chunk layout, its labels, its native pyramid level, the request's
+  scale. Only the adapter `get_tensor_adapter(array_id)` returns can answer them,
+  and `GetFlightInfo` — which binds first — is where they reach a client.
+
+`adapter_base.catalog_entry()` is the projection, and `get_source_descriptor()`
+applies it to every listed entry, so no adapter can publish a read plan into the
+catalog. A client that needs a grid describes the tensor; an empty `chunk_shape`
+is not a fallback to plan on.
 
 ### Canonical axis order (biopb/biopb#596)
 
@@ -149,7 +171,7 @@ family whose behavior actually changes.
 | | |
 |---|---|
 | **Not in scope** | Unlabeled stores (`zarr`, `hdf5`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting the consumers' positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Give such a source semantics with `dim_labels` in its config. |
-| **Fail-safe** | Ambiguity degrades to identity rather than moving pixels on a guess: rank mismatch, a duplicated canonical axis, or an `S` label that fails `samples_axis`' size-3/4 gate. Same posture `serving/renderer.py` already takes toward adapter-supplied labels. |
+| **Fail-safe** | Ambiguity degrades to identity rather than moving pixels on a guess: rank mismatch, a duplicated canonical axis, or an `S` label that fails `samples_axis`' size-3/4 gate. Same posture the render path took toward adapter-supplied labels. |
 | **chunk_ids** | Untouched — minted by the wrapped adapter and opaque here, so versioned / scaled / precompute-level ids all pass through. What is permuted is the client-visible geometry (descriptor + endpoint `bounds`) and the pixels. |
 | **Cache** | The transpose happens *before* the cache store, so a segment holds what the client is served and the localhost mmap fast path stays valid. `CACHE_FILE_FORMAT_VERSION` was bumped to `2` for that (same layout, reordered content); an older client declines the fast path and reads the same normalized chunk over `do_get`. |
 | **Plans** | `plan_flight_info` / `get_read_plan` are delegated and their answer permuted, not re-derived — which is what keeps the native-pyramid `precompute` routing working underneath. |
@@ -172,8 +194,8 @@ justified by open cost.
 
 | Open cost | Policy | Adapters |
 |---|---|---|
-| O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, `tiff`, `bioio`, `dicom`, local `zarr` |
-| O(N) and/or unbounded | persistent handle + `close()`, and TTL reaper (`handle_reaper_ttl`) | `ome-tiff`, `qptiff`, `ndtiff` |
+| O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, TIFF sequences, `bioio`, `dicom`, local `zarr` |
+| O(N) and/or unbounded | persistent handle + `close()`, and TTL reaper (`handle_reaper_ttl`) | `ome-tiff`, native plain TIFF/LSM, `qptiff`, `ndtiff` |
 
 ---
 

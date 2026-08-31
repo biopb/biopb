@@ -28,6 +28,11 @@ Design constraints (all best-effort, never fatal to the server):
   write, so the backlog tier gates each chunk on cache fill and stops above
   ``backlog_high_water`` of the cache's ``max_bytes``, and yields the moment a
   live source is enqueued.
+- **Only warms what scaling makes cheap.** A tensor whose coarsest advertised
+  level is full resolution is skipped: warming it would cache the source 1:1 to
+  save an open nothing. Without this the worker chases a footprint far larger
+  than the cache, and the ``backlog_high_water`` stop then decides *which*
+  sources stay warm by mtime order rather than by what warming is worth.
 """
 
 from __future__ import annotations
@@ -38,10 +43,14 @@ import queue
 import threading
 from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 
+import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.cache import ArrowFileBackend, CacheManager
-from biopb_tensor_server.core.chunk import build_pyramid_plan
+from biopb_tensor_server.core.chunk import (
+    compute_warm_selection,
+    compute_warm_targets,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
@@ -51,6 +60,19 @@ logger = logging.getLogger(__name__)
 
 # How often to re-check idle/stop while waiting for the server to quiesce.
 _POLL_INTERVAL_SECONDS = 0.2
+
+
+def _dtype_itemsize(dtype: str) -> int:
+    """Bytes per element, or 1 when the dtype string is unusable.
+
+    Degrading to 1 under-counts, so a level looks cheaper than it is and the
+    budget narrows less -- the safe direction: the alternative is refusing to
+    warm a tensor because its dtype string was odd.
+    """
+    try:
+        return int(np.dtype(dtype).itemsize)
+    except (TypeError, ValueError):
+        return 1
 
 
 class PrecacheWorker:
@@ -330,7 +352,14 @@ class PrecacheWorker:
     def _process_tensor(
         self, source_adapter, td, cache_manager, backlog: bool = False
     ) -> bool:
-        """Warm one tensor's coarsest level. Return True if preempted (backlog)."""
+        """Warm every level of this tensor's plan. Return True if preempted.
+
+        "Every level" is at most two -- the 2-D target and the 3-D one -- because
+        the plan is sparse (``compute_pyramid_scale_hints``). A tensor with both
+        needs both warmed: they are gated independently (precache-policy.md
+        §5.1), the 3-D one scales Z so it cannot serve a 2-D plane read, and the
+        2-D one is what the browser's tile route anchors on.
+        """
         # The client passes the descriptor's array_id verbatim as tensor_id
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
@@ -345,6 +374,18 @@ class PrecacheWorker:
         # warming is wasted I/O. Per-tensor because pyramid support can vary
         # between tensors of one source (a pyramidal main series alongside flat
         # label/macro series).
+        #
+        # That premise is only true because something reads those levels, which
+        # was not so until biopb/biopb#889: the HTTP sidecar now routes each tile
+        # to the coarsest advertised level that divides it, and a native level is
+        # addressed by an exact (scale_hint, "precompute") pair. Before that a
+        # pyramidal source got neither its native levels nor a warm cache.
+        #
+        # Warming them anyway would be worse than useless. The cache is a bounded
+        # pool and the whole design constraint here is residency (see
+        # PrecacheConfig.enabled): every native chunk warmed evicts a computed one
+        # that costs far more to reproduce -- a computed level has to read all of
+        # level 0 to exist, where a native level is a read of its own store.
         try:
             if tensor_adapter.has_native_pyramid():
                 logger.debug(
@@ -360,18 +401,47 @@ class PrecacheWorker:
             logger.exception("precache: get_tensor_descriptor failed for %s", tensor_id)
             return False
 
-        # Warm the coarsest level of the same plan the server advertises (a
-        # non-native source: native ones are skipped above), so the warmed
-        # chunk_ids are exactly what the client fetches on open.
+        # Warm every non-full-resolution level of the same plan the server
+        # advertises (a non-native source: native ones are skipped above), so the
+        # warmed chunk_ids are exactly what a client fetches on open.
+        #
+        # An empty list is the skip: the plan emits a level only where a gate
+        # passed, so "no levels but full resolution" already means warming would
+        # cache the source 1:1 and save an open nothing. Deferring to the planner
+        # rather than applying a pixel threshold here keeps precache from warming
+        # chunk_ids no client requests. Biggest effect is on long timelapses: the
+        # plan scores Lx*Ly*Lz only, so T is never scaled and a many-frame series
+        # is both the costliest warm and the one warming cannot help.
         cfg = self._pyramid_cfg
-        coarsest = build_pyramid_plan(
+        targets = compute_warm_targets(
             list(base_desc.shape),
             list(base_desc.dim_labels),
-            reduction_method=cfg.reduction_method,
             threshold=cfg.threshold,
             downscale_factor=cfg.downscale_factor,
             pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-        )[-1]
+            plane_max_pixels=cfg.plane_max_pixels,
+        )
+
+        if not targets:
+            logger.debug(
+                "precache: skipping tensor %s (no level below full resolution)",
+                tensor_id,
+            )
+            return False
+
+        for target in targets:
+            if self._stop.is_set():
+                return False
+            if self._warm_level(
+                tensor_adapter, base_desc, tensor_id, target, cache_manager, backlog
+            ):
+                return True
+        return False
+
+    def _warm_level(
+        self, tensor_adapter, base_desc, tensor_id, level, cache_manager, backlog
+    ) -> bool:
+        """Warm every chunk of one pyramid level. Return True if preempted."""
 
         # Build the request descriptor exactly as get_flight_info does, so the
         # read plan's scaled chunk_ids match what the client will fetch.
@@ -382,8 +452,31 @@ class PrecacheWorker:
             chunk_shape=base_desc.chunk_shape,
             dtype=base_desc.dtype,
         )
-        request_desc.scale_hint[:] = list(coarsest.scale_hint)
-        request_desc.reduction_method = coarsest.reduction_method
+        request_desc.scale_hint[:] = list(level.scale_hint)
+        request_desc.reduction_method = self._pyramid_cfg.reduction_method
+
+        # A level is one plane (one volume, on the 3-D target) repeated across
+        # every other axis, and warming that whole cross-product is what makes
+        # the warm set unbounded. Narrow the selection axes to a window from
+        # index 0, where a viewer opens; the plane itself is never narrowed.
+        start, stop = compute_warm_selection(
+            list(base_desc.shape),
+            list(base_desc.dim_labels),
+            level.scale_hint,
+            itemsize=_dtype_itemsize(base_desc.dtype),
+            volumetric=level.volumetric,
+            budget_bytes=self._cfg.warm_budget_bytes,
+        )
+        narrowed = [
+            i
+            for i, (a, b) in enumerate(zip(start, stop, strict=True))
+            if (a, b) != (0, int(base_desc.shape[i]))
+        ]
+        if narrowed:
+            # Only when it actually narrows: an unset slice_hint is the
+            # documented "all chunks" form, and adapters may branch on presence.
+            request_desc.slice_hint.start[:] = start
+            request_desc.slice_hint.stop[:] = stop
 
         try:
             read_plan = tensor_adapter.get_read_plan(request_desc)
@@ -419,7 +512,12 @@ class PrecacheWorker:
             warmed,
             len(endpoints),
             tensor_id,
-            list(coarsest.scale_hint),
-            " (backlog)" if backlog else "",
+            list(level.scale_hint),
+            (
+                ""
+                if not narrowed
+                else " sel=" + ",".join(f"{i}:{start[i]}-{stop[i]}" for i in narrowed)
+            )
+            + (" (backlog)" if backlog else ""),
         )
         return False

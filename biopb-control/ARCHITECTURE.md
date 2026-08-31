@@ -19,11 +19,17 @@ are its children, and MCP sessions are independent clients that merely register.
 
 Two rules keep that tree correct, and every change here must preserve them.
 
-- **I1 — the control *observes* sessions, never *spawns* them.** A control-spawned
-  session would inherit the control's frozen environment, putting the agent's
-  napari viewer on the wrong display (biopb/biopb-mcp#98). Sessions stay
-  shim-owned and env-inherited; they only **register** so the control can route to
-  and list them.
+- **I1 — the control never *owns* a session.** A session serving an MCP client is
+  spawned by that client's shim and only **registers**, so the control routes to
+  and lists it without holding it. The one session the control may *launch* is an
+  agentless `biopb mcp view` viewer, whose only other spawner is a terminal; that
+  child is detached and self-registering, so the registry still only observes and
+  a control restart never closes the user's window. What both preserve is
+  biopb/biopb-mcp#98: a session inherits its spawner's environment, and the wrong
+  one puts the napari viewer where the user is not. So a launch is refused unless
+  this control is loopback-bound **and** has a display of its own, and it launches
+  `--view`, which exits rather than falling back to a virtual display nobody can
+  see.
 - **I2 — the control stays lean and subprocess-based.** It supervises components
   as subprocesses, never by importing them, so no Qt/napari/dask/kernel ever enters
   this process. Facts shared with those components — the control endpoint, the
@@ -64,9 +70,9 @@ namespace, which would collide at the root. So the control serves
 | Path | Target | Hop |
 |---|---|---|
 | `/`, `/viewer`, `/admin`, `/assets/*` | control-served `web/` SPA | in-process |
-| `/api/*` | control's own API (status, sessions, data-plane verbs) | in-process |
+| `/api/*` | control's own API (status, sessions, data-plane verbs, viewer launch) | in-process |
 | `/health` | bare liveness | in-process |
-| `/data_plane/api/*`, `/data_plane/ws/render` | tensor sidecar (API-only) | loopback proxy |
+| `/data_plane/api/*` | tensor sidecar (API-only) | loopback proxy |
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
 | `/session/<id>/api/*` | that session's observe API | loopback proxy |
 | `/session/<id>/console/*` | that session's user console — **loopback-bound control only** | loopback proxy |
@@ -123,9 +129,38 @@ authenticated, for itself and for everything it fronts.
 
 Each session writes a JSON record — host, port, pid, `/mcp` url — into a state dir
 once it is reachable, and removes it on reap; the control reads that dir. The
-contract is a stdlib-only core-SDK module (I2): the session's shim writes, the
+contract is a stdlib-only core-SDK module (I2): the session side writes, the
 control reads, and neither imports the other.
+
+There are two writers, because there are two ways a session comes to exist. A
+shim-owned child is published by its **shim**, which owns its reap and so its
+de-registration. An agentless `biopb mcp view` session has no shim, so it
+**publishes itself** and drops its record on the way out. Either way the control
+only ever reads.
 
 Lookups **self-heal**, pruning records whose owning pid is dead — or alive on a
 recycled pid, caught by a create-time token — so a dead session expires to a clean
 "session ended" rather than a hang.
+
+`POST /api/sessions/new` is the third way a session comes to exist: the control
+spawns `biopb mcp view` and waits for it to appear in this registry, matched on
+the child's own pid. Registration is an exact readiness signal — `--view` opens
+its window *before* it registers — so a record means a viewer really opened, and
+a child that dies first never registers and comes back with its own log tail.
+Each launch writes **its own** file under `state/biopb/mcp/viewers/` (pruned to
+the newest few), beside the shim's per-session logs and for the same reason: a
+shared file interleaves concurrent viewers, and lines that cannot be attributed
+to a process are no use for diagnosing a session that is still running. The
+child is told the path, so `server_status` names the file its output really
+went to.
+The verb is offered only where it can work (I1); the dashboard reads that from
+`/api/status` and shows the refusal in the button's place.
+
+**Stopping one is not the mirror image.** The control does not signal a pid — it
+proxies `/session/<id>/api/shutdown`, and the session runs the same teardown
+Ctrl-C does. So ownership never enters it: a viewer started from a terminal and
+one started here are the same process ending itself, and the control keeps no
+record of which it launched. The route rides `api` rather than the local-only
+gate (it is not an execute surface, and `api` already carries the kernel
+restart), and only a session that owns its own reap serves it — a shim-owned
+child does not, since ending it would leave its shim bridging to a dead process.

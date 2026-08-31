@@ -2220,16 +2220,21 @@ class TensorBrowserWidget(QWidget):
         dims_str = (
             ", ".join(tensor_desc.dim_labels) if tensor_desc.dim_labels else "N/A"
         )
-        chunks_str = _format_shape(tensor_desc.chunk_shape)
-        meta_text = (
-            f"Source: {self._selected_source_id}\n"
-            f"Tensor: {self._selected_tensor_id}\n"
-            f"Shape: {shape_str}\n"
-            f"Dtype: {tensor_desc.dtype}\n"
-            f"Dims: {dims_str}\n"
-            f"Chunks: {chunks_str}"
-        )
-        self._metadata_label.setText(meta_text)
+        lines = [
+            f"Source: {self._selected_source_id}",
+            f"Tensor: {self._selected_tensor_id}",
+            f"Shape: {shape_str}",
+            f"Dtype: {tensor_desc.dtype}",
+            f"Dims: {dims_str}",
+        ]
+        # These descriptors come from the catalog listing, which is structural
+        # and carries no chunk grid: the transfer grid belongs to the tensor
+        # GetFlightInfo binds, which is authoritative for it (biopb/biopb#684,
+        # biopb/biopb#812). Omit the row rather than render an empty one; a
+        # descriptor that does carry a grid still shows it.
+        if tensor_desc.chunk_shape:
+            lines.append(f"Chunks: {_format_shape(tensor_desc.chunk_shape)}")
+        self._metadata_label.setText("\n".join(lines))
         self._metadata_label.setVisible(True)
 
     def _on_filter_text_changed(self, _text: str):

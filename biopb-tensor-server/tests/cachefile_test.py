@@ -1265,7 +1265,11 @@ class TestCachefileIntegration:
 
             block = _fetch_chunk_distributed(loc, None, chunk_id, start, stop, 0)
             assert cmod._cachefile_support.get(loc) is True  # fast path was used
-            assert block.shape == (48, 48)
+            # The endpoint's own extent -- the transfer grid is the adapter's
+            # choice and not this test's subject (biopb/biopb#809).
+            assert block.shape == tuple(
+                int(b) - int(a) for a, b in zip(start, stop, strict=True)
+            )
             assert not block.flags.writeable
             with pytest.raises(ValueError):
                 block[0, 0] = 0

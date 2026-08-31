@@ -1,5 +1,11 @@
-"""Best-effort classification of the cache directory's storage: plain local disk,
-or network / cloud-synced storage the Arrow file cache can't safely use?
+"""Best-effort classification of a cache directory's storage: plain local disk,
+or something -- network, cloud-synced, or RAM -- that an mmap cache can't use.
+
+Lives in the core ``biopb`` SDK rather than the tensor server because it has two
+tenants that may not import each other: the server's Arrow file cache, and the
+SDK's own on-disk chunk cache (``biopb.tensor._diskcache``, which cannot import
+the server -- it isn't on PyPI). Same reasoning that put ``_lifecycle.file_lock``
+and the ``_config_*`` modules here. Stdlib-only, so it costs an importer nothing.
 
 The file cache mmaps its segment files -- both the server (segment reads, boot
 index) and the localhost client fast path (Option C, biopb/biopb#571) map them
@@ -76,6 +82,14 @@ _NETWORK_FUSE_SUBTYPES = frozenset(
     }
 )
 
+# RAM-backed filesystem types. Not "unsafe" in the mmap-semantics sense -- these
+# are local POSIX and mmap fine -- but a cache placed here is stored in the very
+# resource it exists to conserve, so its pages are unevictable RAM plus a mapping
+# that is also RAM. Strictly worse than the in-memory LRU it would be replacing,
+# and silently so, which is why the client's disk cache refuses one
+# (docs/client-disk-cache.md).
+_MEMORY_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
+
 # Windows file-attribute bits marking non-resident (cloud placeholder / HSM stub)
 # content. Mirrors core.discovery's mask -- kept local so this module stays
 # import-free of the discovery machinery; these are stable OS constants.
@@ -89,19 +103,45 @@ _OFFLINE_ATTR_MASK = (
 )
 
 
-def unsafe_cache_dir_reason(path) -> Optional[str]:
-    """One-line reason the mmap file cache should not use *path*, or None if it
-    is local disk (or undeterminable, treated as local).
+def unsafe_cache_dir_reason(path, *, reject_memory: bool = False) -> Optional[str]:
+    """One-line reason an mmap cache should not use *path*, or None if it is
+    local disk (or undeterminable, treated as local).
 
     Network storage is checked first, then cloud-sync; the returned string is
     meant to be dropped straight into a launcher warning.
+
+    ``reject_memory`` adds RAM-backed filesystems to that list. Opt-in because
+    the two tenants disagree about what to do next: the server's answer to an
+    unusable cache_dir is its *memory* backend, so demoting a tmpfs dir would
+    trade RAM for the same RAM. The SDK's disk cache has no such fallback and
+    exists precisely to keep bytes out of RAM, so it passes True.
     """
     net = network_filesystem_type(path)
     if net:
         return f"a network filesystem ({net})"
+    if reject_memory:
+        mem = memory_filesystem_type(path)
+        if mem:
+            return f"a RAM-backed filesystem ({mem})"
     cloud = cloud_sync_hint(path)
     if cloud:
         return f"cloud-synced storage ({cloud})"
+    return None
+
+
+def memory_filesystem_type(path) -> Optional[str]:
+    """Return the RAM-backed filesystem type behind *path* (e.g. ``"tmpfs"``),
+    or None if it is real storage or cannot be determined. Never raises.
+
+    Positive-signal-only like every probe here: an fstype we cannot read, or a
+    platform with no mount table to read, returns None and is treated as disk.
+    """
+    try:
+        fstype = _raw_fstype(_nearest_existing(Path(path)))
+    except Exception:
+        return None
+    if fstype and fstype.lower() in _MEMORY_FSTYPES:
+        return fstype.lower()
     return None
 
 
@@ -190,8 +230,34 @@ def _windows_network_type(path: Path) -> Optional[str]:
     return None
 
 
+def _raw_fstype(path: Path) -> Optional[str]:
+    """The filesystem type backing *path*, unclassified, or None.
+
+    Split out of the network probes so the memory probe reads the same mount
+    table rather than growing a second parser. Windows has no equivalent name to
+    report (its network check is UNC / drive-type based), so it returns None.
+    """
+    if os.name == "nt":
+        return None
+    if sys.platform.startswith("linux"):
+        return _linux_fstype(path)
+    if sys.platform == "darwin":
+        return _darwin_fstype(path)
+    return None
+
+
 def _linux_network_type(path: Path) -> Optional[str]:
-    """Find *path*'s mount in /proc/self/mountinfo and classify its fstype.
+    """Classify *path*'s mount (see :func:`_linux_fstype`) as network or not."""
+    return _classify_fstype(_linux_fstype(path))
+
+
+def _darwin_network_type(path: Path) -> Optional[str]:
+    """Classify *path*'s mount (see :func:`_darwin_fstype`) as network or not."""
+    return _classify_fstype(_darwin_fstype(path))
+
+
+def _linux_fstype(path: Path) -> Optional[str]:
+    """Find *path*'s mount in /proc/self/mountinfo and return its fstype.
 
     Picks the mount whose mount point is the longest prefix of the resolved
     path, so a network export mounted below a local root is detected. When two
@@ -224,10 +290,10 @@ def _linux_network_type(path: Path) -> Optional[str]:
             if _path_under(target, mount_point) and len(mount_point) >= best_len:
                 best_len = len(mount_point)
                 best_type = fstype
-    return _classify_fstype(best_type)
+    return best_type
 
 
-def _darwin_network_type(path: Path) -> Optional[str]:
+def _darwin_fstype(path: Path) -> Optional[str]:
     """macOS: read ``f_fstypename`` from ``statfs(2)`` via ctypes."""
     import ctypes
 
@@ -261,7 +327,7 @@ def _darwin_network_type(path: Path) -> Optional[str]:
     buf = _Statfs()
     if libc.statfs(os.fsencode(str(path)), ctypes.byref(buf)) != 0:
         return None
-    return _classify_fstype(buf.f_fstypename.decode("utf-8", "replace"))
+    return buf.f_fstypename.decode("utf-8", "replace")
 
 
 def _path_under(target: str, mount_point: str) -> bool:

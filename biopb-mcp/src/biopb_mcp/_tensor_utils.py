@@ -11,8 +11,6 @@ from typing import List, Tuple
 
 from biopb.tensor import TensorFlightClient
 
-from ._config import CONFIG, get_setting
-
 logger = logging.getLogger(__name__)
 
 
@@ -184,40 +182,28 @@ def build_pyramid_levels(
     tensor_id: str,
     tensor_desc,
     source_desc=None,
-    config: dict | None = None,
 ) -> List:
     """Build resolution-pyramid levels for a tensor in napari display order.
 
-    When the server advertises a pyramid (the open-time descriptor carries one;
-    see :func:`_advertised_pyramid_levels`), each level is requested by its
-    advertised ``scale_hint`` *and* ``reduction_method`` so the client's
-    chunk_ids match what the server serves and pre-warms. The config-driven plan
-    below is the fallback for servers that advertise none.
+    The levels are the server's, always. Each is requested by its advertised
+    ``scale_hint`` *and* ``reduction_method`` (see
+    :func:`_advertised_pyramid_levels`) so the client's chunk_ids match what the
+    server serves and pre-warms.
 
-    That fallback uses one unified rule for 2-D and 3-D data and bounds napari's
-    3-D whole-volume read (issue #29). All knobs come from the ``pyramid`` config
-    section (``config`` defaults to the on-disk config):
+    **When the server advertises none, this loads level 0 and stops.** There used
+    to be a config-driven plan here that recomputed the ladder client-side. It
+    drifted: the server moved to XY-only rungs plus one 3-D rung against a
+    separate plane cap, while this still scaled X, Y and Z together against a
+    single voxel budget, and it omitted ``reduction_method`` so its chunk_ids
+    could not match a pre-warmed level anyway. A second, contradictory statement
+    of a policy that is the server's to make is worse than no statement: the
+    server has advertised a pyramid for every tensor since biopb/biopb#826, so
+    the fallback was unreachable in practice and wrong wherever it did fire.
 
-    - ``threshold`` -- max x/y extent of the coarsest level (caps 2-D reads),
-    - ``downscale_factor`` -- linear step between levels,
-    - ``pixel_budget_cubic_root`` -- per-axis floor; its cube is the max voxels
-      (``Lx*Ly*Lz``) allowed in the coarsest level, bounding the whole-volume
-      read napari issues in 3-D. Stored as the cube root (not the product) so
-      the floor and the budget are exact integers, free of cube-root rounding.
-
-    Each level is requested at the current per-axis scale, then x, y and z are
-    downsampled *individually* -- skipping any axis that has reached the floor
-    (``pixel_budget_cubic_root``, capped at ``threshold``) -- until the coarsest
-    level fits both the voxel budget and ``threshold`` in x/y. The floor keeps
-    small axes (channels, time, thin z) from being over-shrunk and guarantees
-    termination: once every axis is at or below it, ``Lx*Ly*Lz <= floor**3 <=
-    budget`` and ``Lx, Ly <= threshold``. A tensor without a z axis is treated
-    as ``Lz = 1`` and never gets a z scale factor.
-
-    The per-level extents are read from the *returned* array's shape, not
-    computed as ``L // scale`` -- the server's downsample rounding (floor vs
-    ceil) is not part of the API contract, so trusting the real shape keeps the
-    budget check correct either way.
+    Full resolution is the honest fallback. An old server that advertises nothing
+    is also one that pre-warms nothing, so a client-computed coarse level would
+    cost the same read as level 0 and deliver a blurrier picture -- measured, see
+    ``chunk.compute_pyramid_scale_hints``.
 
     **Output axis order.** napari displays the *last* ndisplay axes by position
     and ignores ``dim_labels`` for layout, so a mis-ordered source (``[Y, X, C]``,
@@ -239,74 +225,18 @@ def build_pyramid_levels(
         List of dask arrays at canonical ``[..., Z, Y, X]`` resolution levels,
         or ``[..., Z, Y, X, S]`` when the tensor carries interleaved samples.
     """
-    if config is None:
-        config = CONFIG.as_dict()
-    threshold = get_setting(config, "pyramid.threshold")
-    downscale_factor = get_setting(config, "pyramid.downscale_factor")
-    budget_root = get_setting(config, "pyramid.pixel_budget_cubic_root")
-    pixel_budget = budget_root**3
-
-    shape = tensor_desc.shape
-    ndim = len(shape)
-
-    # Per-tensor labels win; fall back to the source descriptor's labels.
-    dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
-    y_idx, x_idx, z_idx, _ = _resolve_axes(shape, dim_labels)
-
-    # Stop shrinking an axis once it reaches this floor; see the docstring for
-    # why the cube-root-capped-at-threshold value guarantees termination.
-    axis_floor = min(budget_root, threshold)
-
-    # Prefer the server-advertised pyramid: request each level by the
-    # advertised scale_hint *and* reduction_method so the client's chunk_ids
-    # match what the server serves and pre-warms. The config-driven loop below
-    # is the fallback for servers that advertise no pyramid -- it recomputes the
-    # scale plan and (deliberately) omits reduction_method, which is fine only
-    # when there is nothing pre-warmed to miss.
     advertised = _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc)
-    if advertised:
-        levels = [
-            client.get_tensor(
-                tensor_id,
-                scale_hint=list(lv.scale_hint),
-                reduction_method=lv.reduction_method or None,
-            )
-            for lv in advertised
-        ]
-    else:
-        levels = []
-        sx = sy = sz = 1
-
-        while True:
-            # scale_hint is in the *source* axis order the server expects.
-            scale_hint = [1] * ndim
-            scale_hint[x_idx] = sx
-            scale_hint[y_idx] = sy
-            if z_idx is not None:
-                scale_hint[z_idx] = sz
-
-            arr = client.get_tensor(tensor_id, scale_hint=scale_hint)
-            levels.append(arr)
-
-            # Real downsampled extents from the returned array, not
-            # floor(L/scale).
-            lx = arr.shape[x_idx]
-            ly = arr.shape[y_idx]
-            lz = arr.shape[z_idx] if z_idx is not None else 1
-            if lx * ly * lz <= pixel_budget and lx <= threshold and ly <= threshold:
-                break
-
-            # Downsample each axis individually, leaving any at the floor.
-            nsx = sx * downscale_factor if lx > axis_floor else sx
-            nsy = sy * downscale_factor if ly > axis_floor else sy
-            nsz = (
-                sz * downscale_factor if (z_idx is not None and lz > axis_floor) else sz
-            )
-            if (nsx, nsy, nsz) == (sx, sy, sz):
-                break  # nothing left to shrink; avoid an infinite loop
-            sx, sy, sz = nsx, nsy, nsz
-
-    return levels
+    if not advertised:
+        # No pyramid advertised: full resolution, and no client-side guess.
+        return [client.get_tensor(tensor_id)]
+    return [
+        client.get_tensor(
+            tensor_id,
+            scale_hint=list(lv.scale_hint),
+            reduction_method=lv.reduction_method or None,
+        )
+        for lv in advertised
+    ]
 
 
 def build_layer_scale(
@@ -444,7 +374,6 @@ def add_tensor_layer(
     name: str,
     source_desc=None,
     compute_scheduler: str | None = None,
-    config: dict | None = None,
 ):
     """Build a tensor's pyramid and add it to *viewer* as an image layer.
 
@@ -475,7 +404,6 @@ def add_tensor_layer(
         tensor_id,
         tensor_desc,
         source_desc=source_desc,
-        config=config,
     )
     # Present napari native-byte-order levels (biopb/biopb#296). napari's
     # thumbnail path (convert_to_uint8) does np.maximum(data, 0, out=data,

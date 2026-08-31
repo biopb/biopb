@@ -11,8 +11,14 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -175,6 +181,26 @@ class ZarrAdapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The store's chunk -- the ``native=`` seed of the grid below.
+
+        Inherited by ``OmeZarrAdapter``, ``_HcsFieldAdapter`` and
+        ``_QptiffLevelAdapter``, which all read through a zarr array. A rank that
+        does not match the array means this adapter presents a different axis
+        space than the store's, so the block is not comparable and none is
+        claimed. ``None`` also before the array is bound -- ``_QptiffLevelAdapter``
+        re-resolves its array per read -- which reads a tiled store as
+        unquantized; reachable only if a native level ever serves a computed
+        sub-scale, since ``precompute`` chunk_ids are unscaled and never arrive
+        here.
+        """
+        array = getattr(self, "zarr_array", None)
+        chunks = getattr(array, "chunks", None)
+        if not chunks or len(chunks) != len(array.shape):
+            return None
+        return tuple(int(size) for size in chunks)
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from zarr array.
 
@@ -262,9 +288,19 @@ class ZarrAdapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.zarr_array.shape),
-            chunk_shape=list(self.zarr_array.chunks),
+            # The store's chunk grid is an alignment seed, not the transfer
+            # unit: zarr blocks are routinely far below the transfer target, and
+            # shipping one per chunk is what biopb/biopb#684 measured as too many
+            # endpoints. Reads are served from a real backend at any bounds, so
+            # the grid is free to be a whole multiple of the store's.
+            chunk_shape=default_transfer_chunk_shape(
+                self.zarr_array.shape,
+                self.zarr_array.dtype.str,
+                self.dim_labels,
+                native=self.zarr_array.chunks,
+            ),
             dtype=self.zarr_array.dtype.str,
         )
 
     def list_tensor_descriptors(self):
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]

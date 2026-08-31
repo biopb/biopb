@@ -22,7 +22,7 @@ A **curated, reusable workflow** — "measure labeled objects in physical units"
 "score a segmentation against ground truth" — as one markdown file with YAML
 frontmatter, authored through a git workflow, shipped inside the package
 (`mcp/_skills_data/*.md`), and consumed at runtime through a discovery **tool**
-(`find_skills`) and a **resource** (`skill://<id>`). The user's own directory
+(`list_skills`) and a **resource** (`skill://<id>`). The user's own directory
 (§2d) merges in beside it.
 
 ```markdown
@@ -78,7 +78,7 @@ and then be invisible to the agent.
 
 `mcp/_skills.py`, wired into `_server.py`.
 
-### 2a. `find_skills` — a tool, not a resource
+### 2a. `list_skills` — a tool, not a resource
 
 A tool, so it can take a query and return a tailored subset — mirroring how
 `query_sources` is preferred over `list_sources`. It returns metadata dicts, each
@@ -97,7 +97,7 @@ which is why the docstring steers the agent to a few content words.
 ### 2b. `skill://{skill_id}` — a resource template
 
 A template, so it does not appear in `resources/list` (templates list
-separately) — but `find_skills` hands the agent exact URIs, so retrieval works.
+separately) — but `list_skills` hands the agent exact URIs, so retrieval works.
 The read handler strips frontmatter and returns the body.
 
 ### 2c. Loading and config
@@ -106,7 +106,7 @@ The read handler strips frontmatter and returns the body.
 no cache: they are a handful of small local files, and re-reading is what makes a
 local edit live immediately. Loading is **fail-open per file** — unreadable or
 malformed is skipped and debug-logged, never fatal, and one bad skill must never
-sink `find_skills`. A leading `_` marks a file private, as in the kernel-plugin
+sink `list_skills`. A leading `_` marks a file private, as in the kernel-plugin
 loader.
 
 Which files in a skills directory *are* skills — the `_` marker and the prose
@@ -123,7 +123,7 @@ and they drifted apart the one time each kept its own copy.
 ```
 
 `skills_enabled` is the switch for the *whole* subsystem: false means no scan, an
-empty `find_skills`, and no skills directive in the handshake. It governs the
+empty `list_skills`, and no skills directive in the handshake. It governs the
 local tier too — a user who turns skills off is turning the feature off, not one
 source of it.
 
@@ -133,7 +133,7 @@ source of it.
 catalog beside the shipped entries, with local winning a shared id — a user
 editing their own copy of a shipped skill expects theirs. Same reader, same
 fail-open, body read fresh from disk at retrieval time; `updated` comes from the
-file mtime. Every entry carries `origin` (`local`/`catalog`) and `find_skills`
+file mtime. Every entry carries `origin` (`local`/`catalog`) and `list_skills`
 returns it, so the agent can tell a personal draft from a reviewed one rather
 than presenting both as curated.
 
@@ -146,7 +146,7 @@ a lab wanting a shared set distributes the files or vendors them into an interna
 build.
 
 A host's own skill mechanism (Claude Code, opencode, Claude Desktop) does not
-cover this: it splits discovery (host skills never reach `find_skills`), it
+cover this: it splits discovery (host skills never reach `list_skills`), it
 cannot read biopb's `checklist:`, and it is host-specific — whereas one
 biopb-owned local tier is a single authoring format, identical to a shipped
 `.md`, portable across all three hosts, and exactly the PR payload.
@@ -172,7 +172,7 @@ for a `pkg:` token, tries the import.
 | `plugin:<name>` | `## Kernel plugins` — the file stem (`plugin:rolling_ball` ↔ `rolling_ball.py`) or an entry-point name, reported apart |
 | `pkg:<name>[>=v\|~=v]` | `## Versions` for `pkg:biopb-mcp`, otherwise `execute_code`, in two halves: **present?** is a real `import <name>` and its real ImportError, with none of the dev-build guesswork a version comparator has to hard-code; **which version?** is `importlib.metadata.version("<name>")`, never the module's `__version__` attribute. A third-party token is bounded above as well as below, so an installed version *newer* than the range is unmet too |
 
-**It informs, it never gates.** Nothing filters a skill out of `find_skills`, and
+**It informs, it never gates.** Nothing filters a skill out of `list_skills`, and
 no return value invites `if not ok: bail`. Most of these tokens were never hard
 requirements: `viewer` and `tensor` are usually two routes to the same pixels,
 `dask` names a scheduler rather than a capability, and even a `pkg:` token
@@ -185,7 +185,7 @@ one".
 So the agent checks these against the session before starting, reports what is
 missing, and adapts. Every fix — installing a package, seeding a plugin,
 restarting the kernel — needs the user's consent, so its job is to name the gap
-and ask; the guidance lives in the `find_skills` docstring and `guide://kernel`,
+and ask; the guidance lives in the `list_skills` docstring and `guide://kernel`,
 at the two moments it is needed. A body that has a particular fallback in mind
 should name it: the agent will improvise one otherwise, and the author's is
 usually better than the invented one. That is authoring advice, not a schema
@@ -330,7 +330,7 @@ numeric verifier tests the interaction for free.
 | Layer | Question | Where it lives | Gates a merge? |
 |---|---|---|---|
 | **Structure** (§7) | Is the file well-formed, and does it obey the authoring rules? | `test_schema.py`, `test_validate.py`, `test_shipped_skills.py`, `test_packaging.py` | yes, in `mcp-ci` |
-| **Retrieval** (§8) | Does `find_skills` surface it for the right request? | `test_retrieval.py` | yes, in `mcp-ci` |
+| **Retrieval** (§8) | Does `list_skills` surface it for the right request? | `test_retrieval.py` | yes, in `mcp-ci` |
 | **Contract** (§9) | Can its packages be installed here, are they available everywhere, do they import, and does the API it quotes still exist? | `test_satisfiability.py`, `test_availability.py`, `test_contracts.py` | yes — damage per matrix cell and availability in one job, both in `mcp-ci`; the rest in `skill-contracts.yaml` |
 | **Interaction** (§10) | Does a model following it produce the right numbers? | `_tests/bench/` | **no** — a benchmark; and the case *data* under it does gate |
 
@@ -372,7 +372,7 @@ Ordinary hermetic unit tests over `mcp/_skills_data/*.md`.
 
 ## 8. Retrieval
 
-A skill nobody retrieves is not wrong, it is absent. `find_skills` filters, it
+A skill nobody retrieves is not wrong, it is absent. `list_skills` filters, it
 does not rank, so this splits in two — both hermetic.
 
 **Matcher semantics**, against synthetic catalogs. What `query` means is a
@@ -604,13 +604,13 @@ respondent, and is the default.
 The run happens against a real shim-spawned session child: a real IPython kernel,
 a real napari viewer, real dask, and the nine real tools reached over real MCP
 with their own schemas and the server's own `instructions`. The body arrives
-through the real `mcp/_skills.py` — `find_skills` and `skill://<id>`, the same
+through the real `mcp/_skills.py` — `list_skills` and `skill://<id>`, the same
 calls the runtime makes — so editing or deleting a skill changes what a run is
 scored against.
 
 The agent reaches `skill://<id>` through a **client-supplied** verb
 (`_session.CLIENT_TOOLS`), because a resource is not a tool and the
-chat-completions wire carries only tools. Without it `find_skills` returns a uri
+chat-completions wire carries only tools. Without it `list_skills` returns a uri
 nothing can dereference, and a skills-on run works from catalog metadata while
 appearing to have the procedure. `test_session_smoke.py` asserts the body arrives
 through `call` and not only through the harness's own accessor. The ablation is
@@ -695,7 +695,7 @@ worth of the fact with no conversation on either side.
 Withholding is `services.skills_enabled: false` — a real shipped configuration,
 so the kernel, napari, dask and every library stay as they are and only the
 curated procedure goes. That the switch took effect is checked on what the
-catalog *returns*, not on whether `find_skills` was called: the tool stays
+catalog *returns*, not on whether `list_skills` was called: the tool stays
 registered either way and `load_catalog()` is what gates.
 
 **One invocation is one configuration**, so no single report contains a delta:

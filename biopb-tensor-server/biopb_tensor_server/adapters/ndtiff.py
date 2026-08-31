@@ -30,8 +30,14 @@ from biopb_tensor_server.adapters._handle_reaper import (
     IdleHandleReaper,
 )
 from biopb_tensor_server.adapters._scale import mm_summary_scale
-from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -56,7 +62,13 @@ if TYPE_CHECKING:
 # than pinning for the catalog's whole lifetime. The next read after a lull pays
 # one reopen. The TTL is set from ``ServerConfig.handle_reaper_ttl`` at startup;
 # see :mod:`biopb_tensor_server.adapters._handle_reaper`.
-_dataset_reaper = IdleHandleReaper(DEFAULT_HANDLE_REAPER_TTL, "ndtiff-dataset-reaper")
+# The reopen unit is the whole acquisition, so the TTL is the long default --
+# but so is the *pin*: NDTiffDataset eagerly opens every NDTiffStack_*.tif, so
+# one warm handle here can hold thousands of file descriptors where every other
+# pool holds one. That asymmetry, not the reopen cost, sets the cap.
+_dataset_reaper = IdleHandleReaper(
+    DEFAULT_HANDLE_REAPER_TTL, "ndtiff-dataset-reaper", max_handles=4
+)
 
 
 # =============================================================================
@@ -363,12 +375,18 @@ class NdTiffAdapter(TensorAdapter):
         self._shape = list(self._dask_arr.shape)
         self._dtype = str(self._dask_arr.dtype)
 
-        # Chunk shape: one 2D plane per chunk (1, 1, 1, 1, Y, X) or subset
-        # This matches ndtiff's tile-based storage
+        # One 2D plane matches ndtiff's tile-based storage; it seeds the
+        # transfer grid rather than being it (biopb/biopb#809), so a small plane
+        # ships several planes per chunk instead of one endpoint each.
         spatial_shape = self._shape[-2:]  # Y, X
         n_spatial = len(spatial_shape)
         n_non_spatial = len(self._shape) - n_spatial
-        self._chunk_shape = [1] * n_non_spatial + spatial_shape
+        self._chunk_shape = default_transfer_chunk_shape(
+            self._shape,
+            self._dtype,
+            self.dim_labels,
+            native=[1] * n_non_spatial + spatial_shape,
+        )
 
         # Only a reopen-capable adapter is worth reaping -- one handed a bare
         # dataset it cannot rebuild must keep it. Registering also lazily starts
@@ -388,7 +406,16 @@ class NdTiffAdapter(TensorAdapter):
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors - single tensor source."""
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
+
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """One plane -- the ``native=`` seed above, and the dask block behind it.
+
+        A read slices the dask array, which materialises whole blocks whatever
+        window is asked for.
+        """
+        return tuple([1] * (len(self._shape) - 2) + list(self._shape[-2:]))
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from the dask array.

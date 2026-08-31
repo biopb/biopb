@@ -18,8 +18,14 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.adapter_base import TensorAdapter
-from biopb_tensor_server.core.chunk import content_version_from_path
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    catalog_entry,
+)
+from biopb_tensor_server.core.chunk import (
+    content_version_from_path,
+    default_transfer_chunk_shape,
+)
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
@@ -142,6 +148,15 @@ class Hdf5Adapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "hdf5"
 
+    @property
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """The dataset's HDF5 chunk, or ``None`` where it is contiguous.
+
+        ``None`` is the right answer for a contiguous dataset rather than a
+        missing one: any hyperslab of it is read directly.
+        """
+        return self._chunks
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from HDF5 dataset.
 
@@ -168,12 +183,14 @@ class Hdf5Adapter(TensorAdapter):
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self._shape),
-            chunk_shape=list(self._chunks or self._shape),
+            chunk_shape=default_transfer_chunk_shape(
+                self._shape, self._dtype.str, self.dim_labels, native=self._chunks
+            ),
             dtype=self._dtype.str,
         )
 
     def list_tensor_descriptors(self):
-        return [self.get_tensor_descriptor()]
+        return [catalog_entry(self.get_tensor_descriptor())]
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim voxel size (µm) from the ``element_size_um`` attribute.

@@ -172,9 +172,12 @@ class TestFastPathParity:
         assert descriptors[0].array_id == "noparse/Image:0"
         assert list(descriptors[0].shape) == [1, 2, 1, 32, 32]
         assert list(descriptors[0].dim_labels) == list("TCZYX")
+        # Structural entry: the transfer grid is the scene adapter's to answer
+        # (biopb/biopb#812).
+        assert list(descriptors[0].chunk_shape) == []
         # Cached, and still served from cache without parsing.
-        assert adapter._cached_descriptors is descriptors
-        assert adapter.list_tensor_descriptors() is descriptors
+        assert adapter._cached_descriptors == adapter._scene_descriptors()
+        assert adapter.list_tensor_descriptors() == descriptors
 
 
 class TestClaim:
@@ -208,10 +211,14 @@ class TestClaim:
 
 
 class TestPageAlignedChunkShape:
-    """The advertised chunk_shape is the page grid -- one whole plane per chunk,
-    i.e. series.aszarr(chunkmode="page").chunks mapped onto canonical dim_labels
-    (biopb/biopb#8). Recovers the fine read granularity a small OME-TIFF lost when
-    the read path stopped advertising aicsimageio's per-(T,C) grid.
+    """The advertised chunk_shape is *aligned to* the page grid.
+
+    One whole page -- ``series.aszarr(chunkmode="page").chunks`` mapped onto
+    canonical dim_labels (biopb/biopb#8) -- is the read path's native unit, so
+    the transfer grid is a whole multiple of it and never straddles a page. It
+    is not equal to it: chunk_shape is the transfer grid (biopb/biopb#809), and
+    a small OME-TIFF's page is far below the transfer target, so several pages
+    ship together rather than one endpoint each.
     """
 
     def _za_page_chunks_canonical(self, path, dim_labels):
@@ -224,14 +231,19 @@ class TestPageAlignedChunkShape:
             by_axis = {ax: int(c) for ax, c in zip(str(s.axes), za.chunks, strict=True)}
         return [by_axis.get(d, 1) for d in dim_labels]
 
-    def test_chunk_shape_is_page_grid(self, tmp_path):
+    def test_chunk_shape_is_aligned_to_the_page_grid(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
-        desc = OmeTiffAdapter(path, "pg").list_tensor_descriptors()[0]
-        # 1 on every non-spatial axis, full Y/X -- one plane per chunk.
-        assert list(desc.chunk_shape) == [1, 1, 1, 64, 64]
-        # And that grid IS za.chunks(page) mapped to canonical order.
-        assert list(desc.chunk_shape) == self._za_page_chunks_canonical(
-            path, list(desc.dim_labels)
+        source = OmeTiffAdapter(path, "pg")
+        scene_id = source.list_tensor_descriptors()[0].array_id
+        desc = source.get_tensor_adapter(scene_id).get_tensor_descriptor()
+        page = self._za_page_chunks_canonical(path, list(desc.dim_labels))
+        grid = list(desc.chunk_shape)
+        # Full Y/X -- a page is never cut -- and a whole multiple of the page
+        # grid on every other axis.
+        assert grid[-2:] == [64, 64]
+        assert all(
+            g % pc == 0 and g <= dim
+            for g, pc, dim in zip(grid, page, desc.shape, strict=True)
         )
 
     def test_page_grid_ignores_internal_tiling(self, tmp_path):
@@ -244,9 +256,13 @@ class TestPageAlignedChunkShape:
             metadata={"axes": "CYX"},
             tile=(32, 32),
         )
-        desc = OmeTiffAdapter(str(p), "tl").list_tensor_descriptors()[0]
-        # Whole plane per chunk despite the 32x32 internal tiling (chunkmode="page").
-        assert list(desc.chunk_shape) == [1, 1, 1, 128, 128]
+        source = OmeTiffAdapter(str(p), "tl")
+        scene_id = source.list_tensor_descriptors()[0].array_id
+        desc = source.get_tensor_adapter(scene_id).get_tensor_descriptor()
+        # Whole planes despite the 32x32 internal tiling (chunkmode="page"): the
+        # grid is built from pages, so Y/X stay whole and never fall back to the
+        # tile size.
+        assert list(desc.chunk_shape)[-2:] == [128, 128]
 
 
 class TestOpenStoreFdHygiene:
@@ -797,6 +813,27 @@ class TestReadPathTifffileAuthoritative:
         scale, unit = scene._physical_scale()
         assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]  # TCZYX
         assert unit == ["", "", "µm", "µm", "µm"]
+
+    def test_plan_caches_physical_scale(self, tmp_path, monkeypatch):
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+        from biopb_tensor_server.core.config import PyramidConfig
+
+        path = self._write_ome_tiff_with_physical_sizes(
+            str(tmp_path / "cached-phys.ome.tif"), psx=0.5, psy=0.5, psz=1.0
+        )
+        _, scene = self._scene(path, "cached-phys")
+        calls = 0
+        original = scene._physical_scale_from_ome_xml
+
+        def counting():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(scene, "_physical_scale_from_ome_xml", counting)
+        scene.plan_flight_info(TensorReadOption(), PyramidConfig())
+        scene.plan_flight_info(TensorReadOption(), PyramidConfig())
+        assert calls == 1
 
     def test_physical_scale_missing_unit_defaults_to_micron(self, tmp_path):
         # tifffile always stamps a unit, so inject an OME-XML that omits it to lock

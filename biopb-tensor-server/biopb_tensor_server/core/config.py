@@ -74,11 +74,6 @@ from dataclasses import MISSING as _DC_MISSING, dataclass, field, fields, replac
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-# The constraint primitives and the shared pyramid-knob bounds live in the core
-# biopb package so biopb-mcp (which cannot depend on this server package -- not
-# on PyPI) validates the same pyramid rows against the same rules, with no drift
-# (biopb/biopb#34, #182). `_Range`/`_Enum` stay as local aliases so the
-# `_CONSTRAINTS` table and config_schema keep their existing spelling.
 from biopb._config_constraints import (
     PYRAMID_CONSTRAINTS,
     Enum as _Enum,
@@ -108,6 +103,12 @@ from biopb._locations import (
     find_config as find_config,
 )
 
+# The constraint primitives and the shared pyramid-knob bounds live in the core
+# biopb package so biopb-mcp (which cannot depend on this server package -- not
+# on PyPI) validates the same pyramid rows against the same rules, with no drift
+# (biopb/biopb#34, #182). `_Range`/`_Enum` stay as local aliases so the
+# `_CONSTRAINTS` table and config_schema keep their existing spelling.
+from biopb_tensor_server.core.chunk import PRECACHE_WARM_BUDGET_BYTES
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     ClaimContext,
@@ -219,13 +220,21 @@ _CONSTRAINTS = {
         "file_max_total_bytes": _Range(min=1),
     },
     "PyramidConfig": {
-        # reduction_method is server-local (on-the-fly reduction is a compute
-        # concern, not a biopb-mcp knob); the numeric rows are shared.
+        # reduction_method and plane_max_pixels are server-local: on-the-fly
+        # reduction is a compute concern, and biopb-mcp has no 2-D plane cap
+        # (its fallback plan scales X/Y/Z against one voxel budget). The rows
+        # both packages do share come from PYRAMID_CONSTRAINTS.
         "reduction_method": _Enum(_REDUCTION_METHODS, case_insensitive=True),
+        # <= 0 never satisfies the Phase 1 stop condition, so the ladder runs to
+        # the per-axis floor and the knob silently stops meaning what it says.
+        "plane_max_pixels": _Range(min=1),
         **PYRAMID_CONSTRAINTS,
     },
     "PrecacheConfig": {
         "idle_debounce_seconds": _Range(min=0),
+        # <= 0 would narrow every selection axis to a single index regardless of
+        # size, which is a different policy wearing a budget's name.
+        "warm_budget_bytes": _Range(min=1),
         "backlog_high_water": _Range(min=0.0, max=1.0),
         "backlog_idle_recheck_seconds": _Range(min=0),
     },
@@ -354,6 +363,9 @@ class SourceConfig:
             "hdf5",
             "ome-tiff",
             "ome-tiff-multifile",
+            "tiff",
+            "lsm",
+            "czi",
             "ome-zarr",
             "ome-zarr-hcs",
             "aics",
@@ -509,6 +521,17 @@ class CacheConfig:
         default=4 * 1024 * 1024 * 1024,  # 4 GB total
         metadata={"help": "Maximum total size of the on-disk chunk cache (GB)."},
     )
+    file_deferred_write_mb: int = field(
+        default=0,
+        metadata={
+            "help": "EXPERIMENTAL. Bytes, in MiB, of cached chunks that may be "
+            "committed from memory and written to disk in the background, so a "
+            "cold read stops waiting for its own cache write. 0 (the default) "
+            "writes on the reading thread. Reaching the budget is not an error "
+            "and never blocks: that write goes back on the caller's thread. "
+            "Uploads are never deferred -- for them the cache is the only copy."
+        },
+    )
 
     def __post_init__(self):
         if isinstance(self.file_cache_dir, str):
@@ -532,10 +555,11 @@ class PyramidConfig:
     """
 
     reduction_method: str = field(
-        default="area",
+        default="nearest",
         metadata={
-            "help": "Downsampling method for computed levels ('area' = averaging). "
-            "Native on-disk levels are served precomputed regardless."
+            "help": "Downsampling method for computed levels ('nearest' = strided "
+            "pick, 'area' = averaging). Native on-disk levels are served "
+            "precomputed regardless."
         },
     )
     threshold: int = field(
@@ -543,14 +567,24 @@ class PyramidConfig:
         metadata={"help": "Maximum X/Y extent (pixels) of the coarsest level."},
     )
     downscale_factor: int = field(
-        default=4,
+        default=2,
         metadata={"help": "Per-level linear downsampling step, per spatial axis."},
     )
     pixel_budget_cubic_root: int = field(
-        default=512,
+        default=448,
         metadata={
             "help": "Cube root of the coarsest level's voxel budget "
             "(Lx*Ly*Lz <= this**3); bounds a whole-volume 3-D read."
+        },
+    )
+    plane_max_pixels: int = field(
+        default=4_000_000,
+        metadata={
+            "help": "Max X*Y pixels of the coarsest 2-D level. Also the gate on "
+            "whether a tensor gets 2-D levels at all: below it the plane is "
+            "already cheap to read whole. Values below "
+            "min(pixel_budget_cubic_root, threshold)**2 are unreachable -- the "
+            "rungs stop at that per-axis floor first."
         },
     )
 
@@ -570,11 +604,19 @@ class PrecacheConfig:
     JSON Schema).
     """
 
+    # On by default again (biopb/biopb#826 turned it off). What made warming
+    # unaffordable was an unbounded warm set: every level of the ladder, over the
+    # whole T/C/Z cross-product, so nothing it warmed survived eviction on the
+    # shipped 4 GiB cache. The plan is now at most two levels
+    # (compute_warm_targets) and each is capped at warm_budget_bytes over a
+    # window from index 0 (compute_warm_selection), which is what makes residency
+    # reachable rather than aspirational.
     enabled: bool = field(
         default=True,
         metadata={
             "help": "Run the background pre-cache worker to warm new sources "
-            "(no-op on the memory backend)."
+            "(no-op on the memory backend). Warms at most two levels per tensor, "
+            "each bounded by warm_budget_bytes."
         },
     )
     idle_debounce_seconds: float = field(
@@ -582,6 +624,19 @@ class PrecacheConfig:
         metadata={
             "help": "Quiet period after live traffic before the worker resumes "
             "(seconds)."
+        },
+    )
+    warm_budget_bytes: int = field(
+        default=PRECACHE_WARM_BUDGET_BYTES,
+        metadata={
+            "help": "Per warm level, the cap on the selection cross-product "
+            "(T/Z/C). Over it, those axes are narrowed to a window from index 0, "
+            "where a viewer opens. A budget on what is REQUESTED, not on disk: "
+            "the cache stores whole chunks, so a window that ends mid-chunk "
+            "still writes that chunk entire and the footprint rounds up. Does "
+            "not bound the plane or the 3-D volume themselves -- "
+            "pyramid.plane_max_pixels and pyramid.pixel_budget_cubic_root do "
+            "that."
         },
     )
     # Startup-backlog (existing sources) knobs.
@@ -695,10 +750,13 @@ class ServerConfig:
     handle_reaper_ttl: float = field(
         default=150.0,
         metadata={
-            "help": "Seconds an idle persistent file handle (OME-TIFF store, "
-            "NDTiff acquisition) is kept warm before it is closed; the next read "
-            "reopens it (0 disables reaping). Adapters that reopen per read "
-            "(hdf5, mrc, ...) are unaffected."
+            "help": "Ceiling, in seconds, on how long an idle persistent file "
+            "handle (OME-TIFF store, NDTiff acquisition, CZI or ND2 reader) is "
+            "kept warm before it is closed; the next read reopens it (0 disables "
+            "reaping). A ceiling, not an assignment: each format keeps its own "
+            "shorter value where reopening it is cheap, so raising this never "
+            "lengthens a pin. Adapters that reopen per read (hdf5, mrc, ...) are "
+            "unaffected."
         },
     )
     stability_window: float = field(
@@ -1238,6 +1296,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         ("threshold", int),
         ("downscale_factor", int),
         ("pixel_budget_cubic_root", int),
+        ("plane_max_pixels", int),
     ):
         if _knob in pyramid_data:
             pyramid_kwargs[_knob] = _cast(pyramid_data[_knob])
@@ -1249,6 +1308,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     precache_kwargs: Dict[str, Any] = {}
     _carry(precache_kwargs, "enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "idle_debounce_seconds", precache_data, cast=float)
+    _carry(precache_kwargs, "warm_budget_bytes", precache_data, cast=int)
     _carry(precache_kwargs, "backlog_enabled", precache_data, cast=bool)
     _carry(precache_kwargs, "backlog_high_water", precache_data, cast=float)
     _carry(precache_kwargs, "backlog_idle_recheck_seconds", precache_data, cast=float)

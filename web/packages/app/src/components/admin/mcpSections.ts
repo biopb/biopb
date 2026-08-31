@@ -113,6 +113,14 @@ export const MCP_NAV: McpNavItem[] = [
     section: "observe",
   },
   {
+    id: "chat",
+    label: "Chat",
+    description:
+      "Which model the built-in chat pane talks to. The on/off switch is on the Observe page (chat_enabled); the provider key is not here, by design — this file is served to the browser, so the key lives in an owner-only credential file.",
+    kind: "fields",
+    section: "chat",
+  },
+  {
     id: "update",
     label: "Updates",
     description: "The kernel-start auto-updater that offers to re-run the installer on a newer release.",

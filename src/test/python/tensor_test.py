@@ -317,35 +317,6 @@ class TestQuerySourcesFormat:
             client.query_sources("SELECT 1", format="polars")
 
 
-class TestDescriptorKey:
-    """_descriptor_key normalization (server-free, issue #45).
-
-    The descriptor cache key must be source-unique and must collapse the bare
-    and source-qualified array_id forms (which different RPCs emit) for the same
-    tensor onto a single key.
-    """
-
-    def test_bare_and_qualified_forms_collapse_to_one_key(self):
-        # An old data endpoint returns "src/Image:0"; list_sources returns the
-        # bare "Image:0". Both are the same tensor -> one key.
-        assert TensorFlightClient._descriptor_key(
-            "src", "Image:0"
-        ) == TensorFlightClient._descriptor_key("src", "src/Image:0")
-
-    def test_same_bare_id_different_sources_do_not_collide(self):
-        # Two aicsimageio files both name their tensor "Image:0"; keys must differ.
-        assert TensorFlightClient._descriptor_key(
-            "aics_aaa", "Image:0"
-        ) != TensorFlightClient._descriptor_key("aics_bbb", "Image:0")
-
-    def test_only_own_source_prefix_is_stripped(self):
-        # A leading prefix that isn't this source's id is left intact.
-        assert TensorFlightClient._descriptor_key("src", "other/Image:0") == (
-            "src",
-            "other/Image:0",
-        )
-
-
 class TestGetPhysicalScale:
     """get_physical_scale reads the descriptor summary (server-free).
 
@@ -389,7 +360,7 @@ class TestGetPhysicalScale:
         desc, _ = self._desc(
             "t1", [2.0, 0.325, 0.325], ["micrometer", "micrometer", "micrometer"]
         )
-        client._descriptors[client._descriptor_key("src", "t1")] = desc
+        client._descriptors["src/t1"] = desc
 
         # Addressed by the qualified array_id; cache hit -> no fetch.
         scale, unit = client.get_physical_scale("src/t1")
@@ -401,7 +372,7 @@ class TestGetPhysicalScale:
         # Old server / no physical sizes -> empty repeated field -> None.
         client = self._client()
         desc, _ = self._desc("t1")  # no physical_scale set
-        client._descriptors[client._descriptor_key("src", "t1")] = desc
+        client._descriptors["src/t1"] = desc
 
         assert client.get_physical_scale("src/t1") is None
 
@@ -420,7 +391,7 @@ class TestGetPhysicalScale:
         # physical scale is a compact probe: it fetches the structural descriptor
         # only, never the opt-in OME tree (so it needs no metadata catalog).
         client._catalog._fetch_tensor_descriptor.assert_called_once_with(
-            "src", None, with_metadata=False
+            "src", with_metadata=False
         )
 
     def test_fetch_error_propagates(self):
@@ -495,6 +466,101 @@ class TestGetDescriptorFieldMasks:
         client.get_descriptor("src/A2", with_metadata=True)
         read_opt = self._sent_read_opt(state)
         assert read_opt.with_metadata is True
+
+
+class TestDescriptorCacheStaysStructural:
+    """The descriptor cache holds addressing facts only (biopb/biopb#795).
+
+    Masked-off parts must never be stored: an entry that carried them would be
+    indistinguishable from one cached before anyone asked, and ``metadata_json``
+    is the full OME tree in a dict with no eviction and session lifetime.
+    """
+
+    @staticmethod
+    def _client(response: TensorDescriptor):
+        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+        client = TensorFlightClient.__new__(TensorFlightClient)
+        state = _ClientState(
+            client=Mock(), call_options=None, location="", token=None, cache_bytes=0
+        )
+        info = Mock()
+        info.descriptor.command = response.SerializeToString()
+        state.client.get_flight_info.return_value = info
+        client._state = state
+        client._catalog = CatalogClient(state)
+        client._fetcher = ChunkFetcher(state, client._catalog)
+        return client
+
+    @staticmethod
+    def _fat_descriptor():
+        from biopb.tensor.descriptor_pb2 import PyramidLevel
+
+        desc = TensorDescriptor(
+            array_id="src/A2",
+            dim_labels=["z", "y", "x"],
+            shape=[8, 64, 64],
+            chunk_shape=[1, 64, 64],
+            dtype="uint16",
+            metadata_json='{"metadata": {"big": "' + "x" * 4096 + '"}}',
+        )
+        desc.physical_scale[:] = [2.0, 0.325, 0.325]
+        desc.physical_unit[:] = ["micrometer"] * 3
+        desc.pyramid.append(PyramidLevel(scale_hint=[1, 1, 1], reduction_method="area"))
+        desc.pyramid.append(PyramidLevel(scale_hint=[1, 4, 4], reduction_method="area"))
+        return desc
+
+    def test_caller_gets_the_fields_it_asked_for(self):
+        client = self._client(self._fat_descriptor())
+
+        returned = client.get_descriptor("src/A2", with_metadata=True)
+
+        assert returned.metadata_json  # the mask is honoured on the return value
+        assert len(returned.pyramid) == 2
+
+    def test_heavy_fields_never_enter_the_cache(self):
+        client = self._client(self._fat_descriptor())
+
+        client.get_descriptor("src/A2", with_metadata=True)
+
+        cached = client._descriptors["src/A2"]
+        assert cached.metadata_json == ""
+        assert list(cached.pyramid) == []
+
+    def test_the_transfer_grid_never_enters_the_cache(self):
+        # The server answers a grid only on GetFlightInfo, for the tensor it
+        # bound; a list_flights entry carries none (biopb/biopb#812). Caching it
+        # would leave entries in two grades, and an empty one must never read as
+        # a usable grid -- so the cache keeps none and the caller describes.
+        client = self._client(self._fat_descriptor())
+
+        returned = client.get_descriptor("src/A2")
+
+        assert list(returned.chunk_shape) == [1, 64, 64]  # honoured on the return
+        assert list(client._descriptors["src/A2"].chunk_shape) == []
+
+    def test_addressing_facts_do_enter_the_cache(self):
+        # Stripping must not take the fields the cache exists to serve --
+        # get_physical_scale reads its answer straight out of this entry.
+        client = self._client(self._fat_descriptor())
+
+        client.get_descriptor("src/A2")
+
+        cached = client._descriptors["src/A2"]
+        assert list(cached.shape) == [8, 64, 64]
+        assert cached.dtype == "uint16"
+        assert list(cached.physical_scale) == [2.0, 0.325, 0.325]
+
+    def test_masked_fetch_does_not_poison_a_later_full_fetch(self):
+        # The regression #795 asks for: a pyramid-less fetch first, then a
+        # default one. Every get_descriptor round-trips, so the second caller
+        # sees the pyramid regardless of what the first one cached.
+        client = self._client(self._fat_descriptor())
+
+        client.get_descriptor("src/A2", with_pyramid=False)
+        second = client.get_descriptor("src/A2")
+
+        assert len(second.pyramid) == 2
 
 
 if __name__ == "__main__":

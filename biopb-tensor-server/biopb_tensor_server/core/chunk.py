@@ -11,15 +11,15 @@ import logging
 import os
 import struct
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.axes import labeled_axis_index
+from biopb_tensor_server.core.axes import labeled_axis_index, samples_axis
 from biopb_tensor_server.core.downsample import (
-    DEFAULT_REDUCTION_METHOD,
+    CHUNK_ID_IMPLICIT_REDUCTION_METHOD,
     ceil_div,
     normalize_reduction_method,
 )
@@ -46,24 +46,34 @@ logger = logging.getLogger(__name__)
 # - 8*ndim bytes: bounds.start (int64, big-endian)
 # - 8*ndim bytes: bounds.stop (int64, big-endian)
 # - [scaled only] 8*ndim bytes: scale_hint (int64)
-# - [scaled + non-default method only] 1 byte: reduction_method code
+# - [scaled only] 1 byte: reduction_method code
 #
-# The chunk_id is IDENTITY (array_id + bounds + scale_hint [+ method]). #178 had
+# The chunk_id is IDENTITY (array_id + bounds + scale_hint + method). #178 had
 # dropped reduction_method from the wire -- it was advisory and the compute path
 # hard-coded the default, which silently served a client's requested method with
-# the wrong one (biopb/biopb#578). It is back, but compact and default-free: the
-# computed downsample space is binary ("nearest" | "area", area = the default),
-# so a non-default method appends ONE code byte and "area"/default appends
-# nothing. So an area (default) scaled chunk_id -- and its cache key -- stays
-# byte-identical to the pre-#178 form (its cache entries survive), and only a
-# genuinely-distinct "nearest" read gets a longer id and its own entry. A
-# method-free scaled chunk_id (old server / old cache) decodes to the default,
-# exactly as before. This reverses the #76 cache-sharing (nearest and area no
-# longer collide) -- the deliberate cost of serving the method the client asked
-# for.
-# A cold downsample uses the server default; see core.adapter_base.resolve_chunk_data.
-# (An older chunk_id that still carries a method suffix stays readable: decode /
-# is_scaled / cache_key all ignore the trailing bytes, so no cache wipe is needed.)
+# the wrong one (biopb/biopb#578). It is back, and every computed method carries
+# its own code byte: the id says which method it is, never which one it is not.
+#
+# That is the property worth protecting. Spelling one method by the ABSENCE of a
+# byte ties the wire format -- and, since these bytes are the cache key, every
+# entry already written -- to whichever method happens to be the request default.
+# Moving that default then re-reads ids that are already on disk (same key,
+# different pixels) and makes the old default unreachable, because an explicit
+# request for it encodes byte-free and decodes back as the new one. Both were
+# observed when the default moved to "nearest"; a mandatory byte is what makes
+# the two questions independent.
+#
+# The price, taken deliberately: a scaled AREA id is no longer byte-identical to
+# the pre-#578 method-free form, so area entries warmed under the old encoding
+# are orphaned -- unreachable, reclaimed by ordinary segment LRU, no cache
+# format-version bump and no wipe. Reads of them are correct, just cold. This
+# also reverses the #76 cache-sharing (nearest and area no longer collide), which
+# is the cost of serving the method the client asked for.
+#
+# A byte-free scaled chunk_id (old server, old cache, or a proxy forwarding from
+# an older upstream) stays readable and decodes to area -- see
+# CHUNK_ID_IMPLICIT_REDUCTION_METHOD. Current scaled ids carry an explicit method,
+# and cold compute uses that decoded method in core.adapter_base.resolve_chunk_data.
 #
 # content_version wrapper (biopb/biopb#178)
 # -----------------------------------------
@@ -272,36 +282,60 @@ def get_bounds_from_chunk_id(chunk_id: bytes) -> ChunkBounds:
     return bounds
 
 
-# Compact reduction_method suffix on a scaled chunk_id (biopb/biopb#578). Only a
-# NON-default method is carried, as a single code byte, so an "area"/default
-# scaled chunk_id stays byte-identical to the method-free #178 form. The computed
-# downsample space is binary ("nearest" | "area"), so one code covers it; the
-# reverse map decodes it, and an absent byte means the default.
-_SCALED_METHOD_BYTE = {"nearest": b"\x01"}
-_SCALED_METHOD_BY_BYTE = {1: "nearest"}
+# Compact reduction_method suffix on a scaled chunk_id (biopb/biopb#578). EVERY
+# computed method carries its own code byte -- there is no omitted method -- so
+# the chunk_id says what it is rather than what it is not, and neither the wire
+# nor the cache key depends on which method happens to be the request default.
+#
+# "area" is deliberately code 2 rather than a renumbering: an older server that
+# knows only code 1 resolves an unknown code through its own absent-byte
+# fallback, which is "area", so a mandatory-area id read by an old peer still
+# lands on area.
+#
+# Only the COMPUTED methods are coded. "precompute" is not one: get_read_plan
+# intercepts it and re-plans against the native level's own store, an unscaled
+# read identified by its array_id (source_id/{level}), so it never reaches this
+# encoder. Reaching it anyway is a routing bug and raises -- falling back to a
+# byte-free id would mint something indistinguishable from a pre-#578 chunk_id
+# and serve it as area.
+_SCALED_METHOD_BYTE = {"nearest": b"\x01", "area": b"\x02"}
+_SCALED_METHOD_BY_BYTE = {1: "nearest", 2: "area"}
 
 
 def encode_chunk_id_with_scale(
     array_id: str,
     bounds: ChunkBounds,
     scale_hint: Tuple[int, ...],
-    reduction_method: str = DEFAULT_REDUCTION_METHOD,
+    reduction_method: str = CHUNK_ID_IMPLICIT_REDUCTION_METHOD,
 ) -> bytes:
     """Encode a scaled chunk_id: bounds encoding + scale_hint [+ method byte].
 
     Format: standard bounds encoding, then 8*ndim bytes scale_hint (int64), then
-    -- only for a NON-default reduction_method -- one method-code byte. The default
-    ("area") appends nothing, so an area scaled chunk_id is byte-identical to the
-    pre-#178 identity form (biopb/biopb#578, #178, #76). The method is normalized
-    (stride->nearest, mean->area), so in practice only "nearest" adds a byte.
+    one method-code byte -- for every computed method, not just a non-default one
+    (biopb/biopb#578, #178, #76). The method is normalized (stride->nearest,
+    mean->area) before it is coded.
+
+    This is what decouples the identifier from the request default: no method is
+    spelled by its absence, so changing which method an unspecified read resolves
+    to cannot re-read an id that is already written. The cost is that area ids
+    minted before this change (byte-free) no longer match the ids minted now, so
+    their cache entries are orphaned -- unreachable, and reclaimed by ordinary
+    segment LRU rather than invalidated.
+
     Detection stays ``len(chunk_id) > bounds_end`` (a scaled chunk always carries
     at least the scale_hint); :func:`decode_reduction_method` reads the byte back.
     """
     base = encode_chunk_id(array_id, bounds)
     scale_payload = struct.pack(f">{len(scale_hint)}q", *scale_hint)
-    method_suffix = _SCALED_METHOD_BYTE.get(
-        normalize_reduction_method(reduction_method), b""
-    )
+    normalized = normalize_reduction_method(reduction_method)
+    try:
+        method_suffix = _SCALED_METHOD_BYTE[normalized]
+    except KeyError:
+        raise ValueError(
+            f"No chunk_id code for reduction_method {normalized!r}: a scaled "
+            "chunk_id can only carry a computed method. 'precompute' is routed "
+            "to its native level by get_read_plan and must not reach here."
+        ) from None
     return base + scale_payload + method_suffix
 
 
@@ -329,30 +363,31 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
 def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     """Canonical cache key for a chunk_id.
 
-    A current chunk_id is identity (array_id + bounds [+ scale_hint [+ method
-    byte]]), so the key equals the inner bytes -- INCLUDING the compact one-byte
-    reduction_method suffix, so a "nearest" read keys distinctly from "area"
-    (biopb/biopb#578). Only a LEGACY trailing method suffix (the pre-#178
+    A current chunk_id is identity (array_id + bounds [+ scale_hint + method
+    byte]), so the key equals the inner bytes -- INCLUDING the compact one-byte
+    reduction_method suffix, so a "nearest" read keys distinctly from an "area"
+    one (biopb/biopb#578). Only a LEGACY trailing method suffix (the pre-#178
     ``uint16 len + bytes`` form, which is more than one byte past the scale) is
-    stripped, so a cache entry warmed under that old format still maps to today's
-    area identity (biopb/biopb#76). Non-scaled chunk_ids are returned unchanged.
+    stripped. Non-scaled chunk_ids are returned unchanged.
 
-    Because an "area"/default scaled chunk_id carries no method byte, its key is
-    byte-identical to the pre-#578 key -- so area entries are NOT invalidated;
-    only genuinely-distinct "nearest" reads get a new key.
+    Since the method byte became mandatory, a scaled area key is no longer
+    byte-identical to the pre-#578 method-free key: those entries are orphaned,
+    not invalidated. Nothing looks them up and nothing rewrites them, so they sit
+    until their segment is chosen by the ordinary size-driven segment LRU. That
+    is a knowingly accepted one-time re-warm, taken instead of a cache
+    format-version bump; the same is true of the legacy suffix form above, which
+    now normalizes to a key this server no longer mints.
 
     The result is an opaque cache key: it is NOT a valid chunk_id and must not
     be fed to :func:`decode_scale_info` or forwarded on the wire.
 
     A content_version (biopb/biopb#178) is kept in the key -- so a version bump
-    yields a distinct key and the stale entry becomes un-lookupable -- while the
-    inner projection stays byte-identical to the pre-#178 key for an area read, so
-    an UNVERSIONED area chunk_id maps to exactly its old cache entry.
+    yields a distinct key and the stale entry becomes un-lookupable.
 
     A proxy envelope is returned as-is: it already frames (route, content_version,
-    inner) with lengths, so it is an injective key, and since the inner now carries
-    the method byte for a non-default scaled read, the envelope key distinguishes
-    methods too -- WITHOUT the proxy ever parsing the opaque inner.
+    inner) with lengths, so it is an injective key, and since the inner carries a
+    method byte on every scaled read, the envelope key distinguishes methods too
+    -- WITHOUT the proxy ever parsing the opaque inner.
     """
     if is_proxy_envelope(chunk_id):
         return chunk_id
@@ -360,7 +395,7 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     ndim, bounds_end = _bounds_end(inner)
     scale_end = bounds_end + ndim * 8
     # Keep array_id+bounds+scale_hint and at most the one-byte method suffix; a
-    # longer trailing run is the legacy uint16 method form, stripped for #76.
+    # longer trailing run is the legacy uint16 method form, stripped (#76).
     base = inner if len(inner) <= scale_end + 1 else inner[:scale_end]
     return wrap_content_version(base, cv) if cv is not None else base
 
@@ -383,21 +418,39 @@ def decode_reduction_method(chunk_id: bytes) -> str:
     """Decode the reduction_method carried by a scaled chunk_id (biopb/biopb#578).
 
     Only the compact one-byte code minted by :func:`encode_chunk_id_with_scale`
-    (exactly one byte past the scale_hint) is honored. A non-scaled chunk_id, a
-    method-free scaled chunk_id (old server / pre-#178 cache), or a legacy
-    ``uint16 len + bytes`` method suffix all decode to the default -- so an old
-    scaled read is served exactly as before (``area``), never rejected.
+    (exactly one byte past the scale_hint) is honored.
+
+    The absent-byte fallback is now purely a compatibility path: this server
+    mints a byte for every computed method, so a byte-free scaled chunk_id can
+    only predate that -- an old cache entry, an id a client is still holding, or
+    one a remote proxy forwarded from an older upstream. Everything minted before
+    the byte became mandatory was area, which is what
+    ``CHUNK_ID_IMPLICIT_REDUCTION_METHOD`` records. A non-scaled chunk_id and a
+    legacy ``uint16 len + bytes`` method suffix resolve the same way, so an old
+    scaled read is served exactly as before, never rejected.
     """
     _, inner = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(inner)
     scale_end = bounds_end + ndim * 8
     if len(inner) == scale_end + 1:
-        return _SCALED_METHOD_BY_BYTE.get(inner[scale_end], DEFAULT_REDUCTION_METHOD)
-    return DEFAULT_REDUCTION_METHOD
+        return _SCALED_METHOD_BY_BYTE.get(
+            inner[scale_end], CHUNK_ID_IMPLICIT_REDUCTION_METHOD
+        )
+    return CHUNK_ID_IMPLICIT_REDUCTION_METHOD
 
 
 # Constants
-# 64MB threshold for chunk splitting - enables parallel Flight transfers
+# Preferred transfer size and hard Arrow batch ceiling (biopb/biopb#684).
+# MAX_ARROW_BATCH_BYTES is a wire fact the server enforces on every grid;
+# PREFERRED_ARROW_BATCH_BYTES is the default sizing target, applied only where an
+# adapter asks for it via default_transfer_chunk_shape and never over a grid the
+# adapter declared itself.
+#
+# There is deliberately no minimum-endpoint floor. Chunk size is the only knob:
+# a tensor that fits in one preferred-size chunk *is* one chunk, and splitting a
+# 512x512 snapshot into four to manufacture parallelism costs round trips to
+# parallelize work that was never the bottleneck.
+PREFERRED_ARROW_BATCH_BYTES = 8 * 1024 * 1024
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 
@@ -514,26 +567,28 @@ def estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
     return num_elements * np.dtype(dtype).itemsize
 
 
-def needs_splitting(chunk_shape: Tuple[int, ...], dtype: str) -> bool:
-    """Check if chunk exceeds Arrow batch limit.
-
-    Args:
-        chunk_shape: Chunk shape
-        dtype: Data type string
-
-    Returns:
-        True if chunk needs splitting
-    """
-    return estimate_chunk_bytes(chunk_shape, dtype) > MAX_ARROW_BATCH_BYTES
-
-
-# Defaults mirroring biopb-mcp's [pyramid] config (build_pyramid_levels). These
-# decide the coarsest pyramid level the client requests on open; the precache
-# worker must warm exactly that scale or its chunk_ids won't match. Keep in sync
-# with biopb-mcp/src/biopb_mcp/_config.py if that is retuned.
+# The policy, and now the only copy of it. These decide the coarsest level the
+# server advertises, which is the level a client opens at and the level the
+# precache worker warms -- one derivation, so the chunk_ids cannot fail to
+# match.
+#
+# They used to mirror biopb-mcp's [pyramid] config, which ran the same loop
+# client-side; "keep the two in sync" was the instruction. That loop is gone --
+# the client reads the advertised pyramid and computes nothing -- so retuning
+# these is a server-side change with no counterpart to update. (biopb-mcp's
+# pyramid.* keys still exist in its schema and admin UI with no consumer left
+# behind them; removing them is a separate, user-facing change.)
 PRECACHE_THRESHOLD = 4096
-PRECACHE_DOWNSCALE_FACTOR = 4
-PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 512
+PRECACHE_DOWNSCALE_FACTOR = 2
+# 448**3 = 90 Mvox. The coarsest level is uploaded whole as one 3-D texture by
+# both renderers, and Viv casts it to float32 -- measured on a Quadro P2000,
+# 90 Mvox holds 50 fps there where 512**3 (134 Mvox) drops to 17.
+# See docs/precache-policy.md 9.1.
+PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 448
+# 2048**2. Caps the 2-D rungs, and is chosen to land on the level deck.gl asks
+# for at fit-to-view in a ~1500-2000px window, so the warmed level is the one
+# the browser actually reads.
+PRECACHE_PLANE_MAX_PIXELS = 4_000_000
 
 
 def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
@@ -556,8 +611,13 @@ def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
     return ndim - 2, ndim - 1
 
 
-def _precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
+def precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
     """Index of the z axis or None, agreeing with biopb-mcp's ``_resolve_axes``.
+
+    Public because the HTTP sidecar resolves the same axis for its volume plan
+    (``http_server._volume_plan``) and the two must not be able to disagree:
+    the depth the sidecar advertises has to be the axis this planner did or did
+    not scale.
 
     Prefers a z-labeled axis (by synonym; absent label => no depth axis, never a
     positional guess -- an unlabeled leading axis may be T/C and must not be
@@ -573,22 +633,70 @@ def _precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
 def compute_pyramid_scale_hints(
     shape: Sequence[int],
     dim_labels=None,
+    **kwargs: int,
+) -> List[List[int]]:
+    """Per-axis scale_hint for each level of a computed pyramid: **at most three**.
+
+    :func:`_pyramid_levels` without its phase provenance, which only the warm
+    planner needs.
+    """
+    return _pyramid_levels(shape, dim_labels, **kwargs)[0]
+
+
+def _pyramid_levels(
+    shape: Sequence[int],
+    dim_labels=None,
     threshold: int = PRECACHE_THRESHOLD,
     downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
     pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
-) -> List[List[int]]:
-    """Per-axis scale_hint for *every* level of a computed pyramid.
+    plane_max_pixels: int = PRECACHE_PLANE_MAX_PIXELS,
+) -> Tuple[List[List[int]], List[bool]]:
+    """``(scales, volumetric)`` -- the pyramid, and which level is the 3-D target.
 
-    A faithful port of biopb-mcp's ``build_pyramid_levels`` loop, emitting the
-    full sequence of levels (not just the coarsest): level 0 is full resolution
-    (all 1s), then X, Y and Z are downsampled individually (all other axes stay
-    at 1), each stopping at ``axis_floor = min(pixel_budget_cubic_root,
-    threshold)``, until the level satisfies ``Lx*Ly*Lz <=
-    pixel_budget_cubic_root**3`` and ``Lx, Ly <= threshold``. ``ceil_div(L, s)``
-    is the server's own ``logical_shape`` (adapter_base.py), so each scale matches the
-    client's level and the warmed chunk_ids line up exactly.
+    ``volumetric[i]`` is True for exactly the level Phase 2 produced, and only
+    when there is a depth axis for a renderer to consume whole. It is answered
+    here because only this function knows which phase emitted which level: a
+    plan of length 2 may be Phase 1's target *or* Phase 2's, and reading it off
+    the shape instead ("has a z axis") flags a 2-D target as volumetric, which
+    exempts its Z from the warm budget and lets one level warm past it.
 
-    A tensor with no z axis is treated as ``Lz = 1`` and never gets a z factor.
+    Everything below documents the levels themselves.
+
+    Full resolution, then the two levels the precache worker warms (see
+    ``docs/precache-policy.md`` §4.1, §5):
+
+    - **the 2-D target**, X and Y only, halved by ``downscale_factor`` until the
+      plane fits ``plane_max_pixels`` (and X/Y fit ``threshold``). Z is left
+      alone: a 2-D view displays one slice, so scaling Z here discards depth
+      resolution to save nothing.
+    - **the 3-D target**, continuing from the 2-D one and scaling X, Y *and* Z
+      until the volume fits ``pixel_budget_cubic_root**3``. napari's 3-D mode
+      reads ``len(levels) - 1`` whole (``layers/_scalar_field/_slice.py``), so
+      the coarsest level is what a renderer uploads as one texture and the
+      budget is what bounds it.
+
+    Each target is emitted only if it actually shrinks something, so the two
+    gates of §5.1 fall out of the list length: a tensor may qualify for either,
+    both or neither, and one that qualifies for neither gets a single
+    full-resolution level. Nothing downstream has to re-derive the gates.
+
+    **The intermediate rungs are deliberately absent.** They cost a client the
+    same read as full resolution and save it nothing: measured on a 5032² ND2
+    with a cold page cache and no inherited mmap, ``get_decimated_data`` costs
+    0.14-0.24 s at *every* step from 1 to 16, with no monotonic trend -- the
+    decimation skips bytes only once the pages are resident. Advertising a level
+    with no warmed data behind it therefore just asks the client to pay a
+    level-0 read for a blurrier picture, so a client that zooms past the 2-D
+    target should go to level 0. One that wants finer steps can interpolate them
+    itself; the server will not imply they are cheap.
+
+    Starting the 3-D phase from the 2-D target rather than from full resolution
+    gives per-axis monotonicity for free, which napari requires of
+    ``downsample_factors`` (``layers/utils/layer_utils.py``).
+
+    ``ceil_div(L, s)`` is the server's own ``logical_shape`` (adapter_base.py),
+    so each scale matches the client's level and the warmed chunk_ids line up
+    exactly. A tensor with no z axis is treated as ``Lz = 1``.
 
     Returns:
         Non-empty list of per-axis scale vectors, coarsest last.
@@ -600,13 +708,13 @@ def compute_pyramid_scale_hints(
     # also keeps build_pyramid_plan / get_flight_info from raising on 1-D (or 0-D)
     # tensors, where _precache_xy_indices has no X/Y to resolve.
     if ndim < 2:
-        return [[1] * ndim]
+        return [[1] * ndim], [False]
 
     budget = pixel_budget_cubic_root**3
     floor = min(pixel_budget_cubic_root, threshold)
 
     y_idx, x_idx = _precache_xy_indices(shape, dim_labels)
-    z_idx = _precache_z_index(shape, dim_labels)
+    z_idx = precache_z_index(shape, dim_labels)
     # A degenerate label set could map z onto an x/y axis; drop it if so.
     if z_idx is not None and z_idx in (x_idx, y_idx):
         z_idx = None
@@ -619,23 +727,53 @@ def compute_pyramid_scale_hints(
             scale[z_idx] = sz
         return scale
 
+    def _extent(sx, sy, sz):
+        return (
+            ceil_div(shape[x_idx], sx),
+            ceil_div(shape[y_idx], sy),
+            ceil_div(shape[z_idx], sz) if z_idx is not None else 1,
+        )
+
+    # Phase 1 -- the 2-D target: X and Y only. The intermediate steps are walked
+    # but not emitted; only where the halving lands is a level.
     sx = sy = sz = 1
     scales = [_scale_vector(sx, sy, sz)]  # level 0: full resolution
     while True:
-        lx = ceil_div(shape[x_idx], sx)
-        ly = ceil_div(shape[y_idx], sy)
-        lz = ceil_div(shape[z_idx], sz) if z_idx is not None else 1
-        if lx * ly * lz <= budget and lx <= threshold and ly <= threshold:
+        lx, ly, _lz = _extent(sx, sy, sz)
+        if lx * ly <= plane_max_pixels and lx <= threshold and ly <= threshold:
             break
         nsx = sx * downscale_factor if lx > floor else sx
         nsy = sy * downscale_factor if ly > floor else sy
-        nsz = sz * downscale_factor if (z_idx is not None and lz > floor) else sz
-        if (nsx, nsy, nsz) == (sx, sy, sz):
+        if (nsx, nsy) == (sx, sy):
             break  # nothing left to shrink; avoid an infinite loop
-        sx, sy, sz = nsx, nsy, nsz
+        sx, sy = nsx, nsy
+    if (sx, sy) != (1, 1):
         scales.append(_scale_vector(sx, sy, sz))
 
-    return scales
+    # Phase 2 -- the 3-D target, only if the volume still exceeds the budget.
+    # Continues from the 2-D target, so its factors can only be >= that level's
+    # on every axis.
+    tx, ty, tz = sx, sy, sz
+    while True:
+        lx, ly, lz = _extent(tx, ty, tz)
+        if lx * ly * lz <= budget:
+            break
+        ntx = tx * downscale_factor if lx > floor else tx
+        nty = ty * downscale_factor if ly > floor else ty
+        ntz = tz * downscale_factor if (z_idx is not None and lz > floor) else tz
+        if (ntx, nty, ntz) == (tx, ty, tz):
+            break  # every axis is at the floor; the budget cannot be met
+        tx, ty, tz = ntx, nty, ntz
+    volumetric = [False] * len(scales)
+    if (tx, ty, tz) != (sx, sy, sz):
+        scales.append(_scale_vector(tx, ty, tz))
+        # Only THIS level is the 3-D target, and only when there is a depth axis
+        # for it to consume whole. Phase 2 can fire without scaling Z (Z already
+        # under the floor -- a 181-plane stack), so "did Z change" is not the
+        # question; provenance is, and only this loop knows it.
+        volumetric.append(z_idx is not None and int(shape[z_idx]) > 1)
+
+    return scales, volumetric
 
 
 def compute_precache_scale_hint(
@@ -648,17 +786,184 @@ def compute_precache_scale_hint(
     The last entry of :func:`compute_pyramid_scale_hints` (``threshold`` /
     ``downscale_factor`` / ``pixel_budget_cubic_root`` forwarded through) -- a
     named thin wrapper so there is one pyramid loop, not two.
+
+    This is what napari opens at, **not** the whole warm set: a tensor with both
+    targets has two levels to warm and this names only the second. Precache uses
+    :func:`compute_warm_scale_hints`.
     """
     return compute_pyramid_scale_hints(shape, dim_labels, **kwargs)[-1]
+
+
+class WarmTarget(NamedTuple):
+    """One level the precache worker warms, and how Z is to be treated there.
+
+    ``volumetric`` marks the 3-D target. It decides whether Z is a *selection*
+    axis: a 2-D renderer displays one plane, so Z can be narrowed like T and C,
+    but napari's 3-D mode reads the coarsest level whole
+    (``layers/_scalar_field/_slice.py``) and a Z-narrowed warm would miss every
+    chunk of it. Provenance, not a property of the scale vector -- Phase 2 leaves
+    Z alone when it already sits under the per-axis floor (a 181-plane stack), so
+    "was Z scaled?" cannot answer this.
+    """
+
+    scale_hint: List[int]
+    volumetric: bool
+
+
+def compute_warm_targets(
+    shape: Sequence[int],
+    dim_labels=None,
+    **kwargs: int,
+) -> List[WarmTarget]:
+    """Every level the precache worker should warm: at most two, possibly none.
+
+    :func:`compute_pyramid_scale_hints` without its full-resolution level, each
+    tagged with whether it is the 3-D target. An empty result means the tensor
+    passed neither gate and warming it would cache the source 1:1 -- the caller
+    skips rather than testing scale vectors for all-ones.
+    """
+    scales, volumetric = _pyramid_levels(shape, dim_labels, **kwargs)
+    return [
+        WarmTarget(scale, is_3d)
+        for scale, is_3d in zip(scales[1:], volumetric[1:], strict=True)
+    ]
+
+
+# 256 MiB, per warm level. Not sized to make a catalog fit -- at a few hundred
+# tensors nothing in the hundreds of MiB does, and the backlog high-water gate is
+# what stops a full cache. What it bounds is one tensor eating the cache, and
+# above the first plane it buys *scrub headroom*: at this value a 200-plane
+# confocal keeps 128 of its Z planes rather than 32, so paging through the stack
+# stays warm instead of only the opening slab.
+PRECACHE_WARM_BUDGET_BYTES = 256 * 1024 * 1024
+
+# Order in which selection axes give up extent when a level is over budget.
+# Unnamed axes (a plate's POS, a sequence's `i`) go first and are not in this
+# tuple -- they are independent acquisitions like T, and a viewer opens on one.
+# Then T: frames are independent and a user views very few. Then Z: scrubbed,
+# but locally, so a contiguous slab keeps its value. C last: typically 2-4, so
+# keeping it whole is cheap, and toggling channels is the first thing a user
+# does after open.
+WARM_REDUCE_ORDER = ("t", "z", "c")
+
+
+def compute_warm_selection(
+    shape: Sequence[int],
+    dim_labels,
+    scale_hint: Sequence[int],
+    itemsize: int,
+    volumetric: bool = False,
+    budget_bytes: int = PRECACHE_WARM_BUDGET_BYTES,
+) -> Tuple[List[int], List[int]]:
+    """``(start, stop)`` in full-resolution coords for the part worth warming.
+
+    A warm level is a *plane* (or, when ``volumetric``, a volume) repeated across
+    every other axis. Warming the whole cross-product is what makes the warm set
+    unbounded -- 1000 planes at 1500² is 4.3 GiB where one is 4.3 MiB -- so the
+    plane is kept whole and the selection axes give up extent, in
+    :data:`WARM_REDUCE_ORDER`, until the level fits ``budget_bytes``.
+
+    **The window starts at index 0**, because that is where a viewer opens.
+
+    napari's own default is the middle -- ``_add_layer_from_data`` slices once at
+    the dims default and then calls ``dims._go_to_center_step()``
+    (``components/viewer_model.py``) -- but the tensor browser suppresses that
+    second move (``_tensor_utils._origin_initial_view``) precisely so the opening
+    slice and the slice already decoded are the same one. On a source with no
+    native pyramid each is a full-resolution decode, so letting them differ
+    doubles a cold open. The SPA opens its sliders at 0 for the same reason.
+
+    So all three say index 0 independently -- no client asks the server what is
+    warm, and none could. A centred window would spend the whole budget on
+    planes the only two clients do not display.
+
+    **``budget_bytes`` bounds what is asked for, not what lands on disk.** This
+    counts the logical extent of the window, but the cache stores whole chunks:
+    the read plan snaps the returned range to the transfer grid, so a window that
+    ends mid-chunk still writes that chunk entire, and the backend adds its own
+    per-chunk framing. The footprint therefore rounds *up*, by up to one chunk
+    per narrowed axis. Sizing a cache off this number is what it will not
+    support; bounding one tensor's share of it is what it is for.
+
+    Selection axes are never scaled -- Phase 1 touches only X/Y, and Phase 2's Z
+    belongs to the volume -- so a level index is a full-resolution index on
+    exactly these axes. The multiply below is therefore an identity today and
+    stays correct if that changes.
+    """
+    ndim = len(shape)
+    start = [0] * ndim
+    stop = [int(d) for d in shape]
+    if ndim < 2 or itemsize <= 0 or budget_bytes <= 0:
+        return start, stop
+
+    level = [ceil_div(int(d), int(s)) for d, s in zip(shape, scale_hint, strict=True)]
+    y_idx, x_idx = _precache_xy_indices(shape, dim_labels)
+    kept = {y_idx, x_idx}
+    s_idx = samples_axis(list(dim_labels or []), tuple(int(d) for d in shape))
+    if s_idx is not None:
+        kept.add(s_idx)
+    if volumetric:
+        z = precache_z_index(shape, dim_labels)
+        if z is not None and z not in (y_idx, x_idx):
+            kept.add(z)
+
+    selectable = [a for a in range(ndim) if a not in kept and level[a] > 1]
+    if not selectable:
+        return start, stop
+
+    named = {}
+    if dim_labels:
+        for axis in WARM_REDUCE_ORDER:
+            i = labeled_axis_index(dim_labels, axis)
+            if i is not None and i in selectable:
+                named[axis] = i
+    order = [a for a in selectable if a not in named.values()]  # unnamed first
+    order += [named[axis] for axis in WARM_REDUCE_ORDER if axis in named]
+
+    unit = itemsize
+    for a in kept:
+        unit *= level[a]
+    keep = {a: level[a] for a in selectable}
+
+    total = unit
+    for n in keep.values():
+        total *= n
+    for a in order:
+        if total <= budget_bytes:
+            break
+        others = total // keep[a]
+        k = max(1, min(keep[a], budget_bytes // max(1, others)))
+        keep[a] = k
+        total = others * k
+
+    for a in selectable:
+        k, n = keep[a], level[a]
+        if k >= n:
+            continue
+        # Centred on the index a fresh viewer opens at, clamped into the axis.
+        factor = max(1, int(scale_hint[a]))
+        start[a] = 0
+        stop[a] = min(int(shape[a]), k * factor)
+    return start, stop
+
+
+def compute_warm_scale_hints(
+    shape: Sequence[int],
+    dim_labels=None,
+    **kwargs: int,
+) -> List[List[int]]:
+    """The scales of :func:`compute_warm_targets`, dropping the 3-D tag."""
+    return [t.scale_hint for t in compute_warm_targets(shape, dim_labels, **kwargs)]
 
 
 def build_pyramid_plan(
     shape: Sequence[int],
     dim_labels=None,
-    reduction_method: str = "area",
+    reduction_method: str = "nearest",
     threshold: int = PRECACHE_THRESHOLD,
     downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
     pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+    plane_max_pixels: int = PRECACHE_PLANE_MAX_PIXELS,
 ) -> List[PyramidLevel]:
     """Server-advertised computed pyramid as a list of ``PyramidLevel`` protos.
 
@@ -678,6 +983,7 @@ def build_pyramid_plan(
         threshold=threshold,
         downscale_factor=downscale_factor,
         pixel_budget_cubic_root=pixel_budget_cubic_root,
+        plane_max_pixels=plane_max_pixels,
     )
     levels: List[PyramidLevel] = []
     for scale in scales:
@@ -754,6 +1060,375 @@ def compute_safe_chunk_size(
     return tuple(safe_size)
 
 
+def scaled_virtual_chunk_size(
+    transfer_chunk_size: Tuple[int, ...],
+    tensor_shape: Tuple[int, ...],
+    scale_hint: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]] = None,
+    output_dtype: Optional[str] = None,
+) -> Tuple[int, ...]:
+    """Size the source extent one scaled chunk reads: ``transfer * scale``.
+
+    A scaled chunk reads ``extent`` source elements to deliver ``extent //
+    scale`` of them, so pinning the extent to the full-resolution transfer size
+    shrinks the payload by the scale factor per axis while doing identical read
+    work -- a 1/32 read delivered 1/1024 of the transfer target
+    (biopb/biopb#805). Multiplying by the scale restores it exactly: the
+    delivered chunk is the transfer chunk, and the endpoint count falls with the
+    scale because each chunk covers ``scale`` times more source per axis.
+
+    The product is a multiple of both the scale and the transfer extent, so
+    chunks tile without splitting a reduction block and stay aligned to the grid
+    the adapter reports. Clamping to the tensor keeps that: the clamp can only
+    bite on the last chunk of an axis, which ends at the tensor's end anyway.
+
+    **Nothing else shapes it** -- no byte target, no coalescing, no memory
+    ceiling -- because ``get_scaled_data`` streams the extent rather than
+    materialising it (``core/stream_reduce.py``): residency is one unit, so the
+    extent is free to be as large as the tensor. What a byte target used to buy,
+    a delivered chunk at the transfer size, ``transfer * scale`` gives exactly;
+    what it cost was growth along whatever axis happened to be free once the
+    scaled axes saturated against the tensor. On a 12-plane TIFF at scale 32
+    that was ten Z planes -- 483 MiB read to deliver one requested plane's
+    0.05 MiB, where this reads 48 MiB.
+
+    ``dim_labels`` and ``output_dtype`` are vestigial: they described where the
+    coalescing was allowed to grow and how wide the result would land, and
+    nothing grows any more.
+    """
+    return tuple(
+        min(max(1, int(transfer)) * max(1, int(scale)), int(dim))
+        for transfer, scale, dim in zip(
+            transfer_chunk_size, scale_hint, tensor_shape, strict=True
+        )
+    )
+
+
+def default_transfer_chunk_shape(
+    tensor_shape: Sequence[int],
+    dtype: str,
+    dim_labels: Optional[Sequence[str]] = None,
+    native: Optional[Sequence[int]] = None,
+) -> List[int]:
+    """The transfer grid for an adapter with no layout knowledge to apply.
+
+    ``chunk_shape`` is the *transfer* grid and the adapter owns it
+    (biopb/biopb#809): the server sizes nothing on the adapter's behalf, it only
+    clamps the result to the Arrow ceiling. An adapter that knows how its bytes
+    sit on disk -- an interleaved ND2 whose channels are one unit, a page-aligned
+    TIFF -- states that grid directly. Every other adapter calls this.
+
+    ``native`` seeds the search with the store's own block (zarr chunks, a TIFF
+    tile, one plane) so the grid stays a whole multiple of it; omit it and the
+    seed is the whole tensor, divided down. The seed is an *alignment* hint, not
+    a read unit: no read is ever issued at it.
+    """
+    shape = tuple(int(dim) for dim in tensor_shape)
+    labels = list(dim_labels) if dim_labels else None
+    if native is not None and len(native) == len(shape):
+        seed = tuple(max(1, int(dim)) for dim in native)
+    else:
+        seed = shape
+    return list(compute_transfer_chunk_size(seed, shape, dtype, labels))
+
+
+def compute_transfer_chunk_size(
+    native_chunk_size: Tuple[int, ...],
+    tensor_shape: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]],
+    preferred_bytes: Optional[int] = None,
+    maximum_bytes: Optional[int] = None,
+) -> Tuple[int, ...]:
+    """Size a transfer grid around ``native_chunk_size``.
+
+    The engine behind :func:`default_transfer_chunk_shape`, and the sizing policy
+    an adapter reuses when it wants the standard treatment of a grid it has
+    already shaped. Blocks above ``preferred_bytes`` are divided with the
+    established T/unknown -> C -> Z -> Y/X priority; smaller blocks are coalesced
+    in whole ``native_chunk_size`` multiples, preferring Y/X -> Z -> C ->
+    T/unknown, while retaining enough endpoints for parallel reads and scheduler
+    utilization.
+
+    ``maximum_bytes`` is the hard wire ceiling; ``preferred_bytes`` is the
+    optimization target. Both default to the module constants, read at call time
+    so a sweep can move them. Scaled reads do not run this optimizer a second
+    time: :func:`scaled_virtual_chunk_size` derives their read extent from the
+    chosen transfer grid, so the reduced chunk they deliver lands on the target.
+    """
+    preferred_bytes = (
+        PREFERRED_ARROW_BATCH_BYTES if preferred_bytes is None else preferred_bytes
+    )
+    maximum_bytes = MAX_ARROW_BATCH_BYTES if maximum_bytes is None else maximum_bytes
+    if len(native_chunk_size) != len(tensor_shape):
+        raise ValueError(
+            "Native chunk rank must match tensor rank: "
+            f"chunk={len(native_chunk_size)} shape={len(tensor_shape)}"
+        )
+    if preferred_bytes <= 0 or maximum_bytes <= 0:
+        raise ValueError("Chunk byte targets must be positive")
+    if preferred_bytes > maximum_bytes:
+        raise ValueError("Preferred chunk bytes must not exceed the maximum")
+    if any(int(dim) <= 0 for dim in tensor_shape):
+        raise ValueError(f"Tensor dimensions must be positive: {tensor_shape}")
+    if any(int(dim) <= 0 for dim in native_chunk_size):
+        raise ValueError(
+            f"Native chunk dimensions must be positive: {native_chunk_size}"
+        )
+
+    native = tuple(
+        min(int(chunk), int(shape))
+        for chunk, shape in zip(native_chunk_size, tensor_shape, strict=True)
+    )
+    native_bytes = estimate_chunk_bytes(native, dtype)
+
+    if native_bytes > preferred_bytes:
+        result = _divide_chunk_size(native, dtype, dim_labels, preferred_bytes)
+    elif native_bytes < preferred_bytes:
+        result = _coalesce_chunk_size(
+            native,
+            tensor_shape,
+            dtype,
+            dim_labels,
+            preferred_bytes,
+        )
+    else:
+        result = native
+
+    # Retain an explicit final guard so a future preferred-size policy change
+    # cannot accidentally weaken the Arrow safety bound.
+    if estimate_chunk_bytes(result, dtype) > maximum_bytes:
+        result = compute_safe_chunk_size(result, dtype, dim_labels)
+    return result
+
+
+def _divide_chunk_size(
+    chunk_size: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]],
+    target_bytes: int,
+) -> Tuple[int, ...]:
+    """Divide a chunk toward ``target_bytes`` with the established priority."""
+    result = list(chunk_size)
+    result_bytes = estimate_chunk_bytes(tuple(result), dtype)
+    split_axes: Set[int] = set()
+    labels = [str(label).lower() for label in dim_labels] if dim_labels else []
+
+    while result_bytes > target_bytes:
+        n_splits = int(np.ceil(result_bytes / target_bytes))
+        split_count = n_splits
+        axis = _choose_split_axis_excluding(
+            tuple(result), dim_labels, n_splits, split_axes
+        )
+        if axis is None:
+            # The desired ratio may exceed every one axis even though dividing
+            # several axes successively can reach it.
+            axis = _choose_split_axis_excluding(
+                tuple(result), dim_labels, 2, split_axes
+            )
+            split_count = 2
+        if axis is None:
+            break
+        label = labels[axis] if axis < len(labels) else ""
+        if label in {"y", "x"}:
+            spatial_axes = [
+                index
+                for index, candidate_label in enumerate(labels)
+                if candidate_label in {"y", "x"} and result[index] > 1
+            ]
+            if len(spatial_axes) == 2:
+                scale = (target_bytes / result_bytes) ** 0.5
+                for spatial_axis in spatial_axes:
+                    result[spatial_axis] = max(1, int(result[spatial_axis] * scale))
+                    split_axes.add(spatial_axis)
+                result_bytes = estimate_chunk_bytes(tuple(result), dtype)
+                continue
+        result[axis] = max(1, result[axis] // min(result[axis], split_count))
+        split_axes.add(axis)
+        result_bytes = estimate_chunk_bytes(tuple(result), dtype)
+
+    return tuple(result)
+
+
+def _coalesce_chunk_size(
+    native: Tuple[int, ...],
+    tensor_shape: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]],
+    target_bytes: int,
+) -> Tuple[int, ...]:
+    """Grow whole native blocks toward ``target_bytes``.
+
+    Y and X grow **as a pair**, never one at a time: a chunk that is square-ish
+    in the plane is what makes a square region read touch few chunks. Growing
+    them independently reaches the same byte target with a better sequential
+    read -- a full-width band is contiguous on disk -- but turns a 512x512 tile
+    into one fetch per band it crosses. Coupling is the middle ground: the plane
+    stays roughly square, and the axes that are genuinely free to differ (Z, C,
+    T) still grow on their own.
+
+    Growth stops at ``target_bytes`` and at the tensor's own extent -- nothing
+    else. A tensor small enough to fit in one chunk becomes one chunk.
+    """
+    current = list(native)
+    max_blocks = [
+        int(shape) // int(block)
+        for block, shape in zip(native, tensor_shape, strict=True)
+    ]
+    labels = [str(label).lower() for label in dim_labels] if dim_labels else []
+
+    def priority(axis: int) -> int:
+        label = labels[axis] if axis < len(labels) else ""
+        if label in {"y", "x"}:
+            return 0
+        if label == "z":
+            return 1
+        if label in {"c", "channel", "channels"}:
+            return 2
+        if label in {"t", "time", "frame", "frames"}:
+            return 3
+        return 4
+
+    def blocks(axis: int) -> int:
+        return current[axis] // native[axis]
+
+    spatial = [axis for axis in range(len(current)) if priority(axis) == 0]
+    spatial_set = set(spatial)
+
+    def doubled_spatial() -> Optional[List[int]]:
+        """The spatial pair with every growable axis doubled, or None."""
+        candidate = list(current)
+        for axis in spatial:
+            new_blocks = min(max_blocks[axis], blocks(axis) * 2)
+            candidate[axis] = native[axis] * new_blocks
+        return candidate if candidate != current else None
+
+    while True:
+        candidates = []
+        for axis in range(len(current)):
+            if axis in spatial_set:
+                continue
+            old_blocks = blocks(axis)
+            new_blocks = min(max_blocks[axis], old_blocks * 2)
+            if new_blocks <= old_blocks:
+                continue
+            candidate = list(current)
+            candidate[axis] = native[axis] * new_blocks
+            candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
+            if candidate_bytes <= target_bytes:
+                candidates.append(
+                    (
+                        priority(axis),
+                        current[axis],
+                        candidate_bytes,
+                        axis,
+                        candidate,
+                    )
+                )
+        # One candidate for the whole spatial pair, so Y and X move together.
+        spatial_candidate = doubled_spatial()
+        if spatial_candidate is not None:
+            candidate_bytes = estimate_chunk_bytes(tuple(spatial_candidate), dtype)
+            if candidate_bytes <= target_bytes:
+                candidates.append(
+                    (
+                        0,
+                        current[spatial[0]],
+                        candidate_bytes,
+                        spatial[0],
+                        spatial_candidate,
+                    )
+                )
+        if not candidates:
+            break
+        _, _, _, _, current = min(
+            candidates, key=lambda item: (item[0], item[1], -item[2], item[3])
+        )
+
+    # Consume any remaining budget. The spatial pair goes first and stays square:
+    # size the plane from the budget's square root, then round each axis down to
+    # whole native blocks. Doubling has already brought it within a factor of two,
+    # so the back-off below runs a block or two at most.
+    if spatial and _fill_spatial(
+        current, native, max_blocks, spatial, spatial_set, dtype, target_bytes
+    ):
+        return tuple(current)
+
+    current_bytes = estimate_chunk_bytes(tuple(current), dtype)
+    candidates = []
+    for axis in range(len(current)):
+        if axis in spatial_set:
+            continue
+        other_bytes = current_bytes // current[axis]
+        affordable_blocks = target_bytes // (other_bytes * native[axis])
+        new_blocks = min(max_blocks[axis], int(affordable_blocks))
+        if new_blocks <= blocks(axis):
+            continue
+        candidate = list(current)
+        candidate[axis] = native[axis] * new_blocks
+        candidate_bytes = estimate_chunk_bytes(tuple(candidate), dtype)
+        candidates.append(
+            (priority(axis), target_bytes - candidate_bytes, axis, candidate)
+        )
+    if candidates:
+        _, _, _, current = min(candidates, key=lambda item: item[:3])
+
+    return tuple(current)
+
+
+def _fill_spatial(
+    current: List[int],
+    native: Tuple[int, ...],
+    max_blocks: List[int],
+    spatial: List[int],
+    spatial_set: Set[int],
+    dtype: str,
+    target_bytes: int,
+) -> bool:
+    """Spend the remaining budget on Y/X together, keeping the plane square.
+
+    Mutates ``current`` in place and reports whether it grew. Sizing the plane
+    from ``sqrt(budget)`` rather than stepping one axis keeps the two extents
+    within a block of each other, which is the whole point of coupling them.
+    """
+    per_element = estimate_chunk_bytes(
+        tuple(
+            1 if axis in spatial_set else current[axis] for axis in range(len(current))
+        ),
+        dtype,
+    )
+    if per_element <= 0:
+        return False
+    plane_budget = target_bytes // per_element
+    if plane_budget <= 0:
+        return False
+
+    side = max(1, int(plane_budget**0.5))
+    proposed = list(current)
+    for axis in spatial:
+        want = max(current[axis] // native[axis], side // native[axis])
+        proposed[axis] = native[axis] * min(max_blocks[axis], max(1, want))
+
+    # Whole blocks can overshoot the square: back the longer extent off a block
+    # at a time, never below where doubling already got us.
+    while estimate_chunk_bytes(tuple(proposed), dtype) > target_bytes:
+        shrinkable = [
+            axis
+            for axis in spatial
+            if proposed[axis] // native[axis] > current[axis] // native[axis]
+        ]
+        if not shrinkable:
+            return False
+        axis = max(shrinkable, key=lambda a: (proposed[a], a))
+        proposed[axis] -= native[axis]
+
+    if proposed == current:
+        return False
+    current[:] = proposed
+    return True
+
+
 def _choose_split_axis_excluding(
     shape: Tuple[int, ...],
     dim_labels: Optional[List[str]],
@@ -776,9 +1451,16 @@ def _choose_split_axis_excluding(
         for ax, label in enumerate(dim_labels):
             label_to_axis[label.lower()] = ax
 
-    # Eligible axes: not excluded and large enough for splits
+    # Interleaved RGB(A) samples are one pixel's indivisible components. Keep
+    # them together and divide another axis; an unlabeled trailing size-3/4 axis
+    # is deliberately not inferred as samples.
+    sample_axis = samples_axis(list(dim_labels or []), shape)
+
+    # Eligible axes: not excluded, not interleaved samples, and splittable.
     eligible = [
-        ax for ax in range(len(shape)) if ax not in exclude_axes and shape[ax] >= 2
+        ax
+        for ax in range(len(shape))
+        if ax not in exclude_axes and ax != sample_axis and shape[ax] >= 2
     ]
 
     if not eligible:

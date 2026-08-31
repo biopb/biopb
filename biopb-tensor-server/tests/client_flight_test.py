@@ -365,9 +365,14 @@ class TestTensorFlightClientRoundTrip:
             server_client.get_tensor("nonexistent-source/some-tensor")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_tensor_pb(self, server_client):
+    def test_get_tensor_pb(self, server_client, transfer_target):
         """Test get_tensor_pb returns SerializedTensor protobuf."""
         from biopb.tensor.serialized_pb2 import SerializedTensor
+
+        # Four endpoints over the 128x128 uint8 fixture; at the default target
+        # it is a single chunk (biopb/biopb#809) and the endpoint list under
+        # test would have one entry.
+        transfer_target(64 * 64)
 
         pb = server_client.get_tensor_pb("test-tensor")
 
@@ -385,7 +390,7 @@ class TestTensorFlightClientRoundTrip:
         assert pb.location == "grpc://localhost:8890"
 
         # Verify endpoints are populated
-        assert len(pb.endpoints) == 4  # 4 chunks
+        assert len(pb.endpoints) == 4
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_from_pb(self, server_client):

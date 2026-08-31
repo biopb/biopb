@@ -3,7 +3,7 @@ id: write-a-skill
 title: Write a new biopb skill file
 description: Turn a workflow the user has just validated into a reviewed skill file for the biopb catalog.
 tags: [workflow, authoring]
-version: 1.0.0
+version: 1.1.0
 checklist: []
 ---
 
@@ -13,11 +13,11 @@ checklist: []
 
 The user has finished a workflow worth repeating and wants it captured, or asks
 directly for a new skill. A skill is a markdown recipe retrieved by
-`find_skills`, and it can live in either of two places: the user's own
-`~/.config/biopb/skills/`, available to them immediately, or the curated catalog
-that ships inside biopb-mcp, which a maintainer reviews and which goes live on
-the next release. Same file either way — the destination is the user's choice,
-made at the end (step 7).
+`list_skills`, and it can live in either of two places: the user's own local
+skills dir, available to them immediately, or the curated catalog that ships
+inside biopb-mcp, which a maintainer reviews and which goes live on the next
+release. Same file either way — the destination is the user's choice, made at
+the end (step 7).
 
 A skill is worth writing when the procedure is **multi-step**, has **decisions
 between the steps**, and is **standard practice in bioimaging rather than in
@@ -27,7 +27,7 @@ general Python** — the recipe an agent would otherwise improvise wrongly.
 
 - **The workflow is one call.** Filters, named auto-thresholds, projections,
   binary morphology, connected components, channel splits. An agent writes these
-  correctly without help; cataloguing them dilutes `find_skills` ranking.
+  correctly without help; cataloguing them dilutes `list_skills` ranking.
 - **It is API reference.** How to add a layer, query the catalog, or run a job
   belongs in the `guide://*` resources, not a skill. A skill is judgment,
   parameter rules, and validation.
@@ -35,7 +35,11 @@ general Python** — the recipe an agent would otherwise improvise wrongly.
   not confirmed on real data. A skill is a claim that the procedure works; an
   unverified one teaches every future session the same mistake.
 - **It is specific to one dataset.** Particular file names, hard-coded crops, or
-  one experiment's channel order belong in the conversation, not the catalog.
+  one experiment's channel order belong in a **notebook**, not the catalog:
+  rewrite the session into a clean program, check it with `verify_workflow`, and
+  the user saves it from the observe page. A skill is the procedure minus the
+  dataset, re-derived by an agent on new data; a notebook is this run on this
+  data, re-run and edited by the user. Different artifacts, not competing ones.
 
 ## Parameters
 
@@ -45,7 +49,7 @@ The frontmatter fields, and how to determine each:
 |---|---|
 | `id` | Kebab-case, must equal the filename stem. Name the *task*, not the tool: `track-objects`, not `run-laptrack` |
 | `title` | One line, imperative. What the user gets |
-| `description` | One sentence. This is what `find_skills` ranks on — write it as the user's request, not as an implementation summary |
+| `description` | One sentence. This is what `list_skills` ranks on — write it as the user's request, not as an implementation summary |
 | `tags` | A list of categories describing the skill. Reuse tags you have seen on published skills where they fit — consistent tags are what make discovery work |
 | `version` | `1.0.0` for a new skill. Bump on every content edit — it is the only version signal a reader gets. There is no `updated` field: a shipped skill is dated by the release it rode, a local one by its file mtime, so never write a date by hand |
 | `checklist` | What the steps actually touch: `viewer`, `tensor`, `dask`, `ops:<kind>`, `plugin:<name>` (the plugin's **file stem**, e.g. `plugin:rolling_ball` ↔ `rolling_ball.py` — also the name it is bound under in the kernel namespace, so the body calls `rolling_ball.subtract_background(...)`), `pkg:<name>` with a version bound — `~=X.Y.Z` for a third party (a floor *and* an upper bound at the next minor, so the API the body quotes cannot move under it; never a bare floor, never `==`, and never a comma pair, which the runtime reader splits), `>=X.Y.Z` only for `biopb-mcp` itself. Not decoration and not a gate — the agent resolves this list against the live session before starting (see step 2) so it can tell the user what is missing and adapt, rather than discovering it mid-run. A skill that drives the kernel carries `pkg:biopb-mcp>=0.13.0`, the first release exposing the interface it is written against; raise that bound only if the skill needs something newer. An empty list is a real answer, not an omission: a skill whose steps touch nothing in the session has nothing to resolve |
@@ -54,7 +58,7 @@ The frontmatter fields, and how to determine each:
 
 1. **Confirm the scope with the user** *(blocking)*. State in one sentence what
    the skill will cover and what it deliberately leaves out. First run
-   `find_skills` for overlap — if an existing skill covers most of it, **edit
+   `list_skills` for overlap — if an existing skill covers most of it, **edit
    that skill and bump its version** instead of adding a near-duplicate.
 
 2. **Choose how the code ships.** This is the main scoping decision:
@@ -62,7 +66,7 @@ The frontmatter fields, and how to determine each:
    | Amount | Ships as | The body carries |
    |---|---|---|
    | ≲ 30 lines | Inline code fences | The code itself |
-   | 30–150 lines | A kernel plugin (`biopb_mcp/plugins/`, seeded to `~/.config/biopb/kernel/`) | The call signature — qualified by the plugin's module name — and what the parameters mean |
+   | 30–150 lines | A kernel plugin (`biopb_mcp/plugins/`, seeded to the plugin dir `server_status` reports under `## Kernel plugins`) | The call signature — qualified by the plugin's module name — and what the parameters mean |
    | A published algorithm | A `pip install` pointer | The install command and the degraded path when it is absent |
 
    **Do not restate the install mechanics.** Which command to quote, why never a
@@ -158,6 +162,12 @@ The frontmatter fields, and how to determine each:
    hidden state: every variable and layer it uses must be created by its own
    steps, not left over from this conversation.
 
+   The hidden-state check has a mechanism: put the draft's code cells through
+   `verify_workflow`, which runs them in a namespace holding the kernel's
+   handles and nothing this session bound. A leftover variable raises `NameError`
+   there instead of quietly working. It costs no restart, so there is nothing to
+   ask about first.
+
    A genuinely clean-room run needs `restart_kernel`, which **destroys the
    namespace, every layer, and any running job**. That is a *validate-and-gate*:
    ask the user first, explain what is lost, and offer to note the layers worth
@@ -167,7 +177,7 @@ The frontmatter fields, and how to determine each:
 
    - `id` is kebab-case and matches the intended filename stem.
    - `description` reads like the user's request; that string is what
-     `find_skills` ranks on.
+     `list_skills` ranks on.
    - `tags` reuse tags you have seen on existing skills.
    - The four required sections are present as `##` headings.
    - Every failure row names a failure that actually happened (step 3).
@@ -190,11 +200,20 @@ The frontmatter fields, and how to determine each:
 7. **Deliver the draft** *(blocking)*. Show the complete file in the
    conversation. Then ask what the user wants done with it:
 
-   - **Keep it for themselves** — save it as
-     `~/.config/biopb/skills/<id>.md` (this is an explicit filesystem request, so
-     it is allowed). It is picked up on the next `find_skills`, with no restart,
-     and reported as `origin: local` so later sessions can tell it apart from a
-     reviewed skill. Editing the file takes effect immediately too.
+   - **Keep it for themselves** — save it as `<local skills dir>/<id>.md`
+     (this is an explicit filesystem request, so it is allowed). It is picked up
+     on the next `list_skills`, with no restart, and reported as `origin: local`
+     so later sessions can tell it apart from a reviewed skill. Editing the file
+     takes effect immediately too.
+
+     Take the dir from `server_status`, section `## Skills`, and write the file
+     **from the kernel** with `execute_code`: `~/.config/biopb/skills` is only a
+     default (`services.skills_local_dir` and the config-tree env vars move it),
+     and it resolves in the *kernel's* environment, not in yours — which on a
+     remote session is not even the same machine. Markdown is hostile to Python
+     string literals (backticks, fenced blocks, `"""`), so pick a raw-string
+     delimiter absent from the body and read the file back before telling the
+     user it is saved.
    - **Get it into the public catalog** — the catalog is `mcp/_skills_data/` in
      the `biopb` repository, so promotion is a pull request moving this identical
      file there, reviewed by the biopb maintainers. Offer to write a short
@@ -214,15 +233,15 @@ The frontmatter fields, and how to determine each:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| A saved skill never appears in `find_skills` | Saved outside `~/.config/biopb/skills`, or the filename starts with `_` (private), or skills are switched off | Check the path and `services.skills_enabled` |
+| A saved skill never appears in `list_skills` | Saved outside the local skills dir (it is configurable — `~/.config/biopb/skills` is only the default), or the filename starts with `_` (private), or skills are switched off | Compare the path written against `## Skills` in `server_status`; check `services.skills_enabled` |
 | Section written as bold text or a deeper heading | Required sections are `##` headings | Use `## ` with the exact section names |
 | The body is long but every line reads as necessary | Never ablated — obviousness is invisible from the inside | Diff it against a cold model run (step 6) |
 
 ## Next steps
 
-- A skill saved to `~/.config/biopb/skills` is live on the next `find_skills`,
-  and stays personal and unreviewed (`origin: local`). Tell the user where it
-  went, so they can edit or delete it without asking.
+- A skill saved to the local skills dir is live on the next `list_skills`, and
+  stays personal and unreviewed (`origin: local`). Tell the user the **resolved**
+  path it went to, so they can edit or delete it without asking.
 - A skill accepted by the maintainers ships with the **next biopb-mcp release**,
   not on a site deploy — CI validates the frontmatter and the required sections
   on the pull request. Keeping the local copy is what covers the gap until then.

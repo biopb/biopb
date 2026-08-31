@@ -396,19 +396,18 @@ class NormalizingAdapter(TensorAdapter):
     def close(self) -> None:
         self._inner.close()
 
+    def release_registration_cache(self) -> None:
+        # Declared on SourceAdapter, so it resolves on the wrapper and never
+        # reaches __getattr__ -- delegate explicitly or the inner adapter would
+        # never hear about it.
+        self._inner.release_registration_cache()
+
     # --- tensor role ----------------------------------------------------------
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         desc = self._inner.get_tensor_descriptor()
         perm = self.perm
         return desc if perm is None else _permute_descriptor(desc, perm)
-
-    def get_chunk_size(self) -> Tuple[int, ...]:
-        chunk_size = self._inner.get_chunk_size()
-        perm = self.perm
-        if perm is None or len(chunk_size) != len(perm):
-            return chunk_size
-        return tuple(_permute(chunk_size, perm))
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read ``bounds`` -- given in canonical order -- as a canonical array."""
@@ -483,7 +482,10 @@ class NormalizingAdapter(TensorAdapter):
         ]
         return plan
 
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
+    def get_read_plan(
+        self,
+        request_desc: TensorDescriptor,
+    ) -> TensorReadPlan:
         perm = self.perm
         if perm is None:
             return self._inner.get_read_plan(request_desc)

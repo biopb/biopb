@@ -11,9 +11,23 @@ description = "BioPB Tensor Arrow Flight server for multi-dimensional array stor
 readme = "README.md"
 license = "MIT"
 dependencies = [
-  # Floor: the cache ProcessLock imports biopb._lifecycle.proc (process identity primitive),
-  # first shipped in biopb 0.7.0. The uv workspace already pairs versions from the
-  # tree, so this floor is documentation for any non-workspace install path.
+  # Floor: the server imports several stdlib-only primitives out of the SDK's
+  # private core -- _lifecycle.proc/file_lock/deathwatch, _locations, the
+  # _config_* validators, and _web_auth. All are plain module imports at startup,
+  # so an SDK below the floor is an ImportError, not a degraded path. This floor
+  # is documentation for any non-workspace install path; a workspace install
+  # resolves biopb from the tree.
+  #
+  # UNDERSTATED, and cannot yet be fixed: cli.py now also imports
+  # biopb._fs_detect, which ships in NO released SDK (latest is 0.9.1). The floor
+  # cannot name it before it exists -- CI installs the workspace biopb as a
+  # setuptools_scm dev version (0.9.2.devN+gSHA), which satisfies neither
+  # ">= 0.10.0" nor ">= 0.9.2" under PEP 440, so pip falls through to PyPI and
+  # the resolve fails. Raise this to ">= 0.10.0" in the same change that cuts
+  # v0.10.0, not before. Until then the gap only bites an install that pairs this
+  # server with an SDK older than the move, which no release path produces: the
+  # server ships on release-v*, which requires main, which requires the SDK
+  # stable to be there too.
   "biopb >= 0.7.0",
   # Floor verified for the file cache's Windows zero-copy segment read (#572):
   # the cache hands out batches that alias the segment mmap and unlinks the file
@@ -45,8 +59,6 @@ dependencies = [
   web = [
     "fastapi >= 0.111.0",
     "uvicorn[standard] >= 0.30.0",
-    "pillow >= 9.0.0",
-    "simplejpeg >= 1.6.0",
   ]
   # Self-signed TLS cert generation for `serve --tls` / `cert init` (#604).
   # Kept OUT of the default install closure on purpose: `cryptography` pulls a

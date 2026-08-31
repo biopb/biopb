@@ -91,10 +91,21 @@ class TestEmdAdapter:
             d = descs[0]
             # array_id is source_id/field
             assert d.array_id == f"{adapter.source_id}/0"
-            # rsciio reverses axis order; chunk_shape is the native HDF5 grid,
-            # reversed to match (native (1,1,8,8) -> (8,8,1,1)).
-            assert list(d.chunk_shape) == [8, 8, 1, 1]
             assert list(d.shape) == [8, 8, 3, 2]
+            assert d.chunk_shape == []  # structural listing (biopb/biopb#812)
+
+            # chunk_shape is the transfer grid (biopb/biopb#809), answered by the
+            # signal-bound adapter: seeded by the native HDF5 blocks and reversed
+            # with the axes like everything else rsciio reports: native
+            # (1,1,8,8) -> (8,8,1,1), then grown in whole blocks because one
+            # 128-byte block is far below the transfer target.
+            signal = adapter.get_tensor_adapter(d.array_id)
+            grid = list(signal.get_tensor_descriptor().chunk_shape)
+            assert [grid[0], grid[1]] == [8, 8]
+            assert all(
+                g % n == 0 and g <= s
+                for g, n, s in zip(grid, [8, 8, 1, 1], [8, 8, 3, 2], strict=True)
+            )
             assert d.dtype == np.dtype("uint16").str
 
     def test_get_tensor_adapter_and_read(self):

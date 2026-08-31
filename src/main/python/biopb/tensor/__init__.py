@@ -39,7 +39,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 # (i.e. the lazy/Flight data path) is actually used.
 _LAZY_CLIENT_EXPORTS = (
     "TensorFlightClient",
-    "make_debug_serialized_tensor",
     "ResolveCancelled",
 )
 
@@ -71,6 +70,5 @@ __all__ = [
     "SerializedEndpoint",
     # Client
     "TensorFlightClient",
-    "make_debug_serialized_tensor",
     "ResolveCancelled",
 ]

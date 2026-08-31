@@ -68,7 +68,7 @@ def test_the_nine_tools_are_there_with_their_schemas(session):
     lost a capability the skill bodies assume."""
     names = {t.name for t in session.tools}
     assert names == {
-        "find_skills",
+        "list_skills",
         "start_kernel",
         "take_screenshot",
         "execute_code",
@@ -90,7 +90,7 @@ def test_the_server_instructions_reach_the_client(session):
     and it is the field a generic mcp-proxy drops -- which is why the shim
     vendors its own bridge. A run that never saw it is not the real thing."""
     assert len(session.instructions) > 500, session.instructions[:200]
-    assert "find_skills" in session.instructions
+    assert "list_skills" in session.instructions
 
 
 def test_the_skill_body_comes_from_the_shipped_catalog(session):
@@ -98,7 +98,7 @@ def test_the_skill_body_comes_from_the_shipped_catalog(session):
     `drift-correction` through the same `_skills.py` the runtime uses, so
     deleting or editing the file changes what a run is scored against — which is
     exactly what a hand-transcribed procedure could never do."""
-    found = session.call("find_skills", keywords=["stage drift"])
+    found = session.call("list_skills", keywords=["stage drift"])
     assert "drift-correction" in found.text, found.text[:400]
 
     body = session.read_resource("skill://drift-correction")
@@ -113,7 +113,7 @@ def test_the_agent_can_reach_a_skill_body_and_not_only_the_harness(session):
 
     `read_resource` is a method on `LiveSession`; for a long time it was *only*
     that. The agent is driven over chat-completions and is handed `tools`, so a
-    resource — which is not a tool — had no verb behind it. `find_skills`
+    resource — which is not a tool — had no verb behind it. `list_skills`
     returned a `uri` and the handshake said to read it, and nothing could.
 
     Measured consequence: a `skill+silent` arm that used `pystackreg` purely
@@ -126,7 +126,7 @@ def test_the_agent_can_reach_a_skill_body_and_not_only_the_harness(session):
         "agent_tools must extend the server's advertisement, not replace it"
     )
 
-    found = session.call("find_skills", keywords=["stage drift"])
+    found = session.call("list_skills", keywords=["stage drift"])
     uri = next(
         part.strip('", ')
         for part in found.text.split()

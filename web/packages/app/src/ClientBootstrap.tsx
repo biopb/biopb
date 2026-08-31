@@ -65,11 +65,10 @@ export function ClientBootstrap() {
 
     // The data plane is always reached through the control, which proxies it at
     // /data_plane on this same origin — in dev too, where vite.config forwards
-    // /data_plane (incl. the ws) to the control on :8813. Derived at runtime
-    // rather than baked as VITE_TENSOR_API, because a build-time "/data_plane"
-    // would be missing the --url-prefix the control is published under and would
-    // silently defeat it. This also carries the render WebSocket: it resolves
-    // `${apiBase}/ws/render` against the page origin (useRenderWebSocket).
+    // /data_plane to the control on :8813. Derived at runtime rather than baked
+    // as VITE_TENSOR_API, because a build-time "/data_plane" would be missing
+    // the --url-prefix the control is published under and would silently defeat
+    // it.
     const apiBase = withBase("/data_plane");
 
     (async () => {

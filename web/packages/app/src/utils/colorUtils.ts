@@ -86,12 +86,18 @@ export const PRESET_TO_HEX: Record<PresetColor, string> = {
 /**
  * Resolve "auto" color to the actual guessed color based on channel name.
  * If color is not "auto", returns it unchanged.
+ *
+ * A missing name resolves to grey — the same answer {@link guessDefaultColor}
+ * gives a name it does not recognise. That equality is the point: channel names
+ * arrive asynchronously, so every viewer renders at least one frame before they
+ * land, and a fallback that asserted anything else would paint a colour and then
+ * contradict it. Grey says "nothing is known about this channel", which is true
+ * before the names load and stays true for a channel whose name means nothing to
+ * us. A real marker name still upgrades grey to its conventional colour.
  */
 export function resolveAutoColor(color: ColorValue, channelName?: string): ColorValue {
-  if (color === "auto" && channelName) {
-    return guessDefaultColor(channelName);
-  }
-  return color;
+  if (color !== "auto") return color;
+  return channelName ? guessDefaultColor(channelName) : "gray";
 }
 
 /**

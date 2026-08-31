@@ -150,15 +150,18 @@ class PyramidConfig:
         "criterion (coarsest level fits within threshold in x and y).",
     )
     downscale_factor: int = _h(
-        4,
-        "Linear downscale between successive levels. 4x (vs 2x) roughly halves the "
-        "level count and the per-level get_tensor round trips; napari infers level "
-        "ratios from shapes, so non-2x is fine.",
+        2,
+        "Linear downscale between successive levels. 2x keeps every level on the "
+        "dyadic grid the browser tile route also uses, and keeps napari's "
+        "level pick (the coarsest still above the canvas) from over-fetching by "
+        "up to 4x per axis.",
     )
     pixel_budget_cubic_root: int = _h(
-        512,
+        448,
         "Per-axis edge length of the coarsest level's 3D whole-volume read (#29); "
-        "the voxel budget is this value cubed. Default 512 -> ~134M voxels.",
+        "the voxel budget is this value cubed. 448 -> ~90M voxels, measured as "
+        "the point a float32 volume stays interactive (biopb-tensor-server "
+        "docs/precache-policy.md 9.1).",
     )
 
 
@@ -374,16 +377,16 @@ class ServicesConfig:
     skills_enabled: bool = _h(
         True,
         "Master switch for skills discovery/retrieval. On by default: the agent is "
-        "told to consult find_skills, which resolves the curated workflows shipped "
+        "told to consult list_skills, which resolves the curated workflows shipped "
         "with this package plus the user's own (skills_local_dir). Set false to keep "
-        "the subsystem dormant -- find_skills returns nothing and the agent is not "
+        "the subsystem dormant -- list_skills returns nothing and the agent is not "
         "told about skills.",
     )
     skills_local_dir: str = _h(
         "",
         "Directory of user-authored skill files (*.md) merged into the catalog "
         "beside the shipped ones; empty -> ~/.config/biopb/skills. Personal and "
-        "unreviewed (find_skills reports them as origin=local), re-read on every "
+        "unreviewed (list_skills reports them as origin=local), re-read on every "
         "discovery so an edit is live without a restart. Since the curated set now "
         "arrives only with a release, this is also the only way a skill reaches a "
         "machine out of band. Off with skills_enabled like the rest of the "
@@ -391,7 +394,7 @@ class ServicesConfig:
     )
     skills_index_plugins: bool = _h(
         True,
-        "Also return kernel plugins from find_skills, described by their module "
+        "Also return kernel plugins from list_skills, described by their module "
         "docstring (read with ast, never imported). Without this a plugin is "
         "discoverable only as a bare name in server_status, which conveys nothing "
         "about what it does -- measured: five benchmark arms were shown the name "
@@ -435,6 +438,95 @@ class ObserveConfig:
         "one-job-at-a-time rule. Off drops the route entirely. This can only "
         "narrow the surface -- the control refuses to proxy the console at all "
         "unless it is loopback-bound, whatever this says.",
+    )
+    chat_enabled: bool = _h(
+        True,
+        "Offer the built-in chat client: a pane on the observe page that drives "
+        "this session's kernel through a model. Lives here beside the console "
+        "because it is the same kind of thing -- an execute-capable surface on "
+        "this page -- and because it needs the page: chat routes served without "
+        "one have nothing to reach them. On by default, but inert until the "
+        "model and key in `chat` are set, so it costs nothing to leave on. "
+        "Like the console, this can only narrow the surface.",
+    )
+
+
+@dataclass
+class ChatConfig:
+    """Which agent drives the chat pane, and how to reach it.
+
+    Two engines. ``builtin`` is the in-process loop (``mcp/_chat.py``) talking to
+    an OpenAI-compatible endpoint: ``model`` / ``base_url`` / ``api_key_env`` /
+    ``request_timeout`` describe it. ``acp`` hands the pane to a coding harness
+    the user already runs, over the Agent Client Protocol: the ``acp_*`` settings
+    describe that one. Nothing is shared between the two but the pane.
+
+    The on/off switch is **not** here: it is ``observe.chat_enabled``, beside the
+    console's, because what it turns on is a pane on the observe page. This
+    section is only *which* agent that pane talks to, so there is one place to
+    enable a surface and one place to point it somewhere.
+
+    The provider key is deliberately not here either. This file is served whole
+    by the control's ``GET /api/mcp_config`` so the admin page can edit it, and a
+    key in it would be rendered in a browser; it lives in an owner-only
+    credential file instead (``biopb._credentials``, name ``chat-provider.token``)
+    for the same reasons that module was written. What is here is configuration
+    a person may reasonably want to change and no one needs to keep secret.
+    """
+
+    engine: str = _h(
+        "builtin",
+        "Which agent drives the pane: 'builtin' (the in-process loop, needs a "
+        "model and a provider key) or 'acp' (a coding harness you already have, "
+        "which brings its own model and its own subscription).",
+    )
+    model: str = _h(
+        "",
+        "Model id to send, e.g. 'gpt-4o' or 'deepseek-v4'. Empty means chat is "
+        "unconfigured, which reports as such rather than guessing a default that "
+        "would bill the user for a model they did not choose.",
+    )
+    base_url: str = _h(
+        "https://api.openai.com/v1",
+        "OpenAI-compatible chat-completions base URL. Any gateway speaking that "
+        "shape works; '/chat/completions' is appended.",
+    )
+    api_key_env: str = _h(
+        "BIOPB_CHAT_API_KEY",
+        "Environment variable consulted *before* the credential file. For CI and "
+        "development; the file is the supported path, because an env var leaks "
+        "through /proc, `ps e`, and every inherited child.",
+    )
+    request_timeout: float = _h(
+        120.0,
+        "Seconds to wait for one model reply. Covers a slow first token on a "
+        "long conversation, not the tool calls it triggers.",
+    )
+    acp_agent: str = _h(
+        "opencode",
+        "Which ACP harness to run when engine is 'acp'. Only 'opencode' is "
+        "supported: it is the one that ships an ACP mode natively and honours "
+        "the MCP server handed to it in the session handshake.",
+    )
+    acp_command: str = _h(
+        "",
+        "Absolute path to the harness binary, overriding the usual lookup. For "
+        "an install PATH does not reach; empty means resolve 'opencode' the "
+        "normal way.",
+    )
+    acp_model: str = _h(
+        "",
+        "Model the harness should use, in its own spelling (opencode: "
+        "'openai/gpt-5.5'). Empty takes whatever the harness defaults to — "
+        "which is a model you did not choose, on a provider that may not even "
+        "be reachable. Ignored by a harness that exposes no model setting.",
+    )
+    acp_permission: str = _h(
+        "ask",
+        "What to do when the harness asks permission to run something: 'ask' "
+        "puts the request in the pane, 'allow' answers yes for you. A harness "
+        "brings its own file and shell tools, so 'allow' is unattended access "
+        "to this machine, not just to the viewer.",
     )
 
 
@@ -483,6 +575,7 @@ class McpConfig:
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
     observe: ObserveConfig = field(default_factory=ObserveConfig)
+    chat: ChatConfig = field(default_factory=ChatConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
 
 
@@ -512,6 +605,12 @@ _CONSTRAINTS = {
     "MemoryConfig": {
         "warn_threshold_mb": Range(exclusive_min=0),
         "error_threshold_mb": Range(exclusive_min=0),
+    },
+    "ChatConfig": {
+        "request_timeout": Range(exclusive_min=0),
+        "engine": Enum({"builtin", "acp"}),
+        "acp_agent": Enum({"opencode"}),
+        "acp_permission": Enum({"ask", "allow"}),
     },
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),

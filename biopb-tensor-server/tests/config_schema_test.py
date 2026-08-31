@@ -156,6 +156,7 @@ def test_installer_default_config_validates(validator):
     "cfg",
     [
         {"pyramid": {"downscale_factor": 2}},  # boundary (min)
+        {"pyramid": {"plane_max_pixels": 1}},  # boundary (min)
         {"precache": {"backlog_high_water": 0.0}},  # boundary (min)
         {"precache": {"backlog_high_water": 1.0}},  # boundary (max)
         {"metadata_db": {"query_timeout_ms": 1}},  # boundary (min)
@@ -180,6 +181,7 @@ def test_accepts_valid(validator, cfg):
         {"pyramid": {"downscale_factor": 1}},  # silently single-level before
         {"pyramid": {"downscale_factor": 0}},  # ZeroDivisionError before
         {"pyramid": {"pixel_budget_cubic_root": 0}},  # infinite loop before
+        {"pyramid": {"plane_max_pixels": 0}},  # 2-D rungs ran to the floor before
         {"precache": {"backlog_high_water": 2}},
         {"cache": {"file_max_total_gb": 0}},
         {"sources": [{"type": "zarr"}]},  # missing required url
@@ -263,6 +265,9 @@ def test_legacy_aliases_present_and_marked_deprecated(schema):
     assert precache["downscale_factor"]["deprecated"] is True
     # the back-compat pyramid knob keeps its bound under [precache] too
     assert precache["downscale_factor"]["minimum"] == 2
+    # The pyramid ladder is live again (#826 reverted #818); the one knob
+    # retired here is the read ceiling a streamed scaled read no longer needs.
+    assert _section_props(schema, "pyramid")["max_read_block_mb"]["deprecated"] is True
     assert schema["properties"]["sources"]["items"]["properties"]["path"]["deprecated"]
     # source_id is derived from the URL, not user-assigned (biopb/biopb#308).
     assert schema["properties"]["sources"]["items"]["properties"]["source_id"][

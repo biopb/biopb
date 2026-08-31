@@ -12,20 +12,34 @@ a native on-disk pyramid level should be served (see adapters/ome_zarr.py).
 from __future__ import annotations
 
 import logging
+from itertools import product
 from typing import Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Default matches PyramidConfig.reduction_method so an unspecified-method
-# request agrees with the advertised pyramid levels and what precache warms.
-_DEFAULT_REDUCTION_METHOD = "area"
-# Public alias: since reduction_method left the chunk_id (biopb/biopb#178) it is
-# advisory (the cache key never distinguished it, #76), so a cold compute that has
-# no request in scope -- resolve_chunk_data on the do_get path -- downsamples with
-# this default.
-DEFAULT_REDUCTION_METHOD = _DEFAULT_REDUCTION_METHOD
+# What an unspecified reduction_method resolves to. "nearest" is a strided pick:
+# it never touches the bytes it discards, so it is the cheapest reduction at
+# every scale and the only one that gets cheaper as the level gets coarser (at
+# scale 32 it copies 1/1024 of the extent). It aliases where "area" averages,
+# which is the trade being made -- a client that wants the averaged pixels asks
+# for "area" explicitly.
+#
+_DEFAULT_REDUCTION_METHOD = "nearest"
+
+# What an ABSENT method byte in a scaled chunk_id means (core/chunk.py). Not a
+# policy default and not tied to the line above: it is a fact about bytes already
+# written, and it is frozen.
+#
+# The encoder now carries a code byte for every computed method, so nothing this
+# server mints is byte-free. A byte-free scaled chunk_id can therefore only come
+# from before that change -- an old cache entry, an id a client still holds, or
+# one a remote proxy forwarded from an older upstream -- and everything from
+# before that change was area. Repointing this at the current request default
+# would re-read all of them as the wrong method: same cache key, different
+# pixels, no error.
+CHUNK_ID_IMPLICIT_REDUCTION_METHOD = "area"
 _SUPPORTED_REDUCTION_METHODS = {"nearest", "area", "precompute"}
 _METHOD_ALIASES = {
     "stride": "nearest",
@@ -135,6 +149,51 @@ def _area_reduce_integer(
         new_shape = _blocked_shape(reduced.shape, axis, scale)
         reduced = reduced.reshape(new_shape).sum(axis=axis + 1, dtype=accumulator)
     return reduced
+
+
+# Block size at or below which the strided-add kernel is chosen. The two
+# kernels scale in opposite directions: reshape-sum gets cheaper as the block
+# grows (longer contiguous inner sums), while the strided one costs a pass over
+# the source per offset regardless. Measured on contiguous uint16 planes from
+# 0.24 MiB to 256 MiB, strided wins 1.4-7.6x for blocks up to 256 and loses ~2x
+# at 1024 -- which is the block the tensor browser's first, blank-screen read
+# uses on a large scene, so the bound is not a formality. Block 512 is
+# untested; 256 stays on the measured side of it.
+_STRIDED_ADD_MAX_BLOCK = 256
+
+
+def _area_reduce_strided(
+    padded: np.ndarray,
+    scale_hint: Tuple[int, ...],
+    accumulator: np.dtype,
+) -> np.ndarray:
+    """Block-sum `padded` by strided adds. Same contract as _area_reduce_integer.
+
+    `accumulator` MUST be the one :func:`_plan_integer_area` sized, never a
+    hardcoded uint32: it is chosen from block_size * dtype_max, so a uint16
+    input reduces into uint32 but a uint32 input needs uint64. Hardcoding the
+    width wraps silently -- the sum of block_size elements is exact in the
+    sized accumulator and garbage in a narrow one, with no error either way.
+
+    `padded` must already be a multiple of the scale on every axis
+    (:func:`_pad_array_edge` ran first), which is what makes the strided slices
+    tile it exactly. Do not substitute a trim: the pad is edge-replicated and
+    divided by the FULL block size, so trimming changes the values at a tensor
+    boundary.
+    """
+    acc = None
+    for offsets in product(*(range(scale) for scale in scale_hint)):
+        piece = padded[
+            tuple(
+                slice(offset, None, scale)
+                for offset, scale in zip(offsets, scale_hint, strict=True)
+            )
+        ]
+        if acc is None:
+            acc = piece.astype(accumulator)  # widens once, on the first term
+        else:
+            np.add(acc, piece, out=acc)  # every later term adds in place
+    return acc
 
 
 # Widest integer a float64 holds without loss. The block sum has to stay under
@@ -250,8 +309,13 @@ def downsample_block(
     if accumulator is not None:
         # Sum at input-ish width, then divide/round/clip on the *reduced* array
         # -- kilobytes instead of the hundreds of megabytes a full-resolution
-        # float64 promotion would touch.
-        reduced = _area_reduce_integer(padded, scale_hint, accumulator)
+        # float64 promotion would touch. Both kernels compute the same exact
+        # integer sum; only the traversal order differs (see
+        # _STRIDED_ADD_MAX_BLOCK).
+        if block_size <= _STRIDED_ADD_MAX_BLOCK:
+            reduced = _area_reduce_strided(padded, scale_hint, accumulator)
+        else:
+            reduced = _area_reduce_integer(padded, scale_hint, accumulator)
         info = np.iinfo(original_dtype)
         result = np.clip(np.round(reduced / block_size), info.min, info.max)
         return result.astype(original_dtype)

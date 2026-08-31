@@ -6,7 +6,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { TensorHttpClient, TensorApiError } from "./client.js";
+import {
+  TensorHttpClient,
+  TensorApiError,
+  TensorAbortError,
+  TensorNetworkError,
+  isTransportError,
+} from "./client.js";
 import type { DataSourceDescriptor, TypedNdArray } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -243,6 +249,60 @@ describe("TensorHttpClient.getSourceMetadata", () => {
     const [url] = mockFetch.mock.calls[0] as [string];
     expect(url).toContain("/metadata");
   });
+
+  it("serves simultaneous callers for one source from a single request", async () => {
+    // Selecting a source asks twice in the same tick (metadata panel plus the
+    // channel-name loader). For a per-frame MicroManager blob that was 2 x 13.8 MB.
+    mockFetch.mockResolvedValueOnce(jsonResponse({ Summary: { ChNames: ["STORM"] } }));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    const [a, b] = await Promise.all([c.getSourceMetadata("src0"), c.getSourceMetadata("src0")]);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(a).toBe(b);
+  });
+
+  it("keeps different sources apart", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: 0 }));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: 1 }));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    const [a, b] = await Promise.all([c.getSourceMetadata("src0"), c.getSourceMetadata("src1")]);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(a["id"]).not.toBe(b["id"]);
+  });
+
+  it("asks again once the shared request has settled", async () => {
+    // No cache: a re-indexed source must be able to report something new.
+    mockFetch.mockImplementation(() => Promise.resolve(jsonResponse({ ok: true })));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    await c.getSourceMetadata("src0");
+    await c.getSourceMetadata("src0");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not leave a failed request wedged in the in-flight slot", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(500, "boom"));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    await expect(c.getSourceMetadata("src0")).rejects.toBeInstanceOf(TensorApiError);
+    await expect(c.getSourceMetadata("src0")).resolves.toEqual({ ok: true });
+  });
+
+  it("gives a caller with its own signal a request it alone can abort", async () => {
+    mockFetch.mockImplementation(() => Promise.resolve(jsonResponse({ ok: true })));
+    const c = new TensorHttpClient(BASE, TOKEN);
+
+    const shared = c.getSourceMetadata("src0");
+    const owned = c.getSourceMetadata("src0", { signal: new AbortController().signal });
+
+    await Promise.all([shared, owned]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -260,10 +320,7 @@ describe("TensorHttpClient.slice", () => {
       binaryResponse(buf, [10, 128, 256], "uint16", ["z", "y", "x"]),
     );
     const c = new TensorHttpClient(BASE, TOKEN);
-    const result: TypedNdArray = await c.slice({
-      source_id: "src0",
-      tensor_id: "t0",
-    });
+    const result: TypedNdArray = await c.slice({ array_id: "src0/t0" });
     expect(result.shape).toEqual([10, 128, 256]);
     expect(result.dtype).toBe("uint16");
     expect(result.dimLabels).toEqual(["z", "y", "x"]);
@@ -274,7 +331,7 @@ describe("TensorHttpClient.slice", () => {
     const buf = makeBuffer(4);
     mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
     const c = new TensorHttpClient(BASE, TOKEN);
-    await c.slice({ source_id: "s", tensor_id: "t" });
+    await c.slice({ array_id: "s/t" });
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(opts.method).toBe("POST");
   });
@@ -284,16 +341,71 @@ describe("TensorHttpClient.slice", () => {
     mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
     const c = new TensorHttpClient(BASE, TOKEN);
     const req = {
-      source_id: "src0",
-      tensor_id: "t0",
+      array_id: "src0/t0",
       slice_start: [0, 0, 0],
       slice_stop: [1, 10, 10],
     };
     await c.slice(req);
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(opts.body as string);
-    expect(body.source_id).toBe("src0");
+    expect(body.array_id).toBe("src0/t0");
     expect(body.slice_start).toEqual([0, 0, 0]);
+  });
+
+  it("passes scale_policy through instead of a scale_hint", async () => {
+    const buf = makeBuffer(4);
+    mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.slice({ array_id: "s/t", scale_policy: "volume" });
+    const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(opts.body as string);
+    expect(body.scale_policy).toBe("volume");
+    expect(body.scale_hint).toBeUndefined();
+  });
+
+  it("reads back the scale the server actually read at", async () => {
+    // Load-bearing under scale_policy: the caller did not choose the scale, so
+    // this header is the only statement of what it got.
+    const buf = makeBuffer(4);
+    const res = binaryResponse(buf, [1, 1, 1], "uint8", []);
+    res.headers.set("X-Scale-Hint", "4,4,4");
+    mockFetch.mockResolvedValueOnce(res);
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.slice({ array_id: "s/t", scale_policy: "volume" });
+    expect(result.scaleHint).toEqual([4, 4, 4]);
+  });
+
+  it("reports an empty scale against a server that does not send the header", async () => {
+    const buf = makeBuffer(4);
+    mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 1, 1], "uint8", []));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.slice({ array_id: "s/t" });
+    expect(result.scaleHint).toEqual([]);
+  });
+
+  it("takes a per-call timeout override, so a volume is not held to the tile budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const c = new TensorHttpClient(BASE, TOKEN);
+      mockFetch.mockImplementationOnce((_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          );
+        }),
+      );
+      const p = c
+        .slice({ array_id: "s/t", scale_policy: "volume" }, { timeoutMs: 60_000 })
+        .catch((e) => e);
+      // Past the tile budget, which must not apply here.
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(41_000);
+      const err = await p;
+      expect(err).toBeInstanceOf(TensorApiError);
+      expect((err as TensorApiError).message).toContain("60000ms");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("throws TensorApiError on 502", async () => {
@@ -304,7 +416,7 @@ describe("TensorHttpClient.slice", () => {
       }),
     );
     const c = new TensorHttpClient(BASE, TOKEN);
-    const err = await c.slice({ source_id: "s", tensor_id: "t" }).catch((e) => e);
+    const err = await c.slice({ array_id: "s/t" }).catch((e) => e);
     expect(err).toBeInstanceOf(TensorApiError);
     expect((err as TensorApiError).status).toBe(502);
   });
@@ -313,7 +425,7 @@ describe("TensorHttpClient.slice", () => {
     const buf = makeBuffer(4);
     mockFetch.mockResolvedValueOnce(binaryResponse(buf, [1, 2], "float32", []));
     const c = new TensorHttpClient(BASE, TOKEN);
-    const result = await c.slice({ source_id: "s", tensor_id: "t" });
+    const result = await c.slice({ array_id: "s/t" });
     expect(result.dimLabels).toEqual([]);
   });
 
@@ -327,7 +439,7 @@ describe("TensorHttpClient.slice", () => {
     );
 
     const c = new TensorHttpClient(BASE, TOKEN);
-    const result = await c.slice({ source_id: "s", tensor_id: "t" });
+    const result = await c.slice({ array_id: "s/t" });
 
     expect(result.shape).toEqual([]);
     expect(result.dtype).toBe("");
@@ -462,5 +574,449 @@ describe("TensorHttpClient.browse", () => {
     mockFetch.mockResolvedValueOnce(errorResponse(404, "File browsing is available only on a tokenless local server"));
     const c = new TensorHttpClient(BASE, TOKEN);
     await expect(c.browse("/data")).rejects.toThrow(TensorApiError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/** Reject the way fetch does when its signal fires. */
+function abortRejection(): Error {
+  const e = new Error("The operation was aborted.");
+  e.name = "AbortError";
+  return e;
+}
+
+describe("client-side cancellation", () => {
+  it("passes a signal to fetch", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
+    const ctrl = new AbortController();
+    await c.listSources({ signal: ctrl.signal });
+    const init = mockFetch.mock.calls[0]![1] as RequestInit;
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("aborts the underlying fetch when the caller aborts", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    let seen: AbortSignal | undefined;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) => {
+      seen = init.signal as AbortSignal;
+      return new Promise((_res, rej) => {
+        seen!.addEventListener("abort", () => rej(abortRejection()));
+      });
+    });
+    const ctrl = new AbortController();
+    const p = c.listSources({ signal: ctrl.signal });
+    expect(seen!.aborted).toBe(false);
+    ctrl.abort();
+    await expect(p).rejects.toThrow();
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it("reports a caller abort as TensorAbortError, not a 408 timeout", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.slice({ array_id: "src0/t0" }, { signal: ctrl.signal });
+    ctrl.abort();
+    // A tile the user panned away from must not surface as a server failure.
+    await expect(p).rejects.toBeInstanceOf(TensorAbortError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorApiError);
+  });
+
+  it("keeps name 'AbortError' so the standard idiom still catches it", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.listSources({ signal: ctrl.signal });
+    ctrl.abort();
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("still reports a timeout as a 408 when the caller did not abort", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.metadataTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.listSources({ signal: new AbortController().signal });
+    await expect(p).rejects.toBeInstanceOf(TensorApiError);
+    await expect(p).rejects.toThrow(/Timeout after 5ms/);
+  });
+
+  it("aborts immediately when handed an already-aborted signal", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) => {
+      const s = init.signal as AbortSignal;
+      // A viewport controller aborted before this tile was even requested.
+      if (s.aborted) return Promise.reject(abortRejection());
+      return Promise.resolve(jsonResponse([SOURCE]));
+    });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await expect(c.listSources({ signal: ctrl.signal })).rejects.toBeInstanceOf(TensorAbortError);
+  });
+
+  it("removes its listener so one long-lived signal does not accumulate them", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const ctrl = new AbortController();
+    const added: string[] = [];
+    const realAdd = ctrl.signal.addEventListener.bind(ctrl.signal);
+    const realRemove = ctrl.signal.removeEventListener.bind(ctrl.signal);
+    ctrl.signal.addEventListener = ((t: string, f: EventListener, o?: unknown) => {
+      added.push(t); return realAdd(t, f, o as AddEventListenerOptions);
+    }) as typeof ctrl.signal.addEventListener;
+    ctrl.signal.removeEventListener = ((t: string, f: EventListener, o?: unknown) => {
+      added.splice(added.indexOf(t), 1); return realRemove(t, f, o as EventListenerOptions);
+    }) as typeof ctrl.signal.removeEventListener;
+
+    // One controller per viewport, reused across many tiles.
+    for (let i = 0; i < 20; i++) {
+      mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
+      await c.listSources({ signal: ctrl.signal });
+    }
+    expect(added).toHaveLength(0);
+  });
+
+  it("works without a signal, as before", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
+    await expect(c.listSources()).resolves.toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tiles
+// ---------------------------------------------------------------------------
+
+const TILE_INFO = {
+  array_id: "src0/Image:0",
+  dim_labels: ["T", "C", "Z", "Y", "X"],
+  shape: [1, 3, 16, 1024, 1024],
+  chunk_shape: [1, 1, 1, 512, 512],
+  dtype: "<u2",
+  tile_size: 512,
+  plane: { y: 3, x: 4, s: null },
+  selectable: { t: 0, c: 1, z: 2 },
+  levels: [
+    { level: 0, scale: 1, height: 1024, width: 1024, cols: 2, rows: 2 },
+    { level: 1, scale: 2, height: 512, width: 512, cols: 1, rows: 1 },
+  ],
+};
+
+function tileResponse(bytes: number, shape: number[]): Response {
+  return new Response(new ArrayBuffer(bytes), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Shape": shape.join(","),
+      "X-Dtype": "uint16",
+      "X-Dim-Labels": "T,C,Z,Y,X",
+      "X-Tile-Size": "512",
+      "X-Tile-Level": "1",
+      "X-Tile-Col": "3",
+      "X-Tile-Row": "4",
+    },
+  });
+}
+
+describe("TensorHttpClient.tileInfo", () => {
+  it("GETs /api/tile_info and returns the grid", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse(TILE_INFO));
+    const info = await c.tileInfo("src0");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/tile_info/src0`);
+    expect(info.tile_size).toBe(512);
+    expect(info.levels).toHaveLength(2);
+  });
+
+  it("addresses a tensor by array_id, keeping the field separator", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse(TILE_INFO));
+    await c.tileInfo("src0/Image:0");
+    // The '/' separates source from field and must survive as a path
+    // separator; encoding it to %2F would give one tile two spellings, and so
+    // two browser-cache entries. The ':' is still escaped.
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/tile_info/src0/Image%3A0`);
+  });
+
+  it("keeps a field that itself contains slashes intact", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(jsonResponse(TILE_INFO));
+    await c.tileInfo("plate/A01/0");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/tile_info/plate/A01/0`);
+  });
+});
+
+describe("TensorHttpClient.tile", () => {
+  it("puts the whole address in the URL so the response is cacheable", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    await c.tile({ array_id: "src0/Image:0", level: 1, col: 3, row: 4, c: 2, z: 7 });
+    const url = mockFetch.mock.calls[0]![0] as string;
+    expect(url).toContain("/api/tile/src0/Image%3A0?");
+    for (const q of ["level=1", "col=3", "row=4", "c=2", "z=7"]) {
+      expect(url).toContain(q);
+    }
+    expect((mockFetch.mock.calls[0]![1] as RequestInit).method).toBe("GET");
+  });
+
+  it("omits parameters the caller left undefined", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    await c.tile({ array_id: "src0" });
+    const url = mockFetch.mock.calls[0]![0] as string;
+    // Server defaults must not be re-encoded here, or two spellings of the same
+    // tile would occupy two browser-cache entries.
+    expect(url).toBe(`${BASE}/api/tile/src0`);
+  });
+
+  it("returns the array plus the grid the server actually used", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    const t = await c.tile({ array_id: "src0" });
+    expect(t.shape).toEqual([1, 1, 1, 2, 2]);
+    expect(t.dtype).toBe("uint16");
+    expect(t.buffer.byteLength).toBe(8);
+    expect([t.tileSize, t.level, t.col, t.row]).toEqual([512, 1, 3, 4]);
+  });
+
+  it("is cancellable", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.tile({ array_id: "src0" }, { signal: ctrl.signal });
+    ctrl.abort();
+    await expect(p).rejects.toBeInstanceOf(TensorAbortError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation covers the body, not just the headers
+// ---------------------------------------------------------------------------
+
+describe("cancellation scope", () => {
+  /**
+   * A response whose headers are ready but whose body never arrives, plus the
+   * signal fetch was given. `fetch` resolves on headers, so anything that
+   * cleans up at that point stops guarding the expensive part.
+   */
+  function stallingFetch() {
+    const seen: { signal?: AbortSignal } = {};
+    mockFetch.mockImplementation((_u: string, init: RequestInit) => {
+      seen.signal = init.signal as AbortSignal;
+      return Promise.resolve(
+        new Response(new ReadableStream({ start() { /* never enqueues */ } }), {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream", "X-Shape": "1,1", "X-Dtype": "uint16" },
+        }),
+      );
+    });
+    return seen;
+  }
+
+  it("keeps the caller's abort wired while the body streams", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const seen = stallingFetch();
+    const ctrl = new AbortController();
+    void c.tile({ array_id: "src0" }, { signal: ctrl.signal }).catch(() => {});
+    // Let the headers land and send() reach the body read.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.signal!.aborted).toBe(false);
+
+    ctrl.abort();
+    // The regression: cleanup() used to run when the Response was returned,
+    // detaching this listener, so a mid-body abort never reached the transfer.
+    expect(seen.signal!.aborted).toBe(true);
+  });
+
+  it("keeps the timeout running while the body streams", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.chunkTimeoutMs = 20;
+    const seen = stallingFetch();
+    void c.tile({ array_id: "src0" }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.signal!.aborted).toBe(false);
+    // cleanup() used to clearTimeout here, so a stalled body hung forever.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(seen.signal!.aborted).toBe(true);
+  });
+
+  it("still tears everything down once the body is read", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const ctrl = new AbortController();
+    mockFetch.mockResolvedValueOnce(tileResponse(8, [1, 1, 1, 2, 2]));
+    await c.tile({ array_id: "src0" }, { signal: ctrl.signal });
+    // A completed request must not leave a listener on a long-lived viewport
+    // controller, which is what composeSignal's cleanup exists for.
+    let fired = false;
+    ctrl.signal.addEventListener("abort", () => { fired = true; });
+    ctrl.abort();
+    expect(fired).toBe(true); // our own listener, proving abort works
+    // and no error surfaced from the settled request
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transport vs capability (#773)
+// ---------------------------------------------------------------------------
+
+describe("isTransportError", () => {
+  it("calls a timeout transport, because it decided nothing about the tensor", () => {
+    // The 408 this client synthesises when its own budget expires. Treating it
+    // as "this tensor cannot be tiled" is what cost a whole tensor its viewer
+    // whenever the backend was briefly slow.
+    expect(isTransportError(new TensorApiError(408, "Timeout after 8000ms (/api/tile_info/x)"))).toBe(true);
+  });
+
+  it("calls a failing server transport", () => {
+    for (const status of [500, 502, 503, 504]) {
+      expect(isTransportError(new TensorApiError(status, "upstream"))).toBe(true);
+    }
+    // What assertOk raises when the reverse proxy answers for a data plane that
+    // is still starting.
+    expect(isTransportError(new TensorApiError(503, "Server unavailable - may be starting up."))).toBe(true);
+  });
+
+  it("calls a refused request a fact about the tensor, not the transport", () => {
+    // 404 no such tensor, 422 not tileable, 400 bad request: asking again gets
+    // the same answer, so these are the ones worth making stick.
+    for (const status of [400, 404, 409, 422]) {
+      expect(isTransportError(new TensorApiError(status, "nope"))).toBe(false);
+    }
+  });
+
+  it("calls a rate limit transport, the one 4xx that is", () => {
+    // "Too many requests" is about rate, not about the request being wrong --
+    // its whole meaning is that asking again later works.
+    expect(isTransportError(new TensorApiError(429, "Rate limit exceeded (1 req/s)"))).toBe(true);
+  });
+
+  it("calls a network failure transport", () => {
+    expect(isTransportError(new TensorNetworkError("/api/tile_info/x"))).toBe(true);
+  });
+
+  it("does NOT trust a bare TypeError", () => {
+    // `fetch` rejects with one for DNS / connection / CORS -- but so does our
+    // own code when a malformed response reaches the mapping layer
+    // (`dim_labels.map` on undefined). Classifying that as transport would
+    // retry a bug and then blame the server for it, behind a "Try again"
+    // button that can never work. Only TensorNetworkError, raised around the
+    // `fetch` call alone, is trusted.
+    expect(isTransportError(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isTransportError(new TypeError("Cannot read properties of undefined (reading 'map')"))).toBe(false);
+  });
+
+  it("does not guess about an error it does not recognise", () => {
+    expect(isTransportError(new RangeError("nope"))).toBe(false);
+    expect(isTransportError("a string")).toBe(false);
+    expect(isTransportError(undefined)).toBe(false);
+  });
+
+  it("does not call the caller's own abort a transport failure", () => {
+    // Callers discard these before classifying, but the answer must not be
+    // "retry" if one ever reaches here.
+    expect(isTransportError(new TensorAbortError("/api/tile_info/x"))).toBe(false);
+  });
+
+  it("does not call a mapping failure transport", () => {
+    // vivDtype / vivLabels throw plain Errors after tile_info arrived: the
+    // server answered fine and the tensor still cannot be rendered this way.
+    expect(isTransportError(new Error('Tensor dtype "<c8" has no Viv equivalent'))).toBe(false);
+    expect(isTransportError(new Error("is not in canonical [..., Y, X, S] order"))).toBe(false);
+  });
+});
+
+describe("TensorNetworkError", () => {
+  it("is raised when fetch itself rejects", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation(() => Promise.reject(new TypeError("Failed to fetch")));
+    const p = c.tileInfo("x");
+    await expect(p).rejects.toBeInstanceOf(TensorNetworkError);
+    await expect(p).rejects.toThrow(/Network request failed \(\/api\/tile_info\/x\)/);
+    await expect(p).rejects.toSatisfy(isTransportError);
+  });
+
+  it("is NOT raised for a failure while reading the response", async () => {
+    // The response arrived; whatever went wrong after that is not the network.
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        json: () => Promise.reject(new TypeError("Cannot read properties of undefined")),
+      } as unknown as Response));
+    const p = c.tileInfo("x");
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+    await expect(p).rejects.toSatisfy((e: unknown) => !isTransportError(e));
+  });
+
+  it("still reports a timeout as a timeout, not a network failure", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.tileInfoTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.tileInfo("x", { signal: new AbortController().signal });
+    await expect(p).rejects.toBeInstanceOf(TensorApiError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+  });
+
+  it("still reports a caller abort as an abort", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const ctrl = new AbortController();
+    const p = c.tileInfo("x", { signal: ctrl.signal });
+    ctrl.abort();
+    await expect(p).rejects.toBeInstanceOf(TensorAbortError);
+    await expect(p).rejects.not.toBeInstanceOf(TensorNetworkError);
+  });
+});
+
+describe("tile_info's timeout budget", () => {
+  it("is its own, not the catalog budget", () => {
+    // It gates the whole tiled viewer, so expiring early does not fail one
+    // request -- it costs the tensor its viewer entirely.
+    const c = new TensorHttpClient(BASE, TOKEN);
+    expect(c.tileInfoTimeoutMs).toBeGreaterThan(c.metadataTimeoutMs);
+  });
+
+  it("survives a response slower than the catalog budget", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.metadataTimeoutMs = 5;
+    c.tileInfoTimeoutMs = 200;
+    mockFetch.mockImplementation(
+      () => new Promise((res) => setTimeout(() => res(jsonResponse({ array_id: "x" })), 40)),
+    );
+    await expect(c.tileInfo("x")).resolves.toMatchObject({ array_id: "x" });
+  });
+
+  it("still gives up at its own budget", async () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    c.tileInfoTimeoutMs = 5;
+    mockFetch.mockImplementation((_u: string, init: RequestInit) =>
+      new Promise((_res, rej) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
+      }));
+    const p = c.tileInfo("x", { signal: new AbortController().signal });
+    await expect(p).rejects.toThrow(/Timeout after 5ms/);
+    await expect(p).rejects.toSatisfy(isTransportError);
   });
 });

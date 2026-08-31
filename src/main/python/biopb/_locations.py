@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,15 @@ logger = logging.getLogger(__name__)
 # a test / an unusual deployment can repoint the registry without moving the rest
 # of the state tree. BIOPB_STATE_HOME moves everything; this moves only sessions.
 SESSIONS_DIR_ENV = "BIOPB_SESSIONS_DIR"
+
+# Env var naming the file a session's own stdout/stderr went to, so the session
+# can report it (``server_status``) and an agent's ``execute_code`` can read it
+# from ``os.environ``. Set by whoever redirected that output -- the stdio shim
+# for the child it spawns, the control for a viewer it launches -- and read by
+# the session itself. Defined here because that is now three processes across
+# two packages that must agree on one string, and none of them may import the
+# others (control ARCHITECTURE.md, I2).
+MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 
 
 # --- base trees ---------------------------------------------------------- #
@@ -91,6 +101,7 @@ SESSIONS_DIR_ENV = "BIOPB_SESSIONS_DIR"
 _TREE_ENV_CONFIG = "BIOPB_CONFIG_HOME"
 _TREE_ENV_STATE = "BIOPB_STATE_HOME"
 _TREE_ENV_DATA = "BIOPB_DATA_HOME"
+_TREE_ENV_CACHE = "BIOPB_CACHE_HOME"
 
 # One warning per (biopb var) per process: relocating via XDG used to work, so a
 # stale deployment must be told its tree moved back to the default rather than
@@ -163,6 +174,38 @@ def state_dir() -> Path:
 def data_dir() -> Path:
     """Data tree (``~/.local/share/biopb``): portable assets (webapp bundle, samples)."""
     return _tree(_TREE_ENV_DATA, "XDG_DATA_HOME", ".local/share")
+
+
+def cache_dir() -> Path:
+    """Cache tree: regenerable bytes, safe to delete.
+
+    ``~/.cache/biopb``, and ``%LOCALAPPDATA%\\biopb\\Cache`` on Windows.
+
+    Distinct from :func:`state_dir` precisely because everything here can be
+    thrown away without losing anything -- the SDK's on-disk chunk cache is the
+    first tenant, and its recovery story is "unlink whatever does not parse". A
+    user (or a distro's cache janitor) may empty this tree at any time.
+
+    **The one tree that is not the same layout on every platform.** The other
+    three hold kilobytes of config, state, and assets, so a uniform dotted layout
+    costs nothing. This one is sized to hold tens of gigabytes, which is exactly
+    what Windows separates ``%LOCALAPPDATA%`` (non-roaming, not backed up) from
+    the profile root to keep out of roaming profiles and Folder Redirection.
+    Syncing a chunk cache across a network profile is the harm; the divergence
+    buys avoiding it, and only here because only here is the tree big.
+
+    ``AppData/Local`` is derived from :func:`Path.home`, not read from
+    ``%LOCALAPPDATA%``. Trusting an inherited environment variable to place a
+    base tree is precisely the biopb/biopb#790 bug, and nothing about that lesson
+    changes for a variable Windows happens to own by convention.
+    """
+    if sys.platform == "win32":
+        raw = os.environ.get(_TREE_ENV_CACHE)
+        if raw:
+            _require_absolute(_TREE_ENV_CACHE, raw)
+            return Path(raw) / "biopb"
+        return Path.home() / "AppData" / "Local" / "biopb" / "Cache"
+    return _tree(_TREE_ENV_CACHE, "XDG_CACHE_HOME", ".cache")
 
 
 # --- config file (location + format) ------------------------------------- #
@@ -301,6 +344,27 @@ def mcp_log_dir() -> Path:
 def mcp_server_log() -> Path:
     """Canonical combined log for a direct ``--transport http`` MCP launch."""
     return mcp_log_dir() / "mcp-server.log"
+
+
+def mcp_viewer_log_dir() -> Path:
+    """Where a viewer session the **control** launched writes its output.
+
+    Control-launched viewers are the one session kind whose output has no other
+    home: a shim-owned child logs to the shim's per-session file and a
+    ``biopb mcp view`` started by hand writes to that terminal, but a viewer
+    spawned from the dashboard has neither. Lives here, in the core SDK, because
+    the control may not import biopb-mcp (control ARCHITECTURE.md, I2) and so
+    cannot ask it where its logs go.
+
+    **One file per launch**, beside the shim's per-session directory and for the
+    same reason: concurrent viewers sharing one file interleave, and a log whose
+    lines cannot be attributed to a process is not a log you can diagnose a
+    running session from. Retention is the caller's (the control prunes to the
+    newest few, as the shim does).
+    """
+    d = mcp_log_dir() / "viewers"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 # --- session registry / pids / sentinels --------------------------------- #

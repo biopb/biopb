@@ -36,7 +36,7 @@ is a client route of the same bundle:
 | `/session/:id/observe`         | `ObservePage`    | `/session/:id/api/*` (proxied to child)|
 
 `main.tsx` wires the routes; the dashboard and observe pages are `React.lazy`
-chunks so the observe shell doesn't pull the heavy Pixi/Arrow viewer. Assets are
+chunks, and the tiled viewer is another, so no other route pulls deck.gl. Assets are
 requested from the absolute root (`/assets/*`), so they resolve no matter which
 prefix (`/`, `/viewer`, `/session/<id>/observe`) the shell was served under.
 
@@ -47,8 +47,7 @@ pnpm install                     # in web/
 pnpm dev                         # Vite dev server (HMR) on :5173
 ```
 
-`pnpm dev` proxies `/api`, `/data_plane` (incl. the `/data_plane/ws/render`
-websocket), and `/session` to a live control on `http://localhost:8813` (start
+`pnpm dev` proxies `/api`, `/data_plane`, and `/session` to a live control on `http://localhost:8813` (start
 one with `biopb control start`). In dev the viewer defaults its data plane to the
 proxied `/data_plane`, so plain `pnpm dev` renders end-to-end against that control
 — no env var needed, in dev or in a build.

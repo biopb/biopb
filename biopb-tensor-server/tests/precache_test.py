@@ -10,7 +10,7 @@ from biopb_tensor_server.core.chunk import (
     compute_precache_scale_hint,
     is_scaled_chunk,
 )
-from biopb_tensor_server.core.config import PrecacheConfig
+from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -24,65 +24,12 @@ def _zarr_available() -> bool:
         return False
 
 
-def _import_biopb_mcp():
-    """Return biopb-mcp's _tensor_utils module if importable, else None."""
-    try:
-        from biopb_mcp import _tensor_utils
-
-        return _tensor_utils
-    except Exception:
-        return None
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return -(-a // b)
-
-
-def _simulate_client_terminal_scale(shape, labels, threshold, downscale, budget_root):
-    """Reproduce biopb-mcp build_pyramid_levels' terminal (sx, sy, sz) as a
-    full per-axis scale vector, computed analytically (no get_tensor calls).
-
-    Kept independent of our implementation so the cross-check is meaningful.
-    """
-    ndim = len(shape)
-    budget = budget_root**3
-    floor = min(budget_root, threshold)
-    lbl = [str(x).lower() for x in labels] if labels else None
-    if lbl and "y" in lbl and "x" in lbl:
-        y_idx, x_idx = lbl.index("y"), lbl.index("x")
-    else:
-        y_idx, x_idx = ndim - 2, ndim - 1
-    if lbl:
-        z_idx = lbl.index("z") if "z" in lbl else None
-    else:
-        z_idx = ndim - 3 if ndim >= 3 else None
-    if z_idx is not None and z_idx in (x_idx, y_idx):
-        z_idx = None
-
-    sx = sy = sz = 1
-    while True:
-        lx = _ceil_div(shape[x_idx], sx)
-        ly = _ceil_div(shape[y_idx], sy)
-        lz = _ceil_div(shape[z_idx], sz) if z_idx is not None else 1
-        if lx * ly * lz <= budget and lx <= threshold and ly <= threshold:
-            break
-        nsx = sx * downscale if lx > floor else sx
-        nsy = sy * downscale if ly > floor else sy
-        nsz = sz * downscale if (z_idx is not None and lz > floor) else sz
-        if (nsx, nsy, nsz) == (sx, sy, sz):
-            break
-        sx, sy, sz = nsx, nsy, nsz
-
-    scale = [1] * ndim
-    scale[x_idx] = sx
-    scale[y_idx] = sy
-    if z_idx is not None:
-        scale[z_idx] = sz
-    return scale
-
-
 # ---------------------------------------------------------------------------
-# 1. Scale-hint computation -- must match biopb-mcp's coarsest pyramid level.
+# 1. Scale-hint computation -- the level precache warms and the server
+#    advertises. It used to be cross-checked against a hand-copy of
+#    biopb-mcp's own pyramid loop; that loop is gone (the client reads the
+#    advertised pyramid now and computes nothing), so the invariant is
+#    server-internal and lives in TestAdvertisedPlanIsWhatIsWarmed below.
 # ---------------------------------------------------------------------------
 
 
@@ -90,12 +37,15 @@ class TestComputePrecacheScaleHint:
     @pytest.mark.parametrize(
         "shape,labels,expected",
         [
-            # Small 2-D: below threshold, no downsampling.
-            ([2048, 2048], ["y", "x"], [1, 1]),
+            # Clearly under the plane cap: no downsampling.
+            ([1500, 1500], ["y", "x"], [1, 1]),
+            # The boundary: 2048**2 = 4.19 Mpx just exceeds plane_max_pixels
+            # (4 Mpx), so it earns exactly one rung.
+            ([2048, 2048], ["y", "x"], [2, 2]),
             # Large 2-D: X/Y land in (1024, 4096].
             ([20000, 20000], ["y", "x"], [16, 16]),
-            # Deep volume: the 512**3 voxel budget dominates, not the 4096 X/Y
-            # rule -- this is the case a naive "shrink X/Y to <4096" gets wrong.
+            # Deep volume: the voxel budget dominates, not the X/Y cap --
+            # this is the case a naive "shrink X/Y only" gets wrong.
             ([1000, 8000, 8000], ["z", "y", "x"], [4, 16, 16]),
             # Thin-z stack: z stays at the floor (never over-shrunk).
             ([8, 20000, 20000], ["z", "y", "x"], [1, 16, 16]),
@@ -122,35 +72,61 @@ class TestComputePrecacheScaleHint:
         ly = (20000 + scale[0] - 1) // scale[0]
         assert ly <= 1024
 
-    @pytest.mark.skipif(
-        _import_biopb_mcp() is None,
-        reason="biopb-mcp not importable for cross-check",
-    )
-    def test_matches_biopb_mcp_loop(self):
-        """Cross-check against biopb-mcp's actual pyramid loop, if importable."""
-        tu = _import_biopb_mcp()
-        get_setting = tu.get_setting
-        cfg = tu.CONFIG.as_dict()
-        threshold = get_setting(cfg, "pyramid.threshold")
-        downscale = get_setting(cfg, "pyramid.downscale_factor")
-        budget_root = get_setting(cfg, "pyramid.pixel_budget_cubic_root")
 
-        for shape, labels in [
-            ([20000, 20000], ["y", "x"]),
-            ([1000, 8000, 8000], ["z", "y", "x"]),
-            ([8, 20000, 20000], ["z", "y", "x"]),
-        ]:
-            ours = compute_precache_scale_hint(
-                shape,
-                labels,
-                threshold=threshold,
-                downscale_factor=downscale,
-                pixel_budget_cubic_root=budget_root,
-            )
-            theirs = _simulate_client_terminal_scale(
-                shape, labels, threshold, downscale, budget_root
-            )
-            assert ours == theirs, f"mismatch for {shape}: {ours} != {theirs}"
+class TestAdvertisedPlanIsWhatIsWarmed:
+    """Every advertised level below full resolution is one precache warms.
+
+    This is what the removed biopb-mcp cross-check was really protecting. That
+    test asserted the server's coarsest scale matched a scale the *client*
+    computed, which was the right invariant while biopb-mcp had a pyramid loop
+    of its own. It no longer does -- it requests the levels the descriptor
+    advertises and guesses nothing -- so agreement is no longer a coincidence
+    two implementations have to maintain. What can still drift is the pair on
+    *this* side: the plan the server advertises and the set precache warms are
+    computed by two functions, and a client that opens at an advertised level
+    nothing warmed pays a cold read for a level that was supposed to be free.
+
+    (The old test could not have caught that drift anyway. It imported
+    `biopb_mcp` from wherever the venv resolved it, which in a sibling worktree
+    is the *other* checkout -- so it validated a tree that was not under test.)
+    """
+
+    @pytest.mark.parametrize(
+        "shape,labels",
+        [
+            ([1, 4, 1, 14234, 14234], ["t", "c", "z", "y", "x"]),
+            ([100000, 100000], ["y", "x"]),
+            ([1024, 1024, 1024], ["z", "y", "x"]),
+            ([200, 2048, 2048], ["z", "y", "x"]),
+            ([1000, 6000, 6000], ["z", "y", "x"]),
+            ([40, 1024, 1024], ["z", "y", "x"]),
+            ([500, 2, 1024, 1024], ["t", "c", "y", "x"]),
+        ],
+    )
+    def test_the_warm_set_is_the_plan_without_its_first_level(self, shape, labels):
+        from biopb_tensor_server.core.chunk import (
+            build_pyramid_plan,
+            compute_warm_targets,
+        )
+
+        advertised = [list(lv.scale_hint) for lv in build_pyramid_plan(shape, labels)]
+        warmed = [list(t.scale_hint) for t in compute_warm_targets(shape, labels)]
+
+        assert advertised[0] == [1] * len(shape), "level 0 is full resolution"
+        assert warmed == advertised[1:]
+
+    def test_a_tensor_that_passes_no_gate_advertises_nothing_to_warm(self):
+        # The gates are the list length, so "one level" and "warm nothing" have
+        # to be the same verdict -- otherwise precache chases a level that is
+        # full resolution under another name.
+        from biopb_tensor_server.core.chunk import (
+            build_pyramid_plan,
+            compute_warm_targets,
+        )
+
+        shape, labels = [40, 1024, 1024], ["z", "y", "x"]
+        assert len(build_pyramid_plan(shape, labels)) == 1
+        assert compute_warm_targets(shape, labels) == []
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +231,7 @@ class TestWarming:
             td = adapter.list_tensor_descriptors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
             scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
-            assert scale == [4, 4]
+            assert scale == [8, 8]
             from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
             req = TensorDescriptor(
@@ -266,7 +242,7 @@ class TestWarming:
                 dtype=td.dtype,
             )
             req.scale_hint[:] = scale
-            req.reduction_method = "area"
+            req.reduction_method = PyramidConfig().reduction_method
             plan = ta.get_read_plan(req)
             assert len(plan.chunk_endpoints) > 0
             for ce in plan.chunk_endpoints:
@@ -612,7 +588,9 @@ class TestPreemptionAndLifecycle:
 from types import SimpleNamespace  # noqa: E402
 
 
-def _register_zarr(server, tmp_path, source_id, shape=(8192, 8192)):
+def _register_zarr(
+    server, tmp_path, source_id, shape=(8192, 8192), labels=("y", "x"), chunks=None
+):
     import zarr
     from biopb_tensor_server import ZarrAdapter
 
@@ -620,11 +598,11 @@ def _register_zarr(server, tmp_path, source_id, shape=(8192, 8192)):
         str(tmp_path / f"{source_id}.zarr"),
         mode="w",
         shape=shape,
-        chunks=(1024, 1024),
+        chunks=chunks or (1024, 1024),
         dtype="uint16",
     )
     arr[:] = 3
-    adapter = ZarrAdapter(arr, source_id, ["y", "x"])
+    adapter = ZarrAdapter(arr, source_id, list(labels))
     server.register_source(source_id, adapter)
     return adapter
 
@@ -646,7 +624,7 @@ def _located_all(server, cache_manager, source_ids):
             dtype=td.dtype,
         )
         req.scale_hint[:] = scale
-        req.reduction_method = "area"
+        req.reduction_method = PyramidConfig().reduction_method
         plan = ta.get_read_plan(req)
         if not plan.chunk_endpoints:
             return False
@@ -1020,6 +998,357 @@ class TestSkipNativePyramid:
 # ---------------------------------------------------------------------------
 
 
+class TestSkipUnscaledCoarsestLevel:
+    """A tensor whose coarsest advertised level is full resolution is not warmed.
+
+    Warming it would cache the source 1:1 and save an open nothing, because
+    there is no decode+downsample to precompute.
+    """
+
+    def _init_file_cache(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.core.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+
+    def _warm_one_tensor(self, tmp_path, shape, labels, chunks=None):
+        """Run one tensor through the worker; return the cache's miss count."""
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = _register_zarr(
+                server, tmp_path, "src", shape=shape, labels=labels, chunks=chunks
+            )
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            cm = CacheManager.get_instance()
+            td = adapter.list_tensor_descriptors()[0]
+            preempted = worker._process_tensor(adapter, td, cm)
+            assert preempted is False
+            return cm.stats().misses
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_skips_tensor_already_under_the_pixel_budget(self, tmp_path):
+        # 1024x1024 needs no downsampling, so the coarsest level is level 0.
+        assert compute_precache_scale_hint([1024, 1024], ["y", "x"]) == [1, 1]
+        assert self._warm_one_tensor(tmp_path, (1024, 1024), ("y", "x")) == 0
+
+    def test_warms_tensor_that_has_a_scale_rung(self, tmp_path):
+        # The contrast case: 8192x8192 earns an 8x rung, so warming pays.
+        assert compute_precache_scale_hint([8192, 8192], ["y", "x"]) == [8, 8]
+        assert self._warm_one_tensor(tmp_path, (8192, 8192), ("y", "x")) > 0
+
+    def test_skips_long_timelapse_with_small_frames(self, tmp_path):
+        """The case the gate exists for.
+
+        The planner scores ``Lx*Ly*Lz`` only, so T never enters the pixel budget
+        and is never scaled: a many-frame series of small frames is both the
+        most expensive thing to warm and the one warming does nothing for.
+        """
+        shape, labels = (4000, 256, 256), ("t", "y", "x")
+        assert compute_precache_scale_hint(list(shape), list(labels)) == [1, 1, 1]
+        assert self._warm_one_tensor(tmp_path, shape, labels, chunks=(1, 256, 256)) == 0
+
+    def test_gate_tracks_the_planner_not_a_size_threshold(self):
+        """The skip condition is exactly the planner's all-ones coarsest level.
+
+        If the two ever diverge the worker would warm chunk_ids no client asks
+        for, so this pins them together rather than to a pixel count.
+        """
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
+
+        for shape, labels in [
+            ([1024, 1024], ["y", "x"]),
+            ([4000, 256, 256], ["t", "y", "x"]),
+            ([8192, 8192], ["y", "x"]),
+            ([10, 3, 20000, 20000], ["t", "c", "y", "x"]),
+        ]:
+            levels = build_pyramid_plan(shape, labels)
+            unscaled = all(s == 1 for s in levels[-1].scale_hint)
+            assert unscaled == (len(levels) == 1)
+
+
+class TestSparsePlanAndIndependentGates:
+    """The plan carries full resolution plus the levels precache warms, no more.
+
+    The two gates of docs/precache-policy.md §5.1 are not separate code: a target
+    is emitted only where it shrinks something, so the list length *is* the
+    verdict. These rows are that table.
+    """
+
+    # (name, shape, labels, warmed scales)
+    GATE_TABLE = [
+        # 2-D only: a big plane, nothing to bound in Z.
+        ("nd2", [1, 4, 1, 14234, 14234], ["t", "c", "z", "y", "x"], [[1, 1, 1, 8, 8]]),
+        ("wsi", [100000, 100000], ["y", "x"], [[64, 64]]),
+        # 3-D only: 1 Mpx planes are already cheap, but 1074 Mvox is not. The
+        # case that forces the gates apart -- the downscale 3-D needs is itself
+        # the expensive read.
+        ("cube", [1024, 1024, 1024], ["z", "y", "x"], [[4, 4, 4]]),
+        # Both.
+        ("confocal", [200, 2048, 2048], ["z", "y", "x"], [[1, 2, 2], [1, 4, 4]]),
+        ("lightsheet", [1200, 2048, 2048], ["z", "y", "x"], [[1, 2, 2], [4, 8, 8]]),
+        ("big3D", [1000, 6000, 6000], ["z", "y", "x"], [[1, 4, 4], [4, 16, 16]]),
+        # Neither.
+        ("thin stack", [40, 1024, 1024], ["z", "y", "x"], []),
+        ("timelapse", [500, 2, 1024, 1024], ["t", "c", "y", "x"], []),
+    ]
+
+    @pytest.mark.parametrize(
+        "name,shape,labels,warmed", GATE_TABLE, ids=[r[0] for r in GATE_TABLE]
+    )
+    def test_gate_table(self, name, shape, labels, warmed):
+        from biopb_tensor_server.core.chunk import (
+            compute_pyramid_scale_hints,
+            compute_warm_scale_hints,
+        )
+
+        assert compute_warm_scale_hints(shape, labels) == warmed
+        # Full resolution is always level 0 and is never warmed.
+        full = compute_pyramid_scale_hints(shape, labels)
+        assert full[0] == [1] * len(shape)
+        assert full[1:] == warmed
+
+    @pytest.mark.parametrize(
+        "name,shape,labels,warmed", GATE_TABLE, ids=[r[0] for r in GATE_TABLE]
+    )
+    def test_plan_is_at_most_three_levels(self, name, shape, labels, warmed):
+        from biopb_tensor_server.core.chunk import compute_pyramid_scale_hints
+
+        assert 1 <= len(compute_pyramid_scale_hints(shape, labels)) <= 3
+
+    def test_intermediate_rungs_are_absent(self):
+        """A 14234² plane reaches its target by halving 3x, but only the landing
+        is a level -- the steps through 2 and 4 cost a client a level-0 read and
+        save it nothing (measured; see compute_pyramid_scale_hints)."""
+        from biopb_tensor_server.core.chunk import compute_pyramid_scale_hints
+
+        scales = compute_pyramid_scale_hints([14234, 14234], ["y", "x"])
+        assert scales == [[1, 1], [8, 8]]
+
+    def test_targets_are_monotone_per_axis(self):
+        """napari requires non-decreasing downsample_factors per axis."""
+        from biopb_tensor_server.core.chunk import compute_pyramid_scale_hints
+
+        for _name, shape, labels, _w in self.GATE_TABLE:
+            scales = compute_pyramid_scale_hints(shape, labels)
+            for finer, coarser in zip(scales, scales[1:], strict=False):
+                assert all(b >= a for a, b in zip(finer, coarser, strict=True)), (
+                    shape,
+                    scales,
+                )
+
+    def test_a_tensor_with_both_targets_warms_both(self):
+        """The regression this replaces: warming only [-1] left the 2-D target
+        cold, which is the level the browser's tile route anchors on."""
+        from biopb_tensor_server.core.chunk import compute_warm_scale_hints
+
+        shape, labels = [200, 2048, 2048], ["z", "y", "x"]
+        assert len(compute_warm_scale_hints(shape, labels)) == 2
+
+
+class TestWarmSelection:
+    """The selection window: what bounds the warm set (policy §5.3).
+
+    A warm level is a plane (a volume, on the 3-D target) repeated across every
+    other axis. The plane is never narrowed; the selection axes give up extent,
+    in T -> Z -> C order, until the level fits the budget.
+    """
+
+    MIB = 1024 * 1024
+
+    def _level_bytes(self, shape, scale, start, stop, itemsize=2):
+        import numpy as np
+
+        ext = [b - a for a, b in zip(start, stop, strict=True)]
+        lvl = [-(-e // s) for e, s in zip(ext, scale, strict=True)]
+        return int(np.prod(lvl)) * itemsize
+
+    def test_plane_is_never_narrowed(self):
+        from biopb_tensor_server.core.chunk import compute_warm_selection
+
+        shape, labels = [1000, 6000, 6000], ["z", "y", "x"]
+        start, stop = compute_warm_selection(
+            shape, labels, [1, 4, 4], itemsize=2, budget_bytes=self.MIB
+        )
+        # Y and X keep their full extent even at a budget the plane alone busts.
+        assert (start[1], stop[1]) == (0, 6000)
+        assert (start[2], stop[2]) == (0, 6000)
+        assert stop[0] - start[0] == 1  # Z narrowed to a single plane instead
+
+    def test_window_starts_where_a_viewer_opens(self):
+        """Index 0, because that is where both clients land.
+
+        napari's own default is the middle -- _add_layer_from_data slices once at
+        the dims default, then calls dims._go_to_center_step() -- but the tensor
+        browser suppresses that move (_tensor_utils._origin_initial_view) so the
+        opening slice is the one already decoded. The SPA opens at 0 for the same
+        reason. A centred window would spend the budget on planes neither shows.
+        """
+        from biopb_tensor_server.core.chunk import compute_warm_selection
+
+        shape, labels = [1000, 6000, 6000], ["z", "y", "x"]
+        start, stop = compute_warm_selection(
+            shape, labels, [1, 4, 4], itemsize=2, budget_bytes=64 * self.MIB
+        )
+        assert start[0] == 0 and stop[0] > 0
+
+    @pytest.mark.parametrize("extent", [2, 3, 4, 5, 199, 200, 1000])
+    def test_window_always_contains_the_opening_index(self, extent):
+        from biopb_tensor_server.core.chunk import compute_warm_selection
+
+        shape, labels = [extent, 4096, 4096], ["z", "y", "x"]
+        start, stop = compute_warm_selection(
+            shape, labels, [1, 1, 1], itemsize=2, budget_bytes=self.MIB
+        )
+        assert start[0] == 0 < stop[0]
+        assert stop[0] <= extent
+
+    def test_reduce_order_is_t_then_z_then_c(self):
+        """T gives up everything before Z is touched, and C is last: frames are
+        independent, a Z slab keeps local scrub value, and C is small and the
+        first thing a user toggles."""
+        from biopb_tensor_server.core.chunk import compute_warm_selection
+
+        shape = [100, 100, 100, 512, 512]
+        labels = ["t", "z", "c", "y", "x"]
+        # Exactly one plane of budget: everything selectable must collapse to 1.
+        plane = 512 * 512 * 2
+        start, stop = compute_warm_selection(
+            shape, labels, [1, 1, 1, 1, 1], itemsize=2, budget_bytes=plane
+        )
+        assert [b - a for a, b in zip(start, stop, strict=True)][:3] == [1, 1, 1]
+
+        # A budget that needs exactly one axis cut: T goes, Z and C stay whole.
+        budget = plane * 100 * 100  # room for all Z and C, but not all T
+        start, stop = compute_warm_selection(
+            shape, labels, [1, 1, 1, 1, 1], itemsize=2, budget_bytes=budget
+        )
+        ext = [b - a for a, b in zip(start, stop, strict=True)]
+        assert ext[0] == 1  # t narrowed
+        assert ext[1] == 100 and ext[2] == 100  # z and c untouched
+
+    def test_a_2d_target_is_not_volumetric_just_because_a_z_axis_exists(self):
+        """The Z exemption belongs to the level Phase 2 produced, not to every
+        level of a tensor that happens to have depth.
+
+        [20, 8000, 8000] passes the plane gate and *not* the voxel gate
+        (2000*2000*20 = 80 Mvox, under 448**3), so its single target is the 2-D
+        one. Flagged volumetric, its Z is exempt from the budget and there is
+        nothing left to narrow -- the level warms whole, 305 MiB against a 256
+        MiB budget, and the bound the whole policy rests on stops binding.
+        """
+        from biopb_tensor_server.core.chunk import (
+            compute_warm_selection,
+            compute_warm_targets,
+        )
+
+        shape, labels = [20, 8000, 8000], ["z", "y", "x"]
+        targets = compute_warm_targets(shape, labels)
+        assert [t.volumetric for t in targets] == [False]
+
+        start, stop = compute_warm_selection(
+            shape,
+            labels,
+            targets[0].scale_hint,
+            itemsize=4,
+            volumetric=targets[0].volumetric,
+        )
+        assert stop[0] - start[0] < 20  # Z narrowed rather than exempt
+        assert self._level_bytes(shape, targets[0].scale_hint, start, stop) <= (
+            256 * self.MIB
+        )
+
+    def test_a_3d_target_is_volumetric_even_when_it_did_not_scale_z(self):
+        """Provenance, not "did Z change" -- which is why the flag cannot be
+        read off the scale vector.
+
+        Phase 2 scales an axis only while it is above the floor, so a 200-plane
+        confocal's 3-D target is [1, 4, 4]: Z is untouched because 200 < 448. It
+        is still the level a renderer uploads whole, and `scale_hint[z] > 1`
+        would call it 2-D and narrow the Z it must keep.
+        """
+        from biopb_tensor_server.core.chunk import compute_warm_targets
+
+        targets = compute_warm_targets([200, 2048, 2048], ["z", "y", "x"])
+        assert [list(t.scale_hint) for t in targets] == [[1, 2, 2], [1, 4, 4]]
+        assert [t.volumetric for t in targets] == [False, True]
+        assert targets[-1].scale_hint[0] == 1  # Z never scaled, still volumetric
+
+    def test_volumetric_target_keeps_z_whole(self):
+        """N1: napari's 3-D mode reads the coarsest level whole, so a Z-narrowed
+        warm would miss every chunk of it."""
+        from biopb_tensor_server.core.chunk import compute_warm_selection
+
+        shape, labels = [1000, 6000, 6000], ["z", "y", "x"]
+        start, stop = compute_warm_selection(
+            shape,
+            labels,
+            [4, 16, 16],
+            itemsize=2,
+            volumetric=True,
+            budget_bytes=self.MIB,
+        )
+        assert (start[0], stop[0]) == (0, 1000)
+
+    def test_unnamed_axes_are_reduced_first(self):
+        """A plate's POS or a sequence's `i` is an independent acquisition like
+        T, and a viewer opens on one of them."""
+        from biopb_tensor_server.core.chunk import compute_warm_selection
+
+        shape = [155, 8, 1024, 1024]
+        labels = ["i", "c", "y", "x"]
+        budget = 1024 * 1024 * 2 * 8  # room for all 8 channels of one frame
+        start, stop = compute_warm_selection(
+            shape, labels, [1, 1, 1, 1], itemsize=2, budget_bytes=budget
+        )
+        ext = [b - a for a, b in zip(start, stop, strict=True)]
+        assert ext[0] == 1 and ext[1] == 8
+
+    def test_a_level_under_budget_is_warmed_whole(self):
+        from biopb_tensor_server.core.chunk import compute_warm_selection
+
+        shape, labels = [1, 4, 1, 14234, 14234], ["t", "c", "z", "y", "x"]
+        start, stop = compute_warm_selection(
+            shape, labels, [1, 1, 1, 8, 8], itemsize=2, budget_bytes=64 * self.MIB
+        )
+        assert start == [0] * 5 and stop == shape
+
+    def test_budget_is_respected_where_it_can_be(self):
+        from biopb_tensor_server.core.chunk import (
+            compute_warm_selection,
+            compute_warm_targets,
+        )
+
+        budget = 64 * self.MIB
+        for shape, labels in [
+            ([1000, 6000, 6000], ["z", "y", "x"]),
+            ([200, 2048, 2048], ["z", "y", "x"]),
+            ([500, 2, 1024, 1024], ["t", "c", "y", "x"]),
+            ([1, 4, 1, 14234, 14234], ["t", "c", "z", "y", "x"]),
+        ]:
+            for target in compute_warm_targets(shape, labels):
+                start, stop = compute_warm_selection(
+                    shape,
+                    labels,
+                    target.scale_hint,
+                    itemsize=2,
+                    volumetric=target.volumetric,
+                    budget_bytes=budget,
+                )
+                got = self._level_bytes(shape, target.scale_hint, start, stop)
+                if target.volumetric:
+                    continue  # the volume is bounded by pixel_budget_cubic_root
+                assert got <= budget, (shape, target, got)
+
+
 class TestBuildPyramidPlan:
     """The full computed plan generalizes the coarsest-only helper."""
 
@@ -1030,7 +1359,7 @@ class TestBuildPyramidPlan:
         assert list(levels[0].scale_hint) == [1, 1]
         assert list(levels[0].shape) == [20000, 20000]
         assert levels[0].native is False
-        assert levels[0].reduction_method == "area"
+        assert levels[0].reduction_method == PyramidConfig().reduction_method
 
     def test_coarsest_matches_precache_helper(self):
         from biopb_tensor_server.core.chunk import build_pyramid_plan

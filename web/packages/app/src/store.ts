@@ -3,6 +3,10 @@ import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
+import {
+  DEFAULT_VOLUME_RENDER_MODE,
+  type VolumeRenderMode,
+} from "./utils/volumeUtils";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
@@ -10,9 +14,22 @@ export interface SliceState {
   t: number;
   z: number;
   c: number;
-  reductionMethod: string;
+  /**
+   * Index chosen on each axis `t`/`z`/`c` cannot name, keyed by `SliderAxis.key`
+   * (`a0`, `a3`, ...).
+   *
+   * A TIFF sequence's `i`, a plate's `POS`, the second of two axes sharing a
+   * label: navigable, but with no semantic name to hold them under. Reset with
+   * t/z/c on a source change, and for the same reason — a key means "axis 0 of
+   * the tensor in view", so it does not survive one.
+   */
+  axes: Record<string, number>;
   percentileScale: number;  // 0 = min-max, 1 = 1-99 percentile, 2 = 2-98 percentile
   useMinMax: boolean;  // When true, use full min-max range (0-100 percentile)
+  // Display-only exponent applied to the normalized intensity, after the
+  // contrast window and before the channel color. 1 leaves the ramp linear;
+  // below 1 lifts the dim end, above 1 pushes it down.
+  gamma: number;
 }
 
 export interface AppState {
@@ -40,6 +57,21 @@ export interface AppState {
 
   // UI options
   showAdvancedOptions: boolean;
+  /**
+   * Render the active tensor as a volume rather than as a plane.
+   *
+   * Not part of `SliceState`: that object's identity drives the tiled viewer's
+   * refetches, and the render mode changes which viewer is mounted rather than
+   * which pixels it wants. Reset on a source change — the next tensor may have
+   * no volume to render, and a toggle stuck on would open it on an error.
+   */
+  render3d: boolean;
+  /**
+   * How the 3-D ray-cast combines voxels. A viewing preference rather than a
+   * property of the tensor, so unlike `render3d` it survives a source change —
+   * someone who wants additive wants it for the next stack too.
+   */
+  volumeRenderMode: VolumeRenderMode;
 
   // Channel colors (sourceId -> channelIdx -> color)
   channelColors: Record<string, Record<number, ColorValue>>;
@@ -56,6 +88,8 @@ export interface AppState {
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
   setShowAdvancedOptions: (value: boolean) => void;
+  setRender3d: (value: boolean) => void;
+  setVolumeRenderMode: (value: VolumeRenderMode) => void;
   getChannelColor: (sourceId: string, channelIdx: number) => ColorValue;
   setChannelColor: (sourceId: string, channelIdx: number, color: ColorValue) => void;
   loadChannelNames: (sourceId: string) => Promise<void>;
@@ -108,12 +142,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     t: 0,
     z: 0,
     c: 0,
-    reductionMethod: "area",
+    axes: {},
     percentileScale: 1,  // Default 1-99 percentile
     useMinMax: false,
+    gamma: 1,
   },
 
   showAdvancedOptions: false,
+  render3d: false,
+  volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
 
   // Load persisted colors from localStorage on initialization
   channelColors: loadColorsFromStorage(),
@@ -165,8 +202,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { sources } = get();
     const src = sources.find((s) => s.source_id === sourceId);
     const tid = tensorId ?? src?.tensors[0]?.array_id ?? null;
-    set({ activeSourceId: sourceId, activeTensorId: tid });
-    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0 } }));
+    set({ activeSourceId: sourceId, activeTensorId: tid, render3d: false });
+    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {} } }));
   },
 
   setSlice(partial) {
@@ -175,6 +212,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setShowAdvancedOptions(value) {
     set({ showAdvancedOptions: value });
+  },
+
+  setRender3d(value) {
+    set({ render3d: value });
+  },
+
+  setVolumeRenderMode(value) {
+    set({ volumeRenderMode: value });
   },
 
   getChannelColor(sourceId, channelIdx) {

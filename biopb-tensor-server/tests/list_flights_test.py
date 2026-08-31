@@ -53,6 +53,12 @@ def _command_source_id(flight_info):
     return desc.source_id
 
 
+def _command_descriptor(flight_info):
+    desc = DataSourceDescriptor()
+    desc.ParseFromString(flight_info.descriptor.command)
+    return desc
+
+
 def test_list_flights_skips_failing_source():
     """A source that raises during descriptor build is skipped, not fatal."""
     server = TensorFlightServer(location="grpc://localhost:0")
@@ -86,6 +92,12 @@ def test_list_flights_all_healthy():
 
     returned_ids = {_command_source_id(info) for info in infos}
     assert returned_ids == {"good-1", "good-2"}
+    # The lean listing carries the transfer grid: it is the adapter's stable
+    # per-tensor choice, not a per-request one (biopb/biopb#809).
+    assert all(
+        list(_command_descriptor(info).tensors[0].chunk_shape) == [10, 10]
+        for info in infos
+    )
 
 
 # --- DuckDB-catalog-backed path (biopb/biopb#265) ---------------------------
@@ -128,8 +140,16 @@ def test_list_flights_served_from_catalog_not_adapters():
     # Present in the adapter registry but NOT in the catalog -> must be invisible.
     server.sources.replace({"only-adapter": _HealthyAdapter("only-adapter")})
 
-    returned_ids = {_command_source_id(i) for i in server.list_flights(None, b"")}
+    infos = list(server.list_flights(None, b""))
+    returned_ids = {_command_source_id(i) for i in infos}
     assert returned_ids == {"in-db"}
+    listed = _command_descriptor(infos[0]).tensors[0]
+    assert list(listed.shape) == [10, 10]
+    # Structural entry only. The adapter double hands the catalog a grid; the
+    # catalog does not store one and ListFlights does not publish one -- the
+    # transfer grid is GetFlightInfo's to answer, per the tensor it binds
+    # (biopb/biopb#812).
+    assert list(listed.chunk_shape) == []
 
 
 def test_list_flights_catalog_truncation_signaled():

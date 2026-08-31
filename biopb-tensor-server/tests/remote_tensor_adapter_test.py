@@ -193,7 +193,7 @@ class TestRemoteTensorProxy:
             upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_proxy_sliced_read_preserves_slice_hint(self):
+    def test_proxy_sliced_read_preserves_slice_hint(self, transfer_target):
         """A sliced read through the proxy keeps slice_hint on the forwarded plan,
         so the client can crop the outward-snapped result.
 
@@ -213,6 +213,11 @@ class TestRemoteTensorProxy:
         )
         from pyarrow import flight
 
+        # One plane per chunk upstream, so the forwarded grid is something the
+        # proxy could get wrong; at the default target the whole 12 KB volume is
+        # one chunk and the test would prove nothing (biopb/biopb#809).
+        transfer_target(40 * 50 * 2)
+
         with tempfile.TemporaryDirectory() as tmp:
             zpath = f"{tmp}/vol.zarr"
             za = zarr.open_array(
@@ -229,7 +234,9 @@ class TestRemoteTensorProxy:
                 )
                 try:
                     pc = TensorFlightClient(f"grpc://localhost:{proxy.port}")
-                    # Request the middle z-plane; it snaps to exactly chunk 1.
+                    # Request the middle z-plane. The three-plane source retains
+                    # its native grid because it is already below the endpoint
+                    # parallelism floor.
                     sl = SliceHint(start=[1, 0, 0], stop=[2, 40, 50])
                     read_opt = TensorReadOption(tensor_id="hpc__aics", slice_hint=sl)
                     cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
@@ -329,9 +336,9 @@ class TestRemoteTensorProxy:
                 upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_forward_flight_info_returns_upstream_native_grid(self):
+    def test_forward_flight_info_returns_upstream_transfer_grid(self, transfer_target):
         """forward_flight_info forwards a whole GetFlightInfo to the upstream and
-        returns ITS endpoints on the native grid + server-advertised pyramid --
+        returns ITS endpoints on the transfer grid + server-advertised pyramid --
         the proxy re-derives no grid or pyramid locally, so the advisory (empty)
         catalog seed never drives planning (biopb/biopb#295).
         """
@@ -346,6 +353,11 @@ class TestRemoteTensorProxy:
             peel_proxy_envelope,
             routing_array_id,
         )
+
+        # One plane per chunk upstream, so the forwarded grid is something the
+        # proxy could get wrong; at the default target the whole 12 KB volume is
+        # one chunk and the test would prove nothing (biopb/biopb#809).
+        transfer_target(40 * 50 * 2)
 
         with tempfile.TemporaryDirectory() as tmp:
             zpath = f"{tmp}/vol.zarr"
@@ -385,10 +397,11 @@ class TestRemoteTensorProxy:
                 )
 
                 assert plan is not None
-                # Native upstream grid (one z-plane per chunk), NOT the whole-volume
-                # (3,40,50) default grid an empty seed would otherwise produce.
+                # The upstream, not the proxy's empty advisory seed, selects and
+                # publishes the transfer grid. Its three native endpoints are
+                # retained rather than coalesced below the parallelism floor.
                 assert list(plan.descriptor.chunk_shape) == [1, 40, 50]
-                assert len(plan.chunk_endpoints) == 3  # one endpoint per plane
+                assert len(plan.chunk_endpoints) == 3
                 # The upstream's server-advertised pyramid rode through the forward
                 # (the lean catalog localizer would have stripped it).
                 assert len(plan.descriptor.pyramid) >= 1
@@ -2291,7 +2304,12 @@ def test_get_tensor_descriptor_served_from_seed_without_rpc():
     seeded structural descriptor -- no get_descriptor RPC -- so a bulk-mirrored
     GetFlightInfo makes no upstream call for the descriptor. Falls back to a live
     fetch only when a tensor is not in the seed (covered by the e2e proxy tests,
-    which register without seeding)."""
+    which register without seeding).
+
+    The upstream catalog rows carry no ``chunk_shape`` (biopb/biopb#812), so the
+    seed carries none either: reconciliation and the structural serve path both
+    keep working, and the grid arrives with the forwarded upstream GetFlightInfo
+    (``forward_flight_info``) rather than being reconstructed here."""
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     adapter = RemoteTensorAdapter(
@@ -2305,19 +2323,22 @@ def test_get_tensor_descriptor_served_from_seed_without_rpc():
                 "array_id": "img",
                 "dim_labels": ["y", "x"],
                 "shape": [4, 4],
-                "chunk_shape": [4, 4],
                 "dtype": "uint8",
             },
             {
                 "array_id": "img/A2",
                 "dim_labels": ["y", "x"],
                 "shape": [2, 2],
-                "chunk_shape": [2, 2],
                 "dtype": "uint16",
             },
         ],
         {"ome": "meta"},
     )
+
+    # the mirrored catalog surface is structural, and complete
+    listed = adapter.list_tensor_descriptors()
+    assert [d.array_id for d in listed] == ["lab__img", "lab__img/A2"]
+    assert all(list(d.chunk_shape) == [] for d in listed)
 
     # default (first) tensor
     desc = adapter.get_tensor_descriptor()
@@ -2483,9 +2504,8 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
                 assert adapter._client is None  # no per-source upstream dial
                 # source_url mirrors the upstream path under the endpoint root, so
                 # a browser trees it by filepath instead of a flat node (#297).
-                assert adapter._source_url.startswith(
-                    f"grpc://localhost:{upstream.port}/"
-                )
+                # The root is the configured alias, not the dial host (#788).
+                assert adapter._source_url.startswith("grpc://lab/")
                 assert adapter._source_url.endswith(".zarr")
 
             # local catalog populated from the bulk seed
@@ -2654,3 +2674,120 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             proxy.shutdown()
     finally:
         upstream.shutdown()
+
+
+# ------------------------------------------------ alias + scheme (biopb/biopb#788)
+
+
+def _register_static_proxy(url, alias):
+    """Register a static proxy through the REAL config -> claim -> adapter path.
+
+    Instantiating RemoteTensorAdapter(alias=...) directly would prove nothing: the
+    bug was that `alias` never reached the adapter, because the
+    SourceConfig -> SourceClaim -> SourceConfig rebuild dropped it. So go through
+    discover_sources + create_source_manager and read the adapter the server ended
+    up holding. The upstream is never dialed here -- registration is offline, and
+    the display url is what is under test.
+    """
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.core.config import SourceConfig, discover_sources
+    from biopb_tensor_server.sources.source_manager import create_source_manager
+
+    expanded = discover_sources(SourceConfig(url=url, alias=alias))
+    server = TensorFlightServer("grpc://localhost:0")
+    create_source_manager(
+        server=server,
+        registry=get_default_registry(),
+        watcher=None,
+        static_sources=expanded,
+        monitored_sources=[],
+        metadata_db=None,
+    )
+    return server
+
+
+class TestAliasAndSchemeSurviveRegistration:
+    """The catalog source_url must show the configured alias and scheme (#788).
+
+    `alias` namespaces the source_id early, so an id like ``lab__img`` looked
+    right while the source_url still leaked the upstream host -- and a grpcs://
+    upstream was advertised as plaintext grpc://.
+    """
+
+    def test_static_proxy_keeps_its_alias(self):
+        server = _register_static_proxy("grpc://upstream.example:8815/img", "lab")
+        try:
+            adapter = server.sources.get("lab__img")
+            assert adapter._source_url == "grpc://lab:img"
+        finally:
+            server.shutdown()
+
+    def test_static_proxy_keeps_a_tls_upstream_scheme(self):
+        server = _register_static_proxy("grpcs://upstream.example:8815/img", "lab")
+        try:
+            assert server.sources.get("lab__img")._source_url == "grpcs://lab:img"
+        finally:
+            server.shutdown()
+
+    def test_alias_and_upstream_path_compose_under_the_tls_scheme(self):
+        """The issue's expected value: grpcs://<alias>/<remote-path>."""
+        server = _register_static_proxy(
+            "grpcs://upstream.example:8815/example-source", "lab"
+        )
+        try:
+            adapter = server.sources.get("lab__example-source")
+            # what a bulk upstream re-list seeds (biopb/biopb#297)
+            adapter.seed_catalog([], {}, True, "file:///data/example")
+            assert adapter._source_url == "grpcs://lab/data/example"
+            assert (
+                adapter.get_source_descriptor().source_url == "grpcs://lab/data/example"
+            )
+        finally:
+            server.shutdown()
+
+    def test_an_unaliased_upstream_keeps_its_scheme_and_authority(self):
+        server = _register_static_proxy("grpcs://upstream.example:8815/img", None)
+        try:
+            assert (
+                server.sources.get("img")._source_url
+                == "grpcs://upstream.example:8815:img"
+            )
+        finally:
+            server.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_monitored_reconcile_keeps_the_alias(self, simple_zarr_array):
+        """The mirrored-source path (reconciler) drops the alias independently of
+        the static path, so it needs its own coverage."""
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.adapters import get_default_registry
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.core.discovery import DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
+
+        zarr_path, _, _ = simple_zarr_array
+        upstream, _, _ = _db_upstream(zarr_path, ["img"])
+        _serve(upstream)
+        try:
+            proxy = TensorFlightServer("grpc://localhost:0")
+            manager = SourceManager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                watcher=None,
+                monitored_dirs=set(),
+                metadata_db=None,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+            manager._reconcile_upstreams()
+
+            url = proxy.sources.get("lab__img")._source_url
+            # seeded from the upstream catalog row: the alias is the authority and
+            # the upstream's own filepath is the path (not localhost:<port>).
+            assert url.startswith("grpc://lab/")
+            assert url.endswith(".zarr")
+        finally:
+            upstream.shutdown()

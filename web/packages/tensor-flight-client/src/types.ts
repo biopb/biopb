@@ -4,6 +4,12 @@ export interface TensorDescriptor {
   dim_labels: string[];
   /** Full array shape (per dimension). */
   shape: number[];
+  /**
+   * Transfer grid. EMPTY inside a `DataSourceDescriptor.tensors` entry: a source
+   * listing is structural, and the grid is answered per resolved tensor. Use
+   * `GET /api/tile_info` (`TileInfo.chunk_shape` / `tile_size`) when you need
+   * one -- an empty array is not a usable grid.
+   */
   chunk_shape: number[];
   /** NumPy-style dtype string, e.g. "uint8", "float32". */
   dtype: string;
@@ -16,19 +22,36 @@ export interface DataSourceDescriptor {
   source_type: string;
   /** Raw OME-NGFF JSON string, or null. */
   metadata_json: string | null;
+  /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */
   tensors: TensorDescriptor[];
 }
 
 /** Parameters for a single array-slice request. */
 export interface SliceRequest {
-  source_id: string;
-  tensor_id: string;
+  /**
+   * The tensor's whole address: `source_id` for a single-tensor source,
+   * `source_id/field` otherwise. Not a `(source_id, tensor_id)` pair — that
+   * split had to be rejoined server-side before every read.
+   */
+  array_id: string;
   /** Per-dimension start indices (inclusive). */
   slice_start?: number[];
   /** Per-dimension stop indices (exclusive). */
   slice_stop?: number[];
   /** Per-dimension integer downsampling factors, e.g. [1, 8, 8]. */
   scale_hint?: number[];
+  /**
+   * Hand the scale decision to the server instead of naming one.
+   *
+   * `"volume"` reads at the single scale the server keeps a whole 3-D volume
+   * warm at — the level napari 3-D and `XR3DLayer` upload as one texture.
+   * There is no way to compute it client-side short of reimplementing the
+   * server's pyramid planner, and a guess one rung off misses every warmed
+   * chunk. `TileInfo.volume` says what it will resolve to for a given tensor.
+   *
+   * Mutually exclusive with `scale_hint`; sending both is a 422.
+   */
+  scale_policy?: "volume";
   /** "nearest" | "area" | "precompute" (server also accepts "stride", "decimate", "mean"). */
   reduction_method?: string;
   /** Informational: current viewport pixel budget (stored in diagnostics). */
@@ -45,6 +68,14 @@ export interface TypedNdArray {
   dtype: string;
   /** Semantic axis labels, e.g. ["t","z","y","x"]. Empty if not available. */
   dimLabels: string[];
+  /**
+   * Per-axis scale the server actually read at (`X-Scale-Hint`).
+   *
+   * Echoed on every slice, and load-bearing under `scale_policy`: there the
+   * caller did not choose, so this is the only statement of what it got. Empty
+   * against a server predating the header.
+   */
+  scaleHint: number[];
 }
 
 /** Parsed OME-NGFF multiscales metadata (minimal subset). */
@@ -185,35 +216,179 @@ export interface BrowseResponse {
   truncated: boolean;
 }
 
-/** Parameters for backend rendering request. */
-export interface RenderRequest {
-  source_id: string;
-  tensor_id: string;
-  slice_start?: number[];
-  slice_stop?: number[];
-  scale_hint?: number[];
-  reduction_method?: string;
-  percentile_lo?: number;
-  percentile_hi?: number;
-  color?: string;  // preset name or hex (#rrggbb)
-  channel_name?: string;  // for auto color resolution
-  use_min_max?: boolean;
-  output_format?: "png" | "jpeg" | "raw";  // raw = uncompressed RGBA bytes
-  pixel_budget?: number;
+// ---------------------------------------------------------------------------
+// Tiles
+// ---------------------------------------------------------------------------
+
+/** One pyramid level of a tensor's tile grid. */
+export interface TileLevel {
+  /** 0 is FULL resolution (Viv `PixelSource[]` order, not map-tile z order). */
+  level: number;
+  /** Downsample factor applied to Y/X at this level, i.e. 2**level. */
+  scale: number;
+  height: number;
+  width: number;
+  /** Grid extent at this level; the last row/column may be a short tile. */
+  cols: number;
+  rows: number;
 }
 
-/** Result of backend rendering request. */
-export interface RenderResult {
-  /** Image blob (PNG/JPEG) or ArrayBuffer (raw). */
-  blob: Blob | ArrayBuffer;
-  /** Width of rendered image. */
-  width: number;
-  /** Height of rendered image. */
+/** One rung of the server-advertised pyramid (`TileInfo.pyramid`). */
+export interface TilePyramidLevel {
+  /** Per-axis factors vs full resolution, in wire order. */
+  scale_hint: number[];
+  /** The level's own extent -- not necessarily `ceil(base / scale)`. */
+  shape: number[];
+  /** "precompute" for a native level, else the kernel the server computes with. */
+  reduction_method: string;
+  native: boolean;
+}
+
+/** Everything needed to address a tensor as a tile grid (`GET /api/tile_info`). */
+export interface TileInfo {
+  array_id: string;
+  dim_labels: string[];
+  shape: number[];
+  chunk_shape: number[];
+  dtype: string;
+  /**
+   * Square tile edge in pixels. Derived server-side from `chunk_shape` so a tile
+   * nests inside a stored chunk -- do NOT assume a constant across tensors.
+   */
+  tile_size: number;
+  /** Wire indices of the display plane; `s` is set only for interleaved RGB(A). */
+  plane: { y: number; x: number; s: number | null };
+  /** Wire index of each *named* slider axis, or null when nothing names it. */
+  selectable: { t: number | null; z: number | null; c: number | null };
+  /**
+   * Non-plane axes with extent > 1 that `t`/`z`/`c` cannot *name*.
+   *
+   * An unlabelled axis, a TIFF sequence's opaque file axis (`i`), or the second
+   * of two sharing a label. Empty for an ordinary TCZYX tensor.
+   *
+   * Naming is not addressing: these are selectable, via `TileRequest.sel`. What
+   * the list says is that they must be reached positionally, and that there is
+   * no semantic title for the slider — so show `label`, the name the source
+   * itself gave, rather than deriving `Z` from the axis's position. That
+   * derivation is a guess, and the server declines to make it for a reason
+   * (`biopb-tensor-server/biopb_tensor_server/core/axes.py`); making it here
+   * instead only moves it somewhere less visible.
+   */
+  sel_axes: TileAxis[];
+  levels: TileLevel[];
+  /**
+   * The ladder the *server* advertises, which is what each rung of `levels` is
+   * read from: the coarsest entry whose `scale_hint` divides the rung's scale,
+   * with the remainder reduced server-side. Coarsest first, full resolution
+   * omitted.
+   *
+   * `native: true` is a real on-disk level (OME-Zarr multiscales, a pyramidal
+   * QPTIFF) rather than one computed on the fly. Advisory only -- the rungs are
+   * addressed identically either way -- but it is the one place a client can
+   * see why one source's tiles are cheap and another's are not.
+   */
+  pyramid?: TilePyramidLevel[];
+  /**
+   * What a 3-D read of this tensor gets, or why there isn't one.
+   *
+   * Not a rung of `levels`: a 3-D renderer takes one whole volume rather than
+   * tiles, so it leaves the tile ladder entirely (`XR3DLayer` has no `loader`
+   * prop). It rides this response because this is the one call a viewer
+   * already makes before it can address the tensor at all.
+   *
+   * Absent against a server predating it — treat that as unavailable.
+   */
+  volume?: VolumeInfo;
+}
+
+/** `TileInfo.volume`: the plan for a `scale_policy: "volume"` read. */
+export type VolumeInfo = VolumeAvailable | VolumeUnavailable;
+
+export interface VolumeUnavailable {
+  available: false;
+  /**
+   * Why, in a sentence meant to be shown: no z axis, a z extent of 1, an
+   * interleaved samples axis. A fact about the tensor, so it will not change
+   * on a retry.
+   */
+  reason: string;
+}
+
+export interface VolumeAvailable {
+  available: true;
+  reason: null;
+  /** Wire indices of the three volume axes. */
+  axes: { z: number; y: number; x: number };
+  /** Per-axis scale the server will read at. Full length, wire order. */
+  scale_hint: number[];
+  /** Extent of the returned volume along z / y / x, after `scale_hint`. */
+  depth: number;
   height: number;
-  /** Actual computed lo percentile value. */
-  percentileLoValue: number;
-  /** Actual computed hi percentile value. */
-  percentileHiValue: number;
-  /** Output format used (from X-Image-Format header). */
-  format?: string;
+  width: number;
+  /**
+   * Wire size of the volume at its own dtype. NOT the VRAM it costs: Viv casts
+   * every volume to Float32 on upload, so that is 4 bytes per voxel regardless.
+   */
+  bytes: number;
+  /**
+   * Physical extent of one voxel **of the returned volume** (source physical
+   * size already multiplied by `scale_hint`), or null when the source declares
+   * none — render isotropic then.
+   *
+   * All three are in the *same* unit, reconciled server-side: `physical_unit`
+   * is per-axis and adapters do not all normalise (NIfTI reports mm, the EM
+   * readers nm), so comparing them raw would stretch the volume by whatever the
+   * conversion factor was. Axes whose units differ and cannot be placed on a
+   * common scale come back null rather than as a plausible wrong ratio.
+   */
+  spacing: { z: number; y: number; x: number } | null;
+  /**
+   * Unit `spacing` is expressed in — "µm" whenever the server could convert.
+   * Null when the axes agree on a unit it cannot name, which is still a valid
+   * ratio. Not needed to render: `spacing` is self-consistent either way.
+   */
+  unit: string | null;
+}
+
+/** A non-plane axis addressed by its wire index, with the source's own name. */
+export interface TileAxis {
+  /** Wire index, i.e. position in `dim_labels`/`shape`. */
+  axis: number;
+  /** The source's label for it. May be empty, or shared with another axis. */
+  label: string;
+  extent: number;
+}
+
+/** Address of one tile. Omitted selection axes default to index 0. */
+export interface TileRequest {
+  /**
+   * The tensor's globally-unique id: `source_id` for a single-tensor source,
+   * `source_id/field` otherwise. The whole address -- there is no separate
+   * tensor_id.
+   */
+  array_id: string;
+  level?: number;
+  col?: number;
+  row?: number;
+  t?: number;
+  z?: number;
+  c?: number;
+  /**
+   * Axes selected by wire index: `[[0, 154]]` becomes `?sel=0:154`.
+   *
+   * For the axes `t`/`z`/`c` cannot name — everything in
+   * `TileInfo.sel_axes`. An axis the server *does* name must be sent under that
+   * name instead; sending it both ways is refused (422), because one axis with
+   * two spellings in one URL is two cache entries for one tile.
+   */
+  sel?: Array<[number, number]>;
+}
+
+/** A raw tile plus the grid the server actually served it from. */
+export interface TileResult extends TypedNdArray {
+  /** Echoed from `X-Tile-*`, so a client can check the grid it assumed. */
+  tileSize: number;
+  level: number;
+  col: number;
+  row: number;
 }

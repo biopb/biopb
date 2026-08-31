@@ -491,7 +491,7 @@ transcription never reads the file, so editing a step — or deleting the skill 
 left it green. It also could not reach the instructions that need a *choice* in
 order to be wrong, which is most of what these bodies are for.
 
-Here the body arrives through the real `biopb_mcp.mcp._skills` — `find_skills`
+Here the body arrives through the real `biopb_mcp.mcp._skills` — `list_skills`
 and `skill://<id>`, the same calls the runtime makes — and the run happens
 against a real session: real kernel, real napari, real dask, the nine real
 tools with their real schemas and the server's own `instructions`.

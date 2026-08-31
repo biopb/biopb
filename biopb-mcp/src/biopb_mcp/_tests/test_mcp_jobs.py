@@ -24,13 +24,13 @@ import pytest
 pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
-from biopb_mcp.mcp import _jobs, _server  # noqa: E402
+from biopb_mcp.mcp import _app, _jobs, _kernel_rpc, _server  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
 def _job_result(stdout):
     """Unwrap the ``{"r": result, "w": window_alive}`` job-snippet envelope."""
-    payload = _server._extract_json(stdout)
+    payload = _kernel_rpc._extract_json(stdout)
     return payload["r"] if payload else None
 
 
@@ -132,7 +132,7 @@ class TestJobRunnerUnit:
         runner["_dask_client"] = _StubClient()
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         time.sleep(0.05)
-        _jobs._cancel(jid)
+        _jobs._cancel_dask_futures(_jobs._jobs[jid])
         passed = calls["futures"]
         assert passed and all(isinstance(f, Future) for f in passed)
         assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)
@@ -223,10 +223,21 @@ class TestJobRunnerUnit:
         summ = {j["job_id"]: j for j in _jobs.jobs_summary()}[jid]
         assert summ["code_preview"] == "print('first real line')"
 
-    def test_code_preview_helper(self):
-        assert _jobs._code_preview("") == ""
-        assert _jobs._code_preview("\n\n  hello  \nworld") == "hello"
-        capped = _jobs._code_preview("x" * 100)
+    def test_jobs_summary_has_intent_preview(self, runner):
+        # What the row actually shows. Empty when nobody said why, which is the
+        # case the UI falls back to the code line for.
+        jid = _jobs.submit("x = 1", intent="isolate the nuclei channel")["job_id"]
+        bare = _jobs.submit("y = 2")["job_id"]
+        self._wait(jid)
+        self._wait(bare)
+        summ = {j["job_id"]: j for j in _jobs.jobs_summary()}
+        assert summ[jid]["intent_preview"] == "isolate the nuclei channel"
+        assert summ[bare]["intent_preview"] == ""
+
+    def test_one_line_helper(self):
+        assert _jobs._one_line("") == ""
+        assert _jobs._one_line("\n\n  hello  \nworld") == "hello"
+        capped = _jobs._one_line("x" * 100)
         assert len(capped) == 80 and capped.endswith("…")
 
 
@@ -243,11 +254,11 @@ class TestJobOrigin:
     def test_origin_defaults_to_agent_and_rides_the_snapshot(self, runner):
         jid = _jobs.submit("x = 1")["job_id"]
         snap = self._wait(jid)
-        assert snap["origin"] == "agent"
+        assert snap["origin"] == "mcp"
         summ = {j["job_id"]: j for j in _jobs.jobs_summary()}[jid]
-        assert summ["origin"] == "agent"
+        assert summ["origin"] == "mcp"
         # export() feeds the notebook writer -- provenance must survive there too.
-        assert {e["job_id"]: e for e in _jobs.export()}[jid]["origin"] == "agent"
+        assert {e["job_id"]: e for e in _jobs.export()}[jid]["origin"] == "mcp"
 
     def test_busy_reports_who_is_running(self, runner):
         jid = _jobs.submit(
@@ -269,12 +280,13 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
         )["job_id"]
         try:
-            res = _jobs.interrupt_current(requester="agent")
+            res = _jobs.interrupt_current(requester="mcp")
             assert res == {
                 "job_id": jid,
                 "interrupted": False,
                 "status": "running",
-                "refused": "user_job",
+                "refused": "foreign_job",
+                "origin": "user",
             }
             # Refused means untouched, not merely unreported.
             assert _jobs.poll(jid)["status"] == "running"
@@ -294,22 +306,25 @@ class TestJobOrigin:
 
     def test_agent_may_stop_its_own_job(self, runner):
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
-        assert _jobs.interrupt_current(requester="agent")["interrupted"] is True
+        assert _jobs.interrupt_current(requester="mcp")["interrupted"] is True
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_digest_reports_only_unseen_user_jobs(self, runner):
-        self._wait(_jobs.submit("a = 1", origin="agent")["job_id"])
+        self._wait(_jobs.submit("a = 1", origin="mcp")["job_id"])
         user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
 
-        digest = _jobs.user_digest()
+        digest = _jobs.foreign_digest()
         assert [d["job_id"] for d in digest] == [user_jid]
         assert digest[0]["status"] == "ok"
+        # The entry names its writer: the caller words the notice differently
+        # for a person than for another agent.
+        assert digest[0]["origin"] == "user"
 
         # Reading never consumes; only an explicit ack does, so a finished
         # user job is reported exactly once.
-        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
-        assert _jobs.ack_user_digest([user_jid]) == 1
-        assert _jobs.user_digest() == []
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+        assert _jobs.ack_foreign_digest([user_jid]) == 1
+        assert _jobs.foreign_digest() == []
 
     def test_running_user_job_stays_in_the_digest_until_it_ends(self, runner):
         jid = _jobs.submit(
@@ -319,17 +334,17 @@ class TestJobOrigin:
             # Reading never consumes, so a running cell stays reported:
             # otherwise the agent would hear that a cell started and never
             # learn how it ended. (Excluding it from the ack is the *caller's*
-            # job -- _server._ack_user_digest filters on the reported status,
+            # job -- _writers._ack_foreign_digest filters on the reported status,
             # because re-reading it here is the race this split closes.)
-            assert _jobs.user_digest()[0]["status"] == "running"
-            assert _jobs.user_digest()[0]["status"] == "running"
+            assert _jobs.foreign_digest()[0]["status"] == "running"
+            assert _jobs.foreign_digest()[0]["status"] == "running"
         finally:
             _jobs.interrupt_current()
         self._wait(jid)
-        final = _jobs.user_digest()
+        final = _jobs.foreign_digest()
         assert [d["status"] for d in final] == ["interrupted"]
-        _jobs.ack_user_digest([jid])
-        assert _jobs.user_digest() == []
+        _jobs.ack_foreign_digest([jid])
+        assert _jobs.foreign_digest() == []
 
     def test_prune_never_evicts_an_unreported_user_job(self, runner):
         # The digest entry is the agent's only notice that its namespace changed
@@ -339,13 +354,201 @@ class TestJobOrigin:
             self._wait(_jobs.submit("a = 1")["job_id"])
 
         assert user_jid in _jobs._jobs
-        assert [d["job_id"] for d in _jobs.user_digest()] == [user_jid]
-        _jobs.ack_user_digest([user_jid])
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+        _jobs.ack_foreign_digest([user_jid])
 
         # Once reported it is an ordinary record again, and prunes normally.
         for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
             self._wait(_jobs.submit("a = 1")["job_id"])
         assert user_jid not in _jobs._jobs
+
+    def test_the_chat_loop_is_not_told_about_its_own_cells(self, runner):
+        # "Someone else's cell" is a relation, not a property of the cell. Read
+        # from the MCP client's fixed point of view -- the only one there used
+        # to be -- the loop was handed its own cells as another writer's, and
+        # acking that discharged the user's notices along with them.
+        chat_jid = self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])["job_id"]
+        user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+
+        assert [d["job_id"] for d in _jobs.foreign_digest("chat")] == [user_jid]
+        # The MCP client's view is unchanged: both of those are someone else's.
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [chat_jid, user_jid]
+
+    def test_a_chat_job_is_foreign_to_the_agent_just_as_a_user_cell_is(self, runner):
+        # Every rule that reads origin means "not the agent", not "the user" --
+        # they were the same set until a third writer existed. A chat job the
+        # agent has not been told about must therefore be digested and held
+        # against eviction exactly like a human's cell.
+        chat_jid = self._wait(_jobs.submit("b = 2", origin="chat")["job_id"])["job_id"]
+        assert [(d["job_id"], d["origin"]) for d in _jobs.foreign_digest()] == [
+            (chat_jid, "chat")
+        ]
+        for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
+            self._wait(_jobs.submit("a = 1")["job_id"])
+        assert chat_jid in _jobs._jobs
+
+        assert _jobs.ack_foreign_digest([chat_jid]) == 1
+        assert _jobs.foreign_digest() == []
+
+    def test_agent_is_refused_a_chat_job(self, runner):
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
+        )["job_id"]
+        try:
+            assert _jobs.interrupt_current(requester="mcp") == {
+                "job_id": jid,
+                "interrupted": False,
+                "status": "running",
+                "refused": "foreign_job",
+                "origin": "chat",
+            }
+        finally:
+            _jobs.interrupt_current()
+        assert self._wait(jid)["status"] == "interrupted"
+
+
+class TestKernelOwner:
+    """One agent per kernel: the first non-user submitter claims it."""
+
+    _wait = staticmethod(_wait_job)
+
+    def test_first_agent_claims_and_a_second_is_refused(self, runner):
+        jid = _jobs.submit("a = 1", writer="sess-A", writer_label="claude-code")[
+            "job_id"
+        ]
+        self._wait(jid)
+        assert _jobs.owner() == {"owner": "sess-A", "label": "claude-code"}
+
+        refused = _jobs.submit("b = 2", writer="sess-B")
+        # The id as well as the label: the server mirrors the claim, and a
+        # refusal is its chance to correct a mirror that guessed wrong.
+        assert refused == {
+            "error": "not_owner",
+            "owner": "claude-code",
+            "owner_id": "sess-A",
+        }
+        # Refused at the door: no record, so nothing to poll or export either.
+        assert [j["code"] for j in _jobs.export()] == ["a = 1"]
+
+        # The owner keeps working.
+        assert (
+            self._wait(_jobs.submit("c = 3", writer="sess-A")["job_id"])["status"]
+            == "ok"
+        )
+
+    def test_a_human_cell_is_never_gated(self, runner):
+        # The person at the machine has standing no client does -- and the
+        # observe console has no identity to gate on in the first place.
+        self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
+        jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+        assert _jobs._jobs[jid].status == "ok"
+        # Running one does not steal the claim from the agent that holds it.
+        assert _jobs.owner()["owner"] == "sess-A"
+
+    def test_a_caller_with_no_identity_neither_claims_nor_is_checked(self, runner):
+        # Direct in-process calls (these tests, an in-process chat loop) have no
+        # request and no client id; there is nothing to tell two of them apart
+        # with, so the rule does not apply rather than misfiring.
+        self._wait(_jobs.submit("a = 1")["job_id"])
+        assert _jobs.owner()["owner"] is None
+        self._wait(_jobs.submit("b = 2")["job_id"])
+
+        # ...and an identified client can still claim afterwards.
+        self._wait(_jobs.submit("c = 3", writer="sess-A")["job_id"])
+        assert _jobs.owner()["owner"] == "sess-A"
+
+    def test_a_non_owner_cannot_stop_the_owners_job(self, runner):
+        # Stopping a job changes kernel state, so it is gated like running one.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
+        )["job_id"]
+        try:
+            assert _jobs.interrupt_current(requester="mcp", writer="sess-B") == {
+                "job_id": jid,
+                "interrupted": False,
+                "status": "running",
+                "refused": "not_owner",
+            }
+            # The owner still can, and so can the human (the default requester).
+            assert (
+                _jobs.interrupt_current(requester="mcp", writer="sess-A")["interrupted"]
+                is True
+            )
+        finally:
+            _jobs.interrupt_current()
+        assert self._wait(jid)["status"] == "interrupted"
+
+    def test_a_non_owner_may_read_the_digest_but_not_discharge_it(self, runner):
+        # A watching client's poll_job carries the same digest round trip. It may
+        # see what ran -- but acking would retire a notice the holder never
+        # received, and the holder is promised it exactly once.
+        self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
+        user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+        assert _jobs.ack_foreign_digest([user_jid], writer="sess-B") == 0
+        assert [d["job_id"] for d in _jobs.foreign_digest()] == [user_jid]
+
+        assert _jobs.ack_foreign_digest([user_jid], writer="sess-A") == 1
+        assert _jobs.foreign_digest() == []
+
+    def test_the_foreign_refusal_names_the_writer(self, runner):
+        # "Foreign" stopped being a synonym for "the user's" when a third writer
+        # appeared; a caller that assumes otherwise tells the agent to wait on a
+        # person who is not there.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
+        )["job_id"]
+        try:
+            refused = _jobs.interrupt_current(requester="mcp")
+            assert refused["refused"] == "foreign_job"
+            assert refused["origin"] == "chat"
+        finally:
+            _jobs.interrupt_current()
+        self._wait(jid)
+
+    def test_the_human_can_always_stop_a_held_kernel(self, runner):
+        # The recovery belongs to the person at the machine: requester="user" is
+        # the observe UI, and it is never gated on the claim.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
+        )["job_id"]
+        assert _jobs.interrupt_current(reason="stopped by Bob")["interrupted"] is True
+        assert self._wait(jid)["status"] == "interrupted"
+
+    def test_reset_releases_the_claim(self, runner):
+        # install() calls reset() on every bootstrap, so the claim lasts exactly
+        # one kernel lifetime -- restart_kernel is the documented takeover.
+        self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
+        _jobs.reset()
+        assert _jobs.owner()["owner"] is None
+        self._wait(_jobs.submit("b = 2", writer="sess-B")["job_id"])
+        assert _jobs.owner()["owner"] == "sess-B"
+
+
+class TestJobIntent:
+    """The `intent` field: recorded with the job, never acted on."""
+
+    _wait = staticmethod(_wait_job)
+
+    def test_intent_defaults_empty_and_rides_the_snapshot(self, runner):
+        assert self._wait(_jobs.submit("x = 1")["job_id"])["intent"] == ""
+
+        jid = _jobs.submit("y = 2", intent="check the drift estimate")["job_id"]
+        assert self._wait(jid)["intent"] == "check the drift estimate"
+        # export() feeds the notebook writer, which is the whole point of the
+        # field -- it has to survive the trip.
+        by_id = {e["job_id"]: e for e in _jobs.export()}
+        assert by_id[jid]["intent"] == "check the drift estimate"
+
+    def test_intent_is_free_text_and_never_reaches_the_kernel(self, runner):
+        # Provenance, not a control input: whatever is in it is stored verbatim
+        # and the job runs exactly the code it was given.
+        weird = "print('boom')  -- why: fix the mask; rm -rf /"
+        snap = self._wait(_jobs.submit("x = 1", intent=weird)["job_id"])
+        assert snap["intent"] == weird
+        assert snap["status"] == "ok"
+        assert snap["stdout"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +566,64 @@ print('JOBS_READY')
 """
 
 
+class TestJobOutputCap:
+    """The bound ``_MAX_RETAINED_JOBS`` is not.
+
+    That caps how many records are kept, not how large one gets, so a single
+    cell printing in a loop grew one record without limit and 32 of them
+    bounded nothing.
+    """
+
+    _wait = staticmethod(_wait_job)
+
+    @pytest.fixture
+    def small_cap(self, monkeypatch):
+        """A tiny cap, so a test does not have to print 200k characters."""
+        monkeypatch.setattr(_jobs, "_MAX_JOB_OUTPUT_CHARS", 100)
+        return 100
+
+    #: 100 iterations x ("xxx" + "\n") -- print writes the text and the end
+    #: separately, so this is 400 characters through a cap of 100.
+    LOUD = "for i in range(100): print('x' * 3)"
+
+    def test_output_under_the_cap_is_untouched(self, runner, small_cap):
+        jid = _jobs.submit("print('hi')")["job_id"]
+        snap = self._wait(jid)
+        assert snap["stdout"] == "hi\n"
+        assert snap["stdout_dropped"] == 0
+        assert snap["stdout_total"] == 3
+
+    def test_a_runaway_cell_keeps_only_its_tail(self, runner, small_cap):
+        snap = self._wait(_jobs.submit(self.LOUD)["job_id"])
+        assert snap["stdout_dropped"] > 0
+        assert len(snap["stdout"]) < 400
+        # The newest output survives: while a cell is running that is the part
+        # worth having, which is why the detail view keeps the tail too.
+        assert snap["stdout"].endswith("xxx\n")
+
+    def test_the_record_says_it_is_partial(self, runner, small_cap):
+        snap = self._wait(_jobs.submit(self.LOUD)["job_id"])
+        # Marked on read rather than stored -- a marker written into the buffer
+        # would itself be compacted away by the next rewrite.
+        assert "earlier chars dropped" in snap["stdout"]
+
+    def test_the_total_stays_monotonic_across_compaction(self, runner, small_cap):
+        # What a reader streaming output as it grows has to diff against:
+        # len(stdout) goes *down* when the window moves, and diffing against
+        # that is what would leave the chat pane silent for the rest of a cell.
+        snap = self._wait(_jobs.submit(self.LOUD)["job_id"])
+        assert snap["stdout_total"] == 400
+        assert snap["stdout_total"] > len(snap["stdout"])
+
+    def test_the_row_reports_what_was_printed_not_what_was_kept(
+        self, runner, small_cap
+    ):
+        jid = _jobs.submit(self.LOUD)["job_id"]
+        self._wait(jid)
+        row = next(j for j in _jobs.jobs_summary() if j["job_id"] == jid)
+        assert row["stdout_len"] == 400
+
+
 class TestJobConcurrency:
     @pytest.fixture
     def kernel(self):
@@ -375,13 +636,13 @@ class TestJobConcurrency:
 
     def _submit(self, kernel, code):
         res = kernel.execute(
-            _server._job_snippet("submit(" + repr(code) + ")"), timeout=15.0
+            _kernel_rpc._job_snippet("submit(" + repr(code) + ")"), timeout=15.0
         )
         return _job_result(res["stdout"])
 
     def _poll(self, kernel, job_id):
         res = kernel.execute(
-            _server._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
+            _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
         )
         return _job_result(res["stdout"])
 
@@ -433,17 +694,17 @@ class TestNapariJobs:
             startup_timeout=120.0,
         )
         host.start()
-        _server.set_kernel_host(host)
-        old_promote = _server._promote_after
+        _app.set_kernel_host(host)
+        old_promote = _app._promote_after
         yield host
-        _server._promote_after = old_promote
+        _app._promote_after = old_promote
         host.shutdown()
 
     def _poll_until_done(self, host, job_id, timeout=20.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             res = host.execute(
-                _server._job_snippet("poll(" + repr(job_id) + ")"),
+                _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"),
                 timeout=15.0,
             )
             snap = _job_result(res["stdout"])
@@ -457,7 +718,7 @@ class TestNapariJobs:
         # main thread (no crash) and the layer must appear.
         before = napari_kernel.execute("print(len(viewer.layers))")["stdout"]
         sub = napari_kernel.execute(
-            _server._job_snippet(
+            _kernel_rpc._job_snippet(
                 "submit("
                 + repr("viewer.add_image(np.zeros((8, 8)), name='t'); 'ok'")
                 + ")"
@@ -470,7 +731,7 @@ class TestNapariJobs:
         assert int(after.strip()) == int(before.strip()) + 1
 
     def test_screenshot_and_status_during_job(self, napari_kernel):
-        _server.set_promote_after(0.5)
+        _app.set_promote_after(0.5)
         handle = _server.execute_code("import time; time.sleep(4.0); print('done')")
         assert "still running" in handle  # promoted to a job
 
@@ -483,12 +744,168 @@ class TestNapariJobs:
 
     def test_restart_clears_jobs(self, napari_kernel):
         sub = napari_kernel.execute(
-            _server._job_snippet("submit(" + repr("import time; time.sleep(30)") + ")")
+            _kernel_rpc._job_snippet(
+                "submit(" + repr("import time; time.sleep(30)") + ")"
+            )
         )
         job_id = _job_result(sub["stdout"])["job_id"]
         napari_kernel.restart()  # respawns + re-bootstraps (resets jobs)
         res = napari_kernel.execute(
-            _server._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
+            _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
         )
         snap = _job_result(res["stdout"])
         assert snap["status"] == "unknown"
+
+
+class TestVerification:
+    """A candidate workflow run in a scratch namespace (``submit(verify_cells=)``).
+
+    The mechanism behind ``verify_workflow``: an agent rewrites a session into a
+    clean program and proves it runs without leaning on the session's leftovers
+    — which a *filter* over the transcript cannot do, since the correct program
+    is a rewrite of it and not a subsequence.
+    """
+
+    def test_a_cell_leaning_on_session_state_fails(self, runner):
+        runner["leftover"] = 42
+        snap = _wait_job(_jobs.submit("", verify_cells=["print(leftover)"])["job_id"])
+        cell = snap["verify"]["cells"][0]
+        assert snap["status"] == "error"
+        assert cell["status"] == "error"
+        assert "NameError" in cell["error_text"]
+
+    def test_the_bootstrap_handles_are_still_there(self, runner):
+        # A scratch namespace isolates the *session's* bindings, not the kernel's
+        # own: a workflow that cannot reach `client` would verify nothing.
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["print(_conn is not None)"])["job_id"]
+        )
+        assert snap["status"] == "ok"
+        assert snap["verify"]["cells"][0]["stdout_head"] == "True"
+
+    def test_cells_run_in_order_and_share_one_namespace(self, runner):
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["a = 2", "print(a * 3)\na * 3"])["job_id"]
+        )
+        cells = _jobs.verified()["cells"]
+        assert snap["verify"]["status"] == "ok"
+        assert cells[1]["stdout"] == "6\n"
+        assert cells[1]["result_text"] == "6"
+
+    def test_a_verification_does_not_write_the_session_namespace(self, runner):
+        _wait_job(_jobs.submit("", verify_cells=["scratch_only = 1"])["job_id"])
+        assert "scratch_only" not in runner
+
+    def test_cells_after_a_failure_are_skipped_not_dropped(self, runner):
+        # Dropping them would report a workflow that mysteriously got shorter;
+        # running them would report the cascade as separate defects.
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["1 / 0", "print('a')", "print('b')"])[
+                "job_id"
+            ]
+        )
+        assert [c["status"] for c in snap["verify"]["cells"]] == [
+            "error",
+            "skipped",
+            "skipped",
+        ]
+
+    def test_output_is_split_per_cell_and_teed_to_the_job(self, runner):
+        # The notebook needs the split; poll_job on a long verification needs
+        # the whole run accumulating where it always does.
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["print('one')", "print('two')"])["job_id"]
+        )
+        assert [c["stdout"] for c in _jobs.verified()["cells"]] == ["one\n", "two\n"]
+        assert snap["stdout"] == "one\ntwo\n"
+
+    def test_the_polled_record_carries_a_head_not_the_output(self, runner):
+        # The polled snapshot crosses a JSON round trip every 0.4s while a
+        # verification runs; carrying every cell's output there would ship the
+        # bytes `stdout` already holds, once more per cell, growing with the
+        # workflow. The full text is read once, by verified(), for the notebook.
+        big = "print('x' * 40_000)"
+        snap = _wait_job(_jobs.submit("", verify_cells=[big] * 5)["job_id"])
+        polled = snap["verify"]["cells"]
+        assert all("stdout" not in c for c in polled)
+        assert all(c["stdout_len"] == 40_001 for c in polled)
+        assert all(c["stdout_head"] == "x" * 79 + "…" for c in polled)
+        # ...and the notebook still gets all of it.
+        assert all(len(c["stdout"]) == 40_001 for c in _jobs.verified()["cells"])
+
+    def test_the_polled_record_does_not_grow_with_what_the_cells_printed(self, runner):
+        # The property, stated as a shape rather than a number: the polled
+        # record scales with the *workflow* -- a line per cell, which is the
+        # point of a ledger -- and not with its output.
+        import json
+
+        def polled_size(chars):
+            jid = _jobs.submit("", verify_cells=[f"print('y' * {chars})"] * 5)["job_id"]
+            return len(json.dumps(_wait_job(jid)["verify"]))
+
+        # ~495,000 more characters printed across the five cells; the record
+        # moves by the digits of a length and the source that names them.
+        assert polled_size(100_000) - polled_size(1_000) < 100
+
+    def test_only_a_complete_run_is_kept_as_the_verified_workflow(self, runner):
+        _wait_job(
+            _jobs.submit("", verify_cells=["1 / 0"], verify_title="bad")["job_id"]
+        )
+        assert _jobs.verified() is None
+        assert _jobs.verified_summary() is None
+
+    def test_a_later_failure_does_not_unverify_what_passed(self, runner):
+        _wait_job(_jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"])
+        _wait_job(
+            _jobs.submit("", verify_cells=["1 / 0"], verify_title="bad")["job_id"]
+        )
+        assert _jobs.verified()["title"] == "good"
+        assert _jobs.verified_summary() == {
+            "title": "good",
+            "cells": 1,
+            "created": _jobs.verified()["created"],
+        }
+
+    def test_reset_drops_the_verified_workflow(self, runner):
+        _wait_job(_jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"])
+        _jobs.reset()
+        assert _jobs.verified() is None
+
+    def test_the_job_code_is_derived_from_the_cells(self, runner):
+        # The audit view of this job must not disagree with the workflow view.
+        snap = _wait_job(_jobs.submit("", verify_cells=["a = 1", "a"])["job_id"])
+        assert "a = 1" in snap["code"] and snap["code"].endswith("a")
+
+    def test_an_ordinary_job_carries_no_verification(self, runner):
+        assert _jobs.poll(_jobs.submit("1 + 1")["job_id"])["verify"] is None
+
+    def test_jobs_view_carries_both_in_one_round_trip(self, runner):
+        jid = _jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"]
+        _wait_job(jid)
+        view = _jobs.jobs_view()
+        assert [j["job_id"] for j in view["jobs"]] == [jid]
+        assert view["workflow"]["title"] == "good"
+
+    def test_the_baseline_is_the_namespace_the_bootstrap_left(self, runner):
+        # Without mark_baseline() the fallback names are the floor; with it, a
+        # plugin bound at bootstrap is visible to a scratch run and a variable
+        # bound afterwards is not.
+        runner["myplugin"] = "loaded"
+        _jobs.mark_baseline()
+        runner["session_var"] = 1
+        snap = _wait_job(
+            _jobs.submit("", verify_cells=["print(myplugin)", "print(session_var)"])[
+                "job_id"
+            ]
+        )
+        cells = snap["verify"]["cells"]
+        assert cells[0]["stdout_head"] == "loaded"
+        assert cells[1]["status"] == "error"
+        assert "NameError" in cells[1]["error_text"]
+
+    def test_added_layers_are_counted_not_set_differenced(self):
+        # napari does not promise unique layer names, so a second "nuclei"
+        # beside an existing one is an addition this has to report.
+        assert _jobs._added_layers(["a", "b"], ["a", "b", "a", "c"]) == ["a", "c"]
+        assert _jobs._added_layers(["a"], ["a"]) == []
+        assert _jobs._added_layers(None, ["a"]) == []

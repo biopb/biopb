@@ -221,6 +221,15 @@ class ProcessLock:
             pass  # A record we can't remove costs a spurious recovery, no more.
         self._lock.release()
 
+    def is_held(self) -> bool:
+        """Whether this instance currently owns the cache directory.
+
+        Exists so a caller can tell "we released" from "we deliberately did
+        not": a shutdown that leaves a writer running must keep the lock, and
+        that is otherwise only observable by reaching inside the file lock.
+        """
+        return self._lock.is_held()
+
     def is_stale(self) -> bool:
         """Whether the previous owner exited without releasing (i.e. crashed).
 

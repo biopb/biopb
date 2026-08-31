@@ -83,7 +83,7 @@ def _dask_scaling_side_effect(shape):
     singleton-Z insert produces real output shapes and a real ``.ndim`` (needed
     wherever the test inspects the returned levels)."""
 
-    def _get_tensor(array_id, scale_hint=None):
+    def _get_tensor(array_id, scale_hint=None, reduction_method=None):
         hint = scale_hint or [1] * len(shape)
         new = [max(1, s // h) for s, h in zip(shape, hint, strict=False)]
         return da.zeros(new, chunks=new)
@@ -189,107 +189,52 @@ class TestResolveAxes:
         assert _resolve_axes([8, 8, 3], None)[3] is None
 
 
-class TestBuildPyramidLevels:
-    def test_small_image_returns_single_level(self):
+class TestNoAdvertisedPyramid:
+    """A server that advertises nothing gets full resolution, and nothing else.
+
+    There used to be a config-driven ladder here that recomputed the plan
+    client-side. It drifted from the server's (XY-only rungs plus one 3-D rung
+    against a separate plane cap, vs one joint XYZ loop) and omitted
+    reduction_method, so its chunk_ids could not match a pre-warmed level. A
+    server that advertises no pyramid also pre-warms nothing, so a coarse level
+    would cost the same read as level 0 for a blurrier picture.
+    """
+
+    def test_single_full_resolution_level(self):
         desc = _make_tensor_desc([256, 256])
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((256, 256))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
 
         assert len(levels) == 1
         # The layer is the source array -- no rank-evening.
         assert levels[0].shape == (256, 256)
-        # Unified loop always passes a scale_hint, even for a single level.
-        client.get_tensor.assert_called_once_with("t1", scale_hint=[1, 1])
+        # No scale_hint at all: asking for level 0 is asking for the tensor.
+        client.get_tensor.assert_called_once_with("t1")
 
-    def test_threshold_boundary_no_pyramid(self):
-        desc = _make_tensor_desc([THRESHOLD, THRESHOLD])
+    @pytest.mark.parametrize(
+        "shape,labels",
+        [
+            ([8192, 8192], ["y", "x"]),
+            ([100000, 100000], ["y", "x"]),
+            ([3000, 8192, 8192], ["z", "y", "x"]),
+            ([10, 8192, 8192], ["z", "y", "x"]),
+        ],
+        ids=["large", "wsi", "deep-stack", "thin-z"],
+    )
+    def test_size_never_produces_a_client_side_ladder(self, shape, labels):
+        """Not even the shapes that used to. Level count is the server's call."""
+        desc = _make_tensor_desc(shape, dim_labels=labels)
         client = MagicMock()
-        client.get_tensor.return_value = _arr_with_shape([THRESHOLD, THRESHOLD])
+        client.get_tensor.return_value = _arr_with_shape(shape)
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
+
         assert len(levels) == 1
-
-    def test_large_image_builds_pyramid(self):
-        desc = _make_tensor_desc([8192, 8192])
-        client = MagicMock()
-        client.get_tensor.side_effect = _scaling_side_effect([8192, 8192])
-
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-
-        assert len(levels) > 1
-        # First call should be scale=1 (no scale_hint with all 1s)
-        first_call = client.get_tensor.call_args_list[0]
-        assert first_call == call("t1", scale_hint=[1, 1])
-
-    def test_small_z_is_not_downsampled(self):
-        # A thin z (10 < floor) stays full-res while x/y shrink.
-        desc = _make_tensor_desc([10, 8192, 8192], dim_labels=["z", "y", "x"])
-        client = MagicMock()
-        client.get_tensor.side_effect = _scaling_side_effect([10, 8192, 8192])
-
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-
-        assert len(levels) > 1
-        # First level: scale_hint = [1, 1, 1]
-        first_hint = client.get_tensor.call_args_list[0][1]["scale_hint"]
-        assert first_hint == [1, 1, 1]
-        # Second level: z stays 1 (too small to scale), y and x scale.
-        second_hint = client.get_tensor.call_args_list[1][1]["scale_hint"]
-        assert second_hint[0] == 1  # z
-        assert second_hint[1] == FACTOR  # y
-        assert second_hint[2] == FACTOR  # x
-        # z stays full-res at every level.
-        assert all(c[1]["scale_hint"][0] == 1 for c in client.get_tensor.call_args_list)
-
-    def test_pyramid_coarsest_level_fits_within_threshold(self):
-        # Levels are emitted until the coarsest fits within `threshold`.
-        # Because the previous level still exceeded it, the coarsest always
-        # lands in (threshold // factor, threshold].
-        size = 100000
-        desc = _make_tensor_desc([size, size])
-        client = MagicMock()
-        client.get_tensor.side_effect = _scaling_side_effect([size, size])
-
-        build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-
-        # x is the last dim for a 2D source; scale is symmetric in x/y.
-        scales = [c[1]["scale_hint"][1] for c in client.get_tensor.call_args_list]
-        coarsest = size // scales[-1]
-        assert coarsest <= THRESHOLD
-        assert coarsest > THRESHOLD // FACTOR
-        # Every level before the coarsest still exceeded the threshold --
-        # that's why another level was emitted.
-        for s in scales[:-1]:
-            assert size // s > THRESHOLD
-
-    def test_deep_stack_bounds_coarsest_volume_including_z(self):
-        # A deep stack must downsample z too, so the coarsest level's whole
-        # volume (Lz*Ly*Lx) fits the voxel budget (issue #29).
-        desc = _make_tensor_desc([3000, 8192, 8192], dim_labels=["z", "y", "x"])
-        client = MagicMock()
-        client.get_tensor.side_effect = _scaling_side_effect([3000, 8192, 8192])
-
-        build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-
-        budget = get_setting(_CFG, "pyramid.pixel_budget_cubic_root") ** 3
-        last = client.get_tensor.call_args_list[-1][1]["scale_hint"]
-        sz, sy, sx = last[0], last[1], last[2]
-        lz, ly, lx = 3000 // sz, 8192 // sy, 8192 // sx
-        assert lx * ly * lz <= budget
-        assert sz > 1  # z was genuinely downsampled, not left at full res
-
-    def test_no_z_axis_emits_2d_scale_hints(self):
-        # No z label -> Lz treated as 1; the pyramid never adds a z factor.
-        desc = _make_tensor_desc([8192, 8192], dim_labels=["y", "x"])
-        client = MagicMock()
-        client.get_tensor.side_effect = _scaling_side_effect([8192, 8192])
-
-        build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
-
-        for c in client.get_tensor.call_args_list:
-            assert len(c[1]["scale_hint"]) == 2
+        assert client.get_tensor.call_count == 1
+        # No scale_hint means no client-side policy, not scale_hint=[1,...].
+        assert client.get_tensor.call_args == call("t1")
 
 
 class TestAdvertisedPyramid:
@@ -314,7 +259,7 @@ class TestAdvertisedPyramid:
             ],
         )
 
-        levels = build_pyramid_levels(client, "src", "src/A2", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "src/A2", desc)
 
         assert len(levels) == 2
         # Both requests carry the advertised scale_hint AND reduction_method.
@@ -340,7 +285,7 @@ class TestAdvertisedPyramid:
         )
         lean = SimpleNamespace(shape=self._FULL, dim_labels=self._LABELS)
 
-        levels = build_pyramid_levels(client, "src", "src/A2", lean, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "src/A2", lean)
 
         client.get_descriptor.assert_called_once_with("src/A2", with_pyramid=True)
         assert len(levels) == 2
@@ -358,7 +303,7 @@ class TestAdvertisedPyramid:
             pyramid=[_adv_level([1, 1, 1, 1, 1], "")],
         )
 
-        build_pyramid_levels(client, "src", "src/A2", desc, config=_CFG)
+        build_pyramid_levels(client, "src", "src/A2", desc)
 
         assert calls[0][1] is None
 
@@ -400,7 +345,7 @@ class TestBuildPyramidCanonicalOrder:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((64, 64))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         assert levels[0].shape == (64, 64)
 
     def test_a_leading_channel_is_untouched(self):
@@ -409,7 +354,7 @@ class TestBuildPyramidCanonicalOrder:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((3, 64, 32))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         assert levels[0].shape == (3, 64, 32)
 
     def test_a_real_z_is_left_alone(self):
@@ -418,7 +363,7 @@ class TestBuildPyramidCanonicalOrder:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((3, 10, 64, 64))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         assert levels[0].shape == (3, 10, 64, 64)
 
     def test_keeps_samples_axis_trailing(self):
@@ -428,7 +373,7 @@ class TestBuildPyramidCanonicalOrder:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((1, 1, 1, 512, 512, 3))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         assert levels[0].shape == (1, 1, 1, 512, 512, 3)
 
     def test_rgb_without_a_z_keeps_the_source_rank(self):
@@ -437,7 +382,7 @@ class TestBuildPyramidCanonicalOrder:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((64, 32, 3))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         assert levels[0].shape == (64, 32, 3)
 
     def test_size_three_channel_axis_is_not_treated_as_colour(self):
@@ -447,7 +392,7 @@ class TestBuildPyramidCanonicalOrder:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((3, 64, 32))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         assert levels[0].shape == (3, 64, 32)
         assert _resolve_axes([3, 64, 32], ["c", "y", "x"])[3] is None
 
@@ -461,7 +406,7 @@ class TestBuildPyramidCanonicalOrder:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((64, 32, 3))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         assert levels[0].shape == (64, 32, 3)
         assert _resolve_axes([64, 32, 3], ["y", "x", "c"])[:2] == (1, 2)
 
@@ -482,7 +427,6 @@ class TestBuildPyramidCanonicalOrder:
             _make_tensor_desc([64, 32, 3], None),
             name="lyr",
             source_desc=source_desc,
-            config=_CFG,
         )
         assert viewer.add_image.call_args[1]["rgb"] is True
 
@@ -516,7 +460,7 @@ class TestCanonicalDimLabels:
         client = MagicMock()
         client.get_tensor.return_value = da.zeros((2, 64, 32, 3))
 
-        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        levels = build_pyramid_levels(client, "src", "t1", desc)
         labels = canonical_dim_labels(desc)
         assert labels == ["t", "y", "x", "s"]
         assert len(labels) == levels[0].ndim
@@ -648,9 +592,12 @@ class TestAddTensorLayer:
         viewer = MagicMock()
         client = _make_physical_client([0.25, 0.5], ["µm", "µm"])
         client.get_tensor.side_effect = _dask_scaling_side_effect([8192, 8192])
+        # Multiscale is the server's call now, so the descriptor has to carry a
+        # pyramid for there to be more than one level to wrap.
         desc = _make_tensor_desc([8192, 8192], ["y", "x"])
+        desc.pyramid = [_adv_level([1, 1], "nearest"), _adv_level([8, 8], "nearest")]
 
-        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
 
         levels_arg = viewer.add_image.call_args[0][0]
         _, kwargs = viewer.add_image.call_args
@@ -672,7 +619,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256], ["y", "x"])
 
-        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
 
         _, kwargs = viewer.add_image.call_args
         assert kwargs == {
@@ -689,7 +636,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((3, 64, 32))
         desc = _make_tensor_desc([3, 64, 32], ["C", "Y", "X"])
 
-        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
 
         arr = viewer.add_image.call_args[0][0]
         _, kwargs = viewer.add_image.call_args
@@ -706,7 +653,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256])
 
-        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
 
         _, kwargs = viewer.add_image.call_args
         assert kwargs == {"name": "lyr", "metadata": {"array_id": "t1"}}
@@ -719,9 +666,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256], ["y", "x"])
 
-        add_tensor_layer(
-            viewer, client, "multi", "multi/Image:0", desc, name="lyr", config=_CFG
-        )
+        add_tensor_layer(viewer, client, "multi", "multi/Image:0", desc, name="lyr")
 
         _, kwargs = viewer.add_image.call_args
         # The qualified array_id client.get_tensor takes, not the routing prefix.
@@ -734,7 +679,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((3, 64, 32))
         desc = _make_tensor_desc([3, 64, 32], ["c", "y", "x"])
 
-        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
 
         arr = viewer.add_image.call_args[0][0]
         _, kwargs = viewer.add_image.call_args
@@ -749,7 +694,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((1, 1, 1, 64, 32, 3))
         desc = _make_tensor_desc([1, 1, 1, 64, 32, 3], ["T", "C", "Z", "Y", "X", "S"])
 
-        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
 
         arr = viewer.add_image.call_args[0][0]
         _, kwargs = viewer.add_image.call_args
@@ -766,7 +711,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256], ["y", "x"])
 
-        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr")
 
         _, kwargs = viewer.add_image.call_args
         assert "rgb" not in kwargs

@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 
 import typer
 from biopb import _web_auth
+from biopb._fs_detect import unsafe_cache_dir_reason
 from biopb._lifecycle import deathwatch as _deathwatch
 from biopb._locations import tls_server_cert
 from rich.console import Console
@@ -37,7 +38,6 @@ from biopb_tensor_server.core.config import (
     resolve_all_sources,
     validate_config_dict,
 )
-from biopb_tensor_server.core.fs_detect import unsafe_cache_dir_reason
 from biopb_tensor_server.core.logging_config import (
     get_log_level_from_env,
     setup_logging,
@@ -1697,9 +1697,9 @@ def launch(
         else:
             # No web app is bundled here, so there is no frontend origin to derive
             # by default. The control front reaches this sidecar over loopback for
-            # the data API + /ws/render, so allow all loopback variants of the
-            # server's own address; a browser app on any other origin must be
-            # allowed explicitly via --cors.
+            # the data API, so allow all loopback variants of the server's own
+            # address; a browser app on any other origin must be allowed
+            # explicitly via --cors.
             from urllib.parse import urlparse as _urlparse
 
             _loopback_aliases: dict = {

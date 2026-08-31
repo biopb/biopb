@@ -60,6 +60,10 @@ def _default_of(section, field):
             "pixel_budget_cubic_root",
         ),
         ({"pyramid": {"threshold": 0}}, "pyramid", "threshold"),
+        # <= 0 can never satisfy the 2-D stop condition, so the rungs run to the
+        # per-axis floor and the cap silently stops being the cap.
+        ({"pyramid": {"plane_max_pixels": 0}}, "pyramid", "plane_max_pixels"),
+        ({"pyramid": {"plane_max_pixels": -1}}, "pyramid", "plane_max_pixels"),
         ({"pyramid": {"reduction_method": "bogus"}}, "pyramid", "reduction_method"),
         # "precompute" is protocol vocabulary (request a native on-disk level),
         # not a way to compute a pyramid level -- invalid as config.
@@ -365,6 +369,25 @@ def test_empty_config_reproduces_dataclass_defaults():
                 f"{getattr(section_obj, name)!r}, dataclass default is "
                 f"{getattr(defaults, name)!r}"
             )
+
+
+def test_speculative_warming_ships_on_and_bounded():
+    """Precache defaults to on, and an explicit opt-out still turns it off.
+
+    Not a value the other defaults test can catch: it compares parse_config({})
+    against the dataclass, so both halves flipping together stays green. The
+    shipped answer is a policy call, so it is pinned here rather than left to
+    whoever last edited the dataclass.
+
+    It ships on because the warm set is now bounded -- at most two levels per
+    tensor, each capped by warm_budget_bytes over a centred window. That bound is
+    the whole premise, so the budget is pinned alongside it: warming defaults on
+    only for as long as it stays finite (biopb/biopb#826 turned it off when it
+    did not).
+    """
+    assert parse_config({}).precache.enabled is True
+    assert parse_config({"precache": {"enabled": False}}).precache.enabled is False
+    assert parse_config({}).precache.warm_budget_bytes == 256 * 1024 * 1024
 
 
 def test_present_keys_override_defaults_only_where_set():

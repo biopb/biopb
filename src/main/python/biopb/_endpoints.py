@@ -22,7 +22,7 @@ its root (dashboard ``/``, dataviewer ``/viewer``, per-session observe
 API (bare ``/health``; control verbs under ``/api/*``, e.g.
 ``/api/data_plane/ensure``), and reverse-proxies the supervised tensor server's
 HTTP sidecar under a ``/data_plane/*`` namespace (data API at
-``/data_plane/api/*``, ``/data_plane/ws/render``). Each plane owns a path prefix
+``/data_plane/api/*``). Each plane owns a path prefix
 so the ``/api/*`` namespaces never collide; per-session ``/session/<id>/api/*``
 proxies to the session child on the same origin.
 """

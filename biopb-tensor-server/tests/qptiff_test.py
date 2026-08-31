@@ -142,8 +142,14 @@ class TestQptiffAdapter:
                 assert list(desc.shape) == [3, 512, 512]
                 assert list(desc.dim_labels) == ["c", "y", "x"]
                 assert desc.dtype == np.dtype("uint16").str
-                # Native tile grid as the advertised access chunk.
-                assert list(desc.chunk_shape) == [1, 256, 256]
+                # The advertised grid is the transfer grid, aligned to the
+                # native 256x256 tiles rather than equal to one (#809).
+                grid = list(desc.chunk_shape)
+                assert all(
+                    g % n == 0 and g <= s
+                    for g, n, s in zip(grid, [1, 256, 256], [3, 512, 512], strict=True)
+                )
+                assert grid != [1, 256, 256]
             finally:
                 adapter.close()
 
@@ -381,3 +387,121 @@ class TestQptiffAdapterIntegration:
                 client.close()
             finally:
                 server.shutdown()
+
+
+class TestQptiffHandleReaper:
+    """The handle is bounded (biopb/biopb#816 audit).
+
+    Before this, ``close()`` had no caller anywhere in the package and the adapter
+    registered with no reaper, so a QPTIFF held its ``TiffFile`` plus one live
+    ``aszarr`` store per level read from registration until the process exited --
+    the pin biopb/biopb#71 removed from hdf5/mrc and OME-TIFF bounded with a
+    reaper, which this adapter got neither of.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _release_handles(self):
+        """Close every adapter a test built, so no handle outlives its tmpdir.
+
+        A tifffile handle left warm past the read makes the file undeletable on
+        Windows (WinError 32) -- the same pin this pool exists to bound, reachable
+        from the tests because the handle now survives the read.
+        """
+        self._adapters = []
+        yield
+        # Runs AFTER the test body, which is why these tests use pytest's
+        # tmp_path rather than a `with TemporaryDirectory()`: that cleans up
+        # inside the body, before this ever runs, and on Windows an open handle
+        # makes the removal fail (WinError 32). pytest removes tmp_path after
+        # teardown, so the handle is gone first.
+        for adapter in self._adapters:
+            try:
+                adapter.close()
+            except Exception:
+                pass
+
+    def _open(self, path):
+        adapter = _adapter(path)
+        self._adapters.append(adapter)
+        return adapter
+
+    def _read(self, adapter, stop=(1, 8, 8)):
+        return adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=list(stop)))
+
+    def test_registers_on_open_and_reaps_when_idle(self, tmp_path):
+        from biopb_tensor_server.adapters import qptiff as qptiff_module
+
+        path = tmp_path / "s.qptiff"
+        expected = create_synthetic_qptiff(path)
+        adapter = self._open(path)
+        self._read(adapter)
+        assert adapter._tiff is not None
+        assert adapter in list(qptiff_module._handle_reaper._adapters)
+
+        adapter._persistent_last_access -= qptiff_module._handle_reaper.ttl + 1
+        qptiff_module._handle_reaper._sweep()
+        assert adapter._tiff is None
+        assert adapter._level_stores == {}
+
+        # Reopening is transparent -- same pixels, rebuilt handle.
+        np.testing.assert_array_equal(self._read(adapter), expected[0:1, 0:8, 0:8])
+        assert adapter._tiff is not None
+
+    def test_a_read_in_flight_blocks_the_reap_and_close(self, tmp_path):
+        """Reads decode outside ``_io_lock`` so they stay parallel, which is why
+        the count is needed: closing the store under a decode would fail the read,
+        and the parent's lock alone cannot see a decode that does not hold it."""
+        from biopb_tensor_server.adapters import qptiff as qptiff_module
+
+        path = tmp_path / "s.qptiff"
+        create_synthetic_qptiff(path)
+        adapter = self._open(path)
+        self._read(adapter)
+        adapter._persistent_last_access -= qptiff_module._handle_reaper.ttl + 1
+        adapter._active_reads = 1
+        try:
+            qptiff_module._handle_reaper._sweep()
+            assert adapter._tiff is not None
+            adapter.close()  # explicit close defers to the same guard
+            assert adapter._tiff is not None
+        finally:
+            adapter._active_reads = 0
+        adapter.close()
+        assert adapter._tiff is None
+
+    def test_level_adapter_survives_a_reap(self, tmp_path):
+        """DoGet resolves a level adapter and reads through it as two separate
+        steps, so a sweep can land between them. The level adapter re-resolves its
+        store from the parent per read rather than capturing it once."""
+        from biopb_tensor_server.adapters import qptiff as qptiff_module
+
+        path = tmp_path / "s.qptiff"
+        create_synthetic_qptiff(path)
+        adapter = self._open(path)
+        level = adapter.get_level_adapter("1")
+        bounds = ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8])
+        before = level.get_data(bounds)
+
+        # Reap out from under the adapter the caller already holds.
+        adapter._persistent_last_access -= qptiff_module._handle_reaper.ttl + 1
+        qptiff_module._handle_reaper._sweep()
+        assert adapter._tiff is None
+
+        np.testing.assert_array_equal(level.get_data(bounds), before)
+
+    def test_level_adapter_read_counts_against_the_parent(self, tmp_path):
+        path = tmp_path / "s.qptiff"
+        create_synthetic_qptiff(path)
+        adapter = self._open(path)
+        level = adapter.get_level_adapter("1")
+        seen = []
+        real = adapter._end_read
+
+        def spy():
+            seen.append(adapter._active_reads)
+            real()
+
+        adapter._end_read = spy
+        level.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
+        assert seen == [1]  # counted while the decode was in flight
+        assert adapter._active_reads == 0

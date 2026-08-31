@@ -1,28 +1,53 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { useAppStore } from "../store";
+import {
+  MAX_ROWS,
+  autoExpanded,
+  hasVisibleEntries,
+  visibleEntries,
+} from "../utils/jsonTree";
 
 interface MetaPanelProps {
   sourceId: string;
 }
 
-function isEmptyForDisplay(value: unknown): boolean {
-  if (value === null || value === undefined) return true;
-  if (Array.isArray(value)) {
-    if (value.length === 0) return true;
-    return value.every(isEmptyForDisplay);
-  }
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>);
-    if (entries.length === 0) return true;
-    return entries.every(([, v]) => isEmptyForDisplay(v));
-  }
-  return false;
+/** The affordance for the rows a node is holding back. */
+function MoreRow({ count, onClick }: { count: number; onClick: () => void }) {
+  return (
+    <div
+      style={{ color: "#64748b", cursor: "pointer" }}
+      onClick={onClick}
+      title="Show the remaining entries"
+    >
+      ... {count.toLocaleString()} more
+    </div>
+  );
 }
 
-function JsonNode({ value, depth = 0 }: { value: unknown; depth?: number }) {
-  const [expanded, setExpanded] = useState(depth < 2);
+/**
+ * Memoised because it is recursive: without this, any re-render of the panel
+ * re-renders every row below it, and the rows are the expensive part.
+ */
+const JsonNode = memo(function JsonNode({
+  value,
+  depth = 0,
+  revealed = false,
+}: {
+  value: unknown;
+  depth?: number;
+  /**
+   * This row came from a "… N more", so it starts shut whatever its depth says.
+   *
+   * Otherwise revealing 1,991 held-back keys also opens each one: measured at
+   * 27k DOM nodes for the MicroManager blob, when the point of the click was to
+   * see the key list. Asking for the rest is not asking to expand the rest.
+   */
+  revealed?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(() => !revealed && autoExpanded(value, depth));
+  const [showAll, setShowAll] = useState(false);
 
   if (value === null) return <span style={{ color: "#f87171" }}>null</span>;
   if (value === undefined) return <span style={{ color: "#f87171" }}>undefined</span>;
@@ -57,13 +82,15 @@ function JsonNode({ value, depth = 0 }: { value: unknown; depth?: number }) {
           [
         </span>
         <div style={{ marginLeft: 12 }}>
-          {value.slice(0, 10).map((v, i) => (
+          {(showAll ? value : value.slice(0, MAX_ROWS)).map((v, i) => (
             <div key={i}>
               <span style={{ color: "#64748b" }}>{i}: </span>
-              <JsonNode value={v} depth={depth + 1} />
+              <JsonNode value={v} depth={depth + 1} revealed={i >= MAX_ROWS} />
             </div>
           ))}
-          {value.length > 10 && <span style={{ color: "#64748b" }}>... {value.length - 10} more</span>}
+          {!showAll && value.length > MAX_ROWS && (
+            <MoreRow count={value.length - MAX_ROWS} onClick={() => setShowAll(true)} />
+          )}
         </div>
         <span style={{ color: "#64748b" }}>]</span>
       </span>
@@ -71,31 +98,41 @@ function JsonNode({ value, depth = 0 }: { value: unknown; depth?: number }) {
   }
 
   if (typeof value === "object") {
-    const allEntries = Object.entries(value as Record<string, unknown>);
-    const entries = allEntries.filter(([, v]) => !isEmptyForDisplay(v));
-    if (entries.length === 0) return <span style={{ color: "#64748b" }}>{}</span>;
+    const obj = value as Record<string, unknown>;
     if (!expanded) {
+      // Answered without filtering: a collapsed node only chooses between the
+      // two placeholders, and the filter is a whole-subtree walk.
+      if (!hasVisibleEntries(obj)) return <span style={{ color: "#64748b" }}>{"{}"}</span>;
       return (
         <span
           style={{ color: "#64748b", cursor: "pointer" }}
           onClick={() => setExpanded(true)}
         >
-          {"{...}"}
+          {`{...${Object.keys(obj).length}}`}
         </span>
       );
     }
+    const entries = visibleEntries(obj);
+    if (entries.length === 0) return <span style={{ color: "#64748b" }}>{"{}"}</span>;
+    const shown = showAll ? entries : entries.slice(0, MAX_ROWS);
     return (
       <span>
         <span style={{ color: "#64748b", cursor: "pointer" }} onClick={() => setExpanded(false)}>
           {"{"}
         </span>
         <div style={{ marginLeft: 12 }}>
-          {entries.map(([k, v]) => (
+          {shown.map(([k, v], i) => (
             <div key={k}>
               <span style={{ color: "#fbbf24" }}>{k}: </span>
-              <JsonNode value={v} depth={depth + 1} />
+              <JsonNode value={v} depth={depth + 1} revealed={i >= MAX_ROWS} />
             </div>
           ))}
+          {shown.length < entries.length && (
+            <MoreRow
+              count={entries.length - shown.length}
+              onClick={() => setShowAll(true)}
+            />
+          )}
         </div>
         <span style={{ color: "#64748b" }}>{"}"}</span>
       </span>
@@ -103,7 +140,7 @@ function JsonNode({ value, depth = 0 }: { value: unknown; depth?: number }) {
   }
 
   return <span>{String(value)}</span>;
-}
+});
 
 export function MetaPanel({ sourceId }: MetaPanelProps) {
   const client = useAppStore((s) => s.client);

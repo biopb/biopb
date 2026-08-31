@@ -45,8 +45,8 @@ Full cost model: see the `nd2-cold-read-io-model` agent memory and biopb #72.
   server `PrecacheWorker` already does internally** (`resolve_chunk_data(chunk_id,
   cache_manager)` — compute-and-cache, no client). So Mode B should not be a
   client feature; it should be a smarter, *demand-driven* version of the
-  precache worker (the one currently disabled via `[precache] enabled=false`,
-  because it is blanket + index-time and confounds profiling).
+  precache worker (which is index-time and speculative where this would be
+  demand-driven; it warms two bounded levels per tensor and is on by default).
 
 ## The core risk: the `_io_lock` is non-preemptive
 

@@ -801,10 +801,17 @@ class TestCacheIntegration:
             server.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_different_regions_different_cache_entries(self, simple_zarr_array):
+    def test_different_regions_different_cache_entries(
+        self, simple_zarr_array, transfer_target
+    ):
         """Test that different regions create different cache entries."""
         import zarr
         from biopb_tensor_server import ZarrAdapter
+
+        # Two regions can only land in different cache entries if they land in
+        # different chunks; at the default target this 16 KB array is one chunk
+        # (biopb/biopb#809).
+        transfer_target(64 * 64)
 
         zarr_path, shape, chunks = simple_zarr_array
 
@@ -829,11 +836,10 @@ class TestCacheIntegration:
             darr[: chunks[0], : chunks[1]].compute()
             nbytes1 = client.cache_info()["size_bytes"]
 
-            # Read second chunk (different region)
+            # Read a different chunk of the grid the target above pins.
             darr[chunks[0] : chunks[0] * 2, chunks[1] : chunks[1] * 2].compute()
             nbytes2 = client.cache_info()["size_bytes"]
 
-            # Cache should have grown
             assert nbytes2 > nbytes1
 
             client.close()
@@ -1004,14 +1010,17 @@ class TestBioioReadPath:
     # installer-wheel-coverage CI provisions fixtures for (issue #361).
 
     @pytest.mark.parametrize(
-        "plugin, ext, source_type",
+        "plugin, ext, source_type, claim_type",
         [
-            ("bioio_czi", ".czi", "zeiss"),
-            ("bioio_nd2", ".nd2", "nikon"),
-            ("bioio_lif", ".lif", "leica"),
+            # A local .czi is claimed by the native CziAdapter (biopb/biopb#799);
+            # BioIO still serves the layouts that adapter declines, which is the
+            # read path `source_type` exercises here.
+            ("bioio_czi", ".czi", "zeiss", "czi"),
+            ("bioio_nd2", ".nd2", "nikon", "nikon"),
+            ("bioio_lif", ".lif", "leica", "leica"),
         ],
     )
-    def test_vendor_fixture_read_via_bioio(self, plugin, ext, source_type):
+    def test_vendor_fixture_read_via_bioio(self, plugin, ext, source_type, claim_type):
         """A real CZI/ND2/LIF sample claims + reads through its adapter.
 
         Skips cleanly when the plugin is absent (slim install) or no sample is
@@ -1038,7 +1047,17 @@ class TestBioioReadPath:
                 f"to {_VENDOR_FIXTURE_DIR})"
             )
 
-        self._assert_claims(path, adapter_cls, source_type)
+        # Assert the routing through the registry rather than the read adapter:
+        # a native adapter may own the claim while BioIO still serves the read.
+        from biopb_tensor_server.adapters import get_default_registry
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
+
+        claims = get_default_registry().get_claims_for_path(
+            ClaimContext(Path(path)), DiscoveryState()
+        )
+        assert claims, f"nothing claimed {path}"
+        assert claims[0].source_type == claim_type
+
         desc, data = self._read_full(path, adapter_cls)
         # Descriptor and read agree, the read is non-trivial, and dtype matches.
         assert tuple(data.shape) == tuple(desc.shape)

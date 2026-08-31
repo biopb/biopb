@@ -21,7 +21,7 @@ Two properties make this the tier with teeth, and one makes it the hardest to
 read.
 
 **It tests what we ship, twice over.** A skill body arrives through the real
-:mod:`biopb_mcp.mcp._skills` — ``find_skills`` and ``skill://<id>``, the same
+:mod:`biopb_mcp.mcp._skills` — ``list_skills`` and ``skill://<id>``, the same
 calls the runtime makes — and every run happens against a real shim-spawned
 session: real kernel, real napari, real dask, the nine real tools with their
 real schemas and the server's own ``instructions``. Nothing is stood in for.

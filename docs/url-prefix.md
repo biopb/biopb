@@ -69,7 +69,7 @@ whole, name the prefix in `scope["root_path"]`), nor a hybrid of the two.
 `get_route_path` subtracts `root_path` from `path` only when the path still
 starts with it — so a stripped path *plus* a `root_path` makes that subtraction
 silently no-op inside `/data_plane` and `/session/{id}`, and the sub-app sees its
-own mount prefix again (`/ws/render` stops matching). The un-stripped variant
+own mount prefix again (its routes stop matching). The un-stripped variant
 routes correctly but hands the auth gate a prefixed path, which is the bypass
 above. Nothing in the control builds absolute URLs out of `root_path` — the
 browser side is carried by the rewritten shell — so stripping outright is both
@@ -131,9 +131,8 @@ Router paths are the exception and stay as they are: `<Route path="/viewer">` an
 `main.tsx` sets from `BASE`.
 
 The data plane needs no special handling beyond `apiBase = withBase("/data_plane")`
-in `ClientBootstrap.tsx`. That also carries the render WebSocket for free, since
-`useRenderWebSocket.ts` resolves `${apiBase}/ws/render` against the page origin,
-and `tensor-flight-client` is already parameterized on `apiBase`.
+in `ClientBootstrap.tsx`, since `tensor-flight-client` is already parameterized on
+`apiBase`.
 
 `vite.config.ts` keeps `base: "/"` — the runtime global, not the build-time base,
 carries the prefix. There is deliberately **no** `VITE_TENSOR_API` any more: a

@@ -28,6 +28,7 @@ Design notes that pin this to the current release model (``docs/release-model.md
 
 import json
 import logging
+import os
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -229,3 +230,86 @@ def check_for_update(
         # an update check must never disturb kernel bring-up.
         logger.debug("update check failed (fail-open)", exc_info=True)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Applying the user's choice
+#
+# Deliberately a *notify-only reminder*, not a self-applying updater: a
+# cross-platform apply needs a staging step we do not handle gracefully yet
+# (Windows cannot reinstall into a tool dir the running process holds open).
+# So the popup names the upgrade command and the user runs it; they can opt
+# out per-version (`skip`) or entirely (`disable`).
+#
+# Pure control flow over the config seams, so it is unit-testable without Qt;
+# it runs on the Qt main thread (the popup's button signal delivers there).
+# `_update_popup` keeps the clipboard copy, which needs Qt.
+# ---------------------------------------------------------------------------
+# The published install/upgrade one-liners (docs/release-model.md). Re-running
+# the script is how a user updates; the nagger just surfaces the command.
+_INSTALL_SH = "curl -fsSL https://biopb.org/install.sh | bash"
+_INSTALL_PS1 = "irm https://biopb.org/install.ps1 | iex"
+
+
+def _is_windows() -> bool:
+    """Whether the running platform is Windows.
+
+    A seam so tests can select the platform without mutating the global
+    ``os.name`` — patching that corrupts ``pathlib`` on Python < 3.12 (it picks
+    ``WindowsPath``/``PosixPath`` off ``os.name``, and instantiating the
+    non-native one raises ``NotImplementedError``), which crashes pytest's own
+    location reporting mid-test.
+    """
+    return os.name == "nt"
+
+
+def upgrade_command() -> str:
+    """The platform-appropriate install/upgrade command to show the user."""
+    return _INSTALL_PS1 if _is_windows() else _INSTALL_SH
+
+
+def handle_choice(action: str, info, config: dict) -> None:
+    """Dispatch a nagger choice (``skip`` / ``disable`` / ``later``).
+
+    * ``skip``    -> persist ``update.skipped_version`` so *this* version
+                     never prompts again.
+    * ``disable`` -> turn the check off entirely (``update.enabled = false``).
+    * ``later``   -> do nothing; the check re-prompts on the next kernel start.
+
+    (The ``copy`` button is handled in the popup itself.) Fail-open: a handler
+    error is logged, never raised (this runs in a Qt slot).
+    """
+    try:
+        if action == "skip":
+            _persist_skip(info.latest)
+        elif action == "disable":
+            _disable_checks()
+        elif action == "later":
+            logger.debug("update %s deferred (Later)", info.latest)
+        else:
+            logger.debug("update popup: unknown action %r", action)
+    except Exception:
+        logger.exception("update choice handler failed for action %r", action)
+
+
+def _persist_skip(version: str) -> None:
+    """Record the user's "Skip vX.Y.Z" so :func:`_update.check_for_update`
+    suppresses exactly that version on future starts."""
+    try:
+        from .._config import CONFIG
+
+        CONFIG.set("update.skipped_version", version)
+        logger.info("update %s skipped on user request", version)
+    except Exception:
+        logger.exception("failed to persist skipped update version %s", version)
+
+
+def _disable_checks() -> None:
+    """Opt out of update reminders entirely (``update.enabled = false``)."""
+    try:
+        from .._config import CONFIG
+
+        CONFIG.set("update.enabled", False)
+        logger.info("update reminders disabled on user request")
+    except Exception:
+        logger.exception("failed to disable update reminders")

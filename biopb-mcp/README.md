@@ -6,11 +6,6 @@
 
 **biopb-mcp** is the MCP component of the **[BioPB](https://github.com/biopb/biopb)** project
 
-## Troubleshooting
-
-For URL resolution, the auto-start fallback, and how to resolve startup failures (e.g.
-a port already in use on a shared node), see [docs/troubleshooting.md](docs/troubleshooting.md).
-
 ## Contributing
 
 Contributions are very welcome. Read [ARCHITECTURE.md](ARCHITECTURE.md) first to understand the project architecture.

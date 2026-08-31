@@ -105,6 +105,12 @@ or remove a layer, or import something you did not.
 * **Their cell is not yours to stop.** `interrupt_kernel` refuses a user job (it stops
   only your own). Do not reach for `restart_kernel` to get around that: it would
   destroy the user's variables and layers along with yours.
+* **But no second agent.** The user is the only other writer you will meet: whichever
+  agent runs code first holds the kernel until it restarts, and another client is
+  refused by everything that changes kernel state — `execute_code`, `interrupt_kernel`,
+  `restart_kernel` — keeping only the read-only tools. So a namespace change you did
+  not make came from the person, and the note above is the whole story. If you are the
+  one refused, say so and let the user decide; the restart is theirs.
 
 Reading pixels, moving them between the server / a layer / your own variables,
 and the round trip for data too large to hold: `guide://data`.
@@ -113,12 +119,12 @@ and the round trip for data too large to hold: `guide://data`.
 # Appended to GUIDE only when the skills catalog is enabled
 # (``services.skills_enabled``, on by default; see _server.get_kernel_guide).
 # An install with skills off has no `checklist:` to resolve and no
-# `find_skills` to get them from, so this section would describe a tool the
+# `list_skills` to get them from, so this section would describe a tool the
 # agent cannot call -- the same reasoning as _SKILLS_INSTRUCTIONS.
 SKILL_REQUIREMENTS = """\
 
 ## Skill requirements
-A curated skill from `find_skills` carries a `checklist:`. **Resolve it before you start the
+A curated skill from `list_skills` carries a `checklist:`. **Resolve it before you start the
 skill** — one that assumes a plugin or package it doesn't have fails partway through, after
 the user has already waited.
 
@@ -454,8 +460,10 @@ else:
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table columns: source_id, source_url, source_type, dtype,
 # indexed_at, metadata_json, shape_summary, data_resident, and `tensors`
-# (a LIST of STRUCT(array_id, dim_labels, shape, chunk_shape, dtype) -- one
-# per tensor; `dtype`/`shape_summary` are just the first-tensor projection).
+# (a LIST of STRUCT(array_id, dim_labels, shape, dtype) -- one per tensor;
+# `dtype`/`shape_summary` are just the first-tensor projection).
+# The catalog is structural: the transfer grid a tensor is delivered on is not
+# stored here -- `client.get_descriptor(array_id).chunk_shape` answers it.
 df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
 print(df)
 

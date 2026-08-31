@@ -33,6 +33,15 @@ option java_package = "biopb.tensor";
 //     so an embedded '/' is just payload (safe). A Flight ticket carries no
 //     source_id field, so recovering source_id from a chunk's array_id uses the
 //     same split-on-the-first-'/' rule.
+//
+// VERSIONED FORM (HTTP only). The HTTP sidecar publishes a content-versioned
+// array_id, `source_id "@" token [ "/" field ]`, so a browser cache keyed on a
+// tile URL cannot outlive the content it holds (biopb/biopb#780). The token is
+// derived from DataSourceDescriptor.content_version. This form exists ONLY
+// above the Flight wire: the sidecar strips it before every Flight call, and no
+// adapter, chunk_id, catalog row or descriptor ever carries it. A '@' is legal
+// in a field name and is untouched -- only the source_id half is parsed for it,
+// and a source_id can never contain '@' (it is `<type>_<hex>`).
 // ============================================================================
 
 // Encoded into FlightDescriptor.cmd bytes (identifies the tensor)
@@ -48,7 +57,25 @@ message TensorDescriptor {
   // Full array shape (per dimension)
   repeated int64 shape = 3;
 
-  // Nominal chunk size per dimension (actual may vary for edge chunks)
+  // Nominal transfer chunk size per dimension (actual may vary for edge
+  // chunks). This is the grid the tensor's chunks are delivered on, chosen by
+  // the server-side adapter that knows how the bytes sit on disk; it is not the
+  // store's own block size, and no read is issued at any other granularity.
+  //
+  // On a *response* it is the grid you will read on -- the tensor's own grid in
+  // a describe, and for a scaled read the grid of that response's (already
+  // reduced) chunks. It is answered ONLY by GetFlightInfo, which resolves the
+  // tensor adapter first: the grid depends on facts that exist only once a
+  // specific tensor/scene is bound (its backing chunk layout, its dimension
+  // labels, format layout rules, the native pyramid level, the request scale),
+  // so a source-level listing cannot own it. ListFlights and
+  // DataSourceDescriptor.tensors therefore carry it EMPTY -- like pyramid and
+  // physical_scale -- and an empty grid is not a usable fallback: a client that
+  // needs one for Dask construction, tiling or prefetching must describe the
+  // tensor. (Empty also means "old server"; the field has always been optional.)
+  //
+  // On an upload *request* it is the grid you will write on -- it sets the
+  // created store's blocking and the bounds every chunk must land on.
   repeated int64 chunk_shape = 4;
 
   // Element dtype (numpy-style, e.g., "uint8", "float32", "float64")
@@ -67,8 +94,11 @@ message TensorDescriptor {
   // or "precompute" (serve a native on-disk pyramid level).
   // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
   // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
-  // Advisory for caching: the server may serve an existing cached chunk
-  // computed under a different method at the same bounds/scale.
+  // An empty or omitted value is resolved to "nearest" by the server.
+  // Clients that want averaging must set this field explicitly to "area".
+  // Note: already-cached chunk IDs that carry no method byte (issued before
+  // this default was established) are decoded as "area" for compatibility;
+  // only newly minted IDs default to "nearest".
   string reduction_method = 8;
 
   // Opaque JSON metadata compatible with OME-NGFF (.zattrs schema).
@@ -106,6 +136,32 @@ message TensorDescriptor {
   // reused.
   reserved 13;
   reserved "chunk_array_id";
+
+  // Opaque per-source generation token, sampled once at (re-)registration
+  // (biopb/biopb#178): the stat signature `mtime_ns:size` for a file/dir
+  // source, `iat:<ts>` for a caching proxy's mirror. Two descriptors carrying
+  // DIFFERENT tokens for one source describe different content; two carrying
+  // the SAME token describe the same content. It is not ordered -- newer is not
+  // "greater" -- and it is not a hash of the bytes, so an in-place edit that
+  // preserves mtime and size is invisible to it.
+  //
+  // A SERVING field, like chunk_shape and pyramid: filled by GetFlightInfo from
+  // the bound adapter, left empty on the structural DataSourceDescriptor.tensors
+  // entries. It is a source-level property repeated on the tensor deliberately
+  // -- consumers need it on the freshest thing in the request, and GetFlightInfo
+  // is fetch-per-call by contract while a catalog listing is a natural thing to
+  // cache (biopb/biopb#834).
+  //
+  // Absent means "no claim", not "unchanged": a source whose URL cannot be
+  // stat'd (cloud, unresolved) leaves it unset, and consumers must degrade to
+  // whatever freshness policy they used before rather than treating absence as
+  // a stable version. Servers predating this field also leave it unset.
+  //
+  // Consumers use it to namespace caches they cannot otherwise invalidate. The
+  // chunk cache already folds it into chunk_id; the HTTP sidecar folds it into
+  // the array_id it publishes, so a browser cache keyed on a tile URL cannot
+  // outlive the content (biopb/biopb#780).
+  optional bytes content_version = 14;
 }
 
 // One resolution level of a tensor's server-advertised pyramid.
@@ -235,8 +291,12 @@ message DataSourceDescriptor {
   // Source type: "aics", "micromanager", "ome-zarr", "zarr", "hdf5", etc.
   string source_type = 3;
 
-  // All tensor descriptors in this source
-  // metadata_json field not populated here (source-level metadata only)
+  // Every tensor in this source, as a STRUCTURAL catalog entry: array_id,
+  // dim_labels, shape, dtype. The serving fields are left empty here --
+  // chunk_shape (the transfer grid), pyramid, physical_scale, metadata_json --
+  // because a source lists all its tensors without binding any of them, and
+  // those are answered by the adapter GetFlightInfo binds to one tensor. Read
+  // this to enumerate and address; describe the tensor to plan a read.
   repeated TensorDescriptor tensors = 4;
 
   // Source-level OME/vendor metadata (JSON format)

@@ -1,9 +1,10 @@
 import { Link } from "react-router-dom";
 import { useAppStore } from "../store";
-import { ImageViewer } from "../components/ImageViewer";
+import { ViewerPane } from "../components/ViewerPane";
 import { MetaPanel } from "../components/MetaPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
+import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 
@@ -48,7 +49,7 @@ export function HomePage() {
           <>
             <div className="viewer-column">
               <div className="viewer-canvas-wrap">
-                <ImageViewer
+                <ViewerPane
                   sourceId={activeSourceId}
                   tensorId={activeTensorId}
                 />
@@ -56,7 +57,14 @@ export function HomePage() {
             </div>
             <div className="control-column">
               <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
-              <MetaPanel sourceId={activeSourceId} />
+              {/*
+                Remount per source. Without the key, a switch re-renders the
+                whole tree against the *previous* source's metadata — the new
+                fetch has not resolved yet — and then reconciles it away once it
+                does. It also carries every node's expanded/collapsed state over
+                to a tree that has nothing to do with it.
+              */}
+              <MetaPanel key={activeSourceId} sourceId={activeSourceId} />
             </div>
           </>
         ) : (
@@ -72,6 +80,8 @@ export function HomePage() {
           </div>
         )}
       </main>
+
+      <TipBar />
 
       {connectionError && connectionState === "error" && (
         <div className="error-toast">

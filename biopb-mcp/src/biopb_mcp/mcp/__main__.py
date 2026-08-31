@@ -24,6 +24,8 @@ import socket
 import sys
 import tempfile
 
+from biopb._locations import MCP_SESSION_LOG_ENV
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,10 +35,12 @@ logger = logging.getLogger(__name__)
 # direct `--transport http` launch (fixed port). Kept in sync with _shim.
 ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
-# Env var the stdio shim sets to the child's own session logfile path, so the
-# child can report it (server_status) and the agent's execute_code can read it
-# from os.environ. Kept in sync with _shim.ENV_SESSION_LOG.
-ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
+# Env var naming this process's own logfile, so it can report it (server_status)
+# and the agent's execute_code can read it from os.environ. Set by whoever
+# redirected our output: the stdio shim for the child it spawns, the control for
+# a viewer it launches. Bound from the core SDK rather than repeated, since it is
+# now three processes across two packages that must agree on one string.
+ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
 
 
 def _report_port(path, port):
@@ -61,6 +65,56 @@ def _report_port(path, port):
         os.replace(tmp, path)
     except OSError:
         logger.warning("Could not write port report file %s", path, exc_info=True)
+
+
+def _register_view_session(port):
+    """Publish this agentless viewer in the session registry; return its id.
+
+    The control lists live sessions and proxies ``/session/<id>/*`` from this
+    registry, so a session nobody publishes is a session with no observe page
+    and no dashboard entry. The stdio shim publishes the child it owns
+    (``_shim.spawn_session``); a `biopb mcp view` session has no shim, so it
+    publishes itself.
+
+    Best-effort, and broadly caught for the same reason the shim's publish is
+    (biopb/biopb#422): a registry write failure — a serialization error, an
+    unwritable state dir — must cost the viewer its discoverability and nothing
+    else. Returns ``None`` in that case, leaving the caller nothing to
+    de-register.
+    """
+    from biopb import _sessions
+
+    try:
+        session_id = _sessions.new_session_id()
+        _sessions.register(
+            session_id,
+            port=port,
+            pid=os.getpid(),
+            mcp_url=f"http://127.0.0.1:{port}/mcp",
+        )
+    except Exception:
+        logger.warning("Could not register this session", exc_info=True)
+        return None
+    logger.info("Registered session %s for the control plane.", session_id)
+    return session_id
+
+
+def _unregister_session(session_id):
+    """Drop ``session_id``'s routing record. No-op when it was never registered.
+
+    Best-effort like the publish: teardown must not fail because a record was
+    already gone. The registry's own pid-liveness prune
+    (:func:`biopb._sessions.list_sessions`) is the backstop for a kill abrupt
+    enough that this never runs.
+    """
+    if session_id is None:
+        return
+    from biopb import _sessions
+
+    try:
+        _sessions.unregister(session_id)
+    except Exception:
+        logger.warning("Could not unregister session %s", session_id, exc_info=True)
 
 
 def _parse_args(argv, default_transport, default_port):
@@ -107,13 +161,18 @@ def _has_display():
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _setup_observe(config):
+def _setup_observe(config, agentless=False, on_shutdown=None):
     """Wire up the web observe UI.
 
     On by default (``observe.enabled``, opt-out); it mounts on the existing
     MCP app and shares its loop/port. Fully guarded — an observe failure logs
     and is swallowed so it can never block the MCP server. Returns True if
     mounted.
+
+    *agentless* / *on_shutdown* decide whether this session serves the stop
+    route, and what it runs. Passed in rather than read here because the
+    launcher's ``_shutdown`` is the thing being handed over, and it must be
+    registered before the routes are, which is inside this call.
     """
     from .._config import get_setting
 
@@ -122,6 +181,7 @@ def _setup_observe(config):
     try:
         from . import _observe
 
+        _observe.set_session_owns_its_reap(agentless, on_shutdown=on_shutdown)
         _observe.configure(
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
@@ -134,6 +194,53 @@ def _setup_observe(config):
     except Exception:
         logger.exception("observe UI failed to start; continuing without it")
         return False
+
+
+def _is_agentless_viewer(view, shim_owned):
+    """Whether this session is a viewer a human opened, not a harness's child.
+
+    Two things follow from it and must not drift apart: such a session publishes
+    *itself* to the registry (nothing else owns its reap), and it is the only
+    kind that gets the built-in chat loop. A shim-owned child is serving an MCP
+    client; a direct ``--transport http`` launch is neither, and publishes no
+    session at all, so it has no observe page for a pane to live on.
+    """
+    return bool(view and not shim_owned)
+
+
+def _setup_chat(config, agentless):
+    """Wire up the built-in chat client.
+
+    Switched by ``observe.chat_enabled``, beside the console's. On by default,
+    which costs nothing: without a model and key in ``chat`` the pane is inert,
+    so it never spends the user's provider credits uninvited. Guarded like
+    observe — a chat failure logs and is swallowed rather
+    than blocking the MCP server, which is the surface an already-working
+    harness depends on. Returns True if mounted.
+
+    *agentless* says whether this session is a `biopb mcp view` viewer rather
+    than a child some MCP client is driving; chat is served only on the former.
+
+    The verdict is also published on ``/api/status``
+    (:func:`_observe.set_chat_enabled`), so the control's dashboard can label
+    this session by what it actually serves — a viewer leads with chat, an MCP
+    client's child with the job list — instead of guessing from launch flags it
+    never sees. Set on every path, so a failed mount reads as off rather than
+    stale.
+    """
+    from . import _observe
+
+    mounted = False
+    try:
+        from . import _chat_api
+
+        if _chat_api.configure(config, agentless=agentless):
+            _chat_api.register_http_routes()
+            mounted = True
+    except Exception:
+        logger.exception("chat API failed to start; continuing without it")
+    _observe.set_chat_enabled(mounted)
+    return mounted
 
 
 def _config_defaults(config):
@@ -210,7 +317,7 @@ def _serve_http(config, port, view=False):
     first ``start_kernel`` tool call.
     """
     from .._config import get_setting
-    from . import _server, _xvfb
+    from . import _app, _server, _xvfb
     from ._cluster import DaskClusterHost
     from ._kernel import KernelHost
 
@@ -332,11 +439,11 @@ def _serve_http(config, port, view=False):
     # whether a kernel is attached — the one thing that makes a teardown safe.
     cluster_host.set_kernel_alive(host.is_alive)
     cluster_host.start_reaper()
-    _server.set_kernel_host(host)
-    _server.set_promote_after(get_setting(config, "kernel.promote_after"))
+    _app.set_kernel_host(host)
+    _app.set_promote_after(get_setting(config, "kernel.promote_after"))
     # Advertise the curated-skills catalog only when it is enabled (off by
-    # default) — mirrors what find_skills / the skill:// resource actually serve.
-    _server.set_skills_enabled(get_setting(config, "services.skills_enabled"))
+    # default) — mirrors what list_skills / the skill:// resource actually serve.
+    _app.set_skills_enabled(get_setting(config, "services.skills_enabled"))
 
     # Tell server_status where this process's log lives, so an agent can find it.
     #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
@@ -353,7 +460,7 @@ def _serve_http(config, port, view=False):
         session_log = str(get_daemon_log_file(config))
     else:
         session_log = None
-    _server.set_session_log_path(session_log)
+    _app.set_session_log_path(session_log)
 
     # On-demand start: the kernel is NOT launched here. The server stays cheap
     # and idle (no viewer window pops, no Qt abort on a display-less server)
@@ -397,6 +504,29 @@ def _serve_http(config, port, view=False):
                 flush=True,
             )
 
+    # Set by the registration below; read by _shutdown. Declared here because the
+    # signal handlers are installed before that point, so this name has to exist
+    # even on a Ctrl-C that arrives during the viewer's bring-up.
+    session_id = None
+
+    def _stop_acp_agent():
+        """Reap the chat pane's ACP harness and remove its scratch dir.
+
+        Guarded and imported late for the same reason the chat mount is: an
+        engine that was never used, or a module that failed to import, must not
+        be able to stop this process from exiting.
+        """
+        try:
+            from . import _chat_acp
+
+            _chat_acp.stop_sync()
+            _chat_acp.cleanup_cwd()
+        except Exception:  # noqa: BLE001 - teardown is best-effort
+            logger.debug("stopping the ACP agent failed", exc_info=True)
+
+    # Backstop for the exits that skip _shutdown, matching the dask cluster's.
+    atexit.register(_stop_acp_agent)
+
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
         server loop returning: reap the kernel, close the session-child-owned
@@ -409,6 +539,17 @@ def _serve_http(config, port, view=False):
         The launcher's only remaining job is to exit, so exit immediately.
         """
         logger.info("Shutting down (%s).", reason)
+        # Drop the routing record before anything else, so a control stops
+        # routing here while this process can still refuse a connection cleanly
+        # rather than after it has stopped answering. Teardown and
+        # de-registration are one path, as they are in the shim's _reap_session;
+        # the registry's own pid-liveness prune is the backstop for a kill this
+        # never runs for.
+        _unregister_session(session_id)
+        # Before the kernel: an ACP harness holds an MCP session against this
+        # server, so it is a client, and clients go before the thing they are
+        # attached to. Cheap and idempotent when chat never ran.
+        _stop_acp_agent()
         host.shutdown()
         # After the kernel is reaped (no clients left attached): stop the
         # session-child-owned cluster, then rmtree its now-idle spill dir. This
@@ -426,9 +567,23 @@ def _serve_http(config, port, view=False):
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # Whether this session owns its own reap. Two things hang off it, and the
+    # single expression keeps them from drifting: the built-in chat loop, and
+    # the stop route (a shim-owned child is reaped by its shim, so ending it
+    # here would leave that shim bridging to a dead process).
+    agentless = _is_agentless_viewer(view, shim_owned)
+
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
-    # custom routes are read when the streamable-http app is built.
-    _setup_observe(config)
+    # custom routes are read when the streamable-http app is built. `_shutdown`
+    # goes with it, so a stop from the web takes the same path Ctrl-C does.
+    _setup_observe(
+        config,
+        agentless=agentless,
+        on_shutdown=lambda: _shutdown("stopped from the web"),
+    )
+    # A shim-owned child is serving an MCP client, which is the one situation the
+    # built-in loop is not for.
+    _setup_chat(config, agentless=agentless)
 
     if view:
         # Agentless viewer: bring the window up now (the human wants it
@@ -440,6 +595,15 @@ def _serve_http(config, port, view=False):
         except Exception:
             logger.exception("Failed to open the viewer; exiting")
             return 1  # atexit reaps the kernel/cluster and cleans the spill dir
+
+    # Only the agentless viewer registers *itself*: a shim-owned child is
+    # published by the shim that owns its reap (and so its de-registration), and
+    # a direct `--transport http` launch binds the configured fixed port its
+    # operator already knows. Done last, with the kernel up and the serve loop
+    # the next statement, so a record implies a session that is all but
+    # answering.
+    if _is_agentless_viewer(view, shim_owned):
+        session_id = _register_view_session(port)
 
     _server.run(
         port,

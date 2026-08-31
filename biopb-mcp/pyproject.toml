@@ -115,7 +115,7 @@ tables = [
 # fresh from PyPI, not from uv.lock -- swallow the new major, so every release
 # back to 0.8.0 installs a server that cannot start. Lift the cap only together
 # with the FastMCP port and a re-examined override.
-mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn"]
+mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn", "agent-client-protocol>=0.12,<1"]
 3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
@@ -138,7 +138,7 @@ mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil",
 # and `biopb-tensor-server` to the sibling workspace members (editable), so the
 # whole stack is always built from this same checkout and version-pairing is
 # automatic — no URL/SHA to bump and re-`uv lock` on every server release.
-# `[web]` pulls fastapi/uvicorn/pillow/simplejpeg — the server's CLI
+# `[web]` pulls fastapi/uvicorn — the server's CLI
 # (`biopb server start`) imports its HTTP server at module load, so without it
 # even importing the CLI raises ModuleNotFoundError: fastapi.
 integration = [

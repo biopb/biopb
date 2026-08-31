@@ -29,8 +29,8 @@ permissions:
   contents: read
 
 jobs:
-  # JS/TS unit suite. `-r run test` runs each package's test script; currently
-  # that's vitest in tensor-flight-client (the app has none yet).
+  # JS/TS unit suite. `-r run test` runs each package's test script (vitest in
+  # both tensor-flight-client and the app), in topological order.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -54,6 +54,12 @@ jobs:
 
       - name: Install JS dependencies
         run: pnpm -C web install --frozen-lockfile
+
+      # tensor-flight-client must be compiled first: the app imports it by
+      # package name, which resolves through its `main` (dist/index.js), so
+      # vitest cannot load the app suite against an unbuilt workspace.
+      - name: Build workspace packages
+        run: pnpm -C web -r run build
 
       - name: Run JS tests
         run: pnpm -C web -r run test

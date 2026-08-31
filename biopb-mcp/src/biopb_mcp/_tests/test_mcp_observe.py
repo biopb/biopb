@@ -19,14 +19,14 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _observe, _server
+from biopb_mcp.mcp import _app, _http, _kernel_rpc, _observe
 
 
 def _reply(r, window_alive=True):
     """A kernel ``execute`` result whose stdout carries ``{"r": r, "w": ...}``."""
     env = {"r": r, "w": window_alive}
     return {
-        "stdout": _server._JOB_DELIM + json.dumps(env) + "\n",
+        "stdout": _kernel_rpc._JOB_DELIM + json.dumps(env) + "\n",
         "result_text": "",
         "error_text": "",
         "status": "ok",
@@ -54,29 +54,29 @@ def host():
         "recent_respawns": 0,
         "watchdog_running": True,
     }
-    h.execute.return_value = _reply([])  # jobs_summary() default: empty
+    h.execute.return_value = _reply({"jobs": [], "workflow": None})  # jobs_view()
     return h
 
 
 @pytest.fixture(autouse=True)
 def observe_state(host):
     """Install the mock host + snapshot/restore _observe + _server globals."""
-    old_host = _server._kernel_host
+    old_host = _app._kernel_host
     old_max = _observe._max_output_chars
     old_poll = _observe._poll_interval_ms
     old_console = _observe._console_enabled
     old_mounted = _observe._mounted_http
-    _server.set_kernel_host(host)
+    _app.set_kernel_host(host)
     _observe.configure(
         max_output_chars=20000, poll_interval_ms=3000, console_enabled=True
     )
     yield
-    _server._kernel_host = old_host
+    _app._kernel_host = old_host
     _observe._max_output_chars = old_max
     _observe._poll_interval_ms = old_poll
     _observe._console_enabled = old_console
     _observe._mounted_http = old_mounted
-    _observe._mw = None
+    _http._mw = None
 
 
 @pytest.fixture
@@ -97,15 +97,18 @@ def test_observe_page_is_not_served_by_the_child(client):
 
 def test_api_jobs_lists_summary(client, host):
     host.execute.return_value = _reply(
-        [
-            {
-                "job_id": "job-1",
-                "status": "running",
-                "elapsed": 1.2,
-                "stdout_len": 5,
-                "code_preview": "print('hi')",
-            }
-        ]
+        {
+            "jobs": [
+                {
+                    "job_id": "job-1",
+                    "status": "running",
+                    "elapsed": 1.2,
+                    "stdout_len": 5,
+                    "code_preview": "print('hi')",
+                }
+            ],
+            "workflow": None,
+        }
     )
     r = client.get("/api/jobs")
     assert r.status_code == 200
@@ -186,6 +189,48 @@ def test_api_notebook_downloads_ipynb(client, host):
     assert any(o.get("name") == "stderr" for o in job2["outputs"])
 
 
+def test_api_notebook_workflow_serves_the_verified_run(client, host):
+    host.execute.return_value = _reply(
+        {
+            "title": "Count foci per cell",
+            "created": 1_700_000_000.0,
+            "status": "ok",
+            "added_layers": [],
+            "cells": [
+                {
+                    "code": "a = 2",
+                    "status": "ok",
+                    "stdout": "",
+                    "result_text": "",
+                    "error_text": "",
+                    "elapsed": 0.1,
+                }
+            ],
+        }
+    )
+    r = client.get("/api/notebook?workflow=1")
+    assert r.status_code == 200
+    # A different document, so a different read: the verified program, not the
+    # transcript it was rewritten from.
+    assert "verified()" in host.execute.call_args[0][0]
+    assert r.headers["X-Filename"].startswith("biopb-count-foci-per-cell-")
+    assert "Count foci per cell" in r.text
+
+
+def test_api_notebook_workflow_404s_when_nothing_is_verified(client, host):
+    host.execute.return_value = _reply(None)
+    r = client.get("/api/notebook?workflow=1")
+    assert r.status_code == 404
+
+
+def test_api_notebook_defaults_to_the_audit_export(client, host):
+    # The default is unchanged, so a bookmarked URL and an older page both still
+    # get the document they asked for.
+    host.execute.return_value = _reply([])
+    assert client.get("/api/notebook").status_code == 200
+    assert "export()" in host.execute.call_args[0][0]
+
+
 def test_api_notebook_empty_session(client, host):
     host.execute.return_value = _reply([])
     r = client.get("/api/notebook")
@@ -235,7 +280,7 @@ def test_api_status(client):
 
 
 def test_api_503_without_host(client):
-    _server._kernel_host = None
+    _app._kernel_host = None
     for method, path in [
         ("get", "/api/jobs"),
         ("get", "/api/jobs/job-1"),
@@ -379,13 +424,13 @@ def test_console_reports_a_collision_as_409_with_whose_job(client, host):
     # One job at a time, no preemption and no queue -- so a collision is an
     # expected outcome, and the page needs to know *whose* job it lost to.
     host.execute.return_value = _reply(
-        {"error": "busy", "running_job_id": "job-3", "running_job_origin": "agent"}
+        {"error": "busy", "running_job_id": "job-3", "running_job_origin": "mcp"}
     )
     r = client.post("/console/execute", json={"code": "1"})
     assert r.status_code == 409
     body = r.json()
     assert body["running_job_id"] == "job-3"
-    assert body["running_job_origin"] == "agent"
+    assert body["running_job_origin"] == "mcp"
 
 
 def test_console_kernel_lock_busy_is_a_retryable_503(client, host):
@@ -412,6 +457,72 @@ def test_status_advertises_the_console_switch(host):
         _observe.configure(console_enabled=enabled)
         r = _console_client().get("/api/status")
         assert r.json()["console_enabled"] is enabled
+
+
+def test_status_advertises_whether_chat_is_mounted(host):
+    # The control's dashboard reads this to label a session's link: only an
+    # agentless `biopb mcp view` session mounts chat, so this is also its answer
+    # to "viewer, or an MCP client's child?".
+    old = _observe._chat_enabled
+    try:
+        for enabled in (True, False):
+            _observe.set_chat_enabled(enabled)
+            r = _console_client().get("/api/status")
+            assert r.json()["chat_enabled"] is enabled
+    finally:
+        _observe.set_chat_enabled(old)
+
+
+def test_status_advertises_who_owns_the_reap(host):
+    # The control's dashboard offers a stop only where the session ends itself.
+    # Distinct from chat_enabled: chat is a config switch, and a viewer with
+    # chat off still owns its reap.
+    old = (_observe._agentless, _observe._shutdown_hook)
+    try:
+        for agentless in (True, False):
+            _observe.set_session_owns_its_reap(agentless, on_shutdown=lambda: None)
+            r = _console_client().get("/api/status")
+            assert r.json()["agentless"] is agentless
+    finally:
+        _observe._agentless, _observe._shutdown_hook = old
+
+
+def test_shutdown_route_absent_for_a_shim_owned_child(host):
+    # Not a refusing route -- no route. Ending a shim's child would leave that
+    # shim bridging to a dead process, so the verb must not exist there at all.
+    _observe.set_session_owns_its_reap(False)
+    try:
+        client = _console_client()
+        assert client.post("/api/shutdown").status_code == 404
+        assert client.get("/api/jobs").status_code == 200  # untouched
+    finally:
+        _observe.set_session_owns_its_reap(False)
+
+
+def test_shutdown_runs_the_session_teardown_after_answering(host):
+    # The stop is the session ending itself on the launcher's own `_shutdown`
+    # path -- so the hook is what runs, and it runs only once the response is
+    # out (it ends in os._exit, which would otherwise cut the reply off).
+    calls = []
+    _observe.set_session_owns_its_reap(True, on_shutdown=lambda: calls.append(1))
+    try:
+        r = _console_client().post("/api/shutdown")
+        assert r.status_code == 200
+        assert r.json()["stopping"] is True
+    finally:
+        _observe.set_session_owns_its_reap(False)
+    # TestClient runs background tasks before returning, so by here it has run.
+    assert calls == [1]
+
+
+def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
+    # Deliberately not folded into configure(), which resets allowed_origins /
+    # allowed_hosts on every call and so cannot be called a second time to add
+    # one fact without dropping others.
+    _observe.configure(allowed_origins=("https://front",), allowed_hosts=("front",))
+    _observe.set_chat_enabled(True)
+    assert _http._extra_origins == ("https://front",)
+    assert _http._extra_hosts == ("front",)
 
 
 # -- busy kernel ------------------------------------------------------------

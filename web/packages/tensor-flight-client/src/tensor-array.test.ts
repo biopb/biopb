@@ -10,6 +10,7 @@ import { describe, it, expect, vi, type Mock } from "vitest";
 
 import {
   buildAxisMap,
+  sliderAxes,
   isAxisMapAmbiguous,
   computeScaleHint,
   TensorArray,
@@ -186,6 +187,72 @@ describe("buildAxisMap: the plane is a position", () => {
 });
 
 // ---------------------------------------------------------------------------
+// sliderAxes — navigation without renaming
+// ---------------------------------------------------------------------------
+
+describe("sliderAxes", () => {
+  it("names the axes the labels name", () => {
+    const axes = sliderAxes(["t", "c", "z", "y", "x"], [4, 3, 16, 512, 512]);
+    expect(axes.map((a) => [a.axis, a.named, a.title, a.key])).toEqual([
+      [0, "t", "T", "t"],
+      [1, "c", "C", "c"],
+      [2, "z", "Z", "z"],
+    ]);
+  });
+
+  it("excludes the plane", () => {
+    expect(sliderAxes(["y", "x"], [512, 512])).toEqual([]);
+    expect(sliderAxes(["y", "x", "s"], [512, 512, 3])).toEqual([]);
+  });
+
+  it("does NOT rename an unnamed axis to z", () => {
+    // buildAxisMap's positional fallback would call this one `z`. A TIFF
+    // sequence's 155 stacked files are not depth planes, and nothing in the
+    // source says they are.
+    expect(buildAxisMap(["i", "y", "x"]).z).toBe(0);
+    const axes = sliderAxes(["i", "y", "x"], [155, 1024, 1344]);
+    expect(axes).toEqual([
+      { axis: 0, named: null, title: "i", key: "a0", extent: 155 },
+    ]);
+  });
+
+  it("still makes an unlabelled store navigable", () => {
+    // What the fallback existed to provide, kept: every axis gets a control.
+    // Only the invented semantics are gone.
+    const axes = sliderAxes(["dim0", "dim1", "dim2", "dim3"], [4, 5, 512, 512]);
+    expect(axes.map((a) => a.title)).toEqual(["dim0", "dim1"]);
+    expect(axes.map((a) => a.key)).toEqual(["a0", "a1"]);
+    expect(axes.every((a) => a.named === null)).toBe(true);
+  });
+
+  it("gives the second of two axes sharing a label a key of its own", () => {
+    // Only the first `c` has a name to be addressed by; the second would
+    // otherwise collapse into the same selection entry.
+    const axes = sliderAxes(["c", "c", "y", "x"], [2, 3, 512, 512]);
+    expect(axes.map((a) => [a.named, a.key])).toEqual([
+      ["c", "c"],
+      [null, "a1"],
+    ]);
+  });
+
+  it("titles an empty label by position", () => {
+    const axes = sliderAxes(["", "y", "x"], [7, 512, 512]);
+    expect(axes[0]).toMatchObject({ title: "axis 0", key: "a0" });
+  });
+
+  it("keeps extent-1 axes, which are still part of a selection", () => {
+    const axes = sliderAxes(["t", "y", "x"], [1, 512, 512]);
+    expect(axes).toEqual([{ axis: 0, named: "t", title: "T", key: "t", extent: 1 }]);
+  });
+
+  it("gives every axis a unique key", () => {
+    const labels = ["c", "c", "", "pos", "z", "y", "x"];
+    const axes = sliderAxes(labels, [2, 3, 4, 5, 6, 512, 512]);
+    expect(new Set(axes.map((a) => a.key)).size).toBe(axes.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // isAxisMapAmbiguous
 // ---------------------------------------------------------------------------
 
@@ -280,7 +347,7 @@ describe("TensorArray.compute", () => {
 
   it("sends full extent when no options provided", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute();
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.slice_start).toEqual([0, 0, 0]);
@@ -289,7 +356,7 @@ describe("TensorArray.compute", () => {
 
   it("clamps out-of-range slice stops to shape", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute({ z: [0, 999], y: [0, 999], x: [0, 999] });
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.slice_stop).toEqual([10, 128, 256]);
@@ -297,7 +364,7 @@ describe("TensorArray.compute", () => {
 
   it("sends scalar z as single-index range [z, z+1]", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute({ z: 3 });
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.slice_start![0]).toBe(3);
@@ -306,25 +373,27 @@ describe("TensorArray.compute", () => {
 
   it("includes scale_hint and reduction_method in request", async () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await ta.compute({ scaleHint: [1, 2, 2], reductionMethod: "area" });
     const callArg = (client.slice as Mock).mock.calls[0]![0];
     expect(callArg.scale_hint).toEqual([1, 2, 2]);
     expect(callArg.reduction_method).toBe("area");
   });
 
-  it("sets correct source_id and tensor_id", async () => {
+  it("addresses the read by the descriptor's own array_id", async () => {
+    // Not a rebuilt one: the descriptor is what the geometry came from, so
+    // deriving the read's address separately is how the two came to disagree.
     const client = makeClient();
-    const ta = new TensorArray(client, "my-source", desc);
+    const ta = new TensorArray(client, makeDesc(["z", "y", "x"], [10, 128, 256], "uint16", "my-source/Image:0"));
     await ta.compute();
     const callArg = (client.slice as Mock).mock.calls[0]![0];
-    expect(callArg.source_id).toBe("my-source");
-    expect(callArg.tensor_id).toBe("t0");
+    expect(callArg.array_id).toBe("my-source/Image:0");
+    expect(callArg.source_id).toBeUndefined();
   });
 
   it("exposes ndim, shape, dtype from descriptor", () => {
     const client = makeClient();
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     expect(ta.ndim).toBe(3);
     expect(ta.shape).toEqual([10, 128, 256]);
     expect(ta.dtype).toBe("uint16");
@@ -333,7 +402,7 @@ describe("TensorArray.compute", () => {
   it("propagates client errors", async () => {
     const client = makeClient();
     (client.slice as Mock).mockRejectedValueOnce(new Error("network error"));
-    const ta = new TensorArray(client, "src0", desc);
+    const ta = new TensorArray(client, desc);
     await expect(ta.compute()).rejects.toThrow("network error");
   });
 });

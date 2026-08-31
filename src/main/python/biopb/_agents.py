@@ -14,6 +14,14 @@ one). Kept **stdlib-only** — like ``_endpoints`` / ``_sessions`` — so
 importing it never drags in a heavy stack, and so both the lean control plane and
 the core CLI can call it.
 
+Each client is a :class:`ClientBackend` — one object owning its config location,
+its install signal, and its read/write path. Adding a client is a class plus a
+line in ``_CLIENTS``, with nothing to remember elsewhere. Two rules keep a
+half-implemented one from reaching a user: the format and entry-shape tables
+(``_READERS``, ``_SHAPES``) have no default branch, and the write path is
+abstract, so an omission is a ``TypeError`` at import rather than a config
+written in a format it is not.
+
 Three things it does per client:
 
 - **status** — a subprocess-free read (``not_installed`` / ``installed`` /
@@ -25,7 +33,10 @@ Three things it does per client:
   Cursor, opencode) get an atomic read-merge-replace that preserves every other
   key. Claude Code goes through its ``claude`` CLI (``mcp add --scope user``):
   ``~/.claude.json`` is a busy file Claude Code rewrites constantly, so we let it
-  serialize its own writes rather than race it with our merge.
+  serialize its own writes rather than race it with our merge. Codex CLI goes
+  through ``codex mcp add`` for a different reason: its config is TOML, and only
+  Codex's own editor keeps the user's comments and sibling servers intact — we
+  have no TOML writer and want none (see :func:`_read_toml_entry`).
 - **unregister** — the inverse; idempotent (removing an absent entry is fine).
 
 The registered command is the **absolute path** to ``biopb-mcp`` (resolved beside
@@ -47,7 +58,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+
+try:  # tomllib is 3.11+; on 3.10 (our floor) _scan_toml_entry stands in
+    import tomllib
+except ImportError:  # pragma: no cover - only reached on 3.10
+    tomllib = None  # type: ignore[assignment]
+
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
@@ -62,47 +79,6 @@ _MCP_ARGS = ("--transport", "stdio")
 class AgentError(Exception):
     """A register/unregister could not be completed (bad config, CLI missing,
     unwritable file). Carries a human-facing message the CLI/API surfaces."""
-
-
-@dataclass(frozen=True)
-class AgentSpec:
-    """Static per-client knowledge.
-
-    ``manager`` selects how register/unregister act: ``"json"`` edits a config
-    file directly (atomic merge/delete under ``parent_key``), ``"claude-cli"``
-    shells out to the ``claude`` CLI. ``entry_style`` selects the MCP entry shape
-    for JSON clients: ``"stdio"`` is the canonical ``{command, args}`` form every
-    ``mcpServers`` client accepts; ``"opencode"`` is opencode's
-    ``{type: "local", command: [...]}`` form. ``parent_key`` is the top-level key
-    the biopb entry lives under (``mcpServers`` for most, ``mcp`` for opencode).
-    """
-
-    id: str
-    name: str
-    manager: str  # "json" | "claude-cli"
-    parent_key: str  # "mcpServers" | "mcp"
-    entry_style: str  # "stdio" | "opencode"
-
-
-# The catalog — consistent with the installer (install/install.sh,
-# install/biopb-engine.ps1). Hermes is intentionally omitted: the installer only
-# ever prints a manual YAML snippet for it (it will not edit YAML), so it can
-# never reach `registered` through a button — not worth a dead row.
-_SPECS: tuple[AgentSpec, ...] = (
-    AgentSpec("claude-code", "Claude Code", "claude-cli", "mcpServers", "stdio"),
-    AgentSpec("claude-desktop", "Claude Desktop", "json", "mcpServers", "stdio"),
-    AgentSpec("cursor", "Cursor", "json", "mcpServers", "stdio"),
-    AgentSpec("opencode", "opencode", "json", "mcp", "opencode"),
-)
-
-_SPECS_BY_ID = {s.id: s for s in _SPECS}
-
-
-def _spec(spec_id: str) -> AgentSpec:
-    try:
-        return _SPECS_BY_ID[spec_id]
-    except KeyError:
-        raise AgentError(f"unknown agent client {spec_id!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -134,76 +110,6 @@ def _mcp_command() -> str:
     fails when neither is present, which is also when the bare name is the best
     we can offer."""
     return _mcp_executable() or "biopb-mcp"
-
-
-# --------------------------------------------------------------------------- #
-# Per-client config location + install detection
-# --------------------------------------------------------------------------- #
-
-
-def _config_path(spec: AgentSpec) -> Optional[Path]:
-    """The config file biopb's entry lives in, or ``None`` on a platform where the
-    client has no known location. Resolved at call time (not cached) so a test
-    that repoints ``Path.home()`` / ``$APPDATA`` gets an isolated location."""
-    home = Path.home()
-    if spec.id == "claude-code":
-        # Claude Code stores user-scope MCP servers in ~/.claude.json under the
-        # top-level `mcpServers` key. We only READ this for status; register/
-        # unregister go through the `claude` CLI (see _run_claude).
-        return home / ".claude.json"
-    if spec.id == "claude-desktop":
-        if sys.platform == "win32":
-            base = os.environ.get("APPDATA")
-            root = Path(base) if base else home / "AppData" / "Roaming"
-            return root / "Claude" / "claude_desktop_config.json"
-        if sys.platform == "darwin":
-            return (
-                home
-                / "Library"
-                / "Application Support"
-                / "Claude"
-                / "claude_desktop_config.json"
-            )
-        return home / ".config" / "Claude" / "claude_desktop_config.json"
-    if spec.id == "cursor":
-        return home / ".cursor" / "mcp.json"
-    if spec.id == "opencode":
-        return _opencode_config_path()
-    return None
-
-
-def _opencode_config_path() -> Path:
-    """The opencode global config biopb should target (biopb/biopb#536).
-
-    opencode reads either ``opencode.jsonc`` or ``opencode.json``. Prefer an
-    existing ``.jsonc`` so we edit the file opencode actually honors instead of
-    writing a shadow ``.json`` it may ignore; otherwise fall back to ``.json`` —
-    the canonical file we create on a fresh install. Resolved at call time so a
-    test that repoints ``Path.home()`` is isolated."""
-    base = Path.home() / ".config" / "opencode"
-    jsonc = base / "opencode.jsonc"
-    if jsonc.exists():
-        return jsonc
-    return base / "opencode.json"
-
-
-def _is_installed(spec: AgentSpec) -> bool:
-    """Whether the client appears present — the same signals the installer uses.
-
-    Deliberately cheap and subprocess-free: a binary on PATH or a well-known
-    config directory. A false negative (a portable/flatpak install we can't see)
-    just shows ``not_installed``; register still works as an escape hatch.
-    """
-    if spec.id == "claude-code":
-        return shutil.which("claude") is not None
-    if spec.id == "opencode":
-        if shutil.which("opencode") is not None:
-            return True
-        return (Path.home() / ".config" / "opencode").is_dir()
-    # Claude Desktop / Cursor: the app owns a config directory; its presence is
-    # the install signal (the config file itself may not exist until first use).
-    path = _config_path(spec)
-    return path is not None and path.parent.is_dir()
 
 
 # --------------------------------------------------------------------------- #
@@ -287,6 +193,147 @@ def _load_json_tolerant(path: Path) -> Optional[dict]:
     return None
 
 
+def _read_toml_entry(path: Path, parent_key: str) -> Optional[dict]:
+    """The biopb table from Codex's ``config.toml``, shaped like a JSON stdio
+    entry (``{command, args}``) so :func:`_entry_command` and :func:`status` need
+    no TOML-specific branch.
+
+    Read-only on purpose. Writes go through ``codex mcp add``/``remove``, which
+    edit the table surgically and leave the user's comments and sibling servers
+    alone; a re-emit from a parsed dict would drop the comments, the same trap
+    ``.jsonc`` set for opencode (biopb/biopb#536). ``None`` (never raises) on any
+    problem, like :func:`_load_json_tolerant`: a config we cannot parse simply
+    reads as "not registered".
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if tomllib is None:  # pragma: no cover - only on 3.10; forced in tests
+        return _scan_toml_entry(text, parent_key)
+    try:
+        data = tomllib.loads(text)
+    except ValueError:
+        return None
+    parent = data.get(parent_key)
+    if isinstance(parent, dict):
+        entry = parent.get("biopb")
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _scan_toml_entry(text: str, parent_key: str) -> Optional[dict]:
+    """``_read_toml_entry`` for Python 3.10, which has no ``tomllib``.
+
+    Pulls just ``command`` — the one value status and drift need — out of the
+    ``[<parent_key>.biopb]`` table, stopping at the next table header.
+    Deliberately narrow: it reads the shape ``codex mcp add`` writes (one
+    quoted string per line) and gives up on anything else, which reads as "not
+    registered" like every other config we cannot parse.
+    """
+    header = re.compile(r"^\s*\[\s*" + re.escape(parent_key) + r"\s*\.\s*biopb\s*\]")
+    in_table = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            if in_table:
+                break  # the next table ends ours
+            in_table = bool(header.match(line))
+            continue
+        if not in_table:
+            continue
+        key, sep, raw = line.partition("=")
+        if sep and key.strip() == "command":
+            value = _toml_string(raw.strip())
+            return None if value is None else {"command": value}
+    return None
+
+
+def _toml_string(raw: str) -> Optional[str]:
+    """A single-line TOML basic (``"..."``, escapes decoded) or literal
+    (``'...'``, verbatim) string, or ``None`` if ``raw`` is neither. A trailing
+    comment is not stripped — it makes the value unparseable, which fails safe
+    to "not registered" rather than guessing where a ``#`` inside a path ends."""
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1]
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        try:
+            return json.loads(raw)  # TOML basic escapes are a subset of JSON's
+        except ValueError:
+            return None
+    return None
+
+
+def _read_json_entry(path: Path, parent_key: str) -> Optional[dict]:
+    """The biopb entry from a JSON (or ``.jsonc``) config, or ``None``."""
+    data = _load_json_tolerant(path)
+    if not isinstance(data, dict):
+        return None
+    parent = data.get(parent_key)
+    if isinstance(parent, dict):
+        entry = parent.get("biopb")
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+#: config_format -> reader. Every read goes through this; there is deliberately
+#: no default, so a client whose format we have not implemented raises instead
+#: of being silently parsed as JSON.
+_READERS = {
+    "json": _read_json_entry,
+    "toml": _read_toml_entry,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Entry shapes
+# --------------------------------------------------------------------------- #
+# Each style pairs a builder (what to write) with an extractor (how to read the
+# executable back out for drift). They must stay inverses of each other, which
+# is why they are defined as a pair rather than in the read and write halves.
+
+
+def _stdio_entry(command: str) -> dict:
+    # Canonical mcpServers stdio form: bare command+args, no "type" (a stray
+    # "type" trips stricter validators — matches the installer's choice).
+    return {"command": command, "args": list(_MCP_ARGS)}
+
+
+def _stdio_command(entry: dict) -> Optional[str]:
+    command = entry.get("command")
+    return command if isinstance(command, str) else None
+
+
+def _opencode_entry(command: str) -> dict:
+    return {"type": "local", "command": [command, *_MCP_ARGS], "enabled": True}
+
+
+def _opencode_command(entry: dict) -> Optional[str]:
+    command = entry.get("command")
+    if isinstance(command, list) and command:
+        return command[0] if isinstance(command[0], str) else None
+    return None
+
+
+#: entry_style -> (builder, extractor). No default branch, for the same reason
+#: as _READERS: an unknown style must not silently get the stdio shape.
+_SHAPES = {
+    "stdio": (_stdio_entry, _stdio_command),
+    "opencode": (_opencode_entry, _opencode_command),
+}
+
+
+def _dispatch(table: dict, key: str, client: ClientBackend, axis: str):
+    """Look ``key`` up in ``table``, or raise :class:`AgentError` naming the
+    client and the axis. The single place a missing implementation is caught —
+    every dispatch in this module goes through it rather than an ``else``."""
+    try:
+        return table[key]
+    except KeyError:
+        raise AgentError(f"{client.name}: unsupported {axis} {key!r}")
+
+
 def _jsonc_unmergeable(path: Path) -> bool:
     """True when ``path`` is a ``.jsonc`` our strict-JSON writer must not edit:
     it parses only after comment/trailing-comma stripping, so rewriting it would
@@ -308,115 +355,9 @@ def _jsonc_unmergeable(path: Path) -> bool:
         return True
 
 
-def _manual_edit_message(spec: AgentSpec, path: Path, *, removing: bool) -> str:
-    """The AgentError text shown when biopb can't safely edit a commented
-    ``.jsonc`` — a clear manual instruction instead of clobbering comments or
-    writing a shadow config (biopb/biopb#536)."""
-    if removing:
-        return (
-            f"{path} has comments, so biopb won't rewrite it (that would drop "
-            f'them). Remove the "biopb" key under "{spec.parent_key}" by hand.'
-        )
-    snippet = json.dumps({spec.parent_key: {"biopb": _mcp_entry(spec)}}, indent=2)
-    return (
-        f"{path} has comments, so biopb won't rewrite it (that would drop them). "
-        f"Add this entry under the top level by hand:\n{snippet}"
-    )
-
-
-def _read_entry(spec: AgentSpec, path: Optional[Path]) -> Optional[dict]:
-    """The biopb MCP entry currently in the client's config, or ``None``.
-
-    A read-only, exception-tolerant probe used for status (unlike
-    :func:`_load_json_object` it never raises — a malformed config simply reads as
-    "not registered" for display, and the write path reports the parse error).
-    Reads ``.jsonc`` tolerantly so a commented opencode config is still detected as
-    registered rather than silently reading as "installed" (biopb/biopb#536).
-    """
-    if path is None or not path.exists():
-        return None
-    data = _load_json_tolerant(path)
-    if not isinstance(data, dict):
-        return None
-    parent = data.get(spec.parent_key)
-    if isinstance(parent, dict):
-        entry = parent.get("biopb")
-        if isinstance(entry, dict):
-            return entry
-    return None
-
-
-def _entry_command(spec: AgentSpec, entry: dict) -> Optional[str]:
-    """Extract the executable path a registered entry points at, for drift.
-
-    ``stdio`` entries store ``command`` as a string; ``opencode`` stores
-    ``command`` as a list whose first element is the executable. ``None`` when the
-    entry has no recognizable command (treated as drift so a malformed prior entry
-    prompts a Re-register)."""
-    command = entry.get("command")
-    if spec.entry_style == "opencode":
-        if isinstance(command, list) and command:
-            return command[0] if isinstance(command[0], str) else None
-        return None
-    return command if isinstance(command, str) else None
-
-
-def status(spec_id: str) -> dict:
-    """One client's status: ``{id, name, state, drifted, config_path}``.
-
-    ``state`` is ``registered`` if the biopb entry is present (regardless of
-    detection — the entry is ground truth), else ``installed`` if the client is
-    detected, else ``not_installed``. ``drifted`` is set only when ``registered``
-    and the stored command no longer matches the freshly resolved ``biopb-mcp``
-    path (a moved/reinstalled biopb), so the UI can offer a Re-register.
-    """
-    spec = _spec(spec_id)
-    path = _config_path(spec)
-    entry = _read_entry(spec, path)
-    if entry is not None:
-        state = "registered"
-        drifted = _entry_command(spec, entry) != _mcp_command()
-    elif _is_installed(spec):
-        state, drifted = "installed", False
-    else:
-        state, drifted = "not_installed", False
-    return {
-        "id": spec.id,
-        "name": spec.name,
-        "state": state,
-        "drifted": drifted,
-        "config_path": str(path) if path is not None else None,
-    }
-
-
-def supported() -> list[AgentSpec]:
-    """The static client catalog."""
-    return list(_SPECS)
-
-
-def statuses() -> list[dict]:
-    """Status for every supported client, in catalog order."""
-    return [status(s.id) for s in _SPECS]
-
-
 # --------------------------------------------------------------------------- #
-# Writing: register / unregister
+# Writing helpers
 # --------------------------------------------------------------------------- #
-
-
-def _mcp_entry(spec: AgentSpec) -> dict:
-    """The MCP server entry to write for ``spec``, in its client's shape."""
-    command = _mcp_command()
-    if spec.entry_style == "opencode":
-        # opencode: {type:"local", command:[exe, ...args], enabled:true}
-        return {
-            "type": "local",
-            "command": [command, *_MCP_ARGS],
-            "enabled": True,
-        }
-    # Canonical mcpServers stdio form: bare command+args, no "type" (a stray
-    # "type" trips stricter validators — matches the installer's choice).
-    return {"command": command, "args": list(_MCP_ARGS)}
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
@@ -440,20 +381,23 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         raise
 
 
-def _run_claude(args: list[str], *, required: bool) -> tuple[int, str]:
-    """Run ``claude <args>`` windowless, returning ``(returncode, output)``.
+def _run_client_cli(
+    exe_name: str, args: list[str], *, required: bool
+) -> tuple[int, str]:
+    """Run ``<exe_name> <args>`` windowless, returning ``(returncode, output)``.
 
-    ``required`` distinguishes the two callers: the ``mcp add`` that must succeed
-    (``required=True`` → a missing ``claude`` is an :class:`AgentError`) from the
-    best-effort ``mcp remove`` we run before an add to stay idempotent
-    (``required=False`` → tolerate a non-zero code, i.e. "wasn't registered").
-    We never call ``claude mcp get``/``list`` — those run a live connection test
-    that would spawn ``biopb-mcp``.
+    Shared by the two CLI-managed clients (``claude``, ``codex``). ``required``
+    distinguishes a call that must succeed (``True`` → a missing binary is an
+    :class:`AgentError`) from a best-effort one, like the ``mcp remove`` Claude
+    Code runs before an add to stay idempotent (``False`` → tolerate a non-zero
+    code, i.e. "wasn't registered"). We never call either client's ``mcp
+    get``/``list`` — those run a live connection test that would spawn
+    ``biopb-mcp``.
     """
-    exe = shutil.which("claude")
+    exe = shutil.which(exe_name)
     if exe is None:
         if required:
-            raise AgentError("the `claude` CLI is not on PATH")
+            raise AgentError(f"the `{exe_name}` CLI is not on PATH")
         return 1, ""
     kwargs: dict = {}
     if sys.platform == "win32":
@@ -468,83 +412,395 @@ def _run_claude(args: list[str], *, required: bool) -> tuple[int, str]:
             **kwargs,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise AgentError(f"`claude {' '.join(args)}` failed: {exc}")
+        raise AgentError(f"`{exe_name} {' '.join(args)}` failed: {exc}")
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-def _register_json(spec: AgentSpec) -> None:
-    path = _config_path(spec)
-    if path is None:
-        raise AgentError(f"{spec.name} has no known config location on this platform")
-    if _jsonc_unmergeable(path):
-        raise AgentError(_manual_edit_message(spec, path, removing=False))
-    data = _load_json_object(path)
-    parent = data.get(spec.parent_key)
-    if not isinstance(parent, dict):
-        parent = {}
-    parent["biopb"] = _mcp_entry(spec)
-    data[spec.parent_key] = parent
-    _write_json_atomic(path, data)
+# --------------------------------------------------------------------------- #
+# Client backends
+# --------------------------------------------------------------------------- #
+# One object per client, holding everything biopb knows about it: where its
+# config lives, whether it looks installed, and how to read and write biopb's
+# entry. Adding a client is a new class plus a line in _CLIENTS -- there is no
+# second place to remember, which is what the per-client `if spec.id == ...`
+# chains this replaced kept getting wrong (a client added to some of them and
+# missed in others took the fall-through, i.e. JSON).
+#
+# The write path is abstract, so a backend that omits it cannot be instantiated
+# at all: the failure is a TypeError at import, not a config file written in a
+# format it is not.
 
 
-def _unregister_json(spec: AgentSpec) -> None:
-    path = _config_path(spec)
-    if path is None or not path.exists():
-        return  # nothing registered
-    if _jsonc_unmergeable(path):
-        # Can't safely rewrite a commented .jsonc. If biopb is actually present,
-        # surface a manual-removal instruction rather than silently leaving a
-        # stale entry (biopb/biopb#536); otherwise there is nothing to do.
-        if _read_entry(spec, path) is not None:
-            raise AgentError(_manual_edit_message(spec, path, removing=True))
-        return
-    data = _load_json_object(path)
-    parent = data.get(spec.parent_key)
-    if isinstance(parent, dict) and "biopb" in parent:
-        del parent["biopb"]
+class ClientBackend(ABC):
+    """One MCP client biopb can register itself with."""
+
+    #: stable identifier -- the CLI argument and the /api/agents path segment
+    id: str
+    #: human label for the dashboard and the CLI table
+    name: str
+    #: the container biopb's entry lives under, named in this format's terms: a
+    #: JSON object key (``mcpServers``, ``mcp``) or a TOML table (``mcp_servers``)
+    parent_key: str
+    #: a key of :data:`_READERS` -- how to parse the config for status
+    config_format: str = "json"
+    #: a key of :data:`_SHAPES` -- the entry's shape, written and read back out
+    entry_style: str = "stdio"
+
+    @abstractmethod
+    def config_path(self) -> Optional[Path]:
+        """The config file biopb's entry lives in, or ``None`` on a platform
+        where this client has no known location. Resolved at call time (not
+        cached) so a test that repoints ``Path.home()`` / ``$APPDATA`` gets an
+        isolated location."""
+
+    @abstractmethod
+    def is_installed(self) -> bool:
+        """Whether the client appears present -- the same signals the installer
+        uses. Deliberately cheap and subprocess-free: a binary on PATH or a
+        well-known config directory, per the policy each base sets.
+
+        A false negative (a portable/flatpak install we can't see) just shows
+        ``not_installed``. For a :class:`JsonConfigClient` register is still an
+        escape hatch that works anyway; for a :class:`CliManagedClient` it is
+        not, which is why that base detects the binary and nothing else."""
+
+    @abstractmethod
+    def register(self) -> None:
+        """Write biopb's entry into this client's config."""
+
+    @abstractmethod
+    def unregister(self) -> None:
+        """Remove it. Idempotent -- removing an absent entry is fine."""
+
+    # -- shared, driven by config_format / entry_style ---------------------- #
+
+    def read_entry(self) -> Optional[dict]:
+        """The biopb entry currently in this client's config, or ``None``.
+
+        Tolerant of the *user's* data: a malformed config simply reads as "not
+        registered" for display, and the write path reports the parse error.
+        Raises on a malformed *catalog* -- a ``config_format`` with no reader --
+        because that is our bug, and the alternative is parsing the file as
+        something it is not.
+        """
+        path = self.config_path()
+        if path is None or not path.exists():
+            return None
+        read = _dispatch(_READERS, self.config_format, self, "config format")
+        return read(path, self.parent_key)
+
+    def entry(self) -> dict:
+        """The MCP server entry to write, in this client's shape."""
+        build, _ = _dispatch(_SHAPES, self.entry_style, self, "entry style")
+        return build(_mcp_command())
+
+    def entry_command(self, entry: dict) -> Optional[str]:
+        """The executable a registered entry points at, for drift. ``None`` when
+        the entry has no recognizable command (treated as drift, so a malformed
+        prior entry prompts a Re-register)."""
+        _, extract = _dispatch(_SHAPES, self.entry_style, self, "entry style")
+        return extract(entry)
+
+
+class JsonConfigClient(ClientBackend):
+    """A client whose config is a calm JSON object we edit ourselves.
+
+    Register/unregister are an atomic read-merge-replace that preserves every
+    other key in the file. ``is_installed`` is the app's config *directory*:
+    these are apps that own one, and the config file itself may not exist until
+    first use.
+    """
+
+    def is_installed(self) -> bool:
+        path = self.config_path()
+        return path is not None and path.parent.is_dir()
+
+    def register(self) -> None:
+        path = self.config_path()
+        if path is None:
+            raise AgentError(
+                f"{self.name} has no known config location on this platform"
+            )
+        if _jsonc_unmergeable(path):
+            raise AgentError(self._manual_edit_message(path, removing=False))
+        data = _load_json_object(path)
+        parent = data.get(self.parent_key)
+        if not isinstance(parent, dict):
+            parent = {}
+        parent["biopb"] = self.entry()
+        data[self.parent_key] = parent
         _write_json_atomic(path, data)
 
+    def unregister(self) -> None:
+        path = self.config_path()
+        if path is None or not path.exists():
+            return  # nothing registered
+        if _jsonc_unmergeable(path):
+            # Can't safely rewrite a commented .jsonc. If biopb is actually
+            # present, surface a manual-removal instruction rather than silently
+            # leaving a stale entry (biopb/biopb#536); else there is nothing to do.
+            if self.read_entry() is not None:
+                raise AgentError(self._manual_edit_message(path, removing=True))
+            return
+        data = _load_json_object(path)
+        parent = data.get(self.parent_key)
+        if isinstance(parent, dict) and "biopb" in parent:
+            del parent["biopb"]
+            _write_json_atomic(path, data)
 
-def _register_claude() -> None:
-    # Idempotent: drop any existing entry, then add (matches the installer). The
-    # remove is best-effort (a not-yet-registered client returns non-zero), the
-    # add must succeed.
-    _run_claude(["mcp", "remove", "biopb", "-s", "user"], required=False)
-    code, out = _run_claude(
-        ["mcp", "add", "--scope", "user", "biopb", "--", _mcp_command(), *_MCP_ARGS],
-        required=True,
-    )
-    if code != 0:
-        raise AgentError(f"`claude mcp add` failed: {out.strip()}")
+    def _manual_edit_message(self, path: Path, *, removing: bool) -> str:
+        """The AgentError text shown when biopb can't safely edit a commented
+        ``.jsonc`` -- a clear manual instruction instead of clobbering comments
+        or writing a shadow config (biopb/biopb#536)."""
+        if removing:
+            return (
+                f"{path} has comments, so biopb won't rewrite it (that would drop "
+                f'them). Remove the "biopb" key under "{self.parent_key}" by hand.'
+            )
+        snippet = json.dumps({self.parent_key: {"biopb": self.entry()}}, indent=2)
+        return (
+            f"{path} has comments, so biopb won't rewrite it (that would drop "
+            f"them). Add this entry under the top level by hand:\n{snippet}"
+        )
 
 
-def _unregister_claude() -> None:
-    _run_claude(["mcp", "remove", "biopb", "-s", "user"], required=True)
+class CliManagedClient(ClientBackend):
+    """A client that ships its own CLI for managing MCP servers.
+
+    We shell out rather than edit the file, for two different reasons: Claude
+    Code rewrites ``~/.claude.json`` constantly and we would race its writes,
+    and Codex's config is TOML whose comments and sibling servers only its own
+    editor keeps intact. Status is still a plain config read -- never
+    ``mcp get``/``list``, which run a live connection test that would spawn
+    ``biopb-mcp`` on every dashboard poll.
+    """
+
+    #: the binary to shell out to
+    exe: str
+
+    def is_installed(self) -> bool:
+        """On PATH or not detected — deliberately no config-directory fallback.
+
+        For these clients the binary *is* the write path, so PATH presence is a
+        precondition rather than a hint: without it ``register`` can only raise.
+        A leftover config directory (``~/.codex`` keeps auth, history and logs
+        long after the binary is uninstalled) would otherwise report
+        ``installed`` forever and offer a Register button that cannot work.
+        A client that is registered still reads as ``registered`` either way —
+        :func:`status` takes the entry as ground truth before asking us.
+        """
+        return shutil.which(self.exe) is not None
 
 
-def register(spec_id: str) -> dict:
+class ClaudeCode(CliManagedClient):
+    id = "claude-code"
+    name = "Claude Code"
+    exe = "claude"
+    # Claude Code stores user-scope MCP servers in ~/.claude.json under the
+    # top-level `mcpServers` key. We only READ that for status.
+    parent_key = "mcpServers"
+
+    def config_path(self) -> Optional[Path]:
+        return Path.home() / ".claude.json"
+
+    def register(self) -> None:
+        # Idempotent: drop any existing entry, then add (matches the installer).
+        # The remove is best-effort (a not-yet-registered client returns
+        # non-zero); the add must succeed.
+        _run_client_cli(
+            self.exe, ["mcp", "remove", "biopb", "-s", "user"], required=False
+        )
+        code, out = _run_client_cli(
+            self.exe,
+            [
+                "mcp",
+                "add",
+                "--scope",
+                "user",
+                "biopb",
+                "--",
+                _mcp_command(),
+                *_MCP_ARGS,
+            ],
+            required=True,
+        )
+        if code != 0:
+            raise AgentError(f"`claude mcp add` failed: {out.strip()}")
+
+    def unregister(self) -> None:
+        _run_client_cli(
+            self.exe, ["mcp", "remove", "biopb", "-s", "user"], required=True
+        )
+
+
+class ClaudeDesktop(JsonConfigClient):
+    id = "claude-desktop"
+    name = "Claude Desktop"
+    parent_key = "mcpServers"
+
+    def config_path(self) -> Optional[Path]:
+        home = Path.home()
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA")
+            root = Path(base) if base else home / "AppData" / "Roaming"
+            return root / "Claude" / "claude_desktop_config.json"
+        if sys.platform == "darwin":
+            return (
+                home
+                / "Library"
+                / "Application Support"
+                / "Claude"
+                / "claude_desktop_config.json"
+            )
+        return home / ".config" / "Claude" / "claude_desktop_config.json"
+
+
+class CodexCli(CliManagedClient):
+    id = "codex-cli"
+    name = "Codex CLI"
+    exe = "codex"
+    parent_key = "mcp_servers"
+    config_format = "toml"
+
+    def config_path(self) -> Optional[Path]:
+        # $CODEX_HOME relocates the whole Codex home (config.toml included);
+        # read at call time so a test can point it at a tmp dir.
+        base = os.environ.get("CODEX_HOME")
+        return (Path(base) if base else Path.home() / ".codex") / "config.toml"
+
+    def register(self) -> None:
+        # `codex mcp add` overwrites an existing server of the same name and
+        # exits 0, so unlike Claude Code no remove-then-add dance is needed.
+        code, out = _run_client_cli(
+            self.exe,
+            ["mcp", "add", "biopb", "--", _mcp_command(), *_MCP_ARGS],
+            required=True,
+        )
+        if code != 0:
+            raise AgentError(f"`codex mcp add` failed: {out.strip()}")
+
+    def unregister(self) -> None:
+        # Removing an absent server is not an error for codex (it exits 0), so
+        # this is idempotent without tolerating a failure that is real.
+        code, out = _run_client_cli(self.exe, ["mcp", "remove", "biopb"], required=True)
+        if code != 0:
+            raise AgentError(f"`codex mcp remove` failed: {out.strip()}")
+
+
+class Cursor(JsonConfigClient):
+    id = "cursor"
+    name = "Cursor"
+    parent_key = "mcpServers"
+
+    def config_path(self) -> Optional[Path]:
+        return Path.home() / ".cursor" / "mcp.json"
+
+
+class Opencode(JsonConfigClient):
+    id = "opencode"
+    name = "opencode"
+    parent_key = "mcp"
+    entry_style = "opencode"
+
+    def config_path(self) -> Optional[Path]:
+        """The opencode global config biopb should target (biopb/biopb#536).
+
+        opencode reads either ``opencode.jsonc`` or ``opencode.json``. Prefer an
+        existing ``.jsonc`` so we edit the file opencode actually honors instead
+        of writing a shadow ``.json`` it may ignore; otherwise fall back to
+        ``.json`` -- the canonical file we create on a fresh install."""
+        base = Path.home() / ".config" / "opencode"
+        jsonc = base / "opencode.jsonc"
+        return jsonc if jsonc.exists() else base / "opencode.json"
+
+    def is_installed(self) -> bool:
+        return shutil.which("opencode") is not None or super().is_installed()
+
+
+# --------------------------------------------------------------------------- #
+# The catalog
+# --------------------------------------------------------------------------- #
+# Consistent with the installer (install/install.sh, install/biopb-engine.ps1).
+# Hermes is intentionally omitted: the installer only ever prints a manual YAML
+# snippet for it (it will not edit YAML), so it can never reach `registered`
+# through a button -- not worth a dead row.
+_CLIENTS: tuple[ClientBackend, ...] = (
+    ClaudeCode(),
+    ClaudeDesktop(),
+    CodexCli(),
+    Cursor(),
+    Opencode(),
+)
+
+_CLIENTS_BY_ID = {c.id: c for c in _CLIENTS}
+
+
+def _client(client_id: str) -> ClientBackend:
+    try:
+        return _CLIENTS_BY_ID[client_id]
+    except KeyError:
+        raise AgentError(f"unknown agent client {client_id!r}")
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+
+
+def supported() -> list[ClientBackend]:
+    """The static client catalog."""
+    return list(_CLIENTS)
+
+
+def status(client_id: str) -> dict:
+    """One client's status: ``{id, name, state, drifted, config_path}``.
+
+    ``state`` is ``registered`` if the biopb entry is present (regardless of
+    detection -- the entry is ground truth), else ``installed`` if the client is
+    detected, else ``not_installed``. ``drifted`` is set only when ``registered``
+    and the stored command no longer matches the freshly resolved ``biopb-mcp``
+    path (a moved/reinstalled biopb), so the UI can offer a Re-register.
+    """
+    client = _client(client_id)
+    path = client.config_path()
+    entry = client.read_entry()
+    if entry is not None:
+        state = "registered"
+        drifted = client.entry_command(entry) != _mcp_command()
+    elif client.is_installed():
+        state, drifted = "installed", False
+    else:
+        state, drifted = "not_installed", False
+    return {
+        "id": client.id,
+        "name": client.name,
+        "state": state,
+        "drifted": drifted,
+        "config_path": str(path) if path is not None else None,
+    }
+
+
+def statuses() -> list[dict]:
+    """Status for every supported client, in catalog order."""
+    return [status(c.id) for c in _CLIENTS]
+
+
+def register(client_id: str) -> dict:
     """Register biopb with the client and return its fresh status.
 
-    Works regardless of detection (the "register anyway" escape hatch for a client
-    we could not auto-detect); a genuinely absent client surfaces as an
-    :class:`AgentError` (e.g. Claude Code with no ``claude`` on PATH). Raises
-    :class:`AgentError` on any failure — the caller renders it.
+    Works regardless of detection (the "register anyway" escape hatch for a
+    client we could not auto-detect); a genuinely absent client surfaces as an
+    :class:`AgentError` (e.g. Claude Code with no ``claude`` on PATH).
     """
-    spec = _spec(spec_id)
-    if spec.manager == "claude-cli":
-        _register_claude()
-    else:
-        _register_json(spec)
-    logger.info("registered biopb with %s", spec.name)
-    return status(spec_id)
+    client = _client(client_id)
+    client.register()
+    logger.info("registered biopb with %s", client.name)
+    return status(client_id)
 
 
-def unregister(spec_id: str) -> dict:
+def unregister(client_id: str) -> dict:
     """Remove biopb from the client and return its fresh status. Idempotent."""
-    spec = _spec(spec_id)
-    if spec.manager == "claude-cli":
-        _unregister_claude()
-    else:
-        _unregister_json(spec)
-    logger.info("unregistered biopb from %s", spec.name)
-    return status(spec_id)
+    client = _client(client_id)
+    client.unregister()
+    logger.info("unregistered biopb from %s", client.name)
+    return status(client_id)

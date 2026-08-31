@@ -29,7 +29,7 @@ The Arrow data are then served to the user via an Arrow Flight server, which bri
 | TIFF | `.tif`, `.tiff` | Standard TIFF and TIFF sequences (heuristic filename pattern) |
 | Akoya | `.qptiff` | Native, Akoya PhenoImager multiplex whole-slide format |
 | Micro-Manager | NDTiff (`NDTiff.index`), legacy (`metadata.txt`) | Multi-file MM acquisitions; native (`ndtiff`) |
-| Zeiss | `.czi`, `.lsm` | Native (`bioio-czi`; `.lsm` via `tifffile`) |
+| Zeiss | `.czi`, `.lsm` | Native (`.czi` via `pylibCZIrw`, `.lsm` via `tifffile`) |
 | Leica | `.lif` | Native (`bioio-lif`) |
 | Nikon | `.nd2` | Native (`bioio-nd2`) |
 | DeltaVision | `.dv` | Native (`bioio-dv`) |

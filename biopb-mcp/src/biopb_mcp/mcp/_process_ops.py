@@ -26,11 +26,14 @@ import biopb.image as proto
 import dask.array as da
 import grpc
 import numpy as np
+from biopb import _algorithms
 from biopb.image.utils import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
 )
 from google.protobuf import empty_pb2
+
+from .._config import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +187,30 @@ def _sanitize_name(name: Optional[str]) -> str:
     if not name:
         return ""
     return "".join(c if (c.isalnum() or c == "_") else "_" for c in name)
+
+
+def build_ops_from_config(
+    config: dict, client_getter: Callable[[], object]
+) -> Dict[str, Callable]:
+    """:func:`build_ops` with every argument read from *config*.
+
+    The kernel bootstrap and the audit notebook's bootstrap cell both need this
+    exact wiring, and the notebook's copy is a *string* -- a signature or
+    config-key change there fails only when someone re-runs an exported
+    notebook, long after the change. One function both call keeps that
+    impossible.
+    """
+    max_msg_bytes = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
+    return build_ops(
+        client_getter=client_getter,
+        server_urls=_algorithms.servers_from_config(config),
+        op_names_timeout=get_setting(config, "timeout.get_op_names"),
+        run_timeout=get_setting(config, "timeout.process_image"),
+        channel_options=[
+            ("grpc.max_receive_message_length", max_msg_bytes),
+            ("grpc.max_send_message_length", max_msg_bytes),
+        ],
+    )
 
 
 def build_ops(

@@ -2,8 +2,19 @@
 
 The ``/api/*`` calls behind the observe page: ``execute_code`` job history with
 truncated output plus global control knobs — interrupt the current job (force a
-KeyboardInterrupt into its thread), hard-restart the kernel, and save the session
-as a notebook. On by default (opt-out via ``observe.enabled``).
+KeyboardInterrupt into its thread), hard-restart the kernel, save the session as
+a notebook, and — where this session owns its own reap — end it. On by default
+(opt-out via ``observe.enabled``).
+
+**Stopping the session** (``/api/shutdown``) exists only for an agentless
+``biopb mcp view`` viewer, and runs the launcher's own ``_shutdown``: the same
+single path Ctrl-C and SIGTERM take, injected at wiring time
+(:func:`set_session_owns_its_reap`) rather than reimplemented. That is what
+keeps the control out of the ownership question — it proxies a session ending
+*itself*, so a viewer someone started in a terminal and one the dashboard
+launched behave identically and neither is anybody's to kill. A shim-owned child
+gets no such route: its shim owns its reap, and ending it here would leave that
+shim bridging to a dead process.
 
 The observe **page** itself is served by the control front — it is the React
 ``ObservePage`` in the ``web/`` SPA, served at ``/session/<id>/observe`` — and it
@@ -50,20 +61,16 @@ is only to be honest about which routes exist; the reachability question belongs
 to ``biopb-control``.
 """
 
-import functools
+import asyncio
 import json
 import logging
 
-from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.applications import Starlette
-from starlette.responses import (
-    JSONResponse,
-    PlainTextResponse,
-    Response,
-)
+from starlette.background import BackgroundTask
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import _notebook, _server
+from . import _app, _http, _kernel_rpc, _notebook, _writers
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +84,25 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 _max_output_chars = 20000
 _poll_interval_ms = 3000
 _console_enabled = True
-_extra_origins = ()
-_extra_hosts = ()
-
-# Lazily-built Host/Origin validator.
-_mw = None
-
+# Whether the built-in chat client is actually mounted on this session. Not a
+# config mirror: chat is served only on an agentless `biopb mcp view` session
+# and only when enabled, so `_setup_chat`'s verdict is the one truth. Set by
+# set_chat_enabled() rather than configure(), which resets its extras on every
+# call and so cannot be called twice.
+_chat_enabled = False
+# Whether this session owns its own reap -- an agentless `biopb mcp view`
+# viewer, as opposed to a child a stdio shim spawned and will reap. The stop
+# route exists only for the former: ending a shim's child would leave the shim
+# bridging to a dead process and its MCP client reading errors instead of a
+# clean close. Deliberately NOT keyed off _chat_enabled, which is a config
+# switch that is off by default -- a viewer with chat disabled still owns its
+# reap and still needs a way out.
+_agentless = False
+# The session's own teardown (the launcher's `_shutdown`), or None where there
+# is nothing this session may end. Injected rather than reimplemented: it is the
+# same single path Ctrl-C and SIGTERM take, so a stop from the web de-registers,
+# reaps the kernel and closes the cluster in exactly the same order.
+_shutdown_hook = None
 # Whether the routes were mounted on the MCP app (for server_status). Stays
 # False when observe is disabled, in stdio mode, or if registration failed.
 _mounted_http = False
@@ -108,119 +128,49 @@ def configure(
     this is set.
     """
     global _max_output_chars, _poll_interval_ms, _console_enabled
-    global _extra_origins, _extra_hosts
-    global _mw
     if max_output_chars is not None:
         _max_output_chars = int(max_output_chars)
     if poll_interval_ms is not None:
         _poll_interval_ms = int(poll_interval_ms)
     if console_enabled is not None:
         _console_enabled = bool(console_enabled)
-    _extra_origins = tuple(allowed_origins)
-    _extra_hosts = tuple(allowed_hosts)
-    _mw = None  # rebuilt with the new extras on next request
+    _http.configure(allowed_origins, allowed_hosts)
 
 
-# ---------------------------------------------------------------------------
-# Host/Origin guard (own copy — custom routes are NOT covered by FastMCP's)
-# ---------------------------------------------------------------------------
+def set_session_owns_its_reap(agentless, on_shutdown=None):
+    """Record that this session may be stopped from the web, and how.
 
-
-def _get_mw():
-    global _mw
-    if _mw is None:
-        _mw = TransportSecurityMiddleware(
-            _server.build_transport_security(_extra_origins, _extra_hosts)
-        )
-    return _mw
-
-
-def _check_origin(request):
-    """Return an error Response if Host/Origin is disallowed, else None.
-
-    Reuses the SDK validators (same loopback allowlist as ``/mcp``) but skips
-    its content-type rule — our control POSTs carry no JSON body.
+    Must run before :func:`register_http_routes`, which reads it to decide
+    whether the stop route exists at all -- an absent route rather than a
+    refusing one, the same shape the console gate uses, so "can this session be
+    ended from here?" is one answer and not a status code to interpret.
     """
-    mw = _get_mw()
-    if not mw._validate_host(request.headers.get("host")):
-        return PlainTextResponse("Invalid Host header", status_code=421)
-    if not mw._validate_origin(request.headers.get("origin")):
-        return PlainTextResponse("Invalid Origin header", status_code=403)
-    return None
+    global _agentless, _shutdown_hook
+    _agentless = bool(agentless)
+    _shutdown_hook = on_shutdown if _agentless else None
 
 
-def _route(fn):
-    """Wrap a handler with the Host/Origin guard + a catch-all 500.
+def set_chat_enabled(enabled):
+    """Record whether this session mounted the chat routes, for ``/api/status``.
 
-    Applied to every route so a new one can't forget the guard, and a wedged
-    kernel surfaces a clean JSON 500 instead of leaking a traceback.
+    Separate from :func:`configure` because the launcher only knows this *after*
+    it has tried to mount chat, and configure() is not safely re-callable (it
+    resets ``allowed_origins``/``allowed_hosts`` whether or not they were
+    passed).
     """
-
-    @functools.wraps(fn)
-    async def wrapper(request):
-        denied = _check_origin(request)
-        if denied is not None:
-            return denied
-        try:
-            return await fn(request)
-        except Exception as exc:  # noqa: BLE001 - report, never crash
-            logger.exception("observe handler error")
-            return JSONResponse(
-                {"error": "internal error", "detail": str(exc)},
-                status_code=500,
-            )
-
-    return wrapper
+    global _chat_enabled
+    _chat_enabled = bool(enabled)
 
 
-def _json_route(fn):
-    """:func:`_route` plus the SDK's ``Content-Type: application/json`` rule.
-
-    :func:`_check_origin` deliberately skips that rule because the other control
-    POSTs carry no body — but a JSON content-type is one a cross-site form POST
-    **cannot** set (it is not a CORS-simple value, so it preflights), which makes
-    it a real CSRF defense on the one route that submits code. Restored here
-    rather than added to ``_route`` so the exemption above stays true of the
-    routes it describes, and so a body-carrying route cannot inherit the
-    body-less guard by accident.
-    """
-    guarded = _route(fn)
-
-    @functools.wraps(fn)
-    async def wrapper(request):
-        if not _get_mw()._validate_content_type(request.headers.get("content-type")):
-            return PlainTextResponse("Invalid Content-Type header", status_code=400)
-        return await guarded(request)
-
-    return wrapper
-
-
-def _require_host():
-    """Return ``(host, None)`` or ``(None, 503 response)`` if no kernel host."""
-    host = _server._kernel_host
-    if host is None:
-        return None, JSONResponse(
-            {"error": "kernel host not initialized"}, status_code=503
-        )
-    return host, None
-
-
-def _kernel_error(res):
-    """Map a non-ok job round-trip to a response.
-
-    A ``busy`` kernel is transient (another quick call holds the lock) -> 200
-    with a ``busy`` marker the UI retries on; anything else -> 502.
-    """
-    status = res.get("status")
-    if status == "busy":
-        return JSONResponse({"busy": True, "jobs": []})
-    return JSONResponse(
-        {
-            "error": status or "kernel error",
-            "detail": _server._format_execute_result(res),
-        },
-        status_code=502,
-    )
+# The shared HTTP-surface layer lives in `_http`: the Host/Origin guard, the
+# catch-all 500, the JSON-body parse and the kernel-host/error mapping are the
+# same for the chat routes, so they are not this page's to own. Aliased rather
+# than re-spelled at each use so the route tables below stay readable.
+_route = _http.route
+_json_route = _http.json_route
+_check_origin = _http.check_origin
+_require_host = _http.require_host
+_kernel_error = _http.kernel_error
 
 
 def _truncate_tail(text):
@@ -244,10 +194,13 @@ async def _api_jobs(request):
     host, err = _require_host()
     if err is not None:
         return err
-    result, res, _w = _server._run_job_call(host, "jobs_summary()")
+    # jobs_view(), not jobs_summary(): the page redraws from the job list *and*
+    # from whether a verified workflow is available to download, and this poll
+    # runs about once a second for the life of the session.
+    result, res, _w = _kernel_rpc._run_job_call(host, "jobs_view")
     if result is None:
         return _kernel_error(res)
-    return JSONResponse({"jobs": result})
+    return JSONResponse(result)
 
 
 async def _api_job_detail(request):
@@ -255,31 +208,59 @@ async def _api_job_detail(request):
     if err is not None:
         return err
     job_id = request.path_params["job_id"]
-    snap, res, win = _server._run_job_call(host, "poll(" + repr(job_id) + ")")
+    snap, res, win = _kernel_rpc._run_job_call(host, "poll", job_id)
     if snap is None:
         return _kernel_error(res)
     if snap.get("status") == "unknown":
         return JSONResponse({"error": "no such job", "job_id": job_id}, 404)
     shown, truncated, full_len = _truncate_tail(snap.get("stdout", ""))
     snap["stdout"] = shown
-    snap["truncated"] = truncated
-    snap["stdout_len"] = full_len
+    # Two truncations can apply: this view's tail cap, and the job record's own
+    # output cap upstream of it. `stdout_len` is what the cell actually printed,
+    # so it comes from the record's total rather than from what survived here --
+    # otherwise a capped job reports its kept tail as its full size.
+    total = snap.get("stdout_total", full_len)
+    snap["truncated"] = truncated or total > full_len
+    snap["stdout_len"] = total
     snap["window_alive"] = win
     return JSONResponse(snap)
 
 
 async def _api_notebook(request):
+    """The session as a notebook: the audit export, or ``?workflow=1`` for the
+    verified one.
+
+    Two documents rather than one with a flag inside it, because they answer
+    different questions and a reader wants to have chosen. The default is
+    unchanged, so an older page (and a bookmarked URL) still gets the audit.
+    """
     host, err = _require_host()
     if err is not None:
         return err
+    if request.query_params.get("workflow"):
+        record, res, _w = _kernel_rpc._run_job_call(host, "verified")
+        if record is None:
+            # No verified workflow *and* a failed read look the same from here;
+            # the kernel error is the more specific answer, so prefer it.
+            if res.get("status") != "ok":
+                return _kernel_error(res)
+            return JSONResponse({"error": "no verified workflow in this session"}, 404)
+        nb = _notebook.build_workflow_notebook(record)
+        filename = _notebook.suggested_workflow_filename(record.get("title", ""))
+        return _notebook_response(nb, filename)
+
     # Read the full job history on the kernel main thread (a plain read like
     # jobs_summary(), no background job thread), then serialize to a notebook in
     # this process.
-    jobs, res, _w = _server._run_job_call(host, "export()")
+    jobs, res, _w = _kernel_rpc._run_job_call(host, "export")
     if jobs is None:
         return _kernel_error(res)
     nb = _notebook.build_notebook(jobs)
     filename = _notebook.suggested_filename()
+    return _notebook_response(nb, filename)
+
+
+def _notebook_response(nb, filename):
     return Response(
         json.dumps(nb, indent=1),
         media_type="application/x-ipynb+json",
@@ -298,8 +279,8 @@ async def _api_interrupt(request):
         return err
     # Force a KeyboardInterrupt into the running job's worker thread (SIGINT only
     # reaches the kernel main thread, not the job), attributed to the user.
-    data, res, _w = _server._run_job_call(
-        host, "interrupt_current(" + repr(_USER_INTERRUPT_MSG) + ")"
+    data, res, _w = _kernel_rpc._run_job_call(
+        host, "interrupt_current", _USER_INTERRUPT_MSG
     )
     if data is None:
         return _kernel_error(res)
@@ -307,6 +288,14 @@ async def _api_interrupt(request):
 
 
 async def _api_restart(request):
+    """Restart the kernel on the user's behalf.
+
+    Never gated on the kernel's one-agent claim, which makes this the recovery
+    path for a session held by a client that is gone: an agent cannot take a
+    kernel from another agent, but the person at the machine can always replace
+    it. Clearing the mirrored claim keeps that honest — the next agent to run
+    code here is the new holder, and must not be measured against the old one.
+    """
     host, err = _require_host()
     if err is not None:
         return err
@@ -314,6 +303,7 @@ async def _api_restart(request):
         host.restart()
     except Exception as exc:  # noqa: BLE001 - report restart failure
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    _writers.clear_claim()
     return JSONResponse({"ok": True})
 
 
@@ -331,17 +321,14 @@ async def _console_execute(request):
     host, err = _require_host()
     if err is not None:
         return err
-    try:
-        payload = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is the client's error
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    code = payload.get("code") if isinstance(payload, dict) else None
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return err
+    code = payload.get("code")
     if not isinstance(code, str) or not code.strip():
         return JSONResponse({"error": "missing 'code'"}, status_code=400)
 
-    submitted, res, _w = _server._run_job_call(
-        host, "submit(" + repr(code) + ", origin='user')"
-    )
+    submitted, res, _w = _kernel_rpc._run_job_call(host, "submit", code, origin="user")
     if submitted is None:
         # Distinct from the job-busy case below: this is the kernel *lock*, held
         # by another quick snippet for a moment. Transient, so retryable.
@@ -352,7 +339,7 @@ async def _console_execute(request):
         return JSONResponse(
             {
                 "error": res.get("status") or "kernel error",
-                "detail": _server._format_execute_result(res),
+                "detail": _kernel_rpc._format_execute_result(res),
             },
             status_code=502,
         )
@@ -378,13 +365,55 @@ async def _api_status(request):
     # console_enabled rides here so the page knows whether to offer an editor at
     # all. It is only *this* half of the answer -- the control's gate is the
     # other -- so the SPA needs both before it renders one (see ObservePage).
+    # chat_enabled rides here for a different reader: the control's dashboard,
+    # which probes this endpoint per session anyway and needs it to label the
+    # session's link -- a `biopb mcp view` session leads with chat, an MCP
+    # client's child with the job list. Reporting it beside console_enabled
+    # keeps that one probe the whole answer.
     return JSONResponse(
         {
             **host.health(),
             "poll_interval_ms": _poll_interval_ms,
             "console_enabled": _console_enabled,
+            "chat_enabled": _chat_enabled,
+            # Two different questions, both read by the control's dashboard off
+            # this one probe: chat_enabled says what the page leads with,
+            # agentless says who owns the reap -- and so whether to offer a stop.
+            "agentless": _agentless,
         }
     )
+
+
+# How long the stop route waits before tearing the process down. The teardown
+# ends in os._exit, so it must not run until the response has left: a background
+# task already runs after the body is sent, and this covers the flush behind it.
+_SHUTDOWN_DELAY = 0.25
+
+
+async def _api_shutdown(_request):
+    """End this session -- the same teardown Ctrl-C runs.
+
+    The control proxies this rather than signalling a pid, which is what keeps
+    the ownership question from arising: a session started from a terminal and
+    one started from the dashboard are the same process ending itself the same
+    way, and the control needs no record of which it launched.
+
+    Answers *before* it exits. The teardown's own log line carries the reason,
+    so a viewer started in a terminal says why it is returning rather than
+    dying silently under the person watching it.
+    """
+    if _shutdown_hook is None:
+        return JSONResponse(
+            {"error": "this session does not own its own shutdown"},
+            status_code=404,
+        )
+
+    async def _teardown():
+        await asyncio.sleep(_SHUTDOWN_DELAY)
+        _shutdown_hook()
+
+    logger.info("Stop requested from the web; shutting down.")
+    return JSONResponse({"stopping": True}, background=BackgroundTask(_teardown))
 
 
 # (path, methods, handler) — shared by the http custom routes and the standalone
@@ -400,6 +429,14 @@ _ROUTES = [
     ("/api/status", ["GET"], _route(_api_status)),
 ]
 
+# Served only where this session owns its own reap. Under ``api`` rather than a
+# root of its own: the control already proxies that root everywhere, and it
+# already carries a comparably destructive verb in /api/kernel/restart. This is
+# not an execute surface, so it needs none of the console's local-only gating.
+_SHUTDOWN_ROUTES = [
+    ("/api/shutdown", ["POST"], _route(_api_shutdown)),
+]
+
 # Under its own root, so the control can proxy it on a different rule than
 # /api/* (biopb-control `_session_proxy_roots`).
 _CONSOLE_ROUTES = [
@@ -408,10 +445,14 @@ _CONSOLE_ROUTES = [
 
 
 def _routes():
-    """The routes to serve: the data API, plus the console when enabled."""
+    """The routes to serve: the data API, plus the console and the stop route
+    where each is enabled."""
+    routes = list(_ROUTES)
     if _console_enabled:
-        return _ROUTES + _CONSOLE_ROUTES
-    return _ROUTES
+        routes += _CONSOLE_ROUTES
+    if _agentless:
+        routes += _SHUTDOWN_ROUTES
+    return routes
 
 
 # ---------------------------------------------------------------------------
@@ -429,11 +470,12 @@ def register_http_routes():
     """
     global _mounted_http
     for path, methods, handler in _routes():
-        _server.mcp.custom_route(path, methods=methods)(handler)
+        _app.mcp.custom_route(path, methods=methods)(handler)
     _mounted_http = True
     logger.info(
-        "observe API mounted on the MCP app at /api/* (console: %s)",
+        "observe API mounted on the MCP app at /api/* (console: %s, stop: %s)",
         "on" if _console_enabled else "off",
+        "on" if _agentless else "off",
     )
 
 
