@@ -5,14 +5,23 @@ set -uo pipefail
 # Locate the python of the biopb-tensor-server uv tool environment, where the
 # [bioformats] extra (aicsimageio[bioformats] + scyjava + cjdk) was installed.
 export PATH="$HOME/.local/bin:$PATH"
-TOOLS_DIR="$(uv tool dir 2>/dev/null || true)"
-TOOL_PY="$TOOLS_DIR/biopb-tensor-server/bin/python"
-if [ ! -x "$TOOL_PY" ]; then
-    TOOL_PY="$(find "$HOME/.local/share/uv/tools/biopb-tensor-server" \
-        -path '*/bin/python' 2>/dev/null | head -1)"
-fi
-if [ ! -x "$TOOL_PY" ]; then
-    echo "ERROR: could not find the biopb-tensor-server tool environment."
+# Find it by what it CONTAINS, not by name: install.sh puts everything in one
+# uv tool env (`biopb`, with biopb-tensor-server as a --with dependency and
+# --with-executables-from), so there is no tool named biopb-tensor-server. This
+# script looked for one and could never find it -- it had never run in CI to say
+# so. Probing each env keeps it correct if that layout changes again.
+TOOLS_DIR="$(uv tool dir 2>/dev/null || echo "$HOME/.local/share/uv/tools")"
+TOOL_PY=""
+for candidate in "$TOOLS_DIR"/*/bin/python; do
+    [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import biopb_tensor_server' 2>/dev/null; then
+        TOOL_PY="$candidate"
+        break
+    fi
+done
+if [ -z "$TOOL_PY" ]; then
+    echo "ERROR: no uv tool environment provides biopb_tensor_server."
+    echo "Searched: $TOOLS_DIR/*/bin/python"
     echo "Run 'BIOPB_INSTALL_BIOFORMATS=1 bash /install.sh' first."
     exit 2
 fi
