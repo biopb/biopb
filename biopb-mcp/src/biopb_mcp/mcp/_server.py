@@ -139,9 +139,27 @@ else:
 print("")
 print("## Viewer")
 import os as _os
-if _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
-    # Launcher-owned Xvfb (#90): screenshots work, but no human sees the window.
-    print("  display: virtual (Xvfb) — the viewer window is not visible to the user")
+import sys as _sys
+if _sys.platform == "darwin" or _os.name == "nt":
+    # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
+    # (XQuartz, VcXsrv) says nothing about where Qt actually renders.
+    print("  display: (host window server)")
+elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
+    # Launcher-owned Xvfb (#90). A silent degradation: every tool below still
+    # works, so the agent relaying it is the only thing that reaches the user
+    # (#892). Kept as loud as start_kernel's — a session can reach here without
+    # having seen that message (context cleared, kernel already up).
+    print("  display: VIRTUAL (Xvfb " + str(_os.environ.get("DISPLAY", "?")) + ")")
+    print("    The user sees NO napari window, and software GL renders 3-D")
+    print("    volumes ~13x slower than a real GPU. TELL THE USER, if you have")
+    print("    not already. Usually the host does have a display and the MCP")
+    print("    client dropped $DISPLAY on the way in (Codex CLI does) — ask")
+    print("    whether they sit at a desktop on this machine before treating")
+    print("    the host as headless.")
+else:
+    print("  display: " + str(
+        _os.environ.get("DISPLAY") or _os.environ.get("WAYLAND_DISPLAY") or "?"
+    ))
 if not _viewer_window_alive():
     print("  window: CLOSED — the napari window was closed; layer mutations")
     print("    won't display. Data/compute still work; restart_kernel to restore.")
@@ -890,10 +908,28 @@ def start_kernel() -> str:
         return err
     result = host.ensure_started()
     if result.get("state") == "ready":
-        return (
+        ready = (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
             "use execute_code / take_screenshot now."
         )
+        # A virtual display is a silent degradation: screenshots still work, so
+        # nothing downstream notices, but the user is watching a window that
+        # does not exist and paying software GL for it. Only they can fix it, so
+        # the agent has to be told to say so (#892).
+        display = host.virtual_display
+        if display:
+            ready += (
+                "\n\nWARNING: no display was detected, so the viewer is on a "
+                f"virtual one (Xvfb {display}). Screenshots work, but the "
+                "window is invisible to the user and software GL renders 3-D "
+                "volumes ~13x slower than a real GPU.\n"
+                "TELL THE USER THIS NOW, before doing any work: no napari "
+                "window will appear for them. Usually the host does have a "
+                "display and their MCP client dropped $DISPLAY on the way in "
+                "(Codex CLI does this) — so ask whether they are at a desktop "
+                "on this machine before treating the host as headless."
+            )
+        return ready
     return (
         "Kernel failed to start: "
         + str(result.get("error", "unknown error"))

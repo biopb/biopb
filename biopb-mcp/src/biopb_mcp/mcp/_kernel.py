@@ -909,6 +909,14 @@ class KernelHost:
 
     # -- status ---------------------------------------------------------
 
+    @property
+    def virtual_display(self):
+        """The Xvfb display the kernel renders on, or None when it has the
+        user's real one. The launcher (#90) marks the kernel env it hands us;
+        the session child's own environ never carries it."""
+        env = self._env or {}
+        return env.get("DISPLAY") if env.get("BIOPB_VIRTUAL_DISPLAY") else None
+
     def health(self) -> dict:
         """Liveness summary for server_status (cheap; takes no lock)."""
         return {
