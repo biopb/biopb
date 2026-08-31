@@ -48,13 +48,16 @@ except Exception as e:
     failures.append("adapter registration: %r" % (e,))
     print("[FAIL] adapter registration:", repr(e))
 
-# 2. The Bio-Formats jar shipped with the bioformats extra.
+# 2. The reader plugin shipped with the bioformats extra. This is
+#    bioio_bioformats, NOT the aicsimageio-era bioformats_jar package the bioio
+#    migration removed -- the jar itself is fetched lazily by scyjava/cjdk on
+#    first read (see adapters/bioio.py), so there is no jar package to import.
 try:
-    import bioformats_jar  # noqa: F401
-    print("[PASS] bioformats_jar importable")
+    import bioio_bioformats  # noqa: F401
+    print("[PASS] bioio_bioformats importable")
 except Exception as e:
-    failures.append("bioformats_jar import: %r" % (e,))
-    print("[FAIL] bioformats_jar import:", repr(e))
+    failures.append("bioio_bioformats import: %r" % (e,))
+    print("[FAIL] bioio_bioformats import:", repr(e))
     print("       -> the 'bioformats' component was not installed; rerun "
           "install.sh and tick it.")
 

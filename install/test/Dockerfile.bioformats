@@ -1,6 +1,6 @@
 # Scenario: Bio-Formats / ZVI support, end-to-end
 # Verifies that opting into Bio-Formats during install pulls the
-# aicsimageio[bioformats] + scyjava + cjdk stack, that cjdk auto-fetches a JDK
+# bioio-bioformats + scyjava + cjdk stack, that cjdk auto-fetches a JDK
 # on first use (NO system Java is installed here, on purpose -- that is the whole
 # point), and that a ZVI file can actually be read.
 #
