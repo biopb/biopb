@@ -48,6 +48,15 @@ _session_log_path: str | None = None
 # field carries the guidance that must hold on *every* turn — the operation
 # guardrails.
 _BASE_INSTRUCTIONS = (
+    "First action of every session: call `start_kernel`. It brings up the napari "
+    "viewer, dask and the tensor client, and blocks until they are ready; nothing "
+    "auto-starts, and every other kernel tool fails until it returns. It also "
+    "rebuilds a kernel that never started, died, or was torn down by the user "
+    "closing the viewer window -- but a kernel that is already up it leaves "
+    "alone, so it cannot clear a wedged one: that is `interrupt_kernel` (stop "
+    "the job) or `restart_kernel` (hard-restart). A user asking to start, open, "
+    "or launch biopb or napari is asking for this tool.\n"
+    "\n"
     "This biopb-mcp session drives a live napari viewer through a child IPython "
     "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
     "for detail before non-trivial work: guide://kernel (namespace, skill "
@@ -56,10 +65,6 @@ _BASE_INSTRUCTIONS = (
     "guide://client (the `client` handle: catalog, load, upload), "
     "guide://viewer (layers/camera/dims, annotation layers), "
     "guide://ops (server-side image-processing ops).\n"
-    "\n"
-    "The napari kernel does NOT auto-start. Call `start_kernel` once at the "
-    "start of the session (and again to recover after a failure or after the "
-    "user closes the viewer window); it blocks until the kernel is ready.\n"
     "\n"
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
@@ -89,8 +94,8 @@ _BASE_INSTRUCTIONS = (
 # return nothing) nor prompts it to author skills — set_skills_enabled owns the
 # field.
 _SKILLS_INSTRUCTIONS = (
-    "At the start of a task, call `list_skills` to check for a curated workflow "
-    "before improvising; read the matching `skill://<id>` resource for the "
+    "Once the kernel is ready, call `list_skills` at the start of a task to "
+    "check for a curated workflow before improvising; read the matching `skill://<id>` resource for the "
     "steps. Results marked `origin: local` are the user's own unreviewed skills "
     "from ~/.config/biopb/skills; prefer a curated one when both fit. After "
     "accomplishing a task, ask the user whether a new skill should be generated "

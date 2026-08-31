@@ -890,18 +890,23 @@ def interrupt_kernel() -> str:
 
 @mcp.tool()
 def start_kernel() -> str:
-    """Start the napari kernel on demand (it does not auto-start).
+    """Start biopb: bring up the napari viewer, dask, and the tensor client.
 
-    The MCP server stays cheap and idle until you call this; it then brings up
-    the child IPython kernel, dask, the tensor client, and the napari viewer
-    window. This BLOCKS until the kernel is ready (or the bring-up fails), so
-    on return you can use execute_code / take_screenshot / inspect_object
-    directly (no polling needed). A ready kernel is a no-op.
+    Call this as the first action of every session, and whenever the user asks
+    to start, open, or launch biopb, napari, or the viewer. Nothing auto-starts
+    and every other kernel tool fails until this returns, so when in doubt call
+    it -- a ready kernel is a no-op.
 
-    Call this once at the start of a session. It is also the recovery path:
-    after a failed start, a dead kernel, or the user closing the viewer window
-    (which tears the kernel down to idle), call start_kernel again to rebuild.
-    (restart_kernel is for hard-restarting an already-running kernel.)
+    It BLOCKS until the kernel is ready (or the bring-up fails), so on return
+    you can use execute_code / take_screenshot / inspect_object directly, with
+    no polling.
+
+    It is also the recovery path: after a failed start, a dead kernel, or the
+    user closing the viewer window (which tears the kernel down to idle), call
+    it again to rebuild. A kernel that is already up is left untouched, so this
+    is not the way to clear a wedged or misbehaving one -- that is
+    interrupt_kernel (stop the running job) or restart_kernel (hard-restart,
+    discarding the user's work, which this never does).
     """
     host, err = _app._require_kernel_host()
     if err is not None:
