@@ -841,8 +841,12 @@ const CHAT_CSS = `
   .chat-head { display: flex; align-items: baseline; gap: 10px; padding: 8px 12px;
                border-bottom: 1px solid #333; }
   .chat-title { color: #6a8; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  /* Ellipsised: the head is not a scroll region, so a long engine/model id
+     would otherwise be the widest thing in the pane. */
   .chat-model { color: #777; font-size: 11px; margin-left: auto;
-                font-family: ui-monospace, Menlo, monospace; }
+                font-family: ui-monospace, Menlo, monospace;
+                min-width: 0; white-space: nowrap; overflow: hidden;
+                text-overflow: ellipsis; }
   .chat-thread { flex: 1; overflow: auto; padding: 10px 12px; min-height: 0; }
   .chat-note { color: #777; font-size: 12px; padding: 8px 0 12px; }
   .chat .msg { margin: 0 0 10px; white-space: pre-wrap; word-break: break-word; }
