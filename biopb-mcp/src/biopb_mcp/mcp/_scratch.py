@@ -24,9 +24,10 @@ Three things live here, and they are one module because they are one decision.
   shared and finite, and the agent's whole model is "one cell at a time", so a
   verification takes the same slot ordinary work does — see :func:`start`.
 
-**No ``_verified`` slot.** The record lives here, in the child, for the length of
-the session: the answer is "this run passed, just now", not "some run passed at
-some point in a kernel that has since been restarted".
+**One run at a time, and only the last one.** The record lives here, in the
+child, because the kernel that produced it is gone -- but only the newest, and
+the workflow download follows it: the answer is "this run passed, just now", not
+"some run passed at some point in a kernel that has since been restarted".
 """
 
 import logging
@@ -59,25 +60,11 @@ _lock = threading.RLock()
 _run = None
 _seq = 0
 
-#: Verifications that have finished, oldest first. Kept because the observe page
-#: shows this kernel's runs as a list beside the session kernel's, and a list
-#: that forgets everything but the newest cannot say what the agent has already
-#: tried.
-#:
-#: Bounded, but well above what anyone scrolls: this is the *only* record a
-#: verification leaves -- the kernel that ran it is gone -- so the cap is set by
-#: what it costs to keep one, not by what fits on a screen. A run holds its
-#: cells and a per-cell record whose output is already capped to a head, so a
-#: full list is well under a megabyte. The session kernel keeps 200 jobs for the
-#: same reason; verifications are far rarer than cells.
-_history = []
-_HISTORY_MAX = 100
-
-# The last verification whose every cell ran, as its record dict. Kept across
-# later attempts: a run that fails afterwards does not un-verify the one that
-# passed, and the user may well be mid-way through a second attempt when they
-# decide to save the first.
-_verified = None
+# There is no slot for "the last run that passed". The page shows the last run
+# and the download follows it, so a second attempt that fails leaves nothing to
+# save until it is re-run. That is the honest reading of one visible run: an
+# offer to download a document the reader cannot see, described by a row that
+# says `error`, is the confusing half of keeping the older one.
 
 #: How long an interrupt waits for the cells to stop before taking the process.
 #:
@@ -152,8 +139,8 @@ def detail(job_id):
     snap = poll(job_id)
     if snap is None:
         return None
-    run = _find(job_id)
-    cells = list(run["cells"]) if run is not None else []
+    with _lock:
+        cells = list(_run["cells"]) if _run and _run["job_id"] == job_id else []
     record = snap.get("verify") or {}
     lines = [snap["stdout"].rstrip()] if snap.get("stdout") else []
     for i, cell in enumerate(record.get("cells") or [], 1):
@@ -187,28 +174,22 @@ def owns(job_id):
     return isinstance(job_id, str) and job_id.startswith(_ID_PREFIX)
 
 
-def _find(job_id):
-    """The run dict for *job_id* -- current or finished -- or ``None``."""
+def poll(job_id):
+    """The snapshot for *job_id*, or ``None`` if this is not a run we know."""
     with _lock:
         if _run is not None and _run["job_id"] == job_id:
-            return _run
-        for run in _history:
-            if run["job_id"] == job_id:
-                return run
+            return _snapshot(_run)
     return None
 
 
-def poll(job_id):
-    """The snapshot for *job_id*, or ``None`` if this is not a run we know."""
-    run = _find(job_id)
-    return None if run is None else _snapshot(run)
-
-
 def runs_view():
-    """Every verification this session has run, oldest first.
+    """The last verification, as a one-row list, or an empty one.
 
-    The row shape the observe page renders a job in, so its verification pane is
-    the same list component as its session pane rather than a second one.
+    A list rather than a record so the observe page's verification pane is the
+    same list component as its session pane rather than a second one. One row,
+    because the runs before it are not reachable: their kernels are gone, and
+    the only thing anyone does with an older run -- download the workflow it
+    proved -- is a lookup this page does not yet offer.
 
     Where a session job's "why" is the intent its writer gave that cell, a
     verification has neither: the cells arrive as bare code and the run's intent
@@ -218,28 +199,33 @@ def runs_view():
     written to be read.
     """
     with _lock:
-        runs = [*_history, _run] if _run is not None else list(_history)
+        if _run is None:
+            return []
+        cells = len(_run["cells"])
         return [
             {
-                "job_id": run["job_id"],
-                "status": run["status"],
+                "job_id": _run["job_id"],
+                "status": _run["status"],
                 "origin": "mcp",
-                "elapsed": _elapsed(run),
-                "code_preview": (
-                    f"{len(run['cells'])} cell"
-                    + ("s" if len(run["cells"]) != 1 else "")
-                ),
-                "intent_preview": run["title"],
+                "elapsed": _elapsed(_run),
+                "code_preview": f"{cells} cell" + ("s" if cells != 1 else ""),
+                "intent_preview": _run["title"],
                 "verify": True,
             }
-            for run in runs
         ]
 
 
 def verified():
-    """The last fully-successful verification's record, or ``None``."""
+    """The last verification's record if every cell ran, else ``None``.
+
+    The download follows the run the page is showing, so this is empty while one
+    is running and empty after one fails -- see the note where ``_run`` is
+    declared for why no earlier pass is kept.
+    """
     with _lock:
-        return _verified
+        if _run is None or _run["status"] != "ok" or _run["record"] is None:
+            return None
+        return {**_run["record"], "job_id": _run["job_id"]}
 
 
 def verified_summary():
@@ -248,14 +234,15 @@ def verified_summary():
     Carried on the observe poll so the page can offer the workflow download
     without a second round trip per second for a value that changes rarely.
     """
-    with _lock:
-        if _verified is None:
-            return None
-        return {
-            "title": _verified.get("title", ""),
-            "cells": len(_verified.get("cells") or []),
-            "created": _verified.get("created"),
-        }
+    record = verified()
+    if record is None:
+        return None
+    return {
+        "job_id": record["job_id"],
+        "title": record.get("title", ""),
+        "cells": len(record.get("cells") or []),
+        "created": record.get("created"),
+    }
 
 
 def start(cells, title, session_host, intent="", writer=None, writer_label=""):
@@ -309,9 +296,6 @@ def start(cells, title, session_host, intent="", writer=None, writer_label=""):
                 "running_job_id": busy.get("job_id"),
                 "running_job_origin": busy.get("origin"),
             }
-        if _run is not None:
-            _history.append(_run)
-            del _history[:-_HISTORY_MAX]
         _seq += 1
         _run = {
             "job_id": f"{_ID_PREFIX}{_seq}",
@@ -339,7 +323,6 @@ def start(cells, title, session_host, intent="", writer=None, writer_label=""):
 
 
 def _finish(run, status, error=None):
-    global _verified
     with _lock:
         if run["status"] != "running":
             return  # already discarded; the first verdict stands
@@ -347,13 +330,10 @@ def _finish(run, status, error=None):
         run["finished"] = time.monotonic()
         if error:
             run["error"] = error
-        record = run["record"]
-        if status == "ok" and record is not None:
-            # Kept only when every cell ran. What it is kept *for* is the
-            # workflow document, and a document is not a partial run: half a
-            # workflow that stops at a NameError is a report, which the record
-            # already is.
-            _verified = record
+        # `verified()` reads the status rather than a slot set here: what the
+        # download is offered for is a whole run, and a document is not a
+        # partial one -- half a workflow that stops at a NameError is a report,
+        # which the record already is.
 
 
 def _execute(run):
@@ -531,8 +511,7 @@ def discard(reason=None):
 
 def reset():
     """Forget everything (tests, and a launcher reconfiguring the session)."""
-    global _run, _verified, _seq
+    global _run, _seq
     discard()
     with _lock:
-        _run, _verified, _seq = None, None, 0
-        _history.clear()
+        _run, _seq = None, 0

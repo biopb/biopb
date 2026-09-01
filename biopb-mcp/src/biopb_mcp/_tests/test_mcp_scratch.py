@@ -135,6 +135,7 @@ class TestRunningAVerification:
         assert snap["status"] == "ok"
         assert _scratch.verified()["title"] == "wf"
         assert _scratch.verified_summary() == {
+            "job_id": "verify-1",
             "title": "wf",
             "cells": 1,
             "created": 1_700_000_000.0,
@@ -164,15 +165,6 @@ class TestRunningAVerification:
         assert _scratch.verified() is None
         assert _scratch.verified_summary() is None
 
-    def test_a_later_failure_does_not_unverify_what_passed(self):
-        _scratch.set_host_factory(lambda: _scratch_host(title="good"))
-        _settle(_scratch.start(["1"], "good", _session_host())["job_id"])
-        _scratch.set_host_factory(
-            lambda: _scratch_host(job_status="error", title="bad")
-        )
-        _settle(_scratch.start(["1/0"], "bad", _session_host())["job_id"])
-        assert _scratch.verified()["title"] == "good"
-
     def test_a_kernel_that_never_starts_is_the_verdict_not_a_crash(self):
         # Its death IS the answer: an OOM means the workflow does not fit. The
         # watchdog is off for exactly this reason -- a respawn would re-run a
@@ -194,11 +186,12 @@ class TestRunningAVerification:
 class TestTheRunList:
     """What the observe page's verification pane reads.
 
-    A verification is not a session job, so it is not in the session kernel's
-    list -- which leaves this the only record that a run happened at all.
+    One run: the last, or the one in flight. Older runs are not kept -- their
+    kernels are gone and the page offers no way to reach them -- so the download
+    follows what the page is showing.
     """
 
-    def test_finished_runs_stay_listed_after_the_next_one_starts(self):
+    def test_the_pane_shows_the_last_run(self):
         _scratch.set_host_factory(lambda: _scratch_host(title="first"))
         first = _scratch.start(["a = 2"], "first", _session_host())["job_id"]
         _settle(first)
@@ -207,34 +200,38 @@ class TestTheRunList:
         _settle(second)
 
         rows = _scratch.runs_view()
-        assert [r["job_id"] for r in rows] == [first, second]  # oldest first
-        assert all(r["verify"] and r["origin"] == "mcp" for r in rows)
+        assert [r["job_id"] for r in rows] == [second]
+        assert rows[0]["verify"] and rows[0]["origin"] == "mcp"
         # The title is the row's "why"; a verification has no other one.
-        assert rows[0]["intent_preview"] == "first"
+        assert rows[0]["intent_preview"] == "second"
         assert rows[0]["code_preview"] == "1 cell"
 
-    def test_a_finished_run_can_still_be_opened(self):
-        _scratch.set_host_factory(lambda: _scratch_host())
-        first = _scratch.start(["a = 2"], "first", _session_host())["job_id"]
-        _settle(first)
-        _settle(_scratch.start(["b = 3"], "second", _session_host())["job_id"])
+    def test_there_is_nothing_to_save_until_a_run_passes(self):
+        assert _scratch.runs_view() == []
+        assert _scratch.verified_summary() is None
 
-        # The row is in the list, so the detail view behind it must answer --
-        # a row that 404s is worse than no row (see _scratch.detail).
-        assert _scratch.poll(first)["status"] == "ok"
-        assert _scratch.detail(first)["code"] == "a = 2"
+        _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
+        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
+        # A failed run is listed -- that is the report -- but there is no
+        # document behind it, so the page's download must stay closed.
+        assert len(_scratch.runs_view()) == 1
+        assert _scratch.verified() is None
+        assert _scratch.verified_summary() is None
 
-    def test_the_list_is_bounded(self, monkeypatch):
-        monkeypatch.setattr(_scratch, "_HISTORY_MAX", 2)
-        _scratch.set_host_factory(lambda: _scratch_host())
-        ids = []
-        for i in range(4):
-            ids.append(_scratch.start([f"a = {i}"], f"w{i}", _session_host())["job_id"])
-            _settle(ids[-1])
-        # Two kept plus the current one, and it is the oldest that goes.
-        assert [r["job_id"] for r in _scratch.runs_view()] == ids[1:]
+    def test_a_later_failure_replaces_an_earlier_pass(self):
+        _scratch.set_host_factory(lambda: _scratch_host(title="good"))
+        good = _scratch.start(["a = 2"], "good", _session_host())["job_id"]
+        _settle(good)
+        assert _scratch.verified_summary()["job_id"] == good
 
-    def test_reset_forgets_the_list(self):
+        _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
+        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
+        # Deliberate: the page shows one run, so offering a download of a
+        # document it is not showing is the confusing half. Re-run to get it
+        # back.
+        assert _scratch.verified() is None
+
+    def test_reset_forgets_the_run(self):
         _scratch.set_host_factory(lambda: _scratch_host())
         _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
         _scratch.reset()

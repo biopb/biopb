@@ -52,10 +52,12 @@ interface JobSummary {
   /** A verification, which ran in a scratch kernel rather than this session's. */
   verify?: boolean;
 }
-/** The verified workflow this session has, if any — a clean program an agent
- * rewrote from the transcript and proved by running in a scratch namespace.
- * Absent on an older child, and null until something is verified. */
+/** The workflow the last verification proved, if it proved one — a clean
+ * program an agent rewrote from the transcript and ran in a scratch kernel.
+ * Absent on an older child, and null while a run is in flight or after one
+ * fails: the download follows the run the Verification pane is showing. */
 interface WorkflowSummary {
+  job_id?: string;
   title?: string;
   cells: number;
   created?: number;
@@ -506,11 +508,7 @@ export default function ObservePage() {
                 Verification
                 {/* The one thing the session pane can no longer say for itself:
                     that the kernel is busy with something on the other side. */}
-                {verifyRunning ? (
-                  <span className="live" aria-label="running" />
-                ) : verifyJobs.length ? (
-                  <span className="count">{verifyJobs.length}</span>
-                ) : null}
+                {verifyRunning ? <span className="live" aria-label="running" /> : null}
               </button>
             </div>
             {pane === "verify" ? (
@@ -521,8 +519,12 @@ export default function ObservePage() {
                   workflow
                     ? `${workflow.title || "Verified workflow"} — ${
                         workflow.cells
-                      } cell(s), each one proved by running it`
-                    : "Nothing has passed verification in this session yet"
+                      } cell(s), every one of them proved by running it`
+                    : verifyRunning
+                      ? "The verification is still running"
+                      : verifyJobs.length
+                        ? "The last verification did not pass — there is no workflow to save"
+                        : "Nothing has been verified in this session yet"
                 }
                 onClick={() => saveNotebook("workflow")}
               >
@@ -604,9 +606,9 @@ export default function ObservePage() {
           ) : null}
           {pane === "verify" ? (
             <div className="pane-note">
-              Each row ran in its own scratch kernel — a headless one built for
-              the run and thrown away after it. Nothing here touched your
-              variables, layers or viewer.
+              The last verification. It ran in its own scratch kernel — a
+              headless one built for the run and thrown away after it — so
+              nothing here touched your variables, layers or viewer.
             </div>
           ) : null}
           <div id="jobs">
@@ -856,7 +858,6 @@ const OBS_CSS = `
   .obs-page .pane-toggle .live { width: 7px; height: 7px; border-radius: 50%;
            background: #4c9; animation: obs-pulse 1.4s ease-in-out infinite; }
   @keyframes obs-pulse { 50% { opacity: .25; } }
-  .obs-page .pane-toggle .count { font-size: 11px; color: #888; }
   .obs-page .pane-note { color: #8a8a8a; font-size: 12px; padding: 8px 4px 12px; }
   .obs-page main { padding: 12px 16px; }
   /* The thread beside the jobs it drives: a chat cell shows up in that list,
