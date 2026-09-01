@@ -181,6 +181,15 @@ export default function ObservePage() {
     session: null,
     verify: null,
   });
+  // Which job ids each list held last poll, so a row that has just arrived can
+  // announce itself instead of appearing between two paints. Null until the
+  // first poll lands: on arrival every row is new, and a whole list animating
+  // at once says nothing.
+  const seen = useRef<Record<Pane, Set<string> | null>>({
+    session: null,
+    verify: null,
+  });
+  const [fresh, setFresh] = useState<Set<string>>(new Set());
   // Latest expanded set + details for the poll closure (which fetches details for
   // open jobs) so poll stays stable — reading these through refs keeps the poll
   // interval from resubscribing on every toggle / detail update.
@@ -240,10 +249,16 @@ export default function ObservePage() {
       ["session", list],
       ["verify", verifyList],
     ] as [Pane, JobSummary[]][]) {
+      const mine = new Set(rows.map((j) => j.job_id));
+      const before = seen.current[key];
+      seen.current[key] = mine;
+      if (before) {
+        const added = [...mine].filter((id) => !before.has(id));
+        if (added.length) setFresh((f) => new Set([...f, ...added]));
+      }
       const newest = rows.length ? rows[rows.length - 1]!.job_id : null;
       if (newest === lastNewest.current[key]) continue;
       lastNewest.current[key] = newest;
-      const mine = new Set(rows.map((j) => j.job_id));
       openSet = new Set([...openSet].filter((id) => !mine.has(id)));
       if (newest) openSet.add(newest);
       changed = true;
@@ -474,6 +489,8 @@ export default function ObservePage() {
     setDetails({});
     setExpanded(new Set());
     lastNewest.current = { session: null, verify: null };
+    seen.current = { session: null, verify: null };
+    setFresh(new Set());
     poll();
   }, [base, poll]);
 
@@ -553,14 +570,23 @@ export default function ObservePage() {
                 ⤓ Save notebook
               </button>
             )}
-            {/* Session-side only. It destroys the user's variables and layers,
-                and on a pane about throwaway kernels it would read as the
-                harmless thing it is not. */}
-            {pane === "session" ? (
-              <button className="danger" onClick={restart}>
-                Restart kernel
-              </button>
-            ) : null}
+            {/* Disabled on the verify pane, not removed: a button that leaves
+                the header moves the ones beside it, and a reader who reaches
+                for the same place twice should find the same thing there. It
+                destroys the user's variables and layers, and a scratch kernel
+                has none to destroy. */}
+            <button
+              className="danger"
+              disabled={pane !== "session"}
+              title={
+                pane === "session"
+                  ? "Hard-restart this session's kernel"
+                  : "A verification's kernel is built for its run and discarded after it — there is nothing here to restart"
+              }
+              onClick={restart}
+            >
+              Restart kernel
+            </button>
           </>
         )}
       </header>
@@ -656,6 +682,7 @@ export default function ObservePage() {
                   key={j.job_id}
                   job={j}
                   open={expanded.has(j.job_id)}
+                  fresh={fresh.has(j.job_id)}
                   detail={details[j.job_id]}
                   onToggle={() => toggle(j.job_id)}
                   onInterrupt={interrupt}
@@ -740,12 +767,16 @@ function ConsolePanel({
 export function JobRow({
   job,
   open,
+  fresh,
   detail,
   onToggle,
   onInterrupt,
 }: {
   job: JobSummary;
   open: boolean;
+  /** Arrived since the last poll. The row plays its entrance once, on the paint
+   * that adds it; a row that was already on screen does not. */
+  fresh?: boolean;
   detail: JobDetail | undefined;
   onToggle: () => void;
   onInterrupt: () => void;
@@ -781,7 +812,14 @@ export function JobRow({
         (detail.window_alive === false ? " · viewer window closed" : "");
 
   return (
-    <div className={"job" + (open ? " open" : "")}>
+    <div
+      className={
+        "job" +
+        (open ? " open" : "") +
+        (fresh ? " enter" : "") +
+        (job.status === "running" ? " busy" : "")
+      }
+    >
       <div className="row" onClick={onToggle}>
         <span className="jid">{job.job_id}</span>
         {/* Provenance is worth showing for anything that is not the MCP
@@ -824,38 +862,47 @@ export function JobRow({
           </button>
         ) : null}
       </div>
+      {/* Three elements because the collapse animates: the outer one owns the
+          height, the clip hides what overflows it, and the padding has to sit
+          inside both -- a grid item's padding is its own height even when its
+          row is 0fr. The content stays mounted once fetched, so closing a row
+          folds what you were reading away rather than emptying the box first. */}
       <div className="detail">
-        {open && detail ? (
-          <>
-            {detail.intent ? (
-              // In full here, because the row caps it at one line.
+        <div className="detail-clip">
+          <div className="detail-body">
+            {detail ? (
               <>
-                <div className="label">intent</div>
-                <div className="intent-full">{detail.intent}</div>
+                {detail.intent ? (
+                  // In full here, because the row caps it at one line.
+                  <>
+                    <div className="label">intent</div>
+                    <div className="intent-full">{detail.intent}</div>
+                  </>
+                ) : null}
+                {detail.code ? (
+                  <>
+                    <div className="label">code</div>
+                    <pre className="code">{detail.code}</pre>
+                  </>
+                ) : null}
+                <div className="label">output</div>
+                <div className="meta">{meta}</div>
+                <pre
+                  className="out"
+                  ref={outRef}
+                  onScroll={() => {
+                    const pre = outRef.current;
+                    if (!pre) return;
+                    atBottom.current =
+                      pre.scrollHeight - pre.scrollTop - pre.clientHeight < 4;
+                  }}
+                >
+                  {text}
+                </pre>
               </>
             ) : null}
-            {detail.code ? (
-              <>
-                <div className="label">code</div>
-                <pre className="code">{detail.code}</pre>
-              </>
-            ) : null}
-            <div className="label">output</div>
-            <div className="meta">{meta}</div>
-            <pre
-              className="out"
-              ref={outRef}
-              onScroll={() => {
-                const pre = outRef.current;
-                if (!pre) return;
-                atBottom.current =
-                  pre.scrollHeight - pre.scrollTop - pre.clientHeight < 4;
-              }}
-            >
-              {text}
-            </pre>
-          </>
-        ) : null}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -876,6 +923,11 @@ const OBS_CSS = `
                    font-weight: 600; margin-right: 6px; }
   .obs-page button.primary:hover { background: #25804b; }
   .obs-page button.primary:disabled { opacity: .5; cursor: default; background: #1d6b3f; }
+  .obs-page button:disabled { opacity: .5; cursor: default; }
+  .obs-page button.danger:disabled:hover { background: #222; }
+  /* Wider than either label it carries, so switching panes changes what the
+     button says without moving what sits after it. */
+  .obs-page header button.primary { min-width: 150px; }
   .obs-page .pane-toggle { display: flex; margin-right: 12px; }
   .obs-page .pane-toggle button { border-radius: 0; display: flex; align-items: center;
            gap: 6px; color: #999; }
@@ -928,12 +980,26 @@ const OBS_CSS = `
     .obs-page .splitter { display: none; }
   }
   .obs-page .job { border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; overflow: hidden; }
+  /* A new cell arrives where it will sit rather than being there between two
+     paints. Small and short: this is the list you watch while work runs, and
+     anything louder would be in the way by the third cell. */
+  .obs-page .job.enter { animation: obs-row-in .3s ease-out; }
+  @keyframes obs-row-in { from { opacity: 0; transform: translateY(-6px); } }
+  /* The card the kernel is busy with, findable without reading any of them. */
+  .obs-page .job.busy { border-color: #2a5; }
   .obs-page .row { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }
   .obs-page .row:hover { background: #1a1a1a; }
   .obs-page .jid { font-weight: 600; }
   .obs-page .badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; text-transform: uppercase; }
   .obs-page .you { background: #34305a; color: #b9b0ff; }
   .obs-page .running { background: #243; color: #7e7; }
+  /* Running is the one status you watch rather than read, so it breathes --
+     and the ring it sheds says "still going" from the corner of an eye. */
+  .obs-page .badge.running { animation: obs-run-pulse 1.5s ease-in-out infinite; }
+  @keyframes obs-run-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(90, 230, 150, .38); }
+    50% { background: #2e6042; color: #d6ffe6; box-shadow: 0 0 0 5px rgba(90, 230, 150, 0); }
+  }
   .obs-page .ok { background: #234; color: #8bf; }
   .obs-page .error { background: #422; color: #f99; }
   .obs-page .interrupted { background: #324; color: #c9f; }
@@ -950,8 +1016,15 @@ const OBS_CSS = `
                         border: 1px solid #533; background: #2a1a1a;
                         color: #f99; cursor: pointer; }
   .obs-page .job-stop:hover { background: #3a2020; border-color: #744; }
-  .obs-page .detail { border-top: 1px solid #333; padding: 10px 12px; display: none; }
-  .obs-page .job.open .detail { display: block; }
+  /* 0fr -> 1fr is the one way to transition to a height the content decides,
+     which is what makes autocollapse read as the previous cell folding away
+     rather than blinking out. */
+  .obs-page .detail { display: grid; grid-template-rows: 0fr;
+        border-top: 1px solid transparent;
+        transition: grid-template-rows .28s ease, border-color .28s ease; }
+  .obs-page .job.open .detail { grid-template-rows: 1fr; border-top-color: #333; }
+  .obs-page .detail-clip { overflow: hidden; min-height: 0; }
+  .obs-page .detail-body { padding: 10px 12px; }
   .obs-page .label { color: #6a8; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin: 8px 0 2px; }
   .obs-page .label:first-child { margin-top: 0; }
   .obs-page pre { white-space: pre-wrap; word-break: break-word; margin: 0;
@@ -978,4 +1051,11 @@ const OBS_CSS = `
              border-radius: 5px; padding: 10px 12px; margin-bottom: 12px; }
   .obs-page .ended strong { color: #fdd; }
   .obs-page .ended a { color: #fbb; }
+  /* None of the motion above carries meaning the text does not: with it off,
+     the page still says which cell is running and which one is new. */
+  @media (prefers-reduced-motion: reduce) {
+    .obs-page .job.enter { animation: none; }
+    .obs-page .detail { transition: none; }
+    .obs-page .badge.running, .obs-page .pane-toggle .live { animation: none; }
+  }
 `;
