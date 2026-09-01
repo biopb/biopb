@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from biopb_mcp import _config
 from biopb_mcp._tests.conftest import call_tool as _tool
 from biopb_mcp.mcp import _app, _kernel_rpc, _scratch, _server, _writers
 
@@ -117,6 +118,16 @@ def _settle(job_id, timeout=5.0):
 
 
 @pytest.fixture(autouse=True)
+def spool(tmp_path, monkeypatch):
+    """Redirect the workflow spool. Autouse: a verification that passes writes
+    one, and a test suite must not write into the user's own state tree."""
+    d = tmp_path / "workflows"
+    d.mkdir()
+    monkeypatch.setattr(_config, "get_workflow_dir", lambda: d)
+    return d
+
+
+@pytest.fixture(autouse=True)
 def clean_scratch():
     _scratch.reset()
     _scratch.set_host_factory(None)
@@ -135,9 +146,11 @@ class TestRunningAVerification:
         assert snap["status"] == "ok"
         assert _scratch.verified()["title"] == "wf"
         assert _scratch.verified_summary() == {
+            "job_id": "verify-1",
             "title": "wf",
             "cells": 1,
             "created": 1_700_000_000.0,
+            "saved_path": _scratch.verified()["saved_path"],
         }
 
     def test_the_kept_record_is_the_full_one_not_the_polled_ledger(self):
@@ -164,15 +177,6 @@ class TestRunningAVerification:
         assert _scratch.verified() is None
         assert _scratch.verified_summary() is None
 
-    def test_a_later_failure_does_not_unverify_what_passed(self):
-        _scratch.set_host_factory(lambda: _scratch_host(title="good"))
-        _settle(_scratch.start(["1"], "good", _session_host())["job_id"])
-        _scratch.set_host_factory(
-            lambda: _scratch_host(job_status="error", title="bad")
-        )
-        _settle(_scratch.start(["1/0"], "bad", _session_host())["job_id"])
-        assert _scratch.verified()["title"] == "good"
-
     def test_a_kernel_that_never_starts_is_the_verdict_not_a_crash(self):
         # Its death IS the answer: an OOM means the workflow does not fit. The
         # watchdog is off for exactly this reason -- a respawn would re-run a
@@ -189,6 +193,109 @@ class TestRunningAVerification:
 
     def test_without_a_factory_it_says_so_rather_than_failing_obscurely(self):
         assert "unavailable" in _scratch.start(["1"], "", _session_host())["error"]
+
+
+class TestTheRunList:
+    """What the observe page's verification pane reads.
+
+    One run: the last, or the one in flight. Older runs are not kept -- their
+    kernels are gone and the page offers no way to reach them -- so the download
+    follows what the page is showing.
+    """
+
+    def test_the_pane_shows_the_last_run(self):
+        _scratch.set_host_factory(lambda: _scratch_host(title="first"))
+        first = _scratch.start(["a = 2"], "first", _session_host())["job_id"]
+        _settle(first)
+        _scratch.set_host_factory(lambda: _scratch_host(title="second"))
+        second = _scratch.start(["b = 3"], "second", _session_host())["job_id"]
+        _settle(second)
+
+        rows = _scratch.runs_view()
+        assert [r["job_id"] for r in rows] == [second]
+        assert rows[0]["verify"] and rows[0]["origin"] == "mcp"
+        # The title is the row's "why"; a verification has no other one.
+        assert rows[0]["intent_preview"] == "second"
+        assert rows[0]["code_preview"] == "1 cell"
+
+    def test_there_is_nothing_to_save_until_a_run_passes(self):
+        assert _scratch.runs_view() == []
+        assert _scratch.verified_summary() is None
+
+        _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
+        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
+        # A failed run is listed -- that is the report -- but there is no
+        # document behind it, so the page's download must stay closed.
+        assert len(_scratch.runs_view()) == 1
+        assert _scratch.verified() is None
+        assert _scratch.verified_summary() is None
+
+    def test_a_later_failure_replaces_an_earlier_pass(self):
+        _scratch.set_host_factory(lambda: _scratch_host(title="good"))
+        good = _scratch.start(["a = 2"], "good", _session_host())["job_id"]
+        _settle(good)
+        assert _scratch.verified_summary()["job_id"] == good
+
+        _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
+        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
+        # Deliberate: the page shows one run, so offering a download of a
+        # document it is not showing is the confusing half. Re-run to get it
+        # back.
+        assert _scratch.verified() is None
+
+    def test_a_run_that_passes_is_written_to_the_spool(self, spool):
+        _scratch.set_host_factory(lambda: _scratch_host(title="segment nuclei"))
+        _settle(_scratch.start(["a = 2"], "segment nuclei", _session_host())["job_id"])
+
+        (saved,) = list(spool.iterdir())
+        assert saved.name.startswith("biopb-segment-nuclei-")
+        assert saved.suffix == ".ipynb"
+        # A real notebook, not a fragment: this is the file someone opens.
+        nb = json.loads(saved.read_text())
+        assert nb["nbformat"] == 4 and nb["cells"]
+        assert _scratch.verified_summary()["saved_path"] == str(saved)
+
+    def test_the_document_exists_before_the_run_says_it_passed(self, spool):
+        # Everything waits on the status, so writing after it would hand a
+        # caller a passed run whose file is not there yet.
+        _scratch.set_host_factory(lambda: _scratch_host())
+        job = _scratch.start(["a = 2"], "wf", _session_host())["job_id"]
+        _settle(job)
+        assert list(spool.iterdir())
+
+    def test_a_run_that_fails_writes_nothing(self, spool):
+        _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
+        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
+        assert list(spool.iterdir()) == []
+
+    def test_a_spool_that_cannot_be_written_is_not_a_failed_verification(
+        self, monkeypatch
+    ):
+        # A disk error is not a fact about the user's code. Reporting it as a
+        # failed workflow would be a lie about what their cells did.
+        def boom():
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(_config, "get_workflow_dir", boom)
+        _scratch.set_host_factory(lambda: _scratch_host())
+        snap = _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+        assert snap["status"] == "ok"
+        assert _scratch.verified()["saved_path"] is None
+
+    def test_the_spool_keeps_only_the_newest(self, spool, monkeypatch):
+        monkeypatch.setattr(_scratch, "_SPOOL_KEEP", 3)
+        for i in range(6):
+            # Distinct names: the stamp has one-second resolution, so a loop
+            # this fast would otherwise overwrite one file six times.
+            _scratch.set_host_factory(lambda: _scratch_host())
+            _settle(_scratch.start(["a = 2"], f"wf{i}", _session_host())["job_id"])
+        assert len(list(spool.iterdir())) == 3
+
+    def test_reset_forgets_the_run(self):
+        _scratch.set_host_factory(lambda: _scratch_host())
+        _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+        _scratch.reset()
+        assert _scratch.runs_view() == []
 
 
 class TestTheSlot:

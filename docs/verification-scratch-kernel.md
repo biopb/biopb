@@ -59,12 +59,30 @@ One scratch kernel, spawned on demand, holding its own namespace, attached to
 the session's already-warm dask cluster, and **headless**. A verification is
 then:
 
-    run the cells → verdict → if it passed, offer to save → discard the kernel
+    run the cells → verdict → if it passed, write the notebook → discard the kernel
 
 There is no slot to remember, because the answer is "this run passed, just now"
 rather than "some run passed at some point". There is no residual, because
 whatever the run touched goes with the process. There is nothing to filter out
 of the session's job list, because the run was never in it.
+
+### Every pass is written
+
+The notebook goes to `<state>/biopb/mcp/workflows/` as soon as the run passes,
+before the verdict is published — everything waits on the status, so writing
+after it would hand a reader a passed run whose file does not exist yet.
+
+Every pass, because this process knows only that all the cells ran; whether the
+*numbers* are right is not a question it can ask. Choosing between passes is
+therefore deferred to whoever reads them, and the naming rule was already built
+for it: `suggested_workflow_filename` keeps the timestamp even when there is a
+title, so repeated verifications of one workflow do not collide. Retention is
+keep-newest-50, the shape the per-session logs beside it already use.
+
+The observe page shows the last run and offers *Download* for it. A later
+attempt that fails takes that offer away — the page shows one run, and offering
+a document it is not showing is the confusing half — but the earlier file is
+still on disk. What a failure removes is the offer, not the document.
 
 ### No viewer, as policy
 

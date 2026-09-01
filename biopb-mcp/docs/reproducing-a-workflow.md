@@ -159,11 +159,15 @@ notebook the user is about to save would fail the same way.
 `/api/notebook` is unchanged: the **audit** export, every retained job in order,
 dead ends included, with per-cell provenance headers. `?workflow=1` serves the
 **workflow** export: the verified cells, no headers, an intro that states what
-the run proved and what it did not. The observe page shows *Save workflow*
-beside *Save notebook* only once something is verified, learning that from the
-`workflow` key the session child merges into the poll it already makes
-(`_observe._api_jobs`) — the kernel cannot answer it, having never seen the
-run.
+the run proved and what it did not.
+
+The workflow export is also written to disk without being asked, to
+`<state>/biopb/mcp/workflows/`, on every run that passes. The observe page's
+Verification pane names the file and offers *Download* for putting a copy where
+the user wants it — which on a remote session is the only way to get it at all.
+Both learn what there is to offer from the `workflow` key the session child
+merges into the poll it already makes (`_observe._api_jobs`); the kernel cannot
+answer it, having never seen the run.
 
 ## 7. Why the retained-job cap went up
 

@@ -29,6 +29,15 @@ import { withBase } from "../base";
  * a chat cell the moment there were three. One mapping, so a fourth writer
  * shows its own name rather than someone else's.
  */
+/** The last segment of a path the child sent, POSIX or Windows.
+ *
+ * What a remote viewer is shown: the server's directory layout is not theirs
+ * and means nothing to them, so the name is the whole of the useful part. */
+function baseName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
 function writerName(origin?: string): string {
   if (origin === "user") return "you";
   if (origin === "chat") return "chat";
@@ -45,21 +54,39 @@ interface JobSummary {
   elapsed: number;
   code_preview?: string;
   /** Why the cell was run, when whoever ran it said why. Absent on an older
-   * child, and empty for a cell nobody explained (the console's, typically). */
+   * child, and empty for a cell nobody explained (the console's, typically).
+   * On a verification row it is the workflow's title: the cells arrive as bare
+   * code and there is no per-cell intent to show. */
   intent_preview?: string;
+  /** A verification, which ran in a scratch kernel rather than this session's. */
+  verify?: boolean;
 }
-/** The verified workflow this session has, if any — a clean program an agent
- * rewrote from the transcript and proved by running in a scratch namespace.
- * Absent on an older child, and null until something is verified. */
+/** The workflow the last verification proved, if it proved one — a clean
+ * program an agent rewrote from the transcript and ran in a scratch kernel.
+ * Absent on an older child, and null while a run is in flight or after one
+ * fails: the download follows the run the Verification pane is showing. */
 interface WorkflowSummary {
+  job_id?: string;
   title?: string;
   cells: number;
   created?: number;
+  /** Where the child spooled it. Every run that passes is written, so the
+   * document survives a later attempt that fails — what that takes away is the
+   * download offer, not the file. Null if the write failed, which does not
+   * make the verification any less passed. */
+  saved_path?: string | null;
 }
 /** Which document to download. Not a flag inside one: the audit export is every
  * job that ran, the workflow export is the verified program someone rewrote
  * from it. Different questions, so the reader chooses. */
 type NotebookKind = "audit" | "workflow";
+/** Which kernel the work column is showing.
+ *
+ * Two kernels, one at a time. The session kernel holds the user's variables,
+ * layers and viewer; a verification runs in a scratch kernel built for that run
+ * and thrown away after it. Its jobs are therefore not this session's history,
+ * and merging the two lists said they were. */
+type Pane = "session" | "verify";
 interface JobDetail {
   code?: string;
   intent?: string;
@@ -92,6 +119,8 @@ export default function ObservePage() {
   );
 
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
+  const [verifyJobs, setVerifyJobs] = useState<JobSummary[]>([]);
+  const [pane, setPane] = useState<Pane>("session");
   const [workflow, setWorkflow] = useState<WorkflowSummary | null>(null);
   const [details, setDetails] = useState<Record<string, JobDetail>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -148,7 +177,10 @@ export default function ObservePage() {
     if (width) setChatWidth(width);
   }, []);
 
-  const lastNewest = useRef<string | null>(null);
+  const lastNewest = useRef<Record<Pane, string | null>>({
+    session: null,
+    verify: null,
+  });
   // Latest expanded set + details for the poll closure (which fetches details for
   // open jobs) so poll stays stable — reading these through refs keeps the poll
   // interval from resubscribing on every toggle / detail update.
@@ -187,28 +219,38 @@ export default function ObservePage() {
     const data: {
       busy?: boolean;
       jobs?: JobSummary[];
+      verify_jobs?: JobSummary[];
       workflow?: WorkflowSummary | null;
     } = await r.json().catch(() => ({}));
     if (data.busy) return; // transient; keep current render
     setWorkflow(data.workflow ?? null);
     const list = data.jobs || [];
-    if (!list.length) {
-      setJobs([]);
-      setExpanded(new Set());
-      lastNewest.current = null;
-      return;
-    }
-    const newest = list[list.length - 1]!.job_id;
-    let openSet = expandedRef.current;
-    if (newest !== lastNewest.current) {
-      // autocollapse all but the newest when a new job appears
-      openSet = new Set([newest]);
-      setExpanded(openSet);
-      lastNewest.current = newest;
-    }
+    // Absent on an older child, which is not the same as "none ran": an empty
+    // list is the honest render either way, and the pane says so itself.
+    const verifyList = data.verify_jobs || [];
     setJobs(list);
+    setVerifyJobs(verifyList);
+    // Autocollapse, per list: a new job opens itself and closes its siblings,
+    // and leaves the other kernel's open row alone. The panes do not share a
+    // reading position, so a verification starting must not collapse the
+    // session job someone is reading.
+    let openSet = expandedRef.current;
+    let changed = false;
+    for (const [key, rows] of [
+      ["session", list],
+      ["verify", verifyList],
+    ] as [Pane, JobSummary[]][]) {
+      const newest = rows.length ? rows[rows.length - 1]!.job_id : null;
+      if (newest === lastNewest.current[key]) continue;
+      lastNewest.current[key] = newest;
+      const mine = new Set(rows.map((j) => j.job_id));
+      openSet = new Set([...openSet].filter((id) => !mine.has(id)));
+      if (newest) openSet.add(newest);
+      changed = true;
+    }
+    if (changed) setExpanded(openSet);
     // Refresh details for open jobs: running ones each poll, others once.
-    for (const j of list) {
+    for (const j of [...list, ...verifyList]) {
       if (!openSet.has(j.job_id)) continue;
       if (j.status === "running" || detailsRef.current[j.job_id] === undefined) {
         fetchDetail(j.job_id);
@@ -368,7 +410,13 @@ export default function ObservePage() {
   // The job holding the kernel, if any. Drives the Run button's disabled state,
   // so a collision is shown *before* the click rather than as a failed action:
   // one job runs at a time, and there is no preemption or queue.
-  const running = jobs?.find((j) => j.status === "running") ?? null;
+  //
+  // A verification counts, even though it runs elsewhere: the one job slot is
+  // held in the session child and spans both kernels, so a console cell
+  // submitted during one is refused.
+  const verifyRunning = verifyJobs.find((j) => j.status === "running") ?? null;
+  const running =
+    (jobs?.find((j) => j.status === "running") ?? null) || verifyRunning;
 
   const runCell = useCallback(
     async (code: string): Promise<string | null> => {
@@ -425,9 +473,13 @@ export default function ObservePage() {
     setJobs([]);
     setDetails({});
     setExpanded(new Set());
-    lastNewest.current = null;
+    lastNewest.current = { session: null, verify: null };
     poll();
   }, [base, poll]);
+
+  // `jobs` is null until the first poll lands; the verification list is not,
+  // because "none" is its ordinary state and is worth saying at once.
+  const rows: JobSummary[] | null = pane === "session" ? jobs : verifyJobs;
 
   return (
     <div className="obs-page">
@@ -444,23 +496,71 @@ export default function ObservePage() {
             how the page told the user nothing was wrong. */}
         {ended ? null : (
           <>
-            {workflow ? (
+            {/* The pane governs what the header offers, rather than the header
+                offering both kernels' actions at once and leaving the reader to
+                work out which kernel each one means. */}
+            <div
+              className="pane-toggle"
+              role="tablist"
+              aria-label="Which kernel to show"
+            >
+              <button
+                role="tab"
+                aria-selected={pane === "session"}
+                className={pane === "session" ? "on" : ""}
+                onClick={() => setPane("session")}
+              >
+                Session
+              </button>
+              <button
+                role="tab"
+                aria-selected={pane === "verify"}
+                className={pane === "verify" ? "on" : ""}
+                onClick={() => setPane("verify")}
+                title="Workflow verifications, each in its own scratch kernel"
+              >
+                Verification
+                {/* The one thing the session pane can no longer say for itself:
+                    that the kernel is busy with something on the other side. */}
+                {verifyRunning ? <span className="live" aria-label="running" /> : null}
+              </button>
+            </div>
+            {pane === "verify" ? (
               <button
                 className="primary"
-                title={`${workflow.title || "Verified workflow"} — ${
-                  workflow.cells
-                } cell(s), verified in a scratch namespace`}
+                disabled={!workflow}
+                title={
+                  workflow
+                    ? `${workflow.title || "Verified workflow"} — ${
+                        workflow.cells
+                      } cell(s). Save a copy where you want it.`
+                    : verifyRunning
+                      ? "The verification is still running"
+                      : verifyJobs.length
+                        ? "The last verification did not pass — there is no workflow to save"
+                        : "Nothing has been verified in this session yet"
+                }
                 onClick={() => saveNotebook("workflow")}
               >
-                ⤓ Save workflow
+                ⤓ Download
+              </button>
+            ) : (
+              <button
+                className="primary"
+                title="Every cell this session ran, in order, as an audit trail"
+                onClick={() => saveNotebook("audit")}
+              >
+                ⤓ Save notebook
+              </button>
+            )}
+            {/* Session-side only. It destroys the user's variables and layers,
+                and on a pane about throwaway kernels it would read as the
+                harmless thing it is not. */}
+            {pane === "session" ? (
+              <button className="danger" onClick={restart}>
+                Restart kernel
               </button>
             ) : null}
-            <button className="primary" onClick={() => saveNotebook("audit")}>
-              ⤓ Save notebook
-            </button>
-            <button className="danger" onClick={restart}>
-              Restart kernel
-            </button>
           </>
         )}
       </header>
@@ -515,19 +615,43 @@ export default function ObservePage() {
           />
         ) : null}
         <div className="work">
-          {showConsole ? (
+          {showConsole && pane === "session" ? (
             <ConsolePanel running={running} onRun={runCell} />
           ) : null}
+          {pane === "verify" ? (
+            <div className="pane-note">
+              The last verification. It ran in its own scratch kernel — a
+              headless one built for the run and thrown away after it — so
+              nothing here touched your variables, layers or viewer.
+              {/* The document is already written; the button is for putting a
+                  copy where you want it, and on a remote session it is the
+                  only way to get the file at all. */}
+              {workflow?.saved_path ? (
+                <div className="saved">
+                  Saved{" "}
+                  <code>
+                    {controlLocal
+                      ? workflow.saved_path
+                      : baseName(workflow.saved_path)}
+                  </code>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <div id="jobs">
-            {jobs == null ? (
+            {rows == null ? (
               // Never fetched anything, and on an ended session never will:
               // "loading…" for ever is the same lie in miniature.
               ended ? null : <div className="empty">loading…</div>
-            ) : jobs.length === 0 ? (
-              <div className="empty">no jobs yet</div>
+            ) : rows.length === 0 ? (
+              <div className="empty">
+                {pane === "session"
+                  ? "no jobs yet"
+                  : "nothing verified in this session yet"}
+              </div>
             ) : (
               // newest-first
-              [...jobs].reverse().map((j) => (
+              [...rows].reverse().map((j) => (
                 <JobRow
                   key={j.job_id}
                   job={j}
@@ -678,6 +802,11 @@ export function JobRow({
         ) : (
           <span className="preview">{job.code_preview || ""}</span>
         )}
+        {/* A verification's size is a fact about the run, not about its code,
+            so it sits with the elapsed time rather than displacing the title. */}
+        {job.verify && job.intent_preview ? (
+          <span className="preview">{job.code_preview || ""}</span>
+        ) : null}
         <span className="elapsed">{job.elapsed}s</span>
         {job.status === "running" ? (
           // The whole row toggles the detail, so this has to keep its click:
@@ -746,6 +875,19 @@ const OBS_CSS = `
   .obs-page button.primary { background: #1d6b3f; border-color: #2a5; color: #eafff0;
                    font-weight: 600; margin-right: 6px; }
   .obs-page button.primary:hover { background: #25804b; }
+  .obs-page button.primary:disabled { opacity: .5; cursor: default; background: #1d6b3f; }
+  .obs-page .pane-toggle { display: flex; margin-right: 12px; }
+  .obs-page .pane-toggle button { border-radius: 0; display: flex; align-items: center;
+           gap: 6px; color: #999; }
+  .obs-page .pane-toggle button:first-child { border-radius: 4px 0 0 4px; }
+  .obs-page .pane-toggle button:last-child { border-radius: 0 4px 4px 0; border-left: none; }
+  .obs-page .pane-toggle button.on { background: #333; color: #eee; }
+  .obs-page .pane-toggle .live { width: 7px; height: 7px; border-radius: 50%;
+           background: #4c9; animation: obs-pulse 1.4s ease-in-out infinite; }
+  @keyframes obs-pulse { 50% { opacity: .25; } }
+  .obs-page .pane-note { color: #8a8a8a; font-size: 12px; padding: 8px 4px 12px; }
+  .obs-page .pane-note .saved { margin-top: 6px; color: #9c9; }
+  .obs-page .pane-note code { color: #bcb; word-break: break-all; }
   .obs-page main { padding: 12px 16px; }
   /* The thread beside the jobs it drives: a chat cell shows up in that list,
      and its live stdout is what stands in for the thread's missing stream. */
