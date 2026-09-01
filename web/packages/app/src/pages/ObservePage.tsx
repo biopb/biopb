@@ -29,6 +29,15 @@ import { withBase } from "../base";
  * a chat cell the moment there were three. One mapping, so a fourth writer
  * shows its own name rather than someone else's.
  */
+/** The last segment of a path the child sent, POSIX or Windows.
+ *
+ * What a remote viewer is shown: the server's directory layout is not theirs
+ * and means nothing to them, so the name is the whole of the useful part. */
+function baseName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
 function writerName(origin?: string): string {
   if (origin === "user") return "you";
   if (origin === "chat") return "chat";
@@ -61,6 +70,11 @@ interface WorkflowSummary {
   title?: string;
   cells: number;
   created?: number;
+  /** Where the child spooled it. Every run that passes is written, so the
+   * document survives a later attempt that fails — what that takes away is the
+   * download offer, not the file. Null if the write failed, which does not
+   * make the verification any less passed. */
+  saved_path?: string | null;
 }
 /** Which document to download. Not a flag inside one: the audit export is every
  * job that ran, the workflow export is the verified program someone rewrote
@@ -519,7 +533,7 @@ export default function ObservePage() {
                   workflow
                     ? `${workflow.title || "Verified workflow"} — ${
                         workflow.cells
-                      } cell(s), every one of them proved by running it`
+                      } cell(s). Save a copy where you want it.`
                     : verifyRunning
                       ? "The verification is still running"
                       : verifyJobs.length
@@ -528,7 +542,7 @@ export default function ObservePage() {
                 }
                 onClick={() => saveNotebook("workflow")}
               >
-                ⤓ Save workflow
+                ⤓ Download
               </button>
             ) : (
               <button
@@ -609,6 +623,19 @@ export default function ObservePage() {
               The last verification. It ran in its own scratch kernel — a
               headless one built for the run and thrown away after it — so
               nothing here touched your variables, layers or viewer.
+              {/* The document is already written; the button is for putting a
+                  copy where you want it, and on a remote session it is the
+                  only way to get the file at all. */}
+              {workflow?.saved_path ? (
+                <div className="saved">
+                  Saved{" "}
+                  <code>
+                    {controlLocal
+                      ? workflow.saved_path
+                      : baseName(workflow.saved_path)}
+                  </code>
+                </div>
+              ) : null}
             </div>
           ) : null}
           <div id="jobs">
@@ -859,6 +886,8 @@ const OBS_CSS = `
            background: #4c9; animation: obs-pulse 1.4s ease-in-out infinite; }
   @keyframes obs-pulse { 50% { opacity: .25; } }
   .obs-page .pane-note { color: #8a8a8a; font-size: 12px; padding: 8px 4px 12px; }
+  .obs-page .pane-note .saved { margin-top: 6px; color: #9c9; }
+  .obs-page .pane-note code { color: #bcb; word-break: break-all; }
   .obs-page main { padding: 12px 16px; }
   /* The thread beside the jobs it drives: a chat cell shows up in that list,
      and its live stdout is what stands in for the thread's missing stream. */

@@ -399,6 +399,7 @@ def _verify_snapshot(status="ok", record=None, **kw):
         "intent": "verify workflow",
         "title": "Count foci per cell",
         "cell_count": 1,
+        "saved_path": "/state/biopb/mcp/workflows/biopb-count-foci-20260101-000000.ipynb",
     }
     snap.update(kw)
     snap["verify"] = (
@@ -475,8 +476,10 @@ class TestVerifyWorkflow:
         assert "Verified" in result
         # The claim the process model earns, and the old namespace one could not.
         assert "scratch kernel" in result and "discarded" in result
-        # The agent must hand the save to the user, not write a file itself.
-        assert "Save workflow" in result
+        # Already written, so the agent's job is to say where -- not to offer
+        # to write a file it would only duplicate.
+        assert "biopb-count-foci-20260101-000000.ipynb" in result
+        assert "do not write the file yourself" in result
 
     def test_a_failure_names_the_cell_and_quotes_its_traceback(
         self, server_with_host, monkeypatch
@@ -1709,7 +1712,8 @@ class TestPollJobRendersAVerification:
         )
         result = _tool(_server.poll_job, "job-1")
         assert "job-1: ok" in result
-        assert "Verified" in result and "Save workflow" in result
+        assert "Verified" in result
+        assert "biopb-count-foci-20260101-000000.ipynb" in result
 
     def test_a_running_verification_still_shows_partial_output(self, server_with_host):
         snap = _verify_snapshot()

@@ -30,11 +30,12 @@ the workflow download follows it: the answer is "this run passed, just now", not
 "some run passed at some point in a kernel that has since been restarted".
 """
 
+import json
 import logging
 import threading
 import time
 
-from . import _kernel_rpc
+from . import _kernel_rpc, _notebook
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +63,19 @@ _seq = 0
 
 # There is no slot for "the last run that passed". The page shows the last run
 # and the download follows it, so a second attempt that fails leaves nothing to
-# save until it is re-run. That is the honest reading of one visible run: an
+# offer until it is re-run. That is the honest reading of one visible run: an
 # offer to download a document the reader cannot see, described by a row that
 # says `error`, is the confusing half of keeping the older one.
+#
+# The document itself is not lost, though -- see :func:`_spool`. What a later
+# failure takes away is the *offer*, not the file.
+
+#: How many spooled workflow notebooks to keep. Every run that passes is
+#: written, because this process cannot know which passing run has the right
+#: numbers -- only that every cell ran -- so the choice is deferred to whoever
+#: reads them. They are a few kilobytes each and verifications are rare, so the
+#: cap is generous; it exists so a long-lived session cannot fill a disk.
+_SPOOL_KEEP = 50
 
 #: How long an interrupt waits for the cells to stop before taking the process.
 #:
@@ -115,6 +126,7 @@ def _snapshot(run):
         "intent": run["intent"],
         "title": run["title"],
         "cell_count": len(run["cells"]),
+        "saved_path": run["saved_path"],
     }
 
 
@@ -225,7 +237,11 @@ def verified():
     with _lock:
         if _run is None or _run["status"] != "ok" or _run["record"] is None:
             return None
-        return {**_run["record"], "job_id": _run["job_id"]}
+        return {
+            **_run["record"],
+            "job_id": _run["job_id"],
+            "saved_path": _run["saved_path"],
+        }
 
 
 def verified_summary():
@@ -242,6 +258,7 @@ def verified_summary():
         "title": record.get("title", ""),
         "cells": len(record.get("cells") or []),
         "created": record.get("created"),
+        "saved_path": record.get("saved_path"),
     }
 
 
@@ -312,6 +329,7 @@ def start(cells, title, session_host, intent="", writer=None, writer_label=""):
             "writer": writer,
             "writer_label": writer_label,
             "discarded": False,
+            "saved_path": None,
         }
         run = _run
 
@@ -326,6 +344,16 @@ def _finish(run, status, error=None):
     with _lock:
         if run["status"] != "running":
             return  # already discarded; the first verdict stands
+    # Written *before* the verdict is published, and outside the lock (which is
+    # held only to take, read and release -- see where it is declared). The
+    # order matters: the status is what every reader waits on, so spooling
+    # after it would let a caller see a passed run whose document does not
+    # exist yet, and report `saved_path: None` for a run that has one.
+    if status == "ok" and run["record"] is not None:
+        _spool(run)
+    with _lock:
+        if run["status"] != "running":
+            return  # discarded while the document was being written
         run["status"] = status
         run["finished"] = time.monotonic()
         if error:
@@ -334,6 +362,55 @@ def _finish(run, status, error=None):
         # download is offered for is a whole run, and a document is not a
         # partial one -- half a workflow that stops at a NameError is a report,
         # which the record already is.
+
+
+def _spool(run):
+    """Write the workflow this run proved into the spool. Never raises.
+
+    The document outlives the page's offer of it. A later attempt that fails
+    takes the download away -- deliberately, because the page shows one run --
+    but the file it wrote is still there, which is what makes that a UI decision
+    rather than data loss.
+
+    Best-effort by construction: a verification that passed and could not be
+    written is still a verification that passed, and reporting a disk error as a
+    failed workflow would be a lie about the user's code.
+    """
+    from .._config import get_workflow_dir
+
+    try:
+        path = get_workflow_dir() / _notebook.suggested_workflow_filename(run["title"])
+        nb = _notebook.build_workflow_notebook(run["record"])
+        path.write_text(json.dumps(nb, indent=1), encoding="utf-8")
+    except Exception:  # noqa: BLE001 - the verification stands either way
+        logger.exception("Could not spool the verified workflow")
+        return
+    with _lock:
+        run["saved_path"] = str(path)
+    _prune_spool()
+
+
+def _prune_spool():
+    """Keep only the newest :data:`_SPOOL_KEEP` spooled notebooks; best-effort.
+
+    Run after the current one is written, so the newest always survives -- the
+    same shape as ``_shim._prune_session_logs``, for the same reason.
+    """
+    from .._config import get_workflow_dir
+
+    try:
+        spooled = sorted(
+            get_workflow_dir().glob("*.ipynb"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for old in spooled[_SPOOL_KEEP:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 def _execute(run):

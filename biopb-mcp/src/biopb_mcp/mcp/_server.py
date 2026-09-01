@@ -386,7 +386,7 @@ async def _await_job(host, job_id, window_alive=None, budget=None, snap=None):
     return snap, res, window_alive
 
 
-def _format_verification(record: dict, job_id: str) -> str:
+def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
     """The verification report: the verdict, then the per-cell ledger.
 
     Written for an agent about to decide between "save it" and "fix cell 4",
@@ -431,10 +431,20 @@ def _format_verification(record: dict, job_id: str) -> str:
             break
 
     if status == "ok":
+        # Already on disk: every run that passes is spooled, because this
+        # process cannot know which passing run has the right *numbers* -- only
+        # that every cell ran. So the agent's job is to say where it went, not
+        # to write it.
         lines.append(
-            "\nThe user can now save this workflow as a notebook from the "
-            "observe page ('Save workflow'). Tell them it is there; do not write "
-            "the file yourself."
+            f"\nSaved as a notebook: {saved_path}"
+            if saved_path
+            else "\nThe notebook could not be written to disk (see the server "
+            "log); the user can still download it from the observe page."
+        )
+        lines.append(
+            "The user can download a copy where they want it from the observe "
+            "page (Verification -> Download). Tell them where it is; do not "
+            "write the file yourself."
         )
     else:
         lines.append(
@@ -458,7 +468,9 @@ def _format_job_status(snap: dict) -> str:
     header = f"{job_id}: {status} ({snap.get('elapsed', '?')}s)"
     record = snap.get("verify")
     if record and status != "running":
-        return header + "\n" + _format_verification(record, job_id)
+        return (
+            header + "\n" + _format_verification(record, job_id, snap.get("saved_path"))
+        )
     body = _kernel_rpc._format_execute_result(snap)
     if status == "running":
         return header + "\nPartial output:\n" + (body or "(none yet)")
@@ -739,8 +751,9 @@ async def verify_workflow(
 
     Use this when the user wants a workflow they have just proven kept as a
     document. Rewrite the session into a clean program — one entry in *cells*
-    per notebook cell — and verify it here; on success the user can save it as a
-    notebook from the observe page.
+    per notebook cell — and verify it here; on success the notebook is written
+    to disk for them and this tool reports where. Tell them the path; do not
+    write the file yourself.
 
     **Rewrite it, do not select from it.** The program that works is almost
     never a subsequence of what was run: a cell that created a variable and a
@@ -831,7 +844,7 @@ async def verify_workflow(
             + (snap.get("error_text") or "the scratch kernel produced no record.")
             + foreign_note
         )
-    return _format_verification(record, job_id) + foreign_note
+    return _format_verification(record, job_id, snap.get("saved_path")) + foreign_note
 
 
 async def _await_verification(job_id, budget=None):

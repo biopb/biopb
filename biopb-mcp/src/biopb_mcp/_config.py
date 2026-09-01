@@ -707,6 +707,21 @@ def get_log_dir() -> Path:
     return _locations.mcp_log_dir()
 
 
+def get_workflow_dir() -> Path:
+    """Directory for spooled workflow notebooks (``<log dir>/workflows``).
+
+    Every verification that passes is written here, because the child cannot
+    know which passing run has the *right* numbers -- only that every cell ran.
+    State rather than data: this is a spool the session fills on its own, and
+    the copy a person keeps is the one they download or ask an agent to place.
+    Retention (:data:`biopb_mcp.mcp._scratch._SPOOL_KEEP`) prunes it to the
+    newest N, as the per-session logs beside it are pruned.
+    """
+    d = get_log_dir() / "workflows"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def get_session_log_dir() -> Path:
     """Directory for per-session stdio-shim logs (``<log dir>/sessions``).
 
