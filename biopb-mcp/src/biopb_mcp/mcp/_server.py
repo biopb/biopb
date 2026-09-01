@@ -355,23 +355,26 @@ def _submit_job(host, code, digest, busy_message, **kwargs):
     return submitted["job_id"], None, False, window_alive
 
 
-async def _await_job(host, job_id, window_alive=None):
-    """Poll *job_id* until it is terminal or the promote window runs out.
+async def _await_job(host, job_id, window_alive=None, budget=None, snap=None):
+    """Poll *job_id* until it is terminal or *budget* seconds run out.
 
-    Returns ``(snap, res, window_alive)``. *snap* is None when a poll round trip
-    failed, and *res* is the raw kernel reply to report instead. Otherwise a
-    ``status`` of ``running`` means the window expired and the caller hands back
-    a job handle rather than a result.
+    *budget* defaults to the promote window, which is what a submitting tool
+    waits; ``poll_job`` passes its own. Returns ``(snap, res, window_alive)``.
+    *snap* is None when a poll round trip failed, and *res* is the raw kernel
+    reply to report instead. Otherwise a ``status`` of ``running`` means the
+    budget expired and the caller hands back a job handle rather than a result.
 
-    *window_alive* seeds the flag with the submit round trip's, so a promote
-    window short enough to poll zero times still reports a closed viewer.
+    *window_alive* seeds the flag with the submit round trip's, and *snap* the
+    snapshot, so a budget short enough to poll zero times still reports a closed
+    viewer and still answers with whatever its caller already knew. A submitting
+    tool has no snapshot yet and passes none, which reads as "running".
 
-    The wait is a loop sleep and each probe is a thread hop, so the promote
-    window costs this process nothing: for the ten seconds it runs, the loop is
-    free to serve the observe page and any other client.
+    The wait is a loop sleep and each probe is a thread hop, so waiting costs
+    this process nothing: for however long it runs, the loop is free to serve
+    the observe page and any other client.
     """
-    deadline = time.monotonic() + _app._promote_after
-    snap, res = {"status": "running"}, None
+    deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
+    snap, res = ({"status": "running"} if snap is None else snap), None
     while time.monotonic() < deadline:
         await asyncio.sleep(0.4)
         snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
@@ -808,13 +811,45 @@ async def verify_workflow(
     )
 
 
+#: How long ``poll_job`` waits for a running job when the caller says nothing,
+#: and the most it will wait when the caller asks for more.
+#:
+#: Defaulted rather than opt-in because the caller this exists for will not pass
+#: it: an agent loop has no innate sense of time, and one that would think to
+#: raise `wait` is not the one spinning. A ceiling because the wait holds an MCP
+#: request open, and a client that gives up on it turns a saving into a retry.
+_POLL_WAIT_DEFAULT = 10.0
+_POLL_WAIT_MAX = 30.0
+
+_WAIT_DESC = (
+    "Seconds to wait for a *running* job before answering. The call returns "
+    "the moment the job finishes, so this is a ceiling and not a delay -- a job "
+    "that ends in 2s answers in 2s. Leave it alone unless you have a reason: "
+    f"the default ({_POLL_WAIT_DEFAULT:.0f}s) is there so watching a job costs "
+    f"a handful of calls instead of hundreds. Raise it (up to "
+    f"{_POLL_WAIT_MAX:.0f}s) when you have nothing to do until the job ends; "
+    "set it to 0 only when you want a snapshot right now and will not "
+    "immediately ask again."
+)
+
+
 @mcp.tool()
-async def poll_job(job_id: str) -> str:
+async def poll_job(
+    job_id: str,
+    wait: Annotated[float, Field(description=_WAIT_DESC, ge=0)] = _POLL_WAIT_DEFAULT,
+) -> str:
     """Get the status and output of a job started by execute_code.
 
     Returns the job's status (running/ok/error/interrupted), elapsed time, and
     output so far (full output once terminal). Job records persist until the
     kernel is restarted (older terminal jobs are eventually evicted).
+
+    **This call already waits, so do not poll it in a loop.** A running job is
+    watched here for up to `wait` seconds and answered the instant it ends;
+    calling again immediately just asks the same question sooner and buys
+    nothing. If you have nothing else to do until the job finishes, raise
+    `wait` rather than calling more often. A terminal job, an unknown job id
+    and a dead kernel all answer immediately whatever `wait` says.
     """
     host, err = _app._require_kernel_host()
     if err is not None:
@@ -822,6 +857,13 @@ async def poll_job(job_id: str) -> str:
 
     foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
     snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
+    if snap is not None and snap.get("status") == "running" and wait > 0:
+        # Probe first, wait second: a job that is already terminal -- the common
+        # case for a caller that has been polling -- answers with no delay, and
+        # only a genuinely running one costs the wait.
+        snap, res, window_alive = await _await_job(
+            host, job_id, window_alive, budget=min(wait, _POLL_WAIT_MAX), snap=snap
+        )
     if snap is None:
         return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") == "unknown":

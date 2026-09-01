@@ -705,7 +705,8 @@ class TestJobTools:
                 **_snapshot(status="running", stdout="step 1\n", elapsed=2.5)
             ),
         )
-        result = _tool(_server.poll_job, "job-1")
+        # wait=0: this is about how a running job renders, not about waiting.
+        result = _tool(_server.poll_job, "job-1", wait=0)
         assert "job-1: running" in result
         assert "step 1" in result
 
@@ -734,7 +735,8 @@ class TestJobTools:
                 window_alive=False, **_snapshot(status="running", stdout="step\n")
             ),
         )
-        result = _tool(_server.poll_job, "job-1")
+        # wait=0: this is about how a running job renders, not about waiting.
+        result = _tool(_server.poll_job, "job-1", wait=0)
         assert "viewer window is closed" not in result
 
     def test_job_tools_no_host(self):
@@ -1637,7 +1639,8 @@ class TestPollJobRendersAVerification:
         snap["status"] = "running"
         snap["stdout"] = "one\n"
         _install_replies(server_with_host, returns=_job_reply(**snap))
-        result = _tool(_server.poll_job, "job-1")
+        # wait=0: this is about how a running job renders, not about waiting.
+        result = _tool(_server.poll_job, "job-1", wait=0)
         assert "Partial output" in result and "one" in result
 
     def test_an_ordinary_job_is_unaffected(self, server_with_host):
@@ -1797,3 +1800,112 @@ class TestRestartAndTheClaimAreOneStep:
         finally:
             _writers._local_identity.set(None)
         server_with_host.restart.assert_not_called()
+
+
+class TestPollJobWaits:
+    """`poll_job` waits for a running job rather than answering "still running"
+    to a caller that will immediately ask again.
+
+    The caller this is for is an agent loop, which has no innate sense of time:
+    left to itself it polls a four-minute job hundreds of times. So the wait is
+    on by default, bounded, and short-circuits the moment the job ends.
+    """
+
+    @staticmethod
+    def _polls(host):
+        """How many `_jobs.poll(...)` round trips the kernel has been sent."""
+        return sum(
+            1 for call in host.execute.call_args_list if "_jobs.poll(" in call.args[0]
+        )
+
+    def test_a_terminal_job_answers_immediately(self, server_with_host):
+        _install_replies(server_with_host, returns=_job_reply(**_snapshot(status="ok")))
+        started = time.monotonic()
+        assert "job-1: ok" in _tool(_server.poll_job, "job-1")
+        # Probe first, wait second: a finished job costs one round trip and no
+        # wall clock, however large `wait` is.
+        assert time.monotonic() - started < 1.0
+        assert self._polls(server_with_host) == 1
+
+    def test_an_unknown_job_answers_immediately(self, server_with_host):
+        _install_replies(
+            server_with_host, returns=_job_reply(**_snapshot(status="unknown"))
+        )
+        started = time.monotonic()
+        assert "No such job" in _tool(_server.poll_job, "job-9", wait=30)
+        assert time.monotonic() - started < 1.0
+        assert self._polls(server_with_host) == 1
+
+    def test_wait_zero_is_the_old_one_shot_behaviour(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(**_snapshot(status="running", stdout="a\n")),
+        )
+        result = _tool(_server.poll_job, "job-1", wait=0)
+        assert "job-1: running" in result and "a" in result
+        assert self._polls(server_with_host) == 1
+
+    def test_a_running_job_is_waited_on_and_answered_when_it_ends(
+        self, server_with_host
+    ):
+        # Running for two polls, then done: the call must come back on the third
+        # rather than burn the rest of its budget.
+        _install_replies(
+            server_with_host,
+            queue=[
+                _job_reply(**_snapshot(status="running")),
+                _job_reply(**_snapshot(status="running")),
+                _job_reply(**_snapshot(status="ok", stdout="done\n")),
+            ],
+            returns=_job_reply(**_snapshot(status="ok", stdout="done\n")),
+        )
+        started = time.monotonic()
+        result = _tool(_server.poll_job, "job-1", wait=30)
+        elapsed = time.monotonic() - started
+        assert "job-1: ok" in result and "done" in result
+        assert elapsed < 5.0, f"waited past the job's end ({elapsed:.1f}s)"
+        assert self._polls(server_with_host) == 3
+
+    def test_the_wait_is_bounded_for_a_job_that_keeps_running(self, server_with_host):
+        _install_replies(
+            server_with_host,
+            returns=_job_reply(**_snapshot(status="running", stdout="a\n")),
+        )
+        started = time.monotonic()
+        result = _tool(_server.poll_job, "job-1", wait=1.0)
+        elapsed = time.monotonic() - started
+        assert "job-1: running" in result
+        assert 0.8 < elapsed < 3.0, f"wait was not ~1s ({elapsed:.1f}s)"
+
+    def test_wait_is_capped(self, server_with_host, monkeypatch):
+        """A caller asking for an hour gets the ceiling, not an hour: the wait
+        holds an MCP request open, and a client that gives up turns the saving
+        into a retry."""
+        budgets = []
+
+        async def record(host, job_id, window_alive=None, budget=None, snap=None):
+            budgets.append(budget)
+            return snap, None, window_alive
+
+        monkeypatch.setattr(_server, "_await_job", record)
+        _install_replies(
+            server_with_host, returns=_job_reply(**_snapshot(status="running"))
+        )
+        _tool(_server.poll_job, "job-1", wait=3600)
+        assert budgets == [_server._POLL_WAIT_MAX]
+
+    def test_the_default_waits(self, server_with_host):
+        """The point of the change: a caller that says nothing still waits."""
+        import inspect
+
+        sig = inspect.signature(_server.poll_job)
+        assert sig.parameters["wait"].default == _server._POLL_WAIT_DEFAULT
+        assert _server._POLL_WAIT_DEFAULT > 0
+
+    def test_the_schema_tells_the_model_what_wait_is_for(self):
+        tool = next(
+            t for t in _app.mcp._tool_manager.list_tools() if t.name == "poll_job"
+        )
+        desc = tool.parameters["properties"]["wait"]["description"]
+        assert "ceiling" in desc and "0" in desc
+        assert "do not poll it in a loop" in tool.description
