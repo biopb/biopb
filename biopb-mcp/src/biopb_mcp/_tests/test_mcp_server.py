@@ -366,8 +366,8 @@ class TestInstructions:
 # -----------------------------------------------------------------------
 
 
-def _verify_snapshot(status="ok", cells=None, added_layers=(), **kw):
-    """A job snapshot carrying a verification record, as the kernel returns it."""
+def _verify_record(status="ok", cells=None, title="Count foci per cell"):
+    """A verification record, as the scratch kernel produces it."""
     cells = cells or [
         {
             "code": "a = 2",
@@ -378,21 +378,56 @@ def _verify_snapshot(status="ok", cells=None, added_layers=(), **kw):
             "elapsed": 0.1,
         }
     ]
-    snap = _snapshot(status="ok" if status == "ok" else "error", **kw)
-    snap["verify"] = {
-        "title": "Count foci per cell",
+    return {
+        "title": title,
         "created": 1_700_000_000.0,
         "status": status,
-        "added_layers": list(added_layers),
         "cells": cells,
     }
+
+
+def _verify_snapshot(status="ok", record=None, **kw):
+    """A run snapshot in the shape ``_scratch`` hands to the tool surface."""
+    snap = {
+        "job_id": "verify-1",
+        "status": status,
+        "elapsed": 0.4,
+        "stdout": "",
+        "error_text": "",
+        "result_text": "",
+        "origin": "mcp",
+        "intent": "verify workflow",
+        "title": "Count foci per cell",
+        "cell_count": 1,
+    }
+    snap.update(kw)
+    snap["verify"] = (
+        None
+        if status == "running" and record is None
+        else record or _verify_record(status)
+    )
     return snap
 
 
 class TestVerifyWorkflow:
+    """The tool's own surface: what it hands the agent back.
+
+    The scratch kernel itself is ``test_mcp_scratch.py``; here ``_scratch`` is
+    stubbed at the module boundary so these stay about the report.
+    """
+
     @pytest.fixture(autouse=True)
     def _fast_sleep(self, monkeypatch):
         monkeypatch.setattr(_server.asyncio, "sleep", _no_sleep)
+
+    @staticmethod
+    def _stub(monkeypatch, snap, started=None):
+        monkeypatch.setattr(
+            _server._scratch,
+            "start",
+            lambda *a, **k: started or {"job_id": "verify-1"},
+        )
+        monkeypatch.setattr(_server._scratch, "poll", lambda job_id: snap)
 
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
@@ -402,36 +437,50 @@ class TestVerifyWorkflow:
         assert "at least one cell" in _tool(_server.verify_workflow, [])
         assert not server_with_host.execute.called
 
-    def test_cells_and_title_ride_the_submit_snippet(self, server_with_host):
-        # The runner is in the kernel, so the record only exists if both are
-        # marshaled into the snippet -- repr'd, like the code execute_code sends.
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-1", status="running")
+    def test_the_cells_and_title_reach_the_scratch_kernel(
+        self, server_with_host, monkeypatch
+    ):
+        seen = {}
+        monkeypatch.setattr(
+            _server._scratch,
+            "start",
+            lambda cells, title, host, intent="", writer=None, label="": (
+                seen.update(
+                    cells=cells, title=title, host=host, writer=writer, label=label
+                )
+                or {"job_id": "verify-1"}
+            ),
         )
-        _app.set_promote_after(0.0)
-        _tool(_server.verify_workflow, ["a = 2", "print(a)"], title="Count foci")
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "verify_cells=['a = 2', 'print(a)']" in snippet
-        assert "verify_title='Count foci'" in snippet
+        monkeypatch.setattr(_server._scratch, "poll", lambda _j: _verify_snapshot())
+        _install_replies(server_with_host)
+        _writers._local_identity.set(("agent-A", "A"))
+        try:
+            _tool(_server.verify_workflow, ["a = 2", "print(a)"], title="Count foci")
+        finally:
+            _writers._local_identity.set(None)
+        assert seen["cells"] == ["a = 2", "print(a)"]
+        assert seen["title"] == "Count foci"
+        assert seen["host"] is server_with_host
+        # The run is claimed for the client that asked for it, so the scratch
+        # kernel's own one-agent check can refuse a stranger's interrupt.
+        assert (seen["writer"], seen["label"]) == ("agent-A", "A")
 
-    def test_a_clean_run_reports_the_verdict_and_where_to_save(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            queue=[_job_reply(job_id="job-1", status="running")],
-            returns=_job_reply(**_verify_snapshot()),
-        )
+    def test_a_clean_run_reports_the_verdict_and_where_to_save(
+        self, server_with_host, monkeypatch
+    ):
+        _install_replies(server_with_host)
+        self._stub(monkeypatch, _verify_snapshot())
         _app.set_promote_after(1.0)
         result = _tool(_server.verify_workflow, ["a = 2"], title="Count foci")
         assert "Verified" in result
-        assert "scratch namespace" in result
+        # The claim the process model earns, and the old namespace one could not.
+        assert "scratch kernel" in result and "discarded" in result
         # The agent must hand the save to the user, not write a file itself.
         assert "Save workflow" in result
 
-    def test_a_failure_names_the_cell_and_quotes_its_traceback(self, server_with_host):
+    def test_a_failure_names_the_cell_and_quotes_its_traceback(
+        self, server_with_host, monkeypatch
+    ):
         cells = [
             {
                 "code": "a = 2",
@@ -458,10 +507,10 @@ class TestVerifyWorkflow:
                 "elapsed": 0.0,
             },
         ]
-        _install_replies(
-            server_with_host,
-            queue=[_job_reply(job_id="job-1", status="running")],
-            returns=_job_reply(**_verify_snapshot(status="error", cells=cells)),
+        _install_replies(server_with_host)
+        self._stub(
+            monkeypatch,
+            _verify_snapshot(status="error", record=_verify_record("error", cells)),
         )
         _app.set_promote_after(1.0)
         result = _tool(_server.verify_workflow, [c["code"] for c in cells])
@@ -471,37 +520,63 @@ class TestVerifyWorkflow:
         # The cascade is named as skipped rather than silently absent.
         assert "skipped" in result
 
-    def test_added_layers_are_reported_back(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            queue=[_job_reply(job_id="job-1", status="running")],
-            returns=_job_reply(**_verify_snapshot(added_layers=["foci"])),
+    def test_a_run_that_never_reached_a_cell_reports_why(
+        self, server_with_host, monkeypatch
+    ):
+        # A scratch kernel that dies IS the verdict (an OOM means the workflow
+        # does not fit), so the failure has to say so rather than look like a
+        # broken tool.
+        _install_replies(server_with_host)
+        self._stub(
+            monkeypatch,
+            _verify_snapshot(
+                status="error",
+                record=None,
+                error_text="The scratch kernel failed: killed",
+            )
+            | {"verify": None},
         )
         _app.set_promote_after(1.0)
         result = _tool(_server.verify_workflow, ["a = 2"])
-        assert "foci" in result
-        assert "isolates variables, not the viewer" in result
+        assert "did not run" in result and "killed" in result
 
-    def test_a_kernel_without_the_record_falls_back_to_the_job_result(
-        self, server_with_host
+    def test_a_long_verification_hands_back_a_job_handle(
+        self, server_with_host, monkeypatch
     ):
-        # An older kernel, or a submit that never built one: report the job the
-        # ordinary way rather than invent a verdict.
-        _install_replies(
-            server_with_host,
-            queue=[_job_reply(job_id="job-1", status="running")],
-            returns=_job_reply(**_snapshot(status="ok", stdout="hi\n")),
-        )
-        _app.set_promote_after(1.0)
-        assert "hi" in _tool(_server.verify_workflow, ["a = 2"])
-
-    def test_a_long_verification_hands_back_a_job_handle(self, server_with_host):
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-1", status="running")
-        )
+        _install_replies(server_with_host)
+        self._stub(monkeypatch, _verify_snapshot(status="running"))
         _app.set_promote_after(0.0)
         result = _tool(_server.verify_workflow, ["a = 2"])
-        assert "still running" in result and "poll_job('job-1')" in result
+        assert "still running" in result and "poll_job('verify-1')" in result
+
+    def test_a_busy_session_refuses_rather_than_starting_a_second_kernel(
+        self, server_with_host, monkeypatch
+    ):
+        _install_replies(server_with_host)
+        self._stub(
+            monkeypatch,
+            None,
+            started={
+                "error": "busy",
+                "running_job_id": "job-4",
+                "running_job_origin": "user",
+            },
+        )
+        result = _tool(_server.verify_workflow, ["a = 2"])
+        assert "job-4" in result and "running a cell" in result
+        assert "poll_job('job-4')" in result
+
+    def test_poll_job_routes_a_verification_to_the_scratch_run(
+        self, server_with_host, monkeypatch
+    ):
+        # The session kernel has never heard of verify-1; the id is the routing.
+        _install_replies(server_with_host)
+        monkeypatch.setattr(_server._scratch, "poll", lambda job_id: _verify_snapshot())
+        result = _tool(_server.poll_job, "verify-1", wait=0)
+        assert "verify-1: ok" in result and "Verified" in result
+        assert not any(
+            "_jobs.poll(" in c[0][0] for c in server_with_host.execute.call_args_list
+        )
 
 
 # -----------------------------------------------------------------------
@@ -1629,7 +1704,9 @@ class TestPollJobRendersAVerification:
         monkeypatch.setattr(_server.asyncio, "sleep", _no_sleep)
 
     def test_a_terminal_verification_polls_as_its_report(self, server_with_host):
-        _install_replies(server_with_host, returns=_job_reply(**_verify_snapshot()))
+        _install_replies(
+            server_with_host, returns=_job_reply(**_verify_snapshot(job_id="job-1"))
+        )
         result = _tool(_server.poll_job, "job-1")
         assert "job-1: ok" in result
         assert "Verified" in result and "Save workflow" in result
@@ -1764,11 +1841,13 @@ class TestRestartAndTheClaimAreOneStep:
         restarts in, so nobody can claim the kernel after the gate lets it by."""
         started, release = self._restart_that_waits(server_with_host)
         result = {}
-        restarting = threading.Thread(
-            target=lambda: result.update(
-                refusal=_writers.restart(server_with_host, "agent-A")
+
+        def restart():
+            result["refusal"], result["discarded"] = _writers.restart(
+                server_with_host, "agent-A"
             )
-        )
+
+        restarting = threading.Thread(target=restart)
         restarting.start()
         try:
             assert started.wait(5.0)

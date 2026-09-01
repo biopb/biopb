@@ -31,6 +31,15 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # close_hook (kept in sync by this comment, like _deathwatch.ENV_FD).
 ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 
+# Env var marking a kernel as the scratch one a verification runs in
+# (``_scratch``). The in-kernel bootstrap reads it and leaves out everything
+# user-facing -- above all it builds ``napari.Viewer(show=False)``, so the
+# scratch kernel can take the session's own display, and its real GPU, without a
+# window appearing in front of the user. The literal is mirrored in
+# _bootstrap.is_scratch_kernel (kept in sync by this comment, like
+# ENV_WINDOW_CLOSE_FD above).
+ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
+
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
 # kernel namespace (see _bootstrap, mirrored by this comment) -- and tears the

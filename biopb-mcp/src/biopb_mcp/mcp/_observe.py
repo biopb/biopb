@@ -62,6 +62,7 @@ to ``biopb-control``.
 """
 
 import asyncio
+import functools
 import json
 import logging
 
@@ -70,7 +71,7 @@ from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import _app, _http, _kernel_rpc, _notebook, _writers
+from . import _app, _http, _kernel_rpc, _notebook, _scratch, _writers
 
 logger = logging.getLogger(__name__)
 
@@ -194,12 +195,31 @@ async def _api_jobs(request):
     host, err = _require_host()
     if err is not None:
         return err
-    # jobs_view(), not jobs_summary(): the page redraws from the job list *and*
-    # from whether a verified workflow is available to download, and this poll
-    # runs about once a second for the life of the session.
     result, res, _w = await _kernel_rpc._job_call(host, "jobs_view")
     if result is None:
         return _kernel_error(res)
+    # The workflow, and a running verification, are the session child's to
+    # report: both belong to the scratch kernel, which the session kernel cannot
+    # see. Merged into the same reply because the page redraws from all three
+    # and this poll runs about once a second for the life of the session.
+    result["workflow"] = _scratch.verified_summary()
+    verifying = _scratch.running()
+    if verifying is not None:
+        # One row for the *run*, not one per cell. It is here so the page can
+        # say what the kernel is busy with -- and so a person can interrupt a
+        # verification they did not start, which is otherwise unreachable.
+        result["jobs"] = list(result["jobs"]) + [
+            {
+                "job_id": verifying["job_id"],
+                "status": "running",
+                "origin": "mcp",
+                "elapsed": verifying["elapsed"],
+                "stdout_len": len(verifying["stdout"] or ""),
+                "code_preview": (f"verify workflow ({verifying['cell_count']} cells)"),
+                "intent_preview": verifying["intent"],
+                "verify": True,
+            }
+        ]
     return JSONResponse(result)
 
 
@@ -208,6 +228,17 @@ async def _api_job_detail(request):
     if err is not None:
         return err
     job_id = request.path_params["job_id"]
+    if _scratch.owns(job_id):
+        # A verification runs in a kernel this one has never heard of, so asking
+        # it would 404 the very row _api_jobs put in the list.
+        snap = _scratch.detail(job_id)
+        if snap is None:
+            return JSONResponse({"error": "no such job", "job_id": job_id}, 404)
+        shown, truncated, full_len = _truncate_tail(snap.get("stdout", ""))
+        snap["stdout"] = shown
+        snap["truncated"] = truncated
+        snap["stdout_len"] = full_len
+        return JSONResponse(snap)
     snap, res, win = await _kernel_rpc._job_call(host, "poll", job_id)
     if snap is None:
         return _kernel_error(res)
@@ -238,12 +269,10 @@ async def _api_notebook(request):
     if err is not None:
         return err
     if request.query_params.get("workflow"):
-        record, res, _w = await _kernel_rpc._job_call(host, "verified")
+        # From this process, not the kernel: the run happened in a scratch
+        # kernel that no longer exists.
+        record = _scratch.verified()
         if record is None:
-            # No verified workflow *and* a failed read look the same from here;
-            # the kernel error is the more specific answer, so prefer it.
-            if res.get("status") != "ok":
-                return _kernel_error(res)
             return JSONResponse({"error": "no verified workflow in this session"}, 404)
         nb = _notebook.build_workflow_notebook(record)
         filename = _notebook.suggested_workflow_filename(record.get("title", ""))
@@ -277,6 +306,12 @@ async def _api_interrupt(request):
     host, err = _require_host()
     if err is not None:
         return err
+    # Whichever kernel holds the running job. The slot is global, so "the
+    # running job" is unambiguous -- and a verification the *agent* started is
+    # stoppable from here, which is the point of giving it a row.
+    if _scratch.running() is not None:
+        data = await asyncio.to_thread(_scratch.interrupt, _USER_INTERRUPT_MSG)
+        return JSONResponse(data or {"interrupted": False})
     # Force a KeyboardInterrupt into the running job's worker thread (SIGINT only
     # reaches the kernel main thread, not the job), attributed to the user.
     data, res, _w = await _kernel_rpc._job_call(
@@ -300,11 +335,18 @@ async def _api_restart(request):
     if err is not None:
         return err
     try:
-        # Restart and clear as one critical section (_writers.restart_for_user):
-        # an agent's submit can land between them, and it would lose the claim
-        # it just made on the new kernel. Off the loop because a restart is
-        # seconds of teardown and bring-up, which would take this page with it.
-        await asyncio.to_thread(_writers.restart_for_user, host)
+        # Discard, restart and clear as one critical section
+        # (_writers.restart_for_user): an agent's submit can land between them
+        # and lose the claim it just made on the new kernel, and an in-flight
+        # verification holds the session's one job slot in *this* process, so
+        # leaving it would hand the user a kernel that can accept nothing. Off
+        # the loop because a restart is seconds of teardown and bring-up, which
+        # would otherwise take this page with it.
+        await asyncio.to_thread(
+            _writers.restart_for_user,
+            host,
+            functools.partial(_scratch.discard, "the user restarted the kernel"),
+        )
     except Exception as exc:  # noqa: BLE001 - report restart failure
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     return JSONResponse({"ok": True})
@@ -330,6 +372,20 @@ async def _console_execute(request):
     code = payload.get("code")
     if not isinstance(code, str) or not code.strip():
         return JSONResponse({"error": "missing 'code'"}, status_code=400)
+
+    verifying = _scratch.running()
+    if verifying is not None:
+        # The same one-at-a-time rule, and the row the page points at is in the
+        # list above (_api_jobs adds it) so "wait for it, or interrupt it from
+        # its row" stays true.
+        return JSONResponse(
+            {
+                "error": "busy",
+                "running_job_id": verifying["job_id"],
+                "running_job_origin": "mcp",
+            },
+            status_code=409,
+        )
 
     submitted, res, _w = await _kernel_rpc._job_call(
         host, "submit", code, origin="user"

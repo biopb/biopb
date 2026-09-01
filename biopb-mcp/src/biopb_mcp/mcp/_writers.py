@@ -110,20 +110,36 @@ def claim_holder():
         return _claimed_by
 
 
-def restart(host, writer):
+def restart(host, writer, also_discard=None):
     """Gated restart: replace the kernel and reset the claim, atomically.
 
-    Returns ``None`` once the kernel is back, or the refusal to hand the caller
-    instead. ``host.restart`` failing raises, and leaves the claim alone -- the
-    old kernel may still be there.
+    Returns ``(refusal, discarded)``. *refusal* is ``None`` once the kernel is
+    back, or the message to hand the caller instead; *discarded* is whatever
+    *also_discard* returned, or ``None``. ``host.restart`` failing raises, and
+    leaves the claim alone -- the old kernel may still be there.
 
-    **Blocking, and meant to be called off the event loop.** The three steps are
-    one critical section rather than three statements at a call site: reading
-    the holder, replacing the kernel and clearing the mirror have to be
-    indivisible, or a submit landing between the restart and the clear loses the
-    claim it just made on the new kernel (see :data:`_claim_lock`). Holding the
-    lock for the seconds a restart takes is the point -- a claim on a kernel
-    that is being destroyed is not a claim.
+    **Blocking, and meant to be called off the event loop.** The steps are one
+    critical section rather than several statements at a call site: reading the
+    holder, replacing the kernel and clearing the mirror have to be indivisible,
+    or a submit landing between the restart and the clear loses the claim it just
+    made on the new kernel (see :data:`_claim_lock`). Holding the lock for the
+    seconds a restart takes is the point -- a claim on a kernel that is being
+    destroyed is not a claim.
+
+    *also_discard* is the other thing that dies with this kernel: an in-flight
+    verification, which runs in a second kernel but holds this session's one job
+    slot (``_scratch.discard``). **It runs only once the gate has passed**, which
+    is the whole reason it is a parameter here rather than a line before the
+    call. Refusing a stranger's restart *after* their call has already destroyed
+    the holder's verification is not a refusal -- it hands a client that cannot
+    take the session the power to wreck it, which is precisely what the gate
+    exists to prevent.
+
+    It runs *before* ``host.restart()`` rather than after, because until the slot
+    is released the freshly restarted kernel can accept nothing. A restart that
+    then fails has discarded the verification for nothing; the session is in a
+    bad state either way, and leaving the slot held would be the worse of the
+    two.
 
     Deliberately reads the mirror rather than asking the kernel who holds it:
     that is a check-then-act race *and* fail-open on a busy kernel. See
@@ -132,23 +148,28 @@ def restart(host, writer):
     with _claim_lock:
         held = _claimed_by
         if held is not None and writer is not None and writer != held:
-            return _NOT_OWNER_MSG.format(held_by="")
+            return _NOT_OWNER_MSG.format(held_by=""), None
+        discarded = also_discard() if also_discard is not None else None
         host.restart()
         clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
-        return None
+        return None, discarded
 
 
-def restart_for_user(host):
+def restart_for_user(host, also_discard=None):
     """Ungated restart, for the person at the machine.
 
     Never gated on the one-agent claim, which makes it the recovery path for a
     session held by a client that is gone: an agent cannot take a kernel from
     another agent, but the user can always replace it. Same critical section as
-    :func:`restart`, and blocking for the same reason.
+    :func:`restart`, and blocking for the same reason. There is no gate for
+    *also_discard* to be ordered against here, but it stays inside the lock so a
+    claim cannot land between the discard and the clear.
     """
     with _claim_lock:
+        discarded = also_discard() if also_discard is not None else None
         host.restart()
         clear_claim()
+        return discarded
 
 
 # Refusal for a client that does not hold this kernel's one-agent claim

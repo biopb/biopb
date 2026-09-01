@@ -111,18 +111,11 @@ _lock = threading.RLock()
 _owner = None
 _owner_label = ""
 
-# The namespace's key set as the bootstrap left it -- the seed for a scratch run
-# (:func:`_scratch_ns`). Recorded by :func:`mark_baseline` at the end of the
-# bootstrap, so it names the built-in handles and the loaded plugins and nothing
-# the session has bound since.
-_baseline_names = None
-
-# What the bootstrap binds into the kernel namespace. Two readers need exactly
-# this list -- a scratch run seeds from it (below), and `_bootstrap` refuses to
-# let a user plugin shadow any of it (#92) -- so it is named once here rather
-# than written out in both. `_bootstrap` is the one that binds them, but `_jobs`
-# is the module it already imports, and a set defined in the importer would make
-# the dependency point the wrong way.
+# What the bootstrap binds into the kernel namespace. `_bootstrap` refuses to
+# let a user plugin shadow any of it (#92), and names it from here rather than
+# writing the list out twice. `_bootstrap` is the one that binds them, but
+# `_jobs` is the module it already imports, and a set defined in the importer
+# would make the dependency point the wrong way.
 KERNEL_HANDLE_NAMES = frozenset(
     {
         "viewer",
@@ -139,22 +132,6 @@ KERNEL_HANDLE_NAMES = frozenset(
         "_resync_view",
     }
 )
-
-# Names a scratch namespace falls back to when no baseline was recorded: a
-# partial bootstrap, or a unit test driving this runner directly. A floor under
-# mark_baseline(), not a substitute -- it knows the built-in handles and cannot
-# know a plugin's.
-_SCRATCH_FALLBACK_NAMES = KERNEL_HANDLE_NAMES | {
-    "get_ipython",
-    "__name__",
-    "__builtins__",
-}
-
-# The last verification whose every cell ran (see :func:`verified`). Module
-# state rather than a job field because it outlives the job that produced it:
-# it is the session's answer to "which program is known to work", and a later
-# failed run does not un-verify it.
-_verified = None
 
 
 def _dropped_marker(n):
@@ -434,15 +411,11 @@ class _Verification:
     text, and what makes them trustworthy is that they ran.
     """
 
-    __slots__ = ("title", "cells", "added_layers", "created")
+    __slots__ = ("title", "cells", "created")
 
     def __init__(self, title, cells, job):
         self.title = title
         self.cells = [_Cell(code, job) for code in cells]
-        # Layers this run put in the *live* viewer. A scratch namespace isolates
-        # variables and nothing else (see _scratch_ns), so this is the residual
-        # made visible rather than left for the user to find.
-        self.added_layers = []
         self.created = time.time()
 
     def status(self):
@@ -460,7 +433,6 @@ class _Verification:
             "title": self.title,
             "created": self.created,
             "status": self.status(),
-            "added_layers": list(self.added_layers),
             "cells": [c.snapshot(full=full) for c in self.cells],
         }
 
@@ -573,82 +545,6 @@ def _exec_capture(code, ns, job):
             job.result_text = repr(value)
 
 
-def mark_baseline():
-    """Record the post-bootstrap namespace as the seed for scratch runs.
-
-    Called at the end of the bootstrap, after the built-in handles are bound and
-    the user plugins are loaded — i.e. once ``user_ns`` holds exactly what a
-    fresh kernel holds. Everything bound after this point is the session's, and
-    is what a scratch run is defined to *not* see.
-    """
-    global _baseline_names
-    if _ip is not None:
-        _baseline_names = frozenset(_ip.user_ns)
-
-
-def _scratch_ns():
-    """A namespace with the bootstrap's names and none of the session's.
-
-    A clean *namespace*, not a clean *process*: it costs no ``restart_kernel``,
-    so verifying a workflow does not destroy the viewer, the layers, the dask
-    cluster, or the session that just produced the result worth keeping.
-
-    The values are read live, so ``client`` and ``ops`` are the connected ones —
-    a verification runs against the real server, not a stub. What it isolates is
-    the *bindings*: a cell that reads a variable it never created raises
-    ``NameError`` here instead of quietly succeeding on session leftovers, which
-    is the whole class of defect that makes a transcript unrunnable.
-
-    **The residual, stated rather than hidden.** The viewer, ``sys.modules``,
-    and anything a cell mutates in place are shared with the live session. So a
-    cell reading ``viewer.layers['nuclei']`` still finds a layer this workflow
-    never added, an import with side effects has already happened, and layers the
-    run adds are added for real (reported as ``added_layers``). Variable hygiene
-    is enforced; layer and module hygiene is not.
-    """
-    ns = _ip.user_ns if _ip is not None else {}
-    keep = _baseline_names if _baseline_names is not None else _SCRATCH_FALLBACK_NAMES
-    return {k: v for k, v in ns.items() if k in keep}
-
-
-def _layer_names():
-    """Names of the live viewer's layers, or ``None`` when there is no viewer.
-
-    ``viewer`` is the main-thread marshaling proxy, so this is safe to read from
-    a job thread. Best-effort: a verification must not fail over its own
-    bookkeeping.
-    """
-    ns = _ip.user_ns if _ip is not None else {}
-    viewer = ns.get("viewer")
-    if viewer is None:
-        return None
-    try:
-        return [str(layer.name) for layer in viewer.layers]
-    except Exception:  # noqa: BLE001 - bookkeeping, never the run's problem
-        return None
-
-
-def _added_layers(before, after):
-    """Layer names in *after* that *before* did not account for.
-
-    Counted rather than set-differenced: napari does not promise unique layer
-    names, so adding a second "nuclei" beside an existing one is an addition
-    this has to report.
-    """
-    if before is None or after is None:
-        return []
-    remaining = {}
-    for name in before:
-        remaining[name] = remaining.get(name, 0) + 1
-    added = []
-    for name in after:
-        if remaining.get(name):
-            remaining[name] -= 1
-        else:
-            added.append(name)
-    return added
-
-
 def _exec_cells(job, verification):
     """Run *verification*'s cells in order in one scratch namespace.
 
@@ -665,8 +561,12 @@ def _exec_cells(job, verification):
     not it.
     """
     ident = threading.get_ident()
-    ns = _scratch_ns()
-    before = _layer_names()
+    # The kernel's own namespace, because this only ever runs in a scratch
+    # kernel: a process spawned for this verification and discarded after it
+    # (`_scratch`). The isolation that used to be a filtered dict is the process
+    # boundary now, which is what extends it past bindings to the viewer,
+    # `sys.modules`, and anything a cell mutates in place.
+    ns = _ip.user_ns if _ip is not None else {}
     try:
         for cell in verification.cells:
             _jobs_by_thread[ident] = cell
@@ -689,11 +589,9 @@ def _exec_cells(job, verification):
         for cell in verification.cells:
             if cell.status == "pending":
                 cell.status = "skipped"
-        verification.added_layers = _added_layers(before, _layer_names())
 
 
 def _run(job, code):
-    global _verified
     _jobs_by_thread[threading.get_ident()] = job
     exc = None
     try:
@@ -739,12 +637,6 @@ def _run(job, code):
                 if not job.error_text
                 else job.cancel_reason + "\n" + job.error_text
             )
-        # A verification is kept only when every cell ran. What it is kept *for*
-        # is the workflow document, and a document is not a partial run: half a
-        # workflow that stops at a NameError is a report, which the job record
-        # already is.
-        if job.verify is not None and job.status == "ok":
-            _verified = job.verify
 
 
 def _has_running_job():
@@ -800,13 +692,14 @@ def submit(
     job is already running, ``{"error": "busy", "running_job_id": ...,
     "running_job_origin": ...}``.
 
-    **Verification runs come through this same door.** With *verify_cells* — a
-    list of cell sources — the job runs them in order in a scratch namespace
-    (:func:`_scratch_ns`) instead of running *code* in the session's, and
-    carries a :class:`_Verification` record. Same claim check, same
-    one-at-a-time rule, same interrupt: a verification touches the one shared
-    viewer like any other job, so it is not a second kind of thing that would
-    need its own answer to each of those questions.
+    **Verification runs come through this same door**, but only ever in a
+    *scratch kernel*. With *verify_cells* — a list of cell sources — the job runs
+    them in order in this kernel's own namespace instead of running *code*, and
+    carries a :class:`_Verification` record. The session child spawns a kernel
+    per verification and discards it (``_scratch``), so "this kernel's own
+    namespace" is a fresh one and the isolation covers the viewer and
+    ``sys.modules`` too. Submitting *verify_cells* to a session kernel would run
+    the cells in the user's namespace; nothing does.
 
     *origin* and *intent* are recorded on the job and never acted on beyond the
     rules in :class:`_Job`; see there for the origin vocabulary. The busy return
@@ -927,6 +820,19 @@ def _running_job():
         if j.status == "running":
             return j
     return None
+
+
+def running_job():
+    """``{"job_id": ..., "origin": ...}`` for the running job, or ``None``.
+
+    The session child's cross-kernel admission check reads this: a verification
+    runs in a *second* kernel, which this one cannot see, so the rule that only
+    one job runs at a time has to be decided a level up (``_scratch``).
+    """
+    job = _running_job()
+    if job is None:
+        return None
+    return {"job_id": job.job_id, "origin": job.origin}
 
 
 def _raise_in_thread(ident, exctype):
@@ -1123,39 +1029,30 @@ def export():
     return [j.snapshot() for j in _jobs.values()]
 
 
-def verified():
-    """The most recent verification whose every cell ran, or ``None``.
+def verify_record(job_id):
+    """*job_id*'s verification record with every cell's full output, or ``None``.
 
-    What the workflow notebook export serializes. Kept across later runs: a
-    verification that fails afterwards does not un-verify the one that passed,
-    and the user may well be mid-way through a second attempt when they decide
-    to save the first.
+    The other half of the polled/full split (:meth:`_Cell.snapshot`): a poll
+    ships a head and a length once every 0.4 s, and this is read **once**, when
+    the run ends, for the document the record exists to become. The session child
+    calls it before discarding the scratch kernel -- after which there is nobody
+    left to ask.
     """
-    return _verified.snapshot(full=True) if _verified is not None else None
-
-
-def verified_summary():
-    """A one-line description of :func:`verified`, or ``None``.
-
-    Carried on the observe poll so the page can offer the workflow download
-    without a second round trip per second for a value that changes rarely.
-    """
-    if _verified is None:
+    job = _jobs.get(job_id)
+    if job is None or job.verify is None:
         return None
-    return {
-        "title": _verified.title,
-        "cells": len(_verified.cells),
-        "created": _verified.created,
-    }
+    return job.verify.snapshot(full=True)
 
 
 def jobs_view():
-    """``{"jobs": [...], "workflow": {...} or None}`` for the observe poll.
+    """``{"jobs": [...]}`` for the observe poll.
 
-    One round trip for the two things the page redraws from, rather than two:
-    the poll runs about once a second for the life of a session.
+    The page also redraws from whether a verified workflow is available to
+    download, but that is no longer a fact about this kernel: verification runs
+    in a scratch kernel the session child spawns and discards, so the child
+    holds the record and merges it into this reply (``_observe._api_jobs``).
     """
-    return {"jobs": jobs_summary(), "workflow": verified_summary()}
+    return {"jobs": jobs_summary()}
 
 
 def owner():
@@ -1165,22 +1062,18 @@ def owner():
 
 
 def reset():
-    """Drop all job records, the verified workflow, and the kernel's agent claim
-    (used on kernel restart / re-bootstrap).
+    """Drop all job records and the kernel's agent claim (used on kernel restart
+    / re-bootstrap).
 
     Releasing here is what makes the claim last exactly one kernel lifetime:
     :func:`install` calls this on every bootstrap, and a hard restart replaces
-    the process and its module state outright. The verified workflow goes with
-    them: it is a claim about a namespace that no longer exists, and the
-    baseline it was checked against is about to be recorded again.
+    the process and its module state outright.
     """
-    global _owner, _owner_label, _verified, _baseline_names
+    global _owner, _owner_label
     with _lock:
         _jobs.clear()
         _jobs_by_thread.clear()
         _owner, _owner_label = None, ""
-        _verified = None
-        _baseline_names = None
 
 
 # -- viewer wrapping --------------------------------------------------------

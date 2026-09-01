@@ -25,6 +25,7 @@ sleep. Adding a tool means adding an async one.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import time
@@ -33,7 +34,7 @@ from typing import Annotated
 from mcp.types import ImageContent, TextContent
 from pydantic import Field
 
-from . import _app, _kernel_rpc, _resources, _skills, _writers
+from . import _app, _kernel_rpc, _resources, _scratch, _skills, _writers
 from ._app import mcp
 
 logger = logging.getLogger(__name__)
@@ -399,8 +400,9 @@ def _format_verification(record: dict, job_id: str) -> str:
 
     if status == "ok":
         lines.append(
-            f"Verified: all {len(cells)} cell(s) ran in a scratch namespace "
-            "(the kernel's own handles, none of this session's variables)."
+            f"Verified: all {len(cells)} cell(s) ran in a scratch kernel — a "
+            "fresh, headless process with none of this session's state — which "
+            "has since been discarded."
         )
     else:
         failed = next(
@@ -427,15 +429,6 @@ def _format_verification(record: dict, job_id: str) -> str:
             lines.append(f"\nCell {i}:\n{cell.get('code', '')}")
             lines.append(f"\n{cell.get('error_text', '')}")
             break
-
-    added = record.get("added_layers") or []
-    if added:
-        lines.append(
-            "\nLayers this run added to the live viewer: "
-            + ", ".join(added)
-            + ". A scratch namespace isolates variables, not the viewer — remove "
-            "them if they are duplicates of what was already there."
-        )
 
     if status == "ok":
         lines.append(
@@ -703,6 +696,12 @@ async def execute_code(
     if err is not None:
         return err
 
+    verifying = _scratch.running()
+    if verifying is not None:
+        # One job at a time is a rule about the *session*, not about one kernel:
+        # a verification is running in a second one, on the same dask cluster.
+        return _tool_busy_message(verifying["job_id"], "mcp")
+
     job_id, foreign_note, window_alive, msg = await _start_job(
         host, python_code, intent=intent
     )
@@ -736,7 +735,7 @@ async def verify_workflow(
     cells: list[str],
     title: str = "",
 ) -> str:
-    """Check that a candidate workflow runs on its own, in a scratch namespace.
+    """Check that a candidate workflow runs on its own, in a scratch kernel.
 
     Use this when the user wants a workflow they have just proven kept as a
     document. Rewrite the session into a clean program — one entry in *cells*
@@ -749,21 +748,34 @@ async def verify_workflow(
     retries, and debugging prints drop out. Read the session with poll_job and
     write the cells you *mean*, in the order a reader would want them.
 
-    Each cell runs in order in a namespace seeded with the kernel's own handles
-    (np, da, client, ops, viewer) and nothing this session has bound since it
-    started. The run stops at the first failure; the cells after it are reported
-    as skipped.
+    The cells run in order in a **second kernel**, spawned for this and thrown
+    away afterwards: a fresh namespace with none of this session's state. The run
+    stops at the first failure; the cells after it are reported as skipped.
 
-    **This costs no restart.** The live session — its variables, its layers, its
-    dask cluster — is untouched, so there is nothing to ask the user about
-    before calling this.
+    **There is no `viewer` there, and that is deliberate.** The viewer exists so
+    you can show something to the person you are working with, and nobody is
+    watching a verification. So a workflow cell must not touch `viewer` — it
+    raises `NameError` — and the saved notebook has no viewer either, which is
+    what makes it an ordinary notebook that runs headless. Write the workflow to
+    *compute* and to `print` what matters; leave displaying the result to the
+    live session, where there is someone to see it.
 
-    **What it proves:** every cell ran, and no cell leaned on a variable it did
-    not itself create. That is the defect that makes a transcript unrunnable.
-    **What it does not:** the numbers are right (check them), and the viewer and
-    imported modules are shared — a cell that reads an existing layer by name
-    will find one here and not on a fresh kernel. Layers the run adds are added
-    to the real viewer, and are reported back so you can say so.
+    **The live session is untouched** — its variables, its layers, its viewer —
+    so there is nothing to ask the user about on that account. Bringing the
+    scratch kernel up takes a few seconds, and while a verification runs the
+    session kernel accepts no cells (one job at a time, across both).
+
+    **What it proves:** every cell runs, in order, against nothing but a fresh
+    kernel. That covers the whole class of defect that makes a transcript
+    unrunnable — a cell reading a variable an earlier discarded cell created, or
+    a layer this session happened to have.
+
+    **What it does not.** The numbers are right: check them. And a scratch
+    *process* is not a scratch *world* — it talks to the same tensor server and
+    the same filesystem, so `client.upload_array` / `upload_zarr` /
+    `add_source`, and any cell that writes a file, write through for real. Verify
+    a workflow three times and you have three uploaded arrays. **Say so before
+    running one that writes.**
 
     Args:
         cells: the workflow's cells, in order, each a complete piece of Python.
@@ -776,39 +788,67 @@ async def verify_workflow(
     if not cells:
         return "verify_workflow needs at least one cell."
 
-    job_id, foreign_note, window_alive, msg = await _start_job(
+    # The verification is claimed for this client, and the claim is enforced by
+    # the scratch kernel's own one-agent check (_jobs.submit) rather than a
+    # second one here -- so a stranger is refused an interrupt on it exactly as
+    # on the session kernel.
+    writer, label = _writers._client_identity()
+    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    started = await asyncio.to_thread(
+        _scratch.start,
+        list(cells),
+        title,
         host,
-        "",
-        intent=f"verify workflow: {title}" if title else "verify workflow",
-        verify_cells=list(cells),
-        verify_title=title,
+        f"verify workflow: {title}" if title else "verify workflow",
+        writer,
+        label,
     )
-    if msg is not None:
-        return msg
+    if started.get("error") == "busy":
+        return (
+            _tool_busy_message(
+                started.get("running_job_id"), started.get("running_job_origin")
+            )
+            + foreign_note
+        )
+    if "job_id" not in started:
+        return str(started.get("error")) + foreign_note
 
-    snap, res, window_alive = await _await_job(host, job_id, window_alive)
-    if snap is None:
-        return _kernel_rpc._format_execute_result(res) + foreign_note
+    job_id = started["job_id"]
+    snap = await _await_verification(job_id)
     if snap.get("status") == "running":
         return (
             f"Verification {job_id} is still running after "
-            f"{_app._promote_after:.0f}s. Poll it with poll_job('{job_id}') — the "
-            "per-cell record is in the result." + foreign_note
+            f"{_app._promote_after:.0f}s (a scratch kernel takes a few seconds "
+            f"to build). Poll it with poll_job('{job_id}') — the per-cell record "
+            "is in the result." + foreign_note
         )
     record = snap.get("verify")
     if not record:
-        # A kernel that predates verify_cells, or a submit that never built the
-        # record: report the job the ordinary way rather than invent a verdict.
+        # Never reached a cell: the scratch kernel failed to build, or died
+        # before the first one. Its death IS the verdict, so report why.
         return (
-            _kernel_rpc._format_execute_result(snap)
-            + _kernel_rpc._window_note(window_alive)
+            f"Verification {job_id} did not run: "
+            + (snap.get("error_text") or "the scratch kernel produced no record.")
             + foreign_note
         )
-    return (
-        _format_verification(record, job_id)
-        + _kernel_rpc._window_note(window_alive)
-        + foreign_note
-    )
+    return _format_verification(record, job_id) + foreign_note
+
+
+async def _await_verification(job_id, budget=None):
+    """Poll a verification until it is terminal or *budget* seconds run out.
+
+    ``_await_job``'s counterpart for the scratch kernel. Separate because there
+    is no kernel round trip to make: the run is a thread in this process, so a
+    poll is a dict read and the wait is pure loop sleep.
+    """
+    deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
+    snap = _scratch.poll(job_id)
+    while snap is not None and snap.get("status") == "running":
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.4)
+        snap = _scratch.poll(job_id)
+    return snap or {"status": "unknown"}
 
 
 #: How long ``poll_job`` waits for a running job when the caller says nothing,
@@ -856,6 +896,15 @@ async def poll_job(
         return err
 
     foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    if _scratch.owns(job_id):
+        # A verification runs in a kernel this one cannot see. The id says which,
+        # because the session child issued it (_scratch._ID_PREFIX).
+        snap = _scratch.poll(job_id)
+        if snap is None:
+            return f"No such job '{job_id}'." + foreign_note
+        if snap.get("status") == "running" and wait > 0:
+            snap = await _await_verification(job_id, min(wait, _POLL_WAIT_MAX))
+        return _format_job_status(snap) + foreign_note
     snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
     if snap is not None and snap.get("status") == "running" and wait > 0:
         # Probe first, wait second: a job that is already terminal -- the common
@@ -912,11 +961,49 @@ async def interrupt_kernel() -> str:
     kernel and restart_kernel is not the way around it — restarting would destroy
     the user's running cell, variables and layers along with yours. Wait, or ask
     them.
+
+    Takes no argument for which job because there is only ever one: the slot is
+    the session's, not a kernel's. So this also stops a verification of yours
+    running in its scratch kernel, and refuses one that is not yours, by the
+    same rule and for the same reason.
+
+    **On a verification it is the guaranteed stop, not a best-effort one.** If
+    the cells do not stop promptly the scratch kernel is killed outright and
+    discarded — which is safe precisely because nothing in it is anyone's work.
+    So a stuck verification never needs restart_kernel: reaching for it there
+    would destroy the user's session to end a process that exists to be thrown
+    away.
     """
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
     writer, _label = _writers._client_identity()
+    # Which kernel to signal is this process's business, not the tool
+    # signature's: the slot is global, so "the running job" is unambiguous.
+    # `None` back means there was no verification to stop -- which is not the
+    # same as nothing running, since one that ended a moment ago leaves the
+    # session kernel free to have started something. So fall through; never
+    # answer "nothing is running" from here.
+    data = await asyncio.to_thread(_scratch.interrupt, None, "mcp", writer)
+    if data is not None:
+        job_id = data.get("job_id")
+        if data.get("interrupted"):
+            how = (
+                "its cells would not stop, so the kernel was killed"
+                if data.get("killed")
+                else "its cells stopped"
+            )
+            return (
+                f"Stopped verification {job_id} — {how}, and the scratch kernel "
+                "is discarded. Your session is untouched; nothing here needs "
+                "restart_kernel."
+            )
+        if data.get("refused") == "not_owner":
+            return _writers._NOT_OWNER_MSG.format(held_by="")
+        return (
+            f"Nothing to interrupt in verification {job_id}; it may have "
+            "finished already. Poll it to see."
+        )
     data, res, _w = await _kernel_rpc._job_call(
         host, "interrupt_current", requester="mcp", writer=writer
     )
@@ -1027,13 +1114,25 @@ async def restart_kernel() -> str:
     # _writers.restart. It blocks for the length of the bring-up, so it goes to
     # a thread like every other kernel round trip here.
     writer, _label = _writers._client_identity()
+    # A verification holds the slot in this process, not in the kernel being
+    # replaced, so a restart that left it running would hand back a fresh kernel
+    # that can accept nothing -- and a wedged verification would have no escape
+    # hatch, which is exactly what this tool is documented to be. Handed to
+    # _writers.restart rather than done here, so it happens only once the gate
+    # above has passed: a refused caller must not have destroyed anything.
     try:
-        refusal = await asyncio.to_thread(_writers.restart, host, writer)
+        refusal, discarded = await asyncio.to_thread(
+            _writers.restart,
+            host,
+            writer,
+            functools.partial(_scratch.discard, "restart_kernel"),
+        )
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
     if refusal is not None:
         return refusal
-    return "Kernel restarted. Viewer rebuilt; previous variables are gone."
+    note = f" Verification {discarded} was discarded with it." if discarded else ""
+    return "Kernel restarted. Viewer rebuilt; previous variables are gone." + note
 
 
 @mcp.tool()

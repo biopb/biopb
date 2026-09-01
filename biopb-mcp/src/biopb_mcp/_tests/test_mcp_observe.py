@@ -189,13 +189,16 @@ def test_api_notebook_downloads_ipynb(client, host):
     assert any(o.get("name") == "stderr" for o in job2["outputs"])
 
 
-def test_api_notebook_workflow_serves_the_verified_run(client, host):
-    host.execute.return_value = _reply(
-        {
+def test_api_notebook_workflow_serves_the_verified_run(client, host, monkeypatch):
+    from biopb_mcp.mcp import _scratch
+
+    monkeypatch.setattr(
+        _scratch,
+        "verified",
+        lambda: {
             "title": "Count foci per cell",
             "created": 1_700_000_000.0,
             "status": "ok",
-            "added_layers": [],
             "cells": [
                 {
                     "code": "a = 2",
@@ -206,13 +209,14 @@ def test_api_notebook_workflow_serves_the_verified_run(client, host):
                     "elapsed": 0.1,
                 }
             ],
-        }
+        },
     )
     r = client.get("/api/notebook?workflow=1")
     assert r.status_code == 200
-    # A different document, so a different read: the verified program, not the
-    # transcript it was rewritten from.
-    assert "verified()" in host.execute.call_args[0][0]
+    assert "Count foci per cell" in r.text
+    # A different document, and one this process holds: the verified program ran
+    # in a scratch kernel that no longer exists, so there is no kernel to ask.
+    assert not host.execute.called
     assert r.headers["X-Filename"].startswith("biopb-count-foci-per-cell-")
     assert "Count foci per cell" in r.text
 
