@@ -18,6 +18,7 @@ question is asking about the same relation, and "foreign" is defined by
 
 import contextvars
 import logging
+import threading
 
 from . import _app
 from ._kernel_rpc import _run_job_call
@@ -51,12 +52,30 @@ logger = logging.getLogger(__name__)
 # direction is "held by the client that asked" rather than "held by nobody".
 _claimed_by: str | None = None
 
+# Guards :data:`_claimed_by`, and -- the reason it is a lock rather than nothing
+# -- is held across a whole restart by :func:`restart`.
+#
+# The mirror is read-then-written from several threads: the tools await their
+# kernel round trips off the event loop, so a submit claiming the kernel and a
+# restart clearing it genuinely overlap. The window that matters is the restart:
+# gate, replace the kernel, clear the claim is one decision, and a submit that
+# lands in the middle of it would have its claim on the *new* kernel wiped by
+# the clear that follows. An empty mirror over a held kernel is the failure
+# direction :data:`_claimed_by` exists to prevent -- it lets a stranger restart
+# the session that just started.
+#
+# Reentrant because _presume_claim calls _note_claim. Lock order is
+# _claim_lock -> KernelHost._lock, and nothing takes them the other way round:
+# every claim update happens outside the kernel round trip, never during one.
+_claim_lock = threading.RLock()
+
 
 def _note_claim(writer):
     """Record that the kernel is held by *writer* (ignores ``None``)."""
     global _claimed_by
     if writer is not None:
-        _claimed_by = writer
+        with _claim_lock:
+            _claimed_by = writer
 
 
 def _presume_claim(writer):
@@ -66,14 +85,16 @@ def _presume_claim(writer):
     overwrite a holder already known here, and it will be corrected by the
     refusal in any case.
     """
-    if _claimed_by is None:
-        _note_claim(writer)
+    with _claim_lock:
+        if _claimed_by is None:
+            _note_claim(writer)
 
 
 def clear_claim():
     """Forget the mirrored claim, for a caller that just replaced the kernel."""
     global _claimed_by
-    _claimed_by = None
+    with _claim_lock:
+        _claimed_by = None
 
 
 def claim_holder():
@@ -85,7 +106,49 @@ def claim_holder():
     it can be stale in the safe direction only: it is set from what the kernel
     actually said (:func:`_note_claim`), and cleared when the kernel is replaced.
     """
-    return _claimed_by
+    with _claim_lock:
+        return _claimed_by
+
+
+def restart(host, writer):
+    """Gated restart: replace the kernel and reset the claim, atomically.
+
+    Returns ``None`` once the kernel is back, or the refusal to hand the caller
+    instead. ``host.restart`` failing raises, and leaves the claim alone -- the
+    old kernel may still be there.
+
+    **Blocking, and meant to be called off the event loop.** The three steps are
+    one critical section rather than three statements at a call site: reading
+    the holder, replacing the kernel and clearing the mirror have to be
+    indivisible, or a submit landing between the restart and the clear loses the
+    claim it just made on the new kernel (see :data:`_claim_lock`). Holding the
+    lock for the seconds a restart takes is the point -- a claim on a kernel
+    that is being destroyed is not a claim.
+
+    Deliberately reads the mirror rather than asking the kernel who holds it:
+    that is a check-then-act race *and* fail-open on a busy kernel. See
+    :data:`_claimed_by`.
+    """
+    with _claim_lock:
+        held = _claimed_by
+        if held is not None and writer is not None and writer != held:
+            return _NOT_OWNER_MSG.format(held_by="")
+        host.restart()
+        clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
+        return None
+
+
+def restart_for_user(host):
+    """Ungated restart, for the person at the machine.
+
+    Never gated on the one-agent claim, which makes it the recovery path for a
+    session held by a client that is gone: an agent cannot take a kernel from
+    another agent, but the user can always replace it. Same critical section as
+    :func:`restart`, and blocking for the same reason.
+    """
+    with _claim_lock:
+        host.restart()
+        clear_claim()
 
 
 # Refusal for a client that does not hold this kernel's one-agent claim

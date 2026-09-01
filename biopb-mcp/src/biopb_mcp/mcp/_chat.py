@@ -46,6 +46,10 @@ from mcp.types import ImageContent, TextContent
 
 from . import _app, _kernel_rpc, _server, _writers
 
+# The kernel round trip, off the loop. Bound here under the name this module
+# uses so a test can still swap it (test_mcp_chat_api).
+from ._kernel_rpc import _job_call
+
 logger = logging.getLogger(__name__)
 
 #: This loop's client id, for the kernel's one-agent claim (``_jobs.submit``).
@@ -196,22 +200,6 @@ def _last_user_text():
 # ---------------------------------------------------------------------------
 # The tool surface
 # ---------------------------------------------------------------------------
-
-
-async def _job_call(host, name, *args, **kwargs):
-    """``_kernel_rpc._run_job_call`` off the event loop.
-
-    The round trip blocks: it waits on the kernel's lock (up to
-    ``kernel.busy_lock_timeout``) and then on the reply. One of those in an
-    ``/api/*`` handler is a blip; a chat turn makes one per poll for as long as
-    a job runs, and this process is also serving ``/mcp`` to any attached client
-    and the observe page to the user. So it goes to a thread, which the kernel
-    host already expects -- its lock exists because the tools and the observe
-    API already reach it concurrently.
-    """
-    return await asyncio.to_thread(
-        _kernel_rpc._run_job_call, host, name, *args, **kwargs
-    )
 
 
 def _clean_schema(schema):

@@ -1,10 +1,22 @@
 """Shared pytest fixtures for biopb-mcp tests."""
 
+import asyncio
 import pathlib
 
 import pytest
 
 from biopb_mcp._config import CONFIG
+
+
+def call_tool(fn, *args, **kwargs):
+    """Drive an ``async def`` MCP tool from a synchronous test.
+
+    The tools are async so their kernel round trips go to a thread rather
+    than stalling the process's one event loop (``_kernel_rpc._job_call``).
+    The suite stays synchronous and gives each call its own loop -- the
+    ``asyncio.run`` convention the chat tests already use.
+    """
+    return asyncio.run(fn(*args, **kwargs))
 
 
 def pytest_addoption(parser):

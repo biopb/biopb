@@ -197,7 +197,7 @@ async def _api_jobs(request):
     # jobs_view(), not jobs_summary(): the page redraws from the job list *and*
     # from whether a verified workflow is available to download, and this poll
     # runs about once a second for the life of the session.
-    result, res, _w = _kernel_rpc._run_job_call(host, "jobs_view")
+    result, res, _w = await _kernel_rpc._job_call(host, "jobs_view")
     if result is None:
         return _kernel_error(res)
     return JSONResponse(result)
@@ -208,7 +208,7 @@ async def _api_job_detail(request):
     if err is not None:
         return err
     job_id = request.path_params["job_id"]
-    snap, res, win = _kernel_rpc._run_job_call(host, "poll", job_id)
+    snap, res, win = await _kernel_rpc._job_call(host, "poll", job_id)
     if snap is None:
         return _kernel_error(res)
     if snap.get("status") == "unknown":
@@ -238,7 +238,7 @@ async def _api_notebook(request):
     if err is not None:
         return err
     if request.query_params.get("workflow"):
-        record, res, _w = _kernel_rpc._run_job_call(host, "verified")
+        record, res, _w = await _kernel_rpc._job_call(host, "verified")
         if record is None:
             # No verified workflow *and* a failed read look the same from here;
             # the kernel error is the more specific answer, so prefer it.
@@ -252,7 +252,7 @@ async def _api_notebook(request):
     # Read the full job history on the kernel main thread (a plain read like
     # jobs_summary(), no background job thread), then serialize to a notebook in
     # this process.
-    jobs, res, _w = _kernel_rpc._run_job_call(host, "export")
+    jobs, res, _w = await _kernel_rpc._job_call(host, "export")
     if jobs is None:
         return _kernel_error(res)
     nb = _notebook.build_notebook(jobs)
@@ -279,7 +279,7 @@ async def _api_interrupt(request):
         return err
     # Force a KeyboardInterrupt into the running job's worker thread (SIGINT only
     # reaches the kernel main thread, not the job), attributed to the user.
-    data, res, _w = _kernel_rpc._run_job_call(
+    data, res, _w = await _kernel_rpc._job_call(
         host, "interrupt_current", _USER_INTERRUPT_MSG
     )
     if data is None:
@@ -300,10 +300,13 @@ async def _api_restart(request):
     if err is not None:
         return err
     try:
-        host.restart()
+        # Restart and clear as one critical section (_writers.restart_for_user):
+        # an agent's submit can land between them, and it would lose the claim
+        # it just made on the new kernel. Off the loop because a restart is
+        # seconds of teardown and bring-up, which would take this page with it.
+        await asyncio.to_thread(_writers.restart_for_user, host)
     except Exception as exc:  # noqa: BLE001 - report restart failure
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
-    _writers.clear_claim()
     return JSONResponse({"ok": True})
 
 
@@ -328,7 +331,9 @@ async def _console_execute(request):
     if not isinstance(code, str) or not code.strip():
         return JSONResponse({"error": "missing 'code'"}, status_code=400)
 
-    submitted, res, _w = _kernel_rpc._run_job_call(host, "submit", code, origin="user")
+    submitted, res, _w = await _kernel_rpc._job_call(
+        host, "submit", code, origin="user"
+    )
     if submitted is None:
         # Distinct from the job-busy case below: this is the kernel *lock*, held
         # by another quick snippet for a moment. Transient, so retryable.

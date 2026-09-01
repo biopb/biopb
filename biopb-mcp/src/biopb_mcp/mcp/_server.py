@@ -13,8 +13,18 @@ outside this module -- the observe page, the chat loop, the shared HTTP guard --
 which had to reach in through a dozen private names to get at them.  What is
 left is the agent-facing surface: the snippets its tools run, the job
 submit/await client they share, and the tools and resources themselves.
+
+**Every tool is ``async def``, and no tool blocks.** The SDK invokes a
+synchronous tool function directly on the event loop, and this process serves
+``/mcp``, the observe page and the chat turn on that one loop -- so a tool that
+waits on the kernel there does not make its caller wait, it makes every caller
+wait, for as long as the round trip takes (``execute_code`` used to hold it for
+the whole ``promote_after`` window). Kernel round trips therefore go to a thread
+(``_kernel_rpc._job_call`` / ``_execute``), and the promote window is a loop
+sleep. Adding a tool means adding an async one.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -231,7 +241,7 @@ def _cpu_percent(psutil):
     return psutil.cpu_percent(interval=0.1)
 
 
-def _start_job(host, code, **kwargs):
+async def _start_job(host, code, **kwargs):
     """Submit a job and resolve everything that can happen before it runs.
 
     *code* and *kwargs* are :func:`_jobs.submit`'s own arguments, passed as
@@ -249,14 +259,16 @@ def _start_job(host, code, **kwargs):
     """
     writer, _label = _writers._client_identity()
 
-    # Read once at entry, append to whichever path returns below.
-    digest = _writers._foreign_digest(host)
+    # Read once at entry, append to whichever path returns below. Every kernel
+    # round trip below goes to a thread for the reason on _kernel_rpc._job_call:
+    # blocking here blocks the whole process, not this one call.
+    digest = await asyncio.to_thread(_writers._foreign_digest, host)
     foreign_note = _writers._render_foreign_note(digest)
     if foreign_note:
-        _writers._ack_foreign_digest(host, digest, writer)
+        await asyncio.to_thread(_writers._ack_foreign_digest, host, digest, writer)
 
-    job_id, message, drop_note, window_alive = _submit_job(
-        host, code, digest, _tool_busy_message, **kwargs
+    job_id, message, drop_note, window_alive = await asyncio.to_thread(
+        _submit_job, host, code, digest, _tool_busy_message, **kwargs
     )
     if drop_note:
         foreign_note = ""
@@ -343,7 +355,7 @@ def _submit_job(host, code, digest, busy_message, **kwargs):
     return submitted["job_id"], None, False, window_alive
 
 
-def _await_job(host, job_id, window_alive=None):
+async def _await_job(host, job_id, window_alive=None):
     """Poll *job_id* until it is terminal or the promote window runs out.
 
     Returns ``(snap, res, window_alive)``. *snap* is None when a poll round trip
@@ -353,12 +365,16 @@ def _await_job(host, job_id, window_alive=None):
 
     *window_alive* seeds the flag with the submit round trip's, so a promote
     window short enough to poll zero times still reports a closed viewer.
+
+    The wait is a loop sleep and each probe is a thread hop, so the promote
+    window costs this process nothing: for the ten seconds it runs, the loop is
+    free to serve the observe page and any other client.
     """
     deadline = time.monotonic() + _app._promote_after
     snap, res = {"status": "running"}, None
     while time.monotonic() < deadline:
-        time.sleep(0.4)
-        snap, res, window_alive = _kernel_rpc._run_job_call(host, "poll", job_id)
+        await asyncio.sleep(0.4)
+        snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
         if snap is None:
             return None, res, None
         if snap.get("status") != "running":
@@ -514,7 +530,7 @@ def get_skill(skill_id: str) -> str:
 
 
 @mcp.tool()
-def list_skills(keywords: list[str] | None = None) -> list:
+async def list_skills(keywords: list[str] | None = None) -> list:
     """Discover curated biopb workflows ("skills"). Call at the start of a task.
 
     Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
@@ -560,11 +576,11 @@ def list_skills(keywords: list[str] | None = None) -> list:
     Fail-open: returns an empty list (never errors) rather than reporting a
     catalog that could not be read.
     """
-    return _skills.list_skills(keywords or ())
+    return await asyncio.to_thread(_skills.list_skills, keywords or ())
 
 
 @mcp.tool()
-def take_screenshot(canvas_only: bool = True) -> list:
+async def take_screenshot(canvas_only: bool = True) -> list:
     """Capture the napari viewer as a PNG image.
 
     Args:
@@ -578,7 +594,7 @@ def take_screenshot(canvas_only: bool = True) -> list:
         return [TextContent(type="text", text=err)]
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
-    res = host.execute(snippet)
+    res = await _kernel_rpc._execute(host, snippet)
     if (
         _kernel_rpc._extract_delimited(
             res.get("stdout", ""), _kernel_rpc._WINDOW_CLOSED_DELIM
@@ -627,7 +643,7 @@ PROMOTE_PARAGRAPH = """Code runs in a background thread so it does not block the
 
 
 @mcp.tool()
-def execute_code(
+async def execute_code(
     python_code: str,
     intent: Annotated[str, Field(description=_INTENT_DESC)] = "",
 ) -> str:
@@ -684,13 +700,13 @@ def execute_code(
     if err is not None:
         return err
 
-    job_id, foreign_note, window_alive, msg = _start_job(
+    job_id, foreign_note, window_alive, msg = await _start_job(
         host, python_code, intent=intent
     )
     if msg is not None:
         return msg
 
-    snap, res, window_alive = _await_job(host, job_id, window_alive)
+    snap, res, window_alive = await _await_job(host, job_id, window_alive)
     if snap is None:
         return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") != "running":
@@ -713,7 +729,7 @@ def execute_code(
 
 
 @mcp.tool()
-def verify_workflow(
+async def verify_workflow(
     cells: list[str],
     title: str = "",
 ) -> str:
@@ -757,7 +773,7 @@ def verify_workflow(
     if not cells:
         return "verify_workflow needs at least one cell."
 
-    job_id, foreign_note, window_alive, msg = _start_job(
+    job_id, foreign_note, window_alive, msg = await _start_job(
         host,
         "",
         intent=f"verify workflow: {title}" if title else "verify workflow",
@@ -767,7 +783,7 @@ def verify_workflow(
     if msg is not None:
         return msg
 
-    snap, res, window_alive = _await_job(host, job_id, window_alive)
+    snap, res, window_alive = await _await_job(host, job_id, window_alive)
     if snap is None:
         return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") == "running":
@@ -793,7 +809,7 @@ def verify_workflow(
 
 
 @mcp.tool()
-def poll_job(job_id: str) -> str:
+async def poll_job(job_id: str) -> str:
     """Get the status and output of a job started by execute_code.
 
     Returns the job's status (running/ok/error/interrupted), elapsed time, and
@@ -804,8 +820,8 @@ def poll_job(job_id: str) -> str:
     if err is not None:
         return err
 
-    foreign_note = _writers._foreign_activity_note(host)
-    snap, res, window_alive = _kernel_rpc._run_job_call(host, "poll", job_id)
+    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
     if snap is None:
         return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") == "unknown":
@@ -819,7 +835,7 @@ def poll_job(job_id: str) -> str:
 
 
 @mcp.tool()
-def inspect_object(object_path: str) -> str:
+async def inspect_object(object_path: str) -> str:
     """Inspect a live object in the napari kernel namespace.
 
     Returns the type, docstring, and public methods/attributes.
@@ -830,14 +846,14 @@ def inspect_object(object_path: str) -> str:
         return err
 
     snippet = _INSPECT_TEMPLATE.replace("__PATH__", repr(object_path))
-    res = host.execute(snippet)
+    res = await _kernel_rpc._execute(host, snippet)
     if res.get("status") == "ok":
         return res.get("stdout", "").rstrip() or "(no output)"
     return res.get("error_text") or f"(status: {res.get('status')})"
 
 
 @mcp.tool()
-def interrupt_kernel() -> str:
+async def interrupt_kernel() -> str:
     """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
     Also cancels the job's in-flight dask futures. The job runs in a background
@@ -859,7 +875,7 @@ def interrupt_kernel() -> str:
     if err is not None:
         return err
     writer, _label = _writers._client_identity()
-    data, res, _w = _kernel_rpc._run_job_call(
+    data, res, _w = await _kernel_rpc._job_call(
         host, "interrupt_current", requester="mcp", writer=writer
     )
     if data is None:
@@ -889,7 +905,7 @@ def interrupt_kernel() -> str:
 
 
 @mcp.tool()
-def start_kernel() -> str:
+async def start_kernel() -> str:
     """Start biopb: bring up the napari viewer, dask, and the tensor client.
 
     Call this as the first action of every session, and whenever the user asks
@@ -911,7 +927,7 @@ def start_kernel() -> str:
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
-    result = host.ensure_started()
+    result = await asyncio.to_thread(host.ensure_started)
     if result.get("state") == "ready":
         ready = (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
@@ -943,7 +959,7 @@ def start_kernel() -> str:
 
 
 @mcp.tool()
-def restart_kernel() -> str:
+async def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
@@ -964,23 +980,22 @@ def restart_kernel() -> str:
     if err is not None:
         return err
     # Gated like every other state change, and this is the sharpest of them: a
-    # restart discards the holder's whole session. Decided against the local
-    # mirror (_claimed_by) rather than a round trip to the kernel, so a kernel
-    # too busy to answer cannot be mistaken for an unclaimed one.
+    # restart discards the holder's whole session. Gate, restart and clear are
+    # one call because they have to be one critical section -- see
+    # _writers.restart. It blocks for the length of the bring-up, so it goes to
+    # a thread like every other kernel round trip here.
     writer, _label = _writers._client_identity()
-    held = _writers.claim_holder()
-    if held is not None and writer is not None and writer != held:
-        return _writers._NOT_OWNER_MSG.format(held_by="")
     try:
-        host.restart()
+        refusal = await asyncio.to_thread(_writers.restart, host, writer)
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
-    _writers.clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
+    if refusal is not None:
+        return refusal
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
 @mcp.tool()
-def server_status() -> str:
+async def server_status() -> str:
     """Report server health, system load, and resource usage.
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
@@ -993,7 +1008,8 @@ def server_status() -> str:
 
     host = _app._kernel_host
 
-    cpu_percent = _cpu_percent(psutil)
+    # Off the loop for the one call that pays the 0.1s priming sample.
+    cpu_percent = await asyncio.to_thread(_cpu_percent, psutil)
     mem = psutil.virtual_memory()
     process = psutil.Process(os.getpid())
     proc_mem = process.memory_info()
@@ -1078,7 +1094,7 @@ def server_status() -> str:
             lines.append(line)
         return "\n".join(lines)
 
-    res = host.execute(_STATUS_SNIPPET, timeout=15.0)
+    res = await _kernel_rpc._execute(host, _STATUS_SNIPPET, 15.0)
     if res.get("status") == "ok":
         lines.append("")
         lines.append(res.get("stdout", "").rstrip())
@@ -1092,7 +1108,9 @@ def server_status() -> str:
 
     # Only on this path: the early returns above are all "kernel not usable",
     # where the digest round-trip cannot land anyway.
-    return "\n".join(lines) + _writers._foreign_activity_note(host)
+    return "\n".join(lines) + await asyncio.to_thread(
+        _writers._foreign_activity_note, host
+    )
 
 
 # ---------------------------------------------------------------------------

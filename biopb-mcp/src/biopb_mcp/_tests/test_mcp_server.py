@@ -9,10 +9,13 @@ import asyncio
 import base64
 import json
 import sys
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
+from biopb_mcp._tests.conftest import call_tool as _tool
 from biopb_mcp.mcp import _app, _kernel_rpc, _server, _writers
 
 
@@ -70,6 +73,21 @@ def _install_replies(host, *, returns=None, queue=None, digest=()):
 
     host.execute.side_effect = execute
     return host
+
+
+#: Bound before any fixture patches ``asyncio.sleep``, so the replacement can
+#: still yield to the loop rather than call itself.
+_real_asleep = asyncio.sleep
+
+
+async def _no_sleep(*_args, **_kwargs):
+    """``asyncio.sleep`` that yields to the loop without waiting.
+
+    The promote window sleeps between polls; skipping the wait keeps a
+    test from spending real seconds in it, and awaiting nothing at all
+    would starve anything else the loop is running.
+    """
+    await _real_asleep(0)
 
 
 def _snapshot(
@@ -255,7 +273,7 @@ class TestResources:
 class TestTakeScreenshot:
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
-        result = _server.take_screenshot()
+        result = _tool(_server.take_screenshot)
         assert len(result) == 1
         assert result[0].type == "text"
         assert "not initialized" in result[0].text
@@ -264,7 +282,7 @@ class TestTakeScreenshot:
         data = base64.b64encode(b"fake-png-bytes").decode()
         server_with_host.execute.return_value = _result(stdout=f"<<PNG_B64>>{data}\n")
 
-        result = _server.take_screenshot(canvas_only=True)
+        result = _tool(_server.take_screenshot, canvas_only=True)
 
         assert len(result) == 1
         assert result[0].type == "image"
@@ -275,14 +293,14 @@ class TestTakeScreenshot:
         server_with_host.execute.return_value = _result(
             error_text="boom", status="error"
         )
-        result = _server.take_screenshot()
+        result = _tool(_server.take_screenshot)
         assert result[0].type == "text"
         assert "Screenshot failed" in result[0].text
 
     def test_passes_canvas_only_flag(self, server_with_host):
         data = base64.b64encode(b"x").decode()
         server_with_host.execute.return_value = _result(stdout=f"<<PNG_B64>>{data}")
-        _server.take_screenshot(canvas_only=False)
+        _tool(_server.take_screenshot, canvas_only=False)
         snippet = server_with_host.execute.call_args[0][0]
         assert "canvas_only=False" in snippet
 
@@ -290,7 +308,7 @@ class TestTakeScreenshot:
         server_with_host.execute.return_value = _result(
             stdout=_kernel_rpc._WINDOW_CLOSED_DELIM + "\n"
         )
-        result = _server.take_screenshot()
+        result = _tool(_server.take_screenshot)
         assert result[0].type == "text"
         assert "window was closed" in result[0].text
         assert "restart_kernel" in result[0].text
@@ -374,14 +392,14 @@ def _verify_snapshot(status="ok", cells=None, added_layers=(), **kw):
 class TestVerifyWorkflow:
     @pytest.fixture(autouse=True)
     def _fast_sleep(self, monkeypatch):
-        monkeypatch.setattr(_server.time, "sleep", lambda *a, **k: None)
+        monkeypatch.setattr(_server.asyncio, "sleep", _no_sleep)
 
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
-        assert "not initialized" in _server.verify_workflow(["1"])
+        assert "not initialized" in _tool(_server.verify_workflow, ["1"])
 
     def test_no_cells_is_refused_before_the_kernel_is_touched(self, server_with_host):
-        assert "at least one cell" in _server.verify_workflow([])
+        assert "at least one cell" in _tool(_server.verify_workflow, [])
         assert not server_with_host.execute.called
 
     def test_cells_and_title_ride_the_submit_snippet(self, server_with_host):
@@ -391,7 +409,7 @@ class TestVerifyWorkflow:
             server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
         _app.set_promote_after(0.0)
-        _server.verify_workflow(["a = 2", "print(a)"], title="Count foci")
+        _tool(_server.verify_workflow, ["a = 2", "print(a)"], title="Count foci")
         (snippet,) = [
             c[0][0]
             for c in server_with_host.execute.call_args_list
@@ -407,7 +425,7 @@ class TestVerifyWorkflow:
             returns=_job_reply(**_verify_snapshot()),
         )
         _app.set_promote_after(1.0)
-        result = _server.verify_workflow(["a = 2"], title="Count foci")
+        result = _tool(_server.verify_workflow, ["a = 2"], title="Count foci")
         assert "Verified" in result
         assert "scratch namespace" in result
         # The agent must hand the save to the user, not write a file itself.
@@ -446,7 +464,7 @@ class TestVerifyWorkflow:
             returns=_job_reply(**_verify_snapshot(status="error", cells=cells)),
         )
         _app.set_promote_after(1.0)
-        result = _server.verify_workflow([c["code"] for c in cells])
+        result = _tool(_server.verify_workflow, [c["code"] for c in cells])
         assert "NOT verified" in result
         assert "cell 2" in result
         assert "leftover" in result
@@ -460,7 +478,7 @@ class TestVerifyWorkflow:
             returns=_job_reply(**_verify_snapshot(added_layers=["foci"])),
         )
         _app.set_promote_after(1.0)
-        result = _server.verify_workflow(["a = 2"])
+        result = _tool(_server.verify_workflow, ["a = 2"])
         assert "foci" in result
         assert "isolates variables, not the viewer" in result
 
@@ -475,14 +493,14 @@ class TestVerifyWorkflow:
             returns=_job_reply(**_snapshot(status="ok", stdout="hi\n")),
         )
         _app.set_promote_after(1.0)
-        assert "hi" in _server.verify_workflow(["a = 2"])
+        assert "hi" in _tool(_server.verify_workflow, ["a = 2"])
 
     def test_a_long_verification_hands_back_a_job_handle(self, server_with_host):
         _install_replies(
             server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
         _app.set_promote_after(0.0)
-        result = _server.verify_workflow(["a = 2"])
+        result = _tool(_server.verify_workflow, ["a = 2"])
         assert "still running" in result and "poll_job('job-1')" in result
 
 
@@ -495,7 +513,7 @@ class TestExecuteCode:
     @pytest.fixture(autouse=True)
     def _fast_sleep(self, monkeypatch):
         # Skip the inter-poll sleep so tests don't wait real seconds.
-        monkeypatch.setattr(_server.time, "sleep", lambda *a, **k: None)
+        monkeypatch.setattr(_server.asyncio, "sleep", _no_sleep)
 
     def test_docstring_carries_catalog_contract(self):
         # The tool description is always in the model's context, unlike the
@@ -508,7 +526,7 @@ class TestExecuteCode:
 
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
-        result = _server.execute_code("print('hi')")
+        result = _tool(_server.execute_code, "print('hi')")
         assert "not initialized" in result
 
     def test_submits_code_via_job_runner(self, server_with_host):
@@ -516,7 +534,7 @@ class TestExecuteCode:
             server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
         _app.set_promote_after(0.0)  # return a handle immediately
-        result = _server.execute_code("print('hi')")
+        result = _tool(_server.execute_code, "print('hi')")
         # By content, not by position: the tool also carries the user-activity
         # digest round-trip, so "the first call" is not the submit.
         (snippet,) = [
@@ -535,7 +553,7 @@ class TestExecuteCode:
             server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
         _app.set_promote_after(0.0)
-        _server.execute_code("x = 1", intent="isolate the nuclei channel")
+        _tool(_server.execute_code, "x = 1", intent="isolate the nuclei channel")
         (snippet,) = [
             c[0][0]
             for c in server_with_host.execute.call_args_list
@@ -548,7 +566,7 @@ class TestExecuteCode:
             server_with_host,
             returns=_job_reply(error="not_owner", owner="claude-code"),
         )
-        result = _server.execute_code("x = 1")
+        result = _tool(_server.execute_code, "x = 1")
         assert "already in use by another client (claude-code)" in result
         # It must be told what still works, or it reads the refusal as a broken
         # kernel...
@@ -565,7 +583,7 @@ class TestExecuteCode:
             server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
         _app.set_promote_after(0.0)
-        _server.execute_code("x = 1")
+        _tool(_server.execute_code, "x = 1")
         (snippet,) = [
             c[0][0]
             for c in server_with_host.execute.call_args_list
@@ -579,7 +597,7 @@ class TestExecuteCode:
             server_with_host, returns=_job_reply(job_id="job-1", status="running")
         )
         _app.set_promote_after(0.0)
-        _server.execute_code("x = 1")
+        _tool(_server.execute_code, "x = 1")
         (snippet,) = [
             c[0][0]
             for c in server_with_host.execute.call_args_list
@@ -596,7 +614,7 @@ class TestExecuteCode:
                 _job_reply(**_snapshot(stdout="hello\n", result_text="3")),
             ],
         )
-        result = _server.execute_code("print('hello'); 1 + 2")
+        result = _tool(_server.execute_code, "print('hello'); 1 + 2")
         assert "hello" in result
         assert "3" in result
 
@@ -608,7 +626,7 @@ class TestExecuteCode:
                 _job_reply(**_snapshot(stdout="", result_text="")),
             ],
         )
-        result = _server.execute_code("x = 42")
+        result = _tool(_server.execute_code, "x = 42")
         assert result == "(no output)"
 
     def test_error_path_includes_traceback(self, server_with_host):
@@ -624,7 +642,7 @@ class TestExecuteCode:
                 ),
             ],
         )
-        result = _server.execute_code("1 / 0")
+        result = _tool(_server.execute_code, "1 / 0")
         assert "division by zero" in result
 
     def test_promotes_to_job_handle_when_slow(self, server_with_host):
@@ -632,7 +650,7 @@ class TestExecuteCode:
             server_with_host, returns=_job_reply(job_id="job-7", status="running")
         )
         _app.set_promote_after(0.0)
-        result = _server.execute_code("while True: pass")
+        result = _tool(_server.execute_code, "while True: pass")
         assert "job-7" in result
         assert "still running" in result
         assert "poll_job" in result
@@ -642,7 +660,7 @@ class TestExecuteCode:
             server_with_host,
             returns=_job_reply(error="busy", running_job_id="job-3"),
         )
-        result = _server.execute_code("x = 1")
+        result = _tool(_server.execute_code, "x = 1")
         assert "already running" in result
         assert "job-3" in result
 
@@ -652,7 +670,7 @@ class TestExecuteCode:
             error_text="Execution exceeded 0.5s and was interrupted.",
             status="timeout",
         )
-        result = _server.execute_code("x = 1")
+        result = _tool(_server.execute_code, "x = 1")
         assert "interrupted" in result
 
     def test_inline_result_appends_window_closed_note(self, server_with_host):
@@ -663,7 +681,7 @@ class TestExecuteCode:
                 _job_reply(window_alive=False, **_snapshot(stdout="done\n")),
             ],
         )
-        result = _server.execute_code("viewer.add_image(arr)")
+        result = _tool(_server.execute_code, "viewer.add_image(arr)")
         assert "done" in result
         assert "viewer window is closed" in result
         assert "restart_kernel" in result
@@ -674,7 +692,7 @@ class TestExecuteCode:
             returns=_job_reply(job_id="job-7", status="running", window_alive=False),
         )
         _app.set_promote_after(0.0)
-        result = _server.execute_code("while True: pass")
+        result = _tool(_server.execute_code, "while True: pass")
         assert "job-7" in result
         assert "viewer window is closed" in result
 
@@ -687,7 +705,7 @@ class TestJobTools:
                 **_snapshot(status="running", stdout="step 1\n", elapsed=2.5)
             ),
         )
-        result = _server.poll_job("job-1")
+        result = _tool(_server.poll_job, "job-1")
         assert "job-1: running" in result
         assert "step 1" in result
 
@@ -696,7 +714,7 @@ class TestJobTools:
             server_with_host,
             returns=_job_reply(job_id="job-9", status="unknown", error_text=""),
         )
-        assert "No such job" in _server.poll_job("job-9")
+        assert "No such job" in _tool(_server.poll_job, "job-9")
 
     def test_poll_job_terminal_appends_window_closed_note(self, server_with_host):
         _install_replies(
@@ -705,7 +723,7 @@ class TestJobTools:
                 window_alive=False, **_snapshot(status="ok", stdout="done\n")
             ),
         )
-        result = _server.poll_job("job-1")
+        result = _tool(_server.poll_job, "job-1")
         assert "viewer window is closed" in result
 
     def test_poll_job_running_omits_window_note(self, server_with_host):
@@ -716,12 +734,12 @@ class TestJobTools:
                 window_alive=False, **_snapshot(status="running", stdout="step\n")
             ),
         )
-        result = _server.poll_job("job-1")
+        result = _tool(_server.poll_job, "job-1")
         assert "viewer window is closed" not in result
 
     def test_job_tools_no_host(self):
         _app._kernel_host = None
-        assert "not initialized" in _server.poll_job("job-1")
+        assert "not initialized" in _tool(_server.poll_job, "job-1")
 
 
 # -----------------------------------------------------------------------
@@ -818,7 +836,7 @@ class TestUserActivityNote:
             ],
             digest=self._DIGEST,
         )
-        result = _server.execute_code("x = 1")
+        result = _tool(_server.execute_code, "x = 1")
         assert "done" in result  # the agent's own result still leads
         assert "job-7 (ok)" in result
 
@@ -833,7 +851,7 @@ class TestUserActivityNote:
         )
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
-            _server.poll_job("job-1")
+            _tool(_server.poll_job, "job-1")
         (snippet,) = [
             c[0][0]
             for c in server_with_host.execute.call_args_list
@@ -847,7 +865,7 @@ class TestUserActivityNote:
             returns=_job_reply(**_snapshot(status="ok", stdout="out\n")),
             digest=self._DIGEST,
         )
-        assert "job-7 (ok)" in _server.poll_job("job-1")
+        assert "job-7 (ok)" in _tool(_server.poll_job, "job-1")
 
     def test_busy_on_a_user_cell_tells_the_agent_to_wait(self, server_with_host):
         _install_replies(
@@ -856,7 +874,7 @@ class TestUserActivityNote:
                 error="busy", running_job_id="job-9", running_job_origin="user"
             ),
         )
-        result = _server.execute_code("x = 1")
+        result = _tool(_server.execute_code, "x = 1")
         assert "The user is running a cell" in result
         assert "job-9" in result
         # The agent must not be pointed at interrupt_kernel here: it would be
@@ -873,7 +891,7 @@ class TestUserActivityNote:
                 error="busy", running_job_id="job-9", running_job_origin="chat"
             ),
         )
-        result = _server.execute_code("x = 1")
+        result = _tool(_server.execute_code, "x = 1")
         assert "Another writer is running a cell" in result
         assert "The user" not in result
         assert "interrupt_kernel" not in result
@@ -884,7 +902,7 @@ class TestUserActivityNote:
             returns=_job_reply(**_snapshot(status="ok", stdout="out\n")),
             digest=[{"job_id": "job-7", "status": "ok", "origin": "chat"}],
         )
-        result = _server.poll_job("job-1")
+        result = _tool(_server.poll_job, "job-1")
         assert "Another writer ran code" in result
         assert "job-7 (ok, chat)" in result
 
@@ -895,7 +913,7 @@ class TestUserActivityNote:
                 error="busy", running_job_id="job-3", running_job_origin="mcp"
             ),
         )
-        result = _server.execute_code("x = 1")
+        result = _tool(_server.execute_code, "x = 1")
         assert "already running" in result
         assert "interrupt_kernel" in result
 
@@ -903,12 +921,12 @@ class TestUserActivityNote:
 class TestInspectObject:
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
-        result = _server.inspect_object("viewer")
+        result = _tool(_server.inspect_object, "viewer")
         assert "not initialized" in result
 
     def test_injects_repr_of_path(self, server_with_host):
         server_with_host.execute.return_value = _result(stdout="Type: Mock")
-        _server.inspect_object("viewer.layers")
+        _tool(_server.inspect_object, "viewer.layers")
         snippet = server_with_host.execute.call_args[0][0]
         assert "'viewer.layers'" in snippet
 
@@ -916,7 +934,7 @@ class TestInspectObject:
         server_with_host.execute.return_value = _result(
             stdout="Type: list\nAttributes:\n"
         )
-        result = _server.inspect_object("my_obj")
+        result = _tool(_server.inspect_object, "my_obj")
         assert "Type: list" in result
 
     def test_returns_error_text_on_failure(self, server_with_host):
@@ -924,7 +942,7 @@ class TestInspectObject:
             error_text="NameError: name 'nope' is not defined",
             status="error",
         )
-        result = _server.inspect_object("nope")
+        result = _tool(_server.inspect_object, "nope")
         assert "NameError" in result
 
 
@@ -938,7 +956,7 @@ class TestInterruptRestart:
         server_with_host.execute.return_value = _job_reply(
             job_id="job-3", interrupted=True
         )
-        result = _server.interrupt_kernel()
+        result = _tool(_server.interrupt_kernel)
         snippet = server_with_host.execute.call_args[0][0]
         assert "interrupt_current(" in snippet
         assert "job-3" in result
@@ -947,11 +965,11 @@ class TestInterruptRestart:
         server_with_host.execute.return_value = _job_reply(
             job_id=None, interrupted=False
         )
-        assert "No running job" in _server.interrupt_kernel()
+        assert "No running job" in _tool(_server.interrupt_kernel)
 
     def test_interrupt_no_host(self):
         _app._kernel_host = None
-        assert "not initialized" in _server.interrupt_kernel()
+        assert "not initialized" in _tool(_server.interrupt_kernel)
 
     def test_interrupt_asks_as_the_agent(self, server_with_host):
         # The requester is what lets the runner refuse a user's cell; without it
@@ -959,7 +977,7 @@ class TestInterruptRestart:
         _install_replies(
             server_with_host, returns=_job_reply(job_id="job-3", interrupted=True)
         )
-        _server.interrupt_kernel()
+        _tool(_server.interrupt_kernel)
         (snippet,) = [
             c[0][0]
             for c in server_with_host.execute.call_args_list
@@ -979,7 +997,7 @@ class TestInterruptRestart:
                 refused="not_owner",
             ),
         )
-        result = _server.interrupt_kernel()
+        result = _tool(_server.interrupt_kernel)
         assert "already in use by another client" in result
         # The recovery named must be the person, not restart_kernel -- which is
         # refused for the same reason and would read as the way around this.
@@ -996,19 +1014,19 @@ class TestInterruptRestart:
         _app.set_promote_after(0.0)
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-A", "claude-code"))
-            _server.execute_code("x = 1")
+            _tool(_server.execute_code, "x = 1")
         assert _writers._claimed_by == "sess-A"
 
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
-            result = _server.restart_kernel()
+            result = _tool(_server.restart_kernel)
         assert "already in use by another client" in result
         server_with_host.restart.assert_not_called()
 
         # The holder itself is not blocked, and a fresh kernel is unclaimed.
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-A", "claude-code"))
-            assert "Kernel restarted" in _server.restart_kernel()
+            assert "Kernel restarted" in _tool(_server.restart_kernel)
         server_with_host.restart.assert_called_once()
         assert _writers._claimed_by is None
 
@@ -1023,12 +1041,12 @@ class TestInterruptRestart:
         _install_replies(server_with_host, returns=_result(status="timeout"))
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-A", "claude-code"))
-            _server.execute_code("x = 1")
+            _tool(_server.execute_code, "x = 1")
         assert _writers._claimed_by == "sess-A"
 
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
-            assert "already in use" in _server.restart_kernel()
+            assert "already in use" in _tool(_server.restart_kernel)
         server_with_host.restart.assert_not_called()
 
     def test_a_refusal_corrects_a_mirror_that_guessed_wrong(self, server_with_host):
@@ -1043,7 +1061,7 @@ class TestInterruptRestart:
         )
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
-            assert "already in use" in _server.execute_code("x = 1")
+            assert "already in use" in _tool(_server.execute_code, "x = 1")
         assert _writers._claimed_by == "sess-A"
 
     def test_a_known_holder_is_not_overwritten_by_a_stranger(self, server_with_host):
@@ -1055,7 +1073,7 @@ class TestInterruptRestart:
             _install_replies(server_with_host, returns=_result(status="timeout"))
             with pytest.MonkeyPatch().context() as mp:
                 mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
-                _server.execute_code("x = 1")
+                _tool(_server.execute_code, "x = 1")
             assert _writers._claimed_by == "sess-A"
         finally:
             _writers.clear_claim()
@@ -1069,7 +1087,7 @@ class TestInterruptRestart:
         try:
             with pytest.MonkeyPatch().context() as mp:
                 mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
-                result = _server.restart_kernel()
+                result = _tool(_server.restart_kernel)
         finally:
             _writers.clear_claim()
         assert "already in use by another client" in result
@@ -1080,7 +1098,7 @@ class TestInterruptRestart:
         # the claim -- the same rule submit() uses.
         _writers._claimed_by = "sess-A"
         try:
-            assert "Kernel restarted" in _server.restart_kernel()
+            assert "Kernel restarted" in _tool(_server.restart_kernel)
         finally:
             _writers.clear_claim()
 
@@ -1094,7 +1112,7 @@ class TestInterruptRestart:
                 refused="foreign_job",
             ),
         )
-        result = _server.interrupt_kernel()
+        result = _tool(_server.interrupt_kernel)
         # Must not read as "nothing was running" -- the agent would retry or move
         # on, when what it should do is wait for a person.
         assert "No running job" not in result
@@ -1102,25 +1120,25 @@ class TestInterruptRestart:
         assert "poll_job('job-3')" in result
 
     def test_restart_delegates_to_host(self, server_with_host):
-        result = _server.restart_kernel()
+        result = _tool(_server.restart_kernel)
         server_with_host.restart.assert_called_once()
         assert "restarted" in result.lower()
 
     def test_restart_reports_failure(self, server_with_host):
         server_with_host.restart.side_effect = RuntimeError("nope")
-        result = _server.restart_kernel()
+        result = _tool(_server.restart_kernel)
         assert "failed" in result.lower()
 
     def test_restart_no_host(self):
         _app._kernel_host = None
-        assert "not initialized" in _server.restart_kernel()
+        assert "not initialized" in _tool(_server.restart_kernel)
 
 
 class TestStartKernel:
     def test_ready_state_message(self, server_with_host):
         # ensure_started is synchronous: a ready result means the kernel is up.
         server_with_host.ensure_started.return_value = {"state": "ready"}
-        result = _server.start_kernel()
+        result = _tool(_server.start_kernel)
         server_with_host.ensure_started.assert_called_once()
         assert "ready" in result.lower()
         assert "execute_code" in result
@@ -1130,18 +1148,18 @@ class TestStartKernel:
             "state": "error",
             "error": "no Qt platform",
         }
-        result = _server.start_kernel()
+        result = _tool(_server.start_kernel)
         assert "failed to start" in result.lower()
         assert "no Qt platform" in result
         assert "start_kernel" in result  # retry guidance
 
     def test_no_host(self):
         _app._kernel_host = None
-        assert "not initialized" in _server.start_kernel()
+        assert "not initialized" in _tool(_server.start_kernel)
 
     def test_real_display_is_not_warned_about(self, server_with_host):
         server_with_host.ensure_started.return_value = {"state": "ready"}
-        assert "WARNING" not in _server.start_kernel()
+        assert "WARNING" not in _tool(_server.start_kernel)
 
     def test_virtual_display_warns_and_asks_the_agent_to_tell_the_user(
         self, server_with_host
@@ -1150,7 +1168,7 @@ class TestStartKernel:
         # so the only thing that reaches the user is the agent relaying it (#892).
         server_with_host.ensure_started.return_value = {"state": "ready"}
         server_with_host.virtual_display = ":2"
-        result = _server.start_kernel()
+        result = _tool(_server.start_kernel)
         assert "Kernel ready" in result  # still the success path
         assert ":2" in result
         assert "TELL THE USER" in result
@@ -1163,7 +1181,7 @@ class TestStartKernel:
             "error": "no Qt platform",
         }
         server_with_host.virtual_display = ":2"
-        assert "TELL THE USER" not in _server.start_kernel()
+        assert "TELL THE USER" not in _tool(_server.start_kernel)
 
     def test_execute_code_when_not_started_points_to_start_kernel(
         self, server_with_host
@@ -1177,7 +1195,7 @@ class TestStartKernel:
                 "server_status until it reports ready."
             ),
         )
-        result = _server.execute_code("1 + 1")
+        result = _tool(_server.execute_code, "1 + 1")
         assert "start_kernel" in result
 
 
@@ -1189,18 +1207,18 @@ class TestStartKernel:
 class TestServerStatus:
     def test_reports_not_initialized(self):
         _app._kernel_host = None
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "System" in result
         assert "not initialized" in result
 
     def test_reports_system_info(self, server_with_host):
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "cpu_usage" in result
         assert "memory_total" in result
         assert "process_rss" in result
 
     def test_reports_kernel_state(self, server_with_host):
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "## Kernel" in result
         assert "alive: True" in result
         assert "busy: False" in result
@@ -1209,17 +1227,17 @@ class TestServerStatus:
         server_with_host.execute.return_value = _result(
             stdout="## Dask\n  scheduler: threads\n## Viewer\n  layers: 0"
         )
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "scheduler: threads" in result
         assert "layers: 0" in result
 
     def test_handles_busy_kernel(self, server_with_host):
         server_with_host.execute.return_value = _result(status="busy")
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "busy" in result.lower()
 
     def test_no_sessions_or_bridge_sections(self, server_with_host):
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "Sessions" not in result
         assert "Bridge" not in result
 
@@ -1227,7 +1245,7 @@ class TestServerStatus:
         from biopb_mcp.mcp import _observe
 
         monkeypatch.setattr(_observe, "_mounted_http", False)
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "## Observe" in result
         assert "not running" in result
 
@@ -1235,7 +1253,7 @@ class TestServerStatus:
         from biopb_mcp.mcp import _observe
 
         monkeypatch.setattr(_observe, "_mounted_http", True)
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "## Observe" in result
         # The observe page is served by the control front; this child hosts only
         # the /api/* it calls, so server_status points at the API mount.
@@ -1248,7 +1266,7 @@ class TestServerStatus:
         # Observe is server-process state -> reported despite no kernel.
         _app._kernel_host = None
         monkeypatch.setattr(_observe, "_mounted_http", True)
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "## Observe" in result
         assert "/api" in result
 
@@ -1265,7 +1283,7 @@ class TestServerStatus:
             "recent_respawns": 0,
             "watchdog_running": True,
         }
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "ready: False" in result
         # alive but not ready -> booting (e.g. a watchdog respawn).
         assert "starting" in result.lower()
@@ -1342,7 +1360,7 @@ class TestServerStatus:
             "recent_respawns": 0,
             "watchdog_running": False,
         }
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "not started" in result.lower()
         assert "start_kernel" in result
         assert "napari viewer window" in result  # teardown attribution
@@ -1361,7 +1379,7 @@ class TestServerStatus:
             "recent_respawns": 3,
             "watchdog_running": False,
         }
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "DEAD" in result
         assert "starting" not in result.lower()
         assert "state: failed" not in result
@@ -1382,7 +1400,7 @@ class TestServerStatus:
             "recent_respawns": 0,
             "watchdog_running": False,
         }
-        result = _server.server_status()
+        result = _tool(_server.server_status)
         assert "failed" in result.lower()
         assert "no Qt platform" in result
         assert "start_kernel" in result
@@ -1606,11 +1624,11 @@ class TestPollJobRendersAVerification:
 
     @pytest.fixture(autouse=True)
     def _fast_sleep(self, monkeypatch):
-        monkeypatch.setattr(_server.time, "sleep", lambda *a, **k: None)
+        monkeypatch.setattr(_server.asyncio, "sleep", _no_sleep)
 
     def test_a_terminal_verification_polls_as_its_report(self, server_with_host):
         _install_replies(server_with_host, returns=_job_reply(**_verify_snapshot()))
-        result = _server.poll_job("job-1")
+        result = _tool(_server.poll_job, "job-1")
         assert "job-1: ok" in result
         assert "Verified" in result and "Save workflow" in result
 
@@ -1619,7 +1637,7 @@ class TestPollJobRendersAVerification:
         snap["status"] = "running"
         snap["stdout"] = "one\n"
         _install_replies(server_with_host, returns=_job_reply(**snap))
-        result = _server.poll_job("job-1")
+        result = _tool(_server.poll_job, "job-1")
         assert "Partial output" in result and "one" in result
 
     def test_an_ordinary_job_is_unaffected(self, server_with_host):
@@ -1627,4 +1645,155 @@ class TestPollJobRendersAVerification:
             server_with_host,
             returns=_job_reply(**_snapshot(status="ok", stdout="hi\n")),
         )
-        assert "hi" in _server.poll_job("job-1")
+        assert "hi" in _tool(_server.poll_job, "job-1")
+
+
+class TestToolsDoNotStallTheEventLoop:
+    """A tool that blocks does not make its own caller wait -- it makes every
+    caller wait.
+
+    One process serves ``/mcp``, the observe page and the chat turn on one event
+    loop, and the MCP SDK invokes a synchronous tool function directly on it. So
+    the tools are ``async def`` and put each kernel round trip on a thread. These
+    two pin that: nothing else in the suite would notice a tool that quietly went
+    back to blocking, because a blocked loop still returns the right answer.
+    """
+
+    def test_every_registered_tool_is_async(self):
+        # The guard for tools this file does not otherwise exercise: the SDK
+        # reads async-ness off the function, so a `def` here is a stall.
+        sync = [t.name for t in _app.mcp._tool_manager.list_tools() if not t.is_async]
+        assert not sync, f"a synchronous tool stalls the whole server: {sync}"
+
+    @staticmethod
+    async def _ticks_during(coro, tick=0.01):
+        """Await *coro*, counting how often the loop got back to a second task."""
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await _real_asleep(tick)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            result = await coro
+        finally:
+            beat.cancel()
+        return ticks, result
+
+    def test_a_slow_kernel_round_trip_leaves_the_loop_free(self, server_with_host):
+        # A round trip waits on the kernel lock and then on the reply; 0.3s is a
+        # modest one (execute_timeout is 120s).
+        def slow(*_args, **_kwargs):
+            time.sleep(0.3)
+            return _result(stdout="viewer\n")
+
+        server_with_host.execute.side_effect = slow
+        ticks, result = asyncio.run(
+            self._ticks_during(_server.inspect_object("viewer"))
+        )
+        assert "viewer" in result
+        # ~30 at a 10 ms tick. On the loop it would be exactly zero.
+        assert ticks > 5, f"the loop was stalled for the round trip ({ticks} ticks)"
+
+    def test_the_promote_window_leaves_the_loop_free(self, server_with_host):
+        # The window a long cell actually spends here, and the one the observe
+        # page used to go dark for.
+        _app.set_promote_after(1.0)
+        _install_replies(
+            server_with_host,
+            queue=[_job_reply(job_id="job-1")],
+            returns=_job_reply(**_snapshot(status="running")),
+        )
+        ticks, result = asyncio.run(self._ticks_during(_server.execute_code("x = 1")))
+        assert "still running" in result
+        assert ticks > 20, f"the loop was stalled for the window ({ticks} ticks)"
+
+
+class TestRestartAndTheClaimAreOneStep:
+    """A restart replaces the kernel and resets the one-agent claim, and the two
+    have to be indivisible.
+
+    The tools await their kernel round trips off the loop, so a submit claiming
+    the kernel genuinely overlaps a restart clearing it. If the claim lands
+    between the bring-up and the clear, the clear wipes a claim the agent
+    legitimately holds on the *new* kernel -- and an empty mirror over a held
+    kernel is what lets a stranger restart the session that just started.
+    """
+
+    @staticmethod
+    def _restart_that_waits(host):
+        """Make ``host.restart`` block until released. Returns (started, release)."""
+        started, release = threading.Event(), threading.Event()
+
+        def slow_restart():
+            started.set()
+            assert release.wait(5.0), "test did not release the restart"
+
+        host.restart.side_effect = slow_restart
+        return started, release
+
+    def test_a_claim_made_during_a_restart_is_not_lost(self, server_with_host):
+        started, release = self._restart_that_waits(server_with_host)
+        restarting = threading.Thread(
+            target=_writers.restart_for_user, args=(server_with_host,)
+        )
+        restarting.start()
+        try:
+            assert started.wait(5.0)
+
+            # The kernel is back but the restart has not cleared the mirror yet
+            # -- exactly where a submit's claim used to be swallowed.
+            claiming = threading.Thread(target=_writers._note_claim, args=("agent-A",))
+            claiming.start()
+            claiming.join(0.3)
+            assert claiming.is_alive(), "the claim was taken mid-restart"
+        finally:
+            release.set()  # never leave the restart thread parked on a failure
+        restarting.join(5.0)
+        claiming.join(5.0)
+        assert _writers.claim_holder() == "agent-A"
+
+    def test_the_gate_cannot_go_stale_mid_restart(self, server_with_host):
+        """A gated restart reads the holder inside the same critical section it
+        restarts in, so nobody can claim the kernel after the gate lets it by."""
+        started, release = self._restart_that_waits(server_with_host)
+        result = {}
+        restarting = threading.Thread(
+            target=lambda: result.update(
+                refusal=_writers.restart(server_with_host, "agent-A")
+            )
+        )
+        restarting.start()
+        try:
+            assert started.wait(5.0)
+
+            claiming = threading.Thread(target=_writers._note_claim, args=("agent-B",))
+            claiming.start()
+            claiming.join(0.3)
+            assert claiming.is_alive(), "a claim slipped in behind the gate"
+        finally:
+            release.set()
+        restarting.join(5.0)
+        claiming.join(5.0)
+        assert result["refusal"] is None  # agent-A held nothing; it was let through
+        assert _writers.claim_holder() == "agent-B"
+
+    def test_a_failed_restart_leaves_the_claim_alone(self, server_with_host):
+        # The old kernel may still be there, so its holder still holds it.
+        _writers._note_claim("agent-A")
+        server_with_host.restart.side_effect = RuntimeError("port in use")
+        with pytest.raises(RuntimeError):
+            _writers.restart_for_user(server_with_host)
+        assert _writers.claim_holder() == "agent-A"
+
+    def test_the_tool_still_refuses_a_non_holder(self, server_with_host):
+        _writers._note_claim("agent-A")
+        _writers._local_identity.set(("agent-B", "B"))
+        try:
+            assert "already in use" in _tool(_server.restart_kernel)
+        finally:
+            _writers._local_identity.set(None)
+        server_with_host.restart.assert_not_called()
