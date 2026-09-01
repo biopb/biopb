@@ -300,12 +300,13 @@ async def _api_restart(request):
     if err is not None:
         return err
     try:
-        # A restart is seconds of process teardown and bring-up. On the loop it
-        # would take the whole server -- this page included -- down with it.
-        await asyncio.to_thread(host.restart)
+        # Restart and clear as one critical section (_writers.restart_for_user):
+        # an agent's submit can land between them, and it would lose the claim
+        # it just made on the new kernel. Off the loop because a restart is
+        # seconds of teardown and bring-up, which would take this page with it.
+        await asyncio.to_thread(_writers.restart_for_user, host)
     except Exception as exc:  # noqa: BLE001 - report restart failure
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
-    _writers.clear_claim()
     return JSONResponse({"ok": True})
 
 

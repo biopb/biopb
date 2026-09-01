@@ -980,18 +980,17 @@ async def restart_kernel() -> str:
     if err is not None:
         return err
     # Gated like every other state change, and this is the sharpest of them: a
-    # restart discards the holder's whole session. Decided against the local
-    # mirror (_claimed_by) rather than a round trip to the kernel, so a kernel
-    # too busy to answer cannot be mistaken for an unclaimed one.
+    # restart discards the holder's whole session. Gate, restart and clear are
+    # one call because they have to be one critical section -- see
+    # _writers.restart. It blocks for the length of the bring-up, so it goes to
+    # a thread like every other kernel round trip here.
     writer, _label = _writers._client_identity()
-    held = _writers.claim_holder()
-    if held is not None and writer is not None and writer != held:
-        return _writers._NOT_OWNER_MSG.format(held_by="")
     try:
-        await asyncio.to_thread(host.restart)
+        refusal = await asyncio.to_thread(_writers.restart, host, writer)
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
-    _writers.clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
+    if refusal is not None:
+        return refusal
     return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 

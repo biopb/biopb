@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import sys
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -1709,3 +1710,90 @@ class TestToolsDoNotStallTheEventLoop:
         ticks, result = asyncio.run(self._ticks_during(_server.execute_code("x = 1")))
         assert "still running" in result
         assert ticks > 20, f"the loop was stalled for the window ({ticks} ticks)"
+
+
+class TestRestartAndTheClaimAreOneStep:
+    """A restart replaces the kernel and resets the one-agent claim, and the two
+    have to be indivisible.
+
+    The tools await their kernel round trips off the loop, so a submit claiming
+    the kernel genuinely overlaps a restart clearing it. If the claim lands
+    between the bring-up and the clear, the clear wipes a claim the agent
+    legitimately holds on the *new* kernel -- and an empty mirror over a held
+    kernel is what lets a stranger restart the session that just started.
+    """
+
+    @staticmethod
+    def _restart_that_waits(host):
+        """Make ``host.restart`` block until released. Returns (started, release)."""
+        started, release = threading.Event(), threading.Event()
+
+        def slow_restart():
+            started.set()
+            assert release.wait(5.0), "test did not release the restart"
+
+        host.restart.side_effect = slow_restart
+        return started, release
+
+    def test_a_claim_made_during_a_restart_is_not_lost(self, server_with_host):
+        started, release = self._restart_that_waits(server_with_host)
+        restarting = threading.Thread(
+            target=_writers.restart_for_user, args=(server_with_host,)
+        )
+        restarting.start()
+        try:
+            assert started.wait(5.0)
+
+            # The kernel is back but the restart has not cleared the mirror yet
+            # -- exactly where a submit's claim used to be swallowed.
+            claiming = threading.Thread(target=_writers._note_claim, args=("agent-A",))
+            claiming.start()
+            claiming.join(0.3)
+            assert claiming.is_alive(), "the claim was taken mid-restart"
+        finally:
+            release.set()  # never leave the restart thread parked on a failure
+        restarting.join(5.0)
+        claiming.join(5.0)
+        assert _writers.claim_holder() == "agent-A"
+
+    def test_the_gate_cannot_go_stale_mid_restart(self, server_with_host):
+        """A gated restart reads the holder inside the same critical section it
+        restarts in, so nobody can claim the kernel after the gate lets it by."""
+        started, release = self._restart_that_waits(server_with_host)
+        result = {}
+        restarting = threading.Thread(
+            target=lambda: result.update(
+                refusal=_writers.restart(server_with_host, "agent-A")
+            )
+        )
+        restarting.start()
+        try:
+            assert started.wait(5.0)
+
+            claiming = threading.Thread(target=_writers._note_claim, args=("agent-B",))
+            claiming.start()
+            claiming.join(0.3)
+            assert claiming.is_alive(), "a claim slipped in behind the gate"
+        finally:
+            release.set()
+        restarting.join(5.0)
+        claiming.join(5.0)
+        assert result["refusal"] is None  # agent-A held nothing; it was let through
+        assert _writers.claim_holder() == "agent-B"
+
+    def test_a_failed_restart_leaves_the_claim_alone(self, server_with_host):
+        # The old kernel may still be there, so its holder still holds it.
+        _writers._note_claim("agent-A")
+        server_with_host.restart.side_effect = RuntimeError("port in use")
+        with pytest.raises(RuntimeError):
+            _writers.restart_for_user(server_with_host)
+        assert _writers.claim_holder() == "agent-A"
+
+    def test_the_tool_still_refuses_a_non_holder(self, server_with_host):
+        _writers._note_claim("agent-A")
+        _writers._local_identity.set(("agent-B", "B"))
+        try:
+            assert "already in use" in _tool(_server.restart_kernel)
+        finally:
+            _writers._local_identity.set(None)
+        server_with_host.restart.assert_not_called()
