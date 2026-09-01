@@ -198,28 +198,15 @@ async def _api_jobs(request):
     result, res, _w = await _kernel_rpc._job_call(host, "jobs_view")
     if result is None:
         return _kernel_error(res)
-    # The workflow, and a running verification, are the session child's to
-    # report: both belong to the scratch kernel, which the session kernel cannot
-    # see. Merged into the same reply because the page redraws from all three
-    # and this poll runs about once a second for the life of the session.
+    # The scratch kernel's runs and its verified workflow are the session
+    # child's to report: both live here, and the session kernel cannot see
+    # either. Its runs are a *separate* list rather than rows merged into
+    # `jobs`, because they ran in a different kernel -- the page shows one
+    # kernel at a time and says which. Merged into the same reply because the
+    # page redraws from all of it and this poll runs about once a second for
+    # the life of the session.
     result["workflow"] = _scratch.verified_summary()
-    verifying = _scratch.running()
-    if verifying is not None:
-        # One row for the *run*, not one per cell. It is here so the page can
-        # say what the kernel is busy with -- and so a person can interrupt a
-        # verification they did not start, which is otherwise unreachable.
-        result["jobs"] = list(result["jobs"]) + [
-            {
-                "job_id": verifying["job_id"],
-                "status": "running",
-                "origin": "mcp",
-                "elapsed": verifying["elapsed"],
-                "stdout_len": len(verifying["stdout"] or ""),
-                "code_preview": (f"verify workflow ({verifying['cell_count']} cells)"),
-                "intent_preview": verifying["intent"],
-                "verify": True,
-            }
-        ]
+    result["verify_jobs"] = _scratch.runs_view()
     return JSONResponse(result)
 
 
@@ -306,10 +293,11 @@ async def _api_interrupt(request):
     host, err = _require_host()
     if err is not None:
         return err
-    # Whichever kernel holds the running job. The slot is global, so "the
-    # running job" is unambiguous -- and a verification the *agent* started is
-    # stoppable from here, which is the point of giving it a row.
-    if _scratch.running() is not None:
+    # Which kernel to stop. The page says which one it is showing, so it says
+    # which one this means; `target` absent keeps the older page's behaviour,
+    # which was to stop whichever kernel held the slot.
+    target = request.query_params.get("target")
+    if target == "verify" or (target is None and _scratch.running() is not None):
         data = await asyncio.to_thread(_scratch.interrupt, _USER_INTERRUPT_MSG)
         return JSONResponse(data or {"interrupted": False})
     # Force a KeyboardInterrupt into the running job's worker thread (SIGINT only

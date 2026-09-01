@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _app, _http, _kernel_rpc, _observe
+from biopb_mcp.mcp import _app, _http, _kernel_rpc, _observe, _scratch
 
 
 def _reply(r, window_alive=True):
@@ -243,6 +243,87 @@ def test_api_notebook_empty_session(client, host):
     # Still a valid notebook: title + bootstrap, no job cells.
     assert nb["nbformat"] == 4
     assert any(c["cell_type"] == "code" for c in nb["cells"])
+
+
+class TestTheTwoKernels:
+    """The page shows one kernel at a time, so the API answers for one at a time.
+
+    A verification runs in a scratch kernel the session kernel has never heard
+    of. Merging its runs into ``jobs`` said they were this session's history;
+    they are a separate list, and the interrupt says which kernel it means.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clean_scratch(self):
+        _scratch.reset()
+        yield
+        _scratch.reset()
+
+    def _running_verification(self, monkeypatch):
+        snap = {
+            "job_id": "verify-1",
+            "status": "running",
+            "elapsed": 1.0,
+            "stdout": "",
+            "intent": "check it",
+            "cell_count": 2,
+        }
+        monkeypatch.setattr(_scratch, "running", lambda: snap)
+        monkeypatch.setattr(
+            _scratch,
+            "runs_view",
+            lambda: [
+                {
+                    "job_id": "verify-1",
+                    "status": "running",
+                    "origin": "mcp",
+                    "elapsed": 1.0,
+                    "code_preview": "wf (2 cells)",
+                    "intent_preview": "check it",
+                    "verify": True,
+                }
+            ],
+        )
+        return snap
+
+    def test_verifications_are_their_own_list(self, client, host, monkeypatch):
+        host.execute.return_value = _reply(
+            {"jobs": [{"job_id": "job-1", "status": "ok", "elapsed": 0.1}]}
+        )
+        self._running_verification(monkeypatch)
+        body = client.get("/api/jobs").json()
+        assert [j["job_id"] for j in body["jobs"]] == ["job-1"]
+        assert [j["job_id"] for j in body["verify_jobs"]] == ["verify-1"]
+
+    def test_interrupt_stops_the_kernel_it_is_told_to(self, client, host, monkeypatch):
+        self._running_verification(monkeypatch)
+        called = []
+        monkeypatch.setattr(
+            _scratch,
+            "interrupt",
+            lambda *a, **k: called.append(a) or {"interrupted": True},
+        )
+        host.execute.return_value = _reply({"job_id": "job-1", "interrupted": True})
+
+        # A session job and a verification can both be in flight; without the
+        # target, stopping one from the page stopped the other.
+        assert client.post("/api/kernel/interrupt?target=session").json()["job_id"]
+        assert not called
+        assert "interrupt_current(" in host.execute.call_args[0][0]
+
+        assert client.post("/api/kernel/interrupt?target=verify").json()["interrupted"]
+        assert called
+
+    def test_an_older_page_still_stops_whatever_is_running(
+        self, client, host, monkeypatch
+    ):
+        # No `target`: the pre-toggle behaviour, which was to stop whichever
+        # kernel held the slot.
+        self._running_verification(monkeypatch)
+        monkeypatch.setattr(
+            _scratch, "interrupt", lambda *a, **k: {"interrupted": True}
+        )
+        assert client.post("/api/kernel/interrupt").json()["interrupted"] is True
 
 
 def test_api_interrupt_targets_running_job(client, host):

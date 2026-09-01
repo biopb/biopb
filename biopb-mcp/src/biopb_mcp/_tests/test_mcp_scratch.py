@@ -191,6 +191,56 @@ class TestRunningAVerification:
         assert "unavailable" in _scratch.start(["1"], "", _session_host())["error"]
 
 
+class TestTheRunList:
+    """What the observe page's verification pane reads.
+
+    A verification is not a session job, so it is not in the session kernel's
+    list -- which leaves this the only record that a run happened at all.
+    """
+
+    def test_finished_runs_stay_listed_after_the_next_one_starts(self):
+        _scratch.set_host_factory(lambda: _scratch_host(title="first"))
+        first = _scratch.start(["a = 2"], "first", _session_host())["job_id"]
+        _settle(first)
+        _scratch.set_host_factory(lambda: _scratch_host(title="second"))
+        second = _scratch.start(["b = 3"], "second", _session_host())["job_id"]
+        _settle(second)
+
+        rows = _scratch.runs_view()
+        assert [r["job_id"] for r in rows] == [first, second]  # oldest first
+        assert all(r["verify"] and r["origin"] == "mcp" for r in rows)
+        # The title is the row's "why"; a verification has no other one.
+        assert rows[0]["intent_preview"] == "first"
+        assert rows[0]["code_preview"] == "1 cell"
+
+    def test_a_finished_run_can_still_be_opened(self):
+        _scratch.set_host_factory(lambda: _scratch_host())
+        first = _scratch.start(["a = 2"], "first", _session_host())["job_id"]
+        _settle(first)
+        _settle(_scratch.start(["b = 3"], "second", _session_host())["job_id"])
+
+        # The row is in the list, so the detail view behind it must answer --
+        # a row that 404s is worse than no row (see _scratch.detail).
+        assert _scratch.poll(first)["status"] == "ok"
+        assert _scratch.detail(first)["code"] == "a = 2"
+
+    def test_the_list_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(_scratch, "_HISTORY_MAX", 2)
+        _scratch.set_host_factory(lambda: _scratch_host())
+        ids = []
+        for i in range(4):
+            ids.append(_scratch.start([f"a = {i}"], f"w{i}", _session_host())["job_id"])
+            _settle(ids[-1])
+        # Two kept plus the current one, and it is the oldest that goes.
+        assert [r["job_id"] for r in _scratch.runs_view()] == ids[1:]
+
+    def test_reset_forgets_the_list(self):
+        _scratch.set_host_factory(lambda: _scratch_host())
+        _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+        _scratch.reset()
+        assert _scratch.runs_view() == []
+
+
 class TestTheSlot:
     """One job at a time is a rule about the session, not about one kernel.
 

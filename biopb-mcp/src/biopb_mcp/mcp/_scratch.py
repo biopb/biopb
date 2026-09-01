@@ -59,6 +59,14 @@ _lock = threading.RLock()
 _run = None
 _seq = 0
 
+#: Verifications that have finished, oldest first. Kept because the observe page
+#: shows this kernel's runs as a list beside the session kernel's, and a list
+#: that forgets everything but the newest cannot say what the agent has already
+#: tried. Bounded: a run holds its per-cell record, and nobody scrolls past a
+#: few.
+_history = []
+_HISTORY_MAX = 20
+
 # The last verification whose every cell ran, as its record dict. Kept across
 # later attempts: a run that fails afterwards does not un-verify the one that
 # passed, and the user may well be mid-way through a second attempt when they
@@ -138,8 +146,8 @@ def detail(job_id):
     snap = poll(job_id)
     if snap is None:
         return None
-    with _lock:
-        cells = list(_run["cells"]) if _run and _run["job_id"] == job_id else []
+    run = _find(job_id)
+    cells = list(run["cells"]) if run is not None else []
     record = snap.get("verify") or {}
     lines = [snap["stdout"].rstrip()] if snap.get("stdout") else []
     for i, cell in enumerate(record.get("cells") or [], 1):
@@ -173,12 +181,53 @@ def owns(job_id):
     return isinstance(job_id, str) and job_id.startswith(_ID_PREFIX)
 
 
-def poll(job_id):
-    """The snapshot for *job_id*, or ``None`` if this is not a run we know."""
+def _find(job_id):
+    """The run dict for *job_id* -- current or finished -- or ``None``."""
     with _lock:
         if _run is not None and _run["job_id"] == job_id:
-            return _snapshot(_run)
+            return _run
+        for run in _history:
+            if run["job_id"] == job_id:
+                return run
     return None
+
+
+def poll(job_id):
+    """The snapshot for *job_id*, or ``None`` if this is not a run we know."""
+    run = _find(job_id)
+    return None if run is None else _snapshot(run)
+
+
+def runs_view():
+    """Every verification this session has run, oldest first.
+
+    The row shape the observe page renders a job in, so its verification pane is
+    the same list component as its session pane rather than a second one.
+
+    Where a session job's "why" is the intent its writer gave that cell, a
+    verification has neither: the cells arrive as bare code and the run's intent
+    is synthesized from the title (``_server.verify_workflow``). So the title
+    *is* the why, and the row says it once -- the count is the what. A workflow
+    cell needs no intent of its own the way a transcript cell does: it was
+    written to be read.
+    """
+    with _lock:
+        runs = [*_history, _run] if _run is not None else list(_history)
+        return [
+            {
+                "job_id": run["job_id"],
+                "status": run["status"],
+                "origin": "mcp",
+                "elapsed": _elapsed(run),
+                "code_preview": (
+                    f"{len(run['cells'])} cell"
+                    + ("s" if len(run["cells"]) != 1 else "")
+                ),
+                "intent_preview": run["title"],
+                "verify": True,
+            }
+            for run in runs
+        ]
 
 
 def verified():
@@ -254,6 +303,9 @@ def start(cells, title, session_host, intent="", writer=None, writer_label=""):
                 "running_job_id": busy.get("job_id"),
                 "running_job_origin": busy.get("origin"),
             }
+        if _run is not None:
+            _history.append(_run)
+            del _history[:-_HISTORY_MAX]
         _seq += 1
         _run = {
             "job_id": f"{_ID_PREFIX}{_seq}",
@@ -477,3 +529,4 @@ def reset():
     discard()
     with _lock:
         _run, _verified, _seq = None, None, 0
+        _history.clear()
