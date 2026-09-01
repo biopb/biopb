@@ -24,6 +24,7 @@ import pytest
 pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
+from biopb_mcp._tests.conftest import call_tool as _tool
 from biopb_mcp.mcp import _app, _jobs, _kernel_rpc, _server  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
@@ -732,13 +733,15 @@ class TestNapariJobs:
 
     def test_screenshot_and_status_during_job(self, napari_kernel):
         _app.set_promote_after(0.5)
-        handle = _server.execute_code("import time; time.sleep(4.0); print('done')")
+        handle = _tool(
+            _server.execute_code, "import time; time.sleep(4.0); print('done')"
+        )
         assert "still running" in handle  # promoted to a job
 
         # The agent is NOT blind: screenshot + status work mid-job.
-        shot = _server.take_screenshot()
+        shot = _tool(_server.take_screenshot)
         assert shot[0].type == "image"
-        status = _server.server_status()
+        status = _tool(_server.server_status)
         assert "## Jobs" in status
         assert "running" in status
 

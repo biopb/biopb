@@ -14,6 +14,7 @@ A leaf module: it knows the shape of the hop and nothing about who is making it
 (no claim, no digest, no tool surface).
 """
 
+import asyncio
 import json
 import logging
 
@@ -129,6 +130,29 @@ def _run_job_call(host, name: str, *args, **kwargs):
     if payload is None:
         return None, res, None
     return payload.get("r"), res, payload.get("w")
+
+
+async def _job_call(host, name: str, *args, **kwargs):
+    """:func:`_run_job_call` off the event loop.
+
+    The round trip blocks: it waits on the kernel's lock (up to
+    ``kernel.busy_lock_timeout``) and then on the reply. Every surface in this
+    process shares one event loop -- ``/mcp``, the observe page, the chat
+    turn -- so a round trip made on it is not one caller waiting but all of
+    them: a five-second call leaves the observe page, ``/api/status`` and any
+    concurrent tool call unserved for five seconds.
+
+    The kernel host already expects concurrent callers -- its lock exists
+    because the tools and the observe API reach it at the same time -- so the
+    thread is free of anything but the wait.
+    """
+    return await asyncio.to_thread(_run_job_call, host, name, *args, **kwargs)
+
+
+async def _execute(host, code: str, timeout=None):
+    """``host.execute`` off the event loop, for the snippets that are not job
+    calls (screenshot, inspect, status). See :func:`_job_call`."""
+    return await asyncio.to_thread(host.execute, code, timeout)
 
 
 def _window_note(window_alive) -> str:
