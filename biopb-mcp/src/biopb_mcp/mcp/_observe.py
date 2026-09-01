@@ -293,11 +293,11 @@ async def _api_interrupt(request):
     host, err = _require_host()
     if err is not None:
         return err
-    # Which kernel to stop. The page says which one it is showing, so it says
-    # which one this means; `target` absent keeps the older page's behaviour,
-    # which was to stop whichever kernel held the slot.
-    target = request.query_params.get("target")
-    if target == "verify" or (target is None and _scratch.running() is not None):
+    # Whichever kernel holds the running job. The slot spans both -- a session
+    # cell is refused while a verification runs and vice versa -- so "the
+    # running job" is unambiguous, and the button exists only on the row that
+    # is it.
+    if _scratch.running() is not None:
         data = await asyncio.to_thread(_scratch.interrupt, _USER_INTERRUPT_MSG)
         return JSONResponse(data or {"interrupted": False})
     # Force a KeyboardInterrupt into the running job's worker thread (SIGINT only

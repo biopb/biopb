@@ -250,7 +250,7 @@ class TestTheTwoKernels:
 
     A verification runs in a scratch kernel the session kernel has never heard
     of. Merging its runs into ``jobs`` said they were this session's history;
-    they are a separate list, and the interrupt says which kernel it means.
+    they are a separate list.
     """
 
     @pytest.fixture(autouse=True)
@@ -295,35 +295,17 @@ class TestTheTwoKernels:
         assert [j["job_id"] for j in body["jobs"]] == ["job-1"]
         assert [j["job_id"] for j in body["verify_jobs"]] == ["verify-1"]
 
-    def test_interrupt_stops_the_kernel_it_is_told_to(self, client, host, monkeypatch):
-        self._running_verification(monkeypatch)
-        called = []
-        monkeypatch.setattr(
-            _scratch,
-            "interrupt",
-            lambda *a, **k: called.append(a) or {"interrupted": True},
-        )
-        host.execute.return_value = _reply({"job_id": "job-1", "interrupted": True})
-
-        # A session job and a verification can both be in flight; without the
-        # target, stopping one from the page stopped the other.
-        assert client.post("/api/kernel/interrupt?target=session").json()["job_id"]
-        assert not called
-        assert "interrupt_current(" in host.execute.call_args[0][0]
-
-        assert client.post("/api/kernel/interrupt?target=verify").json()["interrupted"]
-        assert called
-
-    def test_an_older_page_still_stops_whatever_is_running(
+    def test_the_interrupt_finds_the_kernel_that_is_busy(
         self, client, host, monkeypatch
     ):
-        # No `target`: the pre-toggle behaviour, which was to stop whichever
-        # kernel held the slot.
+        # No target argument, and none is needed: the slot spans both kernels,
+        # so only one of them can have a running row for the button to sit on.
         self._running_verification(monkeypatch)
         monkeypatch.setattr(
             _scratch, "interrupt", lambda *a, **k: {"interrupted": True}
         )
         assert client.post("/api/kernel/interrupt").json()["interrupted"] is True
+        host.execute.assert_not_called()
 
 
 def test_api_interrupt_targets_running_job(client, host):
