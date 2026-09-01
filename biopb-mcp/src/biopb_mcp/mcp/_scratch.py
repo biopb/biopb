@@ -62,10 +62,16 @@ _seq = 0
 #: Verifications that have finished, oldest first. Kept because the observe page
 #: shows this kernel's runs as a list beside the session kernel's, and a list
 #: that forgets everything but the newest cannot say what the agent has already
-#: tried. Bounded: a run holds its per-cell record, and nobody scrolls past a
-#: few.
+#: tried.
+#:
+#: Bounded, but well above what anyone scrolls: this is the *only* record a
+#: verification leaves -- the kernel that ran it is gone -- so the cap is set by
+#: what it costs to keep one, not by what fits on a screen. A run holds its
+#: cells and a per-cell record whose output is already capped to a head, so a
+#: full list is well under a megabyte. The session kernel keeps 200 jobs for the
+#: same reason; verifications are far rarer than cells.
 _history = []
-_HISTORY_MAX = 20
+_HISTORY_MAX = 100
 
 # The last verification whose every cell ran, as its record dict. Kept across
 # later attempts: a run that fails afterwards does not un-verify the one that
