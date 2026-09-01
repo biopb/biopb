@@ -118,7 +118,6 @@ def _record(**kw):
         "title": "Count foci per cell",
         "created": 1_700_000_000.0,
         "status": "ok",
-        "added_layers": [],
         "cells": [
             {
                 "code": "a = 2",
@@ -163,21 +162,44 @@ def test_a_workflow_cell_carries_no_audit_header():
 
 def test_the_intro_states_what_the_run_did_and_did_not_prove():
     intro = "".join(_notebook.build_workflow_notebook(_record())["cells"][0]["source"])
-    assert "scratch namespace" in intro
+    assert "scratch kernel" in intro
     assert "2 cell(s)" in intro
-    # The residual is named, not hidden.
-    assert "viewer" in intro and "sys.modules" in intro
+    # The residual is named, not hidden -- and it is a narrower one than the
+    # namespace model had: the process is clean, the world it talks to is not.
+    assert "tensor server" in intro and "filesystem" in intro
+    # ...and the claim the old model could not make is now made.
+    assert "no layer the session happened to have" in intro
 
 
-def test_added_layers_are_reported_when_there_are_any():
-    plain = "".join(_notebook.build_workflow_notebook(_record())["cells"][0]["source"])
-    assert "added to the live viewer" not in plain
-    noted = "".join(
-        _notebook.build_workflow_notebook(_record(added_layers=["foci", "nuclei"]))[
-            "cells"
-        ][0]["source"]
-    )
-    assert "`foci`, `nuclei`" in noted
+def test_the_workflow_notebook_has_no_viewer_and_the_audit_one_does():
+    """The two exports differ by exactly one thing, and it is deliberate.
+
+    A workflow is run by someone already looking at their own screen, so the
+    viewer is one dependency it does not need -- and dropping it is what lets
+    the notebook run headless, under `nbconvert --execute`. The audit export
+    keeps it, because a session transcript is full of viewer cells that need
+    somewhere to land.
+
+    This is also the scratch kernel's policy (`_bootstrap`), and the two have to
+    agree: a workflow verified without a viewer is one this cell can rebuild
+    exactly.
+    """
+    wf = "".join(_notebook.build_workflow_notebook(_record())["cells"][1]["source"])
+    # The *code*, not the comment that explains its absence.
+    code = "\n".join(ln for ln in wf.splitlines() if not ln.lstrip().startswith("#"))
+    assert "napari" not in code and "viewer" not in code
+    assert "get_ipython" in code and "_load_namespace_plugins" in code  # plugins stay
+    assert "build_ops" in code and "TensorConnection" in code  # ops/client stay
+    compile(wf, "<workflow-bootstrap>", "exec")
+
+    audit = "".join(_notebook.build_notebook([])["cells"][1]["source"])
+    assert "import napari" in audit and "napari.Viewer()" in audit
+    compile(audit, "<audit-bootstrap>", "exec")
+
+
+def test_the_workflow_intro_says_there_is_no_viewer():
+    intro = "".join(_notebook.build_workflow_notebook(_record())["cells"][0]["source"])
+    assert "no napari viewer" in intro and "headless" in intro
 
 
 def test_an_empty_record_still_builds():

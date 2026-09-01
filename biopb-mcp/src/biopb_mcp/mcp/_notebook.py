@@ -33,7 +33,7 @@ import datetime
 # it reads the *current* config — the audit notebook is not pinned to the config
 # captured at export. The live napari layers, the distributed dask cluster, and
 # any interactive state are not reproducible (see module docstring).
-BOOTSTRAP_SRC = """\
+_BOOTSTRAP_HEAD = """\
 # === biopb-mcp session bootstrap (best-effort audit reconstruction) ===
 # Rebuilds np / da, the data-plane `client`, the compute-plane `ops`, and an
 # (empty) napari `viewer` so the recorded cells below can, in principle, re-run.
@@ -48,11 +48,18 @@ from biopb_mcp.mcp._process_ops import build_ops_from_config
 
 config = load_config()
 _conn = TensorConnection()
-_conn.auto_connect()          # synchronous best-effort connect (audit; no async service)
+_conn.auto_connect()          # synchronous best-effort connect (no async service here)
 client = _conn.client
 
 ops = build_ops_from_config(config, lambda: _conn.client)
+"""
 
+#: The audit export's extra stage. A session transcript is full of viewer cells,
+#: so the reconstruction needs somewhere for them to land -- best-effort, and
+#: None when there is no display, in which case those cells fail where they are.
+#: The *workflow* export has no counterpart on purpose: see
+#: WORKFLOW_BOOTSTRAP_SRC.
+_BOOTSTRAP_VIEWER = """
 # Best-effort empty viewer via the Qt magic; degrades to None when headless
 # (e.g. `nbconvert --execute` with no display), in which case viewer cells fail.
 try:
@@ -63,7 +70,9 @@ try:
 except Exception as _exc:  # noqa: BLE001 - audit notebook tolerates no display
     viewer = None
     print("napari viewer unavailable (audit notebook):", _exc)
+"""
 
+_BOOTSTRAP_PLUGINS = """
 # User kernel plugins (~/.config/biopb/kernel/*.py and biopb_mcp.namespace entry
 # points), loaded by the kernel's own loader so a cell calling one of them --
 # `rolling_ball.subtract_background(...)` -- resolves the same name it did in the
@@ -80,6 +89,40 @@ try:
 except Exception as _exc:  # noqa: BLE001 - a plugin gap must not stop the rebuild
     print("kernel plugins not loaded:", _exc)
 """
+
+#: The audit export: everything the session had, viewer included.
+BOOTSTRAP_SRC = _BOOTSTRAP_HEAD + _BOOTSTRAP_VIEWER + _BOOTSTRAP_PLUGINS
+
+#: The workflow export: the same, **without a viewer**.
+#:
+#: Not an omission -- a policy, and the same one the scratch kernel enforces.
+#: The viewer is how an agent shows something to a person, and a saved workflow
+#: is run by a person who is already looking at their own screen. Leaving it out
+#: makes the notebook an ordinary one: no Qt, no display, no napari, so it runs
+#: under `nbconvert --execute` and on a headless box.
+#:
+#: The two ends have to agree, and this is that agreement in its strong form: a
+#: workflow verified in a kernel with no viewer is a workflow this cell can
+#: rebuild exactly. A workflow that reaches for `viewer` fails verification
+#: rather than passing there and failing here.
+WORKFLOW_BOOTSTRAP_SRC = (
+    _BOOTSTRAP_HEAD.replace(
+        "# === biopb-mcp session bootstrap (best-effort audit reconstruction) ===\n"
+        "# Rebuilds np / da, the data-plane `client`, the compute-plane `ops`, and an\n"
+        "# (empty) napari `viewer` so the recorded cells below can, in principle, re-run.\n"
+        "# NOT a faithful replica: tensor-server source ids and viewer layers from the\n"
+        "# original session are gone, and the dask cluster is not reproduced.\n",
+        "# === biopb workflow bootstrap ===\n"
+        "# Rebuilds np / da, the data-plane `client` and the compute-plane `ops` --\n"
+        "# everything the verified run was given, and nothing else. There is no napari\n"
+        "# viewer here, by design: the workflow was verified without one, so it does\n"
+        "# not need one, and this notebook runs headless.\n"
+        "# Still external: tensor-server source ids have to exist on the machine that\n"
+        "# runs this, and `auto_connect()` needs a reachable control or"
+        " $BIOPB_TENSOR_URL.\n",
+    )
+    + _BOOTSTRAP_PLUGINS
+)
 
 
 def _lines(text):
@@ -228,32 +271,32 @@ def _job_cell(snap):
 
 _WORKFLOW_INTRO = (
     "Verified {ts}{ncells}.\n\n"
-    "Each cell below ran, in this order, in a **scratch namespace** — one seeded "
-    "with the kernel's own handles (`np`, `da`, `client`, `ops`, `viewer`) and "
-    "the loaded kernel plugins, and nothing the session had bound since it "
-    "started. That is what the first code cell rebuilds, so this notebook asks of "
+    "Each cell below ran, in this order, in a **scratch kernel** — a second "
+    "process spawned for the verification and discarded after it, with its own "
+    "namespace and nothing the session had built. **It had no napari viewer**, "
+    "and neither does this notebook: a workflow is run by someone already "
+    "looking at their own screen, so leaving the viewer out is one less thing "
+    "to depend on and lets this run headless. "
+    "That is what the first code cell rebuilds, so this notebook asks of "
     "a fresh kernel only what the verification run was given — with one gap worth "
     "naming: plugins are loaded from *the reader's* "
     "`~/.config/biopb/kernel`, so a workflow calling a plugin this machine does "
     "not have binds nothing, and the cell using it raises `NameError`. The "
     "bootstrap cell prints what bound.\n\n"
-    "**What the run proves.** Every cell executed without raising, and no cell "
-    "leaned on a variable it did not itself create — the defect that makes a "
-    "session transcript unrunnable. It is not a claim that the numbers are "
+    "**What the run proves.** Every cell executed without raising, against a "
+    "kernel with nothing in it but the bootstrap — no leftover variable, no "
+    "viewer, no layer the session happened to have, no module some earlier cell "
+    "imported. "
+    "That is the whole class of defect that makes a session transcript "
+    "unrunnable. It is not a claim that the numbers are "
     "right; that is the reader's to check, and the outputs are kept below so "
     "there is something to check against.\n\n"
-    "**What it does not prove.** A scratch namespace isolates *bindings*, not "
-    "the world: the napari viewer, `sys.modules`, and anything mutated in place "
-    "were shared with the live session. A cell that reads an existing layer by "
-    "name found one there, and will not on a fresh kernel. External state is "
-    "unchanged by any of this — tensor-server source ids still have to exist, "
-    "and `auto_connect()` still needs a running control (`biopb control start`) "
-    "or `$BIOPB_TENSOR_URL`.{layers}"
-)
-
-_LAYERS_NOTE = (
-    "\n\n**Layers this run added to the live viewer:** {names}. Shared viewer, "
-    "so these are real additions, not a sandbox's."
+    "**What it does not prove.** A scratch *process* is not a scratch *world*. "
+    "The run used the same tensor server and the same filesystem as the session, "
+    "so anything the workflow uploaded or wrote is really there. And external "
+    "state is unchanged by any of this — tensor-server source ids still have to "
+    "exist, and `auto_connect()` still needs a running control "
+    "(`biopb control start`) or `$BIOPB_TENSOR_URL`."
 )
 
 
@@ -324,23 +367,22 @@ def _workflow_cell(cell):
 def build_workflow_notebook(record):
     """Build an nbformat-v4 notebook from a verification record.
 
-    *record* is ``_jobs.verified()`` — a fully-successful run, since a partial
+    *record* is ``_scratch.verified()`` — a fully-successful run, since a partial
     one is a report rather than a document (``_jobs._run``). Returns a plain
     dict ready to ``json.dumps``.
     """
     record = record or {}
     cells_in = record.get("cells") or []
     title = (record.get("title") or "").strip() or "Verified workflow"
-    added = record.get("added_layers") or []
     intro = _WORKFLOW_INTRO.format(
         ts=_fmt_ts(record.get("created")),
         ncells=f" · {len(cells_in)} cell(s)" if cells_in else "",
-        layers=_LAYERS_NOTE.format(names=", ".join(f"`{n}`" for n in added))
-        if added
-        else "",
     )
 
-    cells = [_markdown_cell(f"# {title}\n\n" + intro), _code_cell(BOOTSTRAP_SRC)]
+    cells = [
+        _markdown_cell(f"# {title}\n\n" + intro),
+        _code_cell(WORKFLOW_BOOTSTRAP_SRC),
+    ]
     cells.extend(_workflow_cell(c) for c in cells_in)
     return _notebook(cells)
 

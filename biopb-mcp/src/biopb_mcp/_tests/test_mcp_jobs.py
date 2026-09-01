@@ -675,6 +675,111 @@ class TestJobConcurrency:
         assert "job-done" in snap["stdout"]
         assert "job-done" not in quick["stdout"]
 
+    def test_a_real_scratch_kernel_verifies_a_workflow_and_is_discarded(self):
+        """End to end with two real kernels — and no display, which is the point.
+
+        The scratch kernel is headless by policy (no Qt, no GL, no napari), so
+        the one test that exercises the whole path now runs in CI instead of
+        being gated on a desktop. That is the practical dividend of dropping the
+        viewer, over and above the ~330 MiB.
+        """
+        from biopb_mcp.mcp import _scratch
+        from biopb_mcp.mcp._kernel import ENV_SCRATCH
+
+        env = dict(os.environ)
+        env[ENV_SCRATCH] = "1"
+        _scratch.set_host_factory(
+            lambda: KernelHost(
+                extra_arguments=[
+                    "--IPKernelApp.exec_lines="
+                    "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
+                ],
+                startup_timeout=120.0,
+                env=env,
+                watchdog_interval=0,
+                window_close_pipe=False,
+                health_probe_code="print('_jobs' in dir() and 'ops' in dir())",
+            )
+        )
+        session = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        session.start()
+        assert "JOBS_READY" in session.execute(_SETUP, timeout=30.0)["stdout"]
+        try:
+            started = _scratch.start(["a = 2", "print(a * 3)"], "arithmetic", session)
+            job_id = started["job_id"]
+            deadline = time.monotonic() + 180.0
+            while time.monotonic() < deadline:
+                snap = _scratch.poll(job_id)
+                if snap["status"] != "running":
+                    break
+                time.sleep(0.5)
+            assert snap["status"] == "ok", snap
+            assert _scratch.verified()["title"] == "arithmetic"
+            assert _scratch.verified()["cells"][1]["stdout"] == "6\n"
+            assert _scratch.running() is None  # the process is gone; slot free
+        finally:
+            _scratch.reset()
+            _scratch.set_host_factory(None)
+            session.shutdown()
+
+    def test_a_scratch_kernel_binds_no_viewer(self):
+        """The policy, enforced where it is decided.
+
+        The viewer is how an agent shows something to a person; a verification
+        has nobody watching. So a workflow reaching for `viewer` must fail here
+        rather than pass and then fail in the saved notebook, which has no
+        viewer either (_notebook.WORKFLOW_BOOTSTRAP_SRC).
+        """
+        from biopb_mcp.mcp import _scratch
+        from biopb_mcp.mcp._kernel import ENV_SCRATCH
+
+        env = dict(os.environ)
+        env[ENV_SCRATCH] = "1"
+        _scratch.set_host_factory(
+            lambda: KernelHost(
+                extra_arguments=[
+                    "--IPKernelApp.exec_lines="
+                    "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
+                ],
+                startup_timeout=120.0,
+                env=env,
+                watchdog_interval=0,
+                window_close_pipe=False,
+                health_probe_code="print('_jobs' in dir() and 'ops' in dir())",
+            )
+        )
+        session = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        session.start()
+        assert "JOBS_READY" in session.execute(_SETUP, timeout=30.0)["stdout"]
+        try:
+            started = _scratch.start(
+                [
+                    "print('np ok', np.arange(3).sum())",
+                    "viewer.add_image(np.zeros((4, 4)))",
+                ],
+                "leans on the viewer",
+                session,
+            )
+            deadline = time.monotonic() + 180.0
+            while time.monotonic() < deadline:
+                snap = _scratch.poll(started["job_id"])
+                if snap["status"] != "running":
+                    break
+                time.sleep(0.5)
+            cells = snap["verify"]["cells"]
+            # The handles a workflow may use are there...
+            assert cells[0]["status"] == "ok", cells[0]
+            assert "np ok 3" in cells[0]["stdout"]
+            # ...and the one it may not is simply absent.
+            assert cells[1]["status"] == "error"
+            assert "NameError" in cells[1]["error_text"]
+            assert "viewer" in cells[1]["error_text"]
+            assert _scratch.verified() is None
+        finally:
+            _scratch.reset()
+            _scratch.set_host_factory(None)
+            session.shutdown()
+
     def test_poll_job_waits_out_a_real_job_and_answers_when_it_ends(self, kernel):
         """The wait against a real kernel and a real job: it ends when the job
         ends, not when the budget does, and the caller never asks twice."""
@@ -788,25 +893,28 @@ class TestNapariJobs:
 
 
 class TestVerification:
-    """A candidate workflow run in a scratch namespace (``submit(verify_cells=)``).
+    """A candidate workflow run in a kernel of its own (``submit(verify_cells=)``).
 
     The mechanism behind ``verify_workflow``: an agent rewrites a session into a
     clean program and proves it runs without leaning on the session's leftovers
     — which a *filter* over the transcript cannot do, since the correct program
     is a rewrite of it and not a subsequence.
+
+    These are the *kernel* half. What makes the namespace clean is that the
+    session child spawns a kernel per verification and discards it
+    (``_scratch``, and ``test_mcp_scratch.py``); in here the cells simply run in
+    the kernel's own namespace.
     """
 
-    def test_a_cell_leaning_on_session_state_fails(self, runner):
-        runner["leftover"] = 42
-        snap = _wait_job(_jobs.submit("", verify_cells=["print(leftover)"])["job_id"])
-        cell = snap["verify"]["cells"][0]
-        assert snap["status"] == "error"
-        assert cell["status"] == "error"
-        assert "NameError" in cell["error_text"]
+    def test_cells_run_in_the_kernels_own_namespace(self, runner):
+        # In a scratch kernel that namespace holds the bootstrap and nothing
+        # else, so writing to it is free -- the process is discarded. The
+        # isolation this used to fake with a filtered dict is the process now.
+        _wait_job(_jobs.submit("", verify_cells=["scratch_only = 1"])["job_id"])
+        assert runner["scratch_only"] == 1
 
     def test_the_bootstrap_handles_are_still_there(self, runner):
-        # A scratch namespace isolates the *session's* bindings, not the kernel's
-        # own: a workflow that cannot reach `client` would verify nothing.
+        # A workflow that cannot reach `client` would verify nothing.
         snap = _wait_job(
             _jobs.submit("", verify_cells=["print(_conn is not None)"])["job_id"]
         )
@@ -817,14 +925,10 @@ class TestVerification:
         snap = _wait_job(
             _jobs.submit("", verify_cells=["a = 2", "print(a * 3)\na * 3"])["job_id"]
         )
-        cells = _jobs.verified()["cells"]
+        cells = _jobs.verify_record(snap["job_id"])["cells"]
         assert snap["verify"]["status"] == "ok"
         assert cells[1]["stdout"] == "6\n"
         assert cells[1]["result_text"] == "6"
-
-    def test_a_verification_does_not_write_the_session_namespace(self, runner):
-        _wait_job(_jobs.submit("", verify_cells=["scratch_only = 1"])["job_id"])
-        assert "scratch_only" not in runner
 
     def test_cells_after_a_failure_are_skipped_not_dropped(self, runner):
         # Dropping them would report a workflow that mysteriously got shorter;
@@ -846,14 +950,16 @@ class TestVerification:
         snap = _wait_job(
             _jobs.submit("", verify_cells=["print('one')", "print('two')"])["job_id"]
         )
-        assert [c["stdout"] for c in _jobs.verified()["cells"]] == ["one\n", "two\n"]
+        record = _jobs.verify_record(snap["job_id"])
+        assert [c["stdout"] for c in record["cells"]] == ["one\n", "two\n"]
         assert snap["stdout"] == "one\ntwo\n"
 
     def test_the_polled_record_carries_a_head_not_the_output(self, runner):
         # The polled snapshot crosses a JSON round trip every 0.4s while a
         # verification runs; carrying every cell's output there would ship the
         # bytes `stdout` already holds, once more per cell, growing with the
-        # workflow. The full text is read once, by verified(), for the notebook.
+        # workflow. The full text is read once, by verify_record(), for the
+        # notebook -- before the kernel holding it is discarded.
         big = "print('x' * 40_000)"
         snap = _wait_job(_jobs.submit("", verify_cells=[big] * 5)["job_id"])
         polled = snap["verify"]["cells"]
@@ -861,7 +967,8 @@ class TestVerification:
         assert all(c["stdout_len"] == 40_001 for c in polled)
         assert all(c["stdout_head"] == "x" * 79 + "…" for c in polled)
         # ...and the notebook still gets all of it.
-        assert all(len(c["stdout"]) == 40_001 for c in _jobs.verified()["cells"])
+        full = _jobs.verify_record(snap["job_id"])["cells"]
+        assert all(len(c["stdout"]) == 40_001 for c in full)
 
     def test_the_polled_record_does_not_grow_with_what_the_cells_printed(self, runner):
         # The property, stated as a shape rather than a number: the polled
@@ -877,30 +984,6 @@ class TestVerification:
         # moves by the digits of a length and the source that names them.
         assert polled_size(100_000) - polled_size(1_000) < 100
 
-    def test_only_a_complete_run_is_kept_as_the_verified_workflow(self, runner):
-        _wait_job(
-            _jobs.submit("", verify_cells=["1 / 0"], verify_title="bad")["job_id"]
-        )
-        assert _jobs.verified() is None
-        assert _jobs.verified_summary() is None
-
-    def test_a_later_failure_does_not_unverify_what_passed(self, runner):
-        _wait_job(_jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"])
-        _wait_job(
-            _jobs.submit("", verify_cells=["1 / 0"], verify_title="bad")["job_id"]
-        )
-        assert _jobs.verified()["title"] == "good"
-        assert _jobs.verified_summary() == {
-            "title": "good",
-            "cells": 1,
-            "created": _jobs.verified()["created"],
-        }
-
-    def test_reset_drops_the_verified_workflow(self, runner):
-        _wait_job(_jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"])
-        _jobs.reset()
-        assert _jobs.verified() is None
-
     def test_the_job_code_is_derived_from_the_cells(self, runner):
         # The audit view of this job must not disagree with the workflow view.
         snap = _wait_job(_jobs.submit("", verify_cells=["a = 1", "a"])["job_id"])
@@ -908,34 +991,12 @@ class TestVerification:
 
     def test_an_ordinary_job_carries_no_verification(self, runner):
         assert _jobs.poll(_jobs.submit("1 + 1")["job_id"])["verify"] is None
+        assert _jobs.verify_record(_jobs.submit("1 + 1")["job_id"]) is None
 
-    def test_jobs_view_carries_both_in_one_round_trip(self, runner):
+    def test_jobs_view_carries_the_job_list(self, runner):
+        # The workflow is no longer this kernel's to report: the run happened in
+        # a scratch kernel, so the session child merges it in (_observe).
         jid = _jobs.submit("", verify_cells=["1"], verify_title="good")["job_id"]
         _wait_job(jid)
-        view = _jobs.jobs_view()
-        assert [j["job_id"] for j in view["jobs"]] == [jid]
-        assert view["workflow"]["title"] == "good"
-
-    def test_the_baseline_is_the_namespace_the_bootstrap_left(self, runner):
-        # Without mark_baseline() the fallback names are the floor; with it, a
-        # plugin bound at bootstrap is visible to a scratch run and a variable
-        # bound afterwards is not.
-        runner["myplugin"] = "loaded"
-        _jobs.mark_baseline()
-        runner["session_var"] = 1
-        snap = _wait_job(
-            _jobs.submit("", verify_cells=["print(myplugin)", "print(session_var)"])[
-                "job_id"
-            ]
-        )
-        cells = snap["verify"]["cells"]
-        assert cells[0]["stdout_head"] == "loaded"
-        assert cells[1]["status"] == "error"
-        assert "NameError" in cells[1]["error_text"]
-
-    def test_added_layers_are_counted_not_set_differenced(self):
-        # napari does not promise unique layer names, so a second "nuclei"
-        # beside an existing one is an addition this has to report.
-        assert _jobs._added_layers(["a", "b"], ["a", "b", "a", "c"]) == ["a", "c"]
-        assert _jobs._added_layers(["a"], ["a"]) == []
-        assert _jobs._added_layers(None, ["a"]) == []
+        assert [j["job_id"] for j in _jobs.jobs_view()["jobs"]] == [jid]
+        assert "workflow" not in _jobs.jobs_view()

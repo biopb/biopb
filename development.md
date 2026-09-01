@@ -246,6 +246,10 @@ durable planes and the web origin in
   ships, and how it is checked: structure, retrieval and contract tests in CI;
   simulated-user interaction runs against a real session locally, as a benchmark
   rather than a gate.
+- **Workflow verification:** `docs/verification-scratch-kernel.md` — proposed:
+  why `verify_workflow` should run in a scratch *process* rather than a scratch
+  namespace, what a second kernel costs, and the one-slot admission rule that
+  keeps two kernels from becoming two schedulers.
 - **Agent benchmarks:** `biopb-mcp/docs/fixtures.md` — what a run is given and
   how it is scored. One runner over one case directory, whether the case is a
   claim about a skill or about a piece of work (`_tests/agentbench/` for the
