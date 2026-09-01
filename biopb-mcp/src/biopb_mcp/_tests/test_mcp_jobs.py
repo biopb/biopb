@@ -15,6 +15,7 @@ Three layers:
 """
 
 import os
+import re
 import sys
 import time
 import types
@@ -25,7 +26,7 @@ pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
 from biopb_mcp._tests.conftest import call_tool as _tool
-from biopb_mcp.mcp import _app, _jobs, _kernel_rpc, _server  # noqa: E402
+from biopb_mcp.mcp import _app, _jobs, _kernel_rpc, _server, _writers  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
@@ -673,6 +674,32 @@ class TestJobConcurrency:
         assert snap["status"] == "ok"
         assert "job-done" in snap["stdout"]
         assert "job-done" not in quick["stdout"]
+
+    def test_poll_job_waits_out_a_real_job_and_answers_when_it_ends(self, kernel):
+        """The wait against a real kernel and a real job: it ends when the job
+        ends, not when the budget does, and the caller never asks twice."""
+        old_host, old_promote = _app._kernel_host, _app._promote_after
+        _app.set_kernel_host(kernel)
+        _app.set_promote_after(0.5)  # hand back a handle rather than inline it
+        try:
+            handle = _tool(
+                _server.execute_code, "import time; time.sleep(3.0); print('finished')"
+            )
+            assert "still running" in handle, handle
+            job_id = re.search(r"job-\d+", handle).group(0)
+
+            started = time.monotonic()
+            result = _tool(_server.poll_job, job_id, wait=30)
+            elapsed = time.monotonic() - started
+        finally:
+            _app.set_kernel_host(old_host)
+            _app.set_promote_after(old_promote)
+            _writers.clear_claim()
+
+        assert f"{job_id}: ok" in result, result
+        assert "finished" in result
+        # ~2.5s of the job was left; the 30s budget is nowhere near it.
+        assert elapsed < 15.0, f"waited past the job's end ({elapsed:.1f}s)"
 
 
 # ---------------------------------------------------------------------------
