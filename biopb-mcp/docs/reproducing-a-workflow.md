@@ -1,9 +1,12 @@
-# Reproducing a workflow — verification in a scratch namespace
+# Reproducing a workflow — verification in a scratch kernel
 
-**Component:** `biopb-mcp` — `mcp/_jobs.py` (`_Verification`, `_scratch_ns`,
-`_exec_cells`), `mcp/_server.py` (`verify_workflow`), `mcp/_notebook.py`
-(`build_workflow_notebook`), `mcp/_observe.py` (`/api/notebook?workflow=1`).
-**Related:** [`skills.md`](skills.md) — the *other* way a workflow is kept.
+**Component:** `biopb-mcp` — `mcp/_scratch.py` (the scratch kernel and the
+slot), `mcp/_jobs.py` (`_Verification`, `_exec_cells`), `mcp/_server.py`
+(`verify_workflow`), `mcp/_notebook.py` (`build_workflow_notebook`),
+`mcp/_observe.py` (`/api/notebook?workflow=1`).
+**Related:** [`skills.md`](skills.md) — the *other* way a workflow is kept;
+[`../../docs/verification-scratch-kernel.md`](../../docs/verification-scratch-kernel.md)
+— why the isolation is a process, what it costs, and which display it takes.
 
 ## 1. Two artifacts, two axes
 
@@ -34,42 +37,77 @@ The correct program is a **rewrite** of the transcript, not a subsequence of it.
 No selection UI can express a merge, so the rewrite is the agent's judgment and
 stays that way. What can be mechanized is *checking* the rewrite.
 
-## 3. A clean namespace, not a clean process
+## 3. A clean process, not a clean namespace
 
 The rewrite is checked by running it. Running it somewhere the session's
 leftovers are invisible is what makes the check mean something — a cell that
 silently reads a variable it never created is exactly the defect that makes a
 transcript unrunnable.
 
-That does **not** need `restart_kernel`. A restart destroys the viewer, the
-layers, the dask cluster, and the namespace — i.e. it charges the user the whole
-session at the moment their work succeeded, which they will (rightly) refuse.
-What is actually needed is a clean *namespace*, and `_exec_capture(code, ns, job)`
-already took `ns` as a parameter; only its one call site was pinned to
-`_ip.user_ns`.
+This started as a clean *namespace*: a dict seeded with the bootstrap's names
+and nothing the session had bound. That enforced variable hygiene and nothing
+else — the viewer, `sys.modules`, and anything mutated in place stayed shared —
+so a workflow leaning on a layer the live session produced **passed verification
+and failed on a fresh kernel**, which is the same class of bug in the dimension
+most biopb workflows actually depend on.
 
-So `_scratch_ns()` builds a fresh dict holding the bootstrap's names at their
-*current* values — `client` and `ops` are the live connected ones, so a
-verification runs against the real server — and nothing bound since. The
-baseline is recorded by `_jobs.mark_baseline()` at the end of `_bootstrap_impl`,
-after the plugins load, so a plugin is in and a session variable is out.
+It is now a clean *process*: a second kernel, spawned per verification and
+discarded after it, with its own namespace and **no viewer at all**. It is not a
+`restart_kernel` — the live session is untouched, which is what made the
+namespace model attractive in the first place — it just costs ~1.5 s of bring-up
+instead of nothing.
+
+**Headless is the policy, not a limitation.** The viewer is how an agent shows
+something to a person, and a verification has nobody watching; a workflow cell
+touching `viewer` raises `NameError` here. That is the two ends agreeing (§5):
+the saved workflow notebook has no viewer either, which makes it an ordinary
+notebook that runs under `nbconvert --execute`. The audit export keeps one.
+[`verification-scratch-kernel.md`](../../docs/verification-scratch-kernel.md)
+prices it and records what it cost to learn — a hidden viewer works, but its
+screenshots come back black.
 
 **The residual, named rather than hidden** (the posture of
 [`viewer-thread-safety.md`](viewer-thread-safety.md) and
-[`agent-fs-guardrail.md`](agent-fs-guardrail.md)): the viewer, `sys.modules`,
-and anything mutated in place are shared with the live session. A cell reading
-`viewer.layers['nuclei']` still finds a layer this workflow never added, and
-layers the run adds are added for real — which is why `added_layers` is
-computed and reported instead of left for the user to discover. Variable hygiene
-is enforced; layer and module hygiene is not.
+[`agent-fs-guardrail.md`](agent-fs-guardrail.md)): a scratch *process* is not a
+scratch *world*. It talks to the same tensor server and the same filesystem, so
+`client.upload_array` / `add_source` and any cell that writes a file write
+through for real — verify three times and you have three uploaded arrays. The
+`verify_workflow` docstring says so, because the agent is the one who can warn
+the user before running it.
 
 ## 4. Mechanics
 
-`verify_workflow(cells, title)` submits through the ordinary `_jobs.submit()`
-door with `verify_cells=` — same one-agent claim, same one-job-at-a-time rule,
-same interrupt. A verification touches the one shared viewer like any other job,
-so making it a second kind of thing would mean a second answer to each of those
-questions.
+`verify_workflow(cells, title)` hands the cells to `_scratch.start()`, which
+takes the session's one job slot, spawns a kernel, and submits them there
+through the ordinary `_jobs.submit()` door with `verify_cells=`. Inside that
+kernel the cells run in its *own* namespace: it is fresh, so the filtered dict
+the old model needed is exactly the process.
+
+**One slot across both kernels.** Two kernels must not become two schedulers:
+the dask cluster is shared and finite, and the agent's whole model is one cell
+at a time. So while a verification runs, `execute_code` and the observe console
+are refused with the same `busy` they already give — and the running
+verification appears in the session's job list as a single row, so the refusal's
+"wait for it, or interrupt it from its row" stays true and a person can stop a
+verification they did not start.
+
+The two directions are not enforced identically, and `_scratch.start` says so: a
+session job is refused while a verification holds the slot exactly, but a
+verification checks the session kernel by asking it, which leaves a
+millisecond-wide window. Closing that means the session child issuing every job
+id.
+
+**`restart_kernel` takes an in-flight verification with it** — not because the
+user asked to kill it, but because it holds the slot: leaving it running would
+hand back a fresh kernel that can accept nothing, and a wedged verification
+would have no escape hatch, which is what `restart_kernel` is documented to be.
+
+**Its death is the verdict.** The scratch host runs with the watchdog off. For
+the session kernel a respawn is recovery; here an OOM means "this workflow does
+not fit", and respawning would re-run a workflow that just killed a process,
+three more times. This is [#900](https://github.com/biopb/biopb/issues/900)
+without the retry loop — and without the session dying, which is the containment
+the whole design buys.
 
 The run **stops at the first failure**. Cells after it were written against
 state the failed one was supposed to produce, so running them anyway reports a
@@ -86,21 +124,21 @@ the kernel every 0.4 s while a verification runs, and carrying every cell's
 output there ships the bytes `stdout` already holds, once more per cell — a
 20-cell run polled 1.2 MB where an ordinary job polls 200 KB, growing with the
 workflow. So `_Cell.snapshot()` carries a one-line head and a length, and only
-`verified()` asks for `full=True`, once, when the notebook is built. The ledger
-a report prints never needed more than the head.
+the final collection asks for `full=True`, once, when the run ends.
 
-A verification is kept as *the* workflow (`_jobs.verified()`) only when every
-cell ran — a partial run is a report, which the job record already is. A later
-failure does not un-verify what passed; a kernel restart does.
+**Where the record lives.** In the session child (`_scratch._verified`), not in
+a kernel — the kernel that produced it no longer exists. There is no
+promote-on-success gate and no slot to clear on restart: the answer is "this run
+passed, just now".
 
 ## 5. Plugins, and where the two ends have to agree
 
-The scratch namespace holds the user's kernel plugins, because `mark_baseline()`
-runs after step 7b and a fresh biopb kernel has them. The notebook's bootstrap
-cell **did not rebuild them** — a pre-existing gap that this feature made
-expensive: a workflow calling `rolling_ball.subtract_background(...)` verified
-green and then died on `NameError` in the saved notebook, with the intro
-claiming the cell rebuilt what the run was given.
+The scratch kernel loads the user's kernel plugins, because it runs the same
+bootstrap a session kernel does. The notebook's bootstrap cell **did not rebuild
+them** — a pre-existing gap that this feature made expensive: a workflow calling
+`rolling_ball.subtract_background(...)` verified green and then died on
+`NameError` in the saved notebook, with the intro claiming the cell rebuilt what
+the run was given.
 
 So `BOOTSTRAP_SRC` now calls the kernel's own `_load_namespace_plugins`, last,
 as step 7b is last. **The remaining asymmetry is real and is stated in the
@@ -109,20 +147,27 @@ need not be the author's. A missing one binds nothing (the loader is fail-open)
 and the cell using it raises `NameError` where it is used. The bootstrap cell
 prints what bound, so the reader can tell that case from a bug in the workflow.
 
-The general rule this is an instance of: **whatever the scratch namespace is
-seeded with, the bootstrap cell has to rebuild.** They are two halves of one
-claim — "this ran against a fresh kernel's namespace, and here is that
-namespace" — and a name in one but not the other turns a passing verification
-into a false promise.
+The general rule this is an instance of: **whatever the scratch kernel is built
+with, the bootstrap cell has to rebuild.** They are two halves of one claim —
+"this ran against a fresh kernel, and here is that kernel" — and a name in one
+but not the other turns a passing verification into a false promise. A plugin
+that fails to load in the scratch kernel is therefore a *result*, not noise: the
+notebook the user is about to save would fail the same way.
 
 ## 6. Two exports
 
 `/api/notebook` is unchanged: the **audit** export, every retained job in order,
 dead ends included, with per-cell provenance headers. `?workflow=1` serves the
 **workflow** export: the verified cells, no headers, an intro that states what
-the run proved and what it did not. The observe page shows *Save workflow*
-beside *Save notebook* only once something is verified, learning that from the
-`workflow` key `jobs_view()` added to the poll it already makes.
+the run proved and what it did not.
+
+The workflow export is also written to disk without being asked, to
+`<state>/biopb/mcp/workflows/`, on every run that passes. The observe page's
+Verification pane names the file and offers *Download* for putting a copy where
+the user wants it — which on a remote session is the only way to get it at all.
+Both learn what there is to offer from the `workflow` key the session child
+merges into the poll it already makes (`_observe._api_jobs`); the kernel cannot
+answer it, having never seen the run.
 
 ## 7. Why the retained-job cap went up
 

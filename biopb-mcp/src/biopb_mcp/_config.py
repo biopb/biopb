@@ -502,6 +502,14 @@ class ChatConfig:
         "Seconds to wait for one model reply. Covers a slow first token on a "
         "long conversation, not the tool calls it triggers.",
     )
+    vision: str = _h(
+        "auto",
+        "Whether screenshots are sent to the model: 'auto' sends them until the "
+        "provider refuses one and then stops, 'on' always sends, 'off' never "
+        "sends and does not offer take_screenshot. A model without vision does "
+        "not merely fail the screenshot -- the image is stored and re-sent, so "
+        "every later turn fails too, which is what 'auto' recovers from.",
+    )
     acp_agent: str = _h(
         "opencode",
         "Which ACP harness to run when engine is 'acp'. Only 'opencode' is "
@@ -611,6 +619,7 @@ _CONSTRAINTS = {
         "engine": Enum({"builtin", "acp"}),
         "acp_agent": Enum({"opencode"}),
         "acp_permission": Enum({"ask", "allow"}),
+        "vision": Enum({"auto", "on", "off"}),
     },
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
@@ -705,6 +714,21 @@ def get_log_dir() -> Path:
     :func:`biopb._locations.mcp_log_dir`, which creates it on access.
     """
     return _locations.mcp_log_dir()
+
+
+def get_workflow_dir() -> Path:
+    """Directory for spooled workflow notebooks (``<log dir>/workflows``).
+
+    Every verification that passes is written here, because the child cannot
+    know which passing run has the *right* numbers -- only that every cell ran.
+    State rather than data: this is a spool the session fills on its own, and
+    the copy a person keeps is the one they download or ask an agent to place.
+    Retention (:data:`biopb_mcp.mcp._scratch._SPOOL_KEEP`) prunes it to the
+    newest N, as the per-session logs beside it are pruned.
+    """
+    d = get_log_dir() / "workflows"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def get_session_log_dir() -> Path:

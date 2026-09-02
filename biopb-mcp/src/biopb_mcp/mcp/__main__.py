@@ -317,9 +317,9 @@ def _serve_http(config, port, view=False):
     first ``start_kernel`` tool call.
     """
     from .._config import get_setting
-    from . import _app, _server, _xvfb
+    from . import _app, _scratch, _server, _xvfb
     from ._cluster import DaskClusterHost
-    from ._kernel import KernelHost
+    from ._kernel import ENV_SCRATCH, KernelHost
 
     # Windows: serve on the Selector event loop, not the default Proactor one
     # (biopb/biopb#383). The Proactor accept loop treats *any* OSError from
@@ -435,6 +435,37 @@ def _serve_http(config, port, view=False):
         # its scheduler address so the kernel attaches instead of spinning its own.
         cluster_host=cluster_host,
     )
+
+    # How to build the scratch kernel a verification runs in: the same config
+    # and the same cluster as the session's, with the user-facing parts off. It
+    # is a factory rather than a host because a verification gets a *fresh*
+    # kernel each time and discards it, and it is registered from here because
+    # this is the only place that knows the config both kernels come from --
+    # deriving it twice is how the two drift (see _scratch).
+    def _scratch_host():
+        scratch_env = dict(kernel_env or os.environ)
+        scratch_env[ENV_SCRATCH] = "1"
+        return KernelHost(
+            extra_arguments=extra_arguments,
+            kernel_name=get_setting(config, "kernel.name"),
+            startup_timeout=get_setting(config, "kernel.startup_timeout"),
+            execute_timeout=get_setting(config, "kernel.execute_timeout"),
+            busy_lock_timeout=get_setting(config, "kernel.busy_lock_timeout"),
+            env=scratch_env,
+            # The session kernel's probe asks for `viewer`; this one has none by
+            # design, so it asks for what a verification actually needs.
+            health_probe_code="print('_jobs' in dir() and 'ops' in dir())",
+            # No watchdog: for the session kernel a respawn is recovery, for
+            # this one death is the verdict (an OOM means the workflow does not
+            # fit). No window-close pipe: there is no window.
+            watchdog_interval=0,
+            window_close_pipe=False,
+            parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
+            cluster_host=cluster_host,
+        )
+
+    _scratch.set_host_factory(_scratch_host)
+
     # Now that the kernel host exists, let the cluster's idle reaper ask it
     # whether a kernel is attached — the one thing that makes a teardown safe.
     cluster_host.set_kernel_alive(host.is_alive)

@@ -13,8 +13,19 @@ outside this module -- the observe page, the chat loop, the shared HTTP guard --
 which had to reach in through a dozen private names to get at them.  What is
 left is the agent-facing surface: the snippets its tools run, the job
 submit/await client they share, and the tools and resources themselves.
+
+**Every tool is ``async def``, and no tool blocks.** The SDK invokes a
+synchronous tool function directly on the event loop, and this process serves
+``/mcp``, the observe page and the chat turn on that one loop -- so a tool that
+waits on the kernel there does not make its caller wait, it makes every caller
+wait, for as long as the round trip takes (``execute_code`` used to hold it for
+the whole ``promote_after`` window). Kernel round trips therefore go to a thread
+(``_kernel_rpc._job_call`` / ``_execute``), and the promote window is a loop
+sleep. Adding a tool means adding an async one.
 """
 
+import asyncio
+import functools
 import logging
 import os
 import time
@@ -23,7 +34,7 @@ from typing import Annotated
 from mcp.types import ImageContent, TextContent
 from pydantic import Field
 
-from . import _app, _kernel_rpc, _resources, _skills, _writers
+from . import _app, _kernel_rpc, _resources, _scratch, _skills, _writers
 from ._app import mcp
 
 logger = logging.getLogger(__name__)
@@ -231,7 +242,7 @@ def _cpu_percent(psutil):
     return psutil.cpu_percent(interval=0.1)
 
 
-def _start_job(host, code, **kwargs):
+async def _start_job(host, code, **kwargs):
     """Submit a job and resolve everything that can happen before it runs.
 
     *code* and *kwargs* are :func:`_jobs.submit`'s own arguments, passed as
@@ -249,14 +260,16 @@ def _start_job(host, code, **kwargs):
     """
     writer, _label = _writers._client_identity()
 
-    # Read once at entry, append to whichever path returns below.
-    digest = _writers._foreign_digest(host)
+    # Read once at entry, append to whichever path returns below. Every kernel
+    # round trip below goes to a thread for the reason on _kernel_rpc._job_call:
+    # blocking here blocks the whole process, not this one call.
+    digest = await asyncio.to_thread(_writers._foreign_digest, host)
     foreign_note = _writers._render_foreign_note(digest)
     if foreign_note:
-        _writers._ack_foreign_digest(host, digest, writer)
+        await asyncio.to_thread(_writers._ack_foreign_digest, host, digest, writer)
 
-    job_id, message, drop_note, window_alive = _submit_job(
-        host, code, digest, _tool_busy_message, **kwargs
+    job_id, message, drop_note, window_alive = await asyncio.to_thread(
+        _submit_job, host, code, digest, _tool_busy_message, **kwargs
     )
     if drop_note:
         foreign_note = ""
@@ -343,22 +356,29 @@ def _submit_job(host, code, digest, busy_message, **kwargs):
     return submitted["job_id"], None, False, window_alive
 
 
-def _await_job(host, job_id, window_alive=None):
-    """Poll *job_id* until it is terminal or the promote window runs out.
+async def _await_job(host, job_id, window_alive=None, budget=None, snap=None):
+    """Poll *job_id* until it is terminal or *budget* seconds run out.
 
-    Returns ``(snap, res, window_alive)``. *snap* is None when a poll round trip
-    failed, and *res* is the raw kernel reply to report instead. Otherwise a
-    ``status`` of ``running`` means the window expired and the caller hands back
-    a job handle rather than a result.
+    *budget* defaults to the promote window, which is what a submitting tool
+    waits; ``poll_job`` passes its own. Returns ``(snap, res, window_alive)``.
+    *snap* is None when a poll round trip failed, and *res* is the raw kernel
+    reply to report instead. Otherwise a ``status`` of ``running`` means the
+    budget expired and the caller hands back a job handle rather than a result.
 
-    *window_alive* seeds the flag with the submit round trip's, so a promote
-    window short enough to poll zero times still reports a closed viewer.
+    *window_alive* seeds the flag with the submit round trip's, and *snap* the
+    snapshot, so a budget short enough to poll zero times still reports a closed
+    viewer and still answers with whatever its caller already knew. A submitting
+    tool has no snapshot yet and passes none, which reads as "running".
+
+    The wait is a loop sleep and each probe is a thread hop, so waiting costs
+    this process nothing: for however long it runs, the loop is free to serve
+    the observe page and any other client.
     """
-    deadline = time.monotonic() + _app._promote_after
-    snap, res = {"status": "running"}, None
+    deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
+    snap, res = ({"status": "running"} if snap is None else snap), None
     while time.monotonic() < deadline:
-        time.sleep(0.4)
-        snap, res, window_alive = _kernel_rpc._run_job_call(host, "poll", job_id)
+        await asyncio.sleep(0.4)
+        snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
         if snap is None:
             return None, res, None
         if snap.get("status") != "running":
@@ -366,7 +386,7 @@ def _await_job(host, job_id, window_alive=None):
     return snap, res, window_alive
 
 
-def _format_verification(record: dict, job_id: str) -> str:
+def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
     """The verification report: the verdict, then the per-cell ledger.
 
     Written for an agent about to decide between "save it" and "fix cell 4",
@@ -380,8 +400,9 @@ def _format_verification(record: dict, job_id: str) -> str:
 
     if status == "ok":
         lines.append(
-            f"Verified: all {len(cells)} cell(s) ran in a scratch namespace "
-            "(the kernel's own handles, none of this session's variables)."
+            f"Verified: all {len(cells)} cell(s) ran in a scratch kernel — a "
+            "fresh, headless process with none of this session's state — which "
+            "has since been discarded."
         )
     else:
         failed = next(
@@ -409,20 +430,21 @@ def _format_verification(record: dict, job_id: str) -> str:
             lines.append(f"\n{cell.get('error_text', '')}")
             break
 
-    added = record.get("added_layers") or []
-    if added:
-        lines.append(
-            "\nLayers this run added to the live viewer: "
-            + ", ".join(added)
-            + ". A scratch namespace isolates variables, not the viewer — remove "
-            "them if they are duplicates of what was already there."
-        )
-
     if status == "ok":
+        # Already on disk: every run that passes is spooled, because this
+        # process cannot know which passing run has the right *numbers* -- only
+        # that every cell ran. So the agent's job is to say where it went, not
+        # to write it.
         lines.append(
-            "\nThe user can now save this workflow as a notebook from the "
-            "observe page ('Save workflow'). Tell them it is there; do not write "
-            "the file yourself."
+            f"\nSaved as a notebook: {saved_path}"
+            if saved_path
+            else "\nThe notebook could not be written to disk (see the server "
+            "log); the user can still download it from the observe page."
+        )
+        lines.append(
+            "The user can download a copy where they want it from the observe "
+            "page (Verification -> Download). Tell them where it is; do not "
+            "write the file yourself."
         )
     else:
         lines.append(
@@ -446,7 +468,9 @@ def _format_job_status(snap: dict) -> str:
     header = f"{job_id}: {status} ({snap.get('elapsed', '?')}s)"
     record = snap.get("verify")
     if record and status != "running":
-        return header + "\n" + _format_verification(record, job_id)
+        return (
+            header + "\n" + _format_verification(record, job_id, snap.get("saved_path"))
+        )
     body = _kernel_rpc._format_execute_result(snap)
     if status == "running":
         return header + "\nPartial output:\n" + (body or "(none yet)")
@@ -514,7 +538,7 @@ def get_skill(skill_id: str) -> str:
 
 
 @mcp.tool()
-def list_skills(keywords: list[str] | None = None) -> list:
+async def list_skills(keywords: list[str] | None = None) -> list:
     """Discover curated biopb workflows ("skills"). Call at the start of a task.
 
     Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
@@ -560,11 +584,11 @@ def list_skills(keywords: list[str] | None = None) -> list:
     Fail-open: returns an empty list (never errors) rather than reporting a
     catalog that could not be read.
     """
-    return _skills.list_skills(keywords or ())
+    return await asyncio.to_thread(_skills.list_skills, keywords or ())
 
 
 @mcp.tool()
-def take_screenshot(canvas_only: bool = True) -> list:
+async def take_screenshot(canvas_only: bool = True) -> list:
     """Capture the napari viewer as a PNG image.
 
     Args:
@@ -578,7 +602,7 @@ def take_screenshot(canvas_only: bool = True) -> list:
         return [TextContent(type="text", text=err)]
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
-    res = host.execute(snippet)
+    res = await _kernel_rpc._execute(host, snippet)
     if (
         _kernel_rpc._extract_delimited(
             res.get("stdout", ""), _kernel_rpc._WINDOW_CLOSED_DELIM
@@ -627,7 +651,7 @@ PROMOTE_PARAGRAPH = """Code runs in a background thread so it does not block the
 
 
 @mcp.tool()
-def execute_code(
+async def execute_code(
     python_code: str,
     intent: Annotated[str, Field(description=_INTENT_DESC)] = "",
 ) -> str:
@@ -684,13 +708,19 @@ def execute_code(
     if err is not None:
         return err
 
-    job_id, foreign_note, window_alive, msg = _start_job(
+    verifying = _scratch.running()
+    if verifying is not None:
+        # One job at a time is a rule about the *session*, not about one kernel:
+        # a verification is running in a second one, on the same dask cluster.
+        return _tool_busy_message(verifying["job_id"], "mcp")
+
+    job_id, foreign_note, window_alive, msg = await _start_job(
         host, python_code, intent=intent
     )
     if msg is not None:
         return msg
 
-    snap, res, window_alive = _await_job(host, job_id, window_alive)
+    snap, res, window_alive = await _await_job(host, job_id, window_alive)
     if snap is None:
         return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") != "running":
@@ -713,16 +743,17 @@ def execute_code(
 
 
 @mcp.tool()
-def verify_workflow(
+async def verify_workflow(
     cells: list[str],
     title: str = "",
 ) -> str:
-    """Check that a candidate workflow runs on its own, in a scratch namespace.
+    """Check that a candidate workflow runs on its own, in a scratch kernel.
 
     Use this when the user wants a workflow they have just proven kept as a
     document. Rewrite the session into a clean program — one entry in *cells*
-    per notebook cell — and verify it here; on success the user can save it as a
-    notebook from the observe page.
+    per notebook cell — and verify it here; on success the notebook is written
+    to disk for them and this tool reports where. Tell them the path; do not
+    write the file yourself.
 
     **Rewrite it, do not select from it.** The program that works is almost
     never a subsequence of what was run: a cell that created a variable and a
@@ -730,21 +761,34 @@ def verify_workflow(
     retries, and debugging prints drop out. Read the session with poll_job and
     write the cells you *mean*, in the order a reader would want them.
 
-    Each cell runs in order in a namespace seeded with the kernel's own handles
-    (np, da, client, ops, viewer) and nothing this session has bound since it
-    started. The run stops at the first failure; the cells after it are reported
-    as skipped.
+    The cells run in order in a **second kernel**, spawned for this and thrown
+    away afterwards: a fresh namespace with none of this session's state. The run
+    stops at the first failure; the cells after it are reported as skipped.
 
-    **This costs no restart.** The live session — its variables, its layers, its
-    dask cluster — is untouched, so there is nothing to ask the user about
-    before calling this.
+    **There is no `viewer` there, and that is deliberate.** The viewer exists so
+    you can show something to the person you are working with, and nobody is
+    watching a verification. So a workflow cell must not touch `viewer` — it
+    raises `NameError` — and the saved notebook has no viewer either, which is
+    what makes it an ordinary notebook that runs headless. Write the workflow to
+    *compute* and to `print` what matters; leave displaying the result to the
+    live session, where there is someone to see it.
 
-    **What it proves:** every cell ran, and no cell leaned on a variable it did
-    not itself create. That is the defect that makes a transcript unrunnable.
-    **What it does not:** the numbers are right (check them), and the viewer and
-    imported modules are shared — a cell that reads an existing layer by name
-    will find one here and not on a fresh kernel. Layers the run adds are added
-    to the real viewer, and are reported back so you can say so.
+    **The live session is untouched** — its variables, its layers, its viewer —
+    so there is nothing to ask the user about on that account. Bringing the
+    scratch kernel up takes a few seconds, and while a verification runs the
+    session kernel accepts no cells (one job at a time, across both).
+
+    **What it proves:** every cell runs, in order, against nothing but a fresh
+    kernel. That covers the whole class of defect that makes a transcript
+    unrunnable — a cell reading a variable an earlier discarded cell created, or
+    a layer this session happened to have.
+
+    **What it does not.** The numbers are right: check them. And a scratch
+    *process* is not a scratch *world* — it talks to the same tensor server and
+    the same filesystem, so `client.upload_array` / `upload_zarr` /
+    `add_source`, and any cell that writes a file, write through for real. Verify
+    a workflow three times and you have three uploaded arrays. **Say so before
+    running one that writes.**
 
     Args:
         cells: the workflow's cells, in order, each a complete piece of Python.
@@ -757,55 +801,131 @@ def verify_workflow(
     if not cells:
         return "verify_workflow needs at least one cell."
 
-    job_id, foreign_note, window_alive, msg = _start_job(
+    # The verification is claimed for this client, and the claim is enforced by
+    # the scratch kernel's own one-agent check (_jobs.submit) rather than a
+    # second one here -- so a stranger is refused an interrupt on it exactly as
+    # on the session kernel.
+    writer, label = _writers._client_identity()
+    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    started = await asyncio.to_thread(
+        _scratch.start,
+        list(cells),
+        title,
         host,
-        "",
-        intent=f"verify workflow: {title}" if title else "verify workflow",
-        verify_cells=list(cells),
-        verify_title=title,
+        f"verify workflow: {title}" if title else "verify workflow",
+        writer,
+        label,
     )
-    if msg is not None:
-        return msg
+    if started.get("error") == "busy":
+        return (
+            _tool_busy_message(
+                started.get("running_job_id"), started.get("running_job_origin")
+            )
+            + foreign_note
+        )
+    if "job_id" not in started:
+        return str(started.get("error")) + foreign_note
 
-    snap, res, window_alive = _await_job(host, job_id, window_alive)
-    if snap is None:
-        return _kernel_rpc._format_execute_result(res) + foreign_note
+    job_id = started["job_id"]
+    snap = await _await_verification(job_id)
     if snap.get("status") == "running":
         return (
             f"Verification {job_id} is still running after "
-            f"{_app._promote_after:.0f}s. Poll it with poll_job('{job_id}') — the "
-            "per-cell record is in the result." + foreign_note
+            f"{_app._promote_after:.0f}s (a scratch kernel takes a few seconds "
+            f"to build). Poll it with poll_job('{job_id}') — the per-cell record "
+            "is in the result." + foreign_note
         )
     record = snap.get("verify")
     if not record:
-        # A kernel that predates verify_cells, or a submit that never built the
-        # record: report the job the ordinary way rather than invent a verdict.
+        # Never reached a cell: the scratch kernel failed to build, or died
+        # before the first one. Its death IS the verdict, so report why.
         return (
-            _kernel_rpc._format_execute_result(snap)
-            + _kernel_rpc._window_note(window_alive)
+            f"Verification {job_id} did not run: "
+            + (snap.get("error_text") or "the scratch kernel produced no record.")
             + foreign_note
         )
-    return (
-        _format_verification(record, job_id)
-        + _kernel_rpc._window_note(window_alive)
-        + foreign_note
-    )
+    return _format_verification(record, job_id, snap.get("saved_path")) + foreign_note
+
+
+async def _await_verification(job_id, budget=None):
+    """Poll a verification until it is terminal or *budget* seconds run out.
+
+    ``_await_job``'s counterpart for the scratch kernel. Separate because there
+    is no kernel round trip to make: the run is a thread in this process, so a
+    poll is a dict read and the wait is pure loop sleep.
+    """
+    deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
+    snap = _scratch.poll(job_id)
+    while snap is not None and snap.get("status") == "running":
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.4)
+        snap = _scratch.poll(job_id)
+    return snap or {"status": "unknown"}
+
+
+#: How long ``poll_job`` waits for a running job when the caller says nothing,
+#: and the most it will wait when the caller asks for more.
+#:
+#: Defaulted rather than opt-in because the caller this exists for will not pass
+#: it: an agent loop has no innate sense of time, and one that would think to
+#: raise `wait` is not the one spinning. A ceiling because the wait holds an MCP
+#: request open, and a client that gives up on it turns a saving into a retry.
+_POLL_WAIT_DEFAULT = 10.0
+_POLL_WAIT_MAX = 30.0
+
+_WAIT_DESC = (
+    "Seconds to wait for a *running* job before answering. The call returns "
+    "the moment the job finishes, so this is a ceiling and not a delay -- a job "
+    "that ends in 2s answers in 2s. Leave it alone unless you have a reason: "
+    f"the default ({_POLL_WAIT_DEFAULT:.0f}s) is there so watching a job costs "
+    f"a handful of calls instead of hundreds. Raise it (up to "
+    f"{_POLL_WAIT_MAX:.0f}s) when you have nothing to do until the job ends; "
+    "set it to 0 only when you want a snapshot right now and will not "
+    "immediately ask again."
+)
 
 
 @mcp.tool()
-def poll_job(job_id: str) -> str:
+async def poll_job(
+    job_id: str,
+    wait: Annotated[float, Field(description=_WAIT_DESC, ge=0)] = _POLL_WAIT_DEFAULT,
+) -> str:
     """Get the status and output of a job started by execute_code.
 
     Returns the job's status (running/ok/error/interrupted), elapsed time, and
     output so far (full output once terminal). Job records persist until the
     kernel is restarted (older terminal jobs are eventually evicted).
+
+    **This call already waits, so do not poll it in a loop.** A running job is
+    watched here for up to `wait` seconds and answered the instant it ends;
+    calling again immediately just asks the same question sooner and buys
+    nothing. If you have nothing else to do until the job finishes, raise
+    `wait` rather than calling more often. A terminal job, an unknown job id
+    and a dead kernel all answer immediately whatever `wait` says.
     """
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
 
-    foreign_note = _writers._foreign_activity_note(host)
-    snap, res, window_alive = _kernel_rpc._run_job_call(host, "poll", job_id)
+    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    if _scratch.owns(job_id):
+        # A verification runs in a kernel this one cannot see. The id says which,
+        # because the session child issued it (_scratch._ID_PREFIX).
+        snap = _scratch.poll(job_id)
+        if snap is None:
+            return f"No such job '{job_id}'." + foreign_note
+        if snap.get("status") == "running" and wait > 0:
+            snap = await _await_verification(job_id, min(wait, _POLL_WAIT_MAX))
+        return _format_job_status(snap) + foreign_note
+    snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
+    if snap is not None and snap.get("status") == "running" and wait > 0:
+        # Probe first, wait second: a job that is already terminal -- the common
+        # case for a caller that has been polling -- answers with no delay, and
+        # only a genuinely running one costs the wait.
+        snap, res, window_alive = await _await_job(
+            host, job_id, window_alive, budget=min(wait, _POLL_WAIT_MAX), snap=snap
+        )
     if snap is None:
         return _kernel_rpc._format_execute_result(res) + foreign_note
     if snap.get("status") == "unknown":
@@ -819,7 +939,7 @@ def poll_job(job_id: str) -> str:
 
 
 @mcp.tool()
-def inspect_object(object_path: str) -> str:
+async def inspect_object(object_path: str) -> str:
     """Inspect a live object in the napari kernel namespace.
 
     Returns the type, docstring, and public methods/attributes.
@@ -830,14 +950,14 @@ def inspect_object(object_path: str) -> str:
         return err
 
     snippet = _INSPECT_TEMPLATE.replace("__PATH__", repr(object_path))
-    res = host.execute(snippet)
+    res = await _kernel_rpc._execute(host, snippet)
     if res.get("status") == "ok":
         return res.get("stdout", "").rstrip() or "(no output)"
     return res.get("error_text") or f"(status: {res.get('status')})"
 
 
 @mcp.tool()
-def interrupt_kernel() -> str:
+async def interrupt_kernel() -> str:
     """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
     Also cancels the job's in-flight dask futures. The job runs in a background
@@ -854,12 +974,50 @@ def interrupt_kernel() -> str:
     kernel and restart_kernel is not the way around it — restarting would destroy
     the user's running cell, variables and layers along with yours. Wait, or ask
     them.
+
+    Takes no argument for which job because there is only ever one: the slot is
+    the session's, not a kernel's. So this also stops a verification of yours
+    running in its scratch kernel, and refuses one that is not yours, by the
+    same rule and for the same reason.
+
+    **On a verification it is the guaranteed stop, not a best-effort one.** If
+    the cells do not stop promptly the scratch kernel is killed outright and
+    discarded — which is safe precisely because nothing in it is anyone's work.
+    So a stuck verification never needs restart_kernel: reaching for it there
+    would destroy the user's session to end a process that exists to be thrown
+    away.
     """
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
     writer, _label = _writers._client_identity()
-    data, res, _w = _kernel_rpc._run_job_call(
+    # Which kernel to signal is this process's business, not the tool
+    # signature's: the slot is global, so "the running job" is unambiguous.
+    # `None` back means there was no verification to stop -- which is not the
+    # same as nothing running, since one that ended a moment ago leaves the
+    # session kernel free to have started something. So fall through; never
+    # answer "nothing is running" from here.
+    data = await asyncio.to_thread(_scratch.interrupt, None, "mcp", writer)
+    if data is not None:
+        job_id = data.get("job_id")
+        if data.get("interrupted"):
+            how = (
+                "its cells would not stop, so the kernel was killed"
+                if data.get("killed")
+                else "its cells stopped"
+            )
+            return (
+                f"Stopped verification {job_id} — {how}, and the scratch kernel "
+                "is discarded. Your session is untouched; nothing here needs "
+                "restart_kernel."
+            )
+        if data.get("refused") == "not_owner":
+            return _writers._NOT_OWNER_MSG.format(held_by="")
+        return (
+            f"Nothing to interrupt in verification {job_id}; it may have "
+            "finished already. Poll it to see."
+        )
+    data, res, _w = await _kernel_rpc._job_call(
         host, "interrupt_current", requester="mcp", writer=writer
     )
     if data is None:
@@ -889,7 +1047,7 @@ def interrupt_kernel() -> str:
 
 
 @mcp.tool()
-def start_kernel() -> str:
+async def start_kernel() -> str:
     """Start biopb: bring up the napari viewer, dask, and the tensor client.
 
     Call this as the first action of every session, and whenever the user asks
@@ -911,7 +1069,7 @@ def start_kernel() -> str:
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
-    result = host.ensure_started()
+    result = await asyncio.to_thread(host.ensure_started)
     if result.get("state") == "ready":
         ready = (
             "Kernel ready. The napari viewer, dask, and tensor client are up; "
@@ -943,7 +1101,7 @@ def start_kernel() -> str:
 
 
 @mcp.tool()
-def restart_kernel() -> str:
+async def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
@@ -964,23 +1122,34 @@ def restart_kernel() -> str:
     if err is not None:
         return err
     # Gated like every other state change, and this is the sharpest of them: a
-    # restart discards the holder's whole session. Decided against the local
-    # mirror (_claimed_by) rather than a round trip to the kernel, so a kernel
-    # too busy to answer cannot be mistaken for an unclaimed one.
+    # restart discards the holder's whole session. Gate, restart and clear are
+    # one call because they have to be one critical section -- see
+    # _writers.restart. It blocks for the length of the bring-up, so it goes to
+    # a thread like every other kernel round trip here.
     writer, _label = _writers._client_identity()
-    held = _writers.claim_holder()
-    if held is not None and writer is not None and writer != held:
-        return _writers._NOT_OWNER_MSG.format(held_by="")
+    # A verification holds the slot in this process, not in the kernel being
+    # replaced, so a restart that left it running would hand back a fresh kernel
+    # that can accept nothing -- and a wedged verification would have no escape
+    # hatch, which is exactly what this tool is documented to be. Handed to
+    # _writers.restart rather than done here, so it happens only once the gate
+    # above has passed: a refused caller must not have destroyed anything.
     try:
-        host.restart()
+        refusal, discarded = await asyncio.to_thread(
+            _writers.restart,
+            host,
+            writer,
+            functools.partial(_scratch.discard, "restart_kernel"),
+        )
     except Exception as exc:
         return f"Kernel restart failed: {exc}"
-    _writers.clear_claim()  # a fresh kernel is unclaimed until someone runs code in it
-    return "Kernel restarted. Viewer rebuilt; previous variables are gone."
+    if refusal is not None:
+        return refusal
+    note = f" Verification {discarded} was discarded with it." if discarded else ""
+    return "Kernel restarted. Viewer rebuilt; previous variables are gone." + note
 
 
 @mcp.tool()
-def server_status() -> str:
+async def server_status() -> str:
     """Report server health, system load, and resource usage.
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
@@ -993,7 +1162,8 @@ def server_status() -> str:
 
     host = _app._kernel_host
 
-    cpu_percent = _cpu_percent(psutil)
+    # Off the loop for the one call that pays the 0.1s priming sample.
+    cpu_percent = await asyncio.to_thread(_cpu_percent, psutil)
     mem = psutil.virtual_memory()
     process = psutil.Process(os.getpid())
     proc_mem = process.memory_info()
@@ -1078,7 +1248,7 @@ def server_status() -> str:
             lines.append(line)
         return "\n".join(lines)
 
-    res = host.execute(_STATUS_SNIPPET, timeout=15.0)
+    res = await _kernel_rpc._execute(host, _STATUS_SNIPPET, 15.0)
     if res.get("status") == "ok":
         lines.append("")
         lines.append(res.get("stdout", "").rstrip())
@@ -1092,7 +1262,9 @@ def server_status() -> str:
 
     # Only on this path: the early returns above are all "kernel not usable",
     # where the digest round-trip cannot land anyway.
-    return "\n".join(lines) + _writers._foreign_activity_note(host)
+    return "\n".join(lines) + await asyncio.to_thread(
+        _writers._foreign_activity_note, host
+    )
 
 
 # ---------------------------------------------------------------------------

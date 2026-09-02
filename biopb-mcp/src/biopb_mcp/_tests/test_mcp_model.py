@@ -168,6 +168,44 @@ class TestCall:
         with pytest.raises(RuntimeError, match="context_length_exceeded"):
             asyncio.run(_model.make_model(config)([], []))
 
+    def test_an_image_refusal_is_told_apart_from_a_400_it_cannot_act_on(
+        self, config, state_home
+    ):
+        # The loop can do something about this one -- withdraw the images and
+        # try again -- and nothing about the rest, so it has its own type.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(
+            status=400, text="this model does not support image input"
+        )
+        payload = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "(image returned by take_screenshot)"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,x"},
+                    },
+                ],
+            }
+        ]
+        with pytest.raises(_model.VisionUnsupported, match="rejected an image"):
+            asyncio.run(_model.make_model(config)(payload, []))
+
+    def test_the_same_words_without_an_image_are_an_ordinary_error(
+        self, config, state_home
+    ):
+        # Matched only against the answer to a request that carried one: a
+        # provider saying "image" about a payload with no image in it is talking
+        # about something else, and withdrawing images would not fix it.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(status=400, text="unknown tool: take_image")
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(
+                _model.make_model(config)([{"role": "user", "content": "hi"}], [])
+            )
+        assert not isinstance(caught.value, _model.VisionUnsupported)
+
     def test_an_empty_choices_list_is_an_error_not_an_empty_answer(
         self, config, state_home
     ):

@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _app, _http, _kernel_rpc, _observe
+from biopb_mcp.mcp import _app, _http, _kernel_rpc, _observe, _scratch
 
 
 def _reply(r, window_alive=True):
@@ -189,13 +189,16 @@ def test_api_notebook_downloads_ipynb(client, host):
     assert any(o.get("name") == "stderr" for o in job2["outputs"])
 
 
-def test_api_notebook_workflow_serves_the_verified_run(client, host):
-    host.execute.return_value = _reply(
-        {
+def test_api_notebook_workflow_serves_the_verified_run(client, host, monkeypatch):
+    from biopb_mcp.mcp import _scratch
+
+    monkeypatch.setattr(
+        _scratch,
+        "verified",
+        lambda: {
             "title": "Count foci per cell",
             "created": 1_700_000_000.0,
             "status": "ok",
-            "added_layers": [],
             "cells": [
                 {
                     "code": "a = 2",
@@ -206,13 +209,14 @@ def test_api_notebook_workflow_serves_the_verified_run(client, host):
                     "elapsed": 0.1,
                 }
             ],
-        }
+        },
     )
     r = client.get("/api/notebook?workflow=1")
     assert r.status_code == 200
-    # A different document, so a different read: the verified program, not the
-    # transcript it was rewritten from.
-    assert "verified()" in host.execute.call_args[0][0]
+    assert "Count foci per cell" in r.text
+    # A different document, and one this process holds: the verified program ran
+    # in a scratch kernel that no longer exists, so there is no kernel to ask.
+    assert not host.execute.called
     assert r.headers["X-Filename"].startswith("biopb-count-foci-per-cell-")
     assert "Count foci per cell" in r.text
 
@@ -239,6 +243,69 @@ def test_api_notebook_empty_session(client, host):
     # Still a valid notebook: title + bootstrap, no job cells.
     assert nb["nbformat"] == 4
     assert any(c["cell_type"] == "code" for c in nb["cells"])
+
+
+class TestTheTwoKernels:
+    """The page shows one kernel at a time, so the API answers for one at a time.
+
+    A verification runs in a scratch kernel the session kernel has never heard
+    of. Merging its runs into ``jobs`` said they were this session's history;
+    they are a separate list.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clean_scratch(self):
+        _scratch.reset()
+        yield
+        _scratch.reset()
+
+    def _running_verification(self, monkeypatch):
+        snap = {
+            "job_id": "verify-1",
+            "status": "running",
+            "elapsed": 1.0,
+            "stdout": "",
+            "intent": "check it",
+            "cell_count": 2,
+        }
+        monkeypatch.setattr(_scratch, "running", lambda: snap)
+        monkeypatch.setattr(
+            _scratch,
+            "runs_view",
+            lambda: [
+                {
+                    "job_id": "verify-1",
+                    "status": "running",
+                    "origin": "mcp",
+                    "elapsed": 1.0,
+                    "code_preview": "wf (2 cells)",
+                    "intent_preview": "check it",
+                    "verify": True,
+                }
+            ],
+        )
+        return snap
+
+    def test_verifications_are_their_own_list(self, client, host, monkeypatch):
+        host.execute.return_value = _reply(
+            {"jobs": [{"job_id": "job-1", "status": "ok", "elapsed": 0.1}]}
+        )
+        self._running_verification(monkeypatch)
+        body = client.get("/api/jobs").json()
+        assert [j["job_id"] for j in body["jobs"]] == ["job-1"]
+        assert [j["job_id"] for j in body["verify_jobs"]] == ["verify-1"]
+
+    def test_the_interrupt_finds_the_kernel_that_is_busy(
+        self, client, host, monkeypatch
+    ):
+        # No target argument, and none is needed: the slot spans both kernels,
+        # so only one of them can have a running row for the button to sit on.
+        self._running_verification(monkeypatch)
+        monkeypatch.setattr(
+            _scratch, "interrupt", lambda *a, **k: {"interrupted": True}
+        )
+        assert client.post("/api/kernel/interrupt").json()["interrupted"] is True
+        host.execute.assert_not_called()
 
 
 def test_api_interrupt_targets_running_job(client, host):

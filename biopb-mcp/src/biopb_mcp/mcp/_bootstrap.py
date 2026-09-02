@@ -170,6 +170,25 @@ def _register_cache_plugin(dask_client, url, token, config: dict, planned_worker
         logger.exception("Failed to register chunk-cache budget plugin")
 
 
+def is_scratch_kernel():
+    """Whether this kernel was spawned to verify a workflow (``_scratch``).
+
+    A scratch kernel is a full bootstrap with the user-facing parts left out:
+    nobody is watching it, and everything it builds is thrown away with the
+    process a few seconds later. The one difference that is not cosmetic is the
+    viewer -- ``napari.Viewer(show=False)`` maps no window, so the scratch kernel
+    can take the session's own display, and its real GPU, without a window
+    appearing in front of the user. Offscreen is not an alternative: it creates
+    no GL context at all, so nothing renders and screenshots come back empty
+    (docs/verification-scratch-kernel.md, "The display").
+
+    The literal mirrors ``_kernel.ENV_SCRATCH``, which is where the launcher
+    sets it; spelled out rather than imported because ``_kernel`` belongs to the
+    session child and this module runs in the kernel.
+    """
+    return bool(os.environ.get("BIOPB_SCRATCH_KERNEL"))
+
+
 def _install_window_close_hook(viewer):
     """Signal the launcher when the user closes the napari window.
 
@@ -610,16 +629,23 @@ def _bootstrap_impl():
     #    showing it after the imports (as before) left several seconds of blank
     #    screen the splash was meant to hide (issue #386). Best-effort: show_splash
     #    fails open to _NullSplash when Qt is unavailable.
-    from ._splash import show_splash
+    from ._splash import _NullSplash, show_splash
 
-    ip.enable_gui("qt")
-    splash = show_splash()
+    # A scratch kernel is headless *by policy*, not by circumstance: the viewer
+    # exists so an agent can show something to a person, and a verification has
+    # no person in it. Skipping Qt entirely is what makes that policy free --
+    # no event loop, no GL, no display, and none of napari's ~330 MiB.
+    if is_scratch_kernel():
+        splash = _NullSplash()
+    else:
+        ip.enable_gui("qt")
+        splash = show_splash()
 
     # Heavy core imports, now covered by the splash. dask.array is the slow one
     # here; napari is pulled in transitively on some platforms, so this is the
     # phase the "Loading napari…" cue is for (the later `import napari` is then a
     # no-op — see step 4). numpy/da are bound for the execute_code namespace.
-    splash.message("Loading napari…")
+    splash.message("Loading napari…")  # a no-op in a scratch kernel
     import dask.array as da
     import numpy as np
 
@@ -691,59 +717,83 @@ def _bootstrap_impl():
 
     threading.Thread(target=_attach_dask, name="biopb-dask-attach", daemon=True).start()
 
-    # 4. napari viewer + Tensor Browser (auto-connects on its own tick).
-    #    compute_scheduler pins the viewer's serial slice reads to a
-    #    single-process scheduler so they share the main-process chunk cache
-    #    instead of scattering across the distributed cluster (issue #8).
-    compute_scheduler = get_setting(config, "viewer.compute_scheduler")
-    # Enable napari async slicing via its NAPARI_ASYNC env override, set
-    # BEFORE importing napari. The settings singleton reads the env at load,
-    # and the viewer's _LayerSlicer captures the flag once at construction
-    # (_layer_slicer.py: ``self._force_sync = not ...async_``) -- so the env
-    # var is the only reliable hook; assigning the settings object after
-    # import is too late (the settings load resets it). Async slicing
-    # fetches slices off the Qt main thread so a zoom into a not-yet-cached
-    # level doesn't freeze the viewer (vispy keeps the current coarse
-    # texture until the finer slice resolves); take_screenshot force-syncs a
-    # slice before capturing so the agent still sees the requested frame
-    # (resync_view_for_capture).
-    os.environ["NAPARI_ASYNC"] = (
-        "1" if get_setting(config, "viewer.async_slicing") else "0"
-    )
-
-    try:
-        # napari was already pulled in by the core imports above (splash is
-        # showing "Loading napari…" for that phase), so this import just
-        # binds the name — the real cost is napari.Viewer() below.
-        import napari
-
-        from ..tensor_browser import TensorBrowserWidget
-
-        splash.message("Opening viewer…")  # the slow step
-        viewer = napari.Viewer()
-        tbw = TensorBrowserWidget(
-            viewer, connection=conn, compute_scheduler=compute_scheduler
+    # 4. napari viewer + Tensor Browser -- unless this is a scratch kernel.
+    #
+    # **A scratch kernel is headless by policy.** The viewer is how an agent
+    # shows something to a person; a verification has no person in it, so a
+    # workflow that reaches for `viewer` is a workflow that will not run as the
+    # document it is about to become -- the saved notebook has no viewer either
+    # (`_notebook.WORKFLOW_BOOTSTRAP_SRC`). Failing here is the two ends
+    # agreeing, which is the rule this whole feature rests on.
+    #
+    # It also costs nothing to enforce: no Qt, no GL, no display, and ~330 MiB
+    # and ~1.7 s of napari.Viewer() that nobody was going to look at.
+    viewer = None
+    if not is_scratch_kernel():
+        # 4. napari viewer + Tensor Browser (auto-connects on its own tick).
+        #    compute_scheduler pins the viewer's serial slice reads to a
+        #    single-process scheduler so they share the main-process chunk cache
+        #    instead of scattering across the distributed cluster (issue #8).
+        compute_scheduler = get_setting(config, "viewer.compute_scheduler")
+        # Enable napari async slicing via its NAPARI_ASYNC env override, set
+        # BEFORE importing napari. The settings singleton reads the env at load,
+        # and the viewer's _LayerSlicer captures the flag once at construction
+        # (_layer_slicer.py: ``self._force_sync = not ...async_``) -- so the env
+        # var is the only reliable hook; assigning the settings object after
+        # import is too late (the settings load resets it). Async slicing
+        # fetches slices off the Qt main thread so a zoom into a not-yet-cached
+        # level doesn't freeze the viewer (vispy keeps the current coarse
+        # texture until the finer slice resolves); take_screenshot force-syncs a
+        # slice before capturing so the agent still sees the requested frame
+        # (resync_view_for_capture).
+        os.environ["NAPARI_ASYNC"] = (
+            "1" if get_setting(config, "viewer.async_slicing") else "0"
         )
-        viewer.window.add_dock_widget(tbw, name="Tensor Browser")
-        # Hand the splash off to the viewer window (closes once it's shown).
-        splash.finish(viewer)
-        # Tear the kernel down to idle when the user closes the window: signal
-        # the launcher's reader thread over the inherited window-close pipe.
-        _install_window_close_hook(viewer)
 
-        # Kernel-start update reminder (issue #87): once a window exists, check
-        # in the background whether a newer release-v* deployment is available
-        # and, if so, remind the user to run the upgrade script. Never blocks
-        # window paint.
-        _start_update_check(viewer, config)
+        try:
+            # napari was already pulled in by the core imports above (splash is
+            # showing "Loading napari…" for that phase), so this import just
+            # binds the name — the real cost is napari.Viewer() below.
+            import napari
 
-    except Exception:
-        # Happy path: finish() hands the splash off to the viewer window (it
-        # closes once the window shows). If a step above fails first, close it
-        # so it can't linger before the kernel is torn down, then re-raise for
-        # bootstrap()'s BOOTSTRAP_ERROR handler.
-        splash.close()
-        raise
+            from ..tensor_browser import TensorBrowserWidget
+
+            splash.message("Opening viewer…")  # the slow step
+            if is_scratch_kernel():
+                # Hidden, and alone: no dock widget, no window-close hook (there is
+                # no window to close and the pipe would report a teardown to the
+                # launcher that means nothing), no update check (the user is not
+                # here, and this process outlives nothing). A fresh empty viewer is
+                # the point -- it is what makes a workflow that leans on a layer the
+                # live session produced fail here, which is the defect verification
+                # exists to catch.
+                viewer = napari.Viewer(show=False)
+                splash.close()
+            else:
+                viewer = napari.Viewer()
+                tbw = TensorBrowserWidget(
+                    viewer, connection=conn, compute_scheduler=compute_scheduler
+                )
+                viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+                # Hand the splash off to the viewer window (closes once it's shown).
+                splash.finish(viewer)
+                # Tear the kernel down to idle when the user closes the window:
+                # signal the launcher's reader thread over the inherited pipe.
+                _install_window_close_hook(viewer)
+
+                # Kernel-start update reminder (issue #87): once a window exists,
+                # check in the background whether a newer release-v* deployment is
+                # available and, if so, remind the user to run the upgrade script.
+                # Never blocks window paint.
+                _start_update_check(viewer, config)
+
+        except Exception:
+            # Happy path: finish() hands the splash off to the viewer window (it
+            # closes once the window shows). If a step above fails first, close it
+            # so it can't linger before the kernel is torn down, then re-raise for
+            # bootstrap()'s BOOTSTRAP_ERROR handler.
+            splash.close()
+            raise
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
@@ -759,17 +809,6 @@ def _bootstrap_impl():
     #    install() stores the shell, installs the thread-aware stdout streams,
     #    and clears any prior job state.
     _jobs.install(ip)
-    # The agent-facing `viewer` is a main-thread marshaling proxy so arbitrary
-    # job-thread code (viewer/layers/dims/camera mutations) can't segfault Qt --
-    # the real viewer is touched only on the Qt main thread. Internal subsystems
-    # (helpers, tools, the Tensor Browser widget) keep the real viewer. See
-    # docs/viewer-thread-safety.md.
-    from ._helpers import patch_viewer_add_tensor
-    from ._viewer_proxy import make_viewer_proxy
-
-    patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
-    viewer_handle = make_viewer_proxy(viewer)
-
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
     #    _dask_client was seeded to None at step 3 and is filled by the background
@@ -777,22 +816,38 @@ def _bootstrap_impl():
     #    attach can finish before this runs).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
-    from ._helpers import resync_view_for_capture, viewer_window_alive
+    ns = {
+        "np": np,
+        "da": da,
+        "client": None,
+        "ops": ops,
+        "_conn": conn,
+        "_jobs": _jobs,
+        # Safe to bind headless: with no QCoreApplication it runs `fn` inline
+        # (see _jobs.run_on_main), so a plugin that marshals still works.
+        "run_on_main": _jobs.run_on_main,
+    }
+    if viewer is not None:
+        # The agent-facing `viewer` is a main-thread marshaling proxy so
+        # arbitrary job-thread code (viewer/layers/dims/camera mutations) can't
+        # segfault Qt -- the real viewer is touched only on the Qt main thread.
+        # Internal subsystems (helpers, tools, the Tensor Browser widget) keep
+        # the real viewer. See docs/viewer-thread-safety.md.
+        from ._helpers import (
+            patch_viewer_add_tensor,
+            resync_view_for_capture,
+            viewer_window_alive,
+        )
+        from ._viewer_proxy import make_viewer_proxy
 
-    ip.user_ns.update(
-        {
-            "viewer": viewer_handle,
-            "np": np,
-            "da": da,
-            "client": None,
-            "ops": ops,
-            "_conn": conn,
-            "_jobs": _jobs,
-            "run_on_main": _jobs.run_on_main,
-            "_viewer_window_alive": lambda: viewer_window_alive(viewer),
-            "_resync_view": lambda: resync_view_for_capture(viewer),
-        }
-    )
+        patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
+        ns["viewer"] = make_viewer_proxy(viewer)
+        ns["_viewer_window_alive"] = lambda: viewer_window_alive(viewer)
+        ns["_resync_view"] = lambda: resync_view_for_capture(viewer)
+    # `viewer` is simply absent in a scratch kernel -- a workflow that uses it
+    # raises NameError, which is the verdict. The job-status snippet already
+    # reads _viewer_window_alive with a default, so its absence is expected.
+    ip.user_ns.update(ns)
 
     # 7b. User "bring your own tool" plugins (#92): load *.py files from
     #     ~/.config/biopb/kernel/ and biopb_mcp.namespace entry points into the
@@ -815,11 +870,3 @@ def _bootstrap_impl():
         )
     except Exception:
         logger.exception("Failed to start source watcher")
-
-    # 9. The scratch-run baseline: the namespace as this bootstrap leaves it.
-    #    Last, so it holds the built-in handles *and* the plugins and nothing
-    #    else -- everything bound after this point belongs to the session, and
-    #    is exactly what a verification run is defined not to see. Cheap (a key
-    #    set) and unconditional: a session that never verifies anything pays for
-    #    one frozenset.
-    _jobs.mark_baseline()

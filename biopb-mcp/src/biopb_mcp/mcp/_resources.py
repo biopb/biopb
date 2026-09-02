@@ -75,6 +75,11 @@ A slow `execute_code` call runs in a background thread and returns a `job-N` han
 watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`
 (best-effort, raises KeyboardInterrupt into the job and cancels in-flight dask tasks) or
 `restart_kernel` (guaranteed, kills the kernel). Notes:
+* **`poll_job` waits for you — do not spin on it.** It watches a running job for
+  `wait` seconds (10 by default, 30 max) and answers the moment the job ends, so
+  calling it back-to-back asks the same question sooner and costs you a round trip
+  for nothing. Raise `wait` if you have nothing to do until the job finishes; pass
+  `wait=0` only for a snapshot you are not about to ask for again.
 * **A blocking `.compute()` is interruptible** — `interrupt_kernel` cancels the in-flight
   dask tasks, so the `.compute()` raises and the job ends. No special pattern needed.
 * **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
