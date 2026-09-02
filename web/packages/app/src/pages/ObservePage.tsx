@@ -9,6 +9,7 @@ import { useParams } from "react-router-dom";
 import { localRootsProxied } from "../auth";
 import ChatPane from "../components/ChatPane";
 import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
+import { arrivals } from "../utils/jobArrivals";
 import { sessionFetch, sessionVerdict } from "../utils/sessionFetch";
 import {
   clampChatWidth,
@@ -260,12 +261,9 @@ export default function ObservePage() {
       ["verify", verifyList],
     ] as [Pane, JobSummary[]][]) {
       const mine = new Set(rows.map((j) => j.job_id));
-      const before = seen.current[key];
+      const added = arrivals(seen.current[key], mine);
       seen.current[key] = mine;
-      if (before) {
-        const added = [...mine].filter((id) => !before.has(id));
-        if (added.length) setFresh((f) => new Set([...f, ...added]));
-      }
+      if (added.length) setFresh((f) => new Set([...f, ...added]));
       const newest = rows.length ? rows[rows.length - 1]!.job_id : null;
       if (newest === lastNewest.current[key]) continue;
       lastNewest.current[key] = newest;
@@ -1033,7 +1031,15 @@ const OBS_CSS = `
         border-top: 1px solid transparent;
         transition: grid-template-rows .28s ease, border-color .28s ease; }
   .obs-page .job.open .detail { grid-template-rows: 1fr; border-top-color: #333; }
-  .obs-page .detail-clip { overflow: hidden; min-height: 0; }
+  /* Hidden, not merely clipped. The content stays mounted so the close can
+     animate, and clipping alone leaves a collapsed row's code and output in
+     the accessibility tree and its scrollable <pre> in the tab order --
+     display:none used to rule both out. The flip is delayed by the length of
+     the collapse so the fold is still watchable, and immediate on the way
+     open. */
+  .obs-page .detail-clip { overflow: hidden; min-height: 0; visibility: hidden;
+        transition: visibility 0s linear .28s; }
+  .obs-page .job.open .detail-clip { visibility: visible; transition-delay: 0s; }
   .obs-page .detail-body { padding: 10px 12px; }
   .obs-page .label { color: #6a8; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin: 8px 0 2px; }
   .obs-page .label:first-child { margin-top: 0; }
@@ -1066,6 +1072,7 @@ const OBS_CSS = `
   @media (prefers-reduced-motion: reduce) {
     .obs-page .job.enter { animation: none; }
     .obs-page .detail { transition: none; }
+    .obs-page .detail-clip { transition-delay: 0s; }
     .obs-page .badge.running, .obs-page .pane-toggle .live { animation: none; }
   }
 `;
