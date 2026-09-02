@@ -698,14 +698,22 @@ class TestJobConcurrency:
                 env=env,
                 watchdog_interval=0,
                 window_close_pipe=False,
-                health_probe_code="print('_jobs' in dir() and 'ops' in dir())",
+                health_probe_code="print('_jobs' in dir())",
             )
         )
         session = KernelHost(health_probe_code=None, startup_timeout=60.0)
         session.start()
         assert "JOBS_READY" in session.execute(_SETUP, timeout=30.0)["stdout"]
         try:
-            started = _scratch.start(["a = 2", "print(a * 3)"], "arithmetic", session)
+            started = _scratch.start(
+                [
+                    {"kind": "markdown", "text": "# arithmetic\n\nTriple it."},
+                    {"kind": "code", "text": "a = 2"},
+                    {"kind": "code", "text": "print(a * 3)"},
+                ],
+                "arithmetic",
+                session,
+            )
             job_id = started["job_id"]
             deadline = time.monotonic() + 180.0
             while time.monotonic() < deadline:
@@ -722,13 +730,15 @@ class TestJobConcurrency:
             _scratch.set_host_factory(None)
             session.shutdown()
 
-    def test_a_scratch_kernel_binds_no_viewer(self):
+    def test_a_scratch_kernel_binds_nothing_a_document_must_build(self):
         """The policy, enforced where it is decided.
 
-        The viewer is how an agent shows something to a person; a verification
-        has nobody watching. So a workflow reaching for `viewer` must fail here
-        rather than pass and then fail in the saved notebook, which has no
-        viewer either (_notebook.WORKFLOW_BOOTSTRAP_SRC).
+        The reader of a saved workflow gets a bare kernel, so the verification
+        runs on one too: no `viewer` (nobody is watching a verification), and no
+        `np`, `client` or `ops` either — the document builds those itself with
+        `biopb_mcp.workflow_env`, and this is what makes running it here proof
+        that it runs there. Anything handed to the run for free is something the
+        document can lean on and fail on later.
         """
         from biopb_mcp.mcp import _scratch
         from biopb_mcp.mcp._kernel import ENV_SCRATCH
@@ -745,7 +755,7 @@ class TestJobConcurrency:
                 env=env,
                 watchdog_interval=0,
                 window_close_pipe=False,
-                health_probe_code="print('_jobs' in dir() and 'ops' in dir())",
+                health_probe_code="print('_jobs' in dir())",
             )
         )
         session = KernelHost(health_probe_code=None, startup_timeout=60.0)
@@ -754,8 +764,9 @@ class TestJobConcurrency:
         try:
             started = _scratch.start(
                 [
-                    "print('np ok', np.arange(3).sum())",
-                    "viewer.add_image(np.zeros((4, 4)))",
+                    {"kind": "code", "text": "import numpy as np"},
+                    {"kind": "code", "text": "print('np ok', np.arange(3).sum())"},
+                    {"kind": "code", "text": "viewer.add_image(np.zeros((4, 4)))"},
                 ],
                 "leans on the viewer",
                 session,
@@ -767,13 +778,14 @@ class TestJobConcurrency:
                     break
                 time.sleep(0.5)
             cells = snap["verify"]["cells"]
-            # The handles a workflow may use are there...
+            # What the document imports, it has...
             assert cells[0]["status"] == "ok", cells[0]
-            assert "np ok 3" in cells[0]["stdout"]
-            # ...and the one it may not is simply absent.
-            assert cells[1]["status"] == "error"
-            assert "NameError" in cells[1]["error_text"]
-            assert "viewer" in cells[1]["error_text"]
+            assert cells[1]["status"] == "ok", cells[1]
+            assert "np ok 3" in cells[1]["stdout"]
+            # ...and what it only assumed is simply absent.
+            assert cells[2]["status"] == "error"
+            assert "NameError" in cells[2]["error_text"]
+            assert "viewer" in cells[2]["error_text"]
             assert _scratch.verified() is None
         finally:
             _scratch.reset()

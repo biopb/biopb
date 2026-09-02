@@ -34,8 +34,9 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 
-from . import _kernel_rpc, _notebook
+from . import _kernel_rpc, _notebook, _workflow_doc
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,11 @@ _seq = 0
 #: reads them. They are a few kilobytes each and verifications are rare, so the
 #: cap is generous; it exists so a long-lived session cannot fill a disk.
 _SPOOL_KEEP = 50
+
+#: Where drafts live, under the workflow dir. A subdirectory so the spool's
+#: glob (and its keep-newest rule) sees records only: a draft is a working file,
+#: not a run that happened.
+_DRAFT_DIR = "drafts"
 
 #: How long an interrupt waits for the cells to stop before taking the process.
 #:
@@ -127,12 +133,8 @@ def _snapshot(run):
         "title": run["title"],
         "cell_count": len(run["cells"]),
         "saved_path": run["saved_path"],
+        "draft_path": run["draft_path"],
     }
-
-
-#: How ``_jobs.submit`` joins verification cells into the job's ``code``. Spelled
-#: again here so the observe detail view shows the same program the kernel ran.
-_CELL_SEP = "\n\n# ---\n\n"
 
 
 def detail(job_id):
@@ -152,7 +154,7 @@ def detail(job_id):
     if snap is None:
         return None
     with _lock:
-        cells = list(_run["cells"]) if _run and _run["job_id"] == job_id else []
+        blocks = list(_run["blocks"]) if _run and _run["job_id"] == job_id else []
     record = snap.get("verify") or {}
     lines = [snap["stdout"].rstrip()] if snap.get("stdout") else []
     for i, cell in enumerate(record.get("cells") or [], 1):
@@ -165,7 +167,10 @@ def detail(job_id):
             lines.append(cell["error_text"].rstrip())
     return {
         **snap,
-        "code": _CELL_SEP.join(cells),
+        # The document, prose and all -- not the cells joined back together.
+        # What is being verified is a document, and the page has no better
+        # rendering of one than its own text.
+        "code": _workflow_doc.to_markdown(blocks) if blocks else "",
         "stdout": "\n".join(lines) + ("\n" if lines else ""),
         # The scratch kernel's viewer is hidden and is not the session's, so its
         # liveness is not a thing to warn the user about.
@@ -239,6 +244,11 @@ def verified():
             return None
         return {
             **_run["record"],
+            # The prose never went to the kernel -- it is not code and the
+            # kernel has no use for it -- so it is merged back here, where both
+            # readers of a record (the spool, and the observe download) get it
+            # from one place.
+            "blocks": list(_run["blocks"]),
             "job_id": _run["job_id"],
             "saved_path": _run["saved_path"],
         }
@@ -262,8 +272,13 @@ def verified_summary():
     }
 
 
-def start(cells, title, session_host, intent="", writer=None, writer_label=""):
-    """Take the slot and begin verifying *cells* in a fresh scratch kernel.
+def start(blocks, title, session_host, intent="", writer=None, writer_label=""):
+    """Take the slot and begin verifying a document in a fresh scratch kernel.
+
+    *blocks* is the parsed document (:mod:`_workflow_doc`); its code blocks are
+    what runs, and the whole of it is what the notebook is built from. The draft
+    is written before the run starts, so an attempt that fails -- the one a
+    person most wants to open and fix -- is on disk like any other.
 
     Returns ``{"job_id": ...}``, or ``{"error": "busy", ...}`` naming what holds
     the slot, or ``{"error": <reason>}`` when no scratch kernel can be built.
@@ -317,7 +332,8 @@ def start(cells, title, session_host, intent="", writer=None, writer_label=""):
         _run = {
             "job_id": f"{_ID_PREFIX}{_seq}",
             "title": title,
-            "cells": list(cells),
+            "blocks": list(blocks),
+            "cells": _workflow_doc.code_cells(blocks),
             "intent": intent,
             "started": time.monotonic(),
             "finished": None,
@@ -330,8 +346,11 @@ def start(cells, title, session_host, intent="", writer=None, writer_label=""):
             "writer_label": writer_label,
             "discarded": False,
             "saved_path": None,
+            "draft_path": None,
         }
         run = _run
+
+    _write_draft(run)
 
     thread = threading.Thread(
         target=_execute, args=(run,), name="scratch-verify", daemon=True
@@ -364,6 +383,37 @@ def _finish(run, status, error=None):
         # which the record already is.
 
 
+def _write_draft(run):
+    """Write this attempt's document to its draft file. Never raises.
+
+    **The draft is the working copy, and it is written whether the run passes or
+    not.** A failed attempt is the one a person most wants to open, and the
+    agent's next attempt should edit a file rather than retype the document from
+    memory -- which is also how a human edit survives: the file is what gets
+    sent back.
+
+    Kept in the document's own spelling, not as ``.ipynb``: it is text to edit,
+    it diffs, and it is exactly the format the tool takes, so a draft read back
+    is a draft that can be sent back unchanged.
+
+    One file per title, overwritten. Attempts at one workflow are drafts of one
+    document, not a history worth keeping -- the history that is worth keeping
+    is the record a pass promotes it to.
+    """
+    from .._config import get_workflow_dir
+
+    try:
+        drafts = get_workflow_dir() / _DRAFT_DIR
+        drafts.mkdir(parents=True, exist_ok=True)
+        path = drafts / _notebook.draft_filename(run["title"])
+        path.write_text(_workflow_doc.to_markdown(run["blocks"]), encoding="utf-8")
+    except OSError:
+        logger.exception("Could not write the workflow draft")
+        return
+    with _lock:
+        run["draft_path"] = str(path)
+
+
 def _spool(run):
     """Write the workflow this run proved into the spool. Never raises.
 
@@ -371,6 +421,10 @@ def _spool(run):
     takes the download away -- deliberately, because the page shows one run --
     but the file it wrote is still there, which is what makes that a UI decision
     rather than data loss.
+
+    A pass **promotes**: the record is written and the draft that became it is
+    removed, so a draft on disk means "this one has not passed yet". The draft
+    is only retired once the record exists, so there is no moment with neither.
 
     Best-effort by construction: a verification that passed and could not be
     written is still a verification that passed, and reporting a disk error as a
@@ -380,13 +434,22 @@ def _spool(run):
 
     try:
         path = get_workflow_dir() / _notebook.suggested_workflow_filename(run["title"])
-        nb = _notebook.build_workflow_notebook(run["record"])
+        nb = _notebook.build_workflow_notebook(
+            {**run["record"], "blocks": run["blocks"]}
+        )
         path.write_text(json.dumps(nb, indent=1), encoding="utf-8")
     except Exception:  # noqa: BLE001 - the verification stands either way
         logger.exception("Could not spool the verified workflow")
         return
     with _lock:
         run["saved_path"] = str(path)
+        draft = run["draft_path"]
+        run["draft_path"] = None
+    if draft:
+        try:
+            Path(draft).unlink()
+        except OSError:
+            logger.debug("Could not remove the promoted draft %s", draft)
     _prune_spool()
 
 

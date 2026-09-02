@@ -173,14 +173,18 @@ def _register_cache_plugin(dask_client, url, token, config: dict, planned_worker
 def is_scratch_kernel():
     """Whether this kernel was spawned to verify a workflow (``_scratch``).
 
-    A scratch kernel is a full bootstrap with the user-facing parts left out:
-    nobody is watching it, and everything it builds is thrown away with the
-    process a few seconds later. The one difference that is not cosmetic is the
-    viewer -- ``napari.Viewer(show=False)`` maps no window, so the scratch kernel
-    can take the session's own display, and its real GPU, without a window
-    appearing in front of the user. Offscreen is not an alternative: it creates
-    no GL context at all, so nothing renders and screenshots come back empty
-    (docs/verification-scratch-kernel.md, "The display").
+    A scratch kernel is the bootstrap's machinery -- the job runner, the dask
+    attach, the connection -- and **none of its workflow handles**: no
+    ``viewer``, ``np``, ``da``, ``client`` or ``ops``, and no user plugins.
+    Whoever opens the saved notebook gets a bare kernel, so the run that
+    verifies it gets one too, and what the document needs it builds for itself
+    (``biopb_mcp.workflow_env``). Anything bound here for free is something a
+    workflow can pass on and then fail on
+    (docs/verification-scratch-kernel.md).
+
+    No Qt either, so it needs no display at all -- an earlier design took the
+    session's with ``napari.Viewer(show=False)``, which is why the note about
+    offscreen GL is in that document rather than here.
 
     The literal mirrors ``_kernel.ENV_SCRATCH``, which is where the launcher
     sets it; spelled out rather than imported because ``_kernel`` belongs to the
@@ -722,9 +726,9 @@ def _bootstrap_impl():
     # **A scratch kernel is headless by policy.** The viewer is how an agent
     # shows something to a person; a verification has no person in it, so a
     # workflow that reaches for `viewer` is a workflow that will not run as the
-    # document it is about to become -- the saved notebook has no viewer either
-    # (`_notebook.WORKFLOW_BOOTSTRAP_SRC`). Failing here is the two ends
-    # agreeing, which is the rule this whole feature rests on.
+    # document it is about to become. It is the sharpest case of the wider rule
+    # below: the reader of a saved workflow gets a bare kernel, so the run that
+    # verifies it gets one too.
     #
     # It also costs nothing to enforce: no Qt, no GL, no display, and ~330 MiB
     # and ~1.7 s of napari.Viewer() that nobody was going to look at.
@@ -759,33 +763,22 @@ def _bootstrap_impl():
             from ..tensor_browser import TensorBrowserWidget
 
             splash.message("Opening viewer…")  # the slow step
-            if is_scratch_kernel():
-                # Hidden, and alone: no dock widget, no window-close hook (there is
-                # no window to close and the pipe would report a teardown to the
-                # launcher that means nothing), no update check (the user is not
-                # here, and this process outlives nothing). A fresh empty viewer is
-                # the point -- it is what makes a workflow that leans on a layer the
-                # live session produced fail here, which is the defect verification
-                # exists to catch.
-                viewer = napari.Viewer(show=False)
-                splash.close()
-            else:
-                viewer = napari.Viewer()
-                tbw = TensorBrowserWidget(
-                    viewer, connection=conn, compute_scheduler=compute_scheduler
-                )
-                viewer.window.add_dock_widget(tbw, name="Tensor Browser")
-                # Hand the splash off to the viewer window (closes once it's shown).
-                splash.finish(viewer)
-                # Tear the kernel down to idle when the user closes the window:
-                # signal the launcher's reader thread over the inherited pipe.
-                _install_window_close_hook(viewer)
+            viewer = napari.Viewer()
+            tbw = TensorBrowserWidget(
+                viewer, connection=conn, compute_scheduler=compute_scheduler
+            )
+            viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+            # Hand the splash off to the viewer window (closes once it's shown).
+            splash.finish(viewer)
+            # Tear the kernel down to idle when the user closes the window:
+            # signal the launcher's reader thread over the inherited pipe.
+            _install_window_close_hook(viewer)
 
-                # Kernel-start update reminder (issue #87): once a window exists,
-                # check in the background whether a newer release-v* deployment is
-                # available and, if so, remind the user to run the upgrade script.
-                # Never blocks window paint.
-                _start_update_check(viewer, config)
+            # Kernel-start update reminder (issue #87): once a window exists,
+            # check in the background whether a newer release-v* deployment is
+            # available and, if so, remind the user to run the upgrade script.
+            # Never blocks window paint.
+            _start_update_check(viewer, config)
 
         except Exception:
             # Happy path: finish() hands the splash off to the viewer window (it
@@ -817,16 +810,29 @@ def _bootstrap_impl():
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
     ns = {
-        "np": np,
-        "da": da,
-        "client": None,
-        "ops": ops,
         "_conn": conn,
         "_jobs": _jobs,
         # Safe to bind headless: with no QCoreApplication it runs `fn` inline
         # (see _jobs.run_on_main), so a plugin that marshals still works.
         "run_on_main": _jobs.run_on_main,
     }
+    if not is_scratch_kernel():
+        # **A scratch kernel binds no workflow handles**, for the reason it
+        # builds no viewer: what it verifies is a document someone will run
+        # somewhere else, and the reader gets `np`, `da`, `client` and `ops`
+        # only if the document builds them (`biopb_mcp.workflow_env`). Handing
+        # them to the verification would prove a program that runs here and
+        # nowhere else -- the exact defect this exists to catch, moved one level
+        # up from variables to the environment. A document that forgets its
+        # setup cell raises NameError, which is the verdict.
+        ns.update(
+            {
+                "np": np,
+                "da": da,
+                "client": None,
+                "ops": ops,
+            }
+        )
     if viewer is not None:
         # The agent-facing `viewer` is a main-thread marshaling proxy so
         # arbitrary job-thread code (viewer/layers/dims/camera mutations) can't
@@ -854,7 +860,10 @@ def _bootstrap_impl():
     #     namespace now that the built-in handles (viewer/client/np/da/ops) exist,
     #     so a plugin's code can reference them. Fail-open per plugin; the reserved
     #     handles are guarded against a shadowing plugin.
-    _load_namespace_plugins(ip, config)
+    if not is_scratch_kernel():
+        # Not here either, and for the same reason: `workflow_env()` loads them
+        # for the reader, so the verification has to reach them the same way.
+        _load_namespace_plugins(ip, config)
 
     # 8. Background source-catalog watcher (issue #44): a daemon thread that
     #    health-checks the server and re-lists sources when its source_count

@@ -97,6 +97,17 @@ def _scratch_host(
     return host
 
 
+def _blocks(cells, prose="What this workflow does."):
+    """A parsed document: one markdown block, then *cells* as code blocks.
+
+    `start` takes the whole document now, not a list of cells: the prose is
+    what the saved notebook is mostly made of, and it never goes to the kernel.
+    """
+    return [{"kind": "markdown", "text": prose}] + [
+        {"kind": "code", "text": c} for c in cells
+    ]
+
+
 def _session_host(running=None):
     """The session kernel, which ``_scratch`` asks only whether it is busy."""
     host = MagicMock()
@@ -140,7 +151,7 @@ class TestRunningAVerification:
     def test_a_clean_run_is_kept_as_the_verified_workflow(self):
         host = _scratch_host()
         _scratch.set_host_factory(lambda: host)
-        started = _scratch.start(["a = 2"], "wf", _session_host())
+        started = _scratch.start(_blocks(["a = 2"]), "wf", _session_host())
         snap = _settle(started["job_id"])
 
         assert snap["status"] == "ok"
@@ -159,7 +170,7 @@ class TestRunningAVerification:
         # there is nobody left to ask.
         host = _scratch_host()
         _scratch.set_host_factory(lambda: host)
-        _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+        _settle(_scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"])
         assert _scratch.verified()["cells"][0]["stdout"] == "full output"
 
     def test_the_scratch_kernel_is_discarded_either_way(self):
@@ -167,12 +178,14 @@ class TestRunningAVerification:
             _scratch.reset()
             host = _scratch_host(job_status=status)
             _scratch.set_host_factory(lambda h=host: h)
-            _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+            _settle(_scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"])
             assert host.shutdown.called, status
 
     def test_a_failed_run_is_not_kept(self):
         _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
-        snap = _settle(_scratch.start(["1/0"], "bad", _session_host())["job_id"])
+        snap = _settle(
+            _scratch.start(_blocks(["1/0"]), "bad", _session_host())["job_id"]
+        )
         assert snap["status"] == "error"
         assert _scratch.verified() is None
         assert _scratch.verified_summary() is None
@@ -185,14 +198,19 @@ class TestRunningAVerification:
             raise MemoryError("Cannot allocate memory")
 
         _scratch.set_host_factory(lambda: _scratch_host(on_start=boom))
-        snap = _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+        snap = _settle(
+            _scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"]
+        )
         assert snap["status"] == "error"
         assert "Cannot allocate memory" in snap["error_text"]
         assert snap["verify"] is None
         assert _scratch.verified() is None
 
     def test_without_a_factory_it_says_so_rather_than_failing_obscurely(self):
-        assert "unavailable" in _scratch.start(["1"], "", _session_host())["error"]
+        assert (
+            "unavailable"
+            in _scratch.start(_blocks(["1"]), "", _session_host())["error"]
+        )
 
 
 class TestTheRunList:
@@ -205,10 +223,10 @@ class TestTheRunList:
 
     def test_the_pane_shows_the_last_run(self):
         _scratch.set_host_factory(lambda: _scratch_host(title="first"))
-        first = _scratch.start(["a = 2"], "first", _session_host())["job_id"]
+        first = _scratch.start(_blocks(["a = 2"]), "first", _session_host())["job_id"]
         _settle(first)
         _scratch.set_host_factory(lambda: _scratch_host(title="second"))
-        second = _scratch.start(["b = 3"], "second", _session_host())["job_id"]
+        second = _scratch.start(_blocks(["b = 3"]), "second", _session_host())["job_id"]
         _settle(second)
 
         rows = _scratch.runs_view()
@@ -223,7 +241,7 @@ class TestTheRunList:
         assert _scratch.verified_summary() is None
 
         _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
-        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
+        _settle(_scratch.start(_blocks(["boom"]), "bad", _session_host())["job_id"])
         # A failed run is listed -- that is the report -- but there is no
         # document behind it, so the page's download must stay closed.
         assert len(_scratch.runs_view()) == 1
@@ -232,12 +250,12 @@ class TestTheRunList:
 
     def test_a_later_failure_replaces_an_earlier_pass(self):
         _scratch.set_host_factory(lambda: _scratch_host(title="good"))
-        good = _scratch.start(["a = 2"], "good", _session_host())["job_id"]
+        good = _scratch.start(_blocks(["a = 2"]), "good", _session_host())["job_id"]
         _settle(good)
         assert _scratch.verified_summary()["job_id"] == good
 
         _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
-        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
+        _settle(_scratch.start(_blocks(["boom"]), "bad", _session_host())["job_id"])
         # Deliberate: the page shows one run, so offering a download of a
         # document it is not showing is the confusing half. Re-run to get it
         # back.
@@ -245,28 +263,53 @@ class TestTheRunList:
 
     def test_a_run_that_passes_is_written_to_the_spool(self, spool):
         _scratch.set_host_factory(lambda: _scratch_host(title="segment nuclei"))
-        _settle(_scratch.start(["a = 2"], "segment nuclei", _session_host())["job_id"])
+        _settle(
+            _scratch.start(_blocks(["a = 2"]), "segment nuclei", _session_host())[
+                "job_id"
+            ]
+        )
 
-        (saved,) = list(spool.iterdir())
+        (saved,) = list(spool.glob("*.ipynb"))
         assert saved.name.startswith("biopb-segment-nuclei-")
-        assert saved.suffix == ".ipynb"
         # A real notebook, not a fragment: this is the file someone opens.
         nb = json.loads(saved.read_text())
         assert nb["nbformat"] == 4 and nb["cells"]
         assert _scratch.verified_summary()["saved_path"] == str(saved)
+        # A pass *promotes*: the draft it was written from is gone, so a draft
+        # on disk means "this one has not passed yet".
+        assert list((spool / "drafts").glob("*.md")) == []
 
     def test_the_document_exists_before_the_run_says_it_passed(self, spool):
         # Everything waits on the status, so writing after it would hand a
         # caller a passed run whose file is not there yet.
         _scratch.set_host_factory(lambda: _scratch_host())
-        job = _scratch.start(["a = 2"], "wf", _session_host())["job_id"]
+        job = _scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"]
         _settle(job)
-        assert list(spool.iterdir())
+        assert list(spool.glob("*.ipynb"))
 
-    def test_a_run_that_fails_writes_nothing(self, spool):
+    def test_a_run_that_fails_writes_no_record_but_keeps_the_draft(self, spool):
+        # The failed attempt is the one a person most wants to open and fix, so
+        # it is on disk in the format the tool takes -- but it is not a record:
+        # nothing here ran to the end.
         _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
-        _settle(_scratch.start(["boom"], "bad", _session_host())["job_id"])
-        assert list(spool.iterdir()) == []
+        snap = _settle(
+            _scratch.start(_blocks(["boom"]), "bad", _session_host())["job_id"]
+        )
+        assert list(spool.glob("*.ipynb")) == []
+        (draft,) = list((spool / "drafts").glob("*.md"))
+        assert draft.name == "bad.md"
+        # In the document's own spelling, so what is read back can be sent back.
+        assert "```python\nboom\n```" in draft.read_text()
+        assert snap["draft_path"] == str(draft)
+
+    def test_the_draft_is_one_file_per_workflow_not_a_pile_of_attempts(self, spool):
+        # Attempts at one workflow are drafts of one document.
+        for cell in ("boom", "boom  # try again"):
+            _scratch.reset()
+            _scratch.set_host_factory(lambda: _scratch_host(job_status="error"))
+            _settle(_scratch.start(_blocks([cell]), "bad", _session_host())["job_id"])
+        (draft,) = list((spool / "drafts").glob("*.md"))
+        assert "try again" in draft.read_text()
 
     def test_a_spool_that_cannot_be_written_is_not_a_failed_verification(
         self, monkeypatch
@@ -278,7 +321,9 @@ class TestTheRunList:
 
         monkeypatch.setattr(_config, "get_workflow_dir", boom)
         _scratch.set_host_factory(lambda: _scratch_host())
-        snap = _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+        snap = _settle(
+            _scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"]
+        )
         assert snap["status"] == "ok"
         assert _scratch.verified()["saved_path"] is None
 
@@ -288,12 +333,14 @@ class TestTheRunList:
             # Distinct names: the stamp has one-second resolution, so a loop
             # this fast would otherwise overwrite one file six times.
             _scratch.set_host_factory(lambda: _scratch_host())
-            _settle(_scratch.start(["a = 2"], f"wf{i}", _session_host())["job_id"])
-        assert len(list(spool.iterdir())) == 3
+            _settle(
+                _scratch.start(_blocks(["a = 2"]), f"wf{i}", _session_host())["job_id"]
+            )
+        assert len(list(spool.glob("*.ipynb"))) == 3
 
     def test_reset_forgets_the_run(self):
         _scratch.set_host_factory(lambda: _scratch_host())
-        _settle(_scratch.start(["a = 2"], "wf", _session_host())["job_id"])
+        _settle(_scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"])
         _scratch.reset()
         assert _scratch.runs_view() == []
 
@@ -308,7 +355,7 @@ class TestTheSlot:
     def test_a_verification_is_refused_while_a_session_job_runs(self):
         _scratch.set_host_factory(lambda: _scratch_host())
         session = _session_host(running={"job_id": "job-7", "origin": "user"})
-        started = _scratch.start(["a = 2"], "wf", session)
+        started = _scratch.start(_blocks(["a = 2"]), "wf", session)
         assert started == {
             "error": "busy",
             "running_job_id": "job-7",
@@ -324,12 +371,12 @@ class TestTheSlot:
                 time.sleep(0.01)
 
         _scratch.set_host_factory(lambda: _scratch_host(on_start=slow_start))
-        first = _scratch.start(["a = 2"], "one", _session_host())
+        first = _scratch.start(_blocks(["a = 2"]), "one", _session_host())
         try:
             deadline = time.monotonic() + 5.0
             while _scratch.running() is None and time.monotonic() < deadline:
                 time.sleep(0.01)
-            second = _scratch.start(["a = 2"], "two", _session_host())
+            second = _scratch.start(_blocks(["a = 2"]), "two", _session_host())
             assert second["error"] == "busy"
             assert second["running_job_id"] == first["job_id"]
         finally:
@@ -363,7 +410,7 @@ class TestInterrupting:
         host = _scratch_host(on_start=on_start, hold=hold, interrupt_lands=lands)
         _scratch.set_host_factory(lambda: host)
         started = _scratch.start(
-            ["a = 2"], "wf", _session_host(), writer=writer, writer_label="A"
+            _blocks(["a = 2"]), "wf", _session_host(), writer=writer, writer_label="A"
         )
         return started["job_id"], host
 
@@ -522,7 +569,7 @@ class TestDiscarding:
             )
         )
         _scratch.set_host_factory(lambda: host)
-        started = _scratch.start(["a = 2"], "wf", _session_host())
+        started = _scratch.start(_blocks(["a = 2"]), "wf", _session_host())
         deadline = time.monotonic() + 5.0
         while _scratch.running() is None and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -640,7 +687,9 @@ class TestRouting:
 
     def test_the_detail_view_shows_the_program_and_the_ledger(self):
         _scratch.set_host_factory(lambda: _scratch_host())
-        started = _scratch.start(["a = 2", "print(a * 3)"], "wf", _session_host())
+        started = _scratch.start(
+            _blocks(["a = 2", "print(a * 3)"]), "wf", _session_host()
+        )
         _settle(started["job_id"])
         detail = _scratch.detail(started["job_id"])
         # The program the run was given...

@@ -84,19 +84,84 @@ attempt that fails takes that offer away — the page shows one run, and offerin
 a document it is not showing is the confusing half — but the earlier file is
 still on disk. What a failure removes is the offer, not the document.
 
-### No viewer, as policy
+### The agent writes the document; the run writes the verdict
 
-The scratch kernel builds **no napari viewer and does not import Qt**. That is a
-policy, not a limitation, and it is the one decision the rest of this note
-turned on twice before landing on it.
+`verify_workflow` takes a **document**, not a list of cells: markdown with
+fenced `python` cells (a saved `.ipynb` is accepted too, which is what comes
+back after someone edits one). Each fence is a cell, run in order; everything
+between them is prose the notebook keeps where it was written.
+
+This is not a formatting preference. With cells as parameters, every part of a
+document that is not code has to become another parameter with another alignment
+rule — a title, then notes, then whatever came next — and each one is a rule the
+agent can get wrong. A payload has none of them, and prose is the thing a model
+writes well.
+
+Two halves, two authors, and the split is the point:
+
+- **The body is the agent's.** Headings, explanation, the reason the threshold
+  is 0.4 — nobody else knows it, and it is most of what makes the document worth
+  keeping.
+- **The provenance cell and the outputs are the run's.** An author that writes
+  both can write "verified correct" over a run that only proved the cells
+  execute, and the outputs are evidence precisely because nobody retyped them.
+
+The prose never reaches the kernel — it is not code and the kernel has no use
+for it. `_scratch` holds the parsed document and merges it back into the record
+after the run, which is where both readers of a record (the spool, and the
+observe download) find it.
+
+### The draft, and the retry loop
+
+Verification fails, and the attempt that failed is the one someone most wants to
+open. So **every attempt is written**, pass or fail, to a draft under
+`<state>/biopb/mcp/workflows/drafts/<title>.md`, in the document's own spelling:
+it diffs, and it is exactly the format the tool takes, so a draft read back is a
+draft that can be sent back.
+
+One file per workflow, overwritten. Attempts at one workflow are drafts of one
+document, not a history — the history worth keeping is the record a pass
+promotes it to, and a pass does exactly that: it writes the timestamped
+`.ipynb` and removes the draft. A draft on disk means "this one has not passed
+yet".
+
+Two rules make the loop safe, and both are stated in the tool description
+because neither is discoverable:
+
+- **A retry sends the whole document.** No patches, no cell addressing, no
+  server-held draft mutated by index — what gets verified must be exactly what
+  was sent.
+- **Once a draft exists, the file wins.** The agent re-reads it before
+  resubmitting rather than retyping from context, because the user may have
+  edited it in the meantime and their edit is the one that should survive.
+
+### The scratch kernel is given nothing
+
+The scratch kernel builds **no napari viewer**, and binds no `np`, `da`,
+`client` or `ops` either. It does not load the user's kernel plugins. A
+verification cell is run with no refresh prefix — not even the
+`client = _conn.client` every session cell gets — so what runs is the document
+and nothing else.
+
+That is a policy, not a limitation, and it is one rule: *the reader of a saved
+workflow gets a bare kernel, so the verification runs on one too.* Anything
+handed to the run for free is something the document can lean on and fail on
+later, which is the defect this exists to catch, one level up from variables.
+What the document needs, it builds — `biopb_mcp.workflow_env()`, a public call
+backed by the same code the session bootstrap uses, instead of the block of
+private imports the saved notebook used to carry.
+
+The viewer's own case is the sharpest one, and it came first:
 
 The viewer exists so an agent can show something to the person it is working
 with. A verification has no person in it. So a workflow cell that reaches for
-`viewer` is a cell that will not run as the document it is about to become — the
-saved workflow notebook has no viewer either
-(`_notebook.WORKFLOW_BOOTSTRAP_SRC`). Failing in the scratch kernel is the two
-ends agreeing, which is the rule the whole feature rests on: *whatever the
-scratch kernel is built with, the bootstrap cell has to rebuild.*
+`viewer` is a cell that will not run as the document it is about to become, and
+failing here is the two ends agreeing.
+
+That rule used to be spelled *whatever the scratch kernel is built with, the
+bootstrap cell has to rebuild* — two setups, in two places, kept in step by
+hand. There is one end now: the document's own setup cell, run by the
+verification.
 
 It also drops the notebook's dependency on a display, which makes a saved
 workflow an ordinary notebook — one that runs under `nbconvert --execute`, in
@@ -438,8 +503,14 @@ around.
 
 ## Migration
 
-`_notebook` grew a second bootstrap cell: `WORKFLOW_BOOTSTRAP_SRC` (no viewer,
-for the workflow export) beside `BOOTSTRAP_SRC` (viewer, for the audit export).
+`_notebook`'s workflow half is no longer a builder: `WORKFLOW_BOOTSTRAP_SRC` is
+gone (the document builds its own environment), `build_workflow_notebook` renders
+the parsed document and stamps the run's outputs into it, and `_workflow_doc`
+parses the two input spellings. `BOOTSTRAP_SRC` stays for the audit export, which
+reconstructs a session it recorded and so still writes its own.
+
+`biopb_mcp.workflow_env` is the one public API this added: the setup a saved
+workflow calls, and the reason the scratch kernel can hand a run nothing.
 
 Deleted with the namespace model: `_jobs._verified` and its
 promote-on-success gate, `_jobs.mark_baseline` / `_scratch_ns` / the baseline
