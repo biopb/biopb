@@ -16,7 +16,10 @@ const job = (over: Record<string, unknown> = {}) =>
     ...over,
   }) as Parameters<typeof JobRow>[0]["job"];
 
-const render = (j: ReturnType<typeof job>) =>
+const render = (
+  j: ReturnType<typeof job>,
+  over: Partial<Parameters<typeof JobRow>[0]> = {},
+) =>
   renderToStaticMarkup(
     <JobRow
       job={j}
@@ -24,6 +27,7 @@ const render = (j: ReturnType<typeof job>) =>
       detail={undefined}
       onToggle={() => {}}
       onInterrupt={() => {}}
+      {...over}
     />,
   );
 
@@ -47,6 +51,26 @@ describe("JobRow", () => {
     // Matched on the class, not the word: an `interrupted` job's own status
     // badge says "interrupted", which is a substring of it.
     expect(render(job({ status: "running" }))).toContain("job-stop");
+  });
+
+  it("marks the row the kernel is busy with", () => {
+    // The status word is already there to be read; the class is what lets the
+    // card be found without reading any of them.
+    expect(render(job({ status: "running" }))).toContain("job busy");
+  });
+
+  it("plays its entrance only on the row that has just arrived", () => {
+    // A row already on screen replays nothing on the next poll -- which is
+    // every poll, so getting this wrong is a list that twitches every 3s.
+    expect(render(job(), { fresh: true })).toContain("enter");
+    expect(render(job())).not.toContain("enter");
+  });
+
+  it("keeps what it fetched after it is closed", () => {
+    // The close animates, and a row that unmounted its content on close would
+    // have an empty box to fold away.
+    const html = render(job(), { open: false, detail: { code: "arr.mean()" } });
+    expect(html).toContain("arr.mean()");
   });
 
   it("offers it nowhere else", () => {
