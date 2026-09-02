@@ -87,6 +87,10 @@ def configure(config, *, agentless):
         and get_setting(config, "observe.chat_enabled")
         and agentless
     )
+    # The image policy is the loop's session state, not a per-call config read:
+    # the model can be switched at runtime, and a refusal it learns belongs to
+    # the model that gave it. This is the file's opening position.
+    _chat.set_vision(get_setting(config, "chat.vision"))
     return _enabled
 
 
@@ -309,6 +313,11 @@ async def _chat_model(request):
     # agent not yet spawned starts on it, and one restarted by `/new` comes back
     # on it rather than on the model the config file named an hour ago.
     _config.setdefault("chat", {})[key] = wanted
+    if not _acp():
+        # Back to the configured policy: whether the outgoing model could take
+        # an image says nothing about this one, and a refusal carried across the
+        # switch would leave a vision model blind for the rest of the session.
+        _chat.set_vision(get_setting(_config, "chat.vision"))
     return JSONResponse({"model": wanted, "engine": _engine})
 
 
