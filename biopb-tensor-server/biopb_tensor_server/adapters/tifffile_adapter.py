@@ -107,7 +107,9 @@ class _TifffileAdapterBase(OmeTiffAdapter):
     _LSM = False
 
     def __init__(self, *args, dim_labels=None, **kwargs):
-        self._dim_labels_override = dim_labels is not None
+        # Empty is not an override: labels that came from an unset protobuf
+        # field would otherwise fail the rank check below for every series.
+        self._dim_labels_override = bool(dim_labels)
         super().__init__(*args, dim_labels=dim_labels, **kwargs)
         if self.scene_index is None and self._tifffile_descriptor is None:
             message = (

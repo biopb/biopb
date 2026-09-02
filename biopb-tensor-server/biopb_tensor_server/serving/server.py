@@ -980,7 +980,12 @@ class TensorFlightServer(flight.FlightServerBase):
             events = self._add_source_handler(
                 req.url,
                 source_type=req.source_type,
-                dim_labels=list(req.dim_labels),
+                # An unset repeated field arrives as [], which is "the caller
+                # said nothing" and not "the caller said no labels". Passing the
+                # empty list on makes _record_claim stamp it onto the claim, and
+                # an adapter that reads a claim's labels as an override then
+                # rejects every series whose rank is not zero.
+                dim_labels=list(req.dim_labels) or None,
                 should_cancel=_should_cancel,
             )
             for event in events:

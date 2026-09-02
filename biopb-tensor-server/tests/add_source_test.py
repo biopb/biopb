@@ -363,6 +363,57 @@ class TestAddSourceRoundtrip:
         finally:
             server.shutdown()
 
+    def test_plain_tiff_folder_drop_carries_no_dim_labels(self, tmp_path):
+        """A drop that names no labels must not register as labelled.
+
+        ``AddSourceRequest.dim_labels`` is unset here, and an unset repeated
+        field is ``[]``. Passing that on stamps the empty list onto the claim,
+        and an adapter that reads a claim's labels as an override then rejects
+        every series -- so this drop failed with "cannot read TIFF source" for
+        every plain TIFF, drag-drop included.
+
+        A *folder*, because that is the branch that carried it: the walk hands
+        its labels to ``discover_sources``, while the per-claim assignment
+        beside it already tests them for truth and so never saw the bug.
+        """
+        import tifffile
+        from biopb.tensor import TensorFlightClient
+
+        manager, server = _make_manager()
+        server.set_add_source_handler(manager.add_local_source)
+        server.mark_ready()
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+
+        folder = os.path.join(str(tmp_path), "drop")
+        os.makedirs(folder)
+        tifffile.imwrite(
+            os.path.join(folder, "plain.tif"),
+            np.arange(5 * 8 * 9, dtype="uint16").reshape(5, 8, 9),
+        )
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            result = client.add_source(folder)
+
+            assert not result.failed
+            assert len(result.added) == 1
+            source_id = result.added[0].source_id
+
+            # Unlabelled, so the adapter fills the canonical slots itself.
+            descriptor = client.get_descriptor(f"{source_id}/Image:0")
+            assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
+            assert list(descriptor.shape) == [1, 1, 5, 8, 9]
+            assert client.get_tensor(f"{source_id}/Image:0").compute().shape == (
+                1,
+                1,
+                5,
+                8,
+                9,
+            )
+            client.close()
+        finally:
+            server.shutdown()
+
 
 class TestRemoveDroppedRoot:
     """SourceManager.remove_dropped_root: deregister a dnd:// drop branch."""
