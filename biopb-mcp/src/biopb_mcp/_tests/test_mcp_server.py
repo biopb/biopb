@@ -410,6 +410,12 @@ def _verify_snapshot(status="ok", record=None, **kw):
     return snap
 
 
+def _doc(*cells, prose="Load the stack and count what is in it."):
+    """A workflow document in the spelling the tool takes."""
+    body = "\n\n".join(f"```python\n{c}\n```" for c in cells)
+    return f"# Count foci\n\n{prose}\n\n{body}\n"
+
+
 class TestVerifyWorkflow:
     """The tool's own surface: what it hands the agent back.
 
@@ -432,22 +438,52 @@ class TestVerifyWorkflow:
 
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
-        assert "not initialized" in _tool(_server.verify_workflow, ["1"])
+        assert "not initialized" in _tool(_server.verify_workflow, _doc("1"))
 
-    def test_no_cells_is_refused_before_the_kernel_is_touched(self, server_with_host):
-        assert "at least one cell" in _tool(_server.verify_workflow, [])
+    def test_a_document_with_no_cells_is_refused_before_anything_is_spawned(
+        self, server_with_host
+    ):
+        # The agent's mistake, and it has cost nothing yet: no kernel, no file.
+        out = _tool(_server.verify_workflow, "# Title\n\nAll prose, no code.\n")
+        assert "no ```python cells" in out
         assert not server_with_host.execute.called
 
-    def test_the_cells_and_title_reach_the_scratch_kernel(
+    def test_a_saved_notebook_is_accepted_back(self, server_with_host, monkeypatch):
+        # What the user has open in VS Code after a pass. Accepting it is what
+        # makes the round trip work at the point someone would use it.
+        seen = {}
+        monkeypatch.setattr(
+            _server._scratch,
+            "start",
+            lambda blocks, *a, **k: (
+                seen.update(blocks=blocks) or {"job_id": "verify-1"}
+            ),
+        )
+        monkeypatch.setattr(_server._scratch, "poll", lambda _j: _verify_snapshot())
+        _install_replies(server_with_host)
+        nb = json.dumps(
+            {
+                "cells": [
+                    {"cell_type": "markdown", "source": ["# Count foci"]},
+                    {"cell_type": "code", "source": ["a = 2\n"]},
+                ],
+                "nbformat": 4,
+            }
+        )
+        _tool(_server.verify_workflow, nb)
+        assert [b["kind"] for b in seen["blocks"]] == ["markdown", "code"]
+        assert seen["blocks"][1]["text"] == "a = 2"
+
+    def test_the_whole_document_reaches_the_scratch_kernel(
         self, server_with_host, monkeypatch
     ):
         seen = {}
         monkeypatch.setattr(
             _server._scratch,
             "start",
-            lambda cells, title, host, intent="", writer=None, label="": (
+            lambda blocks, title, host, intent="", writer=None, label="": (
                 seen.update(
-                    cells=cells, title=title, host=host, writer=writer, label=label
+                    blocks=blocks, title=title, host=host, writer=writer, label=label
                 )
                 or {"job_id": "verify-1"}
             ),
@@ -456,10 +492,17 @@ class TestVerifyWorkflow:
         _install_replies(server_with_host)
         _writers._local_identity.set(("agent-A", "A"))
         try:
-            _tool(_server.verify_workflow, ["a = 2", "print(a)"], title="Count foci")
+            _tool(_server.verify_workflow, _doc("a = 2", "print(a)"))
         finally:
             _writers._local_identity.set(None)
-        assert seen["cells"] == ["a = 2", "print(a)"]
+        # Prose and code both, in the order they were written: the document is
+        # what gets saved, not just the cells that ran.
+        assert [b["kind"] for b in seen["blocks"]] == ["markdown", "code", "code"]
+        assert [b["text"] for b in seen["blocks"] if b["kind"] == "code"] == [
+            "a = 2",
+            "print(a)",
+        ]
+        # The title is read from the document's own heading, not asked for twice.
         assert seen["title"] == "Count foci"
         assert seen["host"] is server_with_host
         # The run is claimed for the client that asked for it, so the scratch
@@ -472,7 +515,7 @@ class TestVerifyWorkflow:
         _install_replies(server_with_host)
         self._stub(monkeypatch, _verify_snapshot())
         _app.set_promote_after(1.0)
-        result = _tool(_server.verify_workflow, ["a = 2"], title="Count foci")
+        result = _tool(_server.verify_workflow, _doc("a = 2"), title="Count foci")
         assert "Verified" in result
         # The claim the process model earns, and the old namespace one could not.
         assert "scratch kernel" in result and "discarded" in result
@@ -516,7 +559,7 @@ class TestVerifyWorkflow:
             _verify_snapshot(status="error", record=_verify_record("error", cells)),
         )
         _app.set_promote_after(1.0)
-        result = _tool(_server.verify_workflow, [c["code"] for c in cells])
+        result = _tool(_server.verify_workflow, _doc(*[c["code"] for c in cells]))
         assert "NOT verified" in result
         assert "cell 2" in result
         assert "leftover" in result
@@ -540,7 +583,7 @@ class TestVerifyWorkflow:
             | {"verify": None},
         )
         _app.set_promote_after(1.0)
-        result = _tool(_server.verify_workflow, ["a = 2"])
+        result = _tool(_server.verify_workflow, _doc("a = 2"))
         assert "did not run" in result and "killed" in result
 
     def test_a_long_verification_hands_back_a_job_handle(
@@ -549,7 +592,7 @@ class TestVerifyWorkflow:
         _install_replies(server_with_host)
         self._stub(monkeypatch, _verify_snapshot(status="running"))
         _app.set_promote_after(0.0)
-        result = _tool(_server.verify_workflow, ["a = 2"])
+        result = _tool(_server.verify_workflow, _doc("a = 2"))
         assert "still running" in result and "poll_job('verify-1')" in result
 
     def test_a_busy_session_refuses_rather_than_starting_a_second_kernel(
@@ -565,7 +608,7 @@ class TestVerifyWorkflow:
                 "running_job_origin": "user",
             },
         )
-        result = _tool(_server.verify_workflow, ["a = 2"])
+        result = _tool(_server.verify_workflow, _doc("a = 2"))
         assert "job-4" in result and "running a cell" in result
         assert "poll_job('job-4')" in result
 
@@ -1620,7 +1663,7 @@ class TestToolReturnShape:
         ("list_skills", {}, False),
         ("take_screenshot", {}, False),
         ("execute_code", {"python_code": "1"}, True),
-        ("verify_workflow", {"cells": ["1"]}, True),
+        ("verify_workflow", {"document": "```python\n1\n```"}, True),
         ("poll_job", {"job_id": "job-1"}, True),
         ("inspect_object", {"object_path": "np"}, True),
         ("interrupt_kernel", {}, True),

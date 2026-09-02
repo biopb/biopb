@@ -572,7 +572,13 @@ def _exec_cells(job, verification):
             _jobs_by_thread[ident] = cell
             cell.started = time.monotonic()
             try:
-                _exec_capture(_REFRESH_PREFIX + cell.code, ns, cell)
+                # No refresh prefix, unlike an ordinary cell: a verification
+                # runs the document and nothing else. `client = _conn.client`
+                # prepended here would bind a handle the document never asks
+                # for, so a workflow that forgot to build its own would pass
+                # and then fail for its reader -- the one defect this exists to
+                # catch. The document's own first cell calls `workflow_env()`.
+                _exec_capture(cell.code, ns, cell)
                 cell.status = "ok"
             except BaseException:
                 cell.status = "error"

@@ -34,7 +34,15 @@ from typing import Annotated
 from mcp.types import ImageContent, TextContent
 from pydantic import Field
 
-from . import _app, _kernel_rpc, _resources, _scratch, _skills, _writers
+from . import (
+    _app,
+    _kernel_rpc,
+    _resources,
+    _scratch,
+    _skills,
+    _workflow_doc,
+    _writers,
+)
 from ._app import mcp
 
 logger = logging.getLogger(__name__)
@@ -743,63 +751,91 @@ async def execute_code(
 
 
 @mcp.tool()
-async def verify_workflow(
-    cells: list[str],
-    title: str = "",
-) -> str:
-    """Check that a candidate workflow runs on its own, in a scratch kernel.
+async def verify_workflow(document: str, title: str = "") -> str:
+    """Check that a workflow notebook runs on its own, in a scratch kernel.
 
     Use this when the user wants a workflow they have just proven kept as a
-    document. Rewrite the session into a clean program — one entry in *cells*
-    per notebook cell — and verify it here; on success the notebook is written
-    to disk for them and this tool reports where. Tell them the path; do not
-    write the file yourself.
+    document. **You write the whole document** — prose and code — and this runs
+    it; on success the notebook is saved for them and this tool reports where.
+    Tell them the path; do not write the file yourself.
 
-    **Rewrite it, do not select from it.** The program that works is almost
-    never a subsequence of what was run: a cell that created a variable and a
-    later cell that corrected its value have to merge into one, and dead ends,
-    retries, and debugging prints drop out. Read the session with poll_job and
-    write the cells you *mean*, in the order a reader would want them.
+    **The format** is markdown with fenced ``python`` cells. Each fence is one
+    notebook cell, run in order; everything between them is markdown, rendered
+    as written. A fence in another language (```bash) is prose about a command,
+    not a cell. The first ``# `` heading becomes the title. A saved ``.ipynb``
+    is also accepted verbatim, which is what to send back when the user has
+    edited one.
 
-    The cells run in order in a **second kernel**, spawned for this and thrown
-    away afterwards: a fresh namespace with none of this session's state. The run
-    stops at the first failure; the cells after it are reported as skipped.
+    Write it as a document, not as a list of cells with comments: a heading, a
+    sentence on what each step does and why in the terms the user would use
+    ("the threshold is 0.4 because the background peak sits at 0.3"), and the
+    code between them. That prose is most of what makes the notebook usable
+    months later, and you are the only one who knows it.
 
-    **There is no `viewer` there, and that is deliberate.** The viewer exists so
-    you can show something to the person you are working with, and nobody is
-    watching a verification. So a workflow cell must not touch `viewer` — it
-    raises `NameError` — and the saved notebook has no viewer either, which is
-    what makes it an ordinary notebook that runs headless. Write the workflow to
-    *compute* and to `print` what matters; leave displaying the result to the
-    live session, where there is someone to see it.
+    **It starts with its own setup cell.** The scratch kernel is given nothing —
+    no ``client``, no ``ops``, no ``np``, no plugins, no ``viewer`` — because
+    the reader's kernel will have nothing either. So the first cell is the
+    document's own environment:
 
-    **The live session is untouched** — its variables, its layers, its viewer —
-    so there is nothing to ask the user about on that account. Bringing the
-    scratch kernel up takes a few seconds, and while a verification runs the
-    session kernel accepts no cells (one job at a time, across both).
+        import numpy as np
+        from biopb_mcp.workflow_env import workflow_env
 
-    **What it proves:** every cell runs, in order, against nothing but a fresh
-    kernel. That covers the whole class of defect that makes a transcript
-    unrunnable — a cell reading a variable an earlier discarded cell created, or
-    a layer this session happened to have.
+        client, ops = workflow_env()
+
+    A workflow that skips it fails with ``NameError``, which is the verdict: it
+    would have failed the same way for whoever opened the notebook.
+
+    **Rewrite the session, do not select from it.** The program that works is
+    almost never a subsequence of what was run: a cell that created a variable
+    and a later cell that corrected its value have to merge into one, and dead
+    ends, retries and debugging prints drop out. Read the session with poll_job
+    and write the document you *mean*.
+
+    **There is no `viewer`, and that is deliberate.** The viewer exists so you
+    can show something to the person you are working with, and nobody is
+    watching a verification. Write the workflow to *compute* and to ``print``
+    what matters; leave displaying the result to the live session.
+
+    **Failing is normal; the draft is where you fix it.** Every attempt, pass or
+    fail, is written to a draft file in the document's own format, and this tool
+    reports its path. On a failure, **read that file, edit it, and send the
+    whole thing back** — do not retype the document from memory, because the
+    user may have edited it themselves in the meantime, and their edit is the
+    one that should survive. A pass promotes the draft to the saved notebook and
+    removes it.
+
+    **The live session is untouched** — its variables, its layers, its viewer.
+    Bringing the scratch kernel up takes a few seconds, and while a verification
+    runs the session kernel accepts no cells (one job at a time, across both).
+
+    **What it proves:** every cell runs, in order, on a bare kernel with
+    biopb-mcp installed. That covers the whole class of defect that makes a
+    transcript unrunnable — a cell reading a variable an earlier discarded cell
+    created, a handle only this session had.
 
     **What it does not.** The numbers are right: check them. And a scratch
     *process* is not a scratch *world* — it talks to the same tensor server and
-    the same filesystem, so `client.upload_array` / `upload_zarr` /
-    `add_source`, and any cell that writes a file, write through for real. Verify
-    a workflow three times and you have three uploaded arrays. **Say so before
-    running one that writes.**
+    the same filesystem, so `client.upload_array` / `upload_zarr` / `add_source`,
+    and any cell that writes a file, write through for real. Verify a workflow
+    three times and you have three uploaded arrays. **Say so before running one
+    that writes.**
 
     Args:
-        cells: the workflow's cells, in order, each a complete piece of Python.
-        title: what the workflow does, in a few words. Names the saved file and
-            titles the notebook.
+        document: the workflow, as markdown with fenced ``python`` cells (or a
+            complete ``.ipynb`` document).
+        title: overrides the document's own ``# `` heading. Names the saved
+            file; leave it out unless the heading is wrong.
     """
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
-    if not cells:
-        return "verify_workflow needs at least one cell."
+    try:
+        blocks = _workflow_doc.parse(document)
+    except _workflow_doc.DocumentError as exc:
+        # The agent's mistake to correct, and it has not cost anything yet: no
+        # kernel was spawned and nothing was written.
+        return f"{exc} Send markdown with ```python cells, or a saved .ipynb."
+    title = title.strip() or _workflow_doc.title_of(blocks)
 
     # The verification is claimed for this client, and the claim is enforced by
     # the scratch kernel's own one-agent check (_jobs.submit) rather than a
@@ -809,7 +845,7 @@ async def verify_workflow(
     foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
     started = await asyncio.to_thread(
         _scratch.start,
-        list(cells),
+        blocks,
         title,
         host,
         f"verify workflow: {title}" if title else "verify workflow",
@@ -842,9 +878,30 @@ async def verify_workflow(
         return (
             f"Verification {job_id} did not run: "
             + (snap.get("error_text") or "the scratch kernel produced no record.")
+            + _draft_note(snap)
             + foreign_note
         )
-    return _format_verification(record, job_id, snap.get("saved_path")) + foreign_note
+    return (
+        _format_verification(record, job_id, snap.get("saved_path"))
+        + _draft_note(snap)
+        + foreign_note
+    )
+
+
+def _draft_note(snap):
+    """Where the document that just failed is, so the next attempt edits it.
+
+    Only on a failure: a pass promotes the draft and the report already names
+    the notebook it became, so pointing at a file that is gone would be worse
+    than saying nothing.
+    """
+    draft = snap.get("draft_path")
+    if not draft:
+        return ""
+    return (
+        f"\n\nThe document is at {draft} — read it, edit it, and send the whole "
+        "file back rather than retyping it: the user may have edited it too."
+    )
 
 
 async def _await_verification(job_id, budget=None):

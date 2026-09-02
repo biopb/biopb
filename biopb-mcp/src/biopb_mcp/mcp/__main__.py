@@ -454,7 +454,7 @@ def _serve_http(config, port, view=False):
             env=scratch_env,
             # The session kernel's probe asks for `viewer`; this one has none by
             # design, so it asks for what a verification actually needs.
-            health_probe_code="print('_jobs' in dir() and 'ops' in dir())",
+            health_probe_code="print('_jobs' in dir())",
             # No watchdog: for the session kernel a respawn is recovery, for
             # this one death is the verdict (an OOM means the workflow does not
             # fit). No window-close pipe: there is no window.

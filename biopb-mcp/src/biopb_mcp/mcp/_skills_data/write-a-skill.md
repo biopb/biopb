@@ -162,11 +162,12 @@ The frontmatter fields, and how to determine each:
    hidden state: every variable and layer it uses must be created by its own
    steps, not left over from this conversation.
 
-   The hidden-state check has a mechanism: put the draft's code cells through
-   `verify_workflow`, which runs them in a namespace holding the kernel's
-   handles and nothing this session bound. A leftover variable raises `NameError`
-   there instead of quietly working. It costs no restart, so there is nothing to
-   ask about first.
+   The hidden-state check has a mechanism: write the draft up as a document and
+   put it through `verify_workflow`, which runs it in a kernel holding nothing
+   -- not this session's variables, and not `client`/`ops`/`np` either, which
+   the document builds for itself. A leftover variable raises `NameError` there
+   instead of quietly working. It costs no restart, so there is nothing to ask
+   about first.
 
    A genuinely clean-room run needs `restart_kernel`, which **destroys the
    namespace, every layer, and any running job**. That is a *validate-and-gate*:

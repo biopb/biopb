@@ -1,10 +1,13 @@
 """Serialize a kernel session to a Jupyter notebook — two documents, one writer.
 
 :func:`build_notebook` is the **audit export**: every retained job in order,
-faithfully, dead ends included. :func:`build_workflow_notebook` is the
-**workflow export**: the cells of a verified workflow (``_jobs`` verification
-run), which are a *rewrite* of that transcript rather than a selection from it,
-and which are known to run because they just did.
+faithfully, dead ends included. It is built here, from job snapshots.
+
+:func:`build_workflow_notebook` is the **workflow export**, and it is not built
+here in the same sense: the document is the agent's, written as markdown with
+fenced cells and parsed by :mod:`_workflow_doc`. This module adds the two things
+the *run* owns — the provenance cell and the captured outputs — and serializes
+the result. Prose that is not the run's is not ours to write.
 
 The two answer different questions — "what happened here?" and "what should I
 run again?" — and neither substitutes for the other, so both ship.
@@ -57,8 +60,9 @@ ops = build_ops_from_config(config, lambda: _conn.client)
 #: The audit export's extra stage. A session transcript is full of viewer cells,
 #: so the reconstruction needs somewhere for them to land -- best-effort, and
 #: None when there is no display, in which case those cells fail where they are.
-#: The *workflow* export has no counterpart on purpose: see
-#: WORKFLOW_BOOTSTRAP_SRC.
+#: The *workflow* export has no bootstrap cell at all: its document builds its
+#: own environment (``biopb_mcp.workflow_env``) and the verification runs that
+#: cell, so there is nothing left here to rebuild on its behalf.
 _BOOTSTRAP_VIEWER = """
 # Best-effort empty viewer via the Qt magic; degrades to None when headless
 # (e.g. `nbconvert --execute` with no display), in which case viewer cells fail.
@@ -92,37 +96,6 @@ except Exception as _exc:  # noqa: BLE001 - a plugin gap must not stop the rebui
 
 #: The audit export: everything the session had, viewer included.
 BOOTSTRAP_SRC = _BOOTSTRAP_HEAD + _BOOTSTRAP_VIEWER + _BOOTSTRAP_PLUGINS
-
-#: The workflow export: the same, **without a viewer**.
-#:
-#: Not an omission -- a policy, and the same one the scratch kernel enforces.
-#: The viewer is how an agent shows something to a person, and a saved workflow
-#: is run by a person who is already looking at their own screen. Leaving it out
-#: makes the notebook an ordinary one: no Qt, no display, no napari, so it runs
-#: under `nbconvert --execute` and on a headless box.
-#:
-#: The two ends have to agree, and this is that agreement in its strong form: a
-#: workflow verified in a kernel with no viewer is a workflow this cell can
-#: rebuild exactly. A workflow that reaches for `viewer` fails verification
-#: rather than passing there and failing here.
-WORKFLOW_BOOTSTRAP_SRC = (
-    _BOOTSTRAP_HEAD.replace(
-        "# === biopb-mcp session bootstrap (best-effort audit reconstruction) ===\n"
-        "# Rebuilds np / da, the data-plane `client`, the compute-plane `ops`, and an\n"
-        "# (empty) napari `viewer` so the recorded cells below can, in principle, re-run.\n"
-        "# NOT a faithful replica: tensor-server source ids and viewer layers from the\n"
-        "# original session are gone, and the dask cluster is not reproduced.\n",
-        "# === biopb workflow bootstrap ===\n"
-        "# Rebuilds np / da, the data-plane `client` and the compute-plane `ops` --\n"
-        "# everything the verified run was given, and nothing else. There is no napari\n"
-        "# viewer here, by design: the workflow was verified without one, so it does\n"
-        "# not need one, and this notebook runs headless.\n"
-        "# Still external: tensor-server source ids have to exist on the machine that\n"
-        "# runs this, and `auto_connect()` needs a reachable control or"
-        " $BIOPB_TENSOR_URL.\n",
-    )
-    + _BOOTSTRAP_PLUGINS
-)
 
 
 def _lines(text):
@@ -269,33 +242,38 @@ def _job_cell(snap):
     )
 
 
+#: The provenance cell, prepended to every saved workflow.
+#:
+#: **Server-written, not the agent's.** The body of the document is the agent's
+#: -- prose, headings, whatever it wants to say -- but the claims about what the
+#: verification proved are not: an author that writes both can write "verified
+#: correct" over a run that only proved the cells execute. So the document is
+#: the agent's and the verdict is ours, and a reader can tell which is which by
+#: where it sits.
 _WORKFLOW_INTRO = (
     "Verified {ts}{ncells}.\n\n"
-    "Each cell below ran, in this order, in a **scratch kernel** — a second "
-    "process spawned for the verification and discarded after it, with its own "
-    "namespace and nothing the session had built. **It had no napari viewer**, "
-    "and neither does this notebook: a workflow is run by someone already "
-    "looking at their own screen, so leaving the viewer out is one less thing "
-    "to depend on and lets this run headless. "
-    "That is what the first code cell rebuilds, so this notebook asks of "
-    "a fresh kernel only what the verification run was given — with one gap worth "
-    "naming: plugins are loaded from *the reader's* "
-    "`~/.config/biopb/kernel`, so a workflow calling a plugin this machine does "
-    "not have binds nothing, and the cell using it raises `NameError`. The "
-    "bootstrap cell prints what bound.\n\n"
-    "**What the run proves.** Every cell executed without raising, against a "
-    "kernel with nothing in it but the bootstrap — no leftover variable, no "
-    "viewer, no layer the session happened to have, no module some earlier cell "
-    "imported. "
-    "That is the whole class of defect that makes a session transcript "
-    "unrunnable. It is not a claim that the numbers are "
-    "right; that is the reader's to check, and the outputs are kept below so "
-    "there is something to check against.\n\n"
+    "Every cell below ran, in this order, in a **scratch kernel** — a second "
+    "process spawned for the verification and discarded after it. It was given "
+    "nothing: no `client`, no `ops`, no `np`, no plugins, and no napari viewer. "
+    "Whatever this notebook needs, the cells below build, which is why running "
+    "them here proves they run for you.\n\n"
+    "**What the run proves.** Every cell executed without raising, on a bare "
+    "kernel with biopb-mcp installed — no leftover variable, no layer the "
+    "session happened to have, no module some earlier cell imported. That is "
+    "the whole class of defect that makes a session transcript unrunnable. It "
+    "is not a claim that the numbers are right; that is yours to check, and the "
+    "outputs are kept below so there is something to check against.\n\n"
+    "**The prose is the author's, and unverified.** Running a cell checks the "
+    "code; nothing checks the sentence above it.\n\n"
+    "**Plugins are yours, not the session's.** `workflow_env()` loads them from "
+    "*your* `~/.config/biopb/kernel`, so a workflow calling a plugin this "
+    "machine does not have binds nothing and the cell using it raises "
+    "`NameError`.\n\n"
     "**What it does not prove.** A scratch *process* is not a scratch *world*. "
-    "The run used the same tensor server and the same filesystem as the session, "
-    "so anything the workflow uploaded or wrote is really there. And external "
-    "state is unchanged by any of this — tensor-server source ids still have to "
-    "exist, and `auto_connect()` still needs a running control "
+    "The run used the same tensor server and the same filesystem as the "
+    "session, so anything the workflow uploaded or wrote is really there. And "
+    "external state is unchanged by any of it — tensor-server source ids still "
+    "have to exist, and `workflow_env()` still needs a running control "
     "(`biopb control start`) or `$BIOPB_TENSOR_URL`."
 )
 
@@ -348,42 +326,53 @@ def build_notebook(jobs):
     return _notebook(cells)
 
 
-def _workflow_cell(cell):
-    """One verified cell: its source, and the output it produced when verified.
+def _workflow_cells(blocks, results):
+    """The document's blocks as notebook cells, with the run's outputs in them.
+
+    *results* is the verification's per-cell record, in the same order as the
+    document's code blocks -- they are the same list, so they are zipped by
+    position rather than matched. A missing result renders as a code cell with
+    no output, which is what a document read back and not yet re-run looks like.
 
     No provenance header comment, unlike :func:`_job_cell`. An audit cell needs
-    one because a reader has to know who ran it; a workflow cell has one author
-    and one purpose, and a banner on every cell is noise in a document someone
-    is meant to read and edit.
-
-    A verification cell carries the same output keys a job snapshot does, so it
-    renders through :func:`_job_outputs`. Its ``error_text`` is empty by
-    construction -- ``verified()`` only yields fully-successful runs -- and if
-    one ever were not, showing it beats dropping it.
+    one because a reader has to know who ran it; a workflow has one author and
+    one purpose, and a banner on every cell is noise in a document someone is
+    meant to read and edit.
     """
-    return _code_cell(cell.get("code") or "", outputs=_job_outputs(cell))
+    out = []
+    i = 0
+    for block in blocks:
+        if block["kind"] != "code":
+            out.append(_markdown_cell(block["text"]))
+            continue
+        result = results[i] if i < len(results) else {}
+        i += 1
+        out.append(_code_cell(block["text"], outputs=_job_outputs(result)))
+    return out
 
 
 def build_workflow_notebook(record):
     """Build an nbformat-v4 notebook from a verification record.
 
-    *record* is ``_scratch.verified()`` — a fully-successful run, since a partial
-    one is a report rather than a document (``_jobs._run``). Returns a plain
-    dict ready to ``json.dumps``.
+    *record* is ``_scratch.verified()``: the run's per-cell results plus the
+    document they came from. A partial run is a report rather than a document
+    (``_jobs._run``), so only a fully-successful one reaches here.
+
+    The notebook is the agent's document with two things added, both of them the
+    run's: the provenance cell at the top, and the outputs in the code cells.
+    Nothing else is inserted -- there is no bootstrap cell any more, because the
+    document builds its own environment and the run proved that it does.
     """
     record = record or {}
-    cells_in = record.get("cells") or []
+    blocks = record.get("blocks") or []
+    results = record.get("cells") or []
     title = (record.get("title") or "").strip() or "Verified workflow"
     intro = _WORKFLOW_INTRO.format(
         ts=_fmt_ts(record.get("created")),
-        ncells=f" · {len(cells_in)} cell(s)" if cells_in else "",
+        ncells=f" · {len(results)} cell(s)" if results else "",
     )
-
-    cells = [
-        _markdown_cell(f"# {title}\n\n" + intro),
-        _code_cell(WORKFLOW_BOOTSTRAP_SRC),
-    ]
-    cells.extend(_workflow_cell(c) for c in cells_in)
+    cells = [_markdown_cell(f"# {title}\n\n" + intro)]
+    cells.extend(_workflow_cells(blocks, results))
     return _notebook(cells)
 
 
@@ -415,6 +404,17 @@ def _slug(title, limit=48):
         out.append(ch if ch.isalnum() and ch.isascii() else "-")
     slug = "-".join(part for part in "".join(out).split("-") if part)
     return slug[:limit].strip("-")
+
+
+def draft_filename(title=""):
+    """``<title>.md`` for the draft, or ``workflow.md``.
+
+    No stamp, unlike the record: attempts at one workflow are drafts of one
+    document, and a timestamp per attempt would make a directory of dead ends
+    where what is wanted is the current text.
+    """
+    slug = _slug(title)
+    return f"{slug}.md" if slug else "workflow.md"
 
 
 def suggested_workflow_filename(title=""):
