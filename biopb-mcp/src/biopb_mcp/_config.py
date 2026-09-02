@@ -502,6 +502,14 @@ class ChatConfig:
         "Seconds to wait for one model reply. Covers a slow first token on a "
         "long conversation, not the tool calls it triggers.",
     )
+    vision: str = _h(
+        "auto",
+        "Whether screenshots are sent to the model: 'auto' sends them until the "
+        "provider refuses one and then stops, 'on' always sends, 'off' never "
+        "sends and does not offer take_screenshot. A model without vision does "
+        "not merely fail the screenshot -- the image is stored and re-sent, so "
+        "every later turn fails too, which is what 'auto' recovers from.",
+    )
     acp_agent: str = _h(
         "opencode",
         "Which ACP harness to run when engine is 'acp'. Only 'opencode' is "
@@ -611,6 +619,7 @@ _CONSTRAINTS = {
         "engine": Enum({"builtin", "acp"}),
         "acp_agent": Enum({"opencode"}),
         "acp_permission": Enum({"ask", "allow"}),
+        "vision": Enum({"auto", "on", "off"}),
     },
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),

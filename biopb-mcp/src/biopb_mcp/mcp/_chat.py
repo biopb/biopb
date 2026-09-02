@@ -74,6 +74,14 @@ RESOURCE_TOOL = "read_resource"
 #: without answering is not converging, and the user is sitting there watching.
 _MAX_TOOL_ROUNDS = 12
 
+#: Tools whose only useful result is a picture. Withdrawn when images cannot
+#: reach the model: it would spend a round on a screenshot and be handed a
+#: parenthetical.
+_IMAGE_TOOLS = frozenset({"take_screenshot"})
+
+#: What stands in for an image the provider will not be sent, in the projection.
+_NO_VISION_NOTE = " -- not sent: this model does not accept images."
+
 #: How often a running job's output is re-read while the turn waits on it.
 #: In-process this is a function call, so it is set for a responsive stream
 #: rather than to spare a round trip.
@@ -106,6 +114,13 @@ _KEEP_TURNS = 2
 # name what it walked away from -- the job outlives the turn by design.
 _running_job_id = None
 
+# The image policy, and what the provider has said about it. Session state
+# rather than a config read at the point of use, because the model can be
+# changed at runtime (`POST /chat/model`) and what one model refused says
+# nothing about the next -- see :func:`set_vision`.
+_vision_mode = "auto"
+_vision_refused = False
+
 # One turn at a time, for the same reason the kernel runs one job at a time.
 # Two turns would interleave into the one thread and each compose against a
 # history the other is still writing -- and both would reach for the same
@@ -121,6 +136,44 @@ class TurnInProgress(RuntimeError):
     is an ordering nobody can inspect. The transport reports it the way the user
     console reports a busy kernel -- as state, with a 409.
     """
+
+
+class VisionUnsupported(RuntimeError):
+    """The provider refused the payload because it carried an image.
+
+    Part of the *injected model's* contract rather than the provider adapter's,
+    for the same reason the adapter is injected: the loop is what has to act on
+    it -- stop projecting images, withdraw the screenshot tool, try again -- and
+    a second adapter has to be able to say the same thing.
+    """
+
+
+def set_vision(mode):
+    """Set the image policy, forgetting what a previous model refused.
+
+    Called with the configured value when chat is configured and again whenever
+    the model is switched: a refusal is a fact about one model, and carrying it
+    across a switch would leave a vision model blind for the rest of the
+    session. An unknown value reads as "auto", which is the mode that recovers
+    from being wrong.
+    """
+    global _vision_mode, _vision_refused
+    _vision_mode = mode if mode in ("auto", "on", "off") else "auto"
+    _vision_refused = False
+
+
+def images_allowed():
+    """Whether an image may be projected to the provider.
+
+    Only the projection, never the thread: a screenshot is recorded and shown in
+    the pane whatever this says, because the human can see it even when the
+    model cannot.
+    """
+    if _vision_mode == "off":
+        return False
+    if _vision_mode == "on":
+        return True
+    return not _vision_refused
 
 
 def busy():
@@ -324,6 +377,7 @@ async def tool_payload():
             },
         }
         for tool in await _app.mcp.list_tools()
+        if images_allowed() or tool.name not in _IMAGE_TOOLS
     ]
 
 
@@ -498,7 +552,15 @@ def _llm_messages():
         # that answers the summary has lost the turn it was asked for.
         out.append({"role": "system", "content": _SUMMARY_PREFIX + _summary})
     for msg in _messages[_compacted:]:
-        if msg.get("image"):
+        if msg.get("image") and not images_allowed():
+            # The picture stays in `_messages` for the pane; only the projection
+            # drops it, and it drops *every* one -- an image already in the
+            # thread is re-sent on every later turn, so leaving the old ones in
+            # would keep failing the calls that withdrawing them was meant to
+            # save. The caption is kept because the model called the tool and is
+            # owed an answer to that call.
+            out.append({"role": "user", "content": msg["content"] + _NO_VISION_NOTE})
+        elif msg.get("image"):
             # Chat-completions tool messages are plain strings, so an image
             # cannot ride back in a tool result -- it travels as its own user
             # message and the tool result carries a placeholder.
@@ -737,6 +799,42 @@ def _close_open_calls(reason):
         )
 
 
+async def _ask(model, tools):
+    """One provider call; return ``(assistant message, tool list)``.
+
+    The tool list comes back because it can change here. A model with no vision
+    does not fail only the call that carries the screenshot -- the image is
+    stored, so it is re-sent on every later turn and the conversation is dead
+    until someone resets it. So the refusal is taken as the answer to a question
+    nobody asked explicitly: images stop being projected, ``take_screenshot`` is
+    withdrawn, and the same call is made again.
+
+    Only in ``auto``, and only once. ``on`` is a user who has said to send them
+    anyway, and repeating a call the provider has already refused for the same
+    reason would just spend their money twice.
+    """
+    global _vision_refused
+    try:
+        return await model(_llm_messages(), tools), tools
+    except VisionUnsupported as exc:
+        if _vision_mode != "auto" or _vision_refused:
+            raise
+        logger.warning("chat model refused an image; images withdrawn: %s", exc)
+        _vision_refused = True
+        # In the thread, because the pane goes on showing screenshots the model
+        # is no longer being sent and nothing else would say why its answers
+        # stopped mentioning them.
+        _append(
+            "assistant",
+            "This model does not accept images. Screenshots still appear here, "
+            "but are no longer sent to it -- point chat.model at a model with "
+            "vision, or set chat.vision to 'off' to stop taking them.",
+            error=True,
+        )
+        tools = await tool_payload()
+        return await model(_llm_messages(), tools), tools
+
+
 async def _run_turn(user_text, model, on_progress):
     # Everything that touches the thread is inside the try, so the turn is
     # either wholly absent or recorded with an outcome. Appending the user's
@@ -751,7 +849,7 @@ async def _run_turn(user_text, model, on_progress):
         _append("user", user_text)
         tools = await tool_payload()
         for _round in range(_MAX_TOOL_ROUNDS):
-            reply = await model(_llm_messages(), tools)
+            reply, tools = await _ask(model, tools)
             calls = reply.get("tool_calls") or []
             _append("assistant", reply.get("content") or "", tool_calls=calls)
             if not calls:

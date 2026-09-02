@@ -380,6 +380,101 @@ class TestToolSurface:
         )
 
 
+class TestVision:
+    """A model with no vision, and the screenshot that would otherwise end the
+    session.
+
+    The image is *stored*, so a provider that refuses it refuses every later
+    turn as well: the failure is not "the screenshot did not work", it is "chat
+    is over until someone resets the thread".
+    """
+
+    @pytest.fixture(autouse=True)
+    def policy(self):
+        # Session state, deliberately outliving a reset -- so a test that flips
+        # it puts it back rather than leaking a blind loop into the next one.
+        _chat.set_vision("auto")
+        yield
+        _chat.set_vision("auto")
+
+    def _screenshot_turn(self, model):
+        asyncio.run(_chat.run_turn("what do you see?", model))
+
+    def test_a_refusal_withdraws_the_images_and_the_turn_still_answers(self, chat_host):
+        seen = []
+
+        async def model(messages, tools):
+            seen.append({"messages": messages, "tools": tools})
+            if len(seen) == 1:
+                return {"content": "", "tool_calls": [_call("take_screenshot")]}
+            if any(
+                isinstance(part, dict) and part.get("type") == "image_url"
+                for m in messages
+                for part in (m["content"] if isinstance(m["content"], list) else ())
+            ):
+                raise _chat.VisionUnsupported("no vision on this model")
+            return {"content": "I cannot see it, but the layer list says two"}
+
+        self._screenshot_turn(model)
+
+        # The turn ended with an answer, not with the session in a state where
+        # every later turn re-sends the same image and fails the same way.
+        assert _chat.history()[-1]["content"].startswith("I cannot see it")
+        assert _chat.images_allowed() is False
+        # The picture is still in the thread for the pane...
+        assert [m for m in _chat.history() if m.get("image")]
+        # ...and out of the projection, as its caption.
+        last = seen[-1]["messages"]
+        carrier = [m for m in last if "(image returned by" in str(m.get("content"))][0]
+        assert isinstance(carrier["content"], str)
+        assert "not sent" in carrier["content"]
+
+    def test_the_screenshot_tool_is_withdrawn_once_it_is_pointless(self, chat_host):
+        assert any(
+            t["function"]["name"] == "take_screenshot"
+            for t in asyncio.run(_chat.tool_payload())
+        )
+        _chat.set_vision("off")
+        assert not any(
+            t["function"]["name"] == "take_screenshot"
+            for t in asyncio.run(_chat.tool_payload())
+        )
+
+    def test_images_are_not_projected_at_all_when_vision_is_off(self, chat_host):
+        _chat.set_vision("off")
+        _chat._append(
+            "user",
+            "(image returned by take_screenshot)",
+            image="AAAA",
+            mime="image/png",
+        )
+        model = _scripted({"content": "ok"})
+        asyncio.run(_chat.run_turn("and now?", model))
+        assert all(isinstance(m["content"], str) for m in model.seen[0]["messages"])
+
+    def test_on_means_on_so_a_refusal_is_the_users_own_answer(self, chat_host):
+        # 'on' is a user who has said to send them anyway. Retrying a call the
+        # provider has already refused would just spend their money twice.
+        _chat.set_vision("on")
+        calls = []
+
+        async def model(messages, tools):
+            calls.append(messages)
+            raise _chat.VisionUnsupported("no vision on this model")
+
+        with pytest.raises(_chat.VisionUnsupported):
+            asyncio.run(_chat.run_turn("look", model))
+        assert len(calls) == 1
+        assert _chat.images_allowed() is True
+
+    def test_a_model_switch_forgets_what_the_last_one_refused(self, chat_host):
+        _chat.set_vision("auto")
+        _chat._vision_refused = True
+        assert _chat.images_allowed() is False
+        _chat.set_vision("auto")
+        assert _chat.images_allowed() is True
+
+
 class TestResources:
     """The resource surface, which function-calling has no verb for.
 

@@ -25,7 +25,15 @@ import logging
 import httpx
 from biopb._credentials import read_credential
 
+from ._chat import VisionUnsupported
+
 logger = logging.getLogger(__name__)
+
+#: Words a provider reaches for when the image is what it objected to. Matched
+#: only against the answer to a request that actually carried one, so the bar is
+#: deliberately low: a false positive costs a session its screenshots, a false
+#: negative costs it every remaining turn.
+_VISION_REFUSALS = ("image", "vision", "multimodal")
 
 #: Credential file name, a sibling of the data plane's ``tensor-server.token``.
 KEY_NAME = "chat-provider.token"
@@ -38,6 +46,15 @@ class ChatNotConfigured(RuntimeError):
     side — "this is not set up yet" — and the message says which part is missing
     so the answer is actionable rather than a shrug.
     """
+
+
+def _carries_image(messages):
+    """Whether this payload has an image part in it."""
+    return any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for msg in messages
+        for part in (msg.get("content") if isinstance(msg.get("content"), list) else ())
+    )
 
 
 def api_key(config):
@@ -159,9 +176,20 @@ def make_model(config):
             # The provider's own words, truncated: a 400 here is usually a
             # payload the model rejected (a schema it dislikes, a context
             # overflow), and the detail is the only thing that identifies which.
+            detail = reply.text[:500]
+            if _carries_image(messages) and any(
+                word in detail.lower() for word in _VISION_REFUSALS
+            ):
+                # The one rejection the loop can do something about, so it is
+                # told apart from the ones it cannot: a model with no vision
+                # fails every turn after the screenshot, not just that one.
+                raise VisionUnsupported(
+                    f"{get_setting(config, 'chat.model')} rejected an image "
+                    f"({reply.status_code}): {detail}"
+                )
             raise RuntimeError(
                 f"{get_setting(config, 'chat.model')} returned "
-                f"{reply.status_code}: {reply.text[:500]}"
+                f"{reply.status_code}: {detail}"
             )
         choices = reply.json().get("choices") or []
         if not choices:
