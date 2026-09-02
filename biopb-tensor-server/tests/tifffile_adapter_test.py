@@ -82,6 +82,26 @@ def test_configured_dim_labels_stay_native(tmp_path):
     np.testing.assert_array_equal(actual, data[1:4, 2:7, 3:9])
 
 
+def test_empty_dim_labels_are_not_an_override(tmp_path):
+    """An unset protobuf repeated field arrives as ``[]``, not ``None``.
+
+    Reading that as "the caller specified labels" fails the rank check for every
+    series, leaving no descriptors and turning a readable TIFF into
+    "cannot read TIFF source" -- which is how runtime registration of every
+    plain TIFF broke while the config path, which passes ``None``, kept working.
+    """
+    data = np.arange(5 * 8 * 9, dtype=np.uint16).reshape(5, 8, 9)
+    path = Path(tmp_path).joinpath("unlabelled.tif")
+    tifffile.imwrite(path, data)
+
+    source = TiffAdapter.create_from_config(
+        SourceConfig(url=str(path), type="tiff", source_id="empty", dim_labels=[])
+    )
+    descriptor = source.list_tensor_descriptors()[0]
+    assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
+    assert list(descriptor.shape) == [1, 1, 5, 8, 9]
+
+
 def test_unknown_axes_claim_and_read_natively(tmp_path):
     shape = (2, 2, 2, 2, 8, 9)
     data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
