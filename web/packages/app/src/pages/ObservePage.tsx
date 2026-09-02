@@ -190,6 +190,16 @@ export default function ObservePage() {
     verify: null,
   });
   const [fresh, setFresh] = useState<Set<string>>(new Set());
+  // One shot. The class exists to play an entrance, and a row that keeps it
+  // plays one again every time its element is remounted -- which switching
+  // panes does to every row in the list. Long enough to outlast the animation,
+  // and a row added while the timer is pending simply restarts it: by the time
+  // it fires, everything in the set has been on screen for at least that long.
+  useEffect(() => {
+    if (fresh.size === 0) return;
+    const t = setTimeout(() => setFresh(new Set()), 600);
+    return () => clearTimeout(t);
+  }, [fresh]);
   // Latest expanded set + details for the poll closure (which fetches details for
   // open jobs) so poll stays stable — reading these through refs keeps the poll
   // interval from resubscribing on every toggle / detail update.
