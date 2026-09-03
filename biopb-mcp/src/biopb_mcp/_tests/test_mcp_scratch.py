@@ -236,6 +236,17 @@ class TestTheRunList:
         assert rows[0]["intent_preview"] == "second"
         assert rows[0]["code_preview"] == "1 cell"
 
+    def test_the_row_names_the_client_that_asked_for_the_run(self):
+        # The pane said "mcp" whoever asked, so a verification the chat loop
+        # started was listed as a remote client's (biopb/biopb#880).
+        _scratch.set_host_factory(lambda: _scratch_host())
+        _settle(
+            _scratch.start(_blocks(["a = 2"]), "wf", _session_host(), origin="chat")[
+                "job_id"
+            ]
+        )
+        assert _scratch.runs_view()[0]["origin"] == "chat"
+
     def test_there_is_nothing_to_save_until_a_run_passes(self):
         assert _scratch.runs_view() == []
         assert _scratch.verified_summary() is None
@@ -422,6 +433,22 @@ class TestInterrupting:
         ]
         assert "writer='agent-A'" in submit and "writer_label='A'" in submit
 
+    def test_the_run_is_submitted_with_the_origin_that_asked_for_it(self):
+        # The scratch kernel's own foreign-job check reads it, so a chat-started
+        # verification recorded as the MCP client's would be one the chat loop
+        # could not stop.
+        host = _scratch_host()
+        _scratch.set_host_factory(lambda: host)
+        _settle(
+            _scratch.start(_blocks(["a = 2"]), "wf", _session_host(), origin="chat")[
+                "job_id"
+            ]
+        )
+        (submit,) = [
+            c[0][0] for c in host.execute.call_args_list if "_jobs.submit(" in c[0][0]
+        ]
+        assert "origin='chat'" in submit
+
     def test_the_owning_agent_stops_its_own_verification(self):
         hold = threading.Event()
         job_id, host = self._running(hold=hold)
@@ -443,7 +470,7 @@ class TestInterrupting:
             for c in host.execute.call_args_list
             if "_jobs.interrupt_current(" in c[0][0]
         ]
-        assert "requester='mcp'" in call and "writer='agent-A'" in call
+        assert "origin='mcp'" in call and "writer='agent-A'" in call
 
     def test_a_stranger_cannot_stop_it_during_the_bring_up(self):
         # The one window the kernel cannot answer for itself: it does not exist

@@ -282,7 +282,7 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
         )["job_id"]
         try:
-            res = _jobs.interrupt_current(requester="mcp")
+            res = _jobs.interrupt_current(origin="mcp")
             assert res == {
                 "job_id": jid,
                 "interrupted": False,
@@ -308,7 +308,7 @@ class TestJobOrigin:
 
     def test_agent_may_stop_its_own_job(self, runner):
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
-        assert _jobs.interrupt_current(requester="mcp")["interrupted"] is True
+        assert _jobs.interrupt_current(origin="mcp")["interrupted"] is True
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_digest_reports_only_unseen_user_jobs(self, runner):
@@ -397,12 +397,94 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
         )["job_id"]
         try:
-            assert _jobs.interrupt_current(requester="mcp") == {
+            assert _jobs.interrupt_current(origin="mcp") == {
                 "job_id": jid,
                 "interrupted": False,
                 "status": "running",
                 "refused": "foreign_job",
                 "origin": "chat",
+            }
+        finally:
+            _jobs.interrupt_current()
+        assert self._wait(jid)["status"] == "interrupted"
+
+    def test_a_chat_sessions_own_jobs_are_evicted(self, runner):
+        # _prune reads the *agent's* point of view, which in a chat session is
+        # "chat". From a fixed "mcp" every chat job was foreign, and foreign
+        # jobs can never be acked -- the digest does not offer a client its own
+        # cells -- so both halves of the eviction guard held forever and the cap
+        # bounded nothing (biopb/biopb#879).
+        for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
+            self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])
+        assert len(_jobs._jobs) == _jobs._MAX_RETAINED_JOBS
+
+    def test_a_chat_session_still_holds_the_users_unreported_cell(self, runner):
+        # The other half of that read: what the agent has not been told about is
+        # held against the cap whichever agent is asking, and acking it from the
+        # chat point of view releases it.
+        user_jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
+        for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
+            self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])
+        assert user_jid in _jobs._jobs
+        assert [d["job_id"] for d in _jobs.foreign_digest("chat")] == [user_jid]
+
+        assert _jobs.ack_foreign_digest([user_jid]) == 1
+        for _ in range(_jobs._MAX_RETAINED_JOBS + 5):
+            self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])
+        assert user_jid not in _jobs._jobs
+
+    def test_a_refused_submit_does_not_move_the_point_of_view(self, runner):
+        # Only a job that exists is the agent working here. Moved on the claim
+        # check instead, a submit refused "busy" flipped the view, and the next
+        # ack then could not discharge the running agent's own notices -- which
+        # pins them against eviction, #879 by another route.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="mcp"
+        )["job_id"]
+        try:
+            assert _jobs.submit("a = 1", origin="chat")["error"] == "busy"
+            assert _jobs._agent_origin == "mcp"
+        finally:
+            _jobs.interrupt_current()
+        self._wait(jid)
+
+        # The other refusal, for the same reason.
+        self._wait(_jobs.submit("a = 1", origin="mcp", writer="sess-A")["job_id"])
+        assert (
+            _jobs.submit("b = 2", origin="chat", writer="sess-B")["error"]
+            == "not_owner"
+        )
+        assert _jobs._agent_origin == "mcp"
+
+    def test_an_unidentified_agent_still_sets_the_point_of_view(self, runner):
+        # Identity and point of view are different axes. A caller with no id
+        # neither claims nor is checked, but its cells carry its origin, and a
+        # view that ignored them would call its own jobs foreign to it.
+        self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])
+        assert _jobs._agent_origin == "chat"
+        assert _jobs.owner()["owner"] is None
+
+    def test_the_chat_loop_stops_its_own_cell(self, runner):
+        # "Did not start it" is relative to the asker. Asked as a fixed "mcp",
+        # the loop was refused the cell it had just run itself -- on the session
+        # kernel, the one where the stop is not guaranteed (biopb/biopb#880).
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
+        )["job_id"]
+        assert _jobs.interrupt_current(origin="chat")["interrupted"] is True
+        assert self._wait(jid)["status"] == "interrupted"
+
+    def test_the_chat_loop_is_refused_the_users_cell(self, runner):
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
+        )["job_id"]
+        try:
+            assert _jobs.interrupt_current(origin="chat") == {
+                "job_id": jid,
+                "interrupted": False,
+                "status": "running",
+                "refused": "foreign_job",
+                "origin": "user",
             }
         finally:
             _jobs.interrupt_current()
@@ -465,15 +547,15 @@ class TestKernelOwner:
             "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
         )["job_id"]
         try:
-            assert _jobs.interrupt_current(requester="mcp", writer="sess-B") == {
+            assert _jobs.interrupt_current(origin="mcp", writer="sess-B") == {
                 "job_id": jid,
                 "interrupted": False,
                 "status": "running",
                 "refused": "not_owner",
             }
-            # The owner still can, and so can the human (the default requester).
+            # The owner still can, and so can the human (the default origin).
             assert (
-                _jobs.interrupt_current(requester="mcp", writer="sess-A")["interrupted"]
+                _jobs.interrupt_current(origin="mcp", writer="sess-A")["interrupted"]
                 is True
             )
         finally:
@@ -502,7 +584,7 @@ class TestKernelOwner:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
         )["job_id"]
         try:
-            refused = _jobs.interrupt_current(requester="mcp")
+            refused = _jobs.interrupt_current(origin="mcp")
             assert refused["refused"] == "foreign_job"
             assert refused["origin"] == "chat"
         finally:
@@ -510,7 +592,7 @@ class TestKernelOwner:
         self._wait(jid)
 
     def test_the_human_can_always_stop_a_held_kernel(self, runner):
-        # The recovery belongs to the person at the machine: requester="user" is
+        # The recovery belongs to the person at the machine: origin="user" is
         # the observe UI, and it is never gated on the claim.
         jid = _jobs.submit(
             "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"

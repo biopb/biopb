@@ -316,6 +316,11 @@ def _submit_job(host, code, digest, busy_message, **kwargs):
     security-relevant one, so it is written once here. Both the MCP tools (via
     :func:`_start_job`) and the in-process chat loop go through it.
 
+    The origin is added here for the same reason the identity is: it is the
+    caller's point of view, every seam that reads a job back compares against
+    it, and a surface that let the kernel default it recorded its cells as the
+    MCP client's (biopb/biopb#880). One contextvar, read at one seam.
+
     What legitimately differs between those surfaces is only how a busy kernel
     is described: a tool caller gets a job handle it can poll, the chat loop
     never does (its path has no promote window), so it must not be told to poll
@@ -333,7 +338,13 @@ def _submit_job(host, code, digest, busy_message, **kwargs):
     # while this process still reads as unclaimed. See _claimed_by.
     _writers._presume_claim(writer)
     submitted, res, window_alive = _kernel_rpc._run_job_call(
-        host, "submit", code, writer=writer, writer_label=writer_label, **kwargs
+        host,
+        "submit",
+        code,
+        origin=_writers._local_origin.get(),
+        writer=writer,
+        writer_label=writer_label,
+        **kwargs,
     )
     if submitted is None:
         return None, _kernel_rpc._format_execute_result(res), False, window_alive
@@ -851,6 +862,7 @@ async def verify_workflow(document: str, title: str = "") -> str:
         f"verify workflow: {title}" if title else "verify workflow",
         writer,
         label,
+        _writers._local_origin.get(),
     )
     if started.get("error") == "busy":
         return (
@@ -1054,7 +1066,9 @@ async def interrupt_kernel() -> str:
     # same as nothing running, since one that ended a moment ago leaves the
     # session kernel free to have started something. So fall through; never
     # answer "nothing is running" from here.
-    data = await asyncio.to_thread(_scratch.interrupt, None, "mcp", writer)
+    data = await asyncio.to_thread(
+        _scratch.interrupt, None, _writers._local_origin.get(), writer
+    )
     if data is not None:
         job_id = data.get("job_id")
         if data.get("interrupted"):
@@ -1075,7 +1089,7 @@ async def interrupt_kernel() -> str:
             "finished already. Poll it to see."
         )
     data, res, _w = await _kernel_rpc._job_call(
-        host, "interrupt_current", requester="mcp", writer=writer
+        host, "interrupt_current", origin=_writers._local_origin.get(), writer=writer
     )
     if data is None:
         return _kernel_rpc._format_execute_result(res)

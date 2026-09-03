@@ -481,9 +481,14 @@ class TestVerifyWorkflow:
         monkeypatch.setattr(
             _server._scratch,
             "start",
-            lambda blocks, title, host, intent="", writer=None, label="": (
+            lambda blocks, title, host, intent="", writer=None, label="", origin="mcp": (
                 seen.update(
-                    blocks=blocks, title=title, host=host, writer=writer, label=label
+                    blocks=blocks,
+                    title=title,
+                    host=host,
+                    writer=writer,
+                    label=label,
+                    origin=origin,
                 )
                 or {"job_id": "verify-1"}
             ),
@@ -1095,8 +1100,8 @@ class TestInterruptRestart:
         assert "not initialized" in _tool(_server.interrupt_kernel)
 
     def test_interrupt_asks_as_the_agent(self, server_with_host):
-        # The requester is what lets the runner refuse a user's cell; without it
-        # the refusal below can never trigger.
+        # The asking origin is what lets the runner refuse a user's cell;
+        # without it the refusal below can never trigger.
         _install_replies(
             server_with_host, returns=_job_reply(job_id="job-3", interrupted=True)
         )
@@ -1106,7 +1111,26 @@ class TestInterruptRestart:
             for c in server_with_host.execute.call_args_list
             if "interrupt_current(" in c[0][0]
         ]
-        assert "requester='mcp'" in snippet
+        assert "origin='mcp'" in snippet
+
+    def test_interrupt_from_the_chat_loop_asks_as_the_chat_loop(self, server_with_host):
+        # Asked as a fixed "mcp", the runner read a chat cell as another
+        # writer's and refused the loop its own job (biopb/biopb#880) -- on the
+        # session kernel, where the stop is not guaranteed.
+        _install_replies(
+            server_with_host, returns=_job_reply(job_id="job-3", interrupted=True)
+        )
+        token = _writers._local_origin.set("chat")
+        try:
+            _tool(_server.interrupt_kernel)
+        finally:
+            _writers._local_origin.reset(token)
+        (snippet,) = [
+            c[0][0]
+            for c in server_with_host.execute.call_args_list
+            if "interrupt_current(" in c[0][0]
+        ]
+        assert "origin='chat'" in snippet
 
     def test_interrupt_refused_when_another_client_holds_the_kernel(
         self, server_with_host
