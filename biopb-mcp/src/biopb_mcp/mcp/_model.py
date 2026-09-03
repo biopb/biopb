@@ -61,13 +61,16 @@ def _headers(config, key):
     """
     from .._config import get_setting
 
+    # The key last: `extra_headers` refuses to carry a credential header at
+    # all, and this is the second half of that -- configuration cannot displace
+    # the key even if the refusal above it is ever relaxed.
     return {
-        "Authorization": f"Bearer {key}",
         **_endpoint.extra_headers(
             get_setting(config, "chat.base_url"),
             get_setting(config, "chat.extra_headers"),
             session=_chat.session_id(),
         ),
+        "Authorization": f"Bearer {key}",
     }
 
 

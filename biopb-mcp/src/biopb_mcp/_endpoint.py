@@ -26,8 +26,29 @@ where a conversation begins (``_chat.reset``, a bench backend's construction)
 and passed in here, rather than invented per request.
 """
 
+import logging
 import uuid
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
+
+#: A field name is a ``token`` (RFC 9110 §5.1, §5.6.2); these are its characters
+#: besides ALPHA and DIGIT. Checked rather than assumed: these names are typed
+#: by hand into a config file or an environment variable, and what a transport
+#: does with one that is not a token differs -- ``httpx`` and the SDK do not
+#: agree on whether it raises, and a turn is a bad place to find out.
+_TCHAR = frozenset("!#$%&'*+-.^_`|~")
+
+#: Header names this will not carry, whatever asks for it. These are how a
+#: credential travels, both clients already supply their own, and the values
+#: here reach a browser: ``chat.extra_headers`` lives in the config file that
+#: ``GET /api/mcp_config`` serves whole. Refusing them is what makes the
+#: setting's "no secrets here" a property rather than a request -- a key put
+#: here would otherwise *work*, which is the mistake that gets one rendered in
+#: an admin page. Keys belong in the credential file (``_model.KEY_NAME``).
+_CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+)
 
 #: Hosts that require headers of their own, and what they require. Values are
 #: ``"Name: value"``, with ``{session}`` substituted per :func:`extra_headers`.
@@ -54,6 +75,24 @@ def new_session_id() -> str:
     return f"biopb-{uuid.uuid4().hex}"
 
 
+def _is_token(name: str) -> bool:
+    """Whether *name* is a valid HTTP field name."""
+    return bool(name) and all(
+        c.isascii() and (c.isalnum() or c in _TCHAR) for c in name
+    )
+
+
+def _is_field_value(value: str) -> bool:
+    """Whether *value* can go on the wire as a field value.
+
+    The check that matters is the absence of CR and LF: a value carrying either
+    is not one header but two, which is header injection, and the value here can
+    come from an environment variable. The rest of C0 and DEL go with them --
+    they are not field-vchar, and no gateway asks for one.
+    """
+    return not any((ord(c) < 0x20 and c != "\t") or ord(c) == 0x7F for c in value)
+
+
 def _defaults_for(base_url: str) -> tuple:
     host = (urlsplit(base_url).hostname or "").lower()
     for known, headers in _KNOWN_GATEWAYS.items():
@@ -76,19 +115,40 @@ def extra_headers(base_url: str, configured=(), *, session: str = "") -> dict:
     substituted is dropped rather than sent blank: a gateway reading a header it
     requires as present-but-empty gives a worse error than one reading it as
     absent, and an empty one here means we had no conversation to name.
+
+    **Every entry is validated, and a bad one is skipped rather than raised.**
+    This is hand-edited text, and one malformed line should not take a turn --
+    or a whole bench run -- down with it. Skipped entries are logged by name, so
+    a header that is quietly not being sent is findable. No entry's text is ever
+    logged -- the one thing that must not be put here is the thing most likely
+    to be, and a log line is a file.
     """
     merged: dict = {}
-    for entry in (*_defaults_for(base_url), *(configured or ())):
+    entries = (*_defaults_for(base_url), *(configured or ()))
+    for position, entry in enumerate(entries, start=1):
         name, sep, value = str(entry).partition(":")
         name = name.strip()
-        if not name or not sep:
-            # Not "Name: value". Skipped rather than raised: this comes from a
-            # config file a person edits by hand, and one malformed line should
-            # not take the chat pane down with it.
+        if not sep or not _is_token(name):
+            # Its position, not its text: an entry malformed enough to reach
+            # here is also where a pasted key ends up, and a log line is a file.
+            logger.warning(
+                "ignoring header entry %d: not 'Name: value' with a valid field name",
+                position,
+            )
+            continue
+        if name.lower() in _CREDENTIAL_HEADERS:
+            logger.warning(
+                "ignoring %s: credentials belong in the credential file, not in "
+                "configuration that is served to a browser",
+                name,
+            )
             continue
         value = value.strip().replace("{session}", session)
         if not value:
             merged.pop(name.lower(), None)
+            continue
+        if not _is_field_value(value):
+            logger.warning("ignoring header %s: its value is not a field value", name)
             continue
         merged[name.lower()] = (name, value)
     return dict(merged.values())

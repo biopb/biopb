@@ -165,6 +165,19 @@ class TestCall:
         assert call["headers"]["x-opencode-session"] == _chat.session_id()
         assert call["headers"]["Authorization"] == "Bearer sk-x"
 
+    def test_configuration_cannot_displace_the_key(self, config, state_home):
+        # Two halves: `_endpoint` refuses to carry a credential header at all,
+        # and the key is applied last so it could not be displaced even if that
+        # refusal were relaxed. Without either, the config file becomes a place
+        # where a key *works* -- and that file is served to a browser.
+        write_credential("sk-real", _model.KEY_NAME)
+        config["chat"]["extra_headers"] = ["Authorization: Bearer sk-leak"]
+        _FakeClient.reply = _response(payload={"choices": [{"message": {}}]})
+        asyncio.run(_model.make_model(config)([], []))
+
+        (call,) = _FakeClient.calls
+        assert call["headers"]["Authorization"] == "Bearer sk-real"
+
     def test_the_session_header_follows_the_conversation_not_the_process(
         self, config, state_home
     ):
