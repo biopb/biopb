@@ -14,7 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _endpoints, _locations, _web_auth
+from . import _agents, _endpoints, _locations, _tls_material, _web_auth
 from ._endpoints import (
     flight_port_for as _flight_port,
     sidecar_port_for as _sidecar_port,
@@ -867,18 +867,25 @@ def _resolve_tls_material(
     ``grpcs://`` plane.
 
     Validated here, in the command the user typed, for the same reason
-    :func:`_require_tls_extra` is: a half pair or an unreadable file exits 2 in
-    the supervised child, which crash-loops on backoff with the one useful
-    sentence in tensor-server.log while the control reports a clean start
-    (biopb/biopb#913).
+    :func:`_require_tls_extra` is: a half pair, or material the server cannot
+    read, exits 2 in the supervised child -- which crash-loops on backoff with
+    the one useful sentence in tensor-server.log while the control reports a
+    clean start (biopb/biopb#913). Each file is opened rather than stat'd: a key
+    readable only by root passes ``is_file()`` and fails everything after it. The
+    rule is shared with the other two entry points that resolve this same pair
+    (:mod:`biopb._tls_material`).
     """
     if (tls_cert is None) != (tls_key is None):
         console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
         raise typer.Exit(2)
     for label, path in (("--tls-cert", tls_cert), ("--tls-key", tls_key)):
-        if path is not None and not path.is_file():
-            console.print(f"[red]{label} not found: {path}[/red]")
-            raise typer.Exit(2)
+        if path is None:
+            continue
+        try:
+            _tls_material.read_pem(path, label)
+        except _tls_material.TlsMaterialError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(2) from None
     return tls or tls_cert is not None
 
 

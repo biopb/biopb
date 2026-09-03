@@ -13,6 +13,7 @@ deterministic and fast on any platform; time.sleep is neutralized.
 import inspect
 import json
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import biopb.cli as cli
@@ -846,9 +847,15 @@ class TestControlTlsMaterial:
 
     @staticmethod
     def _pair(tmp_path):
+        """A readable PEM pair -- the material's *bytes* are validated, not just
+        its existence, so a placeholder string no longer passes."""
         cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-        cert.write_text("cert")
-        key.write_text("key")
+        cert.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+        )
+        key.write_bytes(
+            b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
+        )
         return cert, key
 
     def test_the_material_is_forwarded_on_the_child_argv(self, tmp_path):
@@ -881,12 +888,32 @@ class TestControlTlsMaterial:
     def test_unusable_tls_material_fails_the_command_the_user_typed(self, tmp_path):
         """Not the supervised child, which would crash-loop on backoff with the
         reason in tensor-server.log while the control reported a clean start."""
-        cert = tmp_path / "c.pem"
-        cert.write_text("cert")
+        cert, key = self._pair(tmp_path)
         with pytest.raises(typer.Exit):  # half a pair
             cli._resolve_tls_material(True, cert, None)
         with pytest.raises(typer.Exit):  # names a file that isn't there
-            cli._resolve_tls_material(True, tmp_path / "absent.pem", cert)
+            cli._resolve_tls_material(True, tmp_path / "absent.pem", key)
+        empty = tmp_path / "empty.pem"
+        empty.write_text("")
+        with pytest.raises(typer.Exit):  # exists, holds nothing
+            cli._resolve_tls_material(True, empty, key)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads anything"
+    )
+    def test_a_key_that_only_root_can_read_is_caught_here(self, tmp_path):
+        """The preflight opens the pair rather than stat'ing it: mode 0600 owned
+        by someone else is the ordinary shape of a private key, and `is_file()`
+        passes on it (biopb/biopb#913)."""
+        cert, key = self._pair(tmp_path)
+        key.chmod(0o000)
+        try:
+            assert key.is_file()
+            with pytest.raises(typer.Exit):
+                cli._resolve_tls_material(True, cert, key)
+        finally:
+            key.chmod(0o600)
 
     def test_control_run_puts_the_material_on_the_spec(self, tmp_path, monkeypatch):
         """`control run`'s hop -- the foreground command an Open OnDemand app

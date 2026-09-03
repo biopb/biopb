@@ -15,8 +15,11 @@ The security-relevant behavior:
   Local mode (loopback) binds token-less.
 """
 
+import os
+import sys
 from unittest.mock import patch
 
+import pytest
 from biopb import _web_auth
 
 import biopb_control.__main__ as m
@@ -238,9 +241,14 @@ def test_url_prefix_reaches_the_spec_normalized():
 
 
 def _cert_pair(tmp_path):
+    """A readable PEM pair: the preflight validates the bytes, not just the path."""
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-    cert.write_text("cert")
-    key.write_text("key")
+    cert.write_bytes(
+        b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+    )
+    key.write_bytes(
+        b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
+    )
     return cert, key
 
 
@@ -282,6 +290,24 @@ def test_an_unreadable_cert_is_refused_before_anything_starts(tmp_path):
         {},
     )
     assert rc == 2 and spec is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads anything"
+)
+def test_a_key_only_root_can_read_is_refused_before_anything_starts(tmp_path):
+    """`is_file()` passes on a 0600 key owned by someone else; opening it does
+    not, and opening it is what the data plane will do (biopb/biopb#913)."""
+    cert, key = _cert_pair(tmp_path)
+    key.chmod(0o000)
+    try:
+        rc, spec, _ = _capture(
+            _BASE_ARGV + ["--tls-cert", str(cert), "--tls-key", str(key)], {}
+        )
+        assert rc == 2 and spec is None
+    finally:
+        key.chmod(0o600)
 
 
 def test_no_tls_material_leaves_the_spec_alone():

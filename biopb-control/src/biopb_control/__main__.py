@@ -158,10 +158,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # BYO TLS material, validated before anything is spawned: a half pair or a
-    # missing file would otherwise exit 2 inside the supervised child on every
-    # spawn, crash-looping with the reason in tensor-server.log
-    # (biopb/biopb#913).
+    # BYO TLS material, validated before anything is spawned: a half pair, or
+    # material the server cannot read, would otherwise exit 2 inside the
+    # supervised child on every spawn, crash-looping with the reason in
+    # tensor-server.log (biopb/biopb#913). The shared rule opens each file rather
+    # than stat'ing it -- a key readable only by root passes `is_file()`.
+    from biopb import _tls_material
+
     if (args.tls_cert is None) != (args.tls_key is None):
         print(
             "biopb-control: --tls-cert and --tls-key must be given together.",
@@ -169,8 +172,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     for label, value in (("--tls-cert", args.tls_cert), ("--tls-key", args.tls_key)):
-        if value is not None and not Path(value).is_file():
-            print(f"biopb-control: {label} not found: {value}", file=sys.stderr)
+        if value is None:
+            continue
+        try:
+            _tls_material.read_pem(Path(value), label)
+        except _tls_material.TlsMaterialError as e:
+            print(f"biopb-control: {e}", file=sys.stderr)
             return 2
 
     # Validate the URL prefix here so a bad one is a named configuration error

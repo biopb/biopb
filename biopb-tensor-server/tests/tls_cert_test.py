@@ -336,6 +336,33 @@ def test_byo_cert_needs_no_cryptography(tmp_path, monkeypatch):
     assert cert == cert_pem and key == key_pem
 
 
+def test_byo_material_is_validated_by_opening_it(tmp_path):
+    """The server applies the same rule the control's preflight does.
+
+    It matters here too, and not only as a courtesy: the pair can arrive from
+    `biopb.json`, which never passed through any flag validation
+    (biopb/biopb#913).
+    """
+    import typer
+    from biopb_tensor_server.cli import _resolve_tls_material
+    from biopb_tensor_server.core.tls import generate_self_signed_cert
+
+    cert_pem, key_pem = generate_self_signed_cert(["localhost"], [])
+    cf, kf = tmp_path / "c.pem", tmp_path / "k.pem"
+    cf.write_bytes(cert_pem)
+    kf.write_bytes(key_pem)
+
+    der = tmp_path / "c.der"
+    der.write_bytes(b"\x30\x82\x01\x0a\xff\x00")  # not PEM, so unusable
+    with pytest.raises(typer.Exit):
+        _resolve_tls_material(False, der, kf)
+
+    empty = tmp_path / "empty.pem"
+    empty.write_bytes(b"")
+    with pytest.raises(typer.Exit):
+        _resolve_tls_material(False, cf, empty)
+
+
 # --- CLI: cert init ---------------------------------------------------------
 
 
