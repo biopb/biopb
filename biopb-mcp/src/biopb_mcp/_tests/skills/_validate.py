@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from biopb_mcp.mcp._skills_layout import is_skill_file
+from biopb_mcp.mcp._skills_layout import is_catalog_file
 
 from ._schema import (
     CURRENT_SPEC_VERSION,
@@ -167,11 +167,11 @@ def validate(skills_dir: Path) -> tuple[list[SkillEntry], Report]:
     rep = Report()
     entries: list[SkillEntry] = []
     seen: set[str] = set()
-    for path in sorted(skills_dir.glob("*.md")):
+    for path in sorted(p for p in skills_dir.glob("*") if p.is_file()):
         # The gate and the runtime have to agree about which files are skills
         # (`test_what_validates_is_what_the_runtime_loads`), so the rule is not
         # spelled here -- see `mcp/_skills_layout.py`.
-        if not is_skill_file(path.name):
+        if not is_catalog_file(path.name):
             continue
         entry = process(path, rep)
         if entry is None:
