@@ -435,6 +435,30 @@ def test_tls_is_passed_down_when_asked(tmp_path):
     assert "--tls" in DataPlaneSupervisor(spec)._build_argv()
 
 
+def test_byo_tls_material_is_passed_down_to_launch(tmp_path):
+    """A cert the operator supplied outlives the deployment; the minted one does
+    not (biopb/biopb#913)."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "c.json",
+        tls=True,
+        tls_cert=tmp_path / "c.pem",
+        tls_key=tmp_path / "k.pem",
+        sans=("gpu-051.hpc.example", "10.0.0.5"),
+    )
+    argv = DataPlaneSupervisor(spec)._build_argv()
+    assert argv[argv.index("--tls-cert") + 1] == str(tmp_path / "c.pem")
+    assert argv[argv.index("--tls-key") + 1] == str(tmp_path / "k.pem")
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--san"] == [
+        "gpu-051.hpc.example",
+        "10.0.0.5",
+    ]
+
+
+def test_no_tls_material_emits_no_flags(tmp_path):
+    argv = DataPlaneSupervisor(DataPlaneSpec(config=tmp_path / "c.json"))._build_argv()
+    assert "--tls-cert" not in argv and "--san" not in argv
+
+
 def test_a_wildcard_bind_is_probed_over_loopback(tmp_path):
     """A wildcard is a bind target, not a connect target -- and the address
     family has to match, or a `::`-bound server with IPV6_V6ONLY refuses an

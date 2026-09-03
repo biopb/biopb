@@ -826,6 +826,105 @@ class TestPlaneBind:
         assert "--tls" in cli._control_run_argv(**kwargs, tls=True)
 
 
+class TestByoTlsMaterial:
+    """`--tls-cert` / `--tls-key` / `--san`, forwarded to the data plane.
+
+    `serve` and `launch` have taken all three since TLS landed; `control start` /
+    `control run` -- the entry point a deployment actually invokes -- took only
+    `--tls`, so an operator with a certificate of their own had to pre-seed the
+    state tree behind the control's back (biopb/biopb#913).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_helpers(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
+        monkeypatch.delenv("BIOPB_CONTROL_HOST", raising=False)
+        monkeypatch.setattr(cli, "_get_log_file", lambda: tmp_path / "s.log")
+        monkeypatch.setattr(
+            cli, "_control_shutdown_sentinel", lambda: tmp_path / "c.stop"
+        )
+
+    @staticmethod
+    def _pair(tmp_path):
+        cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+        cert.write_text("cert")
+        key.write_text("key")
+        return cert, key
+
+    def test_the_material_is_forwarded_on_the_child_argv(self, tmp_path):
+        """`control start`'s hop: the daemon spawns the control as a subprocess."""
+        cert, key = self._pair(tmp_path)
+        argv = cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="127.0.0.1",
+            base_port=8810,
+            log_level="INFO",
+            data_plane=True,
+            grpc_bind="127.0.0.1",
+            tls=True,
+            tls_cert=cert,
+            tls_key=key,
+            san=["gpu-051.hpc.example"],
+        )
+        assert argv[argv.index("--tls-cert") + 1] == str(cert)
+        assert argv[argv.index("--tls-key") + 1] == str(key)
+        assert argv[argv.index("--san") + 1] == "gpu-051.hpc.example"
+
+    def test_a_supplied_cert_means_tls_even_without_the_flag(self, tmp_path):
+        """The control advertises the plane's scheme from this, so a cert that is
+        served must not leave it reporting grpc://."""
+        cert, key = self._pair(tmp_path)
+        assert cli._resolve_tls_material(False, cert, key) is True
+        assert cli._resolve_tls_material(False, None, None) is False
+
+    def test_unusable_tls_material_fails_the_command_the_user_typed(self, tmp_path):
+        """Not the supervised child, which would crash-loop on backoff with the
+        reason in tensor-server.log while the control reported a clean start."""
+        cert = tmp_path / "c.pem"
+        cert.write_text("cert")
+        with pytest.raises(typer.Exit):  # half a pair
+            cli._resolve_tls_material(True, cert, None)
+        with pytest.raises(typer.Exit):  # names a file that isn't there
+            cli._resolve_tls_material(True, tmp_path / "absent.pem", cert)
+
+    def test_control_run_puts_the_material_on_the_spec(self, tmp_path, monkeypatch):
+        """`control run`'s hop -- the foreground command an Open OnDemand app
+        invokes builds the spec itself, with no argv in between."""
+        import biopb_control
+
+        cert, key = self._pair(tmp_path)
+        captured = {}
+        monkeypatch.setattr(
+            biopb_control,
+            "run_control",
+            lambda spec, **_k: captured.setdefault("spec", spec) and 0,
+        )
+        monkeypatch.setattr(cli, "_guard_ports_free", lambda *_a, **_k: None)
+        monkeypatch.setattr(cli, "_ensure_dirs", lambda: None)
+        monkeypatch.setattr(cli, "_reject_legacy_toml", lambda _c: None)
+
+        with pytest.raises(typer.Exit):
+            cli.control_run(
+                config=tmp_path / "biopb.json",
+                static_dir=None,
+                base_port=8810,
+                log_level="INFO",
+                grpc_bind="127.0.0.1",
+                tls=None,
+                tls_cert=cert,
+                tls_key=key,
+                san=["gpu-051.hpc.example"],
+                token=None,
+                data_plane=True,
+                url_prefix=None,
+                remote=False,
+            )
+        spec = captured["spec"]
+        assert (spec.tls, spec.tls_cert, spec.tls_key) == (True, cert, key)
+        assert spec.sans == ("gpu-051.hpc.example",)
+
+
 class TestBasePort:
     """One number places all three listeners (base+3 / +4 / +5).
 

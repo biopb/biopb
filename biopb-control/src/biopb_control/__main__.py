@@ -33,6 +33,25 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Serve the data plane's flight port over TLS (passed to `launch`).",
     )
+    run.add_argument(
+        "--tls-cert",
+        default=None,
+        help="PEM certificate (chain) the data plane serves, instead of the "
+        "self-signed one it mints into the state tree. Implies --tls. Requires "
+        "--tls-key.",
+    )
+    run.add_argument(
+        "--tls-key",
+        default=None,
+        help="PEM private key paired with --tls-cert.",
+    )
+    run.add_argument(
+        "--san",
+        action="append",
+        default=None,
+        help="Extra hostname or IP for a certificate the data plane mints "
+        "(repeatable). Ignored once a cert exists, and by --tls-cert.",
+    )
     run.add_argument("--web-host", default="127.0.0.1")
     run.add_argument("--web-port", type=int, default=8814)
     run.add_argument("--static-dir", default=None)
@@ -138,6 +157,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # BYO TLS material, validated before anything is spawned: a half pair or a
+    # missing file would otherwise exit 2 inside the supervised child on every
+    # spawn, crash-looping with the reason in tensor-server.log
+    # (biopb/biopb#913).
+    if (args.tls_cert is None) != (args.tls_key is None):
+        print(
+            "biopb-control: --tls-cert and --tls-key must be given together.",
+            file=sys.stderr,
+        )
+        return 2
+    for label, value in (("--tls-cert", args.tls_cert), ("--tls-key", args.tls_key)):
+        if value is not None and not Path(value).is_file():
+            print(f"biopb-control: {label} not found: {value}", file=sys.stderr)
+            return 2
+
     # Validate the URL prefix here so a bad one is a named configuration error
     # rather than a traceback out of build_app. Normalizing twice is harmless
     # (it is pure and idempotent); build_app stays the authority.
@@ -154,7 +188,13 @@ def main(argv: list[str] | None = None) -> int:
         config=Path(args.config),
         grpc_host=args.grpc_host,
         grpc_port=args.grpc_port,
-        tls=args.tls,
+        # A supplied cert means TLS whether or not --tls was also passed: the
+        # plane serves it either way, and this flag is also what the control
+        # advertises the plane's scheme from.
+        tls=args.tls or args.tls_cert is not None,
+        tls_cert=Path(args.tls_cert) if args.tls_cert else None,
+        tls_key=Path(args.tls_key) if args.tls_key else None,
+        sans=tuple(args.san or ()),
         web_host=args.web_host,
         web_port=args.web_port,
         static_dir=Path(args.static_dir) if args.static_dir else None,

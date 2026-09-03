@@ -228,3 +228,68 @@ def test_url_prefix_reaches_the_spec_normalized():
     rc, spec, _ = _capture(_BASE_ARGV + ["--url-prefix", "/node/h/29847/"], {})
     assert rc == 0
     assert spec.url_prefix == "/node/h/29847"
+
+
+# --- BYO TLS material (biopb/biopb#913) ------------------------------------
+# `serve` and `launch` have taken --tls-cert/--tls-key/--san all along; the one
+# entry point a deployment actually invokes did not, so the only way to hand the
+# plane a stable certificate was to pre-seed the state tree behind the control's
+# back.
+
+
+def _cert_pair(tmp_path):
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_text("cert")
+    key.write_text("key")
+    return cert, key
+
+
+def test_byo_tls_material_reaches_the_spec(tmp_path):
+    cert, key = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(
+        _BASE_ARGV
+        + ["--tls-cert", str(cert), "--tls-key", str(key), "--san", "a", "--san", "b"],
+        {},
+    )
+    assert rc == 0
+    assert (spec.tls_cert, spec.tls_key) == (cert, key)
+    assert spec.sans == ("a", "b")
+
+
+def test_a_supplied_cert_implies_tls(tmp_path):
+    """The control advertises the plane's scheme from this flag, so it must agree
+    with what the plane will actually serve."""
+    cert, key = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(
+        _BASE_ARGV + ["--tls-cert", str(cert), "--tls-key", str(key)], {}
+    )
+    assert rc == 0 and spec.tls is True
+
+
+def test_half_a_cert_pair_is_refused_before_anything_starts(tmp_path):
+    cert, _ = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(_BASE_ARGV + ["--tls-cert", str(cert)], {})
+    assert rc == 2 and spec is None
+
+
+def test_an_unreadable_cert_is_refused_before_anything_starts(tmp_path):
+    """Otherwise `launch` exits 2 on every spawn and the control crash-loops it,
+    reporting a clean start with the reason buried in tensor-server.log."""
+    _, key = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(
+        _BASE_ARGV
+        + ["--tls-cert", str(tmp_path / "absent.pem"), "--tls-key", str(key)],
+        {},
+    )
+    assert rc == 2 and spec is None
+
+
+def test_no_tls_material_leaves_the_spec_alone():
+    rc, spec, _ = _capture(_BASE_ARGV, {})
+    assert rc == 0
+    assert (spec.tls, spec.tls_cert, spec.tls_key, spec.sans) == (
+        False,
+        None,
+        None,
+        (),
+    )
