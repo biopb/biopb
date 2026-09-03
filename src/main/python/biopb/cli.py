@@ -1149,12 +1149,15 @@ _OPT_TLS = typer.Option(
 _OPT_TLS_CERT = typer.Option(
     None,
     "--tls-cert",
-    help="PEM certificate (chain) the data plane serves, instead of the "
+    help="PEM certificate chain the data plane serves, instead of the "
     "self-signed one it mints into the state tree. Implies --tls, and needs no "
     "'cryptography' extra. Use it to serve one long-lived certificate that "
-    "outlives any single deployment — an institutional cert, or one shared by "
-    "every node of a cluster — so clients pin once instead of per launch. "
-    "Requires --tls-key.",
+    "outlives a single launch — one cert shared by every node a scheduler might "
+    "pick — so clients pin once instead of per launch. It must carry a loopback "
+    "SAN (localhost / 127.0.0.1) besides the names clients dial, or the "
+    "co-located sidecar cannot reach the flight plane; and a client on this "
+    "machine reads its anchor from the state tree, so put a copy of the cert "
+    "(not the key) there too. Requires --tls-key.",
 )
 _OPT_TLS_KEY = typer.Option(
     None,
@@ -1255,6 +1258,12 @@ def control_start(
     ``--tls-key`` serve an operator's own long-lived cert instead (no
     ``cryptography`` needed), and ``--san`` names addresses a minted cert could
     not discover for itself; both are forwarded to the data plane.
+
+    A supplied cert has to satisfy the two consumers *on this machine*, which the
+    minted one satisfies by construction: the co-located sidecar dials the plane
+    over loopback, so the cert needs a ``localhost`` / ``127.0.0.1`` SAN, and a
+    local SDK client anchors on ``state/biopb/tls/server-cert.pem``, so a copy of
+    the cert (never the key) belongs there as well.
 
     Only the flight plane is ever published. The tensor HTTP sidecar stays on
     loopback (the control proxies it), and so does the control itself — the

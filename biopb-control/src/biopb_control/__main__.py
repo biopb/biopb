@@ -36,9 +36,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--tls-cert",
         default=None,
-        help="PEM certificate (chain) the data plane serves, instead of the "
-        "self-signed one it mints into the state tree. Implies --tls. Requires "
-        "--tls-key.",
+        help="PEM certificate chain the data plane serves, instead of the "
+        "self-signed one it mints into the state tree. Implies --tls. Must carry "
+        "a loopback SAN (localhost / 127.0.0.1) or the co-located sidecar cannot "
+        "reach the flight plane. Requires --tls-key.",
     )
     run.add_argument(
         "--tls-key",
