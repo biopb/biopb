@@ -370,8 +370,114 @@ class TestResolve:
         argv, name = _chat_acp.resolve_command(
             {"chat": {"acp_agent": "opencode", "acp_command": str(fake)}}
         )
-        assert argv == (str(fake), "acp")
+        assert argv == (
+            str(fake),
+            "acp",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "0",
+        )
         assert name == "opencode"
+
+    def test_opencode_acp_uses_a_loopback_ephemeral_http_port(self):
+        argv, name = _chat_acp.resolve_command({"chat": {"acp_agent": "opencode"}})
+        assert argv[-4:] == ("--hostname", "127.0.0.1", "--port", "0")
+        assert name == "opencode"
+
+
+class TestStartupCleanup:
+    @pytest.fixture(autouse=True)
+    def reset_agent_state(self, monkeypatch):
+        monkeypatch.setattr(_chat_acp, "_child", None)
+        monkeypatch.setattr(_chat_acp, "_conn", None)
+        monkeypatch.setattr(_chat_acp, "_session_id", None)
+        monkeypatch.setattr(_chat_acp, "_agent_name", "")
+        monkeypatch.setattr(_chat_acp, "_cwd", "/tmp/biopb-test-acp")
+
+    @staticmethod
+    def _config():
+        return {
+            "chat": {
+                "acp_agent": "opencode",
+                "acp_permission": "allow",
+                "acp_model": None,
+            }
+        }
+
+    @staticmethod
+    def _fakes(monkeypatch, *, initialize=None, new_session=None):
+        events = []
+
+        class Child:
+            proc = object()
+
+            def stop(self):
+                events.append("stop")
+
+        class Connection:
+            async def initialize(self, **_kwargs):
+                events.append("initialize")
+                if initialize is not None:
+                    return await initialize()
+                return object()
+
+            async def new_session(self, **_kwargs):
+                events.append("new_session")
+                if new_session is not None:
+                    return await new_session()
+                return type("Session", (), {"session_id": "s"})()
+
+            async def close(self):
+                events.append("close")
+
+        child = Child()
+        conn = Connection()
+        monkeypatch.setattr(_chat_acp, "_spawn", lambda _config: (child, "fake"))
+        monkeypatch.setattr(_chat_acp, "_PipeTransport", lambda *_args: object())
+        monkeypatch.setattr("acp.connect_to_agent", lambda _client, _transport: conn)
+        monkeypatch.setattr(_chat_acp, "_own_mcp_url", lambda: None)
+        return events
+
+    def test_initialize_failure_closes_connection_and_stops_child(self, monkeypatch):
+        async def fail():
+            raise RuntimeError("initialize failed")
+
+        events = self._fakes(monkeypatch, initialize=fail)
+        with pytest.raises(RuntimeError, match="initialize failed"):
+            asyncio.run(_chat_acp.ensure_agent(self._config()))
+        assert events == ["initialize", "close", "stop"]
+        assert _chat_acp._child is None
+        assert _chat_acp._conn is None
+
+    def test_model_setup_failure_closes_transferred_agent(self, monkeypatch):
+        events = self._fakes(monkeypatch)
+        monkeypatch.setattr(
+            _chat_acp,
+            "_apply_model",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("model failed")),
+        )
+        with pytest.raises(RuntimeError, match="model failed"):
+            asyncio.run(_chat_acp.ensure_agent(self._config()))
+        assert events == ["initialize", "new_session", "close", "stop"]
+        assert _chat_acp._child is None
+        assert _chat_acp._conn is None
+
+    def test_startup_cancellation_closes_connection_and_stops_child(self, monkeypatch):
+        async def wait_forever():
+            await asyncio.Event().wait()
+
+        events = self._fakes(monkeypatch, initialize=wait_forever)
+
+        async def scenario():
+            task = asyncio.create_task(_chat_acp.ensure_agent(self._config()))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        assert events == ["initialize", "close", "stop"]
 
 
 class TestHttpSurface:
