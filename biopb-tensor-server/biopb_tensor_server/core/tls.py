@@ -29,17 +29,16 @@ nothing on a plaintext server that never generates a cert.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import ipaddress
 import logging
 import os
 import socket
-import ssl
 import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from biopb import _tls_material
 from biopb._locations import tls_server_cert, tls_server_key
 
 logger = logging.getLogger(__name__)
@@ -281,47 +280,17 @@ def generate_self_signed_cert(
     return cert_pem, key_pem
 
 
-def leaf_pem(bundle_pem: bytes) -> bytes:
-    """The first certificate in *bundle_pem* — the leaf — as its own PEM block.
-
-    A ``--tls-cert`` may be a chain (leaf first, then issuers, which is the order
-    TLS itself requires on the wire), and everything that identifies "the
-    certificate this server presents" means the leaf: it is what a client
-    fingerprints, and what ``PEM_cert_to_DER_cert`` refuses to parse out of a
-    bundle. Stdlib string work rather than a parse, so this costs no
-    ``cryptography``.
-
-    Returns the input unchanged when it holds a single certificate, and when it
-    holds nothing recognizable — the callers that matter validated it first
-    (:mod:`biopb._tls_material`), and inventing a different failure here would
-    only move the error away from the check that owns it.
-    """
-    marker = b"-----END CERTIFICATE-----"
-    end = bundle_pem.find(marker)
-    if end == -1:
-        return bundle_pem
-    return bundle_pem[: end + len(marker)] + b"\n"
+# The fingerprint helpers live in the core SDK (stdlib-only), because the value
+# has to agree between whoever serves a certificate and everyone who checks it --
+# the client, the pin store, and the record a local plane publishes. Re-exported
+# under the names this package's callers already use.
+leaf_pem = _tls_material.leaf_pem
+format_fingerprint = _tls_material.format_fingerprint
 
 
 def cert_fingerprint(cert_pem: bytes) -> str:
-    """SHA-256 of the cert's DER body — the value a client's TOFU pin matches on.
-
-    Stdlib only (no ``cryptography``), so callers can print it cheaply.
-    """
-    der = ssl.PEM_cert_to_DER_cert(cert_pem.decode("ascii"))
-    return hashlib.sha256(der).hexdigest()
-
-
-def format_fingerprint(fingerprint: str) -> str:
-    """Colon-group a hex fingerprint for display (``AB:CD:...``).
-
-    Operators eyeball-compare this against a client's pin, so every printout of a
-    fingerprint uses the full digest in this one grouped form -- a truncated
-    prefix is not something a human should be asked to trust.
-    """
-    return ":".join(
-        fingerprint[i : i + 2].upper() for i in range(0, len(fingerprint), 2)
-    )
+    """SHA-256 of the cert's DER body — the value a client's TOFU pin matches on."""
+    return _tls_material.fingerprint(cert_pem)
 
 
 def cert_expiry_warning(cert_pem: bytes) -> Optional[str]:

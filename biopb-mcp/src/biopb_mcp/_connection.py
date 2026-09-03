@@ -93,8 +93,8 @@ def _starting_message(health) -> str:
 # (biopb/biopb#615). Re-exported under the original names -- callers (and the
 # ``connect_error_message`` type check below) are unchanged.
 is_local_url = _data_plane.is_local_url
-local_ca = _data_plane.local_ca
-_local_ca = _data_plane.local_ca
+local_fingerprint = _data_plane.local_fingerprint
+_local_fingerprint = _data_plane.local_fingerprint
 LocalTrustError = _data_plane.LocalTrustError
 
 
@@ -264,7 +264,9 @@ class TensorConnection:
         behave exactly as before (issue #12).
         """
         try:
-            client = TensorFlightClient(url, token=token, tls_ca_pem=_local_ca(url))
+            client = TensorFlightClient(
+                url, token=token, tls_fingerprint=_local_fingerprint(url)
+            )
 
             # Advisory probe: any failure falls through to list_sources(),
             # which stays the authoritative connectivity test.

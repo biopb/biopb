@@ -386,6 +386,64 @@ def test_sidecar_refuses_a_plane_presenting_a_different_certificate(
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 @pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
+    simple_zarr_array, tmp_path, monkeypatch
+):
+    """The other local consumer of #916: `biopb tensor` and biopb-mcp.
+
+    `local_fingerprint` used to anchor on state/biopb/tls/server-cert.pem, which
+    a `--tls-cert` never writes -- so a plane serving an operator's own cert was
+    unreachable from this machine, with remediation advice (`cert init`) that
+    would have produced a certificate the plane was not serving. The plane now
+    publishes what it serves, keyed by port.
+    """
+    import numpy as np
+    import zarr
+    from biopb import _data_plane, _tls_material, _tls_record
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    # An operator's own certificate: the names clients dial, no loopback, and
+    # nothing of it in the state tree.
+    cert_pem, key_pem = _self_signed_cert(
+        dns_names=("gpu-051.hpc.example",), ip_addresses=()
+    )
+
+    server = TensorFlightServer(
+        "grpc://127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        url = f"grpcs://127.0.0.1:{server.port}"
+        # Without the record there is nothing on this disk that identifies the
+        # plane, and that is an error rather than a silent fall back to TOFU.
+        with pytest.raises(_data_plane.LocalTrustError):
+            _data_plane.local_fingerprint(url)
+
+        _tls_record.publish(
+            server.port, _tls_material.fingerprint(_tls_material.leaf_pem(cert_pem))
+        )
+        client = TensorFlightClient(
+            url, tls_fingerprint=_data_plane.local_fingerprint(url)
+        )
+        np.testing.assert_array_equal(client.get_tensor("img").compute(), arr[:])
+        client.close()
+
+        from biopb._locations import tls_known_hosts
+
+        assert not tls_known_hosts().exists(), "verified, not pinned"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
 def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
     """A grpc:// sidecar against a TLS plane must fail, not silently degrade."""
     import zarr

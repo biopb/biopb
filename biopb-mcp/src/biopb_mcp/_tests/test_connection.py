@@ -1195,7 +1195,17 @@ class TestConnectErrorMessage:
 # same cert and same reasoning as the tensor server's own HTTP sidecar.
 
 
-def _seed_cert(monkeypatch, tmp_path, body: bytes = b"-----BEGIN CERTIFICATE-----\n"):
+#: A throwaway leaf; only the bytes matter, the digest is over the decoded DER.
+_FAKE_CERT = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+
+
+def _digest(pem: bytes) -> str:
+    from biopb import _tls_material
+
+    return _tls_material.fingerprint(_tls_material.leaf_pem(pem))
+
+
+def _seed_cert(monkeypatch, tmp_path, body: bytes = _FAKE_CERT):
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
     from biopb._locations import tls_server_cert
 
@@ -1208,39 +1218,49 @@ def _seed_cert(monkeypatch, tmp_path, body: bytes = b"-----BEGIN CERTIFICATE----
 def test_plaintext_and_remote_planes_get_no_anchor(monkeypatch, tmp_path):
     _seed_cert(monkeypatch, tmp_path)
     # Plaintext: nothing to anchor.
-    assert _connection._local_ca("grpc://localhost:8815") is None
+    assert _connection._local_fingerprint("grpc://localhost:8815") is None
     # Remote TLS: its cert is not on this disk and cannot be -- TOFU stays.
-    assert _connection._local_ca("grpcs://data.mylab.example:8815") is None
+    assert _connection._local_fingerprint("grpcs://data.mylab.example:8815") is None
 
 
-def test_a_local_tls_plane_is_anchored_on_the_on_disk_cert(monkeypatch, tmp_path):
-    _seed_cert(monkeypatch, tmp_path, b"PEMBYTES")
+def test_a_local_tls_plane_is_identified_by_what_it_serves(monkeypatch, tmp_path):
+    _seed_cert(monkeypatch, tmp_path)
     for url in ("grpcs://localhost:8815", "grpcs://127.0.0.1:8815"):
-        assert _connection._local_ca(url) == b"PEMBYTES"
+        assert _connection._local_fingerprint(url) == _digest(_FAKE_CERT)
 
 
-def test_an_unreadable_local_cert_errors_rather_than_falling_back_to_tofu(
+def test_a_published_record_wins_over_the_minted_cert(monkeypatch, tmp_path):
+    """The plane's own word about what it serves -- the only thing that knows
+    about a --tls-cert, which never lands in the state tree (biopb/biopb#916)."""
+    from biopb import _tls_record
+
+    _seed_cert(monkeypatch, tmp_path)
+    _tls_record.publish(8815, "deadbeef")
+    assert _connection._local_fingerprint("grpcs://127.0.0.1:8815") == "deadbeef"
+
+
+def test_an_unidentifiable_local_plane_errors_rather_than_falling_back_to_tofu(
     monkeypatch, tmp_path
 ):
-    """Degrading here would trade a verified anchor for an unverified one exactly
-    where the strong option was meant to apply."""
+    """Degrading here would trade a verified identity for an unverified one
+    exactly where the strong option was meant to apply."""
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
-    with pytest.raises(RuntimeError, match="could not be read"):
-        _connection._local_ca("grpcs://localhost:8815")
+    with pytest.raises(RuntimeError, match="no record"):
+        _connection._local_fingerprint("grpcs://localhost:8815")
 
 
 def test_an_empty_local_cert_errors(monkeypatch, tmp_path):
     _seed_cert(monkeypatch, tmp_path, b"   \n")
     with pytest.raises(RuntimeError, match="empty"):
-        _connection._local_ca("grpcs://localhost:8815")
+        _connection._local_fingerprint("grpcs://localhost:8815")
 
 
 def test_connect_passes_the_anchor_to_the_client(monkeypatch, tmp_path):
-    _seed_cert(monkeypatch, tmp_path, b"PEMBYTES")
+    _seed_cert(monkeypatch, tmp_path)
     captured = {}
 
-    def _fake_client(url, token=None, tls_ca_pem=None):
-        captured.update(url=url, tls_ca_pem=tls_ca_pem)
+    def _fake_client(url, token=None, tls_fingerprint=None):
+        captured.update(url=url, tls_fingerprint=tls_fingerprint)
         client = MagicMock()
         client.health_check.return_value = {"status": "SERVING"}
         client.list_sources.return_value = {}
@@ -1248,7 +1268,7 @@ def test_connect_passes_the_anchor_to_the_client(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_connection, "TensorFlightClient", _fake_client)
     TensorConnection().connect("grpcs://127.0.0.1:8815", token=None)
-    assert captured["tls_ca_pem"] == b"PEMBYTES"
+    assert captured["tls_fingerprint"] == _digest(_FAKE_CERT)
 
 
 @pytest.mark.skipif(
@@ -1269,11 +1289,11 @@ def test_an_unreadable_cert_is_not_reported_as_an_auth_problem(monkeypatch, tmp_
 
     cert = tls_server_cert()
     cert.parent.mkdir(parents=True, exist_ok=True)
-    cert.write_bytes(b"PEM")
+    cert.write_bytes(_FAKE_CERT)
     cert.chmod(0o000)
     try:
         with pytest.raises(_connection.LocalTrustError) as exc:
-            _connection._local_ca("grpcs://127.0.0.1:8815")
+            _connection._local_fingerprint("grpcs://127.0.0.1:8815")
     finally:
         cert.chmod(0o600)
 

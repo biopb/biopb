@@ -168,7 +168,7 @@ def _connect(
             location=endpoint.url,
             cache_bytes=cache_bytes,
             token=endpoint.token,
-            tls_ca_pem=endpoint.tls_ca_pem,
+            tls_fingerprint=endpoint.tls_fingerprint,
         )
     except Exception as exc:
         stderr_console.print(f"[red]{_dial_error(exc, endpoint)}[/red]")

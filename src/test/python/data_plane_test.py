@@ -231,12 +231,13 @@ class TestResolutionOrder:
         # #615 fault 1: the scheme was hardcoded `grpc://`, so a --tls plane was
         # dialed plaintext and reported as down. Nothing records a directly
         # launched plane's scheme, so it is asked of the socket instead. (A local
-        # grpcs:// dial then needs the on-disk cert as its anchor, so seed one.)
+        # grpcs:// dial then has to identify what that plane serves, so seed the
+        # minted cert it falls back to.)
         from biopb._locations import tls_server_cert
 
         cert = tls_server_cert()
         cert.parent.mkdir(parents=True, exist_ok=True)
-        cert.write_bytes(b"PEMBYTES")
+        cert.write_bytes(TestLocalTrustAnchor.CERT)
         monkeypatch.setattr(_data_plane, "probe_scheme", lambda *_a, **_k: "grpcs")
         assert _data_plane.resolve().url.startswith("grpcs://")
 
@@ -423,40 +424,89 @@ class TestTheCredentialFollowsTheAddress:
 
 
 class TestLocalTrustAnchor:
-    """A local TLS plane is trusted from its cert on disk, never pinned."""
+    """A local TLS plane is verified against what it serves, never pinned.
 
-    def _seed_cert(self, body=b"PEMBYTES"):
+    Two sources, in order: the record the plane publishes for its port, and --
+    for a plane too old to publish one -- the certificate it would have minted.
+    A `--tls-cert` is only ever named by the first (biopb/biopb#916).
+    """
+
+    #: A throwaway leaf. Only the bytes matter: the digest is over the DER body,
+    #: which is decoded, not parsed.
+    CERT = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+
+    def _seed_cert(self, body=None):
         from biopb._locations import tls_server_cert
 
         path = tls_server_cert()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(body)
+        path.write_bytes(self.CERT if body is None else body)
         return path
+
+    @staticmethod
+    def _digest(pem):
+        from biopb import _tls_material
+
+        return _tls_material.fingerprint(_tls_material.leaf_pem(pem))
 
     def test_plaintext_and_remote_planes_get_no_anchor(self):
         self._seed_cert()
-        assert _data_plane.local_ca("grpc://localhost:8815") is None
+        assert _data_plane.local_fingerprint("grpc://localhost:8815") is None
         # A remote plane's cert is not on this disk and cannot be -- TOFU stays.
-        assert _data_plane.local_ca("grpcs://data.mylab.example:8815") is None
+        assert _data_plane.local_fingerprint("grpcs://data.mylab.example:8815") is None
 
-    def test_a_local_tls_plane_is_anchored_on_the_on_disk_cert(self):
+    def test_a_published_record_names_the_certificate_actually_served(self):
+        """The only source that knows about a --tls-cert: the plane says so."""
+        from biopb import _tls_record
+
+        self._seed_cert()  # a minted cert that is NOT what the plane serves
+        _tls_record.publish(8815, "deadbeef")
+        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:8815") == "deadbeef"
+
+    def test_the_record_is_keyed_by_port(self):
+        """Nothing guarantees one plane per state tree: the cache lock that would
+        is uid-scoped, optional, and absent for the memory backend."""
+        from biopb import _tls_record
+
+        _tls_record.publish(8815, "aaaa")
+        _tls_record.publish(9815, "bbbb")
+        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:8815") == "aaaa"
+        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:9815") == "bbbb"
+
+    def test_a_retracted_record_falls_back_rather_than_lying(self):
+        from biopb import _tls_record
+
+        self._seed_cert()
+        _tls_record.publish(8815, "deadbeef")
+        _tls_record.retract(8815)
+        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:8815") == self._digest(
+            self.CERT
+        )
+
+    def test_a_plane_that_published_nothing_falls_back_to_the_minted_cert(self):
+        """What a plane too old to publish a record serves -- and the common case."""
         self._seed_cert()
         for url in ("grpcs://localhost:8815", "grpcs://127.0.0.1:8815"):
-            assert _data_plane.local_ca(url) == b"PEMBYTES"
+            assert _data_plane.local_fingerprint(url) == self._digest(self.CERT)
 
-    def test_a_missing_cert_errors_rather_than_falling_back_to_tofu(self):
-        with pytest.raises(_data_plane.LocalTrustError, match="could not be read"):
-            _data_plane.local_ca("grpcs://127.0.0.1:8815")
+    def test_neither_source_errors_rather_than_falling_back_to_tofu(self):
+        with pytest.raises(_data_plane.LocalTrustError, match="no record"):
+            _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
 
     def test_an_empty_cert_errors(self):
         self._seed_cert(b"  \n")
         with pytest.raises(_data_plane.LocalTrustError, match="empty"):
-            _data_plane.local_ca("grpcs://127.0.0.1:8815")
+            _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
+
+    def test_unparseable_material_errors(self):
+        self._seed_cert(b"not a certificate")
+        with pytest.raises(_data_plane.LocalTrustError, match="readable as PEM"):
+            _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
 
     def test_resolve_attaches_the_anchor(self, control):
         self._seed_cert()
         control({"data_plane": {"grpc_url": "grpcs://127.0.0.1:8815"}})
-        assert _data_plane.resolve().tls_ca_pem == b"PEMBYTES"
+        assert _data_plane.resolve().tls_fingerprint == self._digest(self.CERT)
 
     @pytest.mark.skipif(
         os.name != "posix" or os.geteuid() == 0,
@@ -467,7 +517,7 @@ class TestLocalTrustAnchor:
         cert.chmod(0o000)
         try:
             with pytest.raises(_data_plane.LocalTrustError) as exc:
-                _data_plane.local_ca("grpcs://127.0.0.1:8815")
+                _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
         finally:
             cert.chmod(0o600)
         assert str(cert) in str(exc.value)
