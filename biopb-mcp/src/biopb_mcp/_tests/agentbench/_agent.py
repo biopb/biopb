@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from ... import _endpoint
 from ._bridge import parse_arguments
 from ._models import ModelChoice, agent_choice, echoed_fields
 
@@ -264,6 +265,10 @@ class ToolCallingAgent:
     #: the agent's performance, which is why it scores `agent-truncated` and is
     #: worth spending headroom to avoid.
     max_tokens: int = 32768
+    #: This agent's conversation, for a gateway that attributes per
+    #: conversation. One backend drives one case from its first turn to its
+    #: last, so the instance is the conversation -- see `_models.ModelChoice`.
+    session: str = field(default_factory=_endpoint.new_session_id)
 
     def __post_init__(self) -> None:
         self.choice = self.choice or agent_choice()
@@ -285,6 +290,8 @@ class ToolCallingAgent:
         kwargs = {"api_key": self.choice.key}
         if self.choice.base_url:
             kwargs["base_url"] = self.choice.base_url
+        if headers := self.choice.headers(self.session):
+            kwargs["default_headers"] = headers
         return OpenAI(**kwargs)
 
     def respond(self, messages: list[dict], tools: list[dict]) -> AgentTurn:

@@ -25,6 +25,8 @@ import logging
 import httpx
 from biopb._credentials import read_credential
 
+from .. import _endpoint
+from . import _chat
 from ._chat import VisionUnsupported
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,30 @@ class ChatNotConfigured(RuntimeError):
     side — "this is not set up yet" — and the message says which part is missing
     so the answer is actionable rather than a shrug.
     """
+
+
+def _headers(config, key):
+    """What goes on the wire besides the payload.
+
+    The key, plus whatever the endpoint requires of its own (:mod:`_endpoint`).
+    Built per call rather than once, for the same reason the key is read per
+    call: the conversation this belongs to can change under a long-lived model
+    callable, and a stale session id is worse than none -- it attributes this
+    thread's traffic to the one before it.
+    """
+    from .._config import get_setting
+
+    # The key last: `extra_headers` refuses to carry a credential header at
+    # all, and this is the second half of that -- configuration cannot displace
+    # the key even if the refusal above it is ever relaxed.
+    return {
+        **_endpoint.extra_headers(
+            get_setting(config, "chat.base_url"),
+            get_setting(config, "chat.extra_headers"),
+            session=_chat.session_id(),
+        ),
+        "Authorization": f"Bearer {key}",
+    }
 
 
 def _carries_image(messages):
@@ -128,7 +154,7 @@ async def list_models(config):
     url = get_setting(config, "chat.base_url").rstrip("/") + "/models"
     try:
         async with httpx.AsyncClient(timeout=_LIST_TIMEOUT) as client:
-            reply = await client.get(url, headers={"Authorization": f"Bearer {key}"})
+            reply = await client.get(url, headers=_headers(config, key))
         if reply.status_code >= 400:
             logger.debug("%s answered %s for the model list", url, reply.status_code)
             return []
@@ -169,9 +195,7 @@ def make_model(config):
         url = get_setting(config, "chat.base_url").rstrip("/") + "/chat/completions"
         timeout = get_setting(config, "chat.request_timeout")
         async with httpx.AsyncClient(timeout=timeout) as client:
-            reply = await client.post(
-                url, json=payload, headers={"Authorization": f"Bearer {key}"}
-            )
+            reply = await client.post(url, json=payload, headers=_headers(config, key))
         if reply.status_code >= 400:
             # The provider's own words, truncated: a 400 here is usually a
             # payload the model rejected (a schema it dislikes, a context
