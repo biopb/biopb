@@ -278,11 +278,22 @@ DER_B = _tls._anchor_der(CERT_B)
 SANS = (("DNS", "wrong.example"), ("DNS", "alt.example"), ("IP Address", "10.0.0.5"))
 
 
-def _hostname_mismatch() -> Exception:
-    """The error OpenSSL raises when the dialed name isn't in the cert."""
-    return ssl.SSLCertVerificationError(
-        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname "
-        "mismatch, certificate is not valid for 'lab-gpu.local'. (_ssl.c:1006)"
+def _hostname_mismatch() -> ssl.SSLCertVerificationError:
+    """The error OpenSSL raises when the dialed *name* isn't in the cert."""
+    return _verify_error(
+        "Hostname mismatch, certificate is not valid for 'lab-gpu.local'.", code=62
+    )
+
+
+def _ip_mismatch() -> ssl.SSLCertVerificationError:
+    """The same verdict for a dialed *address* -- a different code and wording.
+
+    Which of the two you get depends only on what was dialed, and the sidecar
+    always dials an address, so anything that recognizes one must recognize both
+    (biopb/biopb#916).
+    """
+    return _verify_error(
+        "IP address mismatch, certificate is not valid for '127.0.0.1'.", code=64
     )
 
 
@@ -359,6 +370,24 @@ def test_override_is_derived_when_the_dialed_name_is_absent(monkeypatch):
         lenient=({"subjectAltName": SANS}, DER_A),
     )
     assert _REAL_OVERRIDE("lab-gpu.local", 8815, CERT_A, tofu=True) == "wrong.example"
+    assert calls == [True, False]
+
+
+def test_an_address_mismatch_is_a_name_mismatch_too(monkeypatch):
+    """The co-located sidecar's exact shape: dial 127.0.0.1, cert names a host.
+
+    Read as a verify code rather than as message text -- OpenSSL words this one
+    "IP address mismatch", so a check for "hostname mismatch" declined to help
+    the one caller that always dials an address (biopb/biopb#916).
+    """
+    calls = _stub_probe(
+        monkeypatch,
+        strict=_ip_mismatch(),
+        lenient=({"subjectAltName": (("DNS", "gpu-051.hpc.example"),)}, DER_A),
+    )
+    assert (
+        _REAL_OVERRIDE("127.0.0.1", 8815, CERT_A, tofu=False) == "gpu-051.hpc.example"
+    )
     assert calls == [True, False]
 
 
