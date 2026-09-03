@@ -62,7 +62,10 @@ logger = logging.getLogger(__name__)
 _ACP_AGENTS = {
     "opencode": {
         "name": "opencode",
-        "argv": ("acp",),
+        # opencode ACP also starts its headless HTTP server. Keep that incidental
+        # listener loopback-only and let the OS choose a collision-free port; ACP
+        # itself uses the stdio pipe below and does not need this port.
+        "argv": ("acp", "--hostname", "127.0.0.1", "--port", "0"),
         # Its own installer puts it here, which is not always on a GUI-launched
         # process's PATH -- the same reason _agents resolves biopb-mcp absolutely.
         "extra_paths": ("~/.opencode/bin/opencode",),
@@ -890,52 +893,71 @@ async def ensure_agent(config):
         # happened to be launched from -- which is frequently the user's home.
         _cwd = tempfile.mkdtemp(prefix="biopb-mcp-acp-")
 
-    child, name = _spawn(config)
-    transport = _PipeTransport(child.proc, asyncio.get_running_loop())
-    client = _PaneClient(get_setting(config, "chat.acp_permission"))
-    conn = acp.connect_to_agent(client, transport)
-
-    init = await asyncio.wait_for(
-        conn.initialize(
-            protocol_version=acp.PROTOCOL_VERSION,
-            client_capabilities=ClientCapabilities(
-                fs=FileSystemCapabilities(readTextFile=False, writeTextFile=False),
-                terminal=False,
-            ),
-            client_info=Implementation(name="biopb-chat", version="1"),
-        ),
-        _START_TIMEOUT,
-    )
-
-    mcp_url = _own_mcp_url()
-    servers = []
-    if mcp_url:
-        # headers is required, not optional: both this library and opencode
-        # reject the entry without it, whatever the spec's example suggests.
-        servers.append(
-            HttpMcpServer(type="http", name="biopb", url=mcp_url, headers=[])
-        )
-    else:
-        logger.warning(
-            "no /mcp url for this session; the ACP agent will start without "
-            "biopb's tools"
-        )
-
+    child = conn = None
+    globals_owned = False
     try:
-        session = await conn.new_session(cwd=_cwd, mcp_servers=servers)
-    except Exception as exc:  # noqa: BLE001 - auth is a normal first-run answer
-        method_id = _auth_method(init)
-        if method_id is None:
-            raise
-        logger.info("ACP agent wants authentication (%s); retrying", method_id)
-        await conn.authenticate(method_id=method_id)
-        session = await conn.new_session(cwd=_cwd, mcp_servers=servers)
-        del exc
+        child, name = _spawn(config)
+        transport = _PipeTransport(child.proc, asyncio.get_running_loop())
+        client = _PaneClient(get_setting(config, "chat.acp_permission"))
+        conn = acp.connect_to_agent(client, transport)
 
-    _child, _conn, _agent_name = child, conn, name
-    _session_id = session.session_id
-    await _apply_model(session, get_setting(config, "chat.acp_model"))
-    logger.info("ACP agent %s ready (session %s)", name, _session_id)
+        init = await asyncio.wait_for(
+            conn.initialize(
+                protocol_version=acp.PROTOCOL_VERSION,
+                client_capabilities=ClientCapabilities(
+                    fs=FileSystemCapabilities(readTextFile=False, writeTextFile=False),
+                    terminal=False,
+                ),
+                client_info=Implementation(name="biopb-chat", version="1"),
+            ),
+            _START_TIMEOUT,
+        )
+
+        mcp_url = _own_mcp_url()
+        servers = []
+        if mcp_url:
+            # headers is required, not optional: both this library and opencode
+            # reject the entry without it, whatever the spec's example suggests.
+            servers.append(
+                HttpMcpServer(type="http", name="biopb", url=mcp_url, headers=[])
+            )
+        else:
+            logger.warning(
+                "no /mcp url for this session; the ACP agent will start without "
+                "biopb's tools"
+            )
+
+        try:
+            session = await conn.new_session(cwd=_cwd, mcp_servers=servers)
+        except Exception as exc:  # noqa: BLE001 - auth is a normal first-run answer
+            method_id = _auth_method(init)
+            if method_id is None:
+                raise
+            logger.info("ACP agent wants authentication (%s); retrying", method_id)
+            await conn.authenticate(method_id=method_id)
+            session = await conn.new_session(cwd=_cwd, mcp_servers=servers)
+            del exc
+
+        # _apply_model uses set_model(), which reads the module globals. Publish
+        # provisional ownership before it runs, but retain rollback responsibility
+        # until model setup has also completed.
+        _child, _conn, _agent_name = child, conn, name
+        _session_id = session.session_id
+        globals_owned = True
+        await _apply_model(session, get_setting(config, "chat.acp_model"))
+        child = conn = None  # ownership is now fully transferred
+        logger.info("ACP agent %s ready (session %s)", name, _session_id)
+    except BaseException:
+        if globals_owned:
+            await shutdown()
+        else:
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:  # noqa: BLE001 - preserve the startup error
+                    logger.debug("closing the ACP connection failed", exc_info=True)
+            _stop_child(child)
+        raise
 
 
 async def _apply_model(session, wanted):

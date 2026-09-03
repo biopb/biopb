@@ -37,6 +37,22 @@ from the registry record the session published for itself
 without it. Sending `{"type": "http", "name", "url"}` fails validation with a
 union error that names all three transports and explains none of them.
 
+### opencode's incidental HTTP listener
+
+`opencode acp` also starts opencode's headless HTTP server, even though biopb
+uses ACP over stdio. The ACP launcher passes `--hostname 127.0.0.1 --port 0`
+explicitly: the listener stays loopback-only and receives an OS-assigned
+ephemeral port, avoiding collisions with a user's opencode server or another
+ACP session. Biopb neither discovers nor advertises that port, and users should
+not use it as an attach endpoint; ACP stdio is the supported interface here.
+
+The listener is an opencode implementation detail and is unauthenticated, so
+this does not protect against a malicious process already running as the same
+user and scanning loopback ports. Eliminating that exposure requires an
+opencode mode that disables the HTTP server or provides authenticated/socket-only
+transport; randomizing the port only removes the well-known-port collision and
+accidental discovery risk.
+
 ### Why http and not a stdio bridge
 
 The alternative is a stdio `mcpServers` entry pointing at a bridge process
