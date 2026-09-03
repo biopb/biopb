@@ -25,8 +25,11 @@ def _crypto_available() -> bool:
     return importlib.util.find_spec("cryptography") is not None
 
 
-def _self_signed_cert() -> tuple[bytes, bytes]:
-    """A throwaway self-signed cert (PEM) + key (PEM), SANs localhost/127.0.0.1."""
+def _self_signed_cert(valid_days: int = 3650) -> tuple[bytes, bytes]:
+    """A throwaway self-signed cert (PEM) + key (PEM), SANs localhost/127.0.0.1.
+
+    A negative *valid_days* backdates notAfter, minting an already-expired cert.
+    """
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -35,14 +38,17 @@ def _self_signed_cert() -> tuple[bytes, bytes]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     now = datetime.datetime.now(datetime.timezone.utc)
+    not_after = now + datetime.timedelta(days=valid_days)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=3650))
+        # Backdated a day against clock skew -- and further still when the span
+        # itself is in the past, so an expired cert is orderly rather than absurd.
+        .not_valid_before(min(now, not_after) - datetime.timedelta(days=1))
+        .not_valid_after(not_after)
         .add_extension(
             x509.SubjectAlternativeName(
                 [
@@ -186,6 +192,36 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
 
         assert f"localhost:{server.port}" in tls_known_hosts().read_text()
         client.close()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_expired_cert_fails_with_its_actual_reason(tmp_path, monkeypatch):
+    """An expired cert is refused, and the client says so (biopb/biopb#913).
+
+    The pin is the trust anchor, not an exemption from validity: gRPC checks
+    notAfter on the anchor even when the anchor is the presented leaf. Left to the
+    transport this surfaces as `FlightUnavailableError: failed to connect to all
+    addresses`, with `certificate has expired` only in gRPC's stderr log -- an
+    outage on a date nobody was watching, presenting as a network fault.
+    """
+    from biopb.tensor import TensorFlightClient
+    from biopb.tensor._tls import TlsCertExpiredError
+    from biopb_tensor_server import TensorFlightServer
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+
+    cert_pem, key_pem = _self_signed_cert(valid_days=-30)
+    server = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    server.mark_ready()
+    _serve(server)
+    try:
+        with pytest.raises(TlsCertExpiredError) as excinfo:
+            TensorFlightClient(f"grpcs://localhost:{server.port}")
+        assert "cert init --force" in str(excinfo.value)
     finally:
         server.shutdown()
 

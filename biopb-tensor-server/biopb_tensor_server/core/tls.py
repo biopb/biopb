@@ -38,18 +38,30 @@ import ssl
 import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from biopb._locations import tls_server_cert, tls_server_key
 
 logger = logging.getLogger(__name__)
 
 # ~27 months, the total span (the cert is backdated one day against clock skew
-# and the span measured from there). At or under the 825-day ceiling browsers
-# enforce for publicly-trusted leaves; irrelevant to a TOFU pin (which ignores
-# validity) but a sane default for anyone who does import the cert into a trust
-# store.
+# and the span measured from there). Long because rotating this cert invalidates
+# every client's TOFU pin, and 825 specifically because it was the CA/Browser
+# Forum's leaf ceiling when this was chosen -- a conservative bound, not a
+# requirement anything here enforces.
+#
+# **A pin does not exempt the cert from validity checking.** gRPC validates
+# notAfter on the trust anchor even when the anchor *is* the presented leaf, so
+# this span ends in a total data-plane outage for every pinned client, reported
+# to them as a generic "failed to connect to all addresses"
+# (biopb/biopb#913). :func:`cert_expiry_warning` is what gives an operator
+# notice before that day; the client raises
+# :class:`biopb.tensor._tls.TlsCertExpiredError` on the day itself.
 _DEFAULT_VALIDITY_DAYS = 825
+
+# How long before notAfter the server starts saying so. A month is enough notice
+# to re-mint and re-pin every client without being so early it becomes noise.
+_EXPIRY_WARN_DAYS = 30
 
 # Ceiling on each name-resolution probe below. Generous for a working
 # resolver, and short enough that a broken one costs a startup blip rather
@@ -288,6 +300,48 @@ def format_fingerprint(fingerprint: str) -> str:
     return ":".join(
         fingerprint[i : i + 2].upper() for i in range(0, len(fingerprint), 2)
     )
+
+
+def cert_expiry_warning(cert_pem: bytes) -> Optional[str]:
+    """Message naming *cert_pem*'s expiry when it is past or near, else ``None``.
+
+    A self-signed cert a client pinned is still rejected once it is past its
+    notAfter -- pinning supplies the trust anchor, it does not turn validity
+    checking off (biopb/biopb#913) -- and nothing else watches the date, so
+    ``serve --tls`` / ``cert init`` say it here.
+
+    Returns a message rather than logging one so the CLI can render it in its own
+    style. ``cryptography`` is optional on this path: reading an existing cert
+    otherwise needs none (the BYO ``--tls-cert`` route deliberately runs without
+    the extra), so an absent or unparseable cert is simply "nothing to say".
+    """
+    try:
+        from cryptography import x509
+
+        cert = x509.load_pem_x509_certificate(cert_pem)
+        not_after = getattr(cert, "not_valid_after_utc", None)
+        if not_after is None:
+            not_after = cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+    except Exception:  # noqa: BLE001 - advisory only; never break the TLS path
+        return None
+
+    remaining = not_after - datetime.datetime.now(datetime.timezone.utc)
+    stamp = not_after.strftime("%Y-%m-%d")
+    if remaining.total_seconds() <= 0:
+        return (
+            f"This TLS certificate expired on {stamp}. Clients will fail the "
+            f"handshake with a generic connection error -- a pinned certificate "
+            f"is still checked against its expiry. Re-mint it with `cert init "
+            f"--force`; every client must then clear its pin for this endpoint."
+        )
+    if remaining.days <= _EXPIRY_WARN_DAYS:
+        return (
+            f"This TLS certificate expires on {stamp} ({remaining.days} days). "
+            f"Once it does, clients fail the handshake with a generic connection "
+            f"error. Re-mint it with `cert init --force` before then; every "
+            f"client must clear its pin for this endpoint afterwards."
+        )
+    return None
 
 
 def _write_cert_files(cert_path: Path, key_path: Path, cert_pem: bytes, key_pem: bytes):

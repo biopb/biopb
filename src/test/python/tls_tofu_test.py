@@ -286,6 +286,24 @@ def _hostname_mismatch() -> Exception:
     )
 
 
+def _verify_error(message: str, *, code: int) -> ssl.SSLCertVerificationError:
+    """An OpenSSL verification failure carrying *code* on ``verify_code``.
+
+    Constructed rather than provoked: this suite mints no certs (see the module
+    docstring), and ``verify_code`` is what the code under test reads.
+    """
+    err = ssl.SSLCertVerificationError(
+        f"[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: {message}"
+    )
+    err.verify_code = code
+    return err
+
+
+def _expired() -> ssl.SSLCertVerificationError:
+    """The error OpenSSL raises when the anchor is past its notAfter."""
+    return _verify_error("certificate has expired", code=10)
+
+
 def _stub_probe(monkeypatch, *, strict, lenient):
     """Stub the two probes: *strict* is the check_hostname=True verdict.
 
@@ -379,10 +397,11 @@ def test_no_usable_san_still_warns_with_the_mode_s_own_fix(monkeypatch, caplog):
 
 def test_probe_failures_never_produce_an_override(monkeypatch):
     """A diagnostic must not turn a working connection into a broken one."""
-    # An expired cert (not a hostname mismatch) -> not our business.
+    # A verification failure that is neither a name mismatch nor an expiry
+    # -> not our business.
     _stub_probe(
         monkeypatch,
-        strict=ssl.SSLCertVerificationError("certificate has expired"),
+        strict=_verify_error("unable to get local issuer certificate", code=20),
         lenient=({"subjectAltName": SANS}, DER_A),
     )
     assert _REAL_OVERRIDE("lab-gpu.local", 8815, CERT_A, tofu=True) is None
@@ -398,6 +417,32 @@ def test_probe_failures_never_produce_an_override(monkeypatch):
         monkeypatch, strict=_hostname_mismatch(), lenient=OSError("connection reset")
     )
     assert _REAL_OVERRIDE("lab-gpu.local", 8815, CERT_A, tofu=True) is None
+
+
+def test_an_expired_certificate_is_raised_not_swallowed(monkeypatch):
+    """Expiry is fatal and gRPC will not say why, so say it here (biopb/biopb#913).
+
+    A pin is the trust anchor, not an exemption from validity: the handshake is
+    refused, and the transport reports only "failed to connect to all addresses".
+    The remediation names both halves -- re-mint, then drop the stale anchor --
+    and which half is the client's depends on the mode.
+    """
+    for tofu, expected in ((True, "entry from"), (False, "configured TLS fingerprint")):
+        calls = _stub_probe(monkeypatch, strict=_expired(), lenient=({}, DER_A))
+        with pytest.raises(_tls.TlsCertExpiredError) as excinfo:
+            _REAL_OVERRIDE("lab-gpu.local", 8815, CERT_A, tofu=tofu)
+        assert "cert init --force" in str(excinfo.value)
+        assert expected in str(excinfo.value)
+        assert calls == [True]  # no point re-handshaking; the cert is done
+
+
+def test_expiry_reaches_the_caller_of_resolve(monkeypatch):
+    """The whole point: the reason surfaces at resolution, not in absl's stderr."""
+    monkeypatch.setattr(_tls, "_resolve_hostname_override", _REAL_OVERRIDE)
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda h, p: CERT_A)
+    _stub_probe(monkeypatch, strict=_expired(), lenient=({}, DER_A))
+    with pytest.raises(_tls.TlsCertExpiredError):
+        _tls.resolve_tls_trust("grpc+tls://lab-gpu.local:8815")
 
 
 def test_anchor_der_rejects_a_bundle():

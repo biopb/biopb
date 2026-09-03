@@ -17,6 +17,13 @@ The security boundary is the same as SSH: the *first* handshake is trusted
 implicitly, so TOFU protects against an attacker who arrives *after* pinning, not
 one already in the path at first connect — an accepted trade on a trusted LAN.
 
+Pinning supplies the anchor; it does **not** exempt the certificate from validity
+checking. gRPC verifies notAfter on the anchor even when the anchor is the
+presented leaf, so an expired pinned cert fails every handshake — reported by the
+transport as a bare "failed to connect to all addresses", with the reason only in
+gRPC's own stderr log. :class:`TlsCertExpiredError` is raised here instead, on
+the resolution path that already has the answer (biopb/biopb#913).
+
 Resolution yields a :class:`TlsTrust` — plain data (PEM bytes, an optional
 hostname override, and a key id). That is what the connection pool passes to
 every worker's ``FlightClient``, so a worker executing a chunk-fetch task
@@ -75,6 +82,11 @@ _TLS_SCHEME = "grpc+tls"
 # Bound the first-connect cert fetch so an unreachable host fails fast rather
 # than hanging client construction.
 _FETCH_TIMEOUT_S = 10.0
+
+# ``X509_V_ERR_CERT_HAS_EXPIRED`` — OpenSSL's verify code for a certificate past
+# its notAfter, read off ``SSLCertVerificationError.verify_code``. The code rather
+# than the message text: the wording is OpenSSL's to change, the number is ABI.
+_VERIFY_CODE_EXPIRED = 10
 
 # Per-process memo. Resolution is called on paths that can hit a pooled,
 # already-open connection (``_get_thread_client``'s fast path) and is evaluated
@@ -165,6 +177,15 @@ class TlsPinMismatchError(Exception):
     cert rotation; a malicious one is a man-in-the-middle. Either way the client
     refuses to connect until the operator confirms, and the message names what to
     update -- the pin store entry, or the configured fingerprint.
+    """
+
+
+class TlsCertExpiredError(Exception):
+    """The server's certificate is past its notAfter, so no handshake can succeed.
+
+    A separate failure from :class:`TlsPinMismatchError`: the cert is the expected
+    one, it has simply run out. Raised because the transport would otherwise
+    report it as an unexplained connection failure — see the module docstring.
     """
 
 
@@ -268,6 +289,33 @@ def _pick_override(san_entries: Sequence[Tuple[str, str]]) -> Optional[str]:
     return ips[0] if ips else None
 
 
+def _raise_if_expired(host: str, port: int, exc: Exception, *, tofu: bool) -> None:
+    """Re-raise an OpenSSL "certificate has expired" verdict as an actionable error.
+
+    The probe below is the one place a client learns *why* the handshake will
+    fail: gRPC's own attempt reports only "failed to connect to all addresses"
+    and leaves ``certificate has expired`` in its stderr log. Expiry is not
+    recoverable here the way a name mismatch is — there is no substitution that
+    makes an expired cert verify — so this raises rather than warns.
+
+    The remediation is two-sided, and both sides are required: the server re-mints
+    and the client drops the anchor it recorded for the old one.
+    """
+    if getattr(exc, "verify_code", None) != _VERIFY_CODE_EXPIRED:
+        return
+    remediation = (
+        f"then clear the '{host}:{port}' entry from {tls_known_hosts()}"
+        if tofu
+        else "then update the configured TLS fingerprint to the new certificate"
+    )
+    raise TlsCertExpiredError(
+        f"The TLS certificate for {host}:{port} has expired. Pinning it does not "
+        f"exempt it from expiry -- the handshake is refused, and the transport "
+        f"reports only a generic connection failure. Re-mint the server's "
+        f"certificate (`biopb-tensor-server cert init --force`) and {remediation}."
+    ) from exc
+
+
 def _resolve_hostname_override(
     host: str, port: int, pem: bytes, *, tofu: bool
 ) -> Optional[str]:
@@ -302,14 +350,20 @@ def _resolve_hostname_override(
     deployment should configure an explicit anchor (``tls_ca_pem``), which never
     reaches here.
 
-    Diagnostic-only failure mode: any error other than a definite hostname
-    mismatch leaves this silent and overrideless, so it can never turn a working
-    connection into a broken one.
+    Diagnostic-only failure mode, with one exception: any error other than a
+    definite hostname mismatch leaves this silent and overrideless, so it can
+    never turn a working connection into a broken one. The exception is an
+    expired certificate (:func:`_raise_if_expired`), which is raised — that
+    connection is already broken, and this is the only place the reason is
+    legible.
     """
     try:
         _probe_peer(host, port, pem, check_hostname=True)
         return None  # the dialed name is covered -- OpenSSL says so; nothing to do
     except ssl.SSLCertVerificationError as e:
+        # Expiry first: it is fatal and unfixable from here, unlike a name
+        # mismatch (biopb/biopb#913).
+        _raise_if_expired(host, port, e, tofu=tofu)
         # verify_message is the OpenSSL reason; code 62 is hostname mismatch. Let
         # OpenSSL make this call rather than comparing the SANs ourselves: it is
         # what already implements wildcards, IP SANs, case and trailing dots, and
@@ -457,7 +511,11 @@ def resolve_tls_trust(
     connection would otherwise have failed.
 
     Raises :class:`TlsPinMismatchError` when the server presents a cert that
-    contradicts the pin or the configured fingerprint.
+    contradicts the pin or the configured fingerprint, and
+    :class:`TlsCertExpiredError` when the anchor it resolved has expired — which
+    a pin does not excuse, so the handshake would fail anyway with a far less
+    legible error. A configured *ca_pem* stays offline and is therefore not
+    checked for either.
 
     ``root_certs`` is handed to ``pyarrow.flight.FlightClient(...,
     tls_root_certs=...)`` — with a leaf anchor, verification succeeds iff the
