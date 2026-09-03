@@ -318,7 +318,10 @@ def cert_expiry_warning(cert_pem: bytes) -> Optional[str]:
     try:
         from cryptography import x509
 
-        not_after = x509.load_pem_x509_certificate(cert_pem).not_valid_after_utc
+        cert = x509.load_pem_x509_certificate(cert_pem)
+        not_after = getattr(cert, "not_valid_after_utc", None)
+        if not_after is None:
+            not_after = cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
     except Exception:  # noqa: BLE001 - advisory only; never break the TLS path
         return None
 
