@@ -475,16 +475,15 @@ async def _run_code(arguments, on_progress):
 
     # The claim protocol is `_server._submit_job`'s, not a copy of it: presume
     # the claim, submit, believe whatever the kernel answers. `_local_identity`
-    # is set for this whole dispatch, so `_client_identity()` inside it already
-    # resolves to this loop's writer. Off the loop, like every other kernel
-    # round trip here.
+    # and `_local_origin` are both set for this whole dispatch, so the writer
+    # and the origin `_submit_job` records are already this loop's. Off the
+    # loop, like every other kernel round trip here.
     job_id, message, drop_note, _w = await asyncio.to_thread(
         _server._submit_job,
         host,
         code,
         digest,
         _busy_message,
-        origin=ORIGIN,
         intent=intent,
     )
     if drop_note:

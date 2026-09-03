@@ -128,7 +128,7 @@ def _snapshot(run):
         "error_text": run["error"] or "",
         "result_text": "",
         "verify": run["record"],
-        "origin": "mcp",
+        "origin": run["origin"],
         "intent": run["intent"],
         "title": run["title"],
         "cell_count": len(run["cells"]),
@@ -223,7 +223,7 @@ def runs_view():
             {
                 "job_id": _run["job_id"],
                 "status": _run["status"],
-                "origin": "mcp",
+                "origin": _run["origin"],
                 "elapsed": _elapsed(_run),
                 "code_preview": f"{cells} cell" + ("s" if cells != 1 else ""),
                 "intent_preview": _run["title"],
@@ -272,7 +272,9 @@ def verified_summary():
     }
 
 
-def start(blocks, title, session_host, intent="", writer=None, writer_label=""):
+def start(
+    blocks, title, session_host, intent="", writer=None, writer_label="", origin="mcp"
+):
     """Take the slot and begin verifying a document in a fresh scratch kernel.
 
     *blocks* is the parsed document (:mod:`_workflow_doc`); its code blocks are
@@ -283,7 +285,9 @@ def start(blocks, title, session_host, intent="", writer=None, writer_label=""):
     Returns ``{"job_id": ...}``, or ``{"error": "busy", ...}`` naming what holds
     the slot, or ``{"error": <reason>}`` when no scratch kernel can be built.
 
-    *writer* is the client this run belongs to. It is passed straight through to
+    *writer* is the client this run belongs to, and *origin* is its point of
+    view (``"chat"`` when the in-process loop asked for the verification). Both
+    are passed straight through to
     the scratch kernel's ``_jobs.submit``, which claims that kernel for it -- so
     the one-agent rule on a verification is the *same* rule, enforced by the same
     code, as on any other job. A second client is then refused an interrupt
@@ -317,7 +321,7 @@ def start(blocks, title, session_host, intent="", writer=None, writer_label=""):
             return {
                 "error": "busy",
                 "running_job_id": _run["job_id"],
-                "running_job_origin": "mcp",
+                "running_job_origin": _run["origin"],
             }
         # Ask the session kernel before claiming, so a verification does not
         # start on top of the user's or the agent's running cell.
@@ -344,6 +348,7 @@ def start(blocks, title, session_host, intent="", writer=None, writer_label=""):
             "host": None,
             "writer": writer,
             "writer_label": writer_label,
+            "origin": origin,
             "discarded": False,
             "saved_path": None,
             "draft_path": None,
@@ -498,6 +503,7 @@ def _execute(run):
             "submit",
             "",
             intent=run["intent"] or "verify workflow",
+            origin=run["origin"],
             writer=run["writer"],
             writer_label=run["writer_label"],
             verify_cells=run["cells"],
@@ -561,7 +567,7 @@ def _discard_host(host):
         logger.exception("Failed to shut down the scratch kernel")
 
 
-def interrupt(reason=None, requester="user", writer=None):
+def interrupt(reason=None, origin="user", writer=None):
     """Stop the running verification's cells, leaving its kernel up.
 
     Returns ``None`` when there is no verification to stop -- which the caller
@@ -581,7 +587,7 @@ def interrupt(reason=None, requester="user", writer=None):
     **Who may stop it is the scratch kernel's own answer**, because ``start``
     claimed that kernel for the client that asked for the verification: a second
     client gets ``not_owner`` from the same check that guards any other job, and
-    ``requester="user"`` is exempt there as it is here, so the person at the
+    ``origin="user"`` is exempt there as it is here, so the person at the
     machine can still stop a verification they did not start.
 
     The one window that check cannot cover is the five to eight seconds before
@@ -594,7 +600,7 @@ def interrupt(reason=None, requester="user", writer=None):
         run, host = _run, _run["host"]
         if (
             host is None  # no kernel to answer for itself yet
-            and requester == "mcp"
+            and origin != "user"
             and writer is not None
             and run["writer"] not in (None, writer)
         ):
@@ -605,7 +611,7 @@ def interrupt(reason=None, requester="user", writer=None):
         discard(reason=reason)
         return {"interrupted": True, "job_id": run["job_id"]}
     data, _res, _w = _kernel_rpc._run_job_call(
-        host, "interrupt_current", reason, requester=requester, writer=writer
+        host, "interrupt_current", reason, origin=origin, writer=writer
     )
     if data and data.get("refused"):
         return data

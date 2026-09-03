@@ -111,6 +111,15 @@ _lock = threading.RLock()
 _owner = None
 _owner_label = ""
 
+# That agent's own job origin ("mcp", or "chat" for the in-process loop),
+# recorded by its first submit. "Foreign" is a relation, not a property, so
+# every reader of it needs a point of view -- and the two internal readers
+# (:func:`_prune`, :func:`ack_foreign_digest`) have no asker to take one from:
+# they run under whoever submitted, which may be the human whose cells the agent
+# has yet to be told about. So the agent's is recorded once, where the one-agent
+# claim is made, and read from here. Until something claims, "mcp".
+_agent_origin = "mcp"
+
 # What the bootstrap binds into the kernel namespace. `_bootstrap` refuses to
 # let a user plugin shadow any of it (#92), and names it from here rather than
 # writing the list out twice. `_bootstrap` is the one that binds them, but
@@ -649,7 +658,7 @@ def _has_running_job():
     return any(j.status == "running" for j in _jobs.values())
 
 
-def _foreign(job, for_origin="mcp"):
+def _foreign(job, for_origin):
     """Whether *job* was written by someone other than *for_origin*'s client.
 
     The rules this serves — the digest and the eviction hold — are about *whose*
@@ -665,7 +674,10 @@ def _foreign(job, for_origin="mcp"):
     *for_origin* is the asking client's own origin, because "someone else's
     cell" is a relation, not a property: the chat loop submits as ``chat``, so
     reading the digest from the MCP client's fixed point of view reported the
-    loop its own cells back to it as another writer's.
+    loop its own cells back to it as another writer's. Deliberately no default:
+    one used to stand in for the point of view here, and every caller that had
+    none silently got the MCP client's (biopb/biopb#879). A caller with no asker
+    to read one from wants :data:`_agent_origin`, and should say so.
     """
     return job.origin != for_origin
 
@@ -676,10 +688,16 @@ def _prune():
     # changed under it, and evicting the record silently drops the notice. So
     # the cap can be exceeded — bounded by how many cells another writer runs
     # between two agent calls, which is small.
+    #
+    # Foreign to _agent_origin, not to the submitter this runs under: a chat
+    # session's own jobs are foreign to "mcp" and can never be acked (the digest
+    # does not offer a client its own cells), so from that fixed point of view
+    # both halves of the guard held forever and the cap bounded nothing.
     terminal = [
         jid
         for jid, j in _jobs.items()
-        if j.status != "running" and not (_foreign(j) and not j.seen_by_agent)
+        if j.status != "running"
+        and not (_foreign(j, _agent_origin) and not j.seen_by_agent)
     ]
     while len(_jobs) > _MAX_RETAINED_JOBS and terminal:
         del _jobs[terminal.pop(0)]
@@ -736,7 +754,7 @@ def submit(
     from the observe page (never gated), or the session ending. That is the same
     principle as the ``origin="user"`` exemption, applied to recovery.
     """
-    global _job_seq, _owner, _owner_label
+    global _job_seq, _owner, _owner_label, _agent_origin
     with _lock:
         if origin != "user" and writer is not None:
             if _owner is None:
@@ -749,6 +767,10 @@ def submit(
                     "owner": _owner_label,
                     "owner_id": _owner,
                 }
+        if origin != "user":
+            # After the refusal above, so a rejected submit does not move the
+            # point of view _prune reads. See _agent_origin.
+            _agent_origin = origin
         # Re-assert the thread-aware stream wrap (idempotent) so a job thread's
         # output is captured even if something replaced sys.stdout since
         # install() — and so it works under pytest's per-phase capture.
@@ -860,7 +882,7 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt_current(reason=None, requester="user", writer=None):
+def interrupt_current(reason=None, origin="user", writer=None):
     """Force-stop the running job: cooperative cancel *plus* a ``KeyboardInterrupt``
     raised directly into the job's worker thread.
 
@@ -872,20 +894,20 @@ def interrupt_current(reason=None, requester="user", writer=None):
     the next bytecode, so a blocking C call ends when it returns. ``{"interrupted":
     False, "status": "idle"}`` when the kernel is idle.
 
-    *requester* is who is asking — ``"user"`` (the observe UI, the default: a
-    person may stop anything running in their own session) or ``"mcp"``. An
-    **MCP client is refused a job it did not start** (``{"refused":
-    "foreign_job"}``): the stop would be silent, since attribution runs one way
-    only — a user stop reaches it through ``cancel_reason``, but the other
-    writer would see nothing beyond an unexplained ``interrupted`` badge. The
-    human has the observe UI and can stop their own work; a program has no
-    consent to.
+    *origin* is the asking client's own job origin, in the vocabulary the jobs
+    themselves are recorded in: ``"user"`` (the observe UI, the default: a
+    person may stop anything running in their own session), ``"mcp"`` for a
+    remote client, ``"chat"`` for the in-process loop. A **client is refused a
+    job it did not start** (``{"refused": "foreign_job"}``): the stop would be
+    silent, since attribution runs one way only — a user stop reaches it through
+    ``cancel_reason``, but the other writer would see nothing beyond an
+    unexplained ``interrupted`` badge. The human has the observe UI and can stop
+    their own work; a program has no consent to.
 
-    Note the test is against *the MCP client*, not against each writer and its
-    own work: a second writer asking as ``"mcp"`` would be refused its own cell.
-    Nothing does that today — the chat loop's cancel stops its turn and leaves
-    the cell to the human, exactly as an MCP client's does. Worth knowing before
-    adding a programmatic interrupt for a writer that is not this one.
+    "Did not start" is therefore relative to the asker, which is why this takes
+    an origin rather than a fixed "is it the MCP client?" flag: the flag refused
+    the chat loop the cell it had just run itself (biopb/biopb#880), on the one
+    kernel where the interrupt is not guaranteed.
 
     *writer* is the asking client's id, checked against the kernel's one-agent
     claim (:func:`submit`): a client that does not hold this kernel cannot stop
@@ -897,14 +919,14 @@ def interrupt_current(reason=None, requester="user", writer=None):
     job = _running_job()
     if job is None:
         return {"job_id": None, "interrupted": False, "status": "idle"}
-    if requester == "mcp" and writer is not None and _owner not in (None, writer):
+    if origin != "user" and writer is not None and _owner not in (None, writer):
         return {
             "job_id": job.job_id,
             "interrupted": False,
             "status": "running",
             "refused": "not_owner",
         }
-    if requester == "mcp" and _foreign(job):
+    if origin != "user" and _foreign(job, origin):
         return {
             "job_id": job.job_id,
             "interrupted": False,
@@ -1019,7 +1041,11 @@ def ack_foreign_digest(job_ids, writer=None):
             return 0
         acked = 0
         for job in _jobs.values():
-            if _foreign(job) and not job.seen_by_agent and job.job_id in wanted:
+            if (
+                _foreign(job, _agent_origin)
+                and not job.seen_by_agent
+                and job.job_id in wanted
+            ):
                 job.seen_by_agent = True
                 acked += 1
         return acked
@@ -1075,11 +1101,12 @@ def reset():
     :func:`install` calls this on every bootstrap, and a hard restart replaces
     the process and its module state outright.
     """
-    global _owner, _owner_label
+    global _owner, _owner_label, _agent_origin
     with _lock:
         _jobs.clear()
         _jobs_by_thread.clear()
         _owner, _owner_label = None, ""
+        _agent_origin = "mcp"
 
 
 # -- viewer wrapping --------------------------------------------------------
