@@ -109,11 +109,17 @@ malformed is skipped and debug-logged, never fatal, and one bad skill must never
 sink `list_skills`. A leading `_` marks a file private, as in the kernel-plugin
 loader.
 
-Which files in a skills directory *are* skills — the `_` marker and the prose
-docs beside them — is decided in `mcp/_skills_layout.py`, and nowhere else. Four
-readers ask (this loader, the authoring gate, its fixtures, and the CI package
-gate), the last of them runs before an env exists and loads that module by path,
-and they drifted apart the one time each kept its own copy.
+Which files in a skills directory *are* skills — the `.md` extension and the `_`
+marker — is decided in `mcp/_skills_layout.py`, and nowhere else. Four readers
+ask (this loader, the authoring gate, its fixtures, and the CI package gate), the
+last of them runs before an env exists and loads that module by path, and they
+drifted apart the one time each kept its own copy.
+
+The extension is matched case-insensitively: a user's `Recipe.MD` is a skill.
+The prose-doc names (`README`, `ROADMAP`) are a *second* rule, `is_catalog_file`,
+because they are a property of `_skills_data/` — where such docs may sit beside
+the skills — and not of the user's own directory, which holds nothing else. So a
+local `readme.md` is that user's skill (#725).
 
 ```python
 "services": {

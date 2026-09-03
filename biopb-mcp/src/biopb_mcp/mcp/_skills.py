@@ -40,7 +40,7 @@ from datetime import date
 from importlib import resources
 from pathlib import Path
 
-from ._skills_layout import is_skill_file
+from ._skills_layout import is_catalog_file, is_skill_file
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +233,7 @@ def _scan_shipped() -> list[dict]:
     """Every readable packaged ``*.md``. Fail-open per file."""
     directory = _data_dir()
     try:
-        names = sorted(p.name for p in directory.iterdir() if is_skill_file(p.name))
+        names = sorted(p.name for p in directory.iterdir() if is_catalog_file(p.name))
     except (FileNotFoundError, NotADirectoryError, OSError):
         _warn_empty_once(f"{directory} is missing or unreadable")
         return []
@@ -295,9 +295,7 @@ def local_dir_status() -> str:
             # first local skill has to mkdir it -- say so rather than let a
             # write_text fail on a path the report just showed as the right one.
             return line + " (does not exist yet — mkdir it to write the first skill)"
-        n = sum(
-            1 for p in directory.glob("*.md") if p.is_file() and is_skill_file(p.name)
-        )
+        n = sum(1 for p in directory.glob("*") if p.is_file() and is_skill_file(p.name))
     except OSError:
         return line + " (unreadable)"
     return line + f" ({n} skill{'' if n == 1 else 's'})"
@@ -327,7 +325,10 @@ def _scan_local() -> list[dict]:
     if directory is None:
         return []
     try:
-        paths = sorted(p for p in directory.glob("*.md") if p.is_file())
+        # Glob every file and let `is_skill_file` decide: `*.md` is a second,
+        # case-sensitive spelling of the extension rule, and on Linux it was
+        # what dropped a `Recipe.MD` before the predicate ever saw it (#725).
+        paths = sorted(p for p in directory.glob("*") if p.is_file())
     except OSError:
         logger.debug("skills: local dir unreadable (fail-open)", exc_info=True)
         return []
@@ -335,6 +336,10 @@ def _scan_local() -> list[dict]:
     out = []
     for path in paths:
         if not is_skill_file(path.name):
+            # The dir is the user's own, so a file they expected to be a skill
+            # and a stray note look alike here. Debug rather than warn, but not
+            # silence: #725 was a dropped file with no skill and no log line.
+            logger.debug("skills: local %s is not a skill file", path.name)
             continue
         try:
             entry = _local_entry(path)

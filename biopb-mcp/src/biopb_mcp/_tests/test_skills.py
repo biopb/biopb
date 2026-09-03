@@ -340,6 +340,51 @@ def test_local_skill_bad_file_is_skipped_not_fatal(local_skills, mock_home):
     assert [s["id"] for s in _skills.list_skills("")] == ["good"]
 
 
+# --- which local files count as skills (#725) --------------------------------
+#
+# The local dir is the only uncontrolled input, and the rule that reads it was
+# spelled twice: a case-sensitive `*.md` glob and a case-sensitive predicate.
+
+
+def test_local_skill_with_an_uppercase_extension_is_served(local_skills, mock_home):
+    """`Recipe.MD` is a skill. Windows is where it gets written -- the OS treats
+    filename case as irrelevant everywhere else -- but the served set is now the
+    same on both platforms, which is the point of fixing it in the predicate."""
+    (local_skills / "Recipe.MD").write_text("# Recipe\n\nprose\n", encoding="utf-8")
+    assert [s["id"] for s in _skills.list_skills("")] == ["Recipe"]
+
+
+def test_a_local_readme_is_the_users_own_skill(local_skills, mock_home):
+    """The prose-doc names are a property of `_skills_data/`, where a README may
+    sit beside the skills. Nothing else lives in the user's dir, so excluding a
+    name there only drops a file that works."""
+    (local_skills / "README.md").write_text("# Readme\n\nprose\n", encoding="utf-8")
+    assert [s["id"] for s in _skills.list_skills("")] == ["README"]
+
+
+def test_a_shipped_readme_is_still_not_a_skill(monkeypatch, tmp_path, skills_cfg):
+    shipped = tmp_path / "shipped"
+    shipped.mkdir(exist_ok=True)
+    (shipped / "real-skill.md").write_text("# Real\n\nprose\n", encoding="utf-8")
+    for name in ("README.md", "readme.md", "ROADMAP.MD"):
+        (shipped / name).write_text("# Prose\n\nprose\n", encoding="utf-8")
+    assert [e["id"] for e in _skills._scan_shipped()] == ["real-skill"]
+
+
+def test_a_rejected_local_file_is_logged(local_skills, mock_home, caplog):
+    """Silence was the bug: no skill, no warning, no log line."""
+    (local_skills / "notes.txt").write_text("not markdown", encoding="utf-8")
+    with caplog.at_level("DEBUG", logger=_skills.logger.name):
+        assert _skills.list_skills("") == []
+    assert any("notes.txt" in r.getMessage() for r in caplog.records)
+
+
+def test_local_dir_status_counts_what_is_served(local_skills, mock_home):
+    (local_skills / "Recipe.MD").write_text("# Recipe\n\nprose\n", encoding="utf-8")
+    (local_skills / "notes.txt").write_text("not markdown", encoding="utf-8")
+    assert _skills.local_dir_status().endswith("(1 skill)")
+
+
 def test_local_skill_shadows_shipped_entry(
     local_skills, mock_home, monkeypatch, tmp_path
 ):

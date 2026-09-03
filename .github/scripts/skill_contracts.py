@@ -90,8 +90,10 @@ def skill_files() -> list[Path]:
     only workspace packages drops out here anyway. See
     `_tests/skills/test_shipped_skills.py`.
     """
-    is_skill_file = _load_layout().is_skill_file
-    return sorted(p for p in SKILLS_DIR.glob("*.md") if is_skill_file(p.name))
+    is_catalog_file = _load_layout().is_catalog_file
+    return sorted(
+        p for p in SKILLS_DIR.glob("*") if p.is_file() and is_catalog_file(p.name)
+    )
 
 
 def declared_packages() -> list[str]:

@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from biopb_mcp.mcp._skills_layout import is_markdown_name
+
 from .conftest import SKILLS_DIR
 
 # biopb-mcp/ -- the package root, four levels up from _tests/skills/.
@@ -72,16 +74,22 @@ def wheel(tmp_path_factory) -> zipfile.ZipFile:
 
 
 def _shipped_md(wheel: zipfile.ZipFile) -> set[str]:
+    # Deliberately wider than `is_skill_file`: a deferred `_foo.md` and the prose
+    # docs have to ship too, so this asks only the extension half of the shared
+    # rule -- but it asks the shared one, which is case-folded. Both sides of the
+    # comparison spelling it themselves is how they disagreed (#725).
     prefix = "biopb_mcp/mcp/_skills_data/"
     return {
         n[len(prefix) :]
         for n in wheel.namelist()
-        if n.startswith(prefix) and n.endswith(".md")
+        if n.startswith(prefix) and is_markdown_name(n)
     }
 
 
 def test_every_skill_in_the_tree_is_in_the_wheel(wheel):
-    on_disk = {p.name for p in SKILLS_DIR.glob("*.md")}
+    on_disk = {
+        p.name for p in SKILLS_DIR.glob("*") if p.is_file() and is_markdown_name(p.name)
+    }
     assert on_disk, f"no skills at {SKILLS_DIR}"
     assert _shipped_md(wheel) == on_disk
 

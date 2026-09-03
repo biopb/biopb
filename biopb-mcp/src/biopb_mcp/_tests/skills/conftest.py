@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from biopb_mcp.mcp._skills_layout import is_skill_file
+from biopb_mcp.mcp._skills_layout import is_catalog_file
 
 from ._schema import REQUIRED_SECTIONS
 
@@ -97,6 +97,10 @@ def skill_factory(skills_dir: Path):
 @pytest.fixture(scope="session")
 def shipped_skill_files() -> list[Path]:
     """Every shipped skill file, excluding any prose docs beside them."""
-    files = [p for p in sorted(SKILLS_DIR.glob("*.md")) if is_skill_file(p.name)]
+    files = [
+        p
+        for p in sorted(SKILLS_DIR.glob("*"))
+        if p.is_file() and is_catalog_file(p.name)
+    ]
     assert files, f"no skill files found under {SKILLS_DIR}"
     return files
