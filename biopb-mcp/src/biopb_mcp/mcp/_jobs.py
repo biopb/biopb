@@ -112,12 +112,20 @@ _owner = None
 _owner_label = ""
 
 # That agent's own job origin ("mcp", or "chat" for the in-process loop),
-# recorded by its first submit. "Foreign" is a relation, not a property, so
-# every reader of it needs a point of view -- and the two internal readers
-# (:func:`_prune`, :func:`ack_foreign_digest`) have no asker to take one from:
-# they run under whoever submitted, which may be the human whose cells the agent
-# has yet to be told about. So the agent's is recorded once, where the one-agent
-# claim is made, and read from here. Until something claims, "mcp".
+# recorded by every non-user submit that starts a job. "Foreign" is a relation,
+# not a property, so every reader of it needs a point of view -- and the two
+# internal readers (:func:`_prune`, :func:`ack_foreign_digest`) have no asker to
+# take one from: they run under whoever submitted, which may be the human whose
+# cells the agent has yet to be told about. So the agent's is recorded here and
+# read from here. Until an agent submits, "mcp".
+#
+# Deliberately *not* conditioned on `writer`, the way the claim is. Identity and
+# point of view are different axes: a caller with no id neither claims nor is
+# checked (there is nothing to compare), but its cells are still recorded with
+# its origin, and a view that ignored them would call an unidentified chat
+# loop's own jobs foreign to it -- the #879 defect, for the one caller least
+# able to notice. One agent per kernel is what keeps a single value honest, and
+# where the claim can enforce that it does.
 _agent_origin = "mcp"
 
 # What the bootstrap binds into the kernel namespace. `_bootstrap` refuses to
@@ -767,10 +775,6 @@ def submit(
                     "owner": _owner_label,
                     "owner_id": _owner,
                 }
-        if origin != "user":
-            # After the refusal above, so a rejected submit does not move the
-            # point of view _prune reads. See _agent_origin.
-            _agent_origin = origin
         # Re-assert the thread-aware stream wrap (idempotent) so a job thread's
         # output is captured even if something replaced sys.stdout since
         # install() — and so it works under pytest's per-phase capture.
@@ -793,6 +797,15 @@ def submit(
         if verify_cells is not None:
             job.verify = _Verification(verify_title, verify_cells, job)
         _jobs[job_id] = job
+        if origin != "user":
+            # Here rather than at the claim check above, because a submit that
+            # is *refused* is not this kernel's agent working: both refusals
+            # ("not_owner", and "busy" a few lines up) return before this, so
+            # the point of view only moves for a job that exists. Letting a
+            # refusal move it left the next ack unable to discharge the
+            # previous agent's notices, which pins them against eviction --
+            # biopb/biopb#879 again, by another route.
+            _agent_origin = origin
         _prune()
         thread = threading.Thread(
             target=_run, args=(job, code), name=job_id, daemon=True

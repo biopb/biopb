@@ -433,6 +433,37 @@ class TestJobOrigin:
             self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])
         assert user_jid not in _jobs._jobs
 
+    def test_a_refused_submit_does_not_move_the_point_of_view(self, runner):
+        # Only a job that exists is the agent working here. Moved on the claim
+        # check instead, a submit refused "busy" flipped the view, and the next
+        # ack then could not discharge the running agent's own notices -- which
+        # pins them against eviction, #879 by another route.
+        jid = _jobs.submit(
+            "import time\nwhile True:\n    time.sleep(0.02)", origin="mcp"
+        )["job_id"]
+        try:
+            assert _jobs.submit("a = 1", origin="chat")["error"] == "busy"
+            assert _jobs._agent_origin == "mcp"
+        finally:
+            _jobs.interrupt_current()
+        self._wait(jid)
+
+        # The other refusal, for the same reason.
+        self._wait(_jobs.submit("a = 1", origin="mcp", writer="sess-A")["job_id"])
+        assert (
+            _jobs.submit("b = 2", origin="chat", writer="sess-B")["error"]
+            == "not_owner"
+        )
+        assert _jobs._agent_origin == "mcp"
+
+    def test_an_unidentified_agent_still_sets_the_point_of_view(self, runner):
+        # Identity and point of view are different axes. A caller with no id
+        # neither claims nor is checked, but its cells carry its origin, and a
+        # view that ignored them would call its own jobs foreign to it.
+        self._wait(_jobs.submit("a = 1", origin="chat")["job_id"])
+        assert _jobs._agent_origin == "chat"
+        assert _jobs.owner()["owner"] is None
+
     def test_the_chat_loop_stops_its_own_cell(self, runner):
         # "Did not start it" is relative to the asker. Asked as a fixed "mcp",
         # the loop was refused the cell it had just run itself -- on the session
