@@ -130,7 +130,7 @@ class TestQueryCommand:
                 location="grpc://custom:9000",
                 cache_bytes=100_000_000,
                 token=None,
-                tls_ca_pem=None,
+                tls_fingerprint=None,
             )
 
     def test_query_shows_cache_info(self):

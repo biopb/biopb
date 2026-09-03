@@ -62,7 +62,8 @@ ENV_URL = "BIOPB_TENSOR_URL"
 ENV_TOKEN = "BIOPB_TENSOR_TOKEN"
 
 # Hosts that mean "this machine". A plane here has its TLS cert on this disk, so
-# it is trusted from the file rather than pinned from the wire (:func:`local_ca`).
+# it is verified against what the plane publishes rather than pinned from the
+# wire (:func:`local_fingerprint`).
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -104,7 +105,8 @@ def probe_scheme(host: str, port: int, timeout: float = 0.5) -> Optional[str]:
 
     Certificate validation is deliberately off: this asks a yes/no question about
     the wire protocol, and the answer decides which scheme to dial. Trust is
-    established afterwards, on the real connection, by :func:`local_ca` or TOFU.
+    established afterwards, on the real connection, by :func:`local_fingerprint`
+    or TOFU.
     """
     import socket
     import ssl
@@ -126,49 +128,79 @@ def probe_scheme(host: str, port: int, timeout: float = 0.5) -> Optional[str]:
         return None
 
 
-def local_ca(url: str) -> Optional[bytes]:
-    """Explicit TLS trust anchor for a *local* plane, read off local disk.
+def local_fingerprint(url: str) -> Optional[str]:
+    """Identity of the certificate a *local* plane serves, as a SHA-256 digest.
 
-    A loopback ``grpcs://`` plane is this machine's own and the certificate it
-    serves is already on this machine's disk — so trust it directly instead of
-    pinning whatever the handshake presents (TOFU). An anchor read from local disk
-    is strictly stronger than one learned from the wire, and it keeps the client
-    out of the shared pin store, which would otherwise strand it the moment an
-    operator rotated the cert with ``cert init --force``.
+    A loopback ``grpcs://`` plane is this machine's own, so what it serves is
+    knowable here rather than something to accept on first sight (TOFU). The
+    digest is checked against the certificate the server actually presents on
+    every connect, which is strictly stronger than a pin learned from the wire
+    and keeps the client out of the shared pin store — where an operator's
+    ``cert init --force`` would otherwise strand it.
+
+    A fingerprint rather than the PEM itself, deliberately: handing the client a
+    PEM resolves trust entirely offline, which also skips the hostname-override
+    probe, and a local client dials loopback. A certificate carrying only the
+    host's public name — the ordinary shape of an operator's own cert — then
+    fails hostname verification on every connect (biopb/biopb#916).
+
+    Two sources, in order:
+
+    - what the plane **published** for this port (:mod:`biopb._tls_record`),
+      which is the only thing that knows about a ``--tls-cert`` the plane was
+      handed;
+    - failing that, the certificate the plane would have **minted**
+      (``state/biopb/tls/server-cert.pem``), which is what a plane too old to
+      publish anything serves.
 
     ``None`` — leaving TOFU in charge — for a plaintext endpoint or a remote one,
-    whose cert is not on this disk and cannot be. Raises :class:`LocalTrustError`
-    when a local plane is TLS but its cert is unreadable: silently falling back to
-    TOFU there would trade a verified anchor for an unverified one exactly where
-    the strong option was meant to apply.
+    whose certificate is not on this disk and cannot be. Raises
+    :class:`LocalTrustError` when a local plane is TLS and neither source
+    answers: silently falling back to TOFU there would trade a verified identity
+    for an unverified one exactly where the strong option was meant to apply.
 
     Known edge: a loopback ``grpcs://`` URL that is really an ``ssh -L`` tunnel to
     a *remote* plane is indistinguishable from a local one by host alone, so it is
-    anchored on the local cert and the handshake fails. Loud and fixable (dial the
-    plane directly, or tunnel to a non-loopback alias), not silent.
+    checked against the local plane's identity and fails. Loud and fixable (dial
+    the plane directly, or tunnel to a non-loopback alias), not silent.
     """
     if not url.lower().startswith("grpcs://") or not is_local_url(url):
         return None
 
-    from ._locations import tls_server_cert
+    from . import _tls_material, _tls_record
+    from ._locations import tls_served_certs, tls_server_cert
+
+    port = urlparse(url).port
+    if port is not None:
+        published = _tls_record.lookup(port)
+        if published:
+            return published
 
     cert_path = tls_server_cert()
     try:
         pem = cert_path.read_bytes()
     except OSError as exc:
         raise LocalTrustError(
-            f"The local data plane at {url} serves TLS, but its certificate could "
-            f"not be read from {cert_path} ({exc}). A local plane is trusted from "
-            "its cert on disk, not by pinning it from the wire — so this is not "
-            "retried as trust-on-first-use. Check the state dir is the one the "
-            "server writes to (BIOPB_STATE_HOME), or re-mint the cert with "
-            "`biopb-tensor-server cert init`."
+            f"The local data plane at {url} serves TLS, but nothing on this "
+            f"machine says which certificate: no record for port {port} in "
+            f"{tls_served_certs()}, and no certificate at {cert_path} ({exc}). A "
+            "local plane is verified against what it serves, not pinned from the "
+            "wire, so this is not retried as trust-on-first-use. Check the state "
+            "dir is the one the server writes to (BIOPB_STATE_HOME); a plane "
+            "publishes its record at startup, so restart one that predates this "
+            "build, or mint the certificate with `biopb-tensor-server cert init`."
         ) from exc
     if not pem.strip():
         raise LocalTrustError(
             f"The local data plane's TLS certificate at {cert_path} is empty."
         )
-    return pem
+    try:
+        return _tls_material.fingerprint(_tls_material.leaf_pem(pem))
+    except ValueError as exc:
+        raise LocalTrustError(
+            f"The local data plane's TLS certificate at {cert_path} is not "
+            f"readable as PEM ({exc})."
+        ) from exc
 
 
 def control_grpc_url(timeout: float = 1.0) -> Optional[str]:
@@ -216,7 +248,7 @@ class Endpoint:
 
     url: str
     token: Optional[str] = None
-    tls_ca_pem: Optional[bytes] = None
+    tls_fingerprint: Optional[str] = None
     origin: str = "default"
 
     @property
@@ -246,8 +278,8 @@ def resolve(
     Set ``probe=False`` to skip the socket scheme probe on the default fallback
     (a caller that only wants to *name* the endpoint, not dial it).
 
-    Raises :class:`LocalTrustError` when the resolved plane is local TLS but its
-    certificate cannot be read — see :func:`local_ca`.
+    Raises :class:`LocalTrustError` when the resolved plane is local TLS but
+    nothing on this machine says what it serves — see :func:`local_fingerprint`.
     """
     url, origin = _resolve_url(override, timeout=timeout, probe=probe)
     return Endpoint(
@@ -260,7 +292,7 @@ def resolve(
         # user never authorized it for. Those endpoints authenticate explicitly or
         # not at all.
         token=resolve_token(token, allow_credential_file=origin == "control"),
-        tls_ca_pem=local_ca(url),
+        tls_fingerprint=local_fingerprint(url),
         origin=origin,
     )
 

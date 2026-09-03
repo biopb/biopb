@@ -72,6 +72,7 @@ from pathlib import Path
 from typing import Dict, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
+from biopb import _tls_material
 from biopb._locations import tls_known_hosts
 
 logger = logging.getLogger(__name__)
@@ -238,10 +239,9 @@ def _fetch_server_cert(host: str, port: int) -> bytes:
     return ssl.DER_cert_to_PEM_cert(der).encode("ascii")
 
 
-def _fingerprint(pem: bytes) -> str:
-    """SHA-256 of the certificate's DER body — a scheme/whitespace-stable id."""
-    der = ssl.PEM_cert_to_DER_cert(pem.decode("ascii"))
-    return hashlib.sha256(der).hexdigest()
+#: SHA-256 of a certificate's DER body — a scheme/whitespace-stable id. Shared
+#: with the server and the local-plane record, which must agree with it exactly.
+_fingerprint = _tls_material.fingerprint
 
 
 def _probe_peer(

@@ -387,6 +387,23 @@ def sessions_dir() -> Path:
     return d
 
 
+def tls_served_certs() -> Path:
+    """What each local flight plane serves (``state/biopb/tls-served.json``).
+
+    Written by a plane that serves TLS, read by clients on the same machine so
+    they verify the certificate it is *actually* serving. Distinct from
+    :func:`tls_server_cert`, which is the pair the plane **mints** — an operator's
+    own ``--tls-cert`` never lands there, and copying it in would be wrong: its
+    key would have to follow, and a later plain ``--tls`` would then serve a
+    certificate whose key is not beside it (biopb/biopb#916).
+
+    Keyed by port, because that is what distinguishes two planes on one machine
+    and this file is only ever consulted for a loopback dial, where the host is
+    an alias. Machine-local, regenerable, and never created on access.
+    """
+    return state_dir() / "tls-served.json"
+
+
 def tls_known_hosts() -> Path:
     """TOFU pin store for the tensor Flight client (``state/biopb/tls-known-hosts.json``).
 

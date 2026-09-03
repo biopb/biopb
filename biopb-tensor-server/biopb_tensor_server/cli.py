@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import typer
-from biopb import _web_auth
+from biopb import _tls_material, _tls_record, _web_auth
 from biopb._fs_detect import unsafe_cache_dir_reason
 from biopb._lifecycle import deathwatch as _deathwatch
 from biopb._locations import tls_server_cert
@@ -271,6 +271,9 @@ def _graceful_shutdown(
     join (a blocking re-list RPC to that upstream) -- so they are sequenced
     *after* the lock release and then individually bounded:
 
+    0. Retract this plane's served-TLS record. Advisory, and cheap: a stale entry
+       is not dangerous (a client that trusts it fails to verify, loudly) but it
+       would leave the next plane on this port inheriting a claim it never made.
     1. Stop the precache worker -- no new warm writes.
     2. Release the process lock + clear the WAL IMMEDIATELY. Cheap and
        upstream-independent; leaves segment writers/mmaps OPEN (closing them here
@@ -336,7 +339,15 @@ def _graceful_shutdown(
         if manager is not None:
             manager.close()
 
+    def _retract_tls_record() -> None:
+        # Only ours to drop, and only if we published one: the record is keyed by
+        # the port this server bound.
+        port = getattr(flight_server, "port", None) if flight_server else None
+        if port:
+            _tls_record.retract(port)
+
     for label, action in (
+        ("served-TLS record", _retract_tls_record),
         ("precache worker", lambda: precache_worker and precache_worker.stop()),
         ("cache lock", _release_lock),
         ("flight server", _bounded_drain),
@@ -825,6 +836,17 @@ def _setup_flight_server(
         tls_cert_chain=tls_cert_chain,
         tls_private_key=tls_private_key,
     )
+
+    if tls_cert_chain is not None:
+        # Say what we serve, so a client on this machine verifies against the
+        # certificate this plane actually presents rather than guessing at the
+        # one it would have minted -- which a `--tls-cert` never is
+        # (biopb/biopb#916). Keyed by the bound port, since `--port 0` picks one
+        # and two planes can share a state tree.
+        _tls_record.publish(
+            getattr(server, "port", port) or port,
+            _tls_material.fingerprint(_tls_material.leaf_pem(tls_cert_chain)),
+        )
 
     # Set up watcher for monitored sources (None for static-only configs)
     watcher = None
