@@ -504,6 +504,22 @@ def _grpc_location(host: str, port: int) -> str:
     return f"grpc://{authority}:{port}"
 
 
+def _warn_if_expiring(cert_pem: bytes) -> None:
+    """Say so when the cert about to be served is past or near its expiry.
+
+    Nothing else watches the date, and the failure it leads to is silent on the
+    client side -- a pinned cert is still rejected once expired, and gRPC reports
+    that as an unexplained "failed to connect to all addresses"
+    (biopb/biopb#913). One warning here covers both the auto-generated cert and a
+    BYO ``--tls-cert``, and both entry points (`serve` and `launch`).
+    """
+    from biopb_tensor_server.core.tls import cert_expiry_warning
+
+    message = cert_expiry_warning(cert_pem)
+    if message:
+        console.print(f"[yellow]{_rich_escape(message)}[/yellow]")
+
+
 def _resolve_tls_material(
     tls: bool,
     tls_cert: Optional[Path],
@@ -537,7 +553,9 @@ def _resolve_tls_material(
                     f"[red]{label} not found: {_rich_escape(str(path))}[/red]"
                 )
                 raise typer.Exit(code=2)
-        return tls_cert.read_bytes(), tls_key.read_bytes()
+        cert_pem = tls_cert.read_bytes()
+        _warn_if_expiring(cert_pem)
+        return cert_pem, tls_key.read_bytes()
 
     if not tls:
         return None, None
@@ -561,6 +579,7 @@ def _resolve_tls_material(
             "[yellow]--san ignored: reusing the existing certificate. Run "
             "`cert init --force --san ...` to re-mint it with those names.[/yellow]"
         )
+    _warn_if_expiring(cert_pem)
     console.print("[green]TLS enabled[/green] (self-signed)")
     _print_verbatim(
         ("cert:", tls_server_cert()),
@@ -623,6 +642,7 @@ def cert_init(
     else:
         verb = "Regenerated" if existed else "Generated"
         console.print(f"[green]{verb} self-signed TLS cert[/green]")
+    _warn_if_expiring(cert_pem)
     _print_verbatim(
         ("cert:", tls_server_cert()),
         ("key:", tls_server_key()),

@@ -130,6 +130,74 @@ def test_validity_span_matches_the_documented_days():
     assert span.days == 10
 
 
+def test_expiry_warning_fires_only_near_the_end_of_the_span():
+    """Nothing else watches notAfter, and a pin does not excuse it (biopb/biopb#913).
+
+    `days=0` mints a cert whose span ends at its backdated notBefore, i.e. one
+    that is already expired -- the state an operator reaches by leaving a cert in
+    place for its full validity.
+    """
+    from biopb_tensor_server.core import tls as tls_mod
+
+    fresh, _ = tls_mod.generate_self_signed_cert(["localhost"], [])
+    assert tls_mod.cert_expiry_warning(fresh) is None
+
+    soon, _ = tls_mod.generate_self_signed_cert(["localhost"], [], days=10)
+    assert "expires on" in tls_mod.cert_expiry_warning(soon)
+
+    gone, _ = tls_mod.generate_self_signed_cert(["localhost"], [], days=0)
+    assert "expired on" in tls_mod.cert_expiry_warning(gone)
+
+
+def test_expiry_warning_is_advisory_not_fatal():
+    """Unreadable material must not take down the TLS path it only annotates."""
+    from biopb_tensor_server.core.tls import cert_expiry_warning
+
+    assert cert_expiry_warning(b"not a certificate") is None
+
+
+def test_cert_init_reports_an_expired_cert_it_reuses(monkeypatch):
+    """The one command an operator runs to inspect the cert has to say it is dead."""
+    from biopb._locations import tls_server_cert, tls_server_key
+    from biopb_tensor_server.cli import app
+    from biopb_tensor_server.core.tls import generate_self_signed_cert
+
+    cert_pem, key_pem = generate_self_signed_cert(["localhost"], ["127.0.0.1"], days=0)
+    tls_server_cert().parent.mkdir(parents=True, exist_ok=True)
+    tls_server_cert().write_bytes(cert_pem)
+    tls_server_key().write_bytes(key_pem)
+
+    result = CliRunner().invoke(app, ["cert", "init"])
+    assert result.exit_code == 0, result.output
+    assert "expired on" in result.output
+    assert "--force" in result.output
+
+
+def test_serve_tls_warns_on_an_expired_byo_cert(tmp_path, capsys):
+    """A BYO cert gets the same notice -- and still without `cryptography` required."""
+    import sys
+
+    from biopb_tensor_server.cli import _resolve_tls_material
+    from biopb_tensor_server.core.tls import generate_self_signed_cert
+
+    cert_pem, key_pem = generate_self_signed_cert(["localhost"], [], days=0)
+    cf, kf = tmp_path / "c.pem", tmp_path / "k.pem"
+    cf.write_bytes(cert_pem)
+    kf.write_bytes(key_pem)
+
+    cert, _ = _resolve_tls_material(False, cf, kf)
+    assert cert == cert_pem  # advisory only: the cert is still served
+    assert "expired" in capsys.readouterr().out
+
+    # Without the extra there is nothing to parse with, and that is a no-op --
+    # not a crash on the very path that exists to avoid needing it.
+    sys.modules["cryptography"] = None
+    try:
+        assert _resolve_tls_material(False, cf, kf)[0] == cert_pem
+    finally:
+        del sys.modules["cryptography"]
+
+
 def test_split_san_values_partitions_names_and_ips():
     from biopb_tensor_server.core.tls import split_san_values
 
