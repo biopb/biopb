@@ -380,8 +380,12 @@ class TestResolve:
         )
         assert name == "opencode"
 
-    def test_opencode_acp_uses_a_loopback_ephemeral_http_port(self):
-        argv, name = _chat_acp.resolve_command({"chat": {"acp_agent": "opencode"}})
+    def test_opencode_acp_uses_a_loopback_ephemeral_http_port(self, tmp_path):
+        fake = tmp_path / "opencode"
+        fake.write_text("#!/bin/sh\n")
+        argv, name = _chat_acp.resolve_command(
+            {"chat": {"acp_agent": "opencode", "acp_command": str(fake)}}
+        )
         assert argv[-4:] == ("--hostname", "127.0.0.1", "--port", "0")
         assert name == "opencode"
 
