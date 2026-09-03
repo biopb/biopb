@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from ... import _endpoint
+
 #: Where a key may live besides the environment. A non-interactive shell does
 #: not read `~/.bashrc` past its `case $- in *i*` guard, so an export added at
 #: the bottom of it is invisible to anything run from a tool or a CI step --
@@ -52,6 +54,14 @@ AGENT_ENV = "BIOPB_AGENT"
 RESPONDENT_ENV = "BIOPB_RESPONDENT"
 AGENT_BASE_URL_ENV = "BIOPB_AGENT_BASE_URL"
 RESPONDENT_BASE_URL_ENV = "BIOPB_RESPONDENT_BASE_URL"
+
+#: Extra headers for a gateway that wants them, one variable per side because
+#: the sides may be on different gateways. Newline-separated `Name: value`, and
+#: `{session}` becomes that side's conversation id -- see :mod:`.._endpoint`,
+#: which also configures the gateways we already know about without any of
+#: this being set.
+AGENT_HEADERS_ENV = "BIOPB_AGENT_HEADERS"
+RESPONDENT_HEADERS_ENV = "BIOPB_RESPONDENT_HEADERS"
 
 DEFAULT_AGENT = "openai:gpt-5"
 DEFAULT_RESPONDENT = "anthropic:claude-sonnet-5"
@@ -179,10 +189,20 @@ class ModelChoice:
     provider: Provider
     model: str
     base_url: str = ""
+    #: `Name: value` entries this endpoint needs beyond the API's own, from the
+    #: side's `*_HEADERS` variable. Merged over what :mod:`.._endpoint` already
+    #: knows about the host, so the common case is empty.
+    extra_headers: tuple = ()
 
     @property
     def name(self) -> str:
         return f"{self.provider.name}:{self.model}"
+
+    def headers(self, session: str) -> dict:
+        """The extra headers for one conversation on this endpoint."""
+        return _endpoint.extra_headers(
+            self.base_url, self.extra_headers, session=session
+        )
 
     @property
     def key(self) -> str:
@@ -232,7 +252,7 @@ class ModelChoice:
         )
 
 
-def parse_choice(spec: str, base_url: str = "") -> ModelChoice:
+def parse_choice(spec: str, base_url: str = "", headers: tuple = ()) -> ModelChoice:
     """``"openai:gpt-5"`` -> a :class:`ModelChoice`.
 
     A bare model name is an error rather than a guess: which vendor is serving
@@ -250,7 +270,7 @@ def parse_choice(spec: str, base_url: str = "") -> ModelChoice:
             f"unknown provider {provider_name!r}; known: {', '.join(sorted(PROVIDERS))}"
         )
     provider = PROVIDERS[provider_name]
-    return ModelChoice(provider, model, base_url or provider.base_url)
+    return ModelChoice(provider, model, base_url or provider.base_url, headers)
 
 
 #: The conventional name, which the OpenAI SDK reads by itself. Honoured as a
@@ -266,6 +286,7 @@ def agent_choice() -> ModelChoice:
     return parse_choice(
         setting(AGENT_ENV, DEFAULT_AGENT),
         setting(AGENT_BASE_URL_ENV) or setting(SHARED_BASE_URL_ENV),
+        _endpoint.parse_env_headers(setting(AGENT_HEADERS_ENV)),
     )
 
 
@@ -273,6 +294,7 @@ def respondent_choice() -> ModelChoice:
     return parse_choice(
         setting(RESPONDENT_ENV, DEFAULT_RESPONDENT),
         setting(RESPONDENT_BASE_URL_ENV) or setting(SHARED_BASE_URL_ENV),
+        _endpoint.parse_env_headers(setting(RESPONDENT_HEADERS_ENV)),
     )
 
 
@@ -382,6 +404,11 @@ class OpenAICompatText:
 
     choice: ModelChoice
     temperature: float = 0.0
+    #: This backend's conversation. One respondent holds one persona and one
+    #: history, so the instance *is* the conversation and its id lives here --
+    #: the two arms of a run are two conversations, and a gateway told they are
+    #: one would attribute the tester's traffic to the persona's.
+    session: str = field(default_factory=_endpoint.new_session_id)
 
     @property
     def name(self) -> str:
@@ -393,6 +420,8 @@ class OpenAICompatText:
         kwargs = {"api_key": self.choice.key}
         if self.choice.base_url:
             kwargs["base_url"] = self.choice.base_url
+        if headers := self.choice.headers(self.session):
+            kwargs["default_headers"] = headers
         completion = OpenAI(**kwargs).chat.completions.create(
             model=self.choice.model,
             messages=[{"role": "system", "content": system}, *messages],
@@ -414,6 +443,8 @@ class AnthropicText:
 
     choice: ModelChoice
     temperature: float = 0.0
+    #: See :class:`OpenAICompatText`. A gateway can front this API too.
+    session: str = field(default_factory=_endpoint.new_session_id)
 
     @property
     def name(self) -> str:
@@ -425,6 +456,8 @@ class AnthropicText:
         kwargs = {"api_key": self.choice.key}
         if self.choice.base_url:
             kwargs["base_url"] = self.choice.base_url
+        if headers := self.choice.headers(self.session):
+            kwargs["default_headers"] = headers
         response = anthropic.Anthropic(**kwargs).messages.create(
             model=self.choice.model,
             max_tokens=max_tokens,

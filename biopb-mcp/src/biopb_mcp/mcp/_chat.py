@@ -44,6 +44,7 @@ import time
 
 from mcp.types import ImageContent, TextContent
 
+from .. import _endpoint
 from . import _app, _kernel_rpc, _server, _writers
 
 # The kernel round trip, off the loop. Bound here under the name this module
@@ -91,6 +92,13 @@ _POLL_INTERVAL = 0.3
 # session, survives kernel restarts, and dies with this process.
 _messages: list = []
 _seq = 0
+
+# This conversation's own id, for anything that has to name it to something
+# outside this process -- today a gateway that attributes traffic per
+# conversation (`_endpoint`), tomorrow a log or a trace. Minted here and
+# re-minted by `reset`, so it tracks the thread rather than the process: two
+# conversations in one session are two, and a kernel restart does not end one.
+_session_id = _endpoint.new_session_id()
 
 # A foreign-activity digest that has been written into a tool result but not yet
 # discharged at the kernel. Held here for the step between the two, which is the
@@ -201,6 +209,11 @@ def note_error(text):
     return _append("assistant", text, error=True)
 
 
+def session_id() -> str:
+    """This conversation's id. See :data:`_session_id`."""
+    return _session_id
+
+
 def reset():
     """Drop the conversation.
 
@@ -210,17 +223,21 @@ def reset():
     must not open by naming a cell it never started, and the compacted prefix,
     which summarised messages that are now gone.
 
-    The id sequence is **not** restarted. Ids are how a view tells a message it
+    The *message* id sequence is **not** restarted. Ids are how a view tells a message it
     has already drawn from one it has not, and ``/api/chat/history?after=`` is
     documented to return everything for an id it does not recognise -- which is
     how a window open across a reset notices. Restarting the count reissues the
     old thread's ids to the new one, so that stale cursor matches a message the
     view has never seen and it skips the new conversation's opening instead.
     """
-    global _running_job_id, _summary, _compacted
+    global _running_job_id, _summary, _compacted, _session_id
     _messages.clear()
     _running_job_id = None
     _summary, _compacted = None, 0
+    # A new thread is a new conversation to anyone outside this process, so it
+    # gets a new id. Unlike the message ids below, nothing holds a cursor on
+    # this one -- it names the thread, it does not order anything within it.
+    _session_id = _endpoint.new_session_id()
 
 
 def _append(role, content, **extra):

@@ -11,15 +11,19 @@ import types
 
 import pytest
 
+from ..._endpoint import parse_env_headers
+from ._agent import ToolCallingAgent
 from ._models import (
     AGENT_BASE_URL_ENV,
     AGENT_ENV,
+    AGENT_HEADERS_ENV,
     DEFAULT_AGENT,
     DEFAULT_RESPONDENT,
     ENV_FILE_ENV,
     PROVIDERS,
     RESPONDENT_BASE_URL_ENV,
     RESPONDENT_ENV,
+    RESPONDENT_HEADERS_ENV,
     SHARED_BASE_URL_ENV,
     AnthropicText,
     EmptyCompletion,
@@ -53,6 +57,8 @@ def no_dotenv(tmp_path, monkeypatch):
         AGENT_BASE_URL_ENV,
         RESPONDENT_BASE_URL_ENV,
         SHARED_BASE_URL_ENV,
+        AGENT_HEADERS_ENV,
+        RESPONDENT_HEADERS_ENV,
         *(provider.key_env for provider in PROVIDERS.values()),
     ):
         monkeypatch.delenv(name, raising=False)
@@ -108,6 +114,37 @@ def test_a_base_url_override_beats_the_provider_default(monkeypatch):
     monkeypatch.setenv(RESPONDENT_ENV, "openai:gpt-4o-mini")
     monkeypatch.setenv("BIOPB_RESPONDENT_BASE_URL", "http://proxy.internal/v1")
     assert respondent_choice().base_url == "http://proxy.internal/v1"
+
+
+def test_a_gateway_that_wants_a_session_gets_one_unasked(no_dotenv, monkeypatch):
+    """Both arms reach OpenCode through the shared base URL, and neither
+    knows it needs a header. The endpoint policy does."""
+    monkeypatch.setenv(AGENT_ENV, "openai:deepseek-v4-flash")
+    monkeypatch.setenv(RESPONDENT_ENV, "openai:deepseek-v4-pro")
+    monkeypatch.setenv(SHARED_BASE_URL_ENV, "https://opencode.ai/zen/go/v1")
+
+    tester = text_backend(agent_choice())
+    persona = text_backend(respondent_choice())
+
+    assert tester.choice.headers(tester.session) == {
+        "x-opencode-session": tester.session
+    }
+    # Two conversations, not one run: a gateway told they are the same would
+    # attribute the tester's traffic to the persona's.
+    assert tester.session != persona.session
+
+
+def test_a_side_can_name_headers_the_harness_has_never_heard_of(no_dotenv, monkeypatch):
+    monkeypatch.setenv(RESPONDENT_ENV, "openai:m")
+    monkeypatch.setenv(RESPONDENT_BASE_URL_ENV, "https://gw.test/v1")
+    monkeypatch.setenv(RESPONDENT_HEADERS_ENV, "X-Trace: {session}\nX-Team: imaging")
+    backend = text_backend(respondent_choice())
+    assert backend.choice.headers("s-9") == {"X-Trace": "s-9", "X-Team": "imaging"}
+    # And the other side is configured on its own, as with every other setting.
+    monkeypatch.setenv(AGENT_ENV, "openai:m")
+    monkeypatch.setenv(AGENT_BASE_URL_ENV, "https://gw.test/v1")
+    monkeypatch.delenv(AGENT_HEADERS_ENV, raising=False)
+    assert agent_choice().headers("s-9") == {}
 
 
 def test_a_missing_key_is_reported_by_name_not_by_traceback(no_dotenv):
@@ -174,6 +211,17 @@ def test_a_line_without_an_equals_is_skipped(tmp_path):
     path = tmp_path / ".env"
     path.write_text("NOT_A_SETTING\nKEY=value\n")
     assert read_env_file(path) == {"KEY": "value"}
+
+
+def test_header_newlines_survive_the_one_line_dotenv_reader(tmp_path):
+    path = tmp_path / ".env"
+    path.write_text('BIOPB_AGENT_HEADERS="X-A: one\\nX-B: two"\n')
+    values = read_env_file(path)
+    assert values["BIOPB_AGENT_HEADERS"] == "X-A: one\\nX-B: two"
+    assert parse_env_headers(values["BIOPB_AGENT_HEADERS"]) == (
+        "X-A: one",
+        "X-B: two",
+    )
 
 
 def test_no_file_anywhere_is_not_an_error(tmp_path, no_dotenv):
@@ -245,7 +293,7 @@ class _Choice:
         self.finish_reason = finish_reason
 
 
-def _fake_openai(monkeypatch, content, finish_reason):
+def _fake_openai(monkeypatch, content, finish_reason, captured=None):
     module = types.ModuleType("openai")
 
     class _Completions:
@@ -254,10 +302,31 @@ def _fake_openai(monkeypatch, content, finish_reason):
 
     class _OpenAI:
         def __init__(self, **kwargs):
+            if captured is not None:
+                captured.update(kwargs)
             self.chat = types.SimpleNamespace(completions=_Completions())
 
     module.OpenAI = _OpenAI
     monkeypatch.setitem(sys.modules, "openai", module)
+
+
+def test_both_openai_clients_forward_endpoint_headers(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    choice = parse_choice("openai:m", "https://gateway.test/v1", ("X-Trace: trace-1",))
+
+    agent_kwargs = {}
+    _fake_openai(monkeypatch, content="ok", finish_reason="stop", captured=agent_kwargs)
+    agent = ToolCallingAgent(choice=choice, session="agent-session")
+    agent._client()
+    assert agent_kwargs["default_headers"] == {"X-Trace": "trace-1"}
+
+    backend_kwargs = {}
+    _fake_openai(
+        monkeypatch, content="ok", finish_reason="stop", captured=backend_kwargs
+    )
+    backend = OpenAICompatText(choice, session="respondent-session")
+    backend.complete(system="s", messages=[], max_tokens=16)
+    assert backend_kwargs["default_headers"] == {"X-Trace": "trace-1"}
 
 
 def _fake_anthropic(monkeypatch, blocks, stop_reason):
