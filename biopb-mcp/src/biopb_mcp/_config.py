@@ -502,6 +502,14 @@ class ChatConfig:
         "Seconds to wait for one model reply. Covers a slow first token on a "
         "long conversation, not the tool calls it triggers.",
     )
+    extra_headers: list = _hlist(
+        [],
+        "Extra headers to send with every request, as 'Name: value'. For a "
+        "gateway that requires something the OpenAI API does not define -- a "
+        "session id, an attribution tag. '{session}' becomes this "
+        "conversation's id. Known gateways are configured automatically; these "
+        "merge over that by name, and a name with an empty value removes one.",
+    )
     vision: str = _h(
         "auto",
         "Whether screenshots are sent to the model: 'auto' sends them until the "

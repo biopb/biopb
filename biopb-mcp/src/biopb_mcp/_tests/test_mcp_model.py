@@ -113,6 +113,10 @@ class _FakeClient:
         )
         return type(self).reply
 
+    async def get(self, url, headers=None):
+        type(self).gets.append({"url": url, "headers": headers})
+        return type(self).reply
+
 
 def _response(status=200, payload=None, text=""):
     return httpx.Response(
@@ -127,6 +131,7 @@ class TestCall:
     @pytest.fixture(autouse=True)
     def stub(self, monkeypatch):
         _FakeClient.calls = []
+        _FakeClient.gets = []
         monkeypatch.setattr(_model.httpx, "AsyncClient", _FakeClient)
         yield
 
@@ -145,6 +150,51 @@ class TestCall:
         # The loop ends a turn when no tool_calls come back, so the model has to
         # stay free to answer rather than being forced to call something.
         assert call["json"]["tool_choice"] == "auto"
+
+    def test_a_gateways_own_headers_ride_along(self, config, state_home):
+        # A gateway in front of the OpenAI shape wants something the API never
+        # defined; the endpoint policy decides what, and this is the wiring.
+        from biopb_mcp.mcp import _chat
+
+        write_credential("sk-x", _model.KEY_NAME)
+        config["chat"]["base_url"] = "https://opencode.ai/zen/go/v1"
+        _FakeClient.reply = _response(payload={"choices": [{"message": {}}]})
+        asyncio.run(_model.make_model(config)([], []))
+
+        (call,) = _FakeClient.calls
+        assert call["headers"]["x-opencode-session"] == _chat.session_id()
+        assert call["headers"]["Authorization"] == "Bearer sk-x"
+
+    def test_the_session_header_follows_the_conversation_not_the_process(
+        self, config, state_home
+    ):
+        # It names the conversation, so a new thread is a new id -- otherwise a
+        # gateway attributes this thread's traffic to the one before it.
+        from biopb_mcp.mcp import _chat
+
+        write_credential("sk-x", _model.KEY_NAME)
+        config["chat"]["base_url"] = "https://opencode.ai/zen/go/v1"
+        _FakeClient.reply = _response(payload={"choices": [{"message": {}}]})
+        model = _model.make_model(config)
+        asyncio.run(model([], []))
+        _chat.reset()
+        asyncio.run(model([], []))
+
+        first, second = (c["headers"]["x-opencode-session"] for c in _FakeClient.calls)
+        assert first != second
+        assert second == _chat.session_id()
+
+    def test_the_catalogue_request_is_identified_too(self, config, state_home):
+        # It goes to the same gateway, and after the deadline a header-less GET
+        # is a 4xx that list_models turns into an empty picker.
+        write_credential("sk-x", _model.KEY_NAME)
+        config["chat"]["base_url"] = "https://opencode.ai/zen/go/v1"
+        _FakeClient.reply = _response(payload={"data": [{"id": "m-1"}]})
+        assert asyncio.run(_model.list_models(config)) == [
+            {"value": "m-1", "name": "m-1"}
+        ]
+        (call,) = _FakeClient.gets
+        assert call["headers"]["x-opencode-session"]
 
     def test_a_replaced_key_takes_effect_on_the_next_turn(self, config, state_home):
         # The file is how a user *sets* their key; a session that must be
