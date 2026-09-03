@@ -44,7 +44,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from biopb import _locations
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
@@ -79,7 +79,13 @@ class DataPlaneSpec:
     target and not a connect target.
 
     ``tls`` serves the flight plane over TLS (``--tls``); clients then dial
-    ``grpcs://``. ``token`` is the data-plane access token the caller resolved:
+    ``grpcs://``. ``tls_cert``/``tls_key`` name an operator-supplied certificate
+    to serve instead of the self-signed one the plane mints into the state tree,
+    and ``sans`` names extra hosts for a cert the plane does mint -- all three
+    forwarded to ``launch`` verbatim (biopb/biopb#913). They are the caller's to
+    validate; the supervisor only passes them on.
+
+    ``token`` is the data-plane access token the caller resolved:
     always set in remote mode, and ``None`` in local mode *unless* a token was
     supplied there too (local mode allows an optional token — enforcement is
     independent of the loopback/public bind).
@@ -89,6 +95,9 @@ class DataPlaneSpec:
     grpc_host: str = "127.0.0.1"
     grpc_port: int = 8815
     tls: bool = False
+    tls_cert: Optional[Path] = None
+    tls_key: Optional[Path] = None
+    sans: Tuple[str, ...] = ()
     web_host: str = "127.0.0.1"
     web_port: int = 8814
     # The built web/ SPA bundle. Consumed by the *control* (it is the single web
@@ -185,6 +194,12 @@ class DataPlaneSupervisor:
         ]
         if s.tls:
             argv.append("--tls")
+        # Both or neither -- `launch` exits 2 on a half pair, and the caller has
+        # already refused one, so this cannot emit a lone flag.
+        if s.tls_cert and s.tls_key:
+            argv += ["--tls-cert", str(s.tls_cert), "--tls-key", str(s.tls_key)]
+        for san in s.sans:
+            argv += ["--san", san]
         return argv
 
     def _child_env(self) -> dict:

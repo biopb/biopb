@@ -15,8 +15,11 @@ The security-relevant behavior:
   Local mode (loopback) binds token-less.
 """
 
+import os
+import sys
 from unittest.mock import patch
 
+import pytest
 from biopb import _web_auth
 
 import biopb_control.__main__ as m
@@ -228,3 +231,91 @@ def test_url_prefix_reaches_the_spec_normalized():
     rc, spec, _ = _capture(_BASE_ARGV + ["--url-prefix", "/node/h/29847/"], {})
     assert rc == 0
     assert spec.url_prefix == "/node/h/29847"
+
+
+# --- BYO TLS material (biopb/biopb#913) ------------------------------------
+# `serve` and `launch` have taken --tls-cert/--tls-key/--san all along; the one
+# entry point a deployment actually invokes did not, so the only way to hand the
+# plane a stable certificate was to pre-seed the state tree behind the control's
+# back.
+
+
+def _cert_pair(tmp_path):
+    """A readable PEM pair: the preflight validates the bytes, not just the path."""
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_bytes(
+        b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+    )
+    key.write_bytes(
+        b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
+    )
+    return cert, key
+
+
+def test_byo_tls_material_reaches_the_spec(tmp_path):
+    cert, key = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(
+        _BASE_ARGV
+        + ["--tls-cert", str(cert), "--tls-key", str(key), "--san", "a", "--san", "b"],
+        {},
+    )
+    assert rc == 0
+    assert (spec.tls_cert, spec.tls_key) == (cert, key)
+    assert spec.sans == ("a", "b")
+
+
+def test_a_supplied_cert_implies_tls(tmp_path):
+    """The control advertises the plane's scheme from this flag, so it must agree
+    with what the plane will actually serve."""
+    cert, key = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(
+        _BASE_ARGV + ["--tls-cert", str(cert), "--tls-key", str(key)], {}
+    )
+    assert rc == 0 and spec.tls is True
+
+
+def test_half_a_cert_pair_is_refused_before_anything_starts(tmp_path):
+    cert, _ = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(_BASE_ARGV + ["--tls-cert", str(cert)], {})
+    assert rc == 2 and spec is None
+
+
+def test_an_unreadable_cert_is_refused_before_anything_starts(tmp_path):
+    """Otherwise `launch` exits 2 on every spawn and the control crash-loops it,
+    reporting a clean start with the reason buried in tensor-server.log."""
+    _, key = _cert_pair(tmp_path)
+    rc, spec, _ = _capture(
+        _BASE_ARGV
+        + ["--tls-cert", str(tmp_path / "absent.pem"), "--tls-key", str(key)],
+        {},
+    )
+    assert rc == 2 and spec is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads anything"
+)
+def test_a_key_only_root_can_read_is_refused_before_anything_starts(tmp_path):
+    """`is_file()` passes on a 0600 key owned by someone else; opening it does
+    not, and opening it is what the data plane will do (biopb/biopb#913)."""
+    cert, key = _cert_pair(tmp_path)
+    key.chmod(0o000)
+    try:
+        rc, spec, _ = _capture(
+            _BASE_ARGV + ["--tls-cert", str(cert), "--tls-key", str(key)], {}
+        )
+        assert rc == 2 and spec is None
+    finally:
+        key.chmod(0o600)
+
+
+def test_no_tls_material_leaves_the_spec_alone():
+    rc, spec, _ = _capture(_BASE_ARGV, {})
+    assert rc == 0
+    assert (spec.tls, spec.tls_cert, spec.tls_key, spec.sans) == (
+        False,
+        None,
+        None,
+        (),
+    )

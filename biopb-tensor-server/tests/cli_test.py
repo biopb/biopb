@@ -849,16 +849,20 @@ def test_launch_points_the_sidecar_at_grpcs_and_hands_it_the_cert(
     The sidecar is co-located, so it gets the served cert as an explicit trust
     anchor rather than pinning it off the wire.
     """
+    # PEM-shaped, not a placeholder string: the BYO pair is validated by opening
+    # it and looking at the bytes (biopb/biopb#913).
+    cert_pem = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+    key_pem = b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-    cert.write_bytes(b"CERTPEM")
-    key.write_bytes(b"KEYPEM")
+    cert.write_bytes(cert_pem)
+    key.write_bytes(key_pem)
 
     captured = _launch_capturing_tls(
         monkeypatch, _fake_server_config(), tls_cert=cert, tls_key=key
     )
 
-    assert captured["flight_cert"] == b"CERTPEM"  # the plane serves it...
-    assert captured["tls_ca_pem"] == b"CERTPEM"  # ...and the sidecar trusts it
+    assert captured["flight_cert"] == cert_pem  # the plane serves it...
+    assert captured["tls_ca_pem"] == cert_pem  # ...and the sidecar trusts it
     assert captured["flight_location"].startswith("grpcs://")
 
 

@@ -14,7 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _endpoints, _locations, _web_auth
+from . import _agents, _endpoints, _locations, _tls_material, _web_auth
 from ._endpoints import (
     flight_port_for as _flight_port,
     sidecar_port_for as _sidecar_port,
@@ -856,6 +856,39 @@ def _resolve_tls(tls: Optional[bool], grpc_bind: str) -> bool:
     return _web_auth.host_is_public_bind(grpc_bind)
 
 
+def _resolve_tls_material(
+    tls: bool, tls_cert: Optional[Path], tls_key: Optional[Path]
+) -> bool:
+    """Validate BYO TLS material and return whether the plane serves TLS.
+
+    A supplied cert means TLS whether or not ``--tls`` was also passed: the plane
+    serves it either way, and this is also the flag the control advertises the
+    plane's scheme from, so leaving it false would publish ``grpc://`` for a
+    ``grpcs://`` plane.
+
+    Validated here, in the command the user typed, for the same reason
+    :func:`_require_tls_extra` is: a half pair, or material the server cannot
+    read, exits 2 in the supervised child -- which crash-loops on backoff with
+    the one useful sentence in tensor-server.log while the control reports a
+    clean start (biopb/biopb#913). Each file is opened rather than stat'd: a key
+    readable only by root passes ``is_file()`` and fails everything after it. The
+    rule is shared with the other two entry points that resolve this same pair
+    (:mod:`biopb._tls_material`).
+    """
+    if (tls_cert is None) != (tls_key is None):
+        console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
+        raise typer.Exit(2)
+    for label, path in (("--tls-cert", tls_cert), ("--tls-key", tls_key)):
+        if path is None:
+            continue
+        try:
+            _tls_material.read_pem(path, label)
+        except _tls_material.TlsMaterialError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(2) from None
+    return tls or tls_cert is not None
+
+
 def _warn_public_plaintext(grpc_bind: str, tls: bool) -> None:
     """Warn when the data plane is published without TLS (an explicit --no-tls)."""
     if not tls and _web_auth.host_is_public_bind(grpc_bind):
@@ -1001,6 +1034,9 @@ def _control_run_argv(
     data_plane: bool,
     grpc_bind: str,
     tls: bool = False,
+    tls_cert: Optional[Path] = None,
+    tls_key: Optional[Path] = None,
+    san: Optional[List[str]] = None,
     url_prefix: Optional[str] = None,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
@@ -1060,6 +1096,12 @@ def _control_run_argv(
         argv.append("--no-data-plane")
     if tls:
         argv.append("--tls")
+    # Paths and hostnames, not secrets -- unlike the token above, these belong on
+    # the argv (biopb/biopb#913).
+    if tls_cert and tls_key:
+        argv += ["--tls-cert", str(tls_cert), "--tls-key", str(tls_key)]
+    for name in san or ():
+        argv += ["--san", name]
     return argv
 
 
@@ -1111,6 +1153,35 @@ _OPT_TLS = typer.Option(
     "fingerprint with `biopb-tensor-server cert init`. --no-tls on a public bind "
     "sends the token in cleartext — trusted networks only.",
 )
+_OPT_TLS_CERT = typer.Option(
+    None,
+    "--tls-cert",
+    help="PEM certificate chain the data plane serves, instead of the "
+    "self-signed one it mints into the state tree. Implies --tls, and needs no "
+    "'cryptography' extra. Use it to serve one long-lived certificate that "
+    "outlives a single launch — one cert shared by every node a scheduler might "
+    "pick — so clients pin once instead of per launch. It must carry a loopback "
+    "SAN (localhost / 127.0.0.1) besides the names clients dial, or the "
+    "co-located sidecar cannot reach the flight plane; and a client on this "
+    "machine reads its anchor from the state tree, so put a copy of the cert "
+    "(not the key) there too. Requires --tls-key.",
+)
+_OPT_TLS_KEY = typer.Option(
+    None,
+    "--tls-key",
+    help="PEM private key paired with --tls-cert.",
+)
+_OPT_SAN = typer.Option(
+    None,
+    "--san",
+    help="Extra hostname or IP to put in the certificate the data plane mints "
+    "(repeatable). Needed when clients dial a name this host cannot discover "
+    "itself — a NAT/VPN address, a CNAME, the scheduler's name for this node — "
+    "because gRPC verifies the dialed name against the SANs even though trust "
+    "comes from the client's pin. Applies only when the cert is generated: it is "
+    "ignored once one exists (re-mint with `biopb-tensor-server cert init "
+    "--force --san ...`) and by --tls-cert.",
+)
 _OPT_TOKEN = typer.Option(
     None,
     "--token",
@@ -1151,6 +1222,9 @@ def control_start(
     log_level: str = _OPT_LOG_LEVEL,
     grpc_bind: Optional[str] = _OPT_GRPC_BIND,
     tls: Optional[bool] = _OPT_TLS,
+    tls_cert: Optional[Path] = _OPT_TLS_CERT,
+    tls_key: Optional[Path] = _OPT_TLS_KEY,
+    san: Optional[List[str]] = _OPT_SAN,
     token: Optional[str] = _OPT_TOKEN,
     data_plane: bool = _OPT_DATA_PLANE,
     url_prefix: Optional[str] = _OPT_URL_PREFIX,
@@ -1184,6 +1258,20 @@ def control_start(
     control's own guard share, so "public but unauthenticated" is unrepresentable
     rather than something to validate against (biopb/biopb#604).
 
+    **A certificate that outlives one launch.** ``--tls`` alone mints a
+    self-signed cert into the state tree and clients pin it on first connect, so
+    a deployment that re-mints — a per-job state tree, an ephemeral container
+    volume — hands a returning client a certificate it refuses. ``--tls-cert`` /
+    ``--tls-key`` serve an operator's own long-lived cert instead (no
+    ``cryptography`` needed), and ``--san`` names addresses a minted cert could
+    not discover for itself; both are forwarded to the data plane.
+
+    A supplied cert has to satisfy the two consumers *on this machine*, which the
+    minted one satisfies by construction: the co-located sidecar dials the plane
+    over loopback, so the cert needs a ``localhost`` / ``127.0.0.1`` SAN, and a
+    local SDK client anchors on ``state/biopb/tls/server-cert.pem``, so a copy of
+    the cert (never the key) belongs there as well.
+
     Only the flight plane is ever published. The tensor HTTP sidecar stays on
     loopback (the control proxies it), and so does the control itself — the
     browser UI is plaintext HTTP with no TLS support, so publishing it would send
@@ -1195,8 +1283,10 @@ def control_start(
     _require_biopb_control()
     grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
     url_prefix = _resolve_url_prefix(url_prefix)
-    tls = _resolve_tls(tls, grpc_bind)
-    if tls:
+    tls = _resolve_tls_material(_resolve_tls(tls, grpc_bind), tls_cert, tls_key)
+    # A BYO cert is read straight off disk, so it is the escape hatch when the
+    # extra is not installed -- only a cert the plane has to *mint* needs it.
+    if tls and tls_cert is None:
         _require_tls_extra()
     _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
@@ -1237,6 +1327,9 @@ def control_start(
                 data_plane=data_plane,
                 grpc_bind=grpc_bind,
                 tls=tls,
+                tls_cert=tls_cert,
+                tls_key=tls_key,
+                san=san,
                 url_prefix=url_prefix,
             )
 
@@ -1491,6 +1584,9 @@ def control_run(
     log_level: str = _OPT_LOG_LEVEL,
     grpc_bind: Optional[str] = _OPT_GRPC_BIND,
     tls: Optional[bool] = _OPT_TLS,
+    tls_cert: Optional[Path] = _OPT_TLS_CERT,
+    tls_key: Optional[Path] = _OPT_TLS_KEY,
+    san: Optional[List[str]] = _OPT_SAN,
     token: Optional[str] = _OPT_TOKEN,
     data_plane: bool = _OPT_DATA_PLANE,
     url_prefix: Optional[str] = _OPT_URL_PREFIX,
@@ -1518,8 +1614,10 @@ def control_run(
     _require_biopb_control()
     grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
     url_prefix = _resolve_url_prefix(url_prefix)
-    tls = _resolve_tls(tls, grpc_bind)
-    if tls:
+    tls = _resolve_tls_material(_resolve_tls(tls, grpc_bind), tls_cert, tls_key)
+    # A BYO cert is read straight off disk, so it is the escape hatch when the
+    # extra is not installed -- only a cert the plane has to *mint* needs it.
+    if tls and tls_cert is None:
         _require_tls_extra()
     _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
@@ -1545,6 +1643,9 @@ def control_run(
         grpc_host=grpc_host,
         grpc_port=grpc_port,
         tls=tls,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
+        sans=tuple(san or ()),
         web_host="127.0.0.1",
         web_port=_sidecar_port(base_port),
         static_dir=static_dir if (static_dir and static_dir.exists()) else None,
@@ -1624,6 +1725,9 @@ def dashboard(
                 log_level="INFO",
                 grpc_bind=grpc_bind,
                 tls=None,
+                tls_cert=None,
+                tls_key=None,
+                san=None,
                 token=None,
                 data_plane=True,
                 remote=remote,

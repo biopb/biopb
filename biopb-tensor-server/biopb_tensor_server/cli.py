@@ -544,18 +544,21 @@ def _resolve_tls_material(
 
     # A BYO cert (both files given) is read straight off disk -- no `cryptography`
     # needed, so this is the escape hatch when the [tls] extra isn't installed.
-    # Existence is re-checked here rather than left to typer's `exists=True`: the
-    # pair can also arrive from the config file, which never passed through it.
+    # Re-validated here rather than left to typer's `exists=True`, because the
+    # pair can also arrive from the config file, which never passed through it --
+    # and by the shared rule, so what the control's preflight accepted is exactly
+    # what this accepts.
     if tls_cert is not None:
-        for label, path in (("tls_cert", tls_cert), ("tls_key", tls_key)):
-            if not path.is_file():
-                console.print(
-                    f"[red]{label} not found: {_rich_escape(str(path))}[/red]"
-                )
-                raise typer.Exit(code=2)
-        cert_pem = tls_cert.read_bytes()
+        from biopb._tls_material import TlsMaterialError, read_pem
+
+        try:
+            cert_pem = read_pem(tls_cert, "tls_cert")
+            key_pem = read_pem(tls_key, "tls_key")
+        except TlsMaterialError as e:
+            console.print(f"[red]{_rich_escape(str(e))}[/red]")
+            raise typer.Exit(code=2) from None
         _warn_if_expiring(cert_pem)
-        return cert_pem, tls_key.read_bytes()
+        return cert_pem, key_pem
 
     if not tls:
         return None, None

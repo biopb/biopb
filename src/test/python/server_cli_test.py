@@ -13,6 +13,7 @@ deterministic and fast on any platform; time.sleep is neutralized.
 import inspect
 import json
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import biopb.cli as cli
@@ -824,6 +825,137 @@ class TestPlaneBind:
         }
         assert "--tls" not in cli._control_run_argv(**kwargs)
         assert "--tls" in cli._control_run_argv(**kwargs, tls=True)
+
+
+class TestControlTlsMaterial:
+    """`--tls-cert` / `--tls-key` / `--san`, forwarded to the data plane.
+
+    `serve` and `launch` have taken all three since TLS landed; `control start` /
+    `control run` -- the entry point a deployment actually invokes -- took only
+    `--tls`, so an operator with a certificate of their own had to pre-seed the
+    state tree behind the control's back (biopb/biopb#913).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_helpers(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
+        monkeypatch.delenv("BIOPB_CONTROL_HOST", raising=False)
+        monkeypatch.setattr(cli, "_get_log_file", lambda: tmp_path / "s.log")
+        monkeypatch.setattr(
+            cli, "_control_shutdown_sentinel", lambda: tmp_path / "c.stop"
+        )
+
+    @staticmethod
+    def _pair(tmp_path):
+        """A readable PEM pair -- the material's *bytes* are validated, not just
+        its existence, so a placeholder string no longer passes."""
+        cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+        cert.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+        )
+        key.write_bytes(
+            b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
+        )
+        return cert, key
+
+    def test_the_material_is_forwarded_on_the_child_argv(self, tmp_path):
+        """`control start`'s hop: the daemon spawns the control as a subprocess."""
+        cert, key = self._pair(tmp_path)
+        argv = cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="127.0.0.1",
+            base_port=8810,
+            log_level="INFO",
+            data_plane=True,
+            grpc_bind="127.0.0.1",
+            tls=True,
+            tls_cert=cert,
+            tls_key=key,
+            san=["gpu-051.hpc.example"],
+        )
+        assert argv[argv.index("--tls-cert") + 1] == str(cert)
+        assert argv[argv.index("--tls-key") + 1] == str(key)
+        assert argv[argv.index("--san") + 1] == "gpu-051.hpc.example"
+
+    def test_a_supplied_cert_means_tls_even_without_the_flag(self, tmp_path):
+        """The control advertises the plane's scheme from this, so a cert that is
+        served must not leave it reporting grpc://."""
+        cert, key = self._pair(tmp_path)
+        assert cli._resolve_tls_material(False, cert, key) is True
+        assert cli._resolve_tls_material(False, None, None) is False
+
+    def test_unusable_tls_material_fails_the_command_the_user_typed(self, tmp_path):
+        """Not the supervised child, which would crash-loop on backoff with the
+        reason in tensor-server.log while the control reported a clean start."""
+        cert, key = self._pair(tmp_path)
+        with pytest.raises(typer.Exit):  # half a pair
+            cli._resolve_tls_material(True, cert, None)
+        with pytest.raises(typer.Exit):  # names a file that isn't there
+            cli._resolve_tls_material(True, tmp_path / "absent.pem", key)
+        empty = tmp_path / "empty.pem"
+        empty.write_text("")
+        with pytest.raises(typer.Exit):  # exists, holds nothing
+            cli._resolve_tls_material(True, empty, key)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads anything"
+    )
+    def test_a_key_that_only_root_can_read_is_caught_here(self, tmp_path):
+        """The preflight opens the pair rather than stat'ing it: mode 0600 owned
+        by someone else is the ordinary shape of a private key, and `is_file()`
+        passes on it (biopb/biopb#913)."""
+        cert, key = self._pair(tmp_path)
+        key.chmod(0o000)
+        try:
+            assert key.is_file()
+            with pytest.raises(typer.Exit):
+                cli._resolve_tls_material(True, cert, key)
+        finally:
+            key.chmod(0o600)
+
+    def test_control_run_puts_the_material_on_the_spec(self, tmp_path, monkeypatch):
+        """`control run`'s hop -- the foreground command an Open OnDemand app
+        invokes builds the spec itself, with no argv in between.
+
+        Needs biopb-control installed, which the core CI job (`.[test,tensor]`)
+        deliberately does not do; control-ci runs this file with `-k Control` and
+        the package present, which is what this class is named to match.
+        """
+        pytest.importorskip("biopb_control")
+        import biopb_control
+
+        cert, key = self._pair(tmp_path)
+        captured = {}
+        monkeypatch.setattr(
+            biopb_control,
+            "run_control",
+            lambda spec, **_k: captured.setdefault("spec", spec) and 0,
+        )
+        monkeypatch.setattr(cli, "_guard_ports_free", lambda *_a, **_k: None)
+        monkeypatch.setattr(cli, "_ensure_dirs", lambda: None)
+        monkeypatch.setattr(cli, "_reject_legacy_toml", lambda _c: None)
+
+        with pytest.raises(typer.Exit):
+            cli.control_run(
+                config=tmp_path / "biopb.json",
+                static_dir=None,
+                base_port=8810,
+                log_level="INFO",
+                grpc_bind="127.0.0.1",
+                tls=None,
+                tls_cert=cert,
+                tls_key=key,
+                san=["gpu-051.hpc.example"],
+                token=None,
+                data_plane=True,
+                url_prefix=None,
+                remote=False,
+            )
+        spec = captured["spec"]
+        assert (spec.tls, spec.tls_cert, spec.tls_key) == (True, cert, key)
+        assert spec.sans == ("gpu-051.hpc.example",)
 
 
 class TestBasePort:
