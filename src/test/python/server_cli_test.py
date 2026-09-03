@@ -826,7 +826,7 @@ class TestPlaneBind:
         assert "--tls" in cli._control_run_argv(**kwargs, tls=True)
 
 
-class TestByoTlsMaterial:
+class TestControlTlsMaterial:
     """`--tls-cert` / `--tls-key` / `--san`, forwarded to the data plane.
 
     `serve` and `launch` have taken all three since TLS landed; `control start` /
@@ -890,7 +890,13 @@ class TestByoTlsMaterial:
 
     def test_control_run_puts_the_material_on_the_spec(self, tmp_path, monkeypatch):
         """`control run`'s hop -- the foreground command an Open OnDemand app
-        invokes builds the spec itself, with no argv in between."""
+        invokes builds the spec itself, with no argv in between.
+
+        Needs biopb-control installed, which the core CI job (`.[test,tensor]`)
+        deliberately does not do; control-ci runs this file with `-k Control` and
+        the package present, which is what this class is named to match.
+        """
+        pytest.importorskip("biopb_control")
         import biopb_control
 
         cert, key = self._pair(tmp_path)
