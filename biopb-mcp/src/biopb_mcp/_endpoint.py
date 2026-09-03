@@ -100,6 +100,9 @@ def parse_env_headers(raw: str) -> tuple:
     Newline-separated, because a header value may contain any of the characters
     a one-line separator would have to be — including the ``:`` that separates
     the name from the value, and the ``;`` and ``,`` that appear inside dates
-    and lists. One header is the common case and needs no separator at all.
+    and lists. In dotenv files, write newlines as the two characters ``\\n``;
+    the small dotenv reader intentionally reads one physical line at a time.
+    One header is the common case and needs no separator at all.
     """
+    raw = raw.replace("\\n", "\n")
     return tuple(line.strip() for line in raw.splitlines() if line.strip())

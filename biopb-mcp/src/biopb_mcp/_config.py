@@ -508,7 +508,10 @@ class ChatConfig:
         "gateway that requires something the OpenAI API does not define -- a "
         "session id, an attribution tag. '{session}' becomes this "
         "conversation's id. Known gateways are configured automatically; these "
-        "merge over that by name, and a name with an empty value removes one.",
+        "merge over that by name, and a name with an empty value removes one. "
+        "These values are returned by /api/mcp_config and must not contain "
+        "secrets; keep API keys and authorization tokens in the credential "
+        "file instead.",
     )
     vision: str = _h(
         "auto",
