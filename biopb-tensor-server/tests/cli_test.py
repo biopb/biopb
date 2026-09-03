@@ -7,6 +7,7 @@ import typer
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.recovery import ProcessLock
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.tls import cert_fingerprint
 
 
 def _cache_lock_is_free(lock_path: Path) -> bool:
@@ -862,14 +863,17 @@ def test_launch_points_the_sidecar_at_grpcs_and_hands_it_the_cert(
     )
 
     assert captured["flight_cert"] == cert_pem  # the plane serves it...
-    assert captured["tls_ca_pem"] == cert_pem  # ...and the sidecar trusts it
+    # ...and the sidecar verifies that exact leaf on every connect. A fingerprint
+    # rather than the PEM, because the PEM resolves offline and so forfeits the
+    # hostname override this loopback dial needs (biopb/biopb#916).
+    assert captured["tls_fingerprint"] == cert_fingerprint(cert_pem)
     assert captured["flight_location"].startswith("grpcs://")
 
 
 def test_launch_without_tls_keeps_the_sidecar_on_plaintext(monkeypatch):
     captured = _launch_capturing_tls(monkeypatch, _fake_server_config())
     assert captured["flight_cert"] is None
-    assert captured["tls_ca_pem"] is None
+    assert captured["tls_fingerprint"] is None
     assert captured["flight_location"].startswith("grpc://")
 
 

@@ -1698,18 +1698,24 @@ def launch(
         elif _flight_connect_host == "::":
             _flight_connect_host = "::1"
         flight_location = _grpc_location(_flight_connect_host, port)
+        flight_fingerprint = None
         if tls_cert_chain is not None:
+            from biopb_tensor_server.core.tls import cert_fingerprint, leaf_pem
+
             # The sidecar is on the same host as the flight plane and holds the
-            # very cert that plane serves, so it trusts it directly (passed below
-            # as the client's root) rather than trust-on-first-use: an anchor read
-            # off local disk is strictly stronger than a pin learned from the
-            # wire, and it keeps the sidecar off the pin store entirely.
+            # very cert that plane serves, so it verifies that exact certificate
+            # rather than pinning whatever answers (TOFU) or trusting the CA that
+            # issued it -- and it stays off the pin store entirely.
             #
-            # The auto-generated cert always carries localhost/127.0.0.1/::1 (see
-            # core.tls._host_identity), so the loopback dial matches its SANs. A
-            # BYO cert minted only for a public name does not, and gRPC still
-            # checks the dialed name against the SANs even when trust comes from
-            # this explicit root -- hence the --tls-cert help text.
+            # Identified by fingerprint, not by handing over the PEM
+            # (biopb/biopb#916): the PEM resolves offline, which also skips the
+            # hostname-override probe, and this dial is loopback. The generated
+            # cert always carries localhost/127.0.0.1/::1 (core.tls._host_identity)
+            # so it matched anyway; a BYO cert minted for the host's public name
+            # alone did not, and failed every request with "Peer name 127.0.0.1 is
+            # not in peer certificate". Resolving by fingerprint ends with the
+            # presented leaf as the anchor, which is what earns the override.
+            flight_fingerprint = cert_fingerprint(leaf_pem(tls_cert_chain))
             flight_location = flight_location.replace("grpc://", "grpcs://", 1)
         flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
         flight_thread.start()
@@ -1757,7 +1763,7 @@ def launch(
             port=web_port,
             cors_origins=effective_cors,
             config_path=str(config),
-            tls_ca_pem=tls_cert_chain,
+            tls_fingerprint=flight_fingerprint,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")

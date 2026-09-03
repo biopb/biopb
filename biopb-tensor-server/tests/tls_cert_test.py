@@ -130,6 +130,27 @@ def test_validity_span_matches_the_documented_days():
     assert span.days == 10
 
 
+def test_leaf_pem_takes_the_first_certificate_of_a_chain():
+    """ "The certificate this server presents" means the leaf, chain or not.
+
+    A `--tls-cert` may be a chain (leaf first, as the wire requires), and both
+    the fingerprint a client verifies and `PEM_cert_to_DER_cert` want exactly one
+    certificate (biopb/biopb#916).
+    """
+    from biopb_tensor_server.core import tls as tls_mod
+
+    leaf, _ = tls_mod.generate_self_signed_cert(["localhost"], [])
+    issuer, _ = tls_mod.generate_self_signed_cert(["Example Issuing CA"], [])
+
+    assert tls_mod.leaf_pem(leaf) == leaf  # a lone cert is returned unchanged
+    assert tls_mod.leaf_pem(leaf + issuer) == leaf
+    assert tls_mod.cert_fingerprint(tls_mod.leaf_pem(leaf + issuer)) == (
+        tls_mod.cert_fingerprint(leaf)
+    )
+    # Nothing recognizable is left to the caller that validated the material.
+    assert tls_mod.leaf_pem(b"not a certificate") == b"not a certificate"
+
+
 def test_expiry_warning_fires_only_near_the_end_of_the_span():
     """Nothing else watches notAfter, and a pin does not excuse it (biopb/biopb#913).
 

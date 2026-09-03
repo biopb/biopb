@@ -88,6 +88,14 @@ _FETCH_TIMEOUT_S = 10.0
 # than the message text: the wording is OpenSSL's to change, the number is ABI.
 _VERIFY_CODE_EXPIRED = 10
 
+# The dialed name is not in the certificate: ``X509_V_ERR_HOSTNAME_MISMATCH`` and
+# ``X509_V_ERR_IP_ADDRESS_MISMATCH``. **Both**, because which one you get depends
+# on what was dialed, and the second is not a corner case: the co-located sidecar
+# always dials an address (127.0.0.1 / ::1), and OpenSSL words that one "IP
+# address mismatch" — so a check for the string "hostname mismatch" silently
+# declined to help exactly the caller that needed it most (biopb/biopb#916).
+_VERIFY_CODES_NAME_MISMATCH = (62, 64)
+
 # Per-process memo. Resolution is called on paths that can hit a pooled,
 # already-open connection (``_get_thread_client``'s fast path) and is evaluated
 # eagerly as an argument there, so without this every ``GetFlightInfo`` would
@@ -323,7 +331,8 @@ def _resolve_hostname_override(
 
     gRPC matches the **dialed** name against the cert's SANs even when the anchor
     is a pin, so a cert that pins fine still fails every handshake if its SANs
-    omit that name. When the anchor *is* the presented leaf we substitute a name
+    omit that name — an address counting as a name here, matched against the IP
+    SANs. When the anchor *is* the presented leaf we substitute a name
     the cert does list (``override_hostname``), which costs nothing: hostname
     verification exists to stop a MITM presenting a *different* validly-issued
     cert, and pinning the leaf has already foreclosed that -- the presented cert
@@ -364,11 +373,12 @@ def _resolve_hostname_override(
         # Expiry first: it is fatal and unfixable from here, unlike a name
         # mismatch (biopb/biopb#913).
         _raise_if_expired(host, port, e, tofu=tofu)
-        # verify_message is the OpenSSL reason; code 62 is hostname mismatch. Let
-        # OpenSSL make this call rather than comparing the SANs ourselves: it is
-        # what already implements wildcards, IP SANs, case and trailing dots, and
-        # a naive membership test would override certs that in fact match.
-        if "hostname mismatch" not in str(e).lower():
+        # Let OpenSSL make the "is the dialed name covered" call rather than
+        # comparing the SANs ourselves: it is what already implements wildcards,
+        # IP SANs, case and trailing dots, and a naive membership test would
+        # override certs that in fact match. Read as a verify code, not as
+        # message text -- see _VERIFY_CODES_NAME_MISMATCH.
+        if getattr(e, "verify_code", None) not in _VERIFY_CODES_NAME_MISMATCH:
             return None
     except Exception:  # noqa: BLE001 - a diagnostic must never break the caller
         return None

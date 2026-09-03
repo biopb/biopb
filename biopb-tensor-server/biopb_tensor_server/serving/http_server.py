@@ -302,15 +302,26 @@ class _SidecarContext:
         cache_bytes: int,
         config_path: Optional[str] = None,
         supervised: bool = False,
-        tls_ca_pem: Optional[bytes] = None,
+        tls_fingerprint: Optional[str] = None,
     ) -> None:
         self.flight_location = flight_location
         self.token = token
         self.cache_bytes = cache_bytes
-        # PEM the flight plane serves, when it serves TLS. We are co-located with
-        # that plane and read this off local disk, so it is an explicit trust
-        # anchor -- not a trust-on-first-use pin. None for a plaintext plane.
-        self.tls_ca_pem = tls_ca_pem
+        # SHA-256 of the leaf the flight plane serves, when it serves TLS. We are
+        # co-located with that plane and take this from the material it was
+        # handed, so the anchor is verified rather than trusted-on-first-use --
+        # and pinning the exact certificate is stronger than trusting the CA
+        # bundle it came from, which would accept any sibling that CA issued.
+        #
+        # A fingerprint rather than the PEM (biopb/biopb#916): passing the PEM
+        # resolves entirely offline, which also skips the hostname-override probe
+        # -- and this dial is loopback, so a certificate minted for the host's
+        # public name alone (the ordinary shape of an operator's own cert) fails
+        # verification with "Peer name 127.0.0.1 is not in peer certificate". The
+        # fingerprint path reaches the wire, ends up with the presented leaf as
+        # its anchor, and so earns the override that makes the loopback dial
+        # verify. None for a plaintext plane.
+        self.tls_fingerprint = tls_fingerprint
         # The config file this daemon was launched with (read/written by the
         # /api/config endpoints).
         self.config_path = config_path
@@ -337,7 +348,7 @@ class _SidecarContext:
                         location=self.flight_location,
                         cache_bytes=self.cache_bytes,
                         token=self.token,
-                        tls_ca_pem=self.tls_ca_pem,
+                        tls_fingerprint=self.tls_fingerprint,
                     )
                     self.diag.mark_connected()
                     logger.info(f"Connected to Flight server at {self.flight_location}")
@@ -2580,7 +2591,7 @@ def create_app(
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
     supervised: Optional[bool] = None,
-    tls_ca_pem: Optional[bytes] = None,
+    tls_fingerprint: Optional[str] = None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -2605,9 +2616,10 @@ def create_app(
             restarted from the browser (biopb/biopb#418). Defaults to reading
             ``BIOPB_DATA_PLANE_SUPERVISED`` from the env the control set, so a
             directly-launched ``biopb-tensor-server launch`` is not supervised.
-        tls_ca_pem: PEM certificate the flight plane serves, when TLS is on. The
-            sidecar is co-located with that plane and reads this off local disk,
-            so it trusts it explicitly instead of pinning it on first use.
+        tls_fingerprint: SHA-256 of the leaf the flight plane serves, when TLS is
+            on. The sidecar is co-located with that plane and takes this from the
+            material it was handed, so it verifies the certificate on every
+            connect instead of pinning whatever answers first.
             ``flight_location`` must then be a ``grpcs://`` URL.
 
     Returns:
@@ -2629,7 +2641,7 @@ def create_app(
         cache_bytes=cache_bytes,
         config_path=config_path,
         supervised=supervised,
-        tls_ca_pem=tls_ca_pem,
+        tls_fingerprint=tls_fingerprint,
     )
 
     app.add_middleware(
@@ -2778,7 +2790,7 @@ def run(
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
-    tls_ca_pem: Optional[bytes] = None,
+    tls_fingerprint: Optional[str] = None,
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
     import uvicorn
@@ -2789,7 +2801,7 @@ def run(
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
         config_path=config_path,
-        tls_ca_pem=tls_ca_pem,
+        tls_fingerprint=tls_fingerprint,
     )
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     # Windows: enable graceful `biopb server stop` via a sentinel-file watcher

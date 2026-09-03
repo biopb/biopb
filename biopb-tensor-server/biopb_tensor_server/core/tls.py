@@ -281,6 +281,28 @@ def generate_self_signed_cert(
     return cert_pem, key_pem
 
 
+def leaf_pem(bundle_pem: bytes) -> bytes:
+    """The first certificate in *bundle_pem* — the leaf — as its own PEM block.
+
+    A ``--tls-cert`` may be a chain (leaf first, then issuers, which is the order
+    TLS itself requires on the wire), and everything that identifies "the
+    certificate this server presents" means the leaf: it is what a client
+    fingerprints, and what ``PEM_cert_to_DER_cert`` refuses to parse out of a
+    bundle. Stdlib string work rather than a parse, so this costs no
+    ``cryptography``.
+
+    Returns the input unchanged when it holds a single certificate, and when it
+    holds nothing recognizable — the callers that matter validated it first
+    (:mod:`biopb._tls_material`), and inventing a different failure here would
+    only move the error away from the check that owns it.
+    """
+    marker = b"-----END CERTIFICATE-----"
+    end = bundle_pem.find(marker)
+    if end == -1:
+        return bundle_pem
+    return bundle_pem[: end + len(marker)] + b"\n"
+
+
 def cert_fingerprint(cert_pem: bytes) -> str:
     """SHA-256 of the cert's DER body — the value a client's TOFU pin matches on.
 
