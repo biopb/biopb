@@ -334,6 +334,58 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
 
   useSliceWheelNavigation(hostRef, info);
 
+  // --- the value under the pointer -----------------------------------------
+  // Costs no read. Viv picks the value out of the tile deck.gl already has
+  // (`info.tile.content.data`) and gives up when there is none, so hovering
+  // over a tile that has not arrived reports nothing rather than fetching it.
+  //
+  // Fed to the badge through a ref instead of through this component's state:
+  // a pointer move at 60/s that re-rendered here would rebuild `VivStage` and,
+  // with it, every deck.gl layer.
+  const hoverSinkRef = useRef<((sample: HoverSample | null) => void) | null>(null);
+  const bindHover = useCallback((sink: ((sample: HoverSample | null) => void) | null) => {
+    hoverSinkRef.current = sink;
+  }, []);
+  const hover = useMemo(() => {
+    // Where the pointer is comes from deck.gl's own hover, which fires for
+    // every move; the value comes from Viv's hook, which fires only when there
+    // is a tile to read. Keeping them apart is what lets the readout go blank
+    // off-image instead of holding the last value it saw.
+    let at: HoverSample | null = null;
+    return {
+      onHover: (info: HoverInfo) => {
+        const c = info?.coordinate;
+        if (!c || !info.sourceLayer || c[0] === undefined || c[1] === undefined) {
+          at = null;
+          hoverSinkRef.current?.(null);
+          return;
+        }
+        // Viv reads `2 ** round(-z)` as the level's scale, so this is the same
+        // number the badge would need to explain a downsampled value.
+        const z = info.tile?.index?.z;
+        at = {
+          x: Math.floor(c[0]),
+          y: Math.floor(c[1]),
+          value: null,
+          scale: typeof z === "number" ? Math.max(1, 2 ** Math.round(-z)) : 1,
+        };
+        hoverSinkRef.current?.(at);
+      },
+      hooks: {
+        handleValue: (values: number[]) => {
+          const v = values?.[0];
+          if (at && typeof v === "number" && Number.isFinite(v)) {
+            hoverSinkRef.current?.({ ...at, value: v });
+          }
+        },
+        // Never called: Viv 0.22 destructures this hook as `handleCoordnate`,
+        // so the coordinate comes from `onHover` above. Present because the
+        // prop's type requires it.
+        handleCoordinate: () => {},
+      },
+    };
+  }, []);
+
   return (
     <div
       ref={hostRef}
@@ -354,6 +406,8 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           color={color}
           maxCacheSize={maxCacheSize}
           onViewportLoad={onViewportLoad}
+          onHover={hover.onHover}
+          hoverHooks={hover.hooks}
           width={size.width}
           height={size.height}
         />
@@ -369,21 +423,82 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           {tileError ? "Plane unavailable" : "Reading plane…"}
         </div>
       )}
-      {dataValid && uniformValue !== null && (
+      {loaded && selection && size && (dataValid || playing) && (
         <div style={{ position: "absolute", bottom: 10, left: 10, display: "grid", gap: 4, zIndex: 2 }}>
-          <div
-            style={{ ...BADGE, position: "static" }}
-            title="Measured from the coarsest pyramid level, subsampled for the contrast histogram."
-          >
-            {uniformValue === 0
-              ? "empty plane (all zeros)"
-              : `uniform plane (value ${Number.isInteger(uniformValue) ? uniformValue : uniformValue.toPrecision(4)})`}
-          </div>
+          {dataValid && uniformValue !== null && (
+            <div
+              style={{ ...BADGE, position: "static" }}
+              title="Measured from the coarsest pyramid level, subsampled for the contrast histogram."
+            >
+              {uniformValue === 0
+                ? "empty plane (all zeros)"
+                : `uniform plane (value ${greyLevel(uniformValue)})`}
+            </div>
+          )}
+          <HoverReadout bind={bindHover} />
         </div>
       )}
       {tileError && (
         <div style={{ ...BADGE, bottom: 10, right: 10, color: "#ff6b6b" }}>{tileError}</div>
       )}
+    </div>
+  );
+}
+
+/** What the pointer is over: image coordinates and, once read, the value. */
+interface HoverSample {
+  x: number;
+  y: number;
+  /** Null until Viv reads it out of a loaded tile. */
+  value: number | null;
+  /** Reduction of the level the value came from; 1 is full resolution. */
+  scale: number;
+}
+
+/** The subset of deck.gl's picking info this reads. */
+interface HoverInfo {
+  coordinate?: number[];
+  sourceLayer?: unknown;
+  tile?: { index?: { z?: number } };
+}
+
+/** A grey level as the badges print it: whole, or four significant digits. */
+function greyLevel(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toPrecision(4);
+}
+
+/**
+ * The value under the pointer, in its own component.
+ *
+ * Its own so that a pointer move repaints one badge rather than re-rendering
+ * the viewer around the deck.gl stage. The parent hands it a sink through
+ * `bind` and never holds the sample itself.
+ */
+function HoverReadout({
+  bind,
+}: {
+  bind: (sink: ((sample: HoverSample | null) => void) | null) => void;
+}) {
+  const [sample, setSample] = useState<HoverSample | null>(null);
+  useEffect(() => {
+    bind(setSample);
+    return () => bind(null);
+  }, [bind]);
+  if (!sample) return null;
+  return (
+    <div
+      style={{ ...BADGE, position: "static" }}
+      title={
+        sample.scale > 1
+          ? "Read from the pyramid level on screen, not from the full-resolution pixel. Zoom in for the pixel's own value."
+          : "The pixel under the pointer, read from the tile already on screen."
+      }
+    >
+      {/* The coordinate is always there; the value is not, and saying which is
+          missing is the difference between "no tile here yet" and "zero". */}
+      ({sample.x}, {sample.y}){" "}
+      {sample.value === null ? "—" : greyLevel(sample.value)}
+      {sample.scale > 1 && ` · at 1/${sample.scale}`}
     </div>
   );
 }
@@ -404,6 +519,8 @@ function VivStage({
   color,
   maxCacheSize,
   onViewportLoad,
+  onHover,
+  hoverHooks,
   width,
   height,
 }: {
@@ -414,6 +531,8 @@ function VivStage({
   color: [number, number, number];
   maxCacheSize: number;
   onViewportLoad: (loaded?: unknown) => void;
+  onHover: (info: HoverInfo) => void;
+  hoverHooks: { handleValue: (values: number[]) => void; handleCoordinate: () => void };
   width: number;
   height: number;
 }) {
@@ -501,6 +620,8 @@ function VivStage({
       layerProps={layerProps}
       viewStates={viewStates}
       onViewStateChange={onViewStateChange}
+      onHover={onHover}
+      hoverHooks={hoverHooks}
     />
   );
 }
