@@ -18,6 +18,7 @@ import pytest
 from conftest import (
     CONTRACT_CASES,
     bash,
+    ps_literal,
     pwsh,
     requires_pwsh,
     write_extras,
@@ -52,16 +53,11 @@ def _parse_bash(config_dir) -> tuple[int, list[str]]:
 def _parse_pwsh(config_dir) -> tuple[int, list[str]]:
     """biopb-engine.ps1's Read-ExtraPackages, in the same shape."""
     out = pwsh(
-        f"$reqs = @(Read-ExtraPackages -ConfigDir {_ps_literal(str(config_dir))})\n"
+        f"$reqs = @(Read-ExtraPackages -ConfigDir {ps_literal(str(config_dir))})\n"
         '"COUNT=$($reqs.Count)"\n'
         "$reqs | ForEach-Object { $_ }\n"
     )
     return _split(out.stdout)
-
-
-def _ps_literal(value: str) -> str:
-    """A PowerShell single-quoted string ('' escapes an embedded quote)."""
-    return "'" + value.replace("'", "''") + "'"
 
 
 def _split(stdout: str) -> tuple[int, list[str]]:

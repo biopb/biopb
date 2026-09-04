@@ -344,6 +344,67 @@ function Assert-LastExit {
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
 }
 
+# Read an interpreter's (Major, Minor) version. Returns a [pscustomobject] with
+# Major/Minor, or $null when the interpreter cannot be read -- missing, a stub, or
+# output we do not recognize as a version. Deciding what to DO with that answer
+# (accept it, warn, fall back to a uv-managed Python) stays with the caller.
+#
+# Emits nothing to the output stream but the result, and calls no Report-* helper:
+# in gui mode those write tagged records to stdout (Emit-Gui), which would arrive
+# folded into this function's return value.
+#
+# A function rather than a dozen lines inside Invoke-BiopbInstall so a test can
+# drive it (install/test/test_python_probe.py) -- the engine is executed by nothing
+# else, and this probe is where a fresh Windows machine actually fails. Two traps
+# live here, and BOTH shipped as install-time crashes that users reported as "the
+# Python stage failed":
+#
+#   1. `2>$null` on a NATIVE command makes Windows PowerShell 5.1 wrap every stderr
+#      line in an ErrorRecord, which under this engine's EAP='Stop' is a
+#      TERMINATING NativeCommandError -- the same trap Invoke-Precompile and
+#      Start-ControlPlane already document. It fires on exactly the machine this
+#      probe exists to serve: a fresh Windows box with no Python still has a 0-byte
+#      Microsoft Store *App Execution Alias* at
+#      %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe, on PATH by default, which
+#      prints "Python was not found; run without arguments to install from the
+#      Microsoft Store..." to stderr and exits 9009. Unsoftened, the install died
+#      quoting that message instead of falling through to the uv-managed Python
+#      that handles the case fine. A Python that merely warns on stderr (a conda
+#      banner, a DLL or deprecation notice) tripped it too, while being perfectly
+#      usable. So: soften EAP across the call and let the exit code decide.
+#
+#   2. An interpreter that greets on STDOUT (conda, a sitecustomize banner) puts a
+#      non-numeric line ahead of the answer, and [int] on it throws -- under
+#      EAP='Stop' that is another terminating error in the same place. So: take the
+#      LAST non-empty line and match it strictly. Anything unrecognized is $null,
+#      and the caller falls back instead of dying.
+#
+# Neither trap reproduces under pwsh 7, which is what CI runs -- see the Windows
+# leg of install-scripts.yaml, added with this function so they cannot come back.
+function Get-SystemPythonVersion {
+    [OutputType([psobject])]
+    param([Parameter(Mandatory)][string]$PythonExe)
+
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $PythonExe -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>$null
+        $code = $LASTEXITCODE
+    } catch {
+        # A stub that cannot be launched at all still means "no usable Python".
+        return $null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if ($code -ne 0) { return $null }
+
+    # $LASTEXITCODE is stale when the command never ran, so the strict match below
+    # -- not the exit code alone -- is what actually vouches for the answer.
+    $line = (@($out) | Where-Object { "$_".Trim() } | Select-Object -Last 1)
+    if ("$line" -notmatch '^\s*(\d+)\s+(\d+)\s*$') { return $null }
+    return [pscustomobject]@{ Major = [int]$Matches[1]; Minor = [int]$Matches[2] }
+}
+
 # Read <ConfigDir>\extra-packages.txt into the requirement list to replay into the
 # shared environment. Returns the requirements in file order; nothing at all when
 # the file (or the directory) is absent, which is every machine until the user
@@ -1175,10 +1236,14 @@ function Invoke-BiopbInstall {
     $pythonSpec = ""
     $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
     if ($pyExe) {
-        $verStr = & $pyExe -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $verStr) {
-            $parts = $verStr.Trim() -split '\s+'
-            $maj = [int]$parts[0]; $min = [int]$parts[1]
+        # Get-SystemPythonVersion returns $null for an interpreter it cannot read
+        # -- a Microsoft Store alias stub, a banner-printing conda shim, anything
+        # unrecognized -- rather than throwing, so those machines fall through to
+        # the uv-managed Python below instead of failing the install. See the
+        # function's own comment for the two traps that live in that call.
+        $ver = Get-SystemPythonVersion -PythonExe $pyExe
+        if ($ver) {
+            $maj = $ver.Major; $min = $ver.Minor
             if ($maj -eq 3 -and $min -ge $minMinor -and $min -le $maxMinor) {
                 Report-Ok "Using system Python: $(& $pyExe --version)"
                 $pythonOk = $true
@@ -1382,7 +1447,22 @@ function Invoke-BiopbInstall {
 
     # Refresh PATH so freshly installed tool shims are visible this session.
     Add-ToUserPath $LocalBin
-    $versionOutput = (biopb-tensor-server version 2>$null)
+    # Same EAP='Stop' + redirected-stderr trap as the Python probe in step 2: a
+    # single benign stderr line here (a Qt/plugin or deprecation notice from the
+    # freshly installed stack) would raise a terminating NativeCommandError and
+    # abort the install AFTER the packages landed successfully. This value is
+    # decorative -- one status line, with an "installed" fallback that could
+    # never actually be reached while the call could throw instead.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $versionOutput = (biopb-tensor-server version 2>$null)
+    } catch {
+        $versionOutput = ""
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    $versionOutput = (@($versionOutput) | Where-Object { "$_".Trim() } | Select-Object -Last 1)
     if (-not $versionOutput) { $versionOutput = "installed" }
     Report-Ok "$versionOutput"
 
