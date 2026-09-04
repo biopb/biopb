@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult, TileInfo } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
-import { decodeViewerState } from "./utils/viewerUrl";
+import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
 import { clampSliceTo } from "./utils/vivUtils";
 import { splitArrayVersion } from "@biopb/tensor-flight-client";
@@ -33,6 +33,42 @@ export interface SliceState {
   // contrast window and before the channel color. 1 leaves the ramp linear;
   // below 1 lifts the dim end, above 1 pushes it down.
   gamma: number;
+}
+
+/**
+ * The 3-D camera, in `OrbitView`'s own terms.
+ *
+ * A mirror, not the source of truth: deck.gl owns the camera while the volume
+ * is mounted and this trails it on a debounce, which is what keeps an orbit
+ * smooth. It is read back only to seed the next mount -- see `VolumeViewer`.
+ */
+/**
+ * The 2-D camera, in `DetailView`'s terms.
+ *
+ * A mirror of Viv's own view state, on the same terms as {@link Camera3DState}:
+ * `VivViewer` keeps driving the viewport and this trails it.
+ *
+ * The target is carried as `[x, y]`, not the `[x, y, z]` deck.gl reports. An
+ * orthographic view's third component is structurally zero
+ * (`getDefaultInitialViewState` builds it that way), so carrying it would put a
+ * constant in every shared link -- and its absence is what tells a 2-D camera
+ * from a 3-D one in the URL.
+ */
+export interface Camera2DState {
+  target: [number, number];
+  /** log2(pixels per world unit), as Viv's own initial view state computes. */
+  zoom: number;
+}
+
+export interface Camera3DState {
+  /** Orbit centre, in the scaled world space `volumeCentre` computes. */
+  target: [number, number, number];
+  /** log2(pixels per world unit), as `volumeZoom` returns. */
+  zoom: number;
+  /** Pitch, in degrees; `OrbitController` holds it within +/-90. */
+  rotationX: number;
+  /** Bearing, in degrees, reported wrapped into [-180, 180). */
+  rotationOrbit: number;
 }
 
 export interface AppState {
@@ -88,8 +124,17 @@ export interface AppState {
    *
    * Null while nothing is loaded, and cleared on a source change so a stale
    * grid can never bound the next tensor.
+   *
+   * Read it through `selectTileInfo`, not directly: a viewer keeps its previous
+   * grid until its next fetch answers, so this slot alone cannot say which
+   * tensor the grid in it describes.
    */
   tileInfo: TileInfo | null;
+  /**
+   * The `array_id` the grid above was fetched for -- the viewer's own `arrayId`
+   * prop, published back with it. See `selectTileInfo`.
+   */
+  tileInfoFor: string | null;
 
   // UI options
   showAdvancedOptions: boolean;
@@ -108,6 +153,16 @@ export interface AppState {
    * someone who wants additive wants it for the next stack too.
    */
   volumeRenderMode: VolumeRenderMode;
+  /**
+   * Where the 3-D camera is, or null for "wherever the volume fits".
+   *
+   * Null rather than a computed default because the fitted camera depends on
+   * the volume and the pane size, neither of which the store knows; only the
+   * viewer can work it out, so the store says "unset" and lets it.
+   */
+  camera3d: Camera3DState | null;
+  /** Where the 2-D camera is, or null for "wherever the plane fits". */
+  camera2d: Camera2DState | null;
 
   // Channel colors (sourceId -> channelIdx -> color)
   channelColors: Record<string, Record<number, ColorValue>>;
@@ -123,7 +178,7 @@ export interface AppState {
   querySources: (sql: string) => Promise<QuerySourcesResult>;
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
-  setTileInfo: (value: TileInfo | null) => void;
+  setTileInfo: (value: TileInfo | null, forArrayId: string) => void;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -138,6 +193,8 @@ export interface AppState {
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
   setVolumeRenderMode: (value: VolumeRenderMode) => void;
+  setCamera3d: (value: Camera3DState | null) => void;
+  setCamera2d: (value: Camera2DState | null) => void;
   getChannelColor: (sourceId: string, channelIdx: number) => ColorValue;
   setChannelColor: (sourceId: string, channelIdx: number, color: ColorValue) => void;
   loadChannelNames: (sourceId: string) => Promise<void>;
@@ -198,10 +255,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   tileInfo: null,
+  tileInfoFor: null,
 
   showAdvancedOptions: false,
   render3d: false,
   volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
+  camera3d: null,
+  camera2d: null,
 
   // Load persisted colors from localStorage on initialization
   channelColors: loadColorsFromStorage(),
@@ -262,7 +322,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeTensorId: tid,
       requestedArrayId: null,
       render3d: false,
+      // camera3d goes with render3d: it is in the previous volume's world
+      // space, so carrying it over would frame the next stack from an
+      // arbitrary point.
+      camera3d: null,
+      camera2d: null,
       tileInfo: null,
+      tileInfoFor: null,
     });
     set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {} } }));
   },
@@ -271,10 +337,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ slice: { ...s.slice, ...partial } }));
   },
 
-  setTileInfo(value) {
+  setTileInfo(value, forArrayId) {
     // The grid is the first thing that can say what an index may be, so the
     // slice is bounded here rather than where it was read -- see clampSliceTo.
-    set((s) => ({ tileInfo: value, slice: clampSliceTo(s.slice, value) }));
+    set((s) => ({
+      tileInfo: value,
+      tileInfoFor: forArrayId,
+      slice: clampSliceTo(s.slice, value),
+    }));
   },
 
   applyViewerState(params) {
@@ -288,10 +358,37 @@ export const useAppStore = create<AppState>((set, get) => ({
     // fails at the fetch, which can say so, rather than here in silence.
     const { arrayId: stable } = splitArrayVersion(requested);
     const s = get();
+    // Nothing about the tensor in view is inherited. Indices are in its grid
+    // and a camera is in its world space, so letting either survive into a link
+    // that does not name one frames whatever opens next from a point nobody
+    // chose.
+    //
+    // There is deliberately no "unless it is the same tensor" exemption,
+    // because that cannot be decided here. A bare `source_id` and the
+    // `source_id/field` it resolves to are two spellings of one identity, and
+    // only the Flight server knows which field it binds as a source's default
+    // -- so an id comparison reports a tensor change for the catalog's own
+    // bare-source click, and reports it in one direction only, which is worse
+    // than not asking.
+    //
+    // Nothing is lost to that. `encodeViewerState` omits a field only when it
+    // is at the default used here, so a link this app wrote round-trips
+    // exactly; inheriting could only ever change what an *incomplete*
+    // hand-written link opens at, which is the case the previous tensor's
+    // framing is wrong for.
+    //
+    // The percentile window, gamma and the render mode do carry across: they
+    // are preferences that belong to the viewer rather than to any one tensor,
+    // which is how `selectSource` treats them too.
     const next = decodeViewerState(params, {
+      ...DEFAULT_VIEWER_URL_STATE,
       arrayId: stable,
-      slice: s.slice,
-      render3d: s.render3d,
+      slice: {
+        ...DEFAULT_VIEWER_URL_STATE.slice,
+        percentileScale: s.slice.percentileScale,
+        useMinMax: s.slice.useMinMax,
+        gamma: s.slice.gamma,
+      },
       volumeRenderMode: s.volumeRenderMode,
     });
     set({
@@ -301,6 +398,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       slice: next.slice,
       render3d: next.render3d,
       volumeRenderMode: next.volumeRenderMode,
+      camera3d: next.camera3d,
+      camera2d: next.camera2d,
+      // `tileInfo` is left alone: `selectTileInfo` already hides a grid fetched
+      // for another id, and clearing it here would depend on a viewer mounting
+      // afterwards to put one back.
     });
     return true;
   },
@@ -315,6 +417,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setVolumeRenderMode(value) {
     set({ volumeRenderMode: value });
+  },
+
+  setCamera3d(value) {
+    set({ camera3d: value });
+  },
+
+  setCamera2d(value) {
+    set({ camera2d: value });
   },
 
   getChannelColor(sourceId, channelIdx) {
@@ -361,7 +471,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   startCatalogPolling() {
     const pollingTimerId = setInterval(async () => {
-      const { client, sources, activeSourceId, selectSource } = get();
+      const { client, sources, activeSourceId, requestedArrayId, selectSource } = get();
       if (!client || get().connectionState !== "connected") return;
 
       try {
@@ -385,8 +495,15 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (oldUrls !== newUrls) {
           set({ sources: sorted });
 
-          // Clear selection if active source was removed
-          if (activeSourceId && !sorted.find((s) => s.source_id === activeSourceId)) {
+          // A catalog response is a listing, not proof that an unlisted source
+          // is gone: it may be capped, still scanning, or temporarily failed.
+          // In particular, retain a source selected from a shared URL, which
+          // deliberately does not need to be present in the listing.
+          if (
+            activeSourceId &&
+            !requestedArrayId &&
+            !sorted.find((s) => s.source_id === activeSourceId)
+          ) {
             selectSource(null);
           }
         }
@@ -407,3 +524,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 }));
+
+/**
+ * The grid for what is currently addressed, or null while none has landed.
+ *
+ * `tileInfo` is whichever viewer last published one, and a viewer holds its
+ * previous grid until its next fetch answers -- so between a new selection and
+ * that answer the slot describes the tensor that just left. Pairing it with the
+ * id it was fetched for makes that window invisible instead of wrong: the
+ * sliders fall back to the catalog, and the URL write-back falls back to the id
+ * it was asked for rather than stamping the previous tensor's into the bar.
+ *
+ * The comparison is safe where the one in `applyViewerState` was not, and for a
+ * concrete reason: both sides are copies of a single string -- the `arrayId`
+ * prop the viewer was mounted with -- rather than two spellings of one
+ * identity, so no canonicalization only the server can do is involved.
+ */
+export function selectTileInfo(s: AppState): TileInfo | null {
+  return s.tileInfoFor === (s.requestedArrayId ?? s.activeTensorId) ? s.tileInfo : null;
+}

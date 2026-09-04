@@ -21,6 +21,13 @@ const defaults = (arrayId: string): ViewerUrlState => ({ arrayId, ...DEFAULT_VIE
 const decode = (qs: string, t = TENSOR) =>
   decodeViewerState(new URLSearchParams(qs), defaults(t.array_id));
 
+const enc = (state: Partial<ViewerUrlState>, qs = "") =>
+  encodeViewerState(
+    new URLSearchParams(qs),
+    { ...defaults(TENSOR.array_id), ...state },
+    defaults(TENSOR.array_id),
+  ).toString();
+
 describe("decodeViewerState", () => {
   it("reads indices, contrast and render mode", () => {
     const s = decode("t=5&z=12&c=1&p=2.5&g=1.5&v=1&vm=additive");
@@ -77,13 +84,6 @@ describe("decodeViewerState", () => {
 });
 
 describe("encodeViewerState", () => {
-  const enc = (state: Partial<ViewerUrlState>, qs = "") =>
-    encodeViewerState(
-      new URLSearchParams(qs),
-      { ...defaults(TENSOR.array_id), ...state },
-      defaults(TENSOR.array_id),
-    ).toString();
-
   it("writes only the id when everything is at its default", () => {
     expect(decodeURIComponent(enc({}))).toBe("id=hpc__ome-tiff_00b764c29c31/Image:0");
   });
@@ -121,8 +121,106 @@ describe("encodeViewerState", () => {
       slice: { t: 5, z: 12, c: 2, axes: {}, percentileScale: 2.5, useMinMax: false, gamma: 1.5 },
       render3d: true,
       volumeRenderMode: "minip",
+      camera3d: { target: [12.5, 30, 7.2], zoom: -2.125, rotationX: 20, rotationOrbit: -45 },
+      camera2d: null,
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
     expect(decodeViewerState(qs, defaults(TENSOR.array_id))).toEqual(state);
+  });
+});
+
+describe("the 3-D camera", () => {
+  it("is absent until the view is orbited", () => {
+    expect(decode("t=1").camera3d).toBeNull();
+    expect(enc({ render3d: true })).not.toContain("tg=");
+  });
+
+  it("needs both a target and a zoom to be a camera", () => {
+    // Half a camera would frame the volume somewhere nobody chose.
+    expect(decode("tg=1,2,3").camera3d).toBeNull();
+    expect(decode("zm=-2").camera3d).toBeNull();
+    expect(decode("tg=1,2&zm=-2").camera3d).toBeNull();
+    expect(decode("tg=1,2,x&zm=-2").camera3d).toBeNull();
+  });
+
+  it("defaults the rotations, since 0 is the fitted orientation", () => {
+    expect(decode("tg=1,2,3&zm=-2").camera3d).toEqual({
+      target: [1, 2, 3], zoom: -2, rotationX: 0, rotationOrbit: 0,
+    });
+  });
+
+  it("clamps pitch to what OrbitController allows", () => {
+    // Bounded at decode, unlike the indices: these limits belong to the camera,
+    // not to the tensor, so there is no grid to wait for.
+    expect(decode("tg=0,0,0&zm=0&rx=400").camera3d?.rotationX).toBe(90);
+    expect(decode("tg=0,0,0&zm=0&rx=-400").camera3d?.rotationX).toBe(-90);
+  });
+
+  it("wraps the orbit angle instead of clamping it", () => {
+    // Periodic: 370 degrees is a real bearing, where clamping would mean 180.
+    expect(decode("tg=0,0,0&zm=0&ro=370").camera3d?.rotationOrbit).toBe(10);
+    expect(decode("tg=0,0,0&zm=0&ro=-190").camera3d?.rotationOrbit).toBe(170);
+    expect(decode("tg=0,0,0&zm=0&ro=180").camera3d?.rotationOrbit).toBe(-180);
+  });
+
+  it("rounds an orbit rather than writing its full floats", () => {
+    const out = enc({
+      render3d: true,
+      camera3d: { target: [1.23456, 2.5, 3], zoom: 1 / 3, rotationX: 10.987, rotationOrbit: 0 },
+    });
+    expect(out).toContain("tg=1.2%2C2.5%2C3");
+    expect(out).toContain("zm=0.333");
+    expect(out).toContain("rx=11");
+    // The fitted orientation, so omitted like every other default.
+    expect(out).not.toContain("ro=");
+  });
+});
+
+describe("the 2-D camera", () => {
+  it("is told from a 3-D one by the target's arity, not by the mode", () => {
+    // Two components is a plane, three is a volume. That is a property of the
+    // data, so neither decoder needs to know which viewer is mounted.
+    expect(decode("tg=10,20&zm=-1").camera2d).toEqual({ target: [10, 20], zoom: -1 });
+    expect(decode("tg=10,20&zm=-1").camera3d).toBeNull();
+    expect(decode("tg=1,2,3&zm=-1").camera2d).toBeNull();
+    expect(decode("tg=1,2,3&zm=-1").camera3d).not.toBeNull();
+  });
+
+  it("needs both a target and a zoom", () => {
+    expect(decode("tg=10,20").camera2d).toBeNull();
+    expect(decode("zm=-1").camera2d).toBeNull();
+    expect(decode("tg=10,x&zm=-1").camera2d).toBeNull();
+  });
+
+  it("writes the mounted viewer's camera and only that one", () => {
+    const cam2 = { target: [10, 20] as [number, number], zoom: -1 };
+    const cam3 = { target: [1, 2, 3] as [number, number, number], zoom: -2, rotationX: 0, rotationOrbit: 0 };
+
+    // Both cameras remembered, 2-D on screen: the link carries the plane.
+    const flat = enc({ render3d: false, camera2d: cam2, camera3d: cam3 });
+    expect(decodeURIComponent(flat)).toContain("tg=10,20");
+    expect(flat).toContain("zm=-1");
+
+    // Same store, 3-D on screen.
+    const vol = enc({ render3d: true, camera2d: cam2, camera3d: cam3 });
+    expect(decodeURIComponent(vol)).toContain("tg=1,2,3");
+    expect(vol).toContain("zm=-2");
+  });
+
+  it("round-trips through decode", () => {
+    const state: ViewerUrlState = {
+      arrayId: TENSOR.array_id,
+      slice: DEFAULT_VIEWER_URL_STATE.slice,
+      render3d: false,
+      volumeRenderMode: DEFAULT_VIEWER_URL_STATE.volumeRenderMode,
+      camera3d: null,
+      camera2d: { target: [10.5, 20.25], zoom: -1.5 },
+    };
+    const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
+    // The target rounds to a tenth, as the encoder documents.
+    expect(decodeViewerState(qs, defaults(TENSOR.array_id)).camera2d).toEqual({
+      target: [10.5, 20.3],
+      zoom: -1.5,
+    });
   });
 });

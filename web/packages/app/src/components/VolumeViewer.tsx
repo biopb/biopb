@@ -20,7 +20,7 @@
  * {@link TileViewer} is.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import { OrbitView } from "@deck.gl/core";
 import DeckGL from "@deck.gl/react";
@@ -42,6 +42,7 @@ import {
   dtypeContrastLimits,
   percentileBounds,
   vivColor,
+  CAMERA_MIRROR_MS,
 } from "../utils/vivUtils";
 import {
   volumeCentre,
@@ -139,8 +140,8 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   // a grid this viewer could not use.
   const setTileInfo = useAppStore((s) => s.setTileInfo);
   useEffect(() => {
-    setTileInfo(info);
-  }, [info, setTileInfo]);
+    setTileInfo(info, arrayId);
+  }, [info, arrayId, setTileInfo]);
 
   // `volumeRefusal` already established this is the available branch; the cast
   // is what lets the rest of the component read the plan without re-narrowing.
@@ -268,7 +269,7 @@ function VolumeStage({
   height: number;
 }) {
   const sizeRef = useRef({ width, height });
-
+  const setCamera3d = useAppStore((s) => s.setCamera3d);
 
   // The anisotropy, and the only place it enters: `XR3DLayer` scales its unit
   // cube by `physicalSizeScalingMatrix.transformPoint([w, h, d])`, so this
@@ -284,15 +285,53 @@ function VolumeStage({
   const resolutionMatrix = useMemo(() => new Matrix4(), []);
 
   const initialViewState = useMemo(
-    () => ({
-      target: volumeCentre(plan),
-      zoom: volumeZoom(plan, sizeRef.current),
-      rotationX: 0,
-      rotationOrbit: 0,
-    }),
+    () => {
+      // Read once per plan rather than subscribed. After mount deck.gl owns the
+      // camera and the store only mirrors it, so a subscription here would feed
+      // every orbit back into `initialViewState` -- which `Deck#setProps` treats
+      // as an instruction to overwrite its own view state, i.e. a fight with the
+      // user's pointer. Reading it is still right: a link that named a camera
+      // has to open at it.
+      const seed = useAppStore.getState().camera3d;
+      if (seed) return seed;
+      return {
+        target: volumeCentre(plan),
+        zoom: volumeZoom(plan, sizeRef.current),
+        rotationX: 0,
+        rotationOrbit: 0,
+      };
+    },
     // Deliberately not [width, height]: a resize must move the viewport, not
     // reset the camera.
     [plan],
+  );
+
+  // Trailing edge only: the resting camera is what a link should carry, and the
+  // intermediate frames of a drag are noise that would otherwise reach the URL
+  // at pointer rate.
+  const mirrorRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (mirrorRef.current) clearTimeout(mirrorRef.current);
+  }, []);
+
+  const onViewStateChange = useCallback(
+    ({ viewState }: { viewState: Record<string, unknown> }) => {
+      if (mirrorRef.current) clearTimeout(mirrorRef.current);
+      const { target, zoom, rotationX, rotationOrbit } = viewState as {
+        target: number[];
+        zoom: number;
+        rotationX: number;
+        rotationOrbit: number;
+      };
+      const [x = 0, y = 0, z = 0] = target;
+      mirrorRef.current = setTimeout(() => {
+        setCamera3d({ target: [x, y, z], zoom, rotationX, rotationOrbit });
+      }, CAMERA_MIRROR_MS);
+      // Returns nothing on purpose: `Deck#_onViewStateChange` falls back to the
+      // view state it already computed, so the camera stays deck.gl's to drive
+      // and this stays a mirror.
+    },
+    [setCamera3d],
   );
 
   const views = useMemo(
@@ -346,6 +385,7 @@ function VolumeStage({
       views={views}
       layers={layers}
       initialViewState={initialViewState}
+      onViewStateChange={onViewStateChange}
       width={width}
       height={height}
       // Black rather than the 2-D pane's slate: additive blending sums the
