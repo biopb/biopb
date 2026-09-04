@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { useAppStore } from "../store";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { selectTileInfo, useAppStore } from "../store";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
+import { splitArrayVersion } from "@biopb/tensor-flight-client";
 
 // Threshold for switching to server-side SQL query
 const SERVER_QUERY_THRESHOLD = 1000;
@@ -194,6 +195,27 @@ function filterTree(
   return { ...node, children: filteredChildren };
 }
 
+/**
+ * The folders between the root and `sourceId`, outermost first, or null when no
+ * source node answers to it.
+ *
+ * Walked rather than derived from `source_url`: `flattenPaths` merges a
+ * single-child chain into one node and takes the *grandchild's* id, so a folder
+ * id is not a prefix of the path it displays. The built tree is the only thing
+ * that knows which ids survived.
+ */
+function folderPathTo(node: TreeNode, sourceId: string): string[] | null {
+  for (const child of node.children) {
+    if (child.type === "source") {
+      if (child.id === sourceId) return [];
+      continue;
+    }
+    const below = folderPathTo(child, sourceId);
+    if (below) return [child.id, ...below];
+  }
+  return null;
+}
+
 function Chevron({ expanded }: { expanded: boolean }) {
   return (
     <span
@@ -293,6 +315,7 @@ function TreeRow({
           alignItems: "center",
           paddingLeft: indent,
         }}
+        data-source-id={src.source_id}
         onClick={() => {
           if (src.tensors.length === 1) {
             selectSource(src.source_id, src.tensors[0]?.array_id);
@@ -353,7 +376,16 @@ export function SourceTree() {
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
   const scanning = useAppStore((s) => s.scanning);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
-  const activeTensorId = useAppStore((s) => s.activeTensorId);
+  // Which tensor row to mark, in the catalog's own spelling. `activeTensorId`
+  // may be a bare source_id -- from a link, or from clicking a source rather
+  // than one of its tensors -- and no row is named that way. Only the Flight
+  // server knows which field it binds as a source's default, and `tile_info` is
+  // where it says so, so the grid the render path already fetched is what
+  // resolves it; until that lands there is nothing better than the id itself.
+  const activeTensorId = useAppStore((s) => {
+    const info = selectTileInfo(s);
+    return info ? splitArrayVersion(info.array_id).arrayId : s.activeTensorId;
+  });
   const selectSource = useAppStore((s) => s.selectSource);
   const querySources = useAppStore((s) => s.querySources);
 
@@ -439,6 +471,48 @@ export function SourceTree() {
     return filtered ?? tree;
   }, [tree, query, filteredSources, serverFilteredIds, expandedFolders]);
 
+  const listRef = useRef<HTMLDivElement | null>(null);
+  // The selection this has already revealed. Latched so a later catalog poll --
+  // which rebuilds the tree every 60s -- cannot re-open a folder the user just
+  // collapsed, while a selection the catalog does not hold *yet* stays unlatched
+  // and is revealed by whichever poll first brings it in.
+  const revealed = useRef<string | null>(null);
+  const pendingScroll = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!activeSourceId) {
+      revealed.current = null;
+      return;
+    }
+    if (revealed.current === activeSourceId) return;
+    // A link can select a source that is filtered out by the search box, or one
+    // the catalog has not listed (still scanning, or past its cap). Nothing to
+    // reveal then, and nothing latched, so clearing the search brings it in.
+    const folders = folderPathTo(tree, activeSourceId);
+    if (!folders) return;
+    revealed.current = activeSourceId;
+    pendingScroll.current = activeSourceId;
+    if (folders.length > 0) {
+      setExpandedFolders((prev) => {
+        if (folders.every((id) => prev.has(id))) return prev;
+        const next = new Set(prev);
+        for (const id of folders) next.add(id);
+        return next;
+      });
+    }
+  }, [activeSourceId, tree]);
+
+  // Deliberately every commit: the row this wants may not exist until the
+  // expansion above has rendered, and it is one ref read until it does.
+  useEffect(() => {
+    const id = pendingScroll.current;
+    if (id === null) return;
+    const row = listRef.current?.querySelector(`[data-source-id="${CSS.escape(id)}"]`);
+    if (!row) return;
+    pendingScroll.current = null;
+    row.scrollIntoView({ block: "nearest" });
+  });
+
   const toggleFolder = useCallback((id: string) => {
     setExpandedFolders((prev) => {
       const next = new Set(prev);
@@ -468,7 +542,7 @@ export function SourceTree() {
         )}
       </div>
 
-      <div style={{ overflow: "auto" }}>
+      <div ref={listRef} style={{ overflow: "auto" }}>
         {sourcesLoading || serverQueryLoading ? (
           <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
             {serverQueryLoading ? "Searching..." : "Loading sources..."}
