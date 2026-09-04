@@ -18,7 +18,11 @@ import json
 import subprocess
 
 import pytest
-from conftest import INSTALL_SH, bash, sh
+from conftest import INSTALL_SH, bash, requires_posix, sh
+
+# install.sh never runs on Windows -- that platform gets install.ps1 and the
+# engine, which test_python_probe.py and test_extras_contract.py cover there.
+pytestmark = requires_posix
 
 # --- the source guard itself -------------------------------------------------
 #
