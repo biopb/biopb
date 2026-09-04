@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
+import { decodeViewerState, resolveArrayId, type ViewerUrlState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
 import {
   DEFAULT_VOLUME_RENDER_MODE,
@@ -87,6 +88,17 @@ export interface AppState {
   querySources: (sql: string) => Promise<QuerySourcesResult>;
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
+  /**
+   * Adopt a whole viewing state at once, as decoded from the URL.
+   *
+   * One `set`, not a `selectSource` followed by a `setSlice`: `selectSource`
+   * resets the slice by design, so the two-call form would need the caller to
+   * know the order and would still flash the reset state through the viewer.
+   * Returns false when the catalog holds no such tensor -- a link to a source
+   * that has since been re-indexed -- which leaves the store untouched so the
+   * viewer opens empty rather than on a guess.
+   */
+  applyViewerState: (params: URLSearchParams) => boolean;
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
   setVolumeRenderMode: (value: VolumeRenderMode) => void;
@@ -208,6 +220,28 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setSlice(partial) {
     set((s) => ({ slice: { ...s.slice, ...partial } }));
+  },
+
+  applyViewerState(params) {
+    const arrayId = params.get("id");
+    if (!arrayId) return false;
+    const found = resolveArrayId(get().sources, arrayId);
+    if (!found) return false;
+    const s = get();
+    const next: ViewerUrlState = decodeViewerState(params, found.tensor, {
+      arrayId,
+      slice: s.slice,
+      render3d: s.render3d,
+      volumeRenderMode: s.volumeRenderMode,
+    });
+    set({
+      activeSourceId: found.source.source_id,
+      activeTensorId: found.tensor.array_id,
+      slice: next.slice,
+      render3d: next.render3d,
+      volumeRenderMode: next.volumeRenderMode,
+    });
+    return true;
   },
 
   setShowAdvancedOptions(value) {
