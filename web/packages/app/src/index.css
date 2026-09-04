@@ -26,7 +26,9 @@ html, body {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  /* Both side panes are draggable; the variables exist only once one has been
+     dragged, so an untouched layout is sized exactly as it always was. */
+  grid-template-columns: var(--sidebar-w, 320px) 1fr;
   /* The last row is the tip bar. It keeps its height when tips are dismissed:
      a footer that appears and disappears would resize the viewport under the
      canvas, which costs a deck.gl re-layout for a cosmetic change. */
@@ -61,13 +63,38 @@ html, body {
 .viewer-column { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 
 .control-column {
-  width: 320px;
+  flex: 0 0 var(--control-w, 320px);
   display: flex;
   flex-direction: column;
   background: #141820;
   border-left: 1px solid #2d3748;
   overflow-y: auto;
 }
+
+/* The grab strip between two panes. Transparent until pointed at: it sits on
+   the panes' own borders, and a second permanent line there would read as a
+   gap rather than as a handle. */
+.pane-splitter {
+  flex: 0 0 8px;
+  align-self: stretch;
+  position: relative;
+  cursor: col-resize;
+  background: none;
+  border: none;
+  padding: 0;
+}
+.pane-splitter::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: transparent;
+}
+.pane-splitter:hover::after,
+.pane-splitter:focus-visible::after { background: #4f8ef7; }
+.pane-splitter:focus-visible { outline: none; }
 
 .source-tree { padding: 0; flex: 1; }
 
