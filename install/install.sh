@@ -344,6 +344,30 @@ _install_opencode() {
 # EXTRA_PACKAGES_COUNT, not ${#EXTRA_PACKAGES[@]}, gates every expansion of the
 # array: macOS still ships bash 3.2, where expanding an *empty* array under
 # `set -u` is an unbound-variable error.
+# Read an interpreter's "MAJOR MINOR", or nothing when it cannot be read -- absent,
+# a stub, a nonzero exit, or output that is not a version. The caller decides what
+# to do with the answer; this function only reads it.
+#
+# The PowerShell twin is biopb-engine.ps1::Get-SystemPythonVersion, and the two are
+# held to one shared table of interpreter shapes (install/test/python-probe-contract.json,
+# via test_python_probe.py) for the same reason the extras parsers are: one rule,
+# implemented twice, which is exactly how #648 happened.
+#
+# The trap on this side is not PowerShell's terminating-stderr one -- it is that an
+# interpreter which greets on STDOUT (conda, a sitecustomize banner) puts a
+# non-numeric line ahead of the answer. Handing that word to `[ "$MAJOR" -eq 3 ]`
+# is an "integer expression expected" error rather than a fallback, so the machine
+# is told its Python is "too old" and the real version is never looked at. Hence:
+# last non-empty line, matched strictly, and anything else is nothing at all.
+_system_python_version() {
+    local py="$1" out line
+    # A nonzero exit means the interpreter did not answer, whatever it printed.
+    out=$("$py" -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>/dev/null) || return 0
+    line=$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)
+    [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]*$ ]] || return 0
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
 _read_extra_packages() {
     EXTRA_PACKAGES=()
     EXTRA_PACKAGES_COUNT=0
@@ -1173,10 +1197,11 @@ install_biopb() {
     PYTHON_SPEC=""
     PYTHON_VERSION=""
     if command -v python3 &>/dev/null; then
-        PYTHON_VERSION=$(python3 -c "import sys; print(sys.version_info[:2])" 2>/dev/null || echo "")
+        PYTHON_VERSION=$(_system_python_version python3)
         if [ -n "$PYTHON_VERSION" ]; then
-            MAJOR=$(echo "$PYTHON_VERSION" | tr -d '(),' | cut -d' ' -f1)
-            MINOR=$(echo "$PYTHON_VERSION" | tr -d '(),' | cut -d' ' -f2)
+            # "MAJOR MINOR", already vouched for by the strict match in there.
+            MAJOR=${PYTHON_VERSION% *}
+            MINOR=${PYTHON_VERSION#* }
             if [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge "$MIN_MINOR" ] && [ "$MINOR" -le "$MAX_MINOR" ]; then
                 _ok "Using system Python: $(python3 --version)"
                 PYTHON_SPEC=$(command -v python3)
