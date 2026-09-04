@@ -2,7 +2,7 @@
 
 import { sliderAxes, type SliderAxis } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useAppStore } from "../store";
+import { selectTileInfo, useAppStore } from "../store";
 import {
   PRESET_COLORS,
   type ColorValue,
@@ -27,7 +27,7 @@ function clamp(value: number, min: number, max: number): number {
 
 export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const sources = useAppStore((s) => s.sources);
-  const tileInfo = useAppStore((s) => s.tileInfo);
+  const tileInfo = useAppStore(selectTileInfo);
   const slice = useAppStore((s) => s.slice);
   const setSlice = useAppStore((s) => s.setSlice);
   const channelNames = useAppStore((s) => s.channelNames);

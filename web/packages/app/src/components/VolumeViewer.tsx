@@ -140,8 +140,8 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   // a grid this viewer could not use.
   const setTileInfo = useAppStore((s) => s.setTileInfo);
   useEffect(() => {
-    setTileInfo(info);
-  }, [info, setTileInfo]);
+    setTileInfo(info, arrayId);
+  }, [info, arrayId, setTileInfo]);
 
   // `volumeRefusal` already established this is the available branch; the cast
   // is what lets the rest of the component read the plan without re-narrowing.

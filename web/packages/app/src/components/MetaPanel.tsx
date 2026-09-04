@@ -2,7 +2,7 @@
 
 import { memo, useEffect, useState } from "react";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
-import { useAppStore } from "../store";
+import { selectTileInfo, useAppStore } from "../store";
 import {
   MAX_ROWS,
   autoExpanded,
@@ -148,7 +148,7 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
   const activeTensorId = useAppStore((s) => s.activeTensorId);
   // The live grid, so the shape shown is the tensor's now rather than the
   // catalog scan's. See `sliderGrid` for why those can differ.
-  const tileInfo = useAppStore((s) => s.tileInfo);
+  const tileInfo = useAppStore(selectTileInfo);
   const [metadata, setMetadata] = useState<Record<string, unknown> | null>(null);
   const [source, setSource] = useState<DataSourceDescriptor | null>(null);
   const [loading, setLoading] = useState(false);

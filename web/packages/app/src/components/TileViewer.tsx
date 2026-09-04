@@ -165,8 +165,8 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // extents to bound its sliders, and this component already paid for them.
   const setTileInfo = useAppStore((s) => s.setTileInfo);
   useEffect(() => {
-    setTileInfo(info);
-  }, [info, setTileInfo]);
+    setTileInfo(info, arrayId);
+  }, [info, arrayId, setTileInfo]);
   // Identity has to follow content, not the store write that produced it. Viv's
   // ImageLayer refetches whenever `selections` is a new *reference*, and zustand
   // hands out a fresh slice object on every `setSlice` — so deriving the

@@ -284,11 +284,13 @@ export interface SliderGrid {
  * and for a tensor whose viewer refused it: blanking the whole control column
  * in that case would take the 2-D/3-D toggle with it.
  *
- * `tileInfo` is deliberately not matched against `tensorId`. `tile_info` answers
- * with the *versioned* array_id (`id@token`, an HTTP-only form -- see the
- * identity policy in descriptor.proto), so an equality test would silently
- * never hold. What makes "whatever is in the slot" the right tensor is that the
- * store clears it on a source change.
+ * `tileInfo` is never matched against `tensorId` here, and must not be:
+ * `tile_info` answers with the *versioned* array_id (`id@token`, an HTTP-only
+ * form -- see the identity policy in descriptor.proto) and resolves a bare
+ * source_id to the field it binds as that source's default, so an equality test
+ * would silently never hold. Whether the grid belongs to the tensor in view is
+ * settled before this, by `selectTileInfo`, which compares the id the grid was
+ * *fetched for* rather than the id it came back naming.
  */
 export function sliderGrid(
   tileInfo: TileInfo | null,

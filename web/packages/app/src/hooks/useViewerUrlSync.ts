@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
-import { useAppStore } from "../store";
+import { selectTileInfo, useAppStore } from "../store";
 import { DEFAULT_VIEWER_URL_STATE, encodeViewerState } from "../utils/viewerUrl";
 
 /**
@@ -24,7 +24,7 @@ export function useViewerUrlSync() {
   const slice = useAppStore((s) => s.slice);
   const render3d = useAppStore((s) => s.render3d);
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
-  const tileInfo = useAppStore((s) => s.tileInfo);
+  const tileInfo = useAppStore(selectTileInfo);
   const requestedArrayId = useAppStore((s) => s.requestedArrayId);
   const camera3d = useAppStore((s) => s.camera3d);
   const camera2d = useAppStore((s) => s.camera2d);
