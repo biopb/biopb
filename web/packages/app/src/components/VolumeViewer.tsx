@@ -37,6 +37,7 @@ import {
 import { useAppStore } from "../store";
 import type { ViewerErrorKind } from "./ViewerPane";
 import {
+  clampContrastLimits,
   contrastLimitsFrom,
   contrastSamples,
   dtypeContrastLimits,
@@ -191,6 +192,18 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
 
   const current = volume && volume.key === requestKey ? volume.data : null;
 
+  // Published for the play driver; see TileViewer.
+  const playing = useAppStore((s) => s.playAxis !== null);
+  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
+  useEffect(() => {
+    setPlaneReady(current !== null);
+  }, [current, setPlaneReady]);
+
+  // Under play, keep the last volume on the canvas while the next read is in
+  // flight. Unmounting the stage between frames -- which is what a null here
+  // does -- makes a scrub through T a strobe of empty panes.
+  const shown = current ?? (playing ? (volume?.data ?? null) : null);
+
   // --- contrast ------------------------------------------------------------
   // Sampled from the volume itself. There is no coarser level to sample here
   // the way the tiled viewer samples its overview — this *is* the coarsest —
@@ -200,10 +213,32 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
 
   const contrastLimits = useMemo<[number, number]>(() => {
     if (!info) return [0, 1];
-    if (!samples) return dtypeContrastLimits(vivDtype(info.dtype));
-    const [lo, hi] = percentileBounds(slice.useMinMax, slice.percentileScale);
+    const range = dtypeContrastLimits(vivDtype(info.dtype));
+    // A fixed window is the user's, not the plane's: it is not re-derived per
+    // plane, only brought inside the dtype it is being applied to.
+    if (slice.contrastMode === "fixed") {
+      return slice.fixedLimits ? clampContrastLimits(slice.fixedLimits, range) : range;
+    }
+    if (!samples) return range;
+    const [lo, hi] = percentileBounds(slice.percentileScale);
     return contrastLimitsFrom(samples, lo, hi);
-  }, [info, samples, slice.useMinMax, slice.percentileScale]);
+  }, [info, samples, slice.contrastMode, slice.fixedLimits, slice.percentileScale]);
+
+  // Published so the panel can seed a fixed window from what is on screen.
+  const setAppliedLimits = useAppStore((s) => s.setAppliedLimits);
+  useEffect(() => {
+    setAppliedLimits(contrastLimits);
+  }, [contrastLimits, setAppliedLimits]);
+
+  // And the plane's own extremes, which the window no longer reports once it
+  // is fixed. Deliberately not keyed to the current selection: the last plane
+  // sampled is what Min/Max should reset onto, and holding it across a read
+  // keeps the button from going dead for the length of one.
+  const planeLimits = useMemo(() => samples ? contrastLimitsFrom(samples, 0, 100) : null, [samples]);
+  const setPlaneLimits = useAppStore((s) => s.setPlaneLimits);
+  useEffect(() => {
+    if (planeLimits) setPlaneLimits(planeLimits);
+  }, [planeLimits, setPlaneLimits]);
 
   const color = useMemo(() => {
     const stored = channelColors[sourceId]?.[slice.c] ?? "auto";
@@ -212,10 +247,10 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
 
   return (
     <div ref={hostRef} style={HOST}>
-      {info && plan && current && size ? (
+      {info && plan && shown && size ? (
         <VolumeStage
           plan={plan}
-          data={current}
+          data={shown}
           dtype={vivDtype(info.dtype)}
           contrastLimits={contrastLimits}
           color={color}
@@ -232,7 +267,7 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
               : "Loading volume…"}
         </div>
       )}
-      {plan && current && size && (
+      {plan && shown && size && (
         <div style={BADGE} title="The scale the server keeps this volume warm at.">
           {plan.width}×{plan.height}×{plan.depth} at 1/{plan.scale_hint[plan.axes.x]}
           {plan.spacing === null && " · isotropic (no physical scale)"}

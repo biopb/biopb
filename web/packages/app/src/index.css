@@ -386,10 +386,66 @@ html, body {
   flex-direction: column;
   gap: 0.75rem;
 }
+/* Drawn rather than accent-coloured: the grab handle's width carries how many
+   positions the axis has (see `sliderThumbPx`), and a native thumb cannot be
+   sized. --thumb-w is set per slider; the fallback is the continuous case. */
 .slice-controls input[type="range"] {
-  accent-color: #4f8ef7;
-  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 14px;
+  background: transparent;
+  cursor: pointer;
 }
+.slice-controls input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #2d3748;
+}
+.slice-controls input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #2d3748;
+}
+.slice-controls input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: var(--thumb-w, 12px);
+  height: 12px;
+  margin-top: -4px;
+  border-radius: 3px;
+  background: #4f8ef7;
+}
+.slice-controls input[type="range"]::-moz-range-thumb {
+  width: var(--thumb-w, 12px);
+  height: 12px;
+  border: none;
+  border-radius: 3px;
+  background: #4f8ef7;
+}
+/* Two grabs on one bar: the inputs are stacked and transparent, so only their
+   thumbs take the pointer and the rail below is drawn once. */
+.dual-range { position: relative; height: 14px; }
+.dual-range-track,
+.dual-range-fill {
+  position: absolute;
+  top: 5px;
+  height: 4px;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.dual-range-track { left: 0; right: 0; background: #2d3748; }
+.dual-range-fill { background: #4f8ef7; opacity: 0.4; }
+.dual-range input[type="range"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  pointer-events: none;
+}
+.dual-range input[type="range"]::-webkit-slider-runnable-track { background: transparent; }
+.dual-range input[type="range"]::-moz-range-track { background: transparent; }
+.dual-range input[type="range"]::-webkit-slider-thumb { pointer-events: auto; }
+.dual-range input[type="range"]::-moz-range-thumb { pointer-events: auto; }
+
 .slice-controls select {
   background: #1e2435;
   border: 1px solid #2d3748;

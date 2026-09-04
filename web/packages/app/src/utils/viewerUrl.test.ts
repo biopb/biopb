@@ -66,10 +66,20 @@ describe("decodeViewerState", () => {
     expect(decode("z=abc&g=NaN").slice).toMatchObject({ z: 0, gamma: 1 });
   });
 
-  it("lets mm win over a stale percentile, and p clear the flag", () => {
-    expect(decode("mm=1").slice.useMinMax).toBe(true);
-    expect(decode("mm=1&p=2").slice).toMatchObject({ useMinMax: true });
-    expect(decode("p=2").slice).toMatchObject({ useMinMax: false, percentileScale: 2 });
+  it("reads the retired mm flag as the window it named", () => {
+    // Links in the wild still carry it; a scale of 0 is the same 0-100 window.
+    expect(decode("mm=1").slice).toMatchObject({ contrastMode: "auto", percentileScale: 0 });
+    expect(decode("mm=1&p=2").slice).toMatchObject({ percentileScale: 0 });
+    expect(decode("p=2").slice).toMatchObject({ contrastMode: "auto", percentileScale: 2 });
+  });
+
+  it("reads a fixed window, and ignores one that names no window", () => {
+    expect(decode("cl=100,4000").slice).toMatchObject({
+      contrastMode: "fixed",
+      fixedLimits: [100, 4000],
+    });
+    expect(decode("cl=4000,100").slice).toMatchObject({ contrastMode: "auto", fixedLimits: null });
+    expect(decode("cl=abc").slice).toMatchObject({ contrastMode: "auto" });
   });
 
   it("clamps gamma to the slider's track", () => {
@@ -104,9 +114,16 @@ describe("encodeViewerState", () => {
     expect(enc({}, "a7=3")).not.toContain("a7");
   });
 
-  it("writes mm instead of p when min/max is on", () => {
-    const out = enc({ slice: { ...DEFAULT_VIEWER_URL_STATE.slice, useMinMax: true, percentileScale: 0 } });
-    expect(out).toContain("mm=1");
+  it("writes the fixed window instead of the percentile it is not using", () => {
+    const out = enc({
+      slice: {
+        ...DEFAULT_VIEWER_URL_STATE.slice,
+        contrastMode: "fixed",
+        fixedLimits: [100, 4000],
+        percentileScale: 2,
+      },
+    });
+    expect(out).toContain("cl=100%2C4000");
     expect(out).not.toContain("p=");
   });
 
@@ -118,7 +135,16 @@ describe("encodeViewerState", () => {
   it("round-trips a state through decode", () => {
     const state: ViewerUrlState = {
       arrayId: TENSOR.array_id,
-      slice: { t: 5, z: 12, c: 2, axes: {}, percentileScale: 2.5, useMinMax: false, gamma: 1.5 },
+      slice: {
+        t: 5,
+        z: 12,
+        c: 2,
+        axes: {},
+        contrastMode: "auto",
+        percentileScale: 2.5,
+        fixedLimits: null,
+        gamma: 1.5,
+      },
       render3d: true,
       volumeRenderMode: "minip",
       camera3d: { target: [12.5, 30, 7.2], zoom: -2.125, rotationX: 20, rotationOrbit: -45 },
