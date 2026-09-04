@@ -6,7 +6,11 @@
  * tile-cache bound, and the axis/colour translations.
  */
 
-import { sliderAxes, type TileInfo } from "@biopb/tensor-flight-client";
+import {
+  sliderAxes,
+  type DataSourceDescriptor,
+  type TileInfo,
+} from "@biopb/tensor-flight-client";
 import { getColorMultipliers, type ColorValue } from "./colorUtils";
 
 // ---------------------------------------------------------------------------
@@ -249,4 +253,83 @@ export function vivColor(
 ): [number, number, number] {
   const [r, g, b] = getColorMultipliers(color, channelName);
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+
+/** Just enough of a tensor to bound a slider. */
+export interface SliderGrid {
+  dim_labels: string[];
+  shape: number[];
+}
+
+/**
+ * The grid a slider should be bounded by, live grid first.
+ *
+ * `tile_info` is fetch-per-call, so it describes the tensor as it is now. The
+ * catalog listing is refreshed only when the set of source *urls* changes, so a
+ * source that gains a tensor or a timelapse whose `T` grows keeps its old shape
+ * there -- and a slider bounded on that cannot reach frames the tensor has.
+ *
+ * The catalog remains the fallback for the window before a viewer has loaded,
+ * and for a tensor whose viewer refused it: blanking the whole control column
+ * in that case would take the 2-D/3-D toggle with it.
+ *
+ * `tileInfo` is deliberately not matched against `tensorId`. `tile_info` answers
+ * with the *versioned* array_id (`id@token`, an HTTP-only form -- see the
+ * identity policy in descriptor.proto), so an equality test would silently
+ * never hold. What makes "whatever is in the slot" the right tensor is that the
+ * store clears it on a source change.
+ */
+export function sliderGrid(
+  tileInfo: TileInfo | null,
+  sources: DataSourceDescriptor[],
+  sourceId: string,
+  tensorId: string,
+): SliderGrid | null {
+  if (tileInfo) return tileInfo;
+  const src = sources.find((s) => s.source_id === sourceId);
+  return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
+}
+
+
+/**
+ * `slice` with every index brought inside what `grid` actually has.
+ *
+ * Deferred rather than done while decoding a URL: once a link may carry a
+ * *pinned* address, the descriptor that bounds it does not exist until
+ * `tile_info` answers, so there is nothing to clamp against at decode time.
+ * Running it when the grid lands covers the same case and one the old placement
+ * could not -- a tensor that grew or shrank under a selection already made.
+ *
+ * Out-of-range clamps rather than resetting: a stale `z` should not also
+ * discard the `t` beside it. An axis key the grid does not have is dropped,
+ * since it names nothing here and would otherwise put a phantom entry in the
+ * selection the viewer builds.
+ */
+export function clampSliceTo<T extends SliceLike>(slice: T, grid: SliderGrid | null): T {
+  if (!grid) return slice;
+  const axes = sliderAxes(grid.dim_labels, grid.shape);
+  const extentOf = (key: string) => axes.find((a) => a.key === key)?.extent ?? 1;
+  const bound = (value: number, key: string) =>
+    Math.max(0, Math.min(Math.round(value), Math.max(0, extentOf(key) - 1)));
+
+  const nextAxes: Record<string, number> = {};
+  for (const [key, value] of Object.entries(slice.axes)) {
+    if (axes.some((a) => a.key === key)) nextAxes[key] = bound(value, key);
+  }
+  return {
+    ...slice,
+    t: bound(slice.t, "t"),
+    z: bound(slice.z, "z"),
+    c: bound(slice.c, "c"),
+    axes: nextAxes,
+  };
+}
+
+/** The part of the slice state this module bounds. */
+export interface SliceLike {
+  t: number;
+  z: number;
+  c: number;
+  axes: Record<string, number>;
 }

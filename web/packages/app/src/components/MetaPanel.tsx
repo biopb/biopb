@@ -1,6 +1,7 @@
 "use client";
 
 import { memo, useEffect, useState } from "react";
+import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
 import {
   MAX_ROWS,
@@ -144,14 +145,38 @@ const JsonNode = memo(function JsonNode({
 
 export function MetaPanel({ sourceId }: MetaPanelProps) {
   const client = useAppStore((s) => s.client);
-  const sources = useAppStore((s) => s.sources);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
+  // The live grid, so the shape shown is the tensor's now rather than the
+  // catalog scan's. See `sliderGrid` for why those can differ.
+  const tileInfo = useAppStore((s) => s.tileInfo);
   const [metadata, setMetadata] = useState<Record<string, unknown> | null>(null);
+  const [source, setSource] = useState<DataSourceDescriptor | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const source = sources.find((s) => s.source_id === sourceId);
-  const tensor = source?.tensors.find((t) => t.array_id === activeTensorId);
+  // Addressed by id rather than found in `sources`: the catalog listing is
+  // capped and may still be scanning, and this panel describes one source that
+  // is already open -- there is no reason for it to depend on the whole list.
+  useEffect(() => {
+    let cancelled = false;
+    if (!client || !sourceId) {
+      setSource(null);
+      return;
+    }
+    client.http
+      .getSource(sourceId)
+      .then((d) => {
+        if (!cancelled) setSource(d);
+      })
+      .catch(() => {
+        // The metadata request below reports for both; a missing descriptor
+        // just leaves the key-info block out.
+        if (!cancelled) setSource(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, sourceId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -187,19 +212,20 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
         <div style={{ marginBottom: 12, padding: 8, background: "#1e2435", borderRadius: 4 }}>
           <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Array</div>
           <div style={{ fontSize: 12, wordBreak: "break-all" }}>
-            {source.tensors.length === 1
-              ? source.source_id
-              : `${source.source_id}/${activeTensorId ?? ""}`}
+            {/* `array_id` is the whole address already -- prefixing the
+                source_id again produced "src/src/field" on a multi-tensor
+                source. */}
+            {activeTensorId ?? source.source_id}
           </div>
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 8, marginBottom: 4 }}>Source URL</div>
           <div style={{ fontSize: 12, wordBreak: "break-all" }}>{source.source_url || source.source_id}</div>
 
-          {tensor && (
+          {tileInfo && (
             <>
               <div style={{ fontSize: 11, color: "#64748b", marginTop: 8 }}>Tensor Shape</div>
-              <div style={{ fontSize: 12 }}>{tensor.shape.join(" × ")}</div>
+              <div style={{ fontSize: 12 }}>{tileInfo.shape.join(" × ")}</div>
               <div style={{ fontSize: 11, color: "#64748b", marginTop: 8 }}>Data Type</div>
-              <div style={{ fontSize: 12 }}>{tensor.dtype}</div>
+              <div style={{ fontSize: 12 }}>{tileInfo.dtype}</div>
             </>
           )}
         </div>

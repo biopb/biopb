@@ -16,6 +16,9 @@ export function HomePage() {
   const connectionError = useAppStore((s) => s.connectionError);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
+  // What the render path fetches: the exact address a link asked for, which may
+  // be content-pinned, falling back to the selection for an ordinary click.
+  const requestedArrayId = useAppStore((s) => s.requestedArrayId);
 
   return (
     <div className="app-shell">
@@ -53,7 +56,7 @@ export function HomePage() {
               <div className="viewer-canvas-wrap">
                 <ViewerPane
                   sourceId={activeSourceId}
-                  tensorId={activeTensorId}
+                  tensorId={requestedArrayId ?? activeTensorId}
                 />
               </div>
             </div>

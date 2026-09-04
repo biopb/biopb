@@ -1,9 +1,11 @@
 import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
-import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
+import type { DataSourceDescriptor, QuerySourcesResult, TileInfo } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
-import { decodeViewerState, resolveArrayId, type ViewerUrlState } from "./utils/viewerUrl";
+import { decodeViewerState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
+import { clampSliceTo } from "./utils/vivUtils";
+import { splitArrayVersion } from "@biopb/tensor-flight-client";
 import {
   DEFAULT_VOLUME_RENDER_MODE,
   type VolumeRenderMode,
@@ -51,10 +53,43 @@ export interface AppState {
 
   // Active selection
   activeSourceId: string | null;
+  /**
+   * The selection, always the *stable* address -- what the tree highlights and
+   * what `selectSource` sets. Never carries a version token.
+   */
   activeTensorId: string | null;
+  /**
+   * The exact address a link asked for, which may be content-pinned
+   * (`id@token`), or null when the selection came from a click.
+   *
+   * Separate from `activeTensorId` because the two answer different questions:
+   * this is what the render path fetches, that is what the catalog UI compares
+   * against. Folding them together would either break the tree's highlight (it
+   * matches catalog ids, which are never pinned) or force a click to resolve a
+   * token before it could select anything.
+   *
+   * Cleared by `selectSource`: a click supersedes whatever version a link named.
+   */
+  requestedArrayId: string | null;
 
   // Slice controls
   slice: SliceState;
+
+  /**
+   * The transfer grid of the tensor in view, published by whichever viewer
+   * mounted it.
+   *
+   * The catalog's descriptor is not a substitute: `/api/sources` is a listing,
+   * refreshed only when the set of source *urls* changes, so a source that
+   * gains a tensor or a timelapse whose `T` grows keeps its old `shape` there
+   * until a reload. Bounding a slider on that means a control that cannot reach
+   * frames the tensor has. `tile_info` is fetch-per-call and answers for the
+   * tensor as it is now.
+   *
+   * Null while nothing is loaded, and cleared on a source change so a stale
+   * grid can never bound the next tensor.
+   */
+  tileInfo: TileInfo | null;
 
   // UI options
   showAdvancedOptions: boolean;
@@ -88,6 +123,7 @@ export interface AppState {
   querySources: (sql: string) => Promise<QuerySourcesResult>;
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
+  setTileInfo: (value: TileInfo | null) => void;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -149,6 +185,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   activeSourceId: null,
   activeTensorId: null,
+  requestedArrayId: null,
 
   slice: {
     t: 0,
@@ -159,6 +196,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     useMinMax: false,
     gamma: 1,
   },
+
+  tileInfo: null,
 
   showAdvancedOptions: false,
   render3d: false,
@@ -208,13 +247,23 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   selectSource(sourceId, tensorId) {
     if (!sourceId) {
-      set({ activeSourceId: null, activeTensorId: null });
+      set({ activeSourceId: null, activeTensorId: null, requestedArrayId: null });
       return;
     }
-    const { sources } = get();
-    const src = sources.find((s) => s.source_id === sourceId);
-    const tid = tensorId ?? src?.tensors[0]?.array_id ?? null;
-    set({ activeSourceId: sourceId, activeTensorId: tid, render3d: false });
+    // No catalog lookup, and no `tensors[0]` guess. A bare source_id *is* a
+    // valid array_id (the identity policy in descriptor.proto), and the Flight
+    // server resolves it to whatever it binds as that source's default tensor.
+    // Guessing the first entry here is what biopb/biopb#75 was about: two
+    // derivations of one identity that can disagree, where the geometry came
+    // from tensors[0] and the read went somewhere else.
+    const tid = tensorId ?? sourceId;
+    set({
+      activeSourceId: sourceId,
+      activeTensorId: tid,
+      requestedArrayId: null,
+      render3d: false,
+      tileInfo: null,
+    });
     set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {} } }));
   },
 
@@ -222,21 +271,33 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ slice: { ...s.slice, ...partial } }));
   },
 
+  setTileInfo(value) {
+    // The grid is the first thing that can say what an index may be, so the
+    // slice is bounded here rather than where it was read -- see clampSliceTo.
+    set((s) => ({ tileInfo: value, slice: clampSliceTo(s.slice, value) }));
+  },
+
   applyViewerState(params) {
-    const arrayId = params.get("id");
-    if (!arrayId) return false;
-    const found = resolveArrayId(get().sources, arrayId);
-    if (!found) return false;
+    const requested = params.get("id");
+    if (!requested) return false;
+    // The link may name a pinned address; the selection is always the stable
+    // one, and `source_id` is the prefix before the first "/" by the identity
+    // policy -- so both come out of the id itself with no catalog lookup. That
+    // is what lets a shared link open while the catalog is capped, still
+    // scanning, or missing the source entirely; an id that names nothing then
+    // fails at the fetch, which can say so, rather than here in silence.
+    const { arrayId: stable } = splitArrayVersion(requested);
     const s = get();
-    const next: ViewerUrlState = decodeViewerState(params, found.tensor, {
-      arrayId,
+    const next = decodeViewerState(params, {
+      arrayId: stable,
       slice: s.slice,
       render3d: s.render3d,
       volumeRenderMode: s.volumeRenderMode,
     });
     set({
-      activeSourceId: found.source.source_id,
-      activeTensorId: found.tensor.array_id,
+      activeSourceId: stable.split("/", 1)[0] ?? null,
+      activeTensorId: stable,
+      requestedArrayId: requested,
       slice: next.slice,
       render3d: next.render3d,
       volumeRenderMode: next.volumeRenderMode,

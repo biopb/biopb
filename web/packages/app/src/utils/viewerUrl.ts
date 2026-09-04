@@ -17,7 +17,6 @@
  * already emits, which is what lets today's links keep working then.
  */
 
-import { sliderAxes, type DataSourceDescriptor, type TensorDescriptor } from "@biopb/tensor-flight-client";
 import type { SliceState } from "../store";
 import { clampGamma } from "./vivUtils";
 import { DEFAULT_VOLUME_RENDER_MODE, VOLUME_RENDER_MODES, type VolumeRenderMode } from "./volumeUtils";
@@ -57,46 +56,38 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-/** A whole index in `[0, extent)`, the form every axis parameter must take. */
-function axisIndex(raw: string | null, extent: number): number | null {
-  const n = num(raw);
-  if (n === null) return null;
-  return clamp(Math.round(n), 0, Math.max(0, extent - 1));
-}
-
 /**
- * Read a viewing state out of `params`, bounded by what `descriptor` allows.
+ * Read a viewing state out of `params`.
  *
- * The descriptor is required rather than optional because a URL is untrusted
- * input on a path with no other bound: `setSlice` spreads whatever it is given,
- * so a hand-edited `z=400` on a 40-plane stack would otherwise reach the
- * viewer's fetch. Out-of-range values clamp instead of rejecting the whole
- * link -- one stale index should not discard the other five parameters.
+ * Unbounded on purpose. A link may carry a *pinned* address, whose descriptor
+ * does not exist until `tile_info` answers, so there is nothing to clamp
+ * against here. `clampSliceTo` does it when the grid lands, which also covers a
+ * case this could never see: a tensor that changed shape under a selection
+ * already made. Values are still *validated* -- a non-number is ignored rather
+ * than passed on as NaN.
+ *
+ * Axis keys are taken as given for the same reason: which ones exist is a
+ * property of the grid, so the clamp is what drops the ones naming nothing.
  */
 export function decodeViewerState(
   params: URLSearchParams,
-  descriptor: TensorDescriptor,
   defaults: ViewerUrlState,
 ): ViewerUrlState {
-  const axes = sliderAxes(descriptor.dim_labels, descriptor.shape);
-  const extentOf = (key: string) => axes.find((a) => a.key === key)?.extent ?? 1;
-
-  const named: Pick<SliceState, "t" | "z" | "c"> = { t: defaults.slice.t, z: defaults.slice.z, c: defaults.slice.c };
+  const named: Pick<SliceState, "t" | "z" | "c"> = {
+    t: defaults.slice.t,
+    z: defaults.slice.z,
+    c: defaults.slice.c,
+  };
   for (const key of ["t", "z", "c"] as const) {
-    const v = axisIndex(params.get(key), extentOf(key));
-    if (v !== null) named[key] = v;
+    const v = num(params.get(key));
+    if (v !== null) named[key] = Math.max(0, Math.round(v));
   }
 
-  // Only axes this tensor actually has: a key left over from the previously
-  // viewed source names nothing here, and carrying it would put a phantom entry
-  // in the selection the viewer builds.
   const unnamed: Record<string, number> = {};
   for (const [key, raw] of params.entries()) {
     if (!AXIS_PARAM.test(key)) continue;
-    const axis = axes.find((a) => a.key === key);
-    if (!axis) continue;
-    const v = axisIndex(raw, axis.extent);
-    if (v !== null) unnamed[key] = v;
+    const v = num(raw);
+    if (v !== null) unnamed[key] = Math.max(0, Math.round(v));
   }
 
   const p = num(params.get("p"));
@@ -104,11 +95,12 @@ export function decodeViewerState(
   const vm = params.get("vm");
 
   return {
-    arrayId: descriptor.array_id,
+    arrayId: params.get(PARAM_ID) ?? defaults.arrayId,
     slice: {
       ...named,
       axes: unnamed,
-      percentileScale: p === null ? defaults.slice.percentileScale : clamp(p, PERCENTILE_MIN, PERCENTILE_MAX),
+      percentileScale:
+        p === null ? defaults.slice.percentileScale : clamp(p, PERCENTILE_MIN, PERCENTILE_MAX),
       // An explicit percentile is a contradiction with min/max, and the control
       // writes them together; the flag wins only when it is the one that is set.
       useMinMax: params.get("mm") === "1" ? true : p !== null ? false : defaults.slice.useMinMax,
@@ -154,25 +146,6 @@ export function encodeViewerState(params: URLSearchParams, state: ViewerUrlState
 function round(value: number, decimals: number): number {
   const f = 10 ** decimals;
   return Math.round(value * f) / f;
-}
-
-/**
- * The source and tensor an `array_id` names, by search rather than by parsing.
- *
- * `array_id` is the whole address (`source_id` for a single-tensor source,
- * `source_id/field` otherwise), and the split is the server's to make -- so
- * this matches whole ids against the catalog instead of re-deriving the rule
- * where it would drift.
- */
-export function resolveArrayId(
-  sources: DataSourceDescriptor[],
-  arrayId: string,
-): { source: DataSourceDescriptor; tensor: TensorDescriptor } | null {
-  for (const source of sources) {
-    const tensor = source.tensors.find((t) => t.array_id === arrayId);
-    if (tensor) return { source, tensor };
-  }
-  return null;
 }
 
 export const DEFAULT_VIEWER_URL_STATE: Omit<ViewerUrlState, "arrayId"> = {

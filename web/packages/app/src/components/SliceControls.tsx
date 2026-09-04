@@ -10,7 +10,7 @@ import {
   isHexColor,
   resolveAutoColor,
 } from "../utils/colorUtils";
-import { GAMMA_OCTAVES, gammaFromOctaves, octavesFromGamma } from "../utils/vivUtils";
+import { GAMMA_OCTAVES, gammaFromOctaves, octavesFromGamma, sliderGrid } from "../utils/vivUtils";
 import { VOLUME_RENDER_MODES } from "../utils/volumeUtils";
 
 // Debounce delay for slider updates (matches the viewer's keyboard+wheel debounce)
@@ -27,6 +27,7 @@ function clamp(value: number, min: number, max: number): number {
 
 export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const sources = useAppStore((s) => s.sources);
+  const tileInfo = useAppStore((s) => s.tileInfo);
   const slice = useAppStore((s) => s.slice);
   const setSlice = useAppStore((s) => s.setSlice);
   const channelNames = useAppStore((s) => s.channelNames);
@@ -74,10 +75,12 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     loadChannelNames(sourceId);
   }, [sourceId, loadChannelNames]);
 
-  const descriptor = useMemo(() => {
-    const src = sources.find((s) => s.source_id === sourceId);
-    return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
-  }, [sourceId, sources, tensorId]);
+  // See `sliderGrid`: the live grid bounds the sliders, the catalog is only a
+  // fallback for before a viewer has loaded.
+  const descriptor = useMemo(
+    () => sliderGrid(tileInfo, sources, sourceId, tensorId),
+    [tileInfo, sources, sourceId, tensorId],
+  );
 
   // Not buildAxisMap: its positional fallback would title a TIFF sequence's
   // `i` axis "Z", asserting depth about 155 stacked files on the strength of
