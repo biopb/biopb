@@ -90,7 +90,10 @@ export async function localRootsProxied(): Promise<boolean> {
 export function redirectToUnlock(): void {
   // `here` is a router path (so UnlockPage can navigate() back to it), while the
   // assign target is a real URL and needs the prefix.
-  const here = appPath(window.location.pathname);
+  const url = new URL(window.location.href);
+  url.searchParams.delete("token");
+  const query = url.searchParams.toString();
+  const here = appPath(url.pathname) + (query ? `?${query}` : "");
   const next =
     here && here !== "/unlock" ? "?next=" + encodeURIComponent(here) : "";
   window.location.assign(withBase("/unlock") + next);

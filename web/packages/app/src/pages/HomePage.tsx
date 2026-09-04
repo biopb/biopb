@@ -6,10 +6,12 @@ import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
 import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { useViewerUrlSync } from "../hooks/useViewerUrlSync";
 import { withBase } from "../base";
 
 export function HomePage() {
   useDocumentTitle("BioPB tensor - viewer");
+  useViewerUrlSync();
   const connectionState = useAppStore((s) => s.connectionState);
   const connectionError = useAppStore((s) => s.connectionError);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
