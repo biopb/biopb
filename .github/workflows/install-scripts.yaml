@@ -117,7 +117,13 @@ jobs:
     # Windows leg exists to run biopb-engine.ps1 under the interpreter users have.
     name: Installer unit tests (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # 30, not 10, for the Windows leg: every PowerShell case spawns a fresh 5.1
+    # that dot-sources the ~100KB engine, and that spawn is ~0.25s on a developer
+    # machine but ~22s on a stock runner (measured: the bash cases next to them
+    # are ~0.2s). The exclusion step below is what brings it back down; this is
+    # the headroom for when it cannot. The Linux leg finishes in well under a
+    # minute either way.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +142,26 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
 
+      # Windows PowerShell 5.1 startup dominates this leg. Each case spawns one,
+      # and each spawn dot-sources biopb-engine.ps1 -- ~100KB of script text that
+      # Defender's real-time scan reads through AMSI every single time. Measured
+      # on a stock runner: ~22s per PowerShell case against ~0.2s for the bash
+      # cases beside them, i.e. the interpreter, not the code under test.
+      #
+      # Excluding the workspace and the runner temp dir is what makes this leg
+      # affordable. It is scoped to an ephemeral runner VM that is destroyed
+      # afterwards, and it changes nothing about what the tests actually assert.
+      # Best-effort: a runner with Defender absent or policy-locked just stays
+      # slow, which the timeout above has room for, so it must not fail the job.
+      - name: Speed up PowerShell startup (Defender exclusion)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath $env:RUNNER_TEMP -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess powershell.exe -ErrorAction SilentlyContinue
+
       # --no-project: these tests import nothing from the monorepo -- they drive
       # install.sh and biopb-engine.ps1 by subprocess -- so syncing the workspace
       # (buf, proto codegen, napari) would be minutes spent on nothing they use.
@@ -143,8 +169,11 @@ jobs:
       # One command on both legs: the install.sh tests skip themselves on Windows
       # (conftest.requires_posix), because install.sh is the POSIX installer and
       # is never run there.
+      # --durations: the slowest cases, printed. This leg's cost is interpreter
+      # startup rather than anything the tests do, and that is invisible in a
+      # green run until it walks into the timeout -- which is how it was found.
       - name: Run the installer tests
-        run: uv run --no-project --with pytest pytest -v --color=yes install/test
+        run: uv run --no-project --with pytest pytest -v --color=yes --durations=10 install/test
 
       - name: Confirm the right PowerShell was exercised
         shell: bash
