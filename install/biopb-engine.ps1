@@ -344,6 +344,67 @@ function Assert-LastExit {
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
 }
 
+# Read an interpreter's (Major, Minor) version. Returns a [pscustomobject] with
+# Major/Minor, or $null when the interpreter cannot be read -- missing, a stub, or
+# output we do not recognize as a version. Deciding what to DO with that answer
+# (accept it, warn, fall back to a uv-managed Python) stays with the caller.
+#
+# Emits nothing to the output stream but the result, and calls no Report-* helper:
+# in gui mode those write tagged records to stdout (Emit-Gui), which would arrive
+# folded into this function's return value.
+#
+# A function rather than a dozen lines inside Invoke-BiopbInstall so a test can
+# drive it (install/test/test_python_probe.py) -- the engine is executed by nothing
+# else, and this probe is where a fresh Windows machine actually fails. Two traps
+# live here, and BOTH shipped as install-time crashes that users reported as "the
+# Python stage failed":
+#
+#   1. `2>$null` on a NATIVE command makes Windows PowerShell 5.1 wrap every stderr
+#      line in an ErrorRecord, which under this engine's EAP='Stop' is a
+#      TERMINATING NativeCommandError -- the same trap Invoke-Precompile and
+#      Start-ControlPlane already document. It fires on exactly the machine this
+#      probe exists to serve: a fresh Windows box with no Python still has a 0-byte
+#      Microsoft Store *App Execution Alias* at
+#      %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe, on PATH by default, which
+#      prints "Python was not found; run without arguments to install from the
+#      Microsoft Store..." to stderr and exits 9009. Unsoftened, the install died
+#      quoting that message instead of falling through to the uv-managed Python
+#      that handles the case fine. A Python that merely warns on stderr (a conda
+#      banner, a DLL or deprecation notice) tripped it too, while being perfectly
+#      usable. So: soften EAP across the call and let the exit code decide.
+#
+#   2. An interpreter that greets on STDOUT (conda, a sitecustomize banner) puts a
+#      non-numeric line ahead of the answer, and [int] on it throws -- under
+#      EAP='Stop' that is another terminating error in the same place. So: take the
+#      LAST non-empty line and match it strictly. Anything unrecognized is $null,
+#      and the caller falls back instead of dying.
+#
+# Neither trap reproduces under pwsh 7, which is what CI runs -- see the Windows
+# leg of install-scripts.yaml, added with this function so they cannot come back.
+function Get-SystemPythonVersion {
+    [OutputType([psobject])]
+    param([Parameter(Mandatory)][string]$PythonExe)
+
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $PythonExe -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>$null
+        $code = $LASTEXITCODE
+    } catch {
+        # A stub that cannot be launched at all still means "no usable Python".
+        return $null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if ($code -ne 0) { return $null }
+
+    # $LASTEXITCODE is stale when the command never ran, so the strict match below
+    # -- not the exit code alone -- is what actually vouches for the answer.
+    $line = (@($out) | Where-Object { "$_".Trim() } | Select-Object -Last 1)
+    if ("$line" -notmatch '^\s*(\d+)\s+(\d+)\s*$') { return $null }
+    return [pscustomobject]@{ Major = [int]$Matches[1]; Minor = [int]$Matches[2] }
+}
+
 # Read <ConfigDir>\extra-packages.txt into the requirement list to replay into the
 # shared environment. Returns the requirements in file order; nothing at all when
 # the file (or the directory) is absent, which is every machine until the user
@@ -388,7 +449,7 @@ function Read-ExtraPackages {
     return $reqs
 }
 
-# Run one `uv tool install`, with a heartbeat while it works and uv's own output
+# Run one `uv` command, with a heartbeat while it works and uv's own output
 # replayed afterwards. Records uv's exit code in $script:LastUvExit and does NOT
 # throw on failure: the caller decides, because one failure mode (a user's extra
 # package that will not resolve) is retried rather than fatal.
@@ -396,8 +457,21 @@ function Read-ExtraPackages {
 # The exit code is recorded in a script variable rather than returned, because in
 # GUI mode the Report-* helpers write to the output stream (Emit-Gui), so a
 # returned value would arrive mixed in with every progress record this emits.
-function Invoke-UvToolInstall {
-    param([string[]]$InstallArgs, [string]$OutLog, [string]$ErrLog)
+#
+# Named for `uv`, not for `uv tool install`: nothing in here was ever specific to
+# that subcommand, and the one uv call that stayed outside it -- `uv python
+# install` in step 2 -- was the one whose failures reached the user as a bare
+# "exit code 2" with uv's own error printed nowhere. Under the GUI front-end,
+# which has no console, it was invisible entirely.
+function Invoke-Uv {
+    param(
+        [string[]]$UvArgs,
+        [string]$OutLog,
+        [string]$ErrLog,
+        # Wording for the heartbeat line, so a multi-minute wheel install and a
+        # Python download each describe what they are actually doing.
+        [string]$Activity = "working"
+    )
 
     # uv only animates its progress bar on a TTY, and it goes SILENT for
     # minutes during the prepare/link phase (no per-line output there) -- which
@@ -415,7 +489,7 @@ function Invoke-UvToolInstall {
     # ("biopb[tensor] @ file:///..."), which an array would split under Windows
     # PowerShell 5.1. Only spaces/quotes need quoting here (no embedded quotes).
     $uvExe = (Get-Command uv -ErrorAction Stop).Source
-    $argLine = ($InstallArgs | ForEach-Object {
+    $argLine = ($UvArgs | ForEach-Object {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     }) -join ' '
 
@@ -434,7 +508,7 @@ function Invoke-UvToolInstall {
         $elapsed = [int]$sw.Elapsed.TotalSeconds
         if (($elapsed - $lastTick) -ge 10) {
             $lastTick = $elapsed
-            Report-Detail "  ...still installing (${elapsed}s elapsed)"
+            Report-Detail "  ...still $Activity (${elapsed}s elapsed)"
         }
     }
     # The timed WaitForExit above returns the instant uv signals exit, which can
@@ -460,6 +534,35 @@ function Invoke-UvToolInstall {
     # so it throws here instead of being retried.
     if ($null -eq $proc.ExitCode) { throw "biopb install: uv exit code unavailable" }
     $script:LastUvExit = $proc.ExitCode
+}
+
+# Throw on a failed Invoke-Uv, quoting uv's own reason.
+#
+# Assert-LastExit's "failed (exit code 2)" is all the user got when uv itself was
+# the thing that failed -- no network, a proxy, a Python build unavailable for the
+# platform. uv puts the actual cause on stderr as an `error:` line, which
+# Invoke-Uv captures; this lifts the first one into the thrown message, because
+# the thrown message is what both front-ends render (the console prints it, and
+# the GUI wizard has nothing else to show).
+function Assert-UvExit {
+    param([string]$What, [string]$ErrLog)
+
+    if ($script:LastUvExit -eq 0) { return }
+
+    $detail = ""
+    if ($ErrLog -and (Test-Path -LiteralPath $ErrLog)) {
+        # -Encoding UTF8 for the same reason Invoke-Uv replays that way: 5.1
+        # defaults to ANSI and would mangle non-ASCII in uv's message.
+        $lines = @(Get-Content -LiteralPath $ErrLog -Encoding UTF8 -ErrorAction SilentlyContinue)
+        # uv's own diagnosis first; failing that, the last thing it said, which
+        # beats saying nothing.
+        $detail = ($lines | Where-Object { $_ -match '^\s*error:' } | Select-Object -First 1)
+        if (-not $detail) {
+            $detail = ($lines | Where-Object { "$_".Trim() } | Select-Object -Last 1)
+        }
+    }
+    if ($detail) { throw "$What failed (exit code $($script:LastUvExit)): $("$detail".Trim())" }
+    throw "$What failed (exit code $($script:LastUvExit))"
 }
 
 # Force-terminate any process running from a biopb uv tool environment so its
@@ -1175,10 +1278,14 @@ function Invoke-BiopbInstall {
     $pythonSpec = ""
     $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
     if ($pyExe) {
-        $verStr = & $pyExe -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $verStr) {
-            $parts = $verStr.Trim() -split '\s+'
-            $maj = [int]$parts[0]; $min = [int]$parts[1]
+        # Get-SystemPythonVersion returns $null for an interpreter it cannot read
+        # -- a Microsoft Store alias stub, a banner-printing conda shim, anything
+        # unrecognized -- rather than throwing, so those machines fall through to
+        # the uv-managed Python below instead of failing the install. See the
+        # function's own comment for the two traps that live in that call.
+        $ver = Get-SystemPythonVersion -PythonExe $pyExe
+        if ($ver) {
+            $maj = $ver.Major; $min = $ver.Minor
             if ($maj -eq 3 -and $min -ge $minMinor -and $min -le $maxMinor) {
                 Report-Ok "Using system Python: $(& $pyExe --version)"
                 $pythonOk = $true
@@ -1192,8 +1299,21 @@ function Invoke-BiopbInstall {
     }
     if (-not $pythonOk) {
         Report-Info "Installing Python 3.$maxMinor via uv..."
-        uv python install "3.$maxMinor"
-        Assert-LastExit "Python install"
+        # Through Invoke-Uv like every other uv call, rather than bare. This one
+        # downloads a ~30MB interpreter build, so it is both the call most likely
+        # to fail on a lab network (proxy, TLS interception, no route to
+        # python-build-standalone) and -- as a bare call -- the one that said
+        # least about it: Assert-LastExit reported "exit code 2" while uv's actual
+        # `error:` line went to a console the GUI front-end does not have.
+        $pyOutLog = Join-Path $env:TEMP "biopb-uv-python.out.log"
+        $pyErrLog = Join-Path $env:TEMP "biopb-uv-python.err.log"
+        try {
+            Invoke-Uv -UvArgs @("python", "install", "3.$maxMinor") `
+                -OutLog $pyOutLog -ErrLog $pyErrLog -Activity "downloading Python"
+            Assert-UvExit "Python install" $pyErrLog
+        } finally {
+            Remove-Item -LiteralPath $pyOutLog, $pyErrLog -Force -ErrorAction SilentlyContinue
+        }
         Report-Ok "Python 3.$maxMinor ready"
         $pythonSpec = "3.$maxMinor"
     }
@@ -1345,8 +1465,8 @@ function Invoke-BiopbInstall {
     $uvOutLog = Join-Path $env:TEMP "biopb-uv-install.out.log"
     $uvErrLog = Join-Path $env:TEMP "biopb-uv-install.err.log"
     try {
-        Invoke-UvToolInstall -InstallArgs ($installArgs + $extraArgs) `
-            -OutLog $uvOutLog -ErrLog $uvErrLog
+        Invoke-Uv -UvArgs ($installArgs + $extraArgs) `
+            -OutLog $uvOutLog -ErrLog $uvErrLog -Activity "installing"
         # Fail-soft on the extras only. A user requirement joins the same resolve as
         # the release's own pins (napari is pinned exactly), so one bad line would
         # otherwise block the whole upgrade over a package the deployment does not
@@ -1362,7 +1482,7 @@ function Invoke-BiopbInstall {
         # the second.
         if ($script:LastUvExit -ne 0 -and $extraNames.Count -gt 0) {
             Report-Warn "Install failed; retrying without your extra packages to see whether they are the cause: $($extraNames -join ', ')"
-            Invoke-UvToolInstall -InstallArgs $installArgs -OutLog $uvOutLog -ErrLog $uvErrLog
+            Invoke-Uv -UvArgs $installArgs -OutLog $uvOutLog -ErrLog $uvErrLog -Activity "installing"
             if ($script:LastUvExit -eq 0) {
                 $script:ExtrasDropped = ($extraNames -join ', ')
                 Report-Warn "Could not resolve your extra packages: $($script:ExtrasDropped)"
@@ -1382,7 +1502,22 @@ function Invoke-BiopbInstall {
 
     # Refresh PATH so freshly installed tool shims are visible this session.
     Add-ToUserPath $LocalBin
-    $versionOutput = (biopb-tensor-server version 2>$null)
+    # Same EAP='Stop' + redirected-stderr trap as the Python probe in step 2: a
+    # single benign stderr line here (a Qt/plugin or deprecation notice from the
+    # freshly installed stack) would raise a terminating NativeCommandError and
+    # abort the install AFTER the packages landed successfully. This value is
+    # decorative -- one status line, with an "installed" fallback that could
+    # never actually be reached while the call could throw instead.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $versionOutput = (biopb-tensor-server version 2>$null)
+    } catch {
+        $versionOutput = ""
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    $versionOutput = (@($versionOutput) | Where-Object { "$_".Trim() } | Select-Object -Last 1)
     if (-not $versionOutput) { $versionOutput = "installed" }
     Report-Ok "$versionOutput"
 

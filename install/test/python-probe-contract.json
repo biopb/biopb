@@ -1,0 +1,108 @@
+{
+  "why": [
+    "The shapes a real `python` on PATH can present, and what each installer half",
+    "must make of them. Both halves ask the same question -- print MAJOR MINOR --",
+    "so the only thing that varies is what the interpreter says back, and on which",
+    "stream. That is what these cases are.",
+    "",
+    "Held by test_python_probe.py against biopb-engine.ps1::Get-SystemPythonVersion",
+    "and install.sh::_system_python_version. Cases belong here, never inline in the",
+    "test module: an inline case is a case only one half is held to, which is the",
+    "hole this closes -- the same one extras-contract.json closes for #648/#653.",
+    "",
+    "`expected` is \"MAJOR.MINOR\" when the probe must read a version, or null when it",
+    "must decline. Declining is never an error: the caller falls back to a",
+    "uv-managed Python, which is a working install. Throwing is the failure, and it",
+    "is what shipped."
+  ],
+  "cases": [
+    {
+      "id": "clean-interpreter",
+      "stdout": ["3 11"],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": "3.11",
+      "why": "The ordinary machine: the answer on stdout, silence elsewhere, exit 0."
+    },
+    {
+      "id": "store-alias-stub",
+      "stdout": [],
+      "stderr": ["Python was not found; run without arguments to install from the Microsoft Store, or disable this shortcut from Settings > Manage App Execution Aliases."],
+      "exit_code": 9009,
+      "expected": null,
+      "why": "A fresh Windows box with no Python still has a 0-byte Store App Execution Alias on PATH. Declining sends the caller to a uv-managed Python; throwing here is what aborted the install in the Python stage."
+    },
+    {
+      "id": "stderr-noise-but-usable",
+      "stdout": ["3 11"],
+      "stderr": ["[warn] some benign startup notice"],
+      "exit_code": 0,
+      "expected": "3.11",
+      "why": "A perfectly usable Python that warns on stderr on the way past -- a conda banner, a DLL or deprecation notice. It answered; the noise is not the answer."
+    },
+    {
+      "id": "stdout-banner-before-the-answer",
+      "stdout": ["conda env active - banner line", "3 11"],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": "3.11",
+      "why": "An interpreter that greets on stdout puts a non-numeric line ahead of the answer. The version is the LAST line; reading the first one is an [int] cast (or a shell arithmetic test) on a word."
+    },
+    {
+      "id": "blank-lines-around-the-answer",
+      "stdout": ["", "3 11", ""],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": "3.11",
+      "why": "'Last line' has to mean last NON-EMPTY line, or a trailing blank becomes the version."
+    },
+    {
+      "id": "too-new-is-still-read",
+      "stdout": ["3 13"],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": "3.13",
+      "why": "The probe reports, it does not judge. Whether 3.13 is acceptable is the caller's min/max policy, and keeping that out of here is what lets the caller warn precisely instead of just falling back."
+    },
+    {
+      "id": "right-answer-wrong-exit",
+      "stdout": ["3 11"],
+      "stderr": [],
+      "exit_code": 1,
+      "expected": null,
+      "why": "A nonzero exit means the interpreter did not answer the question, whatever it happened to print."
+    },
+    {
+      "id": "unparseable-output",
+      "stdout": ["not a version"],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": null,
+      "why": "Exit 0 is not enough on its own: the strict match is what actually vouches for the answer."
+    },
+    {
+      "id": "says-nothing",
+      "stdout": [],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": null,
+      "why": "Silent success is not a version. It is also what a stale exit code looks like when the command never ran at all."
+    },
+    {
+      "id": "major-only",
+      "stdout": ["3"],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": null,
+      "why": "Half an answer is not an answer; taking it would leave MINOR unset and compare it as an empty string."
+    },
+    {
+      "id": "dotted-not-space-separated",
+      "stdout": ["3.11"],
+      "stderr": [],
+      "exit_code": 0,
+      "expected": null,
+      "why": "Not the format either half asked for. Guards against a probe loose enough to accept `python --version` output, where the leading word would be 'Python'."
+    }
+  ]
+}
