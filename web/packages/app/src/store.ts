@@ -27,8 +27,25 @@ export interface SliceState {
    * the tensor in view", so it does not survive one.
    */
   axes: Record<string, number>;
-  percentileScale: number;  // 0 = min-max, 1 = 1-99 percentile, 2 = 2-98 percentile
-  useMinMax: boolean;  // When true, use full min-max range (0-100 percentile)
+  /**
+   * How the contrast window is chosen: from the plane's own histogram, or from
+   * two grey levels the user fixed.
+   *
+   * Fixed is what makes two planes comparable -- an automatic window rescales
+   * per plane, so a channel that dims over a timelapse looks constant under it.
+   */
+  contrastMode: "auto" | "fixed";
+  /** Width of the automatic percentile window: 0 = min-max, 1 = 1-99, 2 = 2-98. */
+  percentileScale: number;
+  /**
+   * The window in `fixed` mode, in raw grey levels, or null for "not chosen".
+   *
+   * Null seeds from whatever is on screen when the mode is turned on, so
+   * switching to fixed does not change the image. Dropped on a source change:
+   * a level is a value of *this* tensor's dtype, and a uint16 window carried
+   * onto a uint8 image is a white frame.
+   */
+  fixedLimits: [number, number] | null;
   // Display-only exponent applied to the normalized intensity, after the
   // contrast window and before the channel color. 1 leaves the ramp linear;
   // below 1 lifts the dim end, above 1 pushes it down.
@@ -136,6 +153,42 @@ export interface AppState {
    */
   tileInfoFor: string | null;
 
+  /**
+   * The axis being scrubbed automatically (a `SliderAxis.key`), or null.
+   *
+   * Not part of `SliceState`: play changes which index is asked for over time,
+   * not what a frame looks like, and folding it in would put a transient of the
+   * UI into the object the viewer diffs its refetches on.
+   */
+  playAxis: string | null;
+  /**
+   * The contrast window actually in use, published by whichever viewer is
+   * mounted -- automatic or fixed, whichever the slice asked for.
+   *
+   * Read only to seed `fixedLimits` when the user turns fixed on: without it
+   * the panel would have to re-derive the histogram the viewer already has,
+   * and the image would jump the moment the mode changed.
+   */
+  appliedLimits: [number, number] | null;
+  /**
+   * The sampled min and max grey level of the plane on screen, or null before
+   * one has been sampled.
+   *
+   * What the automatic window would be with neither tail trimmed, published
+   * separately because in fixed mode `appliedLimits` is the user's window and
+   * no longer says anything about the data. Read to reset a fixed window onto
+   * the image actually in view.
+   */
+  planeLimits: [number, number] | null;
+  /**
+   * Whether what is on the canvas is the slice that was last asked for.
+   *
+   * Published by whichever viewer is mounted. Play reads it to pace itself to
+   * the data plane rather than to a timer, and the tiled viewer reads its own
+   * copy of the same fact to cover a stale plane.
+   */
+  planeReady: boolean;
+
   // UI options
   showAdvancedOptions: boolean;
   /**
@@ -190,6 +243,10 @@ export interface AppState {
    * viewer opens empty rather than on a guess.
    */
   applyViewerState: (params: URLSearchParams) => boolean;
+  setPlayAxis: (key: string | null) => void;
+  setAppliedLimits: (value: [number, number]) => void;
+  setPlaneLimits: (value: [number, number]) => void;
+  setPlaneReady: (value: boolean) => void;
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
   setVolumeRenderMode: (value: VolumeRenderMode) => void;
@@ -249,13 +306,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     z: 0,
     c: 0,
     axes: {},
+    contrastMode: "auto",
     percentileScale: 1,  // Default 1-99 percentile
-    useMinMax: false,
+    fixedLimits: null,
     gamma: 1,
   },
 
   tileInfo: null,
   tileInfoFor: null,
+
+  playAxis: null,
+  planeReady: false,
+  appliedLimits: null,
+  planeLimits: null,
 
   showAdvancedOptions: false,
   render3d: false,
@@ -329,12 +392,47 @@ export const useAppStore = create<AppState>((set, get) => ({
       camera2d: null,
       tileInfo: null,
       tileInfoFor: null,
+      // An axis key means "axis of the tensor in view", so a play in progress
+      // does not survive one either.
+      playAxis: null,
+      planeReady: false,
+      appliedLimits: null,
+      planeLimits: null,
     });
-    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {} } }));
+    // `fixedLimits` goes with the tensor for the reason the indices do -- a
+    // grey level is a value of its dtype. The mode is a preference and stays,
+    // seeding itself from the next tensor's own window.
+    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {}, fixedLimits: null } }));
   },
 
   setSlice(partial) {
     set((s) => ({ slice: { ...s.slice, ...partial } }));
+  },
+
+  setPlayAxis(key) {
+    set({ playAxis: key });
+  },
+
+  setAppliedLimits(value) {
+    // Compared by content: the viewers recompute this array every render, and
+    // storing a fresh identity each time would loop through their effect.
+    set((s) =>
+      s.appliedLimits && s.appliedLimits[0] === value[0] && s.appliedLimits[1] === value[1]
+        ? s
+        : { appliedLimits: value },
+    );
+  },
+
+  setPlaneLimits(value) {
+    set((s) =>
+      s.planeLimits && s.planeLimits[0] === value[0] && s.planeLimits[1] === value[1]
+        ? s
+        : { planeLimits: value },
+    );
+  },
+
+  setPlaneReady(value) {
+    set((s) => (s.planeReady === value ? s : { planeReady: value }));
   },
 
   setTileInfo(value, forArrayId) {
@@ -385,8 +483,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       arrayId: stable,
       slice: {
         ...DEFAULT_VIEWER_URL_STATE.slice,
+        contrastMode: s.slice.contrastMode,
         percentileScale: s.slice.percentileScale,
-        useMinMax: s.slice.useMinMax,
         gamma: s.slice.gamma,
       },
       volumeRenderMode: s.volumeRenderMode,

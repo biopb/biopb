@@ -10,7 +10,12 @@ import {
   dtypeContrastLimits,
   gammaFromOctaves,
   octavesFromGamma,
+  clampContrastLimits,
+  contrastLabel,
+  contrastStep,
   percentileBounds,
+  percentileLabel,
+  withContrastLimit,
   clampSliceTo,
   samplesPerPixel,
   sliderGrid,
@@ -114,18 +119,76 @@ describe("contrastLimitsFrom", () => {
   });
 });
 
+describe("percentileLabel", () => {
+  it("prints every window in one format", () => {
+    expect(percentileLabel(0)).toBe("0.0-100.0");
+    expect(percentileLabel(1)).toBe("1.0-99.0");
+  });
+});
+
 describe("percentileBounds", () => {
-  it("is the full range in min/max mode whatever the slider says", () => {
-    expect(percentileBounds(true, 2.5)).toEqual([0, 100]);
+  it("is the full range at a scale of 0", () => {
+    expect(percentileBounds(0)).toEqual([0, 100]);
   });
 
   it("is symmetric around the slider value", () => {
-    expect(percentileBounds(false, 1)).toEqual([1, 99]);
+    expect(percentileBounds(1)).toEqual([1, 99]);
   });
 
   it("cannot invert the window", () => {
-    const [lo, hi] = percentileBounds(false, 90);
+    const [lo, hi] = percentileBounds(90);
     expect(lo).toBeLessThanOrEqual(hi);
+  });
+});
+
+describe("contrastStep", () => {
+  it("is one grey level on an integer track and a thousandth on a float one", () => {
+    expect(contrastStep([0, 65535])).toBe(1);
+    expect(contrastStep([0, 255])).toBe(1);
+    expect(contrastStep([0, 1])).toBeCloseTo(0.001);
+  });
+});
+
+describe("withContrastLimit", () => {
+  const range: [number, number] = [0, 255];
+
+  it("moves one end and leaves the other where it was", () => {
+    expect(withContrastLimit([10, 200], "lo", 40, range, 1)).toEqual([40, 200]);
+    expect(withContrastLimit([10, 200], "hi", 90, range, 1)).toEqual([10, 90]);
+  });
+
+  it("stops each end a step short of the other rather than crossing", () => {
+    expect(withContrastLimit([10, 200], "lo", 240, range, 1)).toEqual([199, 200]);
+    expect(withContrastLimit([10, 200], "hi", 2, range, 1)).toEqual([10, 11]);
+  });
+
+  it("stays inside the dtype's range", () => {
+    expect(withContrastLimit([10, 200], "lo", -50, range, 1)).toEqual([0, 200]);
+    expect(withContrastLimit([10, 200], "hi", 9999, range, 1)).toEqual([10, 255]);
+  });
+});
+
+describe("clampContrastLimits", () => {
+  it("brings a window chosen on another dtype inside this one", () => {
+    // A uint16 window carried onto a uint8 image: clamped, not applied as a
+    // white frame.
+    expect(clampContrastLimits([300, 40000], [0, 255])).toEqual([254, 255]);
+  });
+
+  it("leaves a window that already fits alone", () => {
+    expect(clampContrastLimits([10, 200], [0, 255])).toEqual([10, 200]);
+  });
+
+  it("never returns a zero-width window", () => {
+    const [lo, hi] = clampContrastLimits([255, 255], [0, 255]);
+    expect(hi).toBeGreaterThan(lo);
+  });
+});
+
+describe("contrastLabel", () => {
+  it("prints whole levels on an integer track and two decimals on a float one", () => {
+    expect(contrastLabel([12.4, 3000.6], 1)).toBe("12-3001");
+    expect(contrastLabel([0.125, 0.9], 0.001)).toBe("0.13-0.90");
   });
 });
 
@@ -298,8 +361,8 @@ describe("sliderGrid", () => {
 });
 
 describe("clampSliceTo", () => {
-  const GRID = { dim_labels: ["t", "c", "z", "y", "x"], shape: [10, 3, 40, 512, 512] };
-  const AMBIGUOUS = { dim_labels: ["t", "t", "y", "x"], shape: [4, 7, 256, 256] };
+  const GRID = { dim_labels: ["t", "c", "z", "y", "x"], shape: [10, 3, 40, 512, 512], dtype: "uint16" };
+  const AMBIGUOUS = { dim_labels: ["t", "t", "y", "x"], shape: [4, 7, 256, 256], dtype: "uint16" };
   const base = { t: 0, z: 0, c: 0, axes: {} as Record<string, number> };
 
   it("brings an index inside the extent", () => {
@@ -314,7 +377,7 @@ describe("clampSliceTo", () => {
   });
 
   it("clamps a stale index when the tensor shrank under it", () => {
-    const shrunk = { dim_labels: ["t", "y", "x"], shape: [4, 512, 512] };
+    const shrunk = { dim_labels: ["t", "y", "x"], shape: [4, 512, 512], dtype: "uint16" };
     expect(clampSliceTo({ ...base, t: 9 }, shrunk).t).toBe(3);
   });
 

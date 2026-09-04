@@ -10,7 +10,16 @@ const SOURCE: DataSourceDescriptor = {
   tensors: [],
 };
 
-const BASE_SLICE = { t: 0, z: 0, c: 0, axes: {}, percentileScale: 1, useMinMax: false, gamma: 1 };
+const BASE_SLICE = {
+  t: 0,
+  z: 0,
+  c: 0,
+  axes: {},
+  contrastMode: "auto" as const,
+  percentileScale: 1,
+  fixedLimits: null,
+  gamma: 1,
+};
 
 /** Only its identity is under test here; the extents just have to be readable. */
 const TILE_INFO = {
@@ -112,7 +121,7 @@ describe("viewer URL state", () => {
     useAppStore.setState({
       activeTensorId: "first",
       render3d: true,
-      slice: { t: 5, z: 6, c: 1, axes: { a3: 2 }, percentileScale: 2, useMinMax: false, gamma: 1.6 },
+      slice: { ...BASE_SLICE, t: 5, z: 6, c: 1, axes: { a3: 2 }, percentileScale: 2, gamma: 1.6 },
     });
 
     expect(useAppStore.getState().applyViewerState(new URLSearchParams("id=second"))).toBe(true);

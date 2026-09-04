@@ -56,14 +56,28 @@ export function contrastSamples(
   return out;
 }
 
-/** The [lo, hi] percentile pair the intensity control is asking for. */
-export function percentileBounds(
-  useMinMax: boolean,
-  percentileScale: number,
-): [number, number] {
-  if (useMinMax) return [0, 100];
+/**
+ * The [lo, hi] percentile pair the automatic intensity control is asking for.
+ *
+ * A scale of 0 is the full min-max window, which is why the old `useMinMax`
+ * flag is gone: it said the same thing a second way, and two encodings of one
+ * window can disagree.
+ */
+export function percentileBounds(percentileScale: number): [number, number] {
   const lo = Math.min(Math.max(percentileScale, 0), 50);
   return [lo, 100 - lo];
+}
+
+/**
+ * The percentile window as the panel prints it: `lo-hi`, one decimal each.
+ *
+ * Derived from {@link percentileBounds} rather than from the slider, so the
+ * readout cannot disagree with the window the shader is given.
+ */
+export function percentileLabel(percentileScale: number): string {
+  return percentileBounds(percentileScale)
+    .map((p) => p.toFixed(1))
+    .join("-");
 }
 
 /**
@@ -147,9 +161,61 @@ const RANGE_BY_DTYPE: Record<string, [number, number]> = {
   Float64: [0, 1],
 };
 
-/** Full-range limits, used until the first sampled plane comes back. */
+/**
+ * The dtype's whole range: full-range limits until the first sampled plane comes
+ * back, and the track a fixed window is chosen on.
+ */
 export function dtypeContrastLimits(vivDtype: string): [number, number] {
   return RANGE_BY_DTYPE[vivDtype] ?? [0, 1];
+}
+
+/**
+ * The step a fixed window moves in on a track spanning `range`.
+ *
+ * One grey level for the integer dtypes, where a fraction of a level names
+ * nothing; a thousandth of the track for the float ones, whose range is 0-1.
+ */
+export function contrastStep(range: [number, number]): number {
+  const span = range[1] - range[0];
+  return span > 8 ? 1 : span / 1000;
+}
+
+/**
+ * `limits` with one end moved to `value`, kept inside `range` and in order.
+ *
+ * The ends may not meet: a zero-width window divides by zero in the shader, and
+ * two thumbs at the same position cannot be told apart by a pointer. So each
+ * end stops one step short of the other, which is also what keeps a drag of the
+ * low end from silently dragging the high one along.
+ */
+export function withContrastLimit(
+  limits: [number, number],
+  end: "lo" | "hi",
+  value: number,
+  range: [number, number],
+  step: number,
+): [number, number] {
+  const [min, max] = range;
+  const at = Math.min(Math.max(value, min), max);
+  if (end === "lo") return [Math.min(at, limits[1] - step), limits[1]];
+  return [limits[0], Math.max(at, limits[0] + step)];
+}
+
+/** A fixed window brought inside `range`, for a dtype it was not chosen on. */
+export function clampContrastLimits(
+  limits: [number, number],
+  range: [number, number],
+): [number, number] {
+  const step = contrastStep(range);
+  const lo = Math.min(Math.max(limits[0], range[0]), range[1] - step);
+  const hi = Math.min(Math.max(limits[1], lo + step), range[1]);
+  return [lo, hi];
+}
+
+/** A fixed window as the panel prints it: whole grey levels, or 0-1 to two dp. */
+export function contrastLabel(limits: [number, number], step: number): string {
+  const fmt = (v: number) => (step >= 1 ? String(Math.round(v)) : v.toFixed(2));
+  return `${fmt(limits[0])}-${fmt(limits[1])}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +336,8 @@ export function vivColor(
 export interface SliderGrid {
   dim_labels: string[];
   shape: number[];
+  /** NumPy-style, as both `tile_info` and the catalog report it. */
+  dtype: string;
 }
 
 /**

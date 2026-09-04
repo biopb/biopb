@@ -36,6 +36,7 @@ import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
 import {
   clampGamma,
+  clampContrastLimits,
   contrastLimitsFrom,
   contrastSamples,
   dtypeContrastLimits,
@@ -219,6 +220,19 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // which plane, so their partial state is legitimate progressive refinement.
   const dataValid = loadedKey !== null && loadedKey === selectionKey;
 
+  // Published for the play driver, which paces its next frame on it. Same fact
+  // the cover below is drawn from, said where SliceControls can read it.
+  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
+  useEffect(() => {
+    setPlaneReady(dataValid);
+  }, [dataValid, setPlaneReady]);
+
+  // Under play the cover is dropped: at 10 frames a second it would be on
+  // screen for most of every frame, which is a flicker rather than a warning,
+  // and the thing it guards against -- mistaking a stale plane for the one
+  // asked for -- cannot happen while the planes are deliberately marching past.
+  const playing = useAppStore((s) => s.playAxis !== null);
+
   // Scoped to the plane that produced it, so a failed read cannot go on
   // labelling later planes that loaded perfectly well.
   useEffect(() => setTileError(null), [selectionKey]);
@@ -253,10 +267,32 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
 
   const contrastLimits = useMemo<[number, number]>(() => {
     if (!info) return [0, 1];
-    const [lo, hi] = percentileBounds(slice.useMinMax, slice.percentileScale);
-    if (!samples) return dtypeContrastLimits(vivDtype(info.dtype));
+    const range = dtypeContrastLimits(vivDtype(info.dtype));
+    // A fixed window is the user's, not the plane's: it is not re-derived per
+    // plane, only brought inside the dtype it is being applied to.
+    if (slice.contrastMode === "fixed") {
+      return slice.fixedLimits ? clampContrastLimits(slice.fixedLimits, range) : range;
+    }
+    if (!samples) return range;
+    const [lo, hi] = percentileBounds(slice.percentileScale);
     return contrastLimitsFrom(samples.values, lo, hi);
-  }, [info, samples, slice.useMinMax, slice.percentileScale]);
+  }, [info, samples, slice.contrastMode, slice.fixedLimits, slice.percentileScale]);
+
+  // Published so the panel can seed a fixed window from what is on screen.
+  const setAppliedLimits = useAppStore((s) => s.setAppliedLimits);
+  useEffect(() => {
+    setAppliedLimits(contrastLimits);
+  }, [contrastLimits, setAppliedLimits]);
+
+  // And the plane's own extremes, which the window no longer reports once it
+  // is fixed. Deliberately not keyed to the current selection: the last plane
+  // sampled is what Min/Max should reset onto, and holding it across a read
+  // keeps the button from going dead for the length of one.
+  const planeLimits = useMemo(() => samples ? contrastLimitsFrom(samples.values, 0, 100) : null, [samples]);
+  const setPlaneLimits = useAppStore((s) => s.setPlaneLimits);
+  useEffect(() => {
+    if (planeLimits) setPlaneLimits(planeLimits);
+  }, [planeLimits, setPlaneLimits]);
 
   // Never trusted straight from the store: a persisted or hand-edited value of 0
   // or below is a uniform white plane, not a dim one.
@@ -326,7 +362,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           {retrying ? "Server did not answer in time — retrying…" : "Loading tiles…"}
         </div>
       )}
-      {loaded && selection && size && !dataValid && (
+      {loaded && selection && size && !dataValid && !playing && (
         // Opaque, not a scrim: the point is that the stale plane stops being
         // visible, which a translucent overlay would not achieve.
         <div style={{ ...OVERLAY_TEXT, background: "#1a1a2e", zIndex: 1 }}>

@@ -29,7 +29,7 @@ const PERCENTILE_MIN = 0;
 const PERCENTILE_MAX = 4;
 
 /** Every parameter this module owns, so unrelated ones survive a write. */
-const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "g", "v", "vm", "tg", "zm", "rx", "ro"]);
+const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "cl", "g", "v", "vm", "tg", "zm", "rx", "ro"]);
 
 /** `OrbitController` clamps pitch to this; a link may not ask for more. */
 const ROTATION_X_LIMIT = 90;
@@ -129,6 +129,22 @@ function decodeCamera3d(params: URLSearchParams): Camera3DState | null {
 }
 
 /**
+ * The fixed contrast window a link carries (`cl=lo,hi`), or null.
+ *
+ * Not bounded here: what a grey level may be is a property of the tensor's
+ * dtype, which is not known until `tile_info` answers. The viewer clamps it
+ * against the dtype it actually got -- see `clampContrastLimits`.
+ */
+function decodeFixedLimits(params: URLSearchParams): [number, number] | null {
+  const raw = params.get("cl");
+  if (raw === null) return null;
+  const parts = raw.split(",").map(Number);
+  if (parts.length !== 2 || !parts.every(Number.isFinite)) return null;
+  const [lo, hi] = parts as [number, number];
+  return lo < hi ? [lo, hi] : null;
+}
+
+/**
  * Read a viewing state out of `params`.
  *
  * Unbounded on purpose. A link may carry a *pinned* address, whose descriptor
@@ -165,17 +181,24 @@ export function decodeViewerState(
   const p = num(params.get("p"));
   const g = num(params.get("g"));
   const vm = params.get("vm");
+  const fixed = decodeFixedLimits(params);
 
   return {
     arrayId: params.get(PARAM_ID) ?? defaults.arrayId,
     slice: {
       ...named,
       axes: unnamed,
+      // `mm=1` is the retired min-max flag, which links in the wild still
+      // carry. It named the window a scale of 0 already means, so it decodes to
+      // that rather than to a mode of its own.
+      contrastMode: fixed ? "fixed" : p !== null || params.get("mm") === "1" ? "auto" : defaults.slice.contrastMode,
       percentileScale:
-        p === null ? defaults.slice.percentileScale : clamp(p, PERCENTILE_MIN, PERCENTILE_MAX),
-      // An explicit percentile is a contradiction with min/max, and the control
-      // writes them together; the flag wins only when it is the one that is set.
-      useMinMax: params.get("mm") === "1" ? true : p !== null ? false : defaults.slice.useMinMax,
+        params.get("mm") === "1"
+          ? 0
+          : p === null
+            ? defaults.slice.percentileScale
+            : clamp(p, PERCENTILE_MIN, PERCENTILE_MAX),
+      fixedLimits: fixed ?? defaults.slice.fixedLimits,
       gamma: g === null ? defaults.slice.gamma : clampGamma(g),
     },
     render3d: params.get("v") === "1" ? true : params.get("v") === "0" ? false : defaults.render3d,
@@ -205,8 +228,10 @@ export function encodeViewerState(params: URLSearchParams, state: ViewerUrlState
   for (const [key, value] of Object.entries(state.slice.axes)) {
     if (value !== 0) out.set(key, String(value));
   }
-  if (state.slice.useMinMax) {
-    out.set("mm", "1");
+  // One or the other: the mode decides which of the two windows a link carries,
+  // and writing both would leave a reader to guess which one applied.
+  if (state.slice.contrastMode === "fixed" && state.slice.fixedLimits) {
+    out.set("cl", state.slice.fixedLimits.map((v) => round(v, 4)).join(","));
   } else if (state.slice.percentileScale !== defaults.slice.percentileScale) {
     out.set("p", String(round(state.slice.percentileScale, 1)));
   }
@@ -240,7 +265,16 @@ function round(value: number, decimals: number): number {
 }
 
 export const DEFAULT_VIEWER_URL_STATE: Omit<ViewerUrlState, "arrayId"> = {
-  slice: { t: 0, z: 0, c: 0, axes: {}, percentileScale: 1, useMinMax: false, gamma: 1 },
+  slice: {
+    t: 0,
+    z: 0,
+    c: 0,
+    axes: {},
+    contrastMode: "auto",
+    percentileScale: 1,
+    fixedLimits: null,
+    gamma: 1,
+  },
   render3d: false,
   volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
   camera3d: null,
