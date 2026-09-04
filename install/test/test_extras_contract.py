@@ -20,6 +20,7 @@ from conftest import (
     bash,
     ps_literal,
     pwsh,
+    requires_posix,
     requires_pwsh,
     write_extras,
 )
@@ -67,7 +68,14 @@ def _split(stdout: str) -> tuple[int, list[str]]:
 
 
 PARSER_PARAMS = [
-    pytest.param(_parse_bash, id="install.sh"),
+    # requires_posix, deliberately. Git bash exists on windows-latest and this
+    # parser needs nothing but shell builtins, so the bash half WOULD run on the
+    # Windows leg -- but install.sh is never run on Windows, so all that proves is
+    # that Git bash's sh works. The contract is held on the Linux leg, where both
+    # halves run against each other; the Windows leg is there for the half that
+    # platform actually ships. Same call as test_install_sh.py, made explicitly
+    # rather than left to whether a tool happens to be on the runner.
+    pytest.param(_parse_bash, id="install.sh", marks=requires_posix),
     pytest.param(_parse_pwsh, id="biopb-engine.ps1", marks=requires_pwsh),
 ]
 

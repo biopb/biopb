@@ -449,7 +449,7 @@ function Read-ExtraPackages {
     return $reqs
 }
 
-# Run one `uv tool install`, with a heartbeat while it works and uv's own output
+# Run one `uv` command, with a heartbeat while it works and uv's own output
 # replayed afterwards. Records uv's exit code in $script:LastUvExit and does NOT
 # throw on failure: the caller decides, because one failure mode (a user's extra
 # package that will not resolve) is retried rather than fatal.
@@ -457,8 +457,21 @@ function Read-ExtraPackages {
 # The exit code is recorded in a script variable rather than returned, because in
 # GUI mode the Report-* helpers write to the output stream (Emit-Gui), so a
 # returned value would arrive mixed in with every progress record this emits.
-function Invoke-UvToolInstall {
-    param([string[]]$InstallArgs, [string]$OutLog, [string]$ErrLog)
+#
+# Named for `uv`, not for `uv tool install`: nothing in here was ever specific to
+# that subcommand, and the one uv call that stayed outside it -- `uv python
+# install` in step 2 -- was the one whose failures reached the user as a bare
+# "exit code 2" with uv's own error printed nowhere. Under the GUI front-end,
+# which has no console, it was invisible entirely.
+function Invoke-Uv {
+    param(
+        [string[]]$UvArgs,
+        [string]$OutLog,
+        [string]$ErrLog,
+        # Wording for the heartbeat line, so a multi-minute wheel install and a
+        # Python download each describe what they are actually doing.
+        [string]$Activity = "working"
+    )
 
     # uv only animates its progress bar on a TTY, and it goes SILENT for
     # minutes during the prepare/link phase (no per-line output there) -- which
@@ -476,7 +489,7 @@ function Invoke-UvToolInstall {
     # ("biopb[tensor] @ file:///..."), which an array would split under Windows
     # PowerShell 5.1. Only spaces/quotes need quoting here (no embedded quotes).
     $uvExe = (Get-Command uv -ErrorAction Stop).Source
-    $argLine = ($InstallArgs | ForEach-Object {
+    $argLine = ($UvArgs | ForEach-Object {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     }) -join ' '
 
@@ -495,7 +508,7 @@ function Invoke-UvToolInstall {
         $elapsed = [int]$sw.Elapsed.TotalSeconds
         if (($elapsed - $lastTick) -ge 10) {
             $lastTick = $elapsed
-            Report-Detail "  ...still installing (${elapsed}s elapsed)"
+            Report-Detail "  ...still $Activity (${elapsed}s elapsed)"
         }
     }
     # The timed WaitForExit above returns the instant uv signals exit, which can
@@ -521,6 +534,35 @@ function Invoke-UvToolInstall {
     # so it throws here instead of being retried.
     if ($null -eq $proc.ExitCode) { throw "biopb install: uv exit code unavailable" }
     $script:LastUvExit = $proc.ExitCode
+}
+
+# Throw on a failed Invoke-Uv, quoting uv's own reason.
+#
+# Assert-LastExit's "failed (exit code 2)" is all the user got when uv itself was
+# the thing that failed -- no network, a proxy, a Python build unavailable for the
+# platform. uv puts the actual cause on stderr as an `error:` line, which
+# Invoke-Uv captures; this lifts the first one into the thrown message, because
+# the thrown message is what both front-ends render (the console prints it, and
+# the GUI wizard has nothing else to show).
+function Assert-UvExit {
+    param([string]$What, [string]$ErrLog)
+
+    if ($script:LastUvExit -eq 0) { return }
+
+    $detail = ""
+    if ($ErrLog -and (Test-Path -LiteralPath $ErrLog)) {
+        # -Encoding UTF8 for the same reason Invoke-Uv replays that way: 5.1
+        # defaults to ANSI and would mangle non-ASCII in uv's message.
+        $lines = @(Get-Content -LiteralPath $ErrLog -Encoding UTF8 -ErrorAction SilentlyContinue)
+        # uv's own diagnosis first; failing that, the last thing it said, which
+        # beats saying nothing.
+        $detail = ($lines | Where-Object { $_ -match '^\s*error:' } | Select-Object -First 1)
+        if (-not $detail) {
+            $detail = ($lines | Where-Object { "$_".Trim() } | Select-Object -Last 1)
+        }
+    }
+    if ($detail) { throw "$What failed (exit code $($script:LastUvExit)): $("$detail".Trim())" }
+    throw "$What failed (exit code $($script:LastUvExit))"
 }
 
 # Force-terminate any process running from a biopb uv tool environment so its
@@ -1257,8 +1299,21 @@ function Invoke-BiopbInstall {
     }
     if (-not $pythonOk) {
         Report-Info "Installing Python 3.$maxMinor via uv..."
-        uv python install "3.$maxMinor"
-        Assert-LastExit "Python install"
+        # Through Invoke-Uv like every other uv call, rather than bare. This one
+        # downloads a ~30MB interpreter build, so it is both the call most likely
+        # to fail on a lab network (proxy, TLS interception, no route to
+        # python-build-standalone) and -- as a bare call -- the one that said
+        # least about it: Assert-LastExit reported "exit code 2" while uv's actual
+        # `error:` line went to a console the GUI front-end does not have.
+        $pyOutLog = Join-Path $env:TEMP "biopb-uv-python.out.log"
+        $pyErrLog = Join-Path $env:TEMP "biopb-uv-python.err.log"
+        try {
+            Invoke-Uv -UvArgs @("python", "install", "3.$maxMinor") `
+                -OutLog $pyOutLog -ErrLog $pyErrLog -Activity "downloading Python"
+            Assert-UvExit "Python install" $pyErrLog
+        } finally {
+            Remove-Item -LiteralPath $pyOutLog, $pyErrLog -Force -ErrorAction SilentlyContinue
+        }
         Report-Ok "Python 3.$maxMinor ready"
         $pythonSpec = "3.$maxMinor"
     }
@@ -1410,8 +1465,8 @@ function Invoke-BiopbInstall {
     $uvOutLog = Join-Path $env:TEMP "biopb-uv-install.out.log"
     $uvErrLog = Join-Path $env:TEMP "biopb-uv-install.err.log"
     try {
-        Invoke-UvToolInstall -InstallArgs ($installArgs + $extraArgs) `
-            -OutLog $uvOutLog -ErrLog $uvErrLog
+        Invoke-Uv -UvArgs ($installArgs + $extraArgs) `
+            -OutLog $uvOutLog -ErrLog $uvErrLog -Activity "installing"
         # Fail-soft on the extras only. A user requirement joins the same resolve as
         # the release's own pins (napari is pinned exactly), so one bad line would
         # otherwise block the whole upgrade over a package the deployment does not
@@ -1427,7 +1482,7 @@ function Invoke-BiopbInstall {
         # the second.
         if ($script:LastUvExit -ne 0 -and $extraNames.Count -gt 0) {
             Report-Warn "Install failed; retrying without your extra packages to see whether they are the cause: $($extraNames -join ', ')"
-            Invoke-UvToolInstall -InstallArgs $installArgs -OutLog $uvOutLog -ErrLog $uvErrLog
+            Invoke-Uv -UvArgs $installArgs -OutLog $uvOutLog -ErrLog $uvErrLog -Activity "installing"
             if ($script:LastUvExit -eq 0) {
                 $script:ExtrasDropped = ($extraNames -join ', ')
                 Report-Warn "Could not resolve your extra packages: $($script:ExtrasDropped)"
