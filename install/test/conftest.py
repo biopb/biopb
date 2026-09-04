@@ -148,6 +148,17 @@ def _pwsh_base_env() -> dict[str, str]:
     for var in (
         "SystemRoot",
         "SystemDrive",
+        # LOCALAPPDATA and APPDATA are where Windows PowerShell 5.1 keeps its
+        # MODULE ANALYSIS CACHE. Strip them and it cannot read or write that
+        # cache, so every single spawn rebuilds it by walking every module on the
+        # machine. On a developer box that is nothing; on a CI runner preloaded
+        # with Az/AWS/etc it measured ~22s PER SPAWN, against ~0.2s for the bash
+        # cases beside it -- enough to walk the Windows leg into its job timeout.
+        # PSModulePath comes along so the walk is over the real module path
+        # rather than a fallback guess.
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PSModulePath",
         # PATHEXT is how PowerShell decides a .cmd is executable AT ALL -- even
         # when handed an absolute path to one. Without it, invoking a .cmd is a
         # silent no-op: no error, no output, and $LASTEXITCODE left unset, so a

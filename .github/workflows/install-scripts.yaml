@@ -142,25 +142,22 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
 
-      # Windows PowerShell 5.1 startup dominates this leg. Each case spawns one,
-      # and each spawn dot-sources biopb-engine.ps1 -- ~100KB of script text that
-      # Defender's real-time scan reads through AMSI every single time. Measured
-      # on a stock runner: ~22s per PowerShell case against ~0.2s for the bash
-      # cases beside them, i.e. the interpreter, not the code under test.
+      # Windows PowerShell 5.1 startup dominates this leg -- ~22s per spawn on a
+      # stock runner against ~0.2s for the bash cases beside it, which is what
+      # walked the first run into its timeout. The cause is the module analysis
+      # cache: conftest hands the interpreter a controlled environment, and
+      # without LOCALAPPDATA/APPDATA in it PowerShell can neither read nor write
+      # that cache, so every spawn rebuilds it by walking every module on a
+      # runner preloaded with Az/AWS/etc.
       #
-      # Excluding the workspace and the runner temp dir is what makes this leg
-      # affordable. It is scoped to an ephemeral runner VM that is destroyed
-      # afterwards, and it changes nothing about what the tests actually assert.
-      # Best-effort: a runner with Defender absent or policy-locked just stays
-      # slow, which the timeout above has room for, so it must not fail the job.
-      - name: Speed up PowerShell startup (Defender exclusion)
+      # conftest._pwsh_base_env passes them now. This step proves it stayed
+      # fixed, and says so in numbers rather than leaving the next person to
+      # rediscover it from a timeout. Diagnostic only -- never fails the job.
+      - name: Time the PowerShell harness (diagnostic)
         if: runner.os == 'Windows'
         continue-on-error: true
-        shell: pwsh
         run: |
-          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE -ErrorAction SilentlyContinue
-          Add-MpPreference -ExclusionPath $env:RUNNER_TEMP -ErrorAction SilentlyContinue
-          Add-MpPreference -ExclusionProcess powershell.exe -ErrorAction SilentlyContinue
+          uv run --no-project --with pytest python install/test/_time_pwsh.py
 
       # --no-project: these tests import nothing from the monorepo -- they drive
       # install.sh and biopb-engine.ps1 by subprocess -- so syncing the workspace
