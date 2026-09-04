@@ -44,6 +44,7 @@ import {
   tileCacheSize,
   vivColor,
   vivSelection,
+  CAMERA_MIRROR_MS,
 } from "../utils/vivUtils";
 
 type PixelSources = Awaited<ReturnType<typeof createTensorPixelSources>>["data"];
@@ -381,16 +382,51 @@ function VivStage({
   height: number;
 }) {
   const sizeRef = useRef({ width, height });
+  const setCamera2d = useAppStore((s) => s.setCamera2d);
+
   const viewStates = useMemo(
-    () => [
-      {
-        ...getDefaultInitialViewState(sources, sizeRef.current, 0.5),
-        id: DETAIL_VIEW_ID,
-      },
-    ],
+    () => {
+      // Read once, not subscribed. `VivViewer.componentDidUpdate` diffs this
+      // prop and overwrites its own view state when it differs, so a
+      // subscription would push every pan back at the viewport mid-gesture.
+      // Reading it is still right: a link that named a camera must open at it.
+      const seed = useAppStore.getState().camera2d;
+      const base = seed
+        // The stored target is [x, y]; an orthographic view wants the z back.
+        ? { target: [seed.target[0], seed.target[1], 0], zoom: seed.zoom }
+        : getDefaultInitialViewState(sources, sizeRef.current, 0.5);
+      return [{ ...base, id: DETAIL_VIEW_ID }];
+    },
     // Deliberately not [width, height]: a resize must move the viewport, not
     // reset it. VivViewer carries the current pan/zoom through the new size.
     [sources],
+  );
+
+  // Trailing edge only, as in VolumeViewer: the resting viewport is what a link
+  // should carry, and the frames of a drag are noise that would otherwise reach
+  // the URL at pointer rate.
+  const mirrorRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (mirrorRef.current) clearTimeout(mirrorRef.current);
+  }, []);
+
+  const onViewStateChange = useCallback(
+    // `object`, not a narrower shape: that is how Viv types the callback.
+    ({ viewState }: { viewState: object }) => {
+      if (mirrorRef.current) clearTimeout(mirrorRef.current);
+      const { target, zoom } = viewState as { target: number[]; zoom: number | number[] };
+      const [x = 0, y = 0] = target ?? [];
+      // deck.gl may report an orthographic zoom per axis; Viv's own initial
+      // state is scalar, and the views here are never anisotropic.
+      const z = Array.isArray(zoom) ? (zoom[0] ?? 0) : zoom;
+      mirrorRef.current = setTimeout(() => {
+        setCamera2d({ target: [x, y], zoom: z });
+      }, CAMERA_MIRROR_MS);
+      // Returns nothing on purpose: VivViewer falls back to the view state it
+      // already computed (`onViewStateChange?.(...) || viewState`), so the
+      // viewport stays Viv's to drive and this stays a mirror.
+    },
+    [setCamera2d],
   );
 
   const views = useMemo(
@@ -423,7 +459,14 @@ function VivStage({
     [sources, selections, contrastLimits, gamma, color, maxCacheSize, onViewportLoad],
   );
 
-  return <VivViewer views={views} layerProps={layerProps} viewStates={viewStates} />;
+  return (
+    <VivViewer
+      views={views}
+      layerProps={layerProps}
+      viewStates={viewStates}
+      onViewStateChange={onViewStateChange}
+    />
+  );
 }
 
 /** The pane's pixel size, or null before the first measurement. */

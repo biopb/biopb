@@ -35,6 +35,42 @@ export interface SliceState {
   gamma: number;
 }
 
+/**
+ * The 3-D camera, in `OrbitView`'s own terms.
+ *
+ * A mirror, not the source of truth: deck.gl owns the camera while the volume
+ * is mounted and this trails it on a debounce, which is what keeps an orbit
+ * smooth. It is read back only to seed the next mount -- see `VolumeViewer`.
+ */
+/**
+ * The 2-D camera, in `DetailView`'s terms.
+ *
+ * A mirror of Viv's own view state, on the same terms as {@link Camera3DState}:
+ * `VivViewer` keeps driving the viewport and this trails it.
+ *
+ * The target is carried as `[x, y]`, not the `[x, y, z]` deck.gl reports. An
+ * orthographic view's third component is structurally zero
+ * (`getDefaultInitialViewState` builds it that way), so carrying it would put a
+ * constant in every shared link -- and its absence is what tells a 2-D camera
+ * from a 3-D one in the URL.
+ */
+export interface Camera2DState {
+  target: [number, number];
+  /** log2(pixels per world unit), as Viv's own initial view state computes. */
+  zoom: number;
+}
+
+export interface Camera3DState {
+  /** Orbit centre, in the scaled world space `volumeCentre` computes. */
+  target: [number, number, number];
+  /** log2(pixels per world unit), as `volumeZoom` returns. */
+  zoom: number;
+  /** Pitch, in degrees; `OrbitController` holds it within +/-90. */
+  rotationX: number;
+  /** Bearing, in degrees, reported wrapped into [-180, 180). */
+  rotationOrbit: number;
+}
+
 export interface AppState {
   // Client
   client: TensorFlightClient | null;
@@ -108,6 +144,16 @@ export interface AppState {
    * someone who wants additive wants it for the next stack too.
    */
   volumeRenderMode: VolumeRenderMode;
+  /**
+   * Where the 3-D camera is, or null for "wherever the volume fits".
+   *
+   * Null rather than a computed default because the fitted camera depends on
+   * the volume and the pane size, neither of which the store knows; only the
+   * viewer can work it out, so the store says "unset" and lets it.
+   */
+  camera3d: Camera3DState | null;
+  /** Where the 2-D camera is, or null for "wherever the plane fits". */
+  camera2d: Camera2DState | null;
 
   // Channel colors (sourceId -> channelIdx -> color)
   channelColors: Record<string, Record<number, ColorValue>>;
@@ -138,6 +184,8 @@ export interface AppState {
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
   setVolumeRenderMode: (value: VolumeRenderMode) => void;
+  setCamera3d: (value: Camera3DState | null) => void;
+  setCamera2d: (value: Camera2DState | null) => void;
   getChannelColor: (sourceId: string, channelIdx: number) => ColorValue;
   setChannelColor: (sourceId: string, channelIdx: number, color: ColorValue) => void;
   loadChannelNames: (sourceId: string) => Promise<void>;
@@ -202,6 +250,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   showAdvancedOptions: false,
   render3d: false,
   volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
+  camera3d: null,
+  camera2d: null,
 
   // Load persisted colors from localStorage on initialization
   channelColors: loadColorsFromStorage(),
@@ -262,6 +312,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeTensorId: tid,
       requestedArrayId: null,
       render3d: false,
+      // camera3d goes with render3d: it is in the previous volume's world
+      // space, so carrying it over would frame the next stack from an
+      // arbitrary point.
+      camera3d: null,
+      camera2d: null,
       tileInfo: null,
     });
     set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {} } }));
@@ -293,6 +348,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       slice: s.slice,
       render3d: s.render3d,
       volumeRenderMode: s.volumeRenderMode,
+      camera3d: s.camera3d,
+      camera2d: s.camera2d,
     });
     set({
       activeSourceId: stable.split("/", 1)[0] ?? null,
@@ -301,6 +358,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       slice: next.slice,
       render3d: next.render3d,
       volumeRenderMode: next.volumeRenderMode,
+      camera3d: next.camera3d,
+      camera2d: next.camera2d,
     });
     return true;
   },
@@ -315,6 +374,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setVolumeRenderMode(value) {
     set({ volumeRenderMode: value });
+  },
+
+  setCamera3d(value) {
+    set({ camera3d: value });
+  },
+
+  setCamera2d(value) {
+    set({ camera2d: value });
   },
 
   getChannelColor(sourceId, channelIdx) {
@@ -361,7 +428,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   startCatalogPolling() {
     const pollingTimerId = setInterval(async () => {
-      const { client, sources, activeSourceId, selectSource } = get();
+      const { client, sources, activeSourceId, requestedArrayId, selectSource } = get();
       if (!client || get().connectionState !== "connected") return;
 
       try {
@@ -385,8 +452,15 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (oldUrls !== newUrls) {
           set({ sources: sorted });
 
-          // Clear selection if active source was removed
-          if (activeSourceId && !sorted.find((s) => s.source_id === activeSourceId)) {
+          // A catalog response is a listing, not proof that an unlisted source
+          // is gone: it may be capped, still scanning, or temporarily failed.
+          // In particular, retain a source selected from a shared URL, which
+          // deliberately does not need to be present in the listing.
+          if (
+            activeSourceId &&
+            !requestedArrayId &&
+            !sorted.find((s) => s.source_id === activeSourceId)
+          ) {
             selectSource(null);
           }
         }

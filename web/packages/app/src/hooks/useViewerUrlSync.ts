@@ -26,6 +26,8 @@ export function useViewerUrlSync() {
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
   const tileInfo = useAppStore((s) => s.tileInfo);
   const requestedArrayId = useAppStore((s) => s.requestedArrayId);
+  const camera3d = useAppStore((s) => s.camera3d);
+  const camera2d = useAppStore((s) => s.camera2d);
 
   const hydrated = useRef(false);
   // The effects below must not re-run when the URL changes -- they are what
@@ -59,7 +61,7 @@ export function useViewerUrlSync() {
     const arrayId = tileInfo?.array_id ?? requestedArrayId ?? activeTensorId;
     const next = encodeViewerState(
       paramsRef.current,
-      { arrayId, slice, render3d, volumeRenderMode },
+      { arrayId, slice, render3d, volumeRenderMode, camera3d, camera2d },
       { arrayId, ...DEFAULT_VIEWER_URL_STATE },
     );
     // Both scrub paths debounce before reaching the store, so this is already
@@ -67,5 +69,15 @@ export function useViewerUrlSync() {
     if (next.toString() !== paramsRef.current.toString()) {
       setSearchParams(next, { replace: true });
     }
-  }, [activeTensorId, requestedArrayId, tileInfo, slice, render3d, volumeRenderMode, setSearchParams]);
+  }, [
+    activeTensorId,
+    requestedArrayId,
+    tileInfo,
+    slice,
+    render3d,
+    volumeRenderMode,
+    camera3d,
+    camera2d,
+    setSearchParams,
+  ]);
 }

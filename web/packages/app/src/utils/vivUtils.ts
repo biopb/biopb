@@ -13,6 +13,16 @@ import {
 } from "@biopb/tensor-flight-client";
 import { getColorMultipliers, type ColorValue } from "./colorUtils";
 
+/**
+ * How long a camera must rest before it reaches the store.
+ *
+ * Shared by both viewers, and matching the slider debounce: all three exist so
+ * a continuous gesture writes once, at the value the user stopped on. Neither
+ * camera is *driven* from the store, so this delays only what a link records --
+ * never what is on screen.
+ */
+export const CAMERA_MIRROR_MS = 150;
+
 // ---------------------------------------------------------------------------
 // Contrast limits
 // ---------------------------------------------------------------------------
