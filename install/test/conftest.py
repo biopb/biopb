@@ -149,11 +149,15 @@ def _pwsh_base_env() -> dict[str, str]:
         "SystemRoot",
         "SystemDrive",
         # LOCALAPPDATA and APPDATA are where Windows PowerShell 5.1 keeps its
-        # MODULE ANALYSIS CACHE. Strip them and it cannot read or write that
-        # cache, so every single spawn rebuilds it by walking every module on the
-        # machine. On a developer box that is nothing; on a CI runner preloaded
-        # with Az/AWS/etc it measured ~22s PER SPAWN, against ~0.2s for the bash
-        # cases beside it -- enough to walk the Windows leg into its job timeout.
+        # MODULE ANALYSIS CACHE. Strip them and it cannot WRITE that cache, so
+        # every spawn rebuilds it by walking every module on the machine. On a
+        # developer box that is nothing; on a CI runner preloaded with Az/AWS/etc
+        # it was ~22s PER SPAWN against ~0.2s for the bash cases beside it.
+        #
+        # Measured on the same runner, same suite: 879s without them, 17s with.
+        # That comparison only exists across two CI runs -- once any spawn has
+        # written the cache the file is on disk and dropping the variables again
+        # looks fast, so a machine that has already run the suite cannot show it.
         # PSModulePath comes along so the walk is over the real module path
         # rather than a fallback guess.
         "LOCALAPPDATA",

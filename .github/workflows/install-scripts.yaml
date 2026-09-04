@@ -117,13 +117,13 @@ jobs:
     # Windows leg exists to run biopb-engine.ps1 under the interpreter users have.
     name: Installer unit tests (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
-    # 30, not 10, for the Windows leg: every PowerShell case spawns a fresh 5.1
-    # that dot-sources the ~100KB engine, and that spawn is ~0.25s on a developer
-    # machine but ~22s on a stock runner (measured: the bash cases next to them
-    # are ~0.2s). The exclusion step below is what brings it back down; this is
-    # the headroom for when it cannot. The Linux leg finishes in well under a
-    # minute either way.
-    timeout-minutes: 30
+    # Deliberately BELOW the known bad state rather than above it. The Windows
+    # leg takes ~17s healthy; the module-analysis-cache regression it recovered
+    # from took 879s (~15 min). A timeout with room for that would let the
+    # regression come back and merely be slow forever, which is how it went
+    # unnoticed in the first place. At 10 it fails instead, and the diagnostic
+    # step says why in its first line.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -142,17 +142,16 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
 
-      # Windows PowerShell 5.1 startup dominates this leg -- ~22s per spawn on a
-      # stock runner against ~0.2s for the bash cases beside it, which is what
-      # walked the first run into its timeout. The cause is the module analysis
-      # cache: conftest hands the interpreter a controlled environment, and
-      # without LOCALAPPDATA/APPDATA in it PowerShell can neither read nor write
-      # that cache, so every spawn rebuilds it by walking every module on a
-      # runner preloaded with Az/AWS/etc.
+      # Windows PowerShell 5.1 startup dominates this leg -- it was ~22s per
+      # spawn on a stock runner against ~0.2s for the bash cases beside it, which
+      # is what walked the first run into its timeout at 879s. The cause was the
+      # module analysis cache, which PowerShell could not write because conftest
+      # was not passing LOCALAPPDATA/APPDATA; with them, the same suite on the
+      # same runner takes 17s.
       #
-      # conftest._pwsh_base_env passes them now. This step proves it stayed
-      # fixed, and says so in numbers rather than leaving the next person to
-      # rediscover it from a timeout. Diagnostic only -- never fails the job.
+      # This step prints the per-spawn cost before the suite runs, so a
+      # regression to that state announces itself in one line instead of twelve
+      # minutes later. Diagnostic only -- never fails the job.
       - name: Time the PowerShell harness (diagnostic)
         if: runner.os == 'Windows'
         continue-on-error: true
