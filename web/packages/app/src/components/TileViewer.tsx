@@ -159,6 +159,13 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   }, [client, arrayId]);
 
   const info = loaded?.info ?? null;
+
+  // Published rather than fetched twice: SliceControls needs this tensor's real
+  // extents to bound its sliders, and this component already paid for them.
+  const setTileInfo = useAppStore((s) => s.setTileInfo);
+  useEffect(() => {
+    setTileInfo(info);
+  }, [info, setTileInfo]);
   // Identity has to follow content, not the store write that produced it. Viv's
   // ImageLayer refetches whenever `selections` is a new *reference*, and zustand
   // hands out a fresh slice object on every `setSlice` — so deriving the

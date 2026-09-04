@@ -3,10 +3,9 @@ import {
   DEFAULT_VIEWER_URL_STATE,
   decodeViewerState,
   encodeViewerState,
-  resolveArrayId,
   type ViewerUrlState,
 } from "./viewerUrl";
-import type { DataSourceDescriptor, TensorDescriptor } from "@biopb/tensor-flight-client";
+import type { TensorDescriptor } from "@biopb/tensor-flight-client";
 
 const TENSOR: TensorDescriptor = {
   array_id: "hpc__ome-tiff_00b764c29c31/Image:0",
@@ -16,27 +15,11 @@ const TENSOR: TensorDescriptor = {
   dtype: "uint16",
 };
 
-/** Two axes sharing a label, so the second is unnamed and keyed `a1`. */
-const AMBIGUOUS: TensorDescriptor = {
-  array_id: "seq_1",
-  dim_labels: ["t", "t", "y", "x"],
-  shape: [4, 7, 256, 256],
-  chunk_shape: [],
-  dtype: "uint8",
-};
-
-const SOURCE: DataSourceDescriptor = {
-  source_id: "hpc__ome-tiff_00b764c29c31",
-  source_url: "file:///data/a.ome.tiff",
-  source_type: "ome-tiff",
-  metadata_json: null,
-  tensors: [TENSOR],
-};
 
 const defaults = (arrayId: string): ViewerUrlState => ({ arrayId, ...DEFAULT_VIEWER_URL_STATE });
 
 const decode = (qs: string, t = TENSOR) =>
-  decodeViewerState(new URLSearchParams(qs), t, defaults(t.array_id));
+  decodeViewerState(new URLSearchParams(qs), defaults(t.array_id));
 
 describe("decodeViewerState", () => {
   it("reads indices, contrast and render mode", () => {
@@ -52,32 +35,28 @@ describe("decodeViewerState", () => {
     expect(decode("t=5").slice).toEqual({ ...DEFAULT_VIEWER_URL_STATE.slice, t: 5 });
   });
 
-  it("clamps an index past the tensor's extent", () => {
-    // The whole point of requiring a descriptor: setSlice has no bound of its own.
-    expect(decode("z=400").slice.z).toBe(39);
-    expect(decode("t=-3").slice.t).toBe(0);
-  });
-
   it("rounds a fractional index rather than passing it to the fetch", () => {
     expect(decode("z=7.6").slice.z).toBe(8);
   });
 
+  it("reads an index without bounding it -- the grid does that later", () => {
+    // Decoding cannot know the extent: a pinned link has no descriptor until
+    // tile_info answers. clampSliceTo covers this, and is tested there.
+    expect(decode("z=400").slice.z).toBe(400);
+    expect(decode("t=-3").slice.t).toBe(0);
+    expect(decode("a7=2").slice.axes).toEqual({ a7: 2 });
+  });
+
+  it("keeps a bad parameter from discarding the rest of the link", () => {
+    expect(decode("z=abc&t=3&g=1.5").slice).toMatchObject({ t: 3, z: 0, gamma: 1.5 });
+  });
+
+  it("takes the id from the link, pinned or not", () => {
+    expect(decode("id=src_a@9f1c4e2b/Image:0").arrayId).toBe("src_a@9f1c4e2b/Image:0");
+  });
+
   it("ignores values that are not numbers", () => {
     expect(decode("z=abc&g=NaN").slice).toMatchObject({ z: 0, gamma: 1 });
-  });
-
-  it("keeps an unnamed axis under its sliderAxes key", () => {
-    expect(decode("a1=5", AMBIGUOUS).slice.axes).toEqual({ a1: 5 });
-  });
-
-  it("drops an axis key the tensor in view does not have", () => {
-    // Left over from the previously viewed source; carrying it would put a
-    // phantom entry in the selection.
-    expect(decode("a7=2").slice.axes).toEqual({});
-  });
-
-  it("clamps an unnamed axis to its own extent", () => {
-    expect(decode("a1=99", AMBIGUOUS).slice.axes).toEqual({ a1: 6 });
   });
 
   it("lets mm win over a stale percentile, and p clear the flag", () => {
@@ -95,9 +74,6 @@ describe("decodeViewerState", () => {
     expect(decode("vm=bogus").volumeRenderMode).toBe("mip");
   });
 
-  it("keeps one bad parameter from discarding the rest of the link", () => {
-    expect(decode("z=9999&t=3&g=1.5").slice).toMatchObject({ t: 3, z: 39, gamma: 1.5 });
-  });
 });
 
 describe("encodeViewerState", () => {
@@ -147,21 +123,6 @@ describe("encodeViewerState", () => {
       volumeRenderMode: "minip",
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
-    expect(decodeViewerState(qs, TENSOR, defaults(TENSOR.array_id))).toEqual(state);
-  });
-});
-
-describe("resolveArrayId", () => {
-  it("finds the tensor and its owning source", () => {
-    expect(resolveArrayId([SOURCE], TENSOR.array_id)?.source.source_id).toBe(SOURCE.source_id);
-  });
-
-  it("returns null for an id the catalog no longer holds", () => {
-    // A link shared before a re-index changed the content hash.
-    expect(resolveArrayId([SOURCE], "hpc__ome-tiff_deadbeef/Image:0")).toBeNull();
-  });
-
-  it("does not confuse a source_id with a tensor address", () => {
-    expect(resolveArrayId([SOURCE], SOURCE.source_id)).toBeNull();
+    expect(decodeViewerState(qs, defaults(TENSOR.array_id))).toEqual(state);
   });
 });

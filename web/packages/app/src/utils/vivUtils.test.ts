@@ -11,7 +11,9 @@ import {
   gammaFromOctaves,
   octavesFromGamma,
   percentileBounds,
+  clampSliceTo,
   samplesPerPixel,
+  sliderGrid,
   tileCacheSize,
   vivColor,
   vivSelection,
@@ -258,5 +260,80 @@ describe("vivColor", () => {
 
   it("resolves auto from the channel name", () => {
     expect(vivColor("auto", "DAPI")).toEqual([0, 0, 255]);
+  });
+});
+
+describe("sliderGrid", () => {
+  const TENSOR = { array_id: "src_a/Image:0", dim_labels: ["t", "y", "x"], shape: [10, 512, 512], chunk_shape: [], dtype: "uint16" };
+  const SOURCES = [{
+    source_id: "src_a",
+    source_url: "file:///a.tiff",
+    source_type: "ome-tiff",
+    metadata_json: null,
+    tensors: [TENSOR],
+  }] as unknown as Parameters<typeof sliderGrid>[1];
+
+  /** The same tensor after it grew, as `tile_info` would report it. */
+  const LIVE = { ...TENSOR, array_id: "src_a@9f1c4e2b/Image:0", shape: [20, 512, 512] } as unknown as Parameters<typeof sliderGrid>[0];
+
+  it("prefers the live grid over the catalog's", () => {
+    // The point of the whole thing: the catalog says T=10, the tensor has 20.
+    expect(sliderGrid(LIVE, SOURCES, "src_a", "src_a/Image:0")?.shape).toEqual([20, 512, 512]);
+  });
+
+  it("takes the live grid even though its array_id is the versioned form", () => {
+    // `tile_info` answers with `id@token`; matching it against the stable id
+    // would silently never hold, so the slot is trusted rather than compared.
+    expect(sliderGrid(LIVE, [] as unknown as Parameters<typeof sliderGrid>[1], "src_a", "src_a/Image:0")).toBe(LIVE);
+  });
+
+  it("falls back to the catalog before a viewer has loaded", () => {
+    expect(sliderGrid(null, SOURCES, "src_a", "src_a/Image:0")?.shape).toEqual([10, 512, 512]);
+  });
+
+  it("is null when neither knows the tensor", () => {
+    expect(sliderGrid(null, SOURCES, "src_a", "src_a/Nope")).toBeNull();
+    expect(sliderGrid(null, SOURCES, "gone", "gone")).toBeNull();
+  });
+});
+
+describe("clampSliceTo", () => {
+  const GRID = { dim_labels: ["t", "c", "z", "y", "x"], shape: [10, 3, 40, 512, 512] };
+  const AMBIGUOUS = { dim_labels: ["t", "t", "y", "x"], shape: [4, 7, 256, 256] };
+  const base = { t: 0, z: 0, c: 0, axes: {} as Record<string, number> };
+
+  it("brings an index inside the extent", () => {
+    // The bound a URL used to get at decode time, now applied when the grid
+    // lands -- which is the only moment a pinned link has one.
+    expect(clampSliceTo({ ...base, z: 400 }, GRID).z).toBe(39);
+    expect(clampSliceTo({ ...base, t: -3 }, GRID).t).toBe(0);
+  });
+
+  it("leaves an in-range index alone", () => {
+    expect(clampSliceTo({ ...base, t: 5, z: 12, c: 1 }, GRID)).toMatchObject({ t: 5, z: 12, c: 1 });
+  });
+
+  it("clamps a stale index when the tensor shrank under it", () => {
+    const shrunk = { dim_labels: ["t", "y", "x"], shape: [4, 512, 512] };
+    expect(clampSliceTo({ ...base, t: 9 }, shrunk).t).toBe(3);
+  });
+
+  it("keeps an unnamed axis and bounds it to its own extent", () => {
+    expect(clampSliceTo({ ...base, axes: { a1: 99 } }, AMBIGUOUS).axes).toEqual({ a1: 6 });
+  });
+
+  it("drops an axis key the grid does not have", () => {
+    // Left over from the previously viewed tensor; carrying it would put a
+    // phantom entry in the selection the viewer builds.
+    expect(clampSliceTo({ ...base, axes: { a7: 2 } }, GRID).axes).toEqual({});
+  });
+
+  it("rounds a fractional index", () => {
+    expect(clampSliceTo({ ...base, z: 7.6 }, GRID).z).toBe(8);
+  });
+
+  it("is a no-op with no grid yet", () => {
+    const slice = { ...base, z: 400 };
+    expect(clampSliceTo(slice, null)).toBe(slice);
   });
 });

@@ -134,6 +134,14 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
     };
   }, [client, arrayId]);
 
+  // Published for SliceControls, as in TileViewer. A refused volume never sets
+  // `info`, so the sliders fall back to the catalog rather than being bounded by
+  // a grid this viewer could not use.
+  const setTileInfo = useAppStore((s) => s.setTileInfo);
+  useEffect(() => {
+    setTileInfo(info);
+  }, [info, setTileInfo]);
+
   // `volumeRefusal` already established this is the available branch; the cast
   // is what lets the rest of the component read the plan without re-narrowing.
   const plan = (info?.volume ?? null) as VolumeAvailable | null;
