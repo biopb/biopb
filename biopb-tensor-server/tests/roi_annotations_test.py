@@ -11,7 +11,7 @@ import time
 
 import pyarrow.flight as flight
 import pytest
-from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Rectangle
+from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
@@ -120,6 +120,21 @@ class TestStore:
                 (7.0, 6.0, 13.0, 14.0),
             ),
             (_polygon((1, 2), (10, 2), (5, 9)), (1.0, 2.0, 10.0, 9.0)),
+            # A zero-width scribble is its vertex extent ...
+            (
+                ROI(polyline=Polyline(points=[Point(x=1, y=2), Point(x=9, y=6)])),
+                (1.0, 2.0, 9.0, 6.0),
+            ),
+            # ... and a fat one covers width/2 beyond it, because the stroke
+            # width is geometry: it is the band of pixels the brush marked.
+            (
+                ROI(
+                    polyline=Polyline(
+                        points=[Point(x=1, y=2), Point(x=9, y=6)], width=4
+                    )
+                ),
+                (-1.0, 0.0, 11.0, 8.0),
+            ),
         ],
     )
     def test_bbox_is_derived_per_shape(self, roi, expected):
@@ -138,6 +153,38 @@ class TestStore:
         db = MetadataDatabase()
         with pytest.raises(ValueError, match="no geometry"):
             db.put_rois(ARRAY_ID, [RoiAnnotation(label="nothing")])
+
+    def test_polyline_round_trips_as_its_own_shape(self):
+        """A scribble is not a polygon: it stays an open stroke through the store."""
+        db = MetadataDatabase()
+        scribble = ROI(
+            polyline=Polyline(
+                points=[Point(x=1, y=2), Point(x=5, y=3), Point(x=9, y=6)], width=3
+            )
+        )
+        db.put_rois(ARRAY_ID, [_annotation(roi=scribble, label="scribble")])
+
+        (got,), _ = db.list_rois(ARRAY_ID)
+        assert got.roi.WhichOneof("shape") == "polyline"
+        assert got.roi.polyline.width == 3
+        assert len(got.roi.polyline.points) == 3
+        assert (
+            db._get_cursor().execute("SELECT shape_kind FROM rois").fetchone()[0]
+            == "polyline"
+        )
+
+    def test_two_point_polyline_is_accepted(self):
+        """A stroke needs only two points; the 3-point floor is a polygon rule."""
+        db = MetadataDatabase()
+        stroke = ROI(polyline=Polyline(points=[Point(x=1, y=1), Point(x=2, y=2)]))
+        stored, _ = db.put_rois(ARRAY_ID, [_annotation(roi=stroke)])
+        assert stored
+
+    def test_single_point_polyline_is_refused(self):
+        db = MetadataDatabase()
+        stroke = ROI(polyline=Polyline(points=[Point(x=1, y=1)]))
+        with pytest.raises(ValueError, match="at least 2 points"):
+            db.put_rois(ARRAY_ID, [_annotation(roi=stroke)])
 
     def test_degenerate_polygon_is_refused(self):
         db = MetadataDatabase()

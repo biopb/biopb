@@ -31,12 +31,27 @@ TypeScript is already generated for the SPA
 (`RoiAnnotation`, below).
 
 **Only the 2-D vector arms are accepted:** `point`, `rectangle`, `ellipse`,
-`polygon`. A `mask` or `mesh` is rejected with a clear error. This follows from
-instance segmentation being a separate tensor (see Non-goals): `Mask` carries a
-`BinData` bitmap, so a single ROI can be hundreds of KB and a few thousand of
-them stop being "annotation scale" in the one dimension the cap is trying to
-bound — and `Mesh` is 3-D, where plane pinning has no meaning. The proto keeps
-both arms, so accepting them later is additive with no wire change.
+`polygon`, `polyline`. A `mask` or `mesh` is rejected with a clear error. This
+follows from instance segmentation being a separate tensor (see Non-goals):
+`Mask` carries a `BinData` bitmap, so a single ROI can be hundreds of KB and a
+few thousand of them stop being "annotation scale" in the one dimension the cap
+is trying to bound — and `Mesh` is 3-D, where plane pinning has no meaning. The
+proto keeps both arms, so accepting them later is additive with no wire change.
+
+**`Polyline` is new in `roi.proto`** — the scribble / freehand stroke, which the
+existing shapes could not express. Its vertex list looks like a `Polygon`'s, but
+the two are not interchangeable: a polygon is a closed region where "inside" is
+meaningful, a polyline encloses nothing and marks the band of pixels under the
+brush. OME-XML draws the same distinction, so this is the shared geometry
+vocabulary catching up rather than a local extension — it goes in `roi.proto`,
+where a detection response can return one too, not in `annotation.proto` where
+only this store would know it.
+
+Its `width` is part of the geometry, not styling. A scribble labels the pixels
+the brush covered, so the width decides what the ROI *means* — and concretely,
+the bbox extends `width/2` past the vertex extent. Had the width lived in
+`props_json` (opaque to the server) the derived bbox would silently
+under-report every fat stroke.
 
 Five decisions fix the semantics:
 
@@ -93,7 +108,7 @@ CREATE TABLE rois (
                                         -- orphan report, and anchors re-attach after a move
     set_name   TEXT NOT NULL DEFAULT 'default',
     label      TEXT,                    -- user class/name
-    shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon
+    shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon|polyline
     plane      MAP(VARCHAR, BIGINT),    -- sparse pin; absent key = all indices
     bbox       DOUBLE[4],               -- [x0,y0,x1,y1], level-0 px, derived server-side
     geometry   TEXT,                    -- biopb.image.ROI as canonical proto3 JSON

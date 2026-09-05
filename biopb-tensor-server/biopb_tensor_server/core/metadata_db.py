@@ -83,8 +83,14 @@ class NumpyEncoder(json.JSONEncoder):
 # stop being "annotation scale" in the one dimension the row cap is trying to
 # bound -- and `mesh` is 3-D, where plane pinning has no meaning. Both belong to
 # instance segmentation, which is a label tensor, not this table. The proto
-# keeps all six arms, so accepting them later is additive.
-_ACCEPTED_SHAPES: Set[str] = {"point", "rectangle", "ellipse", "polygon"}
+# keeps every arm, so accepting them later is additive.
+_ACCEPTED_SHAPES: Set[str] = {
+    "point",
+    "rectangle",
+    "ellipse",
+    "polygon",
+    "polyline",
+}
 
 
 class _PreparedRoi:
@@ -194,12 +200,22 @@ def _roi_bbox(roi, shape_kind: str) -> List[float]:
     if shape_kind == "ellipse":
         c, r = roi.ellipse.center, roi.ellipse.radius
         return [c.x - abs(r.x), c.y - abs(r.y), c.x + abs(r.x), c.y + abs(r.y)]
-    points = roi.polygon.points
-    if len(points) < 3:
-        raise ValueError(f"Polygon needs at least 3 points, got {len(points)}")
+    if shape_kind == "polyline":
+        points = roi.polyline.points
+        if len(points) < 2:
+            raise ValueError(f"Polyline needs at least 2 points, got {len(points)}")
+        # The stroke width is geometry: a scribble marks the band of pixels the
+        # brush covered, so the covered region extends width/2 past the vertices.
+        # A bbox taken from the vertices alone would under-report a fat stroke.
+        pad = abs(roi.polyline.width) / 2.0
+    else:
+        points = roi.polygon.points
+        if len(points) < 3:
+            raise ValueError(f"Polygon needs at least 3 points, got {len(points)}")
+        pad = 0.0
     xs = [p.x for p in points]
     ys = [p.y for p in points]
-    return [min(xs), min(ys), max(xs), max(ys)]
+    return [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
 
 
 def _row_to_proto(row: Sequence) -> RoiAnnotation:

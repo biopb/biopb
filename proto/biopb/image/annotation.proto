@@ -17,8 +17,9 @@ option java_package = "biopb.image";
 //
 // The geometry is biopb.image.ROI, reused as-is -- it carries geometry ONLY (no
 // id, no label), so RoiAnnotation is the record around it. Only the 2-D vector
-// arms are accepted (point / rectangle / ellipse / polygon); a mask or mesh is
-// rejected. Instance segmentation belongs in a label tensor, not here.
+// arms are accepted (point / rectangle / ellipse / polygon / polyline); a mask
+// or mesh is rejected. Instance segmentation belongs in a label tensor, not
+// here.
 
 // One annotation: a geometry, where it sits, and what the user called it.
 message RoiAnnotation {
