@@ -261,13 +261,14 @@ _SECTION_FOR = {
     "PyramidConfig": "pyramid",
     "PrecacheConfig": "precache",
     "MetadataDbConfig": "metadata_db",
+    "AnnotationsConfig": "annotations",
     "ServerConfig": "server",
 }
 
 # The nested sections the checker walks. ServerConfig itself is the "server"
 # section (its scalars are top-level fields, not a nested dataclass), so it is
 # passed separately in _sections_of.
-_NESTED_SECTIONS = ("cache", "pyramid", "precache", "metadata_db")
+_NESTED_SECTIONS = ("cache", "pyramid", "precache", "metadata_db", "annotations")
 
 
 def _sections_of(config: ServerConfig) -> List[Tuple[str, Any]]:
@@ -694,6 +695,37 @@ class MetadataDbConfig:
 
 
 @dataclass
+class AnnotationsConfig:
+    """User-drawn ROI annotations (biopb-tensor-server/docs/roi-annotations.md).
+
+    Annotations live in the DuckDB catalog next to ``sources`` and are served by
+    the ``roi_list`` / ``roi_put`` / ``roi_delete`` Flight actions. They are NOT
+    tied to ``writable``: an annotation writes no pixels, so the token is its
+    boundary and ``enabled`` is the switch for a deployment that wants a strictly
+    read-only catalog.
+
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
+    """
+
+    enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Serve the ROI annotation actions (roi_list / roi_put / "
+            "roi_delete)."
+        },
+    )
+    max_rois_per_tensor: int = field(
+        default=5000,
+        metadata={
+            "help": "Cap on stored annotations per tensor. Deliberately "
+            "human-scale: this is an annotation store, not an object store -- a "
+            "segmentation belongs in a label tensor."
+        },
+    )
+
+
+@dataclass
 class ServerConfig:
     """Server configuration.
 
@@ -811,6 +843,7 @@ class ServerConfig:
     precache: PrecacheConfig = field(default_factory=PrecacheConfig)
     credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
     metadata_db: MetadataDbConfig = field(default_factory=MetadataDbConfig)
+    annotations: AnnotationsConfig = field(default_factory=AnnotationsConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
 
@@ -1377,6 +1410,13 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(metadata_db_kwargs, "query_timeout_ms", metadata_db_data)
     metadata_db_config = MetadataDbConfig(**metadata_db_kwargs)
 
+    # Parse annotations settings
+    annotations_data = data.get("annotations", {})
+    annotations_kwargs: Dict[str, Any] = {}
+    _carry(annotations_kwargs, "enabled", annotations_data)
+    _carry(annotations_kwargs, "max_rois_per_tensor", annotations_data)
+    annotations_config = AnnotationsConfig(**annotations_kwargs)
+
     # Parse sources. `url` accepts the legacy `path` alias; every other field is
     # carried only when present so SourceConfig owns the defaults.
     sources_data = data.get("sources", [])
@@ -1417,6 +1457,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         precache=precache_config,
         credentials=credentials_config,
         metadata_db=metadata_db_config,
+        annotations=annotations_config,
         sources=sources,
         **server_kwargs,
     )

@@ -24,6 +24,15 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
+from biopb.image.annotation_pb2 import (
+    RoiAnnotation,
+    RoiDeleteRequest,
+    RoiDeleteResult,
+    RoiListRequest,
+    RoiListResult,
+    RoiPutRequest,
+    RoiPutResult,
+)
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
@@ -434,20 +443,32 @@ class CatalogClient:
             descriptor, options=self._state.call_options
         )
 
-        # Check schema metadata for truncation info
-        if info.schema.metadata:
-            total_sources = info.schema.metadata.get(b"total_sources")
-            if total_sources:
-                total = int(total_sources.decode())
-                returned = info.schema.metadata.get(b"returned_sources")
-                if returned:
-                    returned_count = int(returned.decode())
-                    if returned_count < total:
-                        logger.info(
-                            f"query_sources: returned {returned_count} of {total} sources (truncated)"
-                        )
-                    else:
-                        logger.info(f"query_sources: returned {returned_count} sources")
+        # Truncation comes from the server's flag, not from differencing counts:
+        # `total_sources` is the catalog size, so a filtered query (or one
+        # against another catalog table) legitimately returns fewer rows without
+        # anything having been dropped. Older servers send no flag; fall back.
+        metadata = info.schema.metadata or {}
+        flag = metadata.get(b"truncated")
+        returned = metadata.get(b"returned_rows") or metadata.get(b"returned_sources")
+        total = metadata.get(b"total_rows")
+        if returned:
+            returned_count = int(returned.decode())
+            if flag is not None:
+                truncated = flag.decode() == "True"
+            else:
+                legacy_total = metadata.get(b"total_sources")
+                truncated = bool(legacy_total) and returned_count < int(
+                    legacy_total.decode()
+                )
+            if truncated:
+                total_count = int(total.decode()) if total else None
+                logger.info(
+                    "query_sources: returned %s of %s rows (truncated)",
+                    returned_count,
+                    total_count if total_count is not None else "?",
+                )
+            else:
+                logger.info("query_sources: returned %s rows", returned_count)
 
         # Fetch results via DoGet
         if info.endpoints:
@@ -897,6 +918,55 @@ class CatalogClient:
                 f"remove_source('{root_url}') returned no result"
             ) from exc
         return RemoveSourceResult.FromString(result_bytes.body.to_pybytes())
+
+    # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
+
+    def _roi_action(self, name: str, req) -> bytes:
+        """One-shot DoAction round trip shared by the three ROI verbs."""
+        action = flight.Action(name, req.SerializeToString())
+        try:
+            results = self._state.client.do_action(
+                action, options=self._state.call_options
+            )
+            result_bytes = next(results)
+        except flight.FlightError as exc:
+            if "Unknown action" in str(exc):
+                raise RuntimeError(
+                    "ROI annotations are unavailable: the tensor server is too "
+                    f"old to support the '{name}' action. Upgrade the server."
+                ) from exc
+            raise
+        except StopIteration as exc:
+            raise RuntimeError(f"{name} returned no result") from exc
+        return result_bytes.body.to_pybytes()
+
+    def list_rois(self, array_id: str, set_name: str = "") -> "RoiListResult":
+        """Backs TensorFlightClient.list_rois; see that method."""
+        req = RoiListRequest(array_id=array_id, set_name=set_name)
+        return RoiListResult.FromString(self._roi_action("roi_list", req))
+
+    def put_rois(
+        self,
+        array_id: str,
+        rois: Sequence["RoiAnnotation"],
+        *,
+        check_rev: bool = False,
+    ) -> "RoiPutResult":
+        """Backs TensorFlightClient.put_rois; see that method."""
+        req = RoiPutRequest(array_id=array_id, rois=rois, check_rev=check_rev)
+        return RoiPutResult.FromString(self._roi_action("roi_put", req))
+
+    def delete_rois(
+        self,
+        array_id: str,
+        roi_ids: Sequence[str] = (),
+        set_name: str = "",
+    ) -> "RoiDeleteResult":
+        """Backs TensorFlightClient.delete_rois; see that method."""
+        req = RoiDeleteRequest(
+            array_id=array_id, roi_ids=list(roi_ids), set_name=set_name
+        )
+        return RoiDeleteResult.FromString(self._roi_action("roi_delete", req))
 
 
 class ChunkFetcher:

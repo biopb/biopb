@@ -84,7 +84,7 @@ in three collaborators it composes:
 
 Custom `do_action` verbs extend these: `health`, `create_source`,
 `upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
-and `remove_source` (below).
+`remove_source` (below), and `roi_list` / `roi_put` / `roi_delete`.
 
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 
@@ -265,6 +265,18 @@ The `add_source` Flight action registers an existing path on the **server's**
 filesystem at runtime — the wire entrypoint behind the tensor-browser's
 drag-and-drop. It routes the dropped path through the same claim → adapter →
 catalog pipeline the watcher uses, so a folder may register several sources.
+
+### ROI annotations (`roi_list` / `roi_put` / `roi_delete`)
+
+User-drawn 2-D ROIs live in a `rois` table in the same DuckDB catalog as
+`sources`, one row per ROI, anchored on the unversioned `array_id`. They are a
+sibling table, not a field inside a source row: `sources.metadata_json` is
+adapter-produced and rewritten on every re-registration. The table is readable on
+the SQL surface (`query_sources`) for analysis; every write goes through the
+three actions. In-memory like the rest of the catalog, so annotations do not yet
+survive a restart.
+
+See **[docs/roi-annotations.md](docs/roi-annotations.md)**.
 
 ---
 

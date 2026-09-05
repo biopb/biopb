@@ -56,6 +56,26 @@ message Polygon {
   repeated Point points = 1;
 }
 
+// An OPEN path of straight segments: the freehand / scribble annotation.
+//
+// Semantically distinct from Polygon even though the vertex list is the same
+// shape. A Polygon is a closed REGION -- its last point joins its first and it
+// encloses area, so "inside" is meaningful. A Polyline encloses nothing; it is a
+// stroke, and what it marks is the band of pixels under the brush. OME-XML draws
+// the same Polygon/Polyline distinction.
+message Polyline {
+  repeated Point points = 1;
+
+  // Stroke width, in the same pixel units as the points.
+  //
+  // This is GEOMETRY, not styling. A scribble annotation marks the pixels the
+  // brush covered, so the width participates in what the ROI means -- and in
+  // its bounding box, which extends width/2 beyond the vertex extent. A
+  // consumer that treated this as a display attribute would compute the wrong
+  // covered region. 0 means a mathematical zero-width path.
+  float width = 2;
+}
+
 // A closed 3D shape repesented by triangular meshes.
 //
 message Mesh {
@@ -92,5 +112,7 @@ message ROI {
     Mesh mesh = 5;
 
     Mask mask = 6;
+
+    Polyline polyline = 7;
   }
 }

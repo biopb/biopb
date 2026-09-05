@@ -5,13 +5,32 @@ try:
 except Exception:
     pass
 
+from biopb.image.annotation_pb2 import (
+    RoiAnnotation,
+    RoiConflict,
+    RoiDeleteRequest,
+    RoiDeleteResult,
+    RoiListRequest,
+    RoiListResult,
+    RoiPutRequest,
+    RoiPutResult,
+)
 from biopb.image.bindata_pb2 import BinData
 from biopb.image.detection_request_pb2 import DetectionRequest
 from biopb.image.detection_response_pb2 import DetectionResponse, ScoredROI
 from biopb.image.detection_settings_pb2 import DetectionSettings
 from biopb.image.image_data_pb2 import ImageAnnotation, ImageData, Pixels, Tensor
 from biopb.image.op_schema_pb2 import InputShapeHint, OpNames, OpSchema
-from biopb.image.roi_pb2 import ROI, Mask, Mesh, Point, Polygon, Rectangle
+from biopb.image.roi_pb2 import (
+    ROI,
+    Ellipse,
+    Mask,
+    Mesh,
+    Point,
+    Polygon,
+    Polyline,
+    Rectangle,
+)
 from biopb.image.rpc_object_detection_pb2_grpc import (
     ObjectDetection,
     ObjectDetectionServicer,

@@ -813,6 +813,7 @@ def _setup_flight_server(
     metadata_db = MetadataDatabase(
         max_query_results=server_config.metadata_db.max_query_results,
         query_timeout_ms=server_config.metadata_db.query_timeout_ms,
+        max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
     )
     console.print(
         "[green]Metadata database initialized:[/green] "
@@ -830,6 +831,7 @@ def _setup_flight_server(
         writable=effective_writable,
         write_dir=write_dir,
         metadata_db=metadata_db,
+        annotations_enabled=server_config.annotations.enabled,
         max_list_flights_results=server_config.metadata_db.max_list_flights_results,
         grpc_max_message_size=80 * 1024 * 1024,
         pyramid_config=server_config.pyramid,
