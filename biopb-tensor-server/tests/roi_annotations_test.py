@@ -345,6 +345,35 @@ class TestStore:
         table = db.get_pending_result(ticket)
         assert table.to_pydict() == {"label": ["interphase", "mitotic"], "n": [1, 2]}
 
+    def test_a_filtered_query_is_not_reported_as_truncated(self):
+        """Truncation is the server's own flag, not a difference of counts.
+
+        `total_sources` counts the CATALOG, so differencing it against the rows
+        a query returned reported truncation for every filtered query and for
+        any query against a table other than `sources` -- 3 rows matching out of
+        100 sources read as "97 were dropped".
+        """
+        db = MetadataDatabase()
+        for i in range(20):
+            _register_source(db, f"zarr_{i}", f"/data/{i}.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(label="nucleus")])
+
+        for sql in (
+            "SELECT source_id FROM sources WHERE source_id = 'zarr_1'",
+            "SELECT roi_id FROM rois",
+            "SELECT roi_id FROM rois WHERE label = 'nothing-matches'",
+        ):
+            md = db.handle_query(sql).schema.metadata
+            assert md[b"truncated"] == b"False", sql
+
+    def test_a_real_truncation_is_reported(self):
+        db = MetadataDatabase(max_query_results=5)
+        for i in range(12):
+            _register_source(db, f"zarr_{i}", f"/data/{i}.zarr")
+        md = db.handle_query("SELECT source_id FROM sources").schema.metadata
+        assert md[b"truncated"] == b"True"
+        assert (md[b"total_rows"], md[b"returned_rows"]) == (b"12", b"5")
+
     def test_sql_surface_stays_read_only(self):
         db = MetadataDatabase()
         with pytest.raises(ValueError, match="forbidden keyword"):

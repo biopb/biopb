@@ -619,7 +619,10 @@ class MetadataDatabase:
             result = cursor.execute(sql)
             arrow_table = result.to_arrow_table()
 
-            # Get source count using same cursor
+            # Catalog size: context for a caller sizing the browse surface. NOT
+            # a truncation denominator -- the query may count something else
+            # entirely (a filtered subset, or the `rois` table), which is exactly
+            # how "3 of 100 matched" got reported as "97 rows were dropped".
             total_sources = cursor.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
 
             elapsed_ms = (time.time() - start_time) * 1000
@@ -635,21 +638,33 @@ class MetadataDatabase:
             logger.error(f"Query failed: {e}")
             raise ValueError(f"SQL query failed: {e}")
 
-        # Apply truncation if needed
-        returned_rows = arrow_table.num_rows
+        # Apply truncation if needed. The pre-slice row count is the query's own
+        # full size, so truncation is known EXACTLY here and never has to be
+        # inferred downstream by comparing against a count of something else.
+        total_rows = arrow_table.num_rows
+        truncated = total_rows > self._max_query_results
 
-        if returned_rows > self._max_query_results:
+        if truncated:
             arrow_table = arrow_table.slice(0, self._max_query_results)
             logger.warning(
-                f"Query result truncated: {self._max_query_results} of {returned_rows} rows"
+                f"Query result truncated: {self._max_query_results} of {total_rows} rows"
             )
+        returned_rows = arrow_table.num_rows
 
         # Build schema metadata for truncation signaling
         metadata = {
+            # Authoritative, server-computed: only the server knows the pre-cap
+            # size. Same key and spelling ListFlights already uses, so a consumer
+            # reads truncation the same way from both surfaces.
+            b"truncated": str(truncated).encode(),
+            # This query's own row counts -- the honest truncation pair.
+            b"total_rows": str(total_rows).encode(),
+            b"returned_rows": str(returned_rows).encode(),
+            # Catalog size, and the row count under its legacy name. Kept so an
+            # older consumer keeps working; `total_sources` is informational and
+            # must not be differenced against `returned_sources`.
             b"total_sources": str(total_sources).encode(),
-            b"returned_sources": str(
-                min(returned_rows, self._max_query_results)
-            ).encode(),
+            b"returned_sources": str(returned_rows).encode(),
             b"query_elapsed_ms": str(int(elapsed_ms)).encode(),
         }
         # Tag the TABLE, not just the FlightInfo schema. DoGet streams this very

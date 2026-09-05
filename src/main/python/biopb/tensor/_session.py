@@ -443,20 +443,32 @@ class CatalogClient:
             descriptor, options=self._state.call_options
         )
 
-        # Check schema metadata for truncation info
-        if info.schema.metadata:
-            total_sources = info.schema.metadata.get(b"total_sources")
-            if total_sources:
-                total = int(total_sources.decode())
-                returned = info.schema.metadata.get(b"returned_sources")
-                if returned:
-                    returned_count = int(returned.decode())
-                    if returned_count < total:
-                        logger.info(
-                            f"query_sources: returned {returned_count} of {total} sources (truncated)"
-                        )
-                    else:
-                        logger.info(f"query_sources: returned {returned_count} sources")
+        # Truncation comes from the server's flag, not from differencing counts:
+        # `total_sources` is the catalog size, so a filtered query (or one
+        # against another catalog table) legitimately returns fewer rows without
+        # anything having been dropped. Older servers send no flag; fall back.
+        metadata = info.schema.metadata or {}
+        flag = metadata.get(b"truncated")
+        returned = metadata.get(b"returned_rows") or metadata.get(b"returned_sources")
+        total = metadata.get(b"total_rows")
+        if returned:
+            returned_count = int(returned.decode())
+            if flag is not None:
+                truncated = flag.decode() == "True"
+            else:
+                legacy_total = metadata.get(b"total_sources")
+                truncated = bool(legacy_total) and returned_count < int(
+                    legacy_total.decode()
+                )
+            if truncated:
+                total_count = int(total.decode()) if total else None
+                logger.info(
+                    "query_sources: returned %s of %s rows (truncated)",
+                    returned_count,
+                    total_count if total_count is not None else "?",
+                )
+            else:
+                logger.info("query_sources: returned %s rows", returned_count)
 
         # Fetch results via DoGet
         if info.endpoints:

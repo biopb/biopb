@@ -1720,9 +1720,24 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         # total" rather than raise an AttributeError that the handler below would
         # then report as a 502 Flight error.
         table_metadata = arrow_table.schema.metadata or {}
-        total = int(table_metadata.get(b"total_sources", len(result)))
-        returned = int(table_metadata.get(b"returned_sources", len(result)))
-        truncated = total > returned
+        # Prefer this query's own row counts; fall back to the legacy
+        # source-count keys for a server that predates them, then to the table.
+        total = int(
+            table_metadata.get(b"total_rows")
+            or table_metadata.get(b"total_sources")
+            or len(result)
+        )
+        returned = int(
+            table_metadata.get(b"returned_rows")
+            or table_metadata.get(b"returned_sources")
+            or len(result)
+        )
+        # Trust the server's own flag: it is the only party that saw the pre-cap
+        # size. Differencing the counts is what made every filtered query report
+        # truncation -- `total_sources` counts the catalog, not this result.
+        # Fall back to the difference only for a server that predates the flag.
+        flag = table_metadata.get(b"truncated")
+        truncated = flag.decode() == "True" if flag else total > returned
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
