@@ -35,6 +35,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -97,26 +98,30 @@ _ACCEPTED_SHAPES: Set[str] = {
 }
 
 
+@dataclass(frozen=True)
 class _PreparedRoi:
-    """A validated annotation, normalized into the column values it will occupy."""
+    """A validated annotation, normalized into the column values it will occupy.
 
-    __slots__ = (
-        "roi_id",
-        "set_name",
-        "label",
-        "shape_kind",
-        "plane",
-        "bbox",
-        "geometry",
-        "props_json",
-        "drawn_against_version",
-        "rev",
-        "roi",
-    )
+    Attribute names match the ``rois`` column names, which is what lets
+    ``column_values`` build a statement's parameters from a column list instead
+    of a hand-maintained positional tuple.
+    """
 
-    def __init__(self, **kwargs) -> None:
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+    roi_id: str
+    set_name: str
+    label: str
+    shape_kind: str
+    plane: Dict[str, int]
+    bbox: List[float]
+    geometry: str
+    props_json: Optional[str]
+    drawn_against_version: Optional[str]
+    rev: int
+    roi: object
+
+    def column_values(self, columns: Sequence[str]) -> List[object]:
+        """Parameters for *columns*, in order."""
+        return [getattr(self, name) for name in columns]
 
     def to_proto(
         self,
@@ -887,6 +892,25 @@ class MetadataDatabase:
     # ROI annotations (docs/roi-annotations.md)
     # ------------------------------------------------------------------
 
+    # Columns a client owns: rewritten verbatim by every update. Everything not
+    # in this list is either identity (roi_id / array_id / source_id), set once
+    # at creation (created_at), server-derived (rev / updated_at), or
+    # catalog-derived (source_url / last_seen_at) -- and an UPDATE that does not
+    # name a column cannot corrupt it. That is the point of splitting create
+    # from update rather than doing one full-row INSERT OR REPLACE: the
+    # "don't touch this on an update" rule is expressed by the statement itself
+    # instead of by reconstruction logic that has to get every column right.
+    _ROI_CLIENT_COLUMNS = (
+        "set_name",
+        "label",
+        "shape_kind",
+        "plane",
+        "bbox",
+        "geometry",
+        "props_json",
+        "drawn_against_version",
+    )
+
     def put_rois(
         self,
         array_id: str,
@@ -915,8 +939,9 @@ class MetadataDatabase:
 
         Raises:
             ValueError: On an empty array_id, a geometry this store does not
-                accept, a mismatched per-ROI array_id, or a write that would
-                push the tensor past ``max_rois_per_tensor``.
+                accept, a mismatched per-ROI array_id, a duplicate roi_id in the
+                batch, or a write that would push the tensor past
+                ``max_rois_per_tensor``.
         """
         if not array_id:
             raise ValueError("array_id is required")
@@ -943,36 +968,15 @@ class MetadataDatabase:
         conflicts: List[RoiConflict] = []
 
         with self._write_lock:
-            source_url = self._lookup_source_url(conn, source_id)
-            if source_url is None:
-                logger.debug(
-                    "put_rois: %s is not in the catalog, storing annotations "
-                    "without a source_url (backfilled on a later write)",
-                    source_id,
-                )
-            else:
-                # Heal any rows written while the source was unknown. A NULL
-                # source_url is exactly the row the staleness model cannot cope
-                # with -- array_id is a SHA-256, so an orphan report could only
-                # name it as "zarr_a3f2b1c4" and a re-attach prompt would have
-                # nothing to offer. Rows only heal if they are in a later batch
-                # otherwise, so backfill the whole source here rather than
-                # leaving the gap permanent. source_url is a human-readable
-                # label for a source_id, not an identifier, so overwriting a
-                # NULL with the catalog's current value is always right.
-                conn.execute(
-                    "UPDATE rois SET source_url = ? "
-                    "WHERE source_id = ? AND source_url IS NULL",
-                    [source_url, source_id],
-                )
-            # source_url / last_seen_at come along because a REPLACE rewrites
-            # the whole row: when the catalog cannot answer, they have to be
-            # carried over rather than overwritten (see the loop).
+            source_url = self._observe_source(conn, source_id, now)
+
+            # created_at is read for the RESPONSE only -- the update statement
+            # does not carry it, so an existing row's value is preserved by not
+            # being mentioned.
             existing = {
-                row[0]: row[1:]
-                for row in conn.execute(
-                    "SELECT roi_id, rev, created_at, source_url, last_seen_at "
-                    "FROM rois WHERE array_id = ?",
+                roi_id: (rev, created_at)
+                for roi_id, rev, created_at in conn.execute(
+                    "SELECT roi_id, rev, created_at FROM rois WHERE array_id = ?",
                     [array_id],
                 ).fetchall()
             }
@@ -987,6 +991,18 @@ class MetadataDatabase:
                     f"annotation store -- a segmentation belongs in a label tensor."
                 )
 
+            assignments = ", ".join(f"{col} = ?" for col in self._ROI_CLIENT_COLUMNS)
+            update_sql = (
+                f"UPDATE rois SET {assignments}, rev = ?, updated_at = ? "
+                f"WHERE array_id = ? AND roi_id = ?"
+            )
+            insert_sql = (
+                "INSERT INTO rois "
+                f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
+                "rev, created_at, updated_at, source_url, last_seen_at) "
+                f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})"
+            )
+
             for prep in prepared:
                 prior = existing.get(prep.roi_id)
                 if prior is not None and check_rev and prep.rev != prior[0]:
@@ -995,52 +1011,19 @@ class MetadataDatabase:
                     )
                     continue
 
-                rev = (prior[0] + 1) if prior is not None else 1
-                created_at = prior[1] if prior is not None else now
-
-                # Catalog-derived columns are written ONLY when the catalog
-                # answered. This is a full-row REPLACE, so writing them
-                # unconditionally meant an edit made while the source was
-                # briefly absent (rescan window, unmounted drive, proxy
-                # upstream down) wiped a good source_url -- and stamped
-                # last_seen_at as if the tensor had just been observed, which
-                # would reset the orphan clock for an image that may really be
-                # gone. Presence is evidence; absence is not, so absence
-                # preserves what the row already knew.
-                if source_url is not None:
-                    row_url, row_seen = source_url, now
-                elif prior is not None:
-                    row_url, row_seen = prior[2], prior[3]
+                values = prep.column_values(self._ROI_CLIENT_COLUMNS)
+                if prior is None:
+                    rev, created_at = 1, now
+                    conn.execute(
+                        insert_sql,
+                        [prep.roi_id, array_id, source_id, *values, rev, now, now]
+                        # A fresh row is only "seen" if the catalog answered;
+                        # inventing a sighting would reset an orphan clock.
+                        + [source_url, now if source_url is not None else None],
+                    )
                 else:
-                    row_url, row_seen = None, None
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO rois
-                    (roi_id, array_id, source_id, source_url, set_name, label,
-                     shape_kind, plane, bbox, geometry, props_json,
-                     drawn_against_version, rev, created_at, updated_at,
-                     last_seen_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        prep.roi_id,
-                        array_id,
-                        source_id,
-                        row_url,
-                        prep.set_name,
-                        prep.label,
-                        prep.shape_kind,
-                        prep.plane,
-                        prep.bbox,
-                        prep.geometry,
-                        prep.props_json,
-                        prep.drawn_against_version,
-                        rev,
-                        created_at,
-                        now,
-                        row_seen,
-                    ],
-                )
+                    rev, created_at = prior[0] + 1, prior[1]
+                    conn.execute(update_sql, [*values, rev, now, array_id, prep.roi_id])
                 stored.append(prep.to_proto(array_id, rev, created_at, now))
 
         logger.debug(
@@ -1050,6 +1033,46 @@ class MetadataDatabase:
             array_id,
         )
         return stored, conflicts
+
+    @staticmethod
+    def _observe_source(conn, source_id: str, now: datetime) -> Optional[str]:
+        """Record a catalog sighting of *source_id*, returning its URL or None.
+
+        Presence in the catalog is evidence; absence is not (progressive
+        discovery, an unmounted drive, a proxy upstream that is down). So this
+        writes only on presence, and a source the catalog cannot answer for
+        leaves every stored row exactly as it was.
+
+        On presence it does two things in one statement, for every row of the
+        source:
+
+        * ``COALESCE`` backfills a ``source_url`` that is still NULL, closing the
+          window where annotations were written before discovery caught up. Rows
+          that already have one keep it -- the URL is a human-readable label for
+          a source_id, not an identifier, so filling a blank is always safe but
+          overwriting is not the intent.
+        * stamps ``last_seen_at``. This is the same statement the future prune
+          sweep runs (docs/roi-annotations.md); the sweep adds only a
+          catalog-completeness gate, which a *presence* observation does not
+          need -- only a conclusion about absence does.
+        """
+        row = conn.execute(
+            "SELECT source_url FROM sources WHERE source_id = ?", [source_id]
+        ).fetchone()
+        if row is None:
+            logger.debug(
+                "put_rois: %s is not in the catalog; annotations keep whatever "
+                "source_url / last_seen_at they already had",
+                source_id,
+            )
+            return None
+        source_url = row[0]
+        conn.execute(
+            "UPDATE rois SET source_url = COALESCE(source_url, ?), last_seen_at = ? "
+            "WHERE source_id = ?",
+            [source_url, now, source_id],
+        )
+        return source_url
 
     def list_rois(
         self, array_id: str, set_name: str = ""
@@ -1121,21 +1144,6 @@ class MetadataDatabase:
 
         logger.debug("delete_rois: removed %s from %s", len(deleted), array_id)
         return deleted
-
-    @staticmethod
-    def _lookup_source_url(conn, source_id: str) -> Optional[str]:
-        """The catalog URL for a source, or None when it is not registered.
-
-        An annotation on a source the catalog does not (yet) know is still
-        stored -- the write is the user's, not the catalog's, and progressive
-        discovery means absence proves nothing, so refusing it would turn a
-        rescan window into lost work. It lands without a URL, and ``put_rois``
-        backfills the whole source the first time one resolves.
-        """
-        row = conn.execute(
-            "SELECT source_url FROM sources WHERE source_id = ?", [source_id]
-        ).fetchone()
-        return row[0] if row else None
 
     def close(self) -> None:
         """Close the DuckDB connection."""

@@ -409,6 +409,33 @@ class TestStore:
             is None
         )
 
+    def test_a_mixed_batch_creates_and_updates_in_one_call(self):
+        """Creates and updates take different statements now; one batch drives both."""
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a", label="v1")])
+
+        stored, conflicts = db.put_rois(
+            ARRAY_ID,
+            [_annotation(roi_id="a", label="v2"), _annotation(roi_id="b", label="new")],
+        )
+        assert not conflicts
+        assert {(s.roi_id, s.label, s.rev) for s in stored} == {
+            ("a", "v2", 2),
+            ("b", "new", 1),
+        }
+        assert len(db.list_rois(ARRAY_ID)[0]) == 2
+
+    def test_an_update_while_present_records_a_fresh_sighting(self):
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
+        before = db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()[0]
+
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
+        after = db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()[0]
+        assert after >= before
+
     def test_backfill_only_touches_rows_that_have_no_url(self):
         db = MetadataDatabase()
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")

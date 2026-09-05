@@ -351,22 +351,33 @@ not advance `last_seen_at`. Deletion is then a policy over age
 (`annotations.prune_unseen_days`, default `0` = never) rather than a claim about
 the world.
 
-Both catalog-derived columns are written **only when the catalog answered**. A
-put is a full-row `INSERT OR REPLACE`, so writing them unconditionally meant an
-edit made while the source was briefly absent wiped a good `source_url` and
-stamped `last_seen_at` as though the tensor had just been observed — resetting
-the orphan clock for an image that may really be gone. Presence is evidence,
-absence is not, so absence preserves whatever the row already knew.
+Both catalog-derived columns are written **only when the catalog answered** —
+and a write states that structurally rather than by reconstruction. A create is
+an `INSERT`; an update is an `UPDATE` naming only the columns a client owns, so
+identity, `created_at`, `source_url` and `last_seen_at` are preserved by *not
+being mentioned*. (A full-row `INSERT OR REPLACE` had to re-derive all sixteen
+columns on every write, and an edit made while the source was briefly absent
+duly wiped a good `source_url` and stamped `last_seen_at` as though the tensor
+had just been seen — resetting the orphan clock for an image that may really be
+gone.)
+
+Presence is recorded once per call, for the whole source:
+
+```sql
+UPDATE rois SET source_url = COALESCE(source_url, ?), last_seen_at = ?
+ WHERE source_id = ?;
+```
+
+`COALESCE` backfills a URL that is still NULL — closing the window where
+annotations were written before discovery caught up — while leaving an existing
+one alone. And this is the *same statement the prune sweep runs*: the sweep adds
+only the catalog-completeness gate, which a presence observation does not need
+(only a conclusion about absence does). Absence writes nothing at all.
 
 A write against a source the catalog does not know is still stored — refusing it
 would turn a rescan window into lost work, and absence proves nothing. It lands
-with a NULL `source_url`, which is precisely the unreportable row above, so the
-next write that *can* resolve the URL backfills every NULL row of that source
-(`UPDATE rois SET source_url = ? WHERE source_id = ? AND source_url IS NULL`).
-Without that the gap was permanent: only rows that happened to appear in a later
-batch ever healed. `source_url` is a human-readable label for a `source_id`, not
-an identifier, so filling a NULL from the catalog's current value is always safe;
-rows that already have one are left alone.
+with a NULL `source_url`, which is precisely the unreportable row above, and the
+next write that *can* resolve the URL backfills it.
 
 Auto-delete stays **opt-in** — the default above is off. These are hand-drawn
 user data; the safe default is to surface orphans, sorted by `last_seen_at` and
