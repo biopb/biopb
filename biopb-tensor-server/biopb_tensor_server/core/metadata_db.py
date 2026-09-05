@@ -89,6 +89,34 @@ class NumpyEncoder(json.JSONEncoder):
 # it so a pathological key cannot be planted in the catalog.
 _MAX_ROI_ID_LEN = 128
 
+# The HTTP sidecar publishes a content-versioned array_id (`source@token[/field]`,
+# biopb/biopb#780). Per the identity policy in descriptor.proto that form exists
+# ONLY above the Flight wire -- "no adapter, chunk_id, catalog row or descriptor
+# ever carries it" -- but nothing used to enforce it, and the read routes only
+# get it right as a side effect of resolving a descriptor
+# (`_tensor_desc_by_array_id` strips and validates in one step). A store keyed by
+# array_id never resolves anything, so a missed strip was silent: the annotation
+# filed itself under a phantom tensor whose id is never minted again once content
+# changes, with a source_id matching no catalog row. See docs/roi-annotations.md.
+_VERSION_SEP = "@"
+
+
+def _require_bare_array_id(array_id: str) -> None:
+    """Refuse a content-versioned array_id at the layer that stores one.
+
+    Loud beats silent: a versioned id is not a different tensor, it is a caller
+    that forgot to strip, and every such bug so far has been invisible until a
+    user's annotations went missing. Only the source half is checked -- a '@' in
+    a field name is legal payload, and a source_id can never contain one.
+    """
+    if _VERSION_SEP in array_id.partition("/")[0]:
+        raise ValueError(
+            f"array_id {array_id!r} carries a content-version token; annotations "
+            f"anchor on the unversioned id (strip it before this layer -- the "
+            f"versioned form exists only above the Flight wire)."
+        )
+
+
 _ACCEPTED_SHAPES: Set[str] = {
     "point",
     "rectangle",
@@ -945,6 +973,7 @@ class MetadataDatabase:
         """
         if not array_id:
             raise ValueError("array_id is required")
+        _require_bare_array_id(array_id)
 
         # Validate and normalize everything BEFORE taking the lock: a batch is
         # all-or-nothing on validity, so a bad shape in the tenth annotation must
@@ -1091,6 +1120,7 @@ class MetadataDatabase:
         """
         if not array_id:
             raise ValueError("array_id is required")
+        _require_bare_array_id(array_id)
 
         sql = (
             "SELECT roi_id, array_id, set_name, label, plane, geometry, "
@@ -1122,6 +1152,7 @@ class MetadataDatabase:
         """
         if not array_id:
             raise ValueError("array_id is required")
+        _require_bare_array_id(array_id)
 
         roi_ids = list(roi_ids)
         conn = self._get_connection()

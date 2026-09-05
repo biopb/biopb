@@ -298,6 +298,33 @@ class TestStore:
         assert db.delete_rois(ARRAY_ID, ["roi-1"]) == ["roi-1"]
         assert len(db.list_rois(other)[0]) == 1
 
+    @pytest.mark.parametrize("verb", ["put", "list", "delete"])
+    def test_a_versioned_array_id_is_refused_at_the_store(self, verb):
+        """The store is the layer that requires a bare id, so it enforces it.
+
+        The versioned form (`source@token/field`) exists only above the Flight
+        wire (identity policy, descriptor.proto). The read routes get this right
+        only as a side effect of resolving a descriptor; a store keyed by
+        array_id resolves nothing, so a missed strip used to be silent -- the
+        annotation filed itself under a phantom tensor whose id is never minted
+        again once content changes, and a bare read found nothing.
+        """
+        db = MetadataDatabase()
+        versioned = "zarr_a1b2c3@9f1c4e2b/Image:0"
+        calls = {
+            "put": lambda: db.put_rois(versioned, [_annotation()]),
+            "list": lambda: db.list_rois(versioned),
+            "delete": lambda: db.delete_rois(versioned, ["a"]),
+        }
+        with pytest.raises(ValueError, match="content-version token"):
+            calls[verb]()
+
+    def test_an_at_sign_in_a_field_name_is_still_legal(self):
+        """Only the source half is parsed: '@' is payload in a field name."""
+        db = MetadataDatabase()
+        db.put_rois("zarr_a1b2c3/we@ird", [_annotation()])
+        assert len(db.list_rois("zarr_a1b2c3/we@ird")[0]) == 1
+
     def test_annotations_are_scoped_to_their_tensor(self):
         db = MetadataDatabase()
         db.put_rois(ARRAY_ID, [_annotation()])

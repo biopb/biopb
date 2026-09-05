@@ -67,7 +67,7 @@ transaction. Per-set attributes (display colour, visibility) have no table yet o
 purpose — they are client display state today, and a `roi_sets` table is additive
 if they ever need to be shared.
 
-**Anchor to `array_id`, unversioned.** A tensor is identified by `array_id` alone
+**Anchor to `array_id`, unversioned — and enforced, not assumed.** A tensor is identified by `array_id` alone
 (see the identity policy in `descriptor.proto`), so that is the foreign key —
 not `source_id` (a multi-field source has many tensors) and not the sidecar's
 `source@token/field` HTTP form, which changes whenever the file's
@@ -77,6 +77,17 @@ the tile route does (`_split_array_version`). What *is* stored is the
 `content_version` observed at write time (`drawn_against_version`), so a client
 can say "this image changed since it was annotated" instead of silently drawing
 stale outlines.
+
+The store *refuses* a versioned id rather than trusting callers to strip. This is
+worth a rule because of where the existing sidecar gets its correctness from:
+every read route handles the token as a side effect of resolving a descriptor
+(`_tensor_desc_by_array_id` strips and validates in one step), so the invariant
+had no independent existence. A store keyed by `array_id` resolves nothing, so a
+missed strip was silent — the annotation filed itself under a phantom tensor
+whose id is never minted again once content changes, `source_id` matched no
+catalog row, and a bare read returned nothing. Loud beats silent: a versioned id
+is not a different tensor, it is a caller that forgot. Only the source half is
+checked, since `@` is legal payload in a field name.
 
 **Coordinates are level-0 pixels.** Always full-resolution, in the tensor's own
 Y/X axes, floating point. A polygon drawn on a downsampled level is scaled up by
