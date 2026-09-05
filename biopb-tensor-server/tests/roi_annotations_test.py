@@ -490,6 +490,52 @@ class TestSidecarRoutes:
         other = client.get("/api/rois/zarr_a1b2c3@deadbeef/Image:0").json()
         assert len(other["rois"]) == 1
 
+    def test_a_read_edit_write_round_trip_survives_the_version_token(
+        self, client_and_app
+    ):
+        """The shape a real client actually uses: GET, change a field, POST back.
+
+        Responses carry versioned array_ids, so the body handed back on the write
+        carries one too -- and the store only ever sees bare ids. Stripping the
+        path alone was not enough; the whole round trip 422'd.
+        """
+        client, _db = client_and_app
+        versioned = "zarr_a1b2c3@9f1c4e2b/Image:0"
+        client.post(
+            f"/api/rois/{versioned}",
+            json={"rois": [{"roi": {"point": {"x": 1, "y": 2}}}]},
+        )
+
+        fetched = client.get(f"/api/rois/{versioned}").json()["rois"][0]
+        assert fetched["arrayId"] == versioned
+        fetched["label"] = "edited"
+
+        resp = client.post(f"/api/rois/{versioned}", json={"rois": [fetched]})
+        assert resp.status_code == 200, resp.text
+        stored = resp.json()["stored"][0]
+        assert stored["label"] == "edited"
+        assert stored["rev"] == "2"  # an update, not a second row
+        assert len(client.get(f"/api/rois/{versioned}").json()["rois"]) == 1
+
+    def test_a_genuinely_wrong_tensor_in_the_body_is_still_refused(
+        self, client_and_app
+    ):
+        """Stripping the version must not blunt the mismatch check itself."""
+        client, _db = client_and_app
+        resp = client.post(
+            f"/api/rois/{ARRAY_ID}",
+            json={
+                "rois": [
+                    {
+                        "arrayId": "zarr_somethingelse/Image:0",
+                        "roi": {"point": {"x": 1, "y": 2}},
+                    }
+                ]
+            },
+        )
+        assert resp.status_code == 422
+        assert "does not match" in resp.json()["detail"]
+
     def test_rejected_geometry_is_422(self, client_and_app):
         client, _db = client_and_app
         resp = client.post(

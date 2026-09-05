@@ -273,9 +273,10 @@ DELETE /api/rois/{array_id:path}?ids=a,b&set=nuclei
 sidecar's: the SPA already holds the tensor's descriptor, and doing it here would
 cost a describe round trip on every save. JSON bodies are canonical proto3 JSON
 (`google.protobuf.json_format` server-side, protobuf-es `toJson`/`fromJson` in the
-SPA) so one schema serves both ends and neither hand-writes a DTO. The handler
-strips the `@version` token from `array_id` and passes the observed token through
-as `drawn_against_version`.
+SPA) so one schema serves both ends and neither hand-writes a DTO. The handler strips the
+`@version` token wherever one can enter — the path *and* each annotation's own
+`array_id` in the body — because responses carry versioned ids, so a read-edit-write
+round trip hands one straight back and the store only ever sees bare ids.
 
 ## Persistence and staleness
 

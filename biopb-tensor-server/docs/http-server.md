@@ -87,9 +87,10 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 
 > **ROI annotations** (`/api/rois/*`) carry canonical proto3 JSON of
 > `biopb.image.RoiAnnotation` in both directions. The version token is stripped
-> from `array_id` before the store sees it — annotations anchor on the
-> unversioned id so they outlive an in-place edit — and spliced back onto the
-> response. `501` means the server does not offer annotations (disabled, or no
+> from `array_id` before the store sees it — from the path *and* from each
+> annotation in a POST body, since responses carry versioned ids and a
+> read-edit-write round trip hands one back — and spliced onto the response.
+> Annotations anchor on the unversioned id so they outlive an in-place edit. `501` means the server does not offer annotations (disabled, or no
 > metadata DB); `422` means the request was rejected (geometry the store does not
 > accept, mismatched `array_id`, per-tensor cap). Design: `roi-annotations.md`.
 

@@ -1971,6 +1971,16 @@ async def put_rois(array_id: str, request: Request) -> JSONResponse:
     except json_format.ParseError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid annotation: {exc}")
 
+    # Strip the version from the BODY too, not just the path. Responses carry
+    # versioned array_ids (so the SPA keeps addressing tensors the way it
+    # already does), which means the natural read-edit-write round trip hands
+    # them straight back -- and the store, which only ever sees bare ids, would
+    # reject them as a mismatched tensor. The sidecar owns this translation at
+    # every boundary it has: path in, body in, body out.
+    for roi in req.rois:
+        if roi.array_id:
+            roi.array_id = _split_array_version(roi.array_id)[0]
+
     try:
         result = ctx.get_client().put_rois(
             bare_id, list(req.rois), check_rev=req.check_rev
