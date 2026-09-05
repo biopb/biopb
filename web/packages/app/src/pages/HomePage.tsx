@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import { useAppStore } from "../store";
 import { ViewerPane } from "../components/ViewerPane";
 import { MetaPanel } from "../components/MetaPanel";
+import { RoiPanel } from "../components/RoiPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
 import { TipBar } from "../components/TipBar";
@@ -49,6 +50,9 @@ export function HomePage() {
   // What the render path fetches: the exact address a link asked for, which may
   // be content-pinned, falling back to the selection for an ordinary click.
   const requestedArrayId = useAppStore((s) => s.requestedArrayId);
+  // The annotations overlay is a 2-D affordance: no panel in volume mode, which
+  // is also what keeps the 3-D viewer from fetching a set it cannot draw.
+  const render3d = useAppStore((s) => s.render3d);
 
   // --- pane widths ---------------------------------------------------------
   const shellRef = useRef<HTMLDivElement | null>(null);
@@ -195,6 +199,7 @@ export function HomePage() {
             {splitter("control", "Resize the control panel")}
             <div className="control-column">
               <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
+              {!render3d && <RoiPanel arrayId={requestedArrayId ?? activeTensorId} />}
               {/*
                 Remount per source. Without the key, a switch re-renders the
                 whole tree against the *previous* source's metadata — the new

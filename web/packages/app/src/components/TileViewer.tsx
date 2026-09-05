@@ -32,6 +32,7 @@ import {
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
+import { buildRoiLayers, currentPlaneFor } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
 import {
@@ -98,6 +99,11 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const slice = useAppStore((s) => s.slice);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
+  const rois = useAppStore((s) => s.rois);
+  const roisFor = useAppStore((s) => s.roisFor);
+  const showRois = useAppStore((s) => s.showRois);
+  const hiddenSets = useAppStore((s) => s.hiddenSets);
+  const loadRois = useAppStore((s) => s.loadRois);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
@@ -386,6 +392,33 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     };
   }, []);
 
+  // --- ROI annotations -----------------------------------------------------
+  // Fetched from here rather than from the store's tensor-change path, so the
+  // 3-D viewer never pays for a set it cannot draw: this component does not
+  // exist in volume mode. `loadRois` is idempotent on the array_id, which is
+  // what keeps a 2-D -> 3-D -> 2-D round trip (a full remount, see ViewerPane's
+  // key) from refetching.
+  useEffect(() => {
+    if (!client) return;
+    void loadRois(arrayId);
+  }, [client, arrayId, loadRois]);
+
+  const currentPlane = useMemo(() => currentPlaneFor(info, slice), [info, slice]);
+
+  const roiLayers = useMemo(
+    () =>
+      buildRoiLayers({
+        // Only this tensor's set: `rois` outlives a switch until the next fetch
+        // lands, and drawing the previous tensor's annotations over a new image
+        // would be worse than drawing none.
+        rois: roisFor === arrayId ? rois : [],
+        currentPlane,
+        hiddenSets,
+        visible: showRois,
+      }),
+    [rois, roisFor, arrayId, currentPlane, hiddenSets, showRois],
+  );
+
   return (
     <div
       ref={hostRef}
@@ -408,6 +441,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           onViewportLoad={onViewportLoad}
           onHover={hover.onHover}
           hoverHooks={hover.hooks}
+          overlayLayers={roiLayers}
           width={size.width}
           height={size.height}
         />
@@ -521,6 +555,7 @@ function VivStage({
   onViewportLoad,
   onHover,
   hoverHooks,
+  overlayLayers,
   width,
   height,
 }: {
@@ -533,6 +568,8 @@ function VivStage({
   onViewportLoad: (loaded?: unknown) => void;
   onHover: (info: HoverInfo) => void;
   hoverHooks: { handleValue: (values: number[]) => void; handleCoordinate: () => void };
+  /** Drawn over the image; see utils/roiLayers.ts for the id constraint. */
+  overlayLayers: unknown[];
   width: number;
   height: number;
 }) {
@@ -614,6 +651,12 @@ function VivStage({
     [sources, selections, contrastLimits, gamma, color, maxCacheSize, onViewportLoad],
   );
 
+  // VivViewer concatenates these after its own layers -- but only draws the
+  // ones whose id contains its view id, which is why they are built through
+  // `roiLayerId`. Memoised on the array itself: `deckProps` is spread into
+  // DeckGL, and a fresh object every render would be a prop change every frame.
+  const deckProps = useMemo(() => ({ layers: overlayLayers }), [overlayLayers]);
+
   return (
     <VivViewer
       views={views}
@@ -622,6 +665,7 @@ function VivStage({
       onViewStateChange={onViewStateChange}
       onHover={onHover}
       hoverHooks={hoverHooks}
+      deckProps={deckProps}
     />
   );
 }

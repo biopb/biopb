@@ -509,6 +509,39 @@ html, body {
 }
 .meta-panel pre { white-space: pre-wrap; word-break: break-all; color: #cbd5e1; }
 
+.roi-panel {
+  background: #141820;
+  border-top: 1px solid #232a38;
+  color: #94a3b8;
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0.6rem 1rem 0.7rem;
+}
+.roi-panel-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+.roi-panel-head label { color: #cbd5e1; cursor: pointer; }
+.roi-count { color: #64748b; font-variant-numeric: tabular-nums; }
+.roi-sets { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.roi-sets li {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 1px 0;
+}
+.roi-sets label {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.roi-note { color: #64748b; margin: 0.5rem 0 0; }
+.roi-error { color: #fca5a5; }
+
 .icon-btn {
   background: none; border: 1px solid #2d3748; border-radius: 6px;
   color: #94a3b8; cursor: pointer; font-size: 12px; padding: 4px 10px;

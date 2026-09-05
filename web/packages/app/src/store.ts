@@ -1,6 +1,12 @@
 import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
-import type { DataSourceDescriptor, QuerySourcesResult, TileInfo } from "@biopb/tensor-flight-client";
+import type {
+  DataSourceDescriptor,
+  QuerySourcesResult,
+  RoiAnnotation,
+  TileInfo,
+} from "@biopb/tensor-flight-client";
+import { TensorApiError } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
@@ -153,6 +159,40 @@ export interface AppState {
    */
   tileInfoFor: string | null;
 
+  // --- ROI annotations (docs/roi-annotations-ui.md) -----------------------
+  /** The tensor's whole annotation set. Filtered to the plane at render time. */
+  rois: RoiAnnotation[];
+  /**
+   * The `array_id` `rois` was fetched for, as `tileInfoFor` is for the grid.
+   *
+   * This is what makes `loadRois` idempotent, and that is load-bearing rather
+   * than an optimisation: switching to the 3-D viewer and back remounts the
+   * whole 2-D subtree (`ViewerPane` keys on the render mode), so without it a
+   * round trip through 3-D would refetch a set that can reach megabytes.
+   */
+  roisFor: string | null;
+  /** The fetch in flight, so a superseded response cannot overwrite a newer one. */
+  roisPending: string | null;
+  roisLoading: boolean;
+  roisError: string | null;
+  /** The per-tensor cap clipped the set: what is shown is not all there is. */
+  roisTruncated: boolean;
+  /** Rows whose geometry this client could not read -- see `decodeRoiListResult`. */
+  roisSkipped: number;
+  /**
+   * The server does not offer annotations at all (501: disabled, or no metadata
+   * DB). Distinct from an error, because it is a fact about the deployment
+   * rather than a failure -- the UI hides itself instead of reporting a fault.
+   */
+  roisUnavailable: boolean;
+  /** Overlay on/off. A view preference, so it outlives a tensor change. */
+  showRois: boolean;
+  /**
+   * Sets switched off by name. Absence means visible, so a set that appears
+   * later shows up rather than starting hidden.
+   */
+  hiddenSets: string[];
+
   /**
    * The axis being scrubbed automatically (a `SliderAxis.key`), or null.
    *
@@ -232,6 +272,9 @@ export interface AppState {
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
   setTileInfo: (value: TileInfo | null, forArrayId: string) => void;
+  loadRois: (arrayId: string) => Promise<void>;
+  setShowRois: (value: boolean) => void;
+  toggleSetHidden: (setName: string) => void;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -314,6 +357,17 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   tileInfo: null,
   tileInfoFor: null,
+
+  rois: [],
+  roisFor: null,
+  roisPending: null,
+  roisLoading: false,
+  roisError: null,
+  roisTruncated: false,
+  roisSkipped: 0,
+  roisUnavailable: false,
+  showRois: true,
+  hiddenSets: [],
 
   playAxis: null,
   planeReady: false,
@@ -398,6 +452,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       planeReady: false,
       appliedLimits: null,
       planeLimits: null,
+      // The set belongs to one tensor, and `hiddenSets` names sets within it.
+      // `showRois` and `roisUnavailable` are not reset: one is a preference,
+      // the other a fact about the server.
+      rois: [],
+      roisFor: null,
+      roisPending: null,
+      roisLoading: false,
+      roisError: null,
+      roisTruncated: false,
+      roisSkipped: 0,
+      hiddenSets: [],
     });
     // `fixedLimits` goes with the tensor for the reason the indices do -- a
     // grey level is a value of its dtype. The mode is a preference and stays,
@@ -442,6 +507,56 @@ export const useAppStore = create<AppState>((set, get) => ({
       tileInfo: value,
       tileInfoFor: forArrayId,
       slice: clampSliceTo(s.slice, value),
+    }));
+  },
+
+  async loadRois(arrayId) {
+    const { client } = get();
+    if (!client) return;
+    // Idempotent: already held, or already asked for. Callers fire this from a
+    // mount effect, and the 2-D subtree remounts on every render-mode flip.
+    if (get().roisFor === arrayId || get().roisPending === arrayId) return;
+    if (get().roisUnavailable) return;
+    set({ roisPending: arrayId, roisLoading: true, roisError: null });
+    try {
+      const result = await client.http.listRois(arrayId);
+      // A response for a tensor that is no longer the one being asked about.
+      if (get().roisPending !== arrayId) return;
+      set({
+        rois: result.rois,
+        roisFor: arrayId,
+        roisPending: null,
+        roisLoading: false,
+        roisTruncated: result.truncated,
+        roisSkipped: result.skipped,
+      });
+    } catch (err) {
+      if (get().roisPending !== arrayId) return;
+      // 501 is the server saying it does not do annotations. Latched for the
+      // session so every later tensor skips the round trip.
+      if (err instanceof TensorApiError && err.status === 501) {
+        set({ roisPending: null, roisLoading: false, roisUnavailable: true });
+        return;
+      }
+      // `roisFor` deliberately stays null so a remount or a tensor switch can
+      // try again; the effect's own deps keep that from becoming a retry loop.
+      set({
+        roisPending: null,
+        roisLoading: false,
+        roisError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  setShowRois(value) {
+    set((s) => (s.showRois === value ? s : { showRois: value }));
+  },
+
+  toggleSetHidden(setName) {
+    set((s) => ({
+      hiddenSets: s.hiddenSets.includes(setName)
+        ? s.hiddenSets.filter((name) => name !== setName)
+        : [...s.hiddenSets, setName],
     }));
   },
 
