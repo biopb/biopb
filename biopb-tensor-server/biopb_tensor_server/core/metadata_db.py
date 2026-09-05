@@ -940,6 +940,27 @@ class MetadataDatabase:
 
         with self._write_lock:
             source_url = self._lookup_source_url(conn, source_id)
+            if source_url is None:
+                logger.debug(
+                    "put_rois: %s is not in the catalog, storing annotations "
+                    "without a source_url (backfilled on a later write)",
+                    source_id,
+                )
+            else:
+                # Heal any rows written while the source was unknown. A NULL
+                # source_url is exactly the row the staleness model cannot cope
+                # with -- array_id is a SHA-256, so an orphan report could only
+                # name it as "zarr_a3f2b1c4" and a re-attach prompt would have
+                # nothing to offer. Rows only heal if they are in a later batch
+                # otherwise, so backfill the whole source here rather than
+                # leaving the gap permanent. source_url is a human-readable
+                # label for a source_id, not an identifier, so overwriting a
+                # NULL with the catalog's current value is always right.
+                conn.execute(
+                    "UPDATE rois SET source_url = ? "
+                    "WHERE source_id = ? AND source_url IS NULL",
+                    [source_url, source_id],
+                )
             existing = {
                 row[0]: (row[1], row[2])
                 for row in conn.execute(
@@ -1086,7 +1107,9 @@ class MetadataDatabase:
 
         An annotation on a source the catalog does not (yet) know is still
         stored -- the write is the user's, not the catalog's, and progressive
-        discovery means absence proves nothing. It just lands without a URL.
+        discovery means absence proves nothing, so refusing it would turn a
+        rescan window into lost work. It lands without a URL, and ``put_rois``
+        backfills the whole source the first time one resolves.
         """
         row = conn.execute(
             "SELECT source_url FROM sources WHERE source_id = ?", [source_id]

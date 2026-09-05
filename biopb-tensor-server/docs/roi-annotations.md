@@ -105,7 +105,8 @@ CREATE TABLE rois (
     array_id   TEXT NOT NULL,           -- the anchor, unversioned
     source_id  TEXT NOT NULL,           -- array_id split on the first '/'; joins + authz
     source_url TEXT,                    -- catalog URL at write time; names the image in an
-                                        -- orphan report, and anchors re-attach after a move
+                                        -- orphan report, and anchors re-attach after a move.
+                                        -- NULL only until the source is first seen
     set_name   TEXT NOT NULL DEFAULT 'default',
     label      TEXT,                    -- user class/name
     shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon|polyline
@@ -349,6 +350,16 @@ source type, and it degrades correctly: a drive offline for a week simply does
 not advance `last_seen_at`. Deletion is then a policy over age
 (`annotations.prune_unseen_days`, default `0` = never) rather than a claim about
 the world.
+
+A write against a source the catalog does not know is still stored — refusing it
+would turn a rescan window into lost work, and absence proves nothing. It lands
+with a NULL `source_url`, which is precisely the unreportable row above, so the
+next write that *can* resolve the URL backfills every NULL row of that source
+(`UPDATE rois SET source_url = ? WHERE source_id = ? AND source_url IS NULL`).
+Without that the gap was permanent: only rows that happened to appear in a later
+batch ever healed. `source_url` is a human-readable label for a `source_id`, not
+an identifier, so filling a NULL from the catalog's current value is always safe;
+rows that already have one are left alone.
 
 Auto-delete stays **opt-in** — the default above is off. These are hand-drawn
 user data; the safe default is to surface orphans, sorted by `last_seen_at` and

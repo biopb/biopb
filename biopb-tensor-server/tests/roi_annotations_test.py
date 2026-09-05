@@ -23,6 +23,14 @@ def _polygon(*pts):
     return ROI(polygon=Polygon(points=[Point(x=x, y=y) for x, y in pts]))
 
 
+def _register_source(db, source_id, source_url):
+    db._get_connection().execute(
+        "INSERT INTO sources (source_id, source_url, source_type, tensors) "
+        "VALUES (?, ?, ?, ?)",
+        [source_id, source_url, "zarr", []],
+    )
+
+
 def _annotation(**kwargs):
     plane = kwargs.pop("plane", None)
     roi = kwargs.pop("roi", None) or _polygon((1, 2), (10, 2), (5, 9))
@@ -318,11 +326,7 @@ class TestStore:
     def test_source_url_is_captured_for_a_registered_source(self, tmp_path):
         """The orphan-report anchor: array_id is a hash and cannot be inverted."""
         db = MetadataDatabase()
-        db._get_connection().execute(
-            "INSERT INTO sources (source_id, source_url, source_type, tensors) "
-            "VALUES (?, ?, ?, ?)",
-            ["zarr_a1b2c3", "/data/exp.zarr", "zarr", []],
-        )
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation()])
         row = (
             db._get_cursor()
@@ -332,7 +336,11 @@ class TestStore:
         assert row == ("/data/exp.zarr", True)
 
     def test_an_unknown_source_still_accepts_annotations(self):
-        """Progressive discovery: catalog absence proves nothing about the image."""
+        """Progressive discovery: catalog absence proves nothing about the image.
+
+        Refusing the write would turn a rescan window into lost work, so the row
+        lands without a URL -- and is backfilled once the source appears.
+        """
         db = MetadataDatabase()
         stored, _ = db.put_rois(ARRAY_ID, [_annotation()])
         assert stored
@@ -340,6 +348,43 @@ class TestStore:
             db._get_cursor().execute("SELECT source_url FROM rois").fetchone()[0]
             is None
         )
+
+    def test_a_null_source_url_is_backfilled_once_the_source_appears(self):
+        """A permanent NULL is the one row the staleness model cannot cope with.
+
+        array_id is a SHA-256, so an orphan report could only name such a row as
+        "zarr_a1b2c3" and a re-attach prompt would have nothing to offer. Only
+        rows caught in a later batch used to heal, leaving the rest NULL forever.
+        """
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a"), _annotation(roi_id="b")])
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
+
+        # A write to a SIBLING tensor heals every row of the source.
+        db.put_rois("zarr_a1b2c3/Image:1", [_annotation(roi_id="c")])
+        assert (
+            db._get_cursor()
+            .execute("SELECT count(*) FROM rois WHERE source_url = '/data/exp.zarr'")
+            .fetchone()[0]
+            == 3
+        )
+
+    def test_backfill_only_touches_rows_that_have_no_url(self):
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
+        db._get_connection().execute(
+            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            ["dnd://exp.zarr", "zarr_a1b2c3"],
+        )
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
+
+        urls = (
+            db._get_cursor()
+            .execute("SELECT roi_id, source_url FROM rois ORDER BY roi_id")
+            .fetchall()
+        )
+        assert urls == [("a", "/data/exp.zarr"), ("b", "dnd://exp.zarr")]
 
 
 class TestFlightActions:
