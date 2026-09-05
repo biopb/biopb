@@ -505,10 +505,14 @@ class MetadataDatabase:
                 rev BIGINT NOT NULL,
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP,
-                -- Last time the tensor was observed in a COMPLETE catalog.
-                -- Absence is never itself evidence of deletion (progressive
-                -- discovery, unmounted drives, a proxy upstream that is down), so
-                -- orphan age is measured from here rather than asserted.
+                -- Last time the source was observed in the catalog -- stamped
+                -- by a write that could resolve it, and by the prune sweep (which
+                -- additionally gates on a COMPLETE catalog, since only a
+                -- conclusion about ABSENCE needs completeness; presence is
+                -- presence). Absence is never itself evidence of deletion
+                -- (progressive discovery, unmounted drives, a proxy upstream that
+                -- is down), so orphan age is measured from here rather than
+                -- asserted. NULL means never observed.
                 last_seen_at TIMESTAMP,
                 PRIMARY KEY (array_id, roi_id)
             )
@@ -961,10 +965,14 @@ class MetadataDatabase:
                     "WHERE source_id = ? AND source_url IS NULL",
                     [source_url, source_id],
                 )
+            # source_url / last_seen_at come along because a REPLACE rewrites
+            # the whole row: when the catalog cannot answer, they have to be
+            # carried over rather than overwritten (see the loop).
             existing = {
-                row[0]: (row[1], row[2])
+                row[0]: row[1:]
                 for row in conn.execute(
-                    "SELECT roi_id, rev, created_at FROM rois WHERE array_id = ?",
+                    "SELECT roi_id, rev, created_at, source_url, last_seen_at "
+                    "FROM rois WHERE array_id = ?",
                     [array_id],
                 ).fetchall()
             }
@@ -989,6 +997,22 @@ class MetadataDatabase:
 
                 rev = (prior[0] + 1) if prior is not None else 1
                 created_at = prior[1] if prior is not None else now
+
+                # Catalog-derived columns are written ONLY when the catalog
+                # answered. This is a full-row REPLACE, so writing them
+                # unconditionally meant an edit made while the source was
+                # briefly absent (rescan window, unmounted drive, proxy
+                # upstream down) wiped a good source_url -- and stamped
+                # last_seen_at as if the tensor had just been observed, which
+                # would reset the orphan clock for an image that may really be
+                # gone. Presence is evidence; absence is not, so absence
+                # preserves what the row already knew.
+                if source_url is not None:
+                    row_url, row_seen = source_url, now
+                elif prior is not None:
+                    row_url, row_seen = prior[2], prior[3]
+                else:
+                    row_url, row_seen = None, None
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO rois
@@ -1002,7 +1026,7 @@ class MetadataDatabase:
                         prep.roi_id,
                         array_id,
                         source_id,
-                        source_url,
+                        row_url,
                         prep.set_name,
                         prep.label,
                         prep.shape_kind,
@@ -1014,10 +1038,7 @@ class MetadataDatabase:
                         rev,
                         created_at,
                         now,
-                        # The tensor is being annotated right now, so it is
-                        # trivially present; seeding this here means a row is
-                        # never born looking like an orphan.
-                        now,
+                        row_seen,
                     ],
                 )
                 stored.append(prep.to_proto(array_id, rev, created_at, now))

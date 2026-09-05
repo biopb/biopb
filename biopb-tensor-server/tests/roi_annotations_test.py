@@ -369,6 +369,46 @@ class TestStore:
             == 3
         )
 
+    def test_an_edit_while_the_source_is_absent_keeps_what_the_row_knew(self):
+        """A REPLACE rewrites the whole row, so catalog-derived columns must not
+        be written when the catalog cannot answer.
+
+        Editing an annotation during a rescan window (or with the drive
+        unmounted) used to wipe a good source_url -- losing the only thing that
+        can name the image in an orphan report -- and stamp last_seen_at as if
+        the tensor had just been observed, resetting the orphan clock for an
+        image that may really be gone.
+        """
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a", label="v1")])
+        seen_before = (
+            db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()[0]
+        )
+
+        db._get_connection().execute(
+            "DELETE FROM sources WHERE source_id = ?", ["zarr_a1b2c3"]
+        )
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a", label="v2")])
+
+        url, seen_after = (
+            db._get_cursor()
+            .execute("SELECT source_url, last_seen_at FROM rois")
+            .fetchone()
+        )
+        assert url == "/data/exp.zarr"
+        assert seen_after == seen_before
+        assert db.list_rois(ARRAY_ID)[0][0].label == "v2"  # the edit still landed
+
+    def test_a_row_created_without_a_catalog_has_no_false_sighting(self):
+        """last_seen_at means "observed in the catalog", so it stays NULL here."""
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation()])
+        assert (
+            db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()[0]
+            is None
+        )
+
     def test_backfill_only_touches_rows_that_have_no_url(self):
         db = MetadataDatabase()
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")

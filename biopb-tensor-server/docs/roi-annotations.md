@@ -118,8 +118,8 @@ CREATE TABLE rois (
     rev        BIGINT NOT NULL,         -- per-roi, monotonic
     created_at TIMESTAMP,
     updated_at TIMESTAMP,
-    last_seen_at TIMESTAMP,             -- last time the catalog was complete AND held this
-                                        -- tensor; orphan age = now() - last_seen_at
+    last_seen_at TIMESTAMP,             -- last time the source was observed in the catalog;
+                                        -- orphan age = now() - last_seen_at, NULL = never seen
     PRIMARY KEY (array_id, roi_id)
 );
 CREATE INDEX idx_rois_array ON rois(array_id);
@@ -350,6 +350,13 @@ source type, and it degrades correctly: a drive offline for a week simply does
 not advance `last_seen_at`. Deletion is then a policy over age
 (`annotations.prune_unseen_days`, default `0` = never) rather than a claim about
 the world.
+
+Both catalog-derived columns are written **only when the catalog answered**. A
+put is a full-row `INSERT OR REPLACE`, so writing them unconditionally meant an
+edit made while the source was briefly absent wiped a good `source_url` and
+stamped `last_seen_at` as though the tensor had just been observed — resetting
+the orphan clock for an image that may really be gone. Presence is evidence,
+absence is not, so absence preserves whatever the row already knew.
 
 A write against a source the catalog does not know is still stored — refusing it
 would turn a rescan window into lost work, and absence proves nothing. It lands
