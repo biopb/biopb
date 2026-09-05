@@ -110,9 +110,53 @@ export interface RoiAnnotation {
 
 ## Fetching
 
-`GET /api/rois/{array_id}` returns the tensor's whole set — no plane or bbox
-filter, by design (a viewport-filtered fetch would make the ROI being edited vanish
-on a pan). One fetch per tensor change, held in the store, filtered in memory.
+`GET /api/rois/{array_id}` returns the tensor's whole set. One fetch per tensor,
+held in the store, filtered in memory.
+
+**Why not a viewport filter.** The ROI being edited would vanish on a pan.
+
+**Why not a per-plane filter**, which is the more tempting version and needs its
+own answer — the viewport argument does *not* carry over, since a per-plane fetch
+would return exactly the ROIs the user can interact with:
+
+- **The play driver steps a slice axis every 100 ms** (`PLAY_FPS = 10`), and a
+  slider drag does it at pointer rate. Per-plane means a round trip per frame,
+  with the overlay trailing the image by at least one. This is the one that
+  decides it.
+- **The pin is sparse, so the filter does not push down cleanly.** A dimension
+  absent from `plane` applies at every index, so the predicate is
+  `(plane['z'] IS NULL OR plane['z'] = ?)` per pinnable dim, and every unpinned
+  ROI matches every plane. On a 2-D tensor, or one whose axes cannot be named,
+  *nothing* is pinned and a per-plane fetch returns the whole set anyway.
+- **It does not exist server-side.** `RoiListRequest` carries only `array_id` and
+  `set_name`. Adding a plane filter means a proto field, the Flight action, a
+  per-tensor predicate over a `MAP(VARCHAR, BIGINT)` column, and the route — to
+  optimise something the 5000-per-tensor cap already bounds.
+
+It would also foreclose showing which planes carry annotations as tick marks on
+the z/t slider, which is a one-line derivation with the set resident.
+
+**The cost of whole-set, honestly.** There is no compression anywhere in the
+stack (the sidecar mounts only `CORSMiddleware`; control's proxy adds none), so
+at the cap a polygon set measures 2.6 MB (8 vertices each) to 9.7 MB (50)
+uncompressed. Hand-drawn sets are tens of KB, so this bites only at the cap — and
+the fix there is `GZipMiddleware` (the same payload gzips 3.7x), not a plane
+filter.
+
+### Nothing is fetched in 3-D
+
+`ViewerPane` keys the viewer on `` `${tensorId}#${render3d ? "3d" : "2d"}#...` ``,
+so flipping to the volume viewer unmounts the whole 2-D subtree. The overlay and
+the panel are the only two callers of `loadRois`, and the panel is not rendered
+in volume mode — so 3-D issues no request for a set it cannot draw.
+
+That makes `loadRois` idempotent on `roisFor` load-bearing rather than an
+optimisation: the mode flip is a full remount, so without it a 2-D → 3-D → 2-D
+round trip would refetch a set that can reach megabytes.
+
+Rendering ROIs *in* the volume is a separate feature, not a gap: `Point` has an
+optional z, but a plane-pinned polygon under an orbit camera needs a
+billboard-or-extrude decision the 2-D geometry does not answer.
 
 The array_id passed is whatever the viewer is already using —
 `requestedArrayId ?? activeTensorId`, possibly content-versioned. The sidecar
@@ -144,6 +188,13 @@ named and unnamed axis.
 
 Selection state (which ROI is active) is SPA-local and never written.
 
+**Every overlay layer is `pickable: false`, and not only because nothing is
+interactive yet.** `TileViewer`'s hover badge reads `info.sourceLayer` and
+`info.tile` to report the pixel under the pointer; a pickable overlay sits on top
+and would answer that hover itself, blanking the readout wherever an annotation
+lies. Authoring has to route around that — read the pixel from the tile layer
+explicitly, or re-report it from the overlay — rather than just flipping the flag.
+
 ## Authoring
 
 **Creation is click-to-place.** Click each vertex; double-click or `Enter` closes a
@@ -163,6 +214,10 @@ navigation. A failed write leaves the shape on screen marked unsaved, retryable.
 
 **Vertex editing is Phase 3**, and needs the `DetailView` subclass described above
 to toggle `dragPan` for the duration of a drag.
+
+**The draft is cleared on a render-mode flip as well as on a tensor change.** The
+tool is a preference and can survive a trip through 3-D; a half-placed polygon
+reappearing afterwards is only confusing.
 
 ## State
 
