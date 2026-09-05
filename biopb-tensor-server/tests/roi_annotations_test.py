@@ -232,6 +232,64 @@ class TestStore:
         (a,), _ = db.put_rois(ARRAY_ID, [_annotation()])
         assert db.delete_rois(ARRAY_ID, [a.roi_id, "not-a-real-id"]) == [a.roi_id]
 
+    def test_a_client_id_reused_on_another_tensor_does_not_clobber_it(self):
+        """roi_id is unique per tensor, not globally.
+
+        A client may name its own ids, so two tensors independently choosing
+        "roi-1" is ordinary. With roi_id alone as the primary key, writing to one
+        tensor silently destroyed the other's row: the create-or-update lookup is
+        scoped by array_id and saw no conflict, while INSERT OR REPLACE hit the
+        global key.
+        """
+        db = MetadataDatabase()
+        other = "zarr_other/Image:0"
+        db.put_rois(other, [_annotation(roi_id="roi-1", label="precious")])
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="roi-1", label="new")])
+
+        assert [(r.roi_id, r.label) for r in db.list_rois(other)[0]] == [
+            ("roi-1", "precious")
+        ]
+        assert [(r.roi_id, r.label) for r in db.list_rois(ARRAY_ID)[0]] == [
+            ("roi-1", "new")
+        ]
+
+    def test_a_client_id_is_an_update_on_its_own_tensor(self):
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="roi-1", label="first")])
+        (second,), _ = db.put_rois(
+            ARRAY_ID, [_annotation(roi_id="roi-1", label="second")]
+        )
+        assert second.rev == 2
+        assert len(db.list_rois(ARRAY_ID)[0]) == 1
+
+    def test_duplicate_ids_in_one_batch_are_refused(self):
+        db = MetadataDatabase()
+        with pytest.raises(ValueError, match="Duplicate roi_id"):
+            db.put_rois(
+                ARRAY_ID,
+                [_annotation(roi_id="dup"), _annotation(roi_id="dup")],
+            )
+        assert db.list_rois(ARRAY_ID)[0] == []
+
+    def test_an_overlong_client_id_is_refused(self):
+        db = MetadataDatabase()
+        with pytest.raises(ValueError, match="longer than"):
+            db.put_rois(ARRAY_ID, [_annotation(roi_id="x" * 200)])
+
+    def test_a_blank_client_id_gets_a_minted_one(self):
+        db = MetadataDatabase()
+        (stored,), _ = db.put_rois(ARRAY_ID, [_annotation(roi_id="   ")])
+        assert len(stored.roi_id) == 32
+
+    def test_deleting_by_id_touches_only_its_own_tensor(self):
+        db = MetadataDatabase()
+        other = "zarr_other/Image:0"
+        db.put_rois(other, [_annotation(roi_id="roi-1")])
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="roi-1")])
+
+        assert db.delete_rois(ARRAY_ID, ["roi-1"]) == ["roi-1"]
+        assert len(db.list_rois(other)[0]) == 1
+
     def test_annotations_are_scoped_to_their_tensor(self):
         db = MetadataDatabase()
         db.put_rois(ARRAY_ID, [_annotation()])

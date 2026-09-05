@@ -101,7 +101,7 @@ New table in `MetadataDatabase._create_schema()`:
 
 ```sql
 CREATE TABLE rois (
-    roi_id     TEXT PRIMARY KEY,        -- uuid4 hex; client-supplied or server-minted
+    roi_id     TEXT NOT NULL,           -- uuid4 hex; client-supplied or server-minted
     array_id   TEXT NOT NULL,           -- the anchor, unversioned
     source_id  TEXT NOT NULL,           -- array_id split on the first '/'; joins + authz
     source_url TEXT,                    -- catalog URL at write time; names the image in an
@@ -117,8 +117,9 @@ CREATE TABLE rois (
     rev        BIGINT NOT NULL,         -- per-roi, monotonic
     created_at TIMESTAMP,
     updated_at TIMESTAMP,
-    last_seen_at TIMESTAMP              -- last time the catalog was complete AND held this
+    last_seen_at TIMESTAMP,             -- last time the catalog was complete AND held this
                                         -- tensor; orphan age = now() - last_seen_at
+    PRIMARY KEY (array_id, roi_id)
 );
 CREATE INDEX idx_rois_array ON rois(array_id);
 ```
@@ -134,6 +135,16 @@ verbatim, with no decode/re-encode on the hot path, and the row stays legible to
 the SQL surface (`SELECT geometry FROM rois`, or reach inside with
 `geometry->'$.polygon.points'`). At annotation scale the ~2× size over a blob is
 not worth optimising.
+
+**The key is composite, and has to be.** `roi_id` is unique *within a tensor*,
+not globally: a client may name its own ids, so two tensors independently
+choosing `"roi-1"` is ordinary rather than a conflict. With `roi_id` alone as the
+primary key this silently destroyed data — the create-or-update lookup is scoped
+by `array_id` and saw no conflict, so it treated the write as a create, while
+`INSERT OR REPLACE` hit the global key and overwrote the *other* tensor's row.
+Every other query here is already array_id-scoped; the key now matches. A batch
+naming one `roi_id` twice is refused (the writes would collapse), and a
+client-supplied id is length-bounded since it becomes half the key.
 
 `set_name` groups annotations into a layer ("nuclei", "hand-drawn"). It is in the
 first version deliberately — it is what makes bulk delete and layer toggling

@@ -84,6 +84,10 @@ class NumpyEncoder(json.JSONEncoder):
 # bound -- and `mesh` is 3-D, where plane pinning has no meaning. Both belong to
 # instance segmentation, which is a label tensor, not this table. The proto
 # keeps every arm, so accepting them later is additive.
+# A client may name its own roi_id, and it becomes half the primary key. Bound
+# it so a pathological key cannot be planted in the catalog.
+_MAX_ROI_ID_LEN = 128
+
 _ACCEPTED_SHAPES: Set[str] = {
     "point",
     "rectangle",
@@ -151,6 +155,15 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
             f"{array_id!r}"
         )
 
+    # A client-supplied id becomes half of the primary key, so bound it. Ids are
+    # unique per tensor, so no cross-tensor check is needed -- the composite key
+    # makes two tensors reusing one id independent rows.
+    roi_id = roi.roi_id.strip()
+    if len(roi_id) > _MAX_ROI_ID_LEN:
+        raise ValueError(
+            f"roi_id is longer than {_MAX_ROI_ID_LEN} characters: {roi_id[:32]!r}..."
+        )
+
     shape_kind = roi.roi.WhichOneof("shape")
     if shape_kind is None:
         raise ValueError("Annotation has no geometry")
@@ -166,7 +179,7 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
             raise ValueError(f"Plane index for {dim!r} is negative: {index}")
 
     return _PreparedRoi(
-        roi_id=roi.roi_id or uuid.uuid4().hex,
+        roi_id=roi_id or uuid.uuid4().hex,
         set_name=roi.set_name or "default",
         label=roi.label,
         shape_kind=shape_kind,
@@ -442,7 +455,14 @@ class MetadataDatabase:
         conn.execute(
             """
             CREATE TABLE rois (
-                roi_id TEXT PRIMARY KEY,
+                -- Unique WITHIN a tensor, not globally: a client may name its
+                -- own ids, and two tensors independently choosing "roi-1" is
+                -- ordinary, not a conflict. The key must be composite for that
+                -- to be safe -- with roi_id alone as the PK, an INSERT OR
+                -- REPLACE for one tensor silently overwrote another tensor's
+                -- row, because the create-or-update lookup is scoped by
+                -- array_id while the key was not.
+                roi_id TEXT NOT NULL,
                 -- The tensor, in its UNVERSIONED array_id form. Annotations must
                 -- outlive an in-place edit of the image, so the sidecar's
                 -- `source@token/field` version token never reaches this column.
@@ -489,7 +509,8 @@ class MetadataDatabase:
                 -- Absence is never itself evidence of deletion (progressive
                 -- discovery, unmounted drives, a proxy upstream that is down), so
                 -- orphan age is measured from here rather than asserted.
-                last_seen_at TIMESTAMP
+                last_seen_at TIMESTAMP,
+                PRIMARY KEY (array_id, roi_id)
             )
             """
         )
@@ -900,6 +921,15 @@ class MetadataDatabase:
         # all-or-nothing on validity, so a bad shape in the tenth annotation must
         # not leave the first nine written.
         prepared = [_prepare_roi(array_id, roi) for roi in rois]
+
+        # A batch naming one roi_id twice is a client bug: the writes would
+        # collapse to whichever came last, and the caller would get two "stored"
+        # records for one row. Say so rather than silently keeping one.
+        seen: Set[str] = set()
+        for prep in prepared:
+            if prep.roi_id in seen:
+                raise ValueError(f"Duplicate roi_id in one batch: {prep.roi_id!r}")
+            seen.add(prep.roi_id)
 
         conn = self._get_connection()
         source_id = array_id.split("/")[0]
