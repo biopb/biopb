@@ -50,6 +50,7 @@ from typing import Any, Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
 import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
+from biopb.image.annotation_pb2 import RoiPutRequest
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
@@ -63,6 +64,7 @@ from fastapi import (
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from google.protobuf import json_format
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -1883,6 +1885,145 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
 
 
 # -- Tiles (cacheable GET reads) --------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ROI annotations (biopb-tensor-server/docs/roi-annotations.md)
+#
+# Its own /api/rois/* namespace, so nothing here is shadowed by the greedy
+# /api/sources/{source_id:path} catch-all. Bodies are canonical proto3 JSON in
+# both directions -- json_format here, protobuf-es in the SPA -- so one schema
+# serves both ends and neither hand-writes a DTO.
+# ---------------------------------------------------------------------------
+
+
+def _roi_bare_id(array_id: str) -> Tuple[str, Optional[str]]:
+    """Strip the HTTP version token before the store ever sees the array_id.
+
+    Annotations anchor on the UNVERSIONED array_id so they outlive an in-place
+    edit of the image; the token is spliced back onto the way out so the SPA
+    keeps addressing tensors in the form it already uses.
+    """
+    return _split_array_version(array_id)
+
+
+def _roi_flight_error(exc: Exception) -> HTTPException:
+    """Map a Flight failure onto the status the caller can act on."""
+    if isinstance(exc, flight.FlightUnavailableError):
+        # The server does not offer annotations (disabled, or no metadata DB).
+        return HTTPException(status_code=501, detail=str(exc))
+    if isinstance(exc, flight.FlightServerError):
+        # Rejected geometry, mismatched array_id, cap breached: caller's problem.
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+
+
+@_router.get("/api/rois/{array_id:path}")
+async def list_rois(array_id: str, request: Request) -> JSONResponse:
+    """A tensor's whole annotation set, optionally one layer (``?set=``).
+
+    No plane or bbox filter by design: the client needs every ROI resident to
+    hit-test, drag a vertex and re-render, and a viewport-filtered fetch would
+    make the ROI being edited vanish on a pan.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    bare_id, token = _roi_bare_id(array_id)
+    set_name = request.query_params.get("set", "")
+    try:
+        result = ctx.get_client().list_rois(bare_id, set_name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("ROI_LIST_FAILED", str(exc))
+        raise _roi_flight_error(exc)
+    return JSONResponse(_roi_result_to_dict(result, token))
+
+
+@_router.post("/api/rois/{array_id:path}")
+async def put_rois(array_id: str, request: Request) -> JSONResponse:
+    """Create or update annotations: ``{"rois": [...], "check_rev": bool}``.
+
+    ``drawn_against_version`` is the caller's to set -- the SPA already holds the
+    tensor's descriptor, and filling it here would cost a describe round trip on
+    every save.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    bare_id, token = _roi_bare_id(array_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Body must be a JSON object")
+
+    req = RoiPutRequest()
+    try:
+        json_format.ParseDict(
+            {
+                "rois": body.get("rois", []),
+                "checkRev": bool(body.get("check_rev", body.get("checkRev", False))),
+            },
+            req,
+        )
+    except json_format.ParseError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid annotation: {exc}")
+
+    # Strip the version from the BODY too, not just the path. Responses carry
+    # versioned array_ids (so the SPA keeps addressing tensors the way it
+    # already does), which means the natural read-edit-write round trip hands
+    # them straight back -- and the store, which only ever sees bare ids, would
+    # reject them as a mismatched tensor. The sidecar owns this translation at
+    # every boundary it has: path in, body in, body out.
+    for roi in req.rois:
+        if roi.array_id:
+            roi.array_id = _split_array_version(roi.array_id)[0]
+
+    try:
+        result = ctx.get_client().put_rois(
+            bare_id, list(req.rois), check_rev=req.check_rev
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("ROI_PUT_FAILED", str(exc))
+        raise _roi_flight_error(exc)
+
+    payload = json_format.MessageToDict(result)
+    for stored in payload.get("stored", []):
+        stored["arrayId"] = _versioned_array_id(stored.get("arrayId", ""), token)
+    return JSONResponse(payload)
+
+
+@_router.delete("/api/rois/{array_id:path}")
+async def delete_rois(array_id: str, request: Request) -> JSONResponse:
+    """Delete annotations: ``?ids=a,b`` for specific ones, else the whole
+    tensor's set, narrowed by ``?set=`` when given."""
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    bare_id, _token = _roi_bare_id(array_id)
+    raw_ids = request.query_params.get("ids", "")
+    roi_ids = [part for part in raw_ids.split(",") if part]
+    set_name = request.query_params.get("set", "")
+    try:
+        result = ctx.get_client().delete_rois(bare_id, roi_ids, set_name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("ROI_DELETE_FAILED", str(exc))
+        raise _roi_flight_error(exc)
+    return JSONResponse(json_format.MessageToDict(result))
+
+
+def _roi_result_to_dict(result, token: Optional[str]) -> Dict[str, Any]:
+    """Proto3 JSON for a RoiListResult, with array_ids re-versioned."""
+    payload = json_format.MessageToDict(result)
+    for roi in payload.get("rois", []):
+        roi["arrayId"] = _versioned_array_id(roi.get("arrayId", ""), token)
+    return payload
 
 
 @_router.get("/api/tile_info/{array_id:path}")

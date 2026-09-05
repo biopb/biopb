@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package biopb.image;
+
+import "biopb/image/roi.proto";
+
+option java_multiple_files = true;
+option java_package = "biopb.image";
+
+// User-drawn ROI annotations on a served tensor. Design:
+// biopb-tensor-server/docs/roi-annotations.md
+//
+// Lives in biopb.image, not biopb.tensor, for two reasons: it wraps
+// biopb.image.ROI, and biopb.image already imports biopb.tensor
+// (image_data.proto), so the reverse import would be a package cycle. It needs
+// nothing from biopb.tensor -- array_id crosses as a plain string.
+//
+// The geometry is biopb.image.ROI, reused as-is -- it carries geometry ONLY (no
+// id, no label), so RoiAnnotation is the record around it. Only the 2-D vector
+// arms are accepted (point / rectangle / ellipse / polygon / polyline); a mask
+// or mesh is rejected. Instance segmentation belongs in a label tensor, not
+// here.
+
+// One annotation: a geometry, where it sits, and what the user called it.
+message RoiAnnotation {
+  // Stable id. Empty on create -> the server mints a uuid4 hex.
+  string roi_id = 1;
+
+  // The tensor this annotation is drawn on: the globally-unique array_id, in its
+  // UNVERSIONED form (never the sidecar's `source@token/field`). Annotations
+  // must outlive an in-place edit of the image, so the version token is stripped
+  // before it reaches the store.
+  string array_id = 2;
+
+  // Grouping key -- the "layer" an annotation belongs to (e.g. "nuclei").
+  // Empty -> "default".
+  string set_name = 3;
+
+  // User-facing class/name for this ROI.
+  string label = 4;
+
+  // Geometry in LEVEL-0 pixel coordinates, in the tensor's own Y/X axes. A shape
+  // drawn on a downsampled level is scaled up by the client; the server never
+  // rescales geometry.
+  ROI roi = 5;
+
+  // Sparse plane pin: dim_label -> index (e.g. {"z": 12, "t": 0}). A dimension
+  // ABSENT from the map means "applies at every index of that dimension", which
+  // is how one ROI follows a z-stack or a time course without being duplicated
+  // per plane. Keyed by label rather than fixed t/z/c fields because dim_labels
+  // are per-tensor.
+  map<string, int64> plane = 6;
+
+  // Free-form client JSON (colour, score, author, ...). Opaque to the server.
+  string props_json = 7;
+
+  // The tensor's content_version when this annotation was written, or unset when
+  // the source could not claim one. A client compares it against the current
+  // descriptor to warn "the image changed since this was drawn" -- CONTENT
+  // staleness, as distinct from the tensor going away entirely.
+  optional bytes drawn_against_version = 8;
+
+  // Server-assigned, bumped on every write. Echo the value you read back in a
+  // put with check_rev set to make the write conditional.
+  int64 rev = 9;
+
+  int64 created_at_unix_ms = 10;
+  int64 updated_at_unix_ms = 11;
+}
+
+// Body of the "roi_put" action: create-or-update a batch, applied in one
+// transaction.
+message RoiPutRequest {
+  // The tensor every annotation in this batch belongs to (unversioned array_id).
+  // Each RoiAnnotation.array_id must match it or be empty.
+  string array_id = 1;
+
+  repeated RoiAnnotation rois = 2;
+
+  // Optimistic concurrency. When true, an annotation whose `rev` differs from
+  // the stored one is reported in RoiPutResult.conflicts and NOT applied; the
+  // rest of the batch still lands. When false, last writer wins.
+  bool check_rev = 3;
+}
+
+// One annotation that lost a conditional write.
+message RoiConflict {
+  string roi_id = 1;
+
+  // The rev currently in the store, so the client can re-read and merge.
+  int64 stored_rev = 2;
+}
+
+message RoiPutResult {
+  // The stored records, with server-assigned roi_id / rev / timestamps.
+  repeated RoiAnnotation stored = 1;
+
+  repeated RoiConflict conflicts = 2;
+}
+
+// Body of the "roi_list" action.
+//
+// There is deliberately NO plane or bbox filter: a client fetches a tensor's
+// whole annotation set and filters in memory (it needs every ROI resident to
+// hit-test, drag a vertex and re-render anyway), and a viewport-filtered fetch
+// would make the ROI being edited disappear on a pan. Analytic slicing is the
+// SQL surface's job (the `rois` table is readable via query_sources).
+message RoiListRequest {
+  string array_id = 1;
+
+  // Restrict to one layer. Empty -> every set on the tensor.
+  string set_name = 2;
+}
+
+message RoiListResult {
+  repeated RoiAnnotation rois = 1;
+
+  // True when the per-tensor cap clipped the result.
+  bool truncated = 2;
+}
+
+// Body of the "roi_delete" action. Deletes `roi_ids` when given; otherwise
+// deletes every annotation on `array_id` in `set_name` (or every annotation on
+// the tensor when `set_name` is empty too).
+message RoiDeleteRequest {
+  string array_id = 1;
+
+  repeated string roi_ids = 2;
+
+  string set_name = 3;
+}
+
+message RoiDeleteResult {
+  // The ids actually removed (an id that was not there is simply absent).
+  repeated string deleted = 1;
+}
