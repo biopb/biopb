@@ -28,6 +28,12 @@ import pyarrow.flight as flight
 # locks (``_POOL_LOCK`` etc.), so a name bound here at import time goes stale after
 # a fork, and patching a re-export never lands on the binding _pool actually
 # resolves.
+from biopb.image.annotation_pb2 import (
+    RoiAnnotation,
+    RoiDeleteResult,
+    RoiListResult,
+    RoiPutResult,
+)
 from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
@@ -598,6 +604,87 @@ class TensorFlightClient:
                 returned no result.
         """
         return self._catalog.remove_source(root_url)
+
+    # ---- ROI annotations ----
+
+    def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
+        """Fetch a tensor's ROI annotations.
+
+        Returns the tensor's WHOLE annotation set (optionally one layer); there
+        is no plane or bbox filter. A client needs every ROI resident to
+        hit-test, drag a vertex and re-render anyway, and a viewport-filtered
+        fetch would make the ROI being edited disappear on a pan. For analytic
+        slicing -- counts per label, annotations overlapping a region, a join
+        against the catalog -- query the ``rois`` table with
+        :meth:`query_sources`.
+
+        Args:
+            array_id: Unversioned array_id of the tensor.
+            set_name: Restrict to one layer; empty means every set.
+
+        Returns:
+            ``RoiListResult`` with ``rois`` and a ``truncated`` flag.
+
+        Raises:
+            flight.FlightServerError: annotations disabled, or no metadata DB.
+            RuntimeError: the server predates the ``roi_list`` action.
+        """
+        return self._catalog.list_rois(array_id, set_name)
+
+    def put_rois(
+        self,
+        array_id: str,
+        rois: Sequence[RoiAnnotation],
+        *,
+        check_rev: bool = False,
+    ) -> RoiPutResult:
+        """Create or update ROI annotations on a tensor, as one batch.
+
+        Geometry is ``biopb.image.ROI`` in LEVEL-0 pixel coordinates -- a shape
+        drawn on a downsampled level must be scaled up by the caller. Only the
+        2-D vector arms are accepted (point / rectangle / ellipse / polygon); a
+        mask or mesh is refused, because instance segmentation belongs in a
+        label tensor.
+
+        An annotation with an empty ``roi_id`` is created (the server mints a
+        uuid4); one that names an existing id is updated. The batch is applied
+        in a single transaction.
+
+        Args:
+            array_id: Unversioned array_id every annotation belongs to.
+            rois: The annotations to store.
+            check_rev: Make each write conditional on ``rev`` matching what is
+                stored. Mismatches come back in ``conflicts`` and are not
+                applied; the rest of the batch still lands. Default is last
+                writer wins.
+
+        Returns:
+            ``RoiPutResult`` with ``stored`` (server-assigned roi_id / rev /
+            timestamps) and ``conflicts``.
+
+        Raises:
+            flight.FlightServerError: rejected geometry, a mismatched array_id,
+                or the per-tensor cap would be breached.
+            RuntimeError: the server predates the ``roi_put`` action.
+        """
+        return self._catalog.put_rois(array_id, rois, check_rev=check_rev)
+
+    def delete_rois(
+        self,
+        array_id: str,
+        roi_ids: Sequence[str] = (),
+        set_name: str = "",
+    ) -> RoiDeleteResult:
+        """Delete ROI annotations.
+
+        With ``roi_ids``, deletes exactly those. Without, deletes every
+        annotation on the tensor -- narrowed to ``set_name`` when given, which
+        is how a whole layer is dropped.
+
+        Returns:
+            ``RoiDeleteResult.deleted`` -- the ids actually removed.
+        """
+        return self._catalog.delete_rois(array_id, roi_ids, set_name)
 
     # ---- Reads (delegated to ChunkFetcher) ----
 

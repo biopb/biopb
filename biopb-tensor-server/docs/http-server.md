@@ -73,6 +73,9 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels, selectable axes and the 3-D volume plan |
 | `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (raw bytes) |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region; `scale_policy` delegates the scale |
+| `GET` | `/api/rois/{array_id}` | ✓ | A tensor's whole ROI annotation set (`?set=` for one layer) |
+| `POST` | `/api/rois/{array_id}` | ✓ | Create/update annotations (same-origin guarded) |
+| `DELETE` | `/api/rois/{array_id}` | ✓ | Delete by `?ids=a,b`, else the whole set / one `?set=` (same-origin guarded) |
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
@@ -81,6 +84,14 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 > **Route ordering:** `/api/sources/{id}/metadata` and `/ticket/{ticket_hex}` are
 > registered *before* the greedy `{source_id:path}` catch-all to avoid Starlette
 > first-match shadowing.
+
+> **ROI annotations** (`/api/rois/*`) carry canonical proto3 JSON of
+> `biopb.image.RoiAnnotation` in both directions. The version token is stripped
+> from `array_id` before the store sees it — annotations anchor on the
+> unversioned id so they outlive an in-place edit — and spliced back onto the
+> response. `501` means the server does not offer annotations (disabled, or no
+> metadata DB); `422` means the request was rejected (geometry the store does not
+> accept, mismatched `array_id`, per-tensor cap). Design: `roi-annotations.md`.
 
 > **Source listings are structural.** Each `tensors[]` entry on `/api/sources`
 > carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`

@@ -7,12 +7,16 @@ Database Schema:
 - sources table with indexed fields (source_id, source_url)
 - JSON column for full metadata access via DuckDB JSON operators
 - Shape summary column for quick size estimates
+- rois table: user-drawn ROI annotations, one row per ROI, anchored on the
+  unversioned array_id (docs/roi-annotations.md)
 
 Security Model:
 - DuckDB connection runs with enable_external_access=False, so all file/network
   access (read_csv, read_text, glob, COPY, ATTACH, extension loading) is blocked
   at the engine level. This is the primary defense against file exfiltration.
-- Only 'sources' table accessible (keyword/table denylist; defense in depth)
+- Only the 'sources' and 'rois' tables are accessible (keyword/table denylist;
+  defense in depth). 'rois' is readable here for analysis; every ROI write goes
+  through put_rois/delete_rois, never through this surface.
 - Forbidden keywords: INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, EXECUTE
 - No subqueries referencing external tables
 - Query timeout enforced
@@ -30,14 +34,17 @@ import logging
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.image.annotation_pb2 import RoiAnnotation, RoiConflict
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+from google.protobuf import json_format
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -67,6 +74,176 @@ class NumpyEncoder(json.JSONEncoder):
         return f"Unserializable {type(obj).__qualname__}"
 
 
+# ---------------------------------------------------------------------------
+# ROI annotation helpers (docs/roi-annotations.md)
+# ---------------------------------------------------------------------------
+
+# Only the 2-D vector arms of biopb.image.ROI are stored. `mask` carries a
+# BinData bitmap -- one ROI can be hundreds of KB, so a few thousand of them
+# stop being "annotation scale" in the one dimension the row cap is trying to
+# bound -- and `mesh` is 3-D, where plane pinning has no meaning. Both belong to
+# instance segmentation, which is a label tensor, not this table. The proto
+# keeps all six arms, so accepting them later is additive.
+_ACCEPTED_SHAPES: Set[str] = {"point", "rectangle", "ellipse", "polygon"}
+
+
+class _PreparedRoi:
+    """A validated annotation, normalized into the column values it will occupy."""
+
+    __slots__ = (
+        "roi_id",
+        "set_name",
+        "label",
+        "shape_kind",
+        "plane",
+        "bbox",
+        "geometry",
+        "props_json",
+        "drawn_against_version",
+        "rev",
+        "roi",
+    )
+
+    def __init__(self, **kwargs) -> None:
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def to_proto(
+        self,
+        array_id: str,
+        rev: int,
+        created_at: datetime,
+        updated_at: datetime,
+    ) -> RoiAnnotation:
+        out = RoiAnnotation(
+            roi_id=self.roi_id,
+            array_id=array_id,
+            set_name=self.set_name,
+            label=self.label or "",
+            roi=self.roi,
+            props_json=self.props_json or "",
+            rev=rev,
+            created_at_unix_ms=_to_unix_ms(created_at),
+            updated_at_unix_ms=_to_unix_ms(updated_at),
+        )
+        out.plane.update(self.plane)
+        if self.drawn_against_version is not None:
+            out.drawn_against_version = bytes.fromhex(self.drawn_against_version)
+        return out
+
+
+def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
+    """Validate one annotation and derive its stored columns.
+
+    Raises:
+        ValueError: unusable geometry, an array_id that contradicts the batch's,
+            or a negative plane index.
+    """
+    if roi.array_id and roi.array_id != array_id:
+        raise ValueError(
+            f"Annotation array_id {roi.array_id!r} does not match the request's "
+            f"{array_id!r}"
+        )
+
+    shape_kind = roi.roi.WhichOneof("shape")
+    if shape_kind is None:
+        raise ValueError("Annotation has no geometry")
+    if shape_kind not in _ACCEPTED_SHAPES:
+        raise ValueError(
+            f"Geometry {shape_kind!r} is not accepted by the annotation store "
+            f"(accepted: {', '.join(sorted(_ACCEPTED_SHAPES))}). Instance "
+            f"segmentation belongs in a label tensor."
+        )
+
+    for dim, index in roi.plane.items():
+        if index < 0:
+            raise ValueError(f"Plane index for {dim!r} is negative: {index}")
+
+    return _PreparedRoi(
+        roi_id=roi.roi_id or uuid.uuid4().hex,
+        set_name=roi.set_name or "default",
+        label=roi.label,
+        shape_kind=shape_kind,
+        plane=dict(roi.plane),
+        bbox=_roi_bbox(roi.roi, shape_kind),
+        # Canonical proto3 JSON, so the SPA and the SQL surface read the same
+        # text and the sidecar can pass it through without re-encoding.
+        geometry=json_format.MessageToJson(roi.roi, indent=0).replace("\n", ""),
+        props_json=roi.props_json or None,
+        # Hex, not raw bytes: the token is opaque and a TEXT column keeps the row
+        # legible to the SQL surface.
+        drawn_against_version=(
+            roi.drawn_against_version.hex()
+            if roi.HasField("drawn_against_version")
+            else None
+        ),
+        rev=roi.rev,
+        roi=roi.roi,
+    )
+
+
+def _roi_bbox(roi, shape_kind: str) -> List[float]:
+    """Axis-aligned [x0, y0, x1, y1] in level-0 pixels."""
+    if shape_kind == "point":
+        p = roi.point
+        return [p.x, p.y, p.x, p.y]
+    if shape_kind == "rectangle":
+        xs = (roi.rectangle.top_left.x, roi.rectangle.bottom_right.x)
+        ys = (roi.rectangle.top_left.y, roi.rectangle.bottom_right.y)
+        return [min(xs), min(ys), max(xs), max(ys)]
+    if shape_kind == "ellipse":
+        c, r = roi.ellipse.center, roi.ellipse.radius
+        return [c.x - abs(r.x), c.y - abs(r.y), c.x + abs(r.x), c.y + abs(r.y)]
+    points = roi.polygon.points
+    if len(points) < 3:
+        raise ValueError(f"Polygon needs at least 3 points, got {len(points)}")
+    xs = [p.x for p in points]
+    ys = [p.y for p in points]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _row_to_proto(row: Sequence) -> RoiAnnotation:
+    """Rebuild a RoiAnnotation from a ``rois`` SELECT row."""
+    (
+        roi_id,
+        array_id,
+        set_name,
+        label,
+        plane,
+        geometry,
+        props_json,
+        drawn_against_version,
+        rev,
+        created_at,
+        updated_at,
+    ) = row
+    out = RoiAnnotation(
+        roi_id=roi_id,
+        array_id=array_id,
+        set_name=set_name,
+        label=label or "",
+        props_json=props_json or "",
+        rev=rev,
+        created_at_unix_ms=_to_unix_ms(created_at),
+        updated_at_unix_ms=_to_unix_ms(updated_at),
+    )
+    json_format.Parse(geometry, out.roi)
+    if plane:
+        out.plane.update(plane)
+    if drawn_against_version:
+        out.drawn_against_version = bytes.fromhex(drawn_against_version)
+    return out
+
+
+def _to_unix_ms(value: Optional[datetime]) -> int:
+    """Epoch milliseconds for a naive-local DuckDB timestamp; 0 when absent."""
+    if value is None:
+        return 0
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return int(value.timestamp() * 1000)
+
+
 class MetadataDatabase:
     """In-memory DuckDB for source metadata filtering.
 
@@ -80,6 +257,10 @@ class MetadataDatabase:
     Args:
         max_query_results: Safety cap on returned rows (truncation signaled via schema metadata)
         query_timeout_ms: Query execution timeout in milliseconds
+        max_rois_per_tensor: Cap on stored annotations per tensor. Deliberately
+            human-scale: it is the line between an annotation store and an
+            object store, and it is what lets the read path be a single
+            whole-set fetch (see docs/roi-annotations.md).
 
     Example:
         db = MetadataDatabase()
@@ -114,8 +295,12 @@ class MetadataDatabase:
         r"\b(" + "|".join(sorted(FORBIDDEN_KEYWORDS)) + r")\b"
     )
 
-    # Only these tables can be referenced in queries
-    ALLOWED_TABLES: Set[str] = {"sources"}
+    # Only these tables can be referenced in queries. ``rois`` is readable here
+    # as an ANALYSIS affordance (count labels, join against sources, find
+    # annotations overlapping a region); the viewer never composes SQL -- it
+    # calls list_rois(), which builds parameterized SQL itself. Writes stay off
+    # this surface entirely: FORBIDDEN_KEYWORDS still rejects INSERT/UPDATE/DELETE.
+    ALLOWED_TABLES: Set[str] = {"sources", "rois"}
 
     # Pattern for detecting table references in SQL
     TABLE_REFERENCE_PATTERN = re.compile(
@@ -130,9 +315,11 @@ class MetadataDatabase:
         self,
         max_query_results: int = 100000,
         query_timeout_ms: int = 30000,
+        max_rois_per_tensor: int = 5000,
     ):
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
+        self._max_rois_per_tensor = max_rois_per_tensor
 
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
         self._write_lock = threading.Lock()  # Lock for write operations only
@@ -230,7 +417,69 @@ class MetadataDatabase:
         """)
         # Index on source_url for path filtering
         conn.execute("CREATE INDEX idx_source_url ON sources(source_url)")
-        logger.debug("Created sources table and indexes")
+
+        # User-drawn ROI annotations, one row per ROI (design:
+        # docs/roi-annotations.md). A sibling table, deliberately NOT a field
+        # inside a source row: sources.metadata_json is adapter-produced and
+        # rewritten by the INSERT OR REPLACE in sync_source_added(), so an
+        # annotation parked there would be destroyed by the next rescan.
+        conn.execute(
+            """
+            CREATE TABLE rois (
+                roi_id TEXT PRIMARY KEY,
+                -- The tensor, in its UNVERSIONED array_id form. Annotations must
+                -- outlive an in-place edit of the image, so the sidecar's
+                -- `source@token/field` version token never reaches this column.
+                array_id TEXT NOT NULL,
+                -- array_id split on the first '/': joins, authorization, and the
+                -- catalog-presence check last_seen_at is built on.
+                source_id TEXT NOT NULL,
+                -- The catalog URL at write time. NOT a liveness probe -- there is
+                -- no existence oracle spanning file / proxy / cloud / upload
+                -- sources -- but array_id is a SHA-256 and cannot be inverted, so
+                -- without this an orphan report can only say "annotations for
+                -- zarr_a3f2b1c4", which no one can act on. Also what a
+                -- re-attach-after-move prompt would key on.
+                source_url TEXT,
+                -- Grouping key: the "layer" ("nuclei", "hand-drawn").
+                set_name TEXT NOT NULL DEFAULT 'default',
+                label TEXT,
+                -- point|rectangle|ellipse|polygon, denormalized from the geometry
+                -- for filtering. mask/mesh are rejected on write.
+                shape_kind TEXT NOT NULL,
+                -- Sparse plane pin, dim_label -> index. A dimension ABSENT from
+                -- the map applies at every index of that dimension, so one ROI
+                -- can follow a z-stack without being duplicated per plane. Keyed
+                -- by label because dim_labels are per-tensor.
+                plane MAP(VARCHAR, BIGINT),
+                -- [x0, y0, x1, y1] in level-0 pixels, derived server-side. Unused
+                -- by the viewer read path (which fetches a tensor's whole set);
+                -- it is what makes the SQL surface useful.
+                bbox DOUBLE[4],
+                -- biopb.image.ROI as canonical proto3 JSON *text*, not a blob:
+                -- the sidecar hands it to the SPA verbatim with no
+                -- decode/re-encode, and the row stays legible to the SQL surface.
+                geometry TEXT NOT NULL,
+                -- Opaque client JSON (colour, score, author).
+                props_json TEXT,
+                -- content_version at write time -> CONTENT staleness ("the image
+                -- changed since this was drawn"), as distinct from the tensor
+                -- going away entirely.
+                drawn_against_version TEXT,
+                rev BIGINT NOT NULL,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP,
+                -- Last time the tensor was observed in a COMPLETE catalog.
+                -- Absence is never itself evidence of deletion (progressive
+                -- discovery, unmounted drives, a proxy upstream that is down), so
+                -- orphan age is measured from here rather than asserted.
+                last_seen_at TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX idx_rois_array ON rois(array_id)")
+        conn.execute("CREATE INDEX idx_rois_source ON rois(source_id)")
+        logger.debug("Created sources and rois tables and indexes")
 
     def _validate_query(self, sql: str) -> None:
         """Validate SQL query for security.
@@ -592,6 +841,211 @@ class MetadataDatabase:
         with self._write_lock:
             conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
         logger.debug(f"Removed source from metadata database: {source_id}")
+
+    # ------------------------------------------------------------------
+    # ROI annotations (docs/roi-annotations.md)
+    # ------------------------------------------------------------------
+
+    def put_rois(
+        self,
+        array_id: str,
+        rois: Sequence[RoiAnnotation],
+        *,
+        check_rev: bool = False,
+    ) -> Tuple[List[RoiAnnotation], List[RoiConflict]]:
+        """Create or update a batch of annotations on one tensor.
+
+        The whole batch is applied under the write lock so a client's "save this
+        layer" lands as a unit -- that is how row-per-ROI storage still gives
+        layer-level atomicity.
+
+        ``check_rev`` makes each write conditional: an annotation whose ``rev``
+        differs from the stored one is returned as a conflict and NOT applied,
+        while the rest of the batch still lands. Without it, last writer wins.
+
+        Args:
+            array_id: Unversioned array_id every annotation belongs to.
+            rois: Annotations to store. An empty ``roi_id`` mints a new uuid4.
+            check_rev: Enable optimistic concurrency.
+
+        Returns:
+            ``(stored, conflicts)`` -- the stored records carry the server's
+            roi_id / rev / timestamps.
+
+        Raises:
+            ValueError: On an empty array_id, a geometry this store does not
+                accept, a mismatched per-ROI array_id, or a write that would
+                push the tensor past ``max_rois_per_tensor``.
+        """
+        if not array_id:
+            raise ValueError("array_id is required")
+
+        # Validate and normalize everything BEFORE taking the lock: a batch is
+        # all-or-nothing on validity, so a bad shape in the tenth annotation must
+        # not leave the first nine written.
+        prepared = [_prepare_roi(array_id, roi) for roi in rois]
+
+        conn = self._get_connection()
+        source_id = array_id.split("/")[0]
+        now = datetime.now()
+
+        stored: List[RoiAnnotation] = []
+        conflicts: List[RoiConflict] = []
+
+        with self._write_lock:
+            source_url = self._lookup_source_url(conn, source_id)
+            existing = {
+                row[0]: (row[1], row[2])
+                for row in conn.execute(
+                    "SELECT roi_id, rev, created_at FROM rois WHERE array_id = ?",
+                    [array_id],
+                ).fetchall()
+            }
+
+            # Cap on the post-write count, so a batch cannot straddle the limit.
+            new_ids = {p.roi_id for p in prepared if p.roi_id not in existing}
+            if len(existing) + len(new_ids) > self._max_rois_per_tensor:
+                raise ValueError(
+                    f"Annotation limit reached for {array_id}: "
+                    f"{len(existing)} stored + {len(new_ids)} new exceeds "
+                    f"max_rois_per_tensor={self._max_rois_per_tensor}. This is an "
+                    f"annotation store -- a segmentation belongs in a label tensor."
+                )
+
+            for prep in prepared:
+                prior = existing.get(prep.roi_id)
+                if prior is not None and check_rev and prep.rev != prior[0]:
+                    conflicts.append(
+                        RoiConflict(roi_id=prep.roi_id, stored_rev=prior[0])
+                    )
+                    continue
+
+                rev = (prior[0] + 1) if prior is not None else 1
+                created_at = prior[1] if prior is not None else now
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO rois
+                    (roi_id, array_id, source_id, source_url, set_name, label,
+                     shape_kind, plane, bbox, geometry, props_json,
+                     drawn_against_version, rev, created_at, updated_at,
+                     last_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        prep.roi_id,
+                        array_id,
+                        source_id,
+                        source_url,
+                        prep.set_name,
+                        prep.label,
+                        prep.shape_kind,
+                        prep.plane,
+                        prep.bbox,
+                        prep.geometry,
+                        prep.props_json,
+                        prep.drawn_against_version,
+                        rev,
+                        created_at,
+                        now,
+                        # The tensor is being annotated right now, so it is
+                        # trivially present; seeding this here means a row is
+                        # never born looking like an orphan.
+                        now,
+                    ],
+                )
+                stored.append(prep.to_proto(array_id, rev, created_at, now))
+
+        logger.debug(
+            "put_rois: %s stored, %s conflicts on %s",
+            len(stored),
+            len(conflicts),
+            array_id,
+        )
+        return stored, conflicts
+
+    def list_rois(
+        self, array_id: str, set_name: str = ""
+    ) -> Tuple[List[RoiAnnotation], bool]:
+        """Return a tensor's whole annotation set (optionally one layer).
+
+        No plane or bbox filter by design: a client needs every ROI resident to
+        hit-test, drag a vertex and re-render, and a viewport-filtered fetch
+        would make the ROI being edited vanish on a pan. Analytic slicing is the
+        SQL surface's job.
+
+        Returns:
+            ``(rois, truncated)``. ``truncated`` is true only if the row count
+            somehow exceeds the per-tensor cap (rows written before a lowered
+            cap), in which case the result is clipped.
+        """
+        if not array_id:
+            raise ValueError("array_id is required")
+
+        sql = (
+            "SELECT roi_id, array_id, set_name, label, plane, geometry, "
+            "props_json, drawn_against_version, rev, created_at, updated_at "
+            "FROM rois WHERE array_id = ?"
+        )
+        params: List[object] = [array_id]
+        if set_name:
+            sql += " AND set_name = ?"
+            params.append(set_name)
+        # Stable order so a client diffing two reads sees no spurious churn.
+        sql += " ORDER BY created_at, roi_id LIMIT ?"
+        params.append(self._max_rois_per_tensor + 1)
+
+        rows = self._get_cursor().execute(sql, params).fetchall()
+        truncated = len(rows) > self._max_rois_per_tensor
+        if truncated:
+            rows = rows[: self._max_rois_per_tensor]
+        return [_row_to_proto(row) for row in rows], truncated
+
+    def delete_rois(
+        self, array_id: str, roi_ids: Iterable[str] = (), set_name: str = ""
+    ) -> List[str]:
+        """Delete annotations, returning the ids actually removed.
+
+        With ``roi_ids``, deletes exactly those. Without, deletes every
+        annotation on ``array_id`` -- narrowed to ``set_name`` when given, which
+        is how a client drops a whole layer.
+        """
+        if not array_id:
+            raise ValueError("array_id is required")
+
+        roi_ids = list(roi_ids)
+        conn = self._get_connection()
+        with self._write_lock:
+            if roi_ids:
+                placeholders = ", ".join("?" for _ in roi_ids)
+                sql = (
+                    f"DELETE FROM rois WHERE array_id = ? "
+                    f"AND roi_id IN ({placeholders}) RETURNING roi_id"
+                )
+                params: List[object] = [array_id, *roi_ids]
+            else:
+                sql = "DELETE FROM rois WHERE array_id = ?"
+                params = [array_id]
+                if set_name:
+                    sql += " AND set_name = ?"
+                    params.append(set_name)
+                sql += " RETURNING roi_id"
+            deleted = [row[0] for row in conn.execute(sql, params).fetchall()]
+
+        logger.debug("delete_rois: removed %s from %s", len(deleted), array_id)
+        return deleted
+
+    @staticmethod
+    def _lookup_source_url(conn, source_id: str) -> Optional[str]:
+        """The catalog URL for a source, or None when it is not registered.
+
+        An annotation on a source the catalog does not (yet) know is still
+        stored -- the write is the user's, not the catalog's, and progressive
+        discovery means absence proves nothing. It just lands without a URL.
+        """
+        row = conn.execute(
+            "SELECT source_url FROM sources WHERE source_id = ?", [source_id]
+        ).fetchone()
+        return row[0] if row else None
 
     def close(self) -> None:
         """Close the DuckDB connection."""

@@ -24,6 +24,15 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
+from biopb.image.annotation_pb2 import (
+    RoiAnnotation,
+    RoiDeleteRequest,
+    RoiDeleteResult,
+    RoiListRequest,
+    RoiListResult,
+    RoiPutRequest,
+    RoiPutResult,
+)
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
@@ -897,6 +906,55 @@ class CatalogClient:
                 f"remove_source('{root_url}') returned no result"
             ) from exc
         return RemoveSourceResult.FromString(result_bytes.body.to_pybytes())
+
+    # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
+
+    def _roi_action(self, name: str, req) -> bytes:
+        """One-shot DoAction round trip shared by the three ROI verbs."""
+        action = flight.Action(name, req.SerializeToString())
+        try:
+            results = self._state.client.do_action(
+                action, options=self._state.call_options
+            )
+            result_bytes = next(results)
+        except flight.FlightError as exc:
+            if "Unknown action" in str(exc):
+                raise RuntimeError(
+                    "ROI annotations are unavailable: the tensor server is too "
+                    f"old to support the '{name}' action. Upgrade the server."
+                ) from exc
+            raise
+        except StopIteration as exc:
+            raise RuntimeError(f"{name} returned no result") from exc
+        return result_bytes.body.to_pybytes()
+
+    def list_rois(self, array_id: str, set_name: str = "") -> "RoiListResult":
+        """Backs TensorFlightClient.list_rois; see that method."""
+        req = RoiListRequest(array_id=array_id, set_name=set_name)
+        return RoiListResult.FromString(self._roi_action("roi_list", req))
+
+    def put_rois(
+        self,
+        array_id: str,
+        rois: Sequence["RoiAnnotation"],
+        *,
+        check_rev: bool = False,
+    ) -> "RoiPutResult":
+        """Backs TensorFlightClient.put_rois; see that method."""
+        req = RoiPutRequest(array_id=array_id, rois=rois, check_rev=check_rev)
+        return RoiPutResult.FromString(self._roi_action("roi_put", req))
+
+    def delete_rois(
+        self,
+        array_id: str,
+        roi_ids: Sequence[str] = (),
+        set_name: str = "",
+    ) -> "RoiDeleteResult":
+        """Backs TensorFlightClient.delete_rois; see that method."""
+        req = RoiDeleteRequest(
+            array_id=array_id, roi_ids=list(roi_ids), set_name=set_name
+        )
+        return RoiDeleteResult.FromString(self._roi_action("roi_delete", req))
 
 
 class ChunkFetcher:

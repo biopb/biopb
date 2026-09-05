@@ -21,6 +21,14 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.image.annotation_pb2 import (
+    RoiDeleteRequest,
+    RoiDeleteResult,
+    RoiListRequest,
+    RoiListResult,
+    RoiPutRequest,
+    RoiPutResult,
+)
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -206,6 +214,17 @@ class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
         return _AuthMiddleware(provided)
 
 
+def _roi_source_id(array_id: str) -> str:
+    """The source an annotation's tensor belongs to, for authorization.
+
+    Same split-on-the-first-'/' rule the ticket path uses: array_id is
+    authoritative, source_id is the prefix before the first '/'.
+    """
+    if not array_id:
+        raise ValueError("array_id is required")
+    return array_id.split("/")[0]
+
+
 class TensorFlightServer(flight.FlightServerBase):
     """Arrow Flight server for tensor storage.
 
@@ -252,6 +271,7 @@ class TensorFlightServer(flight.FlightServerBase):
         writable: bool = False,
         write_dir: Optional[Path] = None,
         metadata_db: Optional[MetadataDatabase] = None,
+        annotations_enabled: bool = True,
         max_list_flights_results: int = 100000,
         grpc_max_message_size: Optional[int] = None,
         pyramid_config: Optional[PyramidConfig] = None,
@@ -267,6 +287,10 @@ class TensorFlightServer(flight.FlightServerBase):
             writable: Enable write mode for source creation and data upload
             write_dir: Directory for zarr-backed uploaded sources (required if writable)
             metadata_db: MetadataDatabase instance for source filtering queries (optional)
+            annotations_enabled: Serve the ROI annotation actions. Not tied to
+                ``writable``: an annotation writes no pixels, so the token is its
+                boundary. This is the switch for a deployment that wants a
+                strictly read-only catalog.
             max_list_flights_results: Safety cap on list_flights() returned sources
             grpc_max_message_size: gRPC max message size in bytes (default: 16MB)
             tls_cert_chain: PEM-encoded server certificate chain. When supplied
@@ -301,6 +325,7 @@ class TensorFlightServer(flight.FlightServerBase):
         self.sources = SourceRegistry()
         self._writable = writable
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
+        self._annotations_enabled = annotations_enabled
         self._max_list_flights_results = max_list_flights_results
         # Authoritative resolution-pyramid knobs. Used to advertise
         # TensorDescriptor.pyramid in get_flight_info (computed levels) and shared
@@ -594,6 +619,63 @@ class TensorFlightServer(flight.FlightServerBase):
             )
         return adapter
 
+    def _handle_roi_action(
+        self, action_type: str, body: bytes, context: flight.ServerCallContext
+    ) -> bytes:
+        """Serve one of the three annotation actions.
+
+        DoAction rather than DoGet/DoPut on purpose (docs/roi-annotations.md):
+        an ROI read is a bounded whole-set fetch, not the unbounded query that
+        earns ``__metadata_query__`` its ticket and Arrow stream, and a write is
+        a small structured command with a structured reply -- DoPut's only
+        response channel is a single app-metadata blob, and it is gated on
+        ``--writable``, which annotations deliberately are not (they write no
+        pixels; the token is the boundary).
+        """
+        # Unavailable vs. ServerError is load-bearing for the HTTP sidecar: it
+        # maps the former to 501 (this server does not offer the feature) and the
+        # latter to 422 (your request was rejected).
+        if self._metadata_db is None:
+            raise flight.FlightUnavailableError(
+                "This server has no metadata database attached, so ROI "
+                "annotations are unavailable."
+            )
+        if not self._annotations_enabled:
+            raise flight.FlightUnavailableError(
+                "ROI annotations are disabled on this server"
+            )
+
+        try:
+            if action_type == "roi_list":
+                req = RoiListRequest.FromString(body)
+                self._authorize_source(context, _roi_source_id(req.array_id))
+                rois, truncated = self._metadata_db.list_rois(
+                    req.array_id, req.set_name
+                )
+                return RoiListResult(rois=rois, truncated=truncated).SerializeToString()
+
+            if action_type == "roi_put":
+                req = RoiPutRequest.FromString(body)
+                self._authorize_source(context, _roi_source_id(req.array_id))
+                stored, conflicts = self._metadata_db.put_rois(
+                    req.array_id, list(req.rois), check_rev=req.check_rev
+                )
+                return RoiPutResult(
+                    stored=stored, conflicts=conflicts
+                ).SerializeToString()
+
+            req = RoiDeleteRequest.FromString(body)
+            self._authorize_source(context, _roi_source_id(req.array_id))
+            deleted = self._metadata_db.delete_rois(
+                req.array_id, req.roi_ids, req.set_name
+            )
+            return RoiDeleteResult(deleted=deleted).SerializeToString()
+        except ValueError as e:
+            # Rejected geometry, a mismatched array_id, a breached cap: all are
+            # the caller's problem, so surface the reason instead of a bare
+            # internal error.
+            raise flight.FlightServerError(str(e))
+
     def list_actions(
         self,
         context: flight.ServerCallContext,
@@ -628,6 +710,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 "remove_source",
                 "Deregister a drag-dropped (dnd://) source branch at runtime",
             ),
+            flight.ActionType("roi_list", "List a tensor's ROI annotations"),
+            flight.ActionType("roi_put", "Create or update ROI annotations"),
+            flight.ActionType("roi_delete", "Delete ROI annotations"),
         ]
 
     def do_action(
@@ -701,6 +786,10 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "remove_source":
             req = RemoveSourceRequest.FromString(action.body.to_pybytes())
             yield self._handle_remove_source(req)
+        elif action.type in ("roi_list", "roi_put", "roi_delete"):
+            yield self._handle_roi_action(
+                action.type, action.body.to_pybytes(), context
+            )
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
