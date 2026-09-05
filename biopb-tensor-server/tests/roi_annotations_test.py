@@ -510,6 +510,87 @@ class TestStore:
         assert urls == [("a", "/data/exp.zarr"), ("b", "dnd://exp.zarr")]
 
 
+class TestBatchAtomicity:
+    """A batch is all-or-nothing, to a failure and to a concurrent reader.
+
+    The write lock only serializes writers -- DuckDB autocommits each statement,
+    so without an explicit transaction a mid-batch failure left the rows written
+    so far behind, and a reader (list_rois takes no lock, by design) watched a
+    layer appear row by row.
+    """
+
+    @staticmethod
+    def _fail_on_nth(monkeypatch, n):
+        from biopb_tensor_server.core import metadata_db as m
+
+        original = m._PreparedRoi.column_values
+        calls = {"n": 0}
+
+        def boom(self, columns):
+            calls["n"] += 1
+            if calls["n"] == n:
+                raise RuntimeError("db hiccup")
+            return original(self, columns)
+
+        monkeypatch.setattr(m._PreparedRoi, "column_values", boom)
+
+    def test_a_failed_batch_leaves_nothing_behind(self, monkeypatch):
+        db = MetadataDatabase()
+        self._fail_on_nth(monkeypatch, 4)
+        with pytest.raises(RuntimeError, match="db hiccup"):
+            db.put_rois(ARRAY_ID, [_annotation(roi_id=str(i)) for i in range(6)])
+        assert db.list_rois(ARRAY_ID)[0] == []
+
+    def test_the_connection_survives_a_rolled_back_batch(self, monkeypatch):
+        """A BEGIN left open would poison the shared connection for every writer."""
+        db = MetadataDatabase()
+        self._fail_on_nth(monkeypatch, 2)
+        with pytest.raises(RuntimeError):
+            db.put_rois(ARRAY_ID, [_annotation(roi_id=str(i)) for i in range(3)])
+        monkeypatch.undo()
+        stored, _ = db.put_rois(
+            ARRAY_ID, [_annotation(roi_id=str(i)) for i in range(3)]
+        )
+        assert len(stored) == 3
+
+    def test_a_failed_batch_does_not_disturb_what_was_already_there(self, monkeypatch):
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="keep", label="v1")])
+        self._fail_on_nth(monkeypatch, 2)
+        with pytest.raises(RuntimeError):
+            db.put_rois(
+                ARRAY_ID,
+                [_annotation(roi_id="keep", label="v2"), _annotation(roi_id="new")],
+            )
+        (survivor,) = db.list_rois(ARRAY_ID)[0]
+        assert (survivor.roi_id, survivor.label, survivor.rev) == ("keep", "v1", 1)
+
+    def test_a_reader_never_sees_half_a_batch(self):
+        """list_rois uses its own cursor and takes no lock, so isolation has to
+        come from the transaction, not from mutual exclusion."""
+        import threading
+
+        db = MetadataDatabase()
+        rois = [_annotation(roi_id=str(i)) for i in range(40)]
+        seen = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                seen.append(len(db.list_rois(ARRAY_ID)[0]))
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        try:
+            db.put_rois(ARRAY_ID, rois)
+        finally:
+            stop.set()
+            t.join(timeout=5)
+
+        assert seen, "reader never ran"
+        assert set(seen) <= {0, 40}, f"observed a partial batch: {sorted(set(seen))}"
+
+
 class TestFlightActions:
     """One full server -> client gRPC round-trip over the three actions."""
 

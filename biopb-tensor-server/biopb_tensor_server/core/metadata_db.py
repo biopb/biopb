@@ -1008,67 +1008,100 @@ class MetadataDatabase:
         source_id = array_id.split("/")[0]
         now = datetime.now()
 
+        # The write lock serializes writers; it does NOT make the batch atomic,
+        # because DuckDB autocommits each statement. Without an explicit
+        # transaction a failure partway left the rows written so far behind, and
+        # a concurrent reader (list_rois uses its own cursor and takes no lock)
+        # watched a layer appear row by row. Cursors see the pre-commit snapshot,
+        # so wrapping the whole body gives both all-or-nothing recovery and an
+        # all-or-nothing view.
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                return self._put_rois_locked(
+                    conn, array_id, source_id, prepared, check_rev, now
+                )
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:  # pragma: no cover - rollback of a dead conn
+                    # Never mask the original failure with a rollback error.
+                    logger.exception("put_rois: ROLLBACK failed for %s", array_id)
+                raise
+
+    def _put_rois_locked(
+        self,
+        conn,
+        array_id: str,
+        source_id: str,
+        prepared: List[_PreparedRoi],
+        check_rev: bool,
+        now: datetime,
+    ) -> Tuple[List[RoiAnnotation], List[RoiConflict]]:
+        """The body of :meth:`put_rois`, inside the lock and the transaction.
+
+        Split out so the transaction is a plain try/except around one call rather
+        than a second level of indentation over the whole method.
+        """
         stored: List[RoiAnnotation] = []
         conflicts: List[RoiConflict] = []
+        source_url = self._observe_source(conn, source_id, now)
 
-        with self._write_lock:
-            source_url = self._observe_source(conn, source_id, now)
+        # created_at is read for the RESPONSE only -- the update statement
+        # does not carry it, so an existing row's value is preserved by not
+        # being mentioned.
+        existing = {
+            roi_id: (rev, created_at)
+            for roi_id, rev, created_at in conn.execute(
+                "SELECT roi_id, rev, created_at FROM rois WHERE array_id = ?",
+                [array_id],
+            ).fetchall()
+        }
 
-            # created_at is read for the RESPONSE only -- the update statement
-            # does not carry it, so an existing row's value is preserved by not
-            # being mentioned.
-            existing = {
-                roi_id: (rev, created_at)
-                for roi_id, rev, created_at in conn.execute(
-                    "SELECT roi_id, rev, created_at FROM rois WHERE array_id = ?",
-                    [array_id],
-                ).fetchall()
-            }
+        # Cap on the post-write count, so a batch cannot straddle the limit.
+        new_ids = {p.roi_id for p in prepared if p.roi_id not in existing}
+        if len(existing) + len(new_ids) > self._max_rois_per_tensor:
+            raise ValueError(
+                f"Annotation limit reached for {array_id}: "
+                f"{len(existing)} stored + {len(new_ids)} new exceeds "
+                f"max_rois_per_tensor={self._max_rois_per_tensor}. This is an "
+                f"annotation store -- a segmentation belongs in a label tensor."
+            )
 
-            # Cap on the post-write count, so a batch cannot straddle the limit.
-            new_ids = {p.roi_id for p in prepared if p.roi_id not in existing}
-            if len(existing) + len(new_ids) > self._max_rois_per_tensor:
-                raise ValueError(
-                    f"Annotation limit reached for {array_id}: "
-                    f"{len(existing)} stored + {len(new_ids)} new exceeds "
-                    f"max_rois_per_tensor={self._max_rois_per_tensor}. This is an "
-                    f"annotation store -- a segmentation belongs in a label tensor."
+        assignments = ", ".join(f"{col} = ?" for col in self._ROI_CLIENT_COLUMNS)
+        update_sql = (
+            f"UPDATE rois SET {assignments}, rev = ?, updated_at = ? "
+            f"WHERE array_id = ? AND roi_id = ?"
+        )
+        insert_sql = (
+            "INSERT INTO rois "
+            f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
+            "rev, created_at, updated_at, source_url, last_seen_at) "
+            f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})"
+        )
+
+        for prep in prepared:
+            prior = existing.get(prep.roi_id)
+            if prior is not None and check_rev and prep.rev != prior[0]:
+                conflicts.append(RoiConflict(roi_id=prep.roi_id, stored_rev=prior[0]))
+                continue
+
+            values = prep.column_values(self._ROI_CLIENT_COLUMNS)
+            if prior is None:
+                rev, created_at = 1, now
+                conn.execute(
+                    insert_sql,
+                    [prep.roi_id, array_id, source_id, *values, rev, now, now]
+                    # A fresh row is only "seen" if the catalog answered;
+                    # inventing a sighting would reset an orphan clock.
+                    + [source_url, now if source_url is not None else None],
                 )
+            else:
+                rev, created_at = prior[0] + 1, prior[1]
+                conn.execute(update_sql, [*values, rev, now, array_id, prep.roi_id])
+            stored.append(prep.to_proto(array_id, rev, created_at, now))
 
-            assignments = ", ".join(f"{col} = ?" for col in self._ROI_CLIENT_COLUMNS)
-            update_sql = (
-                f"UPDATE rois SET {assignments}, rev = ?, updated_at = ? "
-                f"WHERE array_id = ? AND roi_id = ?"
-            )
-            insert_sql = (
-                "INSERT INTO rois "
-                f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
-                "rev, created_at, updated_at, source_url, last_seen_at) "
-                f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})"
-            )
-
-            for prep in prepared:
-                prior = existing.get(prep.roi_id)
-                if prior is not None and check_rev and prep.rev != prior[0]:
-                    conflicts.append(
-                        RoiConflict(roi_id=prep.roi_id, stored_rev=prior[0])
-                    )
-                    continue
-
-                values = prep.column_values(self._ROI_CLIENT_COLUMNS)
-                if prior is None:
-                    rev, created_at = 1, now
-                    conn.execute(
-                        insert_sql,
-                        [prep.roi_id, array_id, source_id, *values, rev, now, now]
-                        # A fresh row is only "seen" if the catalog answered;
-                        # inventing a sighting would reset an orphan clock.
-                        + [source_url, now if source_url is not None else None],
-                    )
-                else:
-                    rev, created_at = prior[0] + 1, prior[1]
-                    conn.execute(update_sql, [*values, rev, now, array_id, prep.roi_id])
-                stored.append(prep.to_proto(array_id, rev, created_at, now))
+        conn.execute("COMMIT")
 
         logger.debug(
             "put_rois: %s stored, %s conflicts on %s",

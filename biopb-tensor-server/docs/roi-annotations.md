@@ -62,8 +62,8 @@ nothing in the design still argues for DuckDB over a plain dict. Row-per-ROI is
 what makes the premise pay off — `WHERE label = 'mitotic'`, per-field object
 counts, a bbox overlap, a join against `sources` — and at the cap here the row
 count is trivial. What set-per-row wins is atomicity of a whole layer; row-per-ROI
-gets that back from `set_name` plus a batched `roi_put` applied in one
-transaction. Per-set attributes (display colour, visibility) have no table yet on
+gets that back from `set_name` plus a batched `roi_put` applied in one real
+transaction (see below — the write lock alone does not provide that). Per-set attributes (display colour, visibility) have no table yet on
 purpose — they are client display state today, and a `roi_sets` table is additive
 if they ever need to be shared.
 
@@ -176,6 +176,16 @@ and they re-attach if the same path is registered again (`source_id` is a SHA-25
 of the resolved path, so it is stable). Deleting annotations is an explicit call.
 See Persistence and staleness for why absence from the catalog is never on its
 own a reason to delete.
+
+**A batch is a transaction, not just a locked section.** `put_rois` wraps its
+whole body in `BEGIN`/`COMMIT` with a rollback on any failure. The write lock
+only serializes writers — DuckDB autocommits each statement, so without this a
+failure partway through left the rows written so far behind, and a reader
+(`list_rois` deliberately takes no lock, using its own cursor) watched a layer
+appear row by row. Cursors observe the pre-commit snapshot, so one transaction
+buys both all-or-nothing recovery and an all-or-nothing view. The rollback is
+guarded so a dead connection cannot mask the original error, and so an open
+`BEGIN` can never poison the shared connection for later writers.
 
 **Cap.** One config knob, `annotations.max_rois_per_tensor` (default 5 000): a
 write that would exceed it fails with a clear error. The number is deliberately
