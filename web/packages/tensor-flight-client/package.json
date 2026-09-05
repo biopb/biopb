@@ -16,7 +16,6 @@
     "lint": "echo \"No lint config yet\""
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2.2.4",
     "@vivjs/types": "0.22.1"
   },
   "devDependencies": {

@@ -1020,3 +1020,130 @@ describe("tile_info's timeout budget", () => {
     await expect(p).rejects.toSatisfy(isTransportError);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ROI annotations
+// ---------------------------------------------------------------------------
+
+describe("TensorHttpClient.listRois", () => {
+  it("GETs the tensor's whole set and decodes it", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ rois: [{ roiId: "r1", roi: { point: { x: 3, y: 4 } }, rev: "2" }] }),
+    );
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.listRois("src/Image:0");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/rois/src/Image%3A0`);
+    expect(result.rois).toHaveLength(1);
+    expect(result.rois[0]!.rev).toBe(2);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("narrows to one set", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({}));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.listRois("src", "nuclei");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/rois/src?set=nuclei`);
+  });
+
+  it("passes a content-versioned array_id through untouched", async () => {
+    // The sidecar strips the token and splices it back; no version handling
+    // belongs on this side.
+    mockFetch.mockResolvedValueOnce(jsonResponse({}));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.listRois("zarr_x@9f1c4e2b/Image:0");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/rois/zarr_x%409f1c4e2b/Image%3A0`);
+  });
+
+  it("surfaces a server without annotations as a 501", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(501, "annotations are disabled"));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await expect(c.listRois("src")).rejects.toMatchObject({ status: 501 });
+  });
+
+  it("has its own budget, not the catalog's", () => {
+    const c = new TensorHttpClient(BASE, TOKEN);
+    expect(c.roiTimeoutMs).toBeGreaterThan(c.metadataTimeoutMs);
+  });
+});
+
+describe("TensorHttpClient.putRois", () => {
+  function sentBody(): Record<string, unknown> {
+    return JSON.parse((mockFetch.mock.calls[0]![1] as RequestInit).body as string);
+  }
+
+  it("POSTs encoded annotations and decodes what came back", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ stored: [{ roiId: "srv1", roi: { point: { x: 1, y: 1 } }, rev: "1" }] }),
+    );
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.putRois("src", [
+      { geometry: { kind: "point", at: { x: 1, y: 1 } }, label: "cell" },
+    ]);
+    const init = mockFetch.mock.calls[0]![1] as RequestInit;
+    expect(init.method).toBe("POST");
+    expect(sentBody().rois).toEqual([
+      { roi: { point: { x: 1, y: 1 } }, label: "cell" },
+    ]);
+    expect(result.stored[0]!.roiId).toBe("srv1");
+  });
+
+  it("defaults check_rev off, and sends it when asked", async () => {
+    // A fresh Response per call: a body can only be read once.
+    mockFetch.mockImplementation(() => Promise.resolve(jsonResponse({})));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const roi = { geometry: { kind: "point" as const, at: { x: 0, y: 0 } } };
+    await c.putRois("src", [roi]);
+    expect(sentBody().check_rev).toBe(false);
+    mockFetch.mockClear();
+    await c.putRois("src", [roi], { checkRev: true });
+    expect(sentBody().check_rev).toBe(true);
+  });
+
+  it("reports a lost conditional write", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ conflicts: [{ roiId: "r1", storedRev: "7" }] }),
+    );
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.putRois(
+      "src",
+      [{ roiId: "r1", rev: 3, geometry: { kind: "point", at: { x: 0, y: 0 } } }],
+      { checkRev: true },
+    );
+    expect(result.conflicts).toEqual([{ roiId: "r1", storedRev: 7 }]);
+    expect(result.stored).toEqual([]);
+  });
+
+  it("turns rejected geometry into a 422", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(422, "mask is not an accepted shape"));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await expect(
+      c.putRois("src", [{ geometry: { kind: "point", at: { x: 0, y: 0 } } }]),
+    ).rejects.toMatchObject({ status: 422 });
+  });
+});
+
+describe("TensorHttpClient.deleteRois", () => {
+  it("names the ids to remove", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ deleted: ["a", "b"] }));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const deleted = await c.deleteRois("src", ["a", "b"]);
+    const init = mockFetch.mock.calls[0]![1] as RequestInit;
+    expect(init.method).toBe("DELETE");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/rois/src?ids=a%2Cb`);
+    expect(deleted).toEqual(["a", "b"]);
+  });
+
+  it("with no ids clears the whole set, narrowed by set name", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({}));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.deleteRois("src", [], { setName: "nuclei" });
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/rois/src?set=nuclei`);
+  });
+
+  it("with neither wipes the tensor", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({}));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.deleteRois("src");
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/rois/src`);
+  });
+});

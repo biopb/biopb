@@ -26,6 +26,17 @@ import type {
   TileResult,
   TypedNdArray,
 } from "./types.js";
+import type {
+  RoiAnnotationInput,
+  RoiListResult,
+  RoiPutResult,
+} from "./roi-types.js";
+import {
+  decodeRoiDeleteResult,
+  decodeRoiListResult,
+  decodeRoiPutResult,
+  encodeRoiAnnotation,
+} from "./roi-json.js";
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -262,6 +273,14 @@ export class TensorHttpClient {
    * ({@link chunkTimeoutMs}) instead, and paired with a retry in the viewer.
    */
   tileInfoTimeoutMs = 8_000;
+  /**
+   * Timeout for the ROI routes (ms).
+   *
+   * Not {@link metadataTimeoutMs}: a whole annotation set is up to the server's
+   * per-tensor cap (5000) in one response, which is nothing like the small
+   * catalog calls that budget is sized for.
+   */
+  roiTimeoutMs = 8_000;
 
   /**
    * @param apiBase   Base URL of the FastAPI sidecar, e.g. "http://localhost:8816".
@@ -620,6 +639,89 @@ export class TensorHttpClient {
     return this.send(path, { method: "GET", headers: this.headers() }, timeoutMs, opts, consume);
   }
 
+
+  // -------------------------------------------------------------------------
+  // ROI annotations
+  //
+  // Bodies are proto3 canonical JSON in both directions (`roi-json.ts`). The
+  // array_id is passed exactly as the viewer holds it -- content-versioned or
+  // not: the sidecar strips the token before the store sees it and splices it
+  // back on the way out, so no version handling belongs on this side.
+  //
+  // A server with annotations disabled answers 501 on all three.
+  // -------------------------------------------------------------------------
+
+  /**
+   * A tensor's whole annotation set (`GET /api/rois`), optionally one layer.
+   *
+   * Whole-set by design -- there is no plane or bbox filter on the route. The
+   * client needs every ROI resident to hit-test and re-render, and a
+   * viewport-filtered fetch would make the ROI being edited vanish on a pan.
+   */
+  async listRois(arrayId: string, setName?: string, opts?: RequestOptions): Promise<RoiListResult> {
+    const query = setName ? `?set=${encodeURIComponent(setName)}` : "";
+    const body = await this.fetchJson<unknown>(
+      `/api/rois/${encodeArrayId(arrayId)}${query}`,
+      undefined,
+      this.roiTimeoutMs,
+      opts,
+    );
+    return decodeRoiListResult(body);
+  }
+
+  /**
+   * Create or update a batch (`POST /api/rois`), applied in one transaction.
+   *
+   * `checkRev` makes each write conditional on the `rev` the caller read: an
+   * annotation whose stored rev has moved on is reported in `conflicts` and not
+   * applied, while the rest of the batch still lands. Without it, last writer
+   * wins.
+   */
+  async putRois(
+    arrayId: string,
+    rois: RoiAnnotationInput[],
+    opts?: RequestOptions & { checkRev?: boolean },
+  ): Promise<RoiPutResult> {
+    const body = await this.fetchJson<unknown>(
+      `/api/rois/${encodeArrayId(arrayId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          rois: rois.map(encodeRoiAnnotation),
+          check_rev: opts?.checkRev === true,
+        }),
+      },
+      this.roiTimeoutMs,
+      opts,
+    );
+    return decodeRoiPutResult(body);
+  }
+
+  /**
+   * Delete annotations (`DELETE /api/rois`); returns the ids actually removed.
+   *
+   * `roiIds` empty deletes the tensor's whole set, narrowed by `setName` when
+   * given -- so calling this with neither wipes the tensor.
+   */
+  async deleteRois(
+    arrayId: string,
+    roiIds?: string[],
+    opts?: RequestOptions & { setName?: string },
+  ): Promise<string[]> {
+    const params = new URLSearchParams();
+    // The route splits on "," and the Flight action rejects an id containing
+    // one, so an id can never be mangled by this join.
+    if (roiIds && roiIds.length > 0) params.set("ids", roiIds.join(","));
+    if (opts?.setName) params.set("set", opts.setName);
+    const query = params.toString();
+    const body = await this.fetchJson<unknown>(
+      `/api/rois/${encodeArrayId(arrayId)}${query ? `?${query}` : ""}`,
+      { method: "DELETE" },
+      this.roiTimeoutMs,
+      opts,
+    );
+    return decodeRoiDeleteResult(body);
+  }
   // -------------------------------------------------------------------------
   // Diagnostics
   // -------------------------------------------------------------------------

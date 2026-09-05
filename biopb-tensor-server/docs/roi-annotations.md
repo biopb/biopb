@@ -6,7 +6,7 @@ is a new table in the tensor server's DuckDB catalog, reached over a small Fligh
 action set and re-exposed by the HTTP sidecar.
 
 Scope of this doc: the backend (store, wire types, API surfaces). The SPA's draw
-tooling is a separate design.
+tooling is `docs/roi-annotations-ui.md`.
 
 ## Non-goals
 
@@ -24,11 +24,9 @@ OME-XML / GeoJSON (the geometry is proto, so an exporter is additive).
 ## Model
 
 An **annotation** is a geometry plus the metadata that makes it findable. The
-geometry is `biopb.image.ROI` (`proto/biopb/image/roi.proto`), reused as-is —
-TypeScript is already generated for the SPA
-(`web/.../gen/biopb/image/roi_pb.ts`) and Python exports it from `biopb.image`.
-`ROI` carries geometry *only* — no id, no label — so the record around it is new
-(`RoiAnnotation`, below).
+geometry is `biopb.image.ROI` (`proto/biopb/image/roi.proto`), reused as-is, and
+Python exports it from `biopb.image`. `ROI` carries geometry *only* — no id, no
+label — so the record around it is new (`RoiAnnotation`, below).
 
 **Only the 2-D vector arms are accepted:** `point`, `rectangle`, `ellipse`,
 `polygon`, `polyline`. A `mask` or `mesh` is rejected with a clear error. This
@@ -425,8 +423,9 @@ of the same name, size and mtime — re-attach?" rather than silently losing the
 
 ## Implementation order
 
-1. `annotation.proto` + `buf generate` (Python, Java; the TS gen for the SPA is
-   a separate `protoc-gen-es` run, not wired into `buf.gen.yaml`).
+1. `annotation.proto` + `buf generate` (Python and Java only — `buf.gen.yaml`
+   emits no TypeScript, and the SPA hand-writes its JSON codec rather than
+   generating one; see `docs/roi-annotations-ui.md`).
 2. `MetadataDatabase`: `rois` table, `put_rois` / `list_rois` / `delete_rois`,
    bbox derivation, shape-arm rejection, `ALLOWED_TABLES += {"rois"}`; unit tests
    against the DB alone.
