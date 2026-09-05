@@ -284,6 +284,17 @@ class TestStore:
         with pytest.raises(ValueError, match="longer than"):
             db.put_rois(ARRAY_ID, [_annotation(roi_id="x" * 200)])
 
+    def test_a_comma_in_a_client_id_is_refused(self):
+        """The sidecar deletes by a comma-separated ?ids= list.
+
+        An id containing a comma could be created but never addressed: it would
+        split into two ids matching nothing, and the delete would report zero
+        removals with no error at all.
+        """
+        db = MetadataDatabase()
+        with pytest.raises(ValueError, match="may not contain a comma"):
+            db.put_rois(ARRAY_ID, [_annotation(roi_id="a,b")])
+
     def test_a_blank_client_id_gets_a_minted_one(self):
         db = MetadataDatabase()
         (stored,), _ = db.put_rois(ARRAY_ID, [_annotation(roi_id="   ")])
@@ -810,6 +821,16 @@ class TestSidecarRoutes:
         resp = client.delete(f"/api/rois/{ARRAY_ID}?set=scratch")
         assert resp.json()["deleted"] == [b.roi_id]
         assert db.list_rois(ARRAY_ID)[0] == []
+
+    def test_a_string_check_rev_is_refused_not_coerced(self, client_and_app):
+        """bool("false") is True, so coercing would silently turn conditional
+        writes ON for a client that sent the string."""
+        client, _db = client_and_app
+        resp = client.post(
+            f"/api/rois/{ARRAY_ID}",
+            json={"rois": [], "check_rev": "false"},
+        )
+        assert resp.status_code == 422
 
     def test_cross_origin_write_is_refused(self, client_and_app):
         client, _db = client_and_app

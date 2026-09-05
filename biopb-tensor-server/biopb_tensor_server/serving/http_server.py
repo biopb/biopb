@@ -45,6 +45,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -1946,7 +1947,8 @@ async def list_rois(array_id: str, request: Request) -> JSONResponse:
     bare_id, token = _roi_bare_id(array_id)
     set_name = request.query_params.get("set", "")
     try:
-        result = ctx.get_client().list_rois(bare_id, set_name)
+        client = await run_in_threadpool(ctx.get_client)
+        result = await run_in_threadpool(client.list_rois, bare_id, set_name)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1979,7 +1981,10 @@ async def put_rois(array_id: str, request: Request) -> JSONResponse:
         json_format.ParseDict(
             {
                 "rois": body.get("rois", []),
-                "checkRev": bool(body.get("check_rev", body.get("checkRev", False))),
+                # No bool() coercion: bool("false") is True, so a client
+                # sending the string would silently get conditional writes ON.
+                # Let ParseDict refuse a non-bool as a 422 instead.
+                "checkRev": body.get("check_rev", body.get("checkRev", False)),
             },
             req,
         )
@@ -1997,8 +2002,9 @@ async def put_rois(array_id: str, request: Request) -> JSONResponse:
             roi.array_id = _split_array_version(roi.array_id)[0]
 
     try:
-        result = ctx.get_client().put_rois(
-            bare_id, list(req.rois), check_rev=req.check_rev
+        client = await run_in_threadpool(ctx.get_client)
+        result = await run_in_threadpool(
+            partial(client.put_rois, bare_id, list(req.rois), check_rev=req.check_rev)
         )
     except HTTPException:
         raise
@@ -2024,7 +2030,8 @@ async def delete_rois(array_id: str, request: Request) -> JSONResponse:
     roi_ids = [part for part in raw_ids.split(",") if part]
     set_name = request.query_params.get("set", "")
     try:
-        result = ctx.get_client().delete_rois(bare_id, roi_ids, set_name)
+        client = await run_in_threadpool(ctx.get_client)
+        result = await run_in_threadpool(client.delete_rois, bare_id, roi_ids, set_name)
     except HTTPException:
         raise
     except Exception as exc:

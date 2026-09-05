@@ -196,6 +196,12 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
         raise ValueError(
             f"roi_id is longer than {_MAX_ROI_ID_LEN} characters: {roi_id[:32]!r}..."
         )
+    # The sidecar deletes by a comma-separated `?ids=` list, so an id containing
+    # a comma could be created but never addressed: it would split into two ids
+    # matching nothing, and the delete would report zero removals with no error.
+    # Refused at the store so no transport can mint an unreachable row.
+    if "," in roi_id:
+        raise ValueError(f"roi_id may not contain a comma: {roi_id!r}")
 
     shape_kind = roi.roi.WhichOneof("shape")
     if shape_kind is None:
@@ -1006,7 +1012,6 @@ class MetadataDatabase:
 
         conn = self._get_connection()
         source_id = array_id.split("/")[0]
-        now = datetime.now()
 
         # The write lock serializes writers; it does NOT make the batch atomic,
         # because DuckDB autocommits each statement. Without an explicit
@@ -1019,7 +1024,7 @@ class MetadataDatabase:
             conn.execute("BEGIN TRANSACTION")
             try:
                 return self._put_rois_locked(
-                    conn, array_id, source_id, prepared, check_rev, now
+                    conn, array_id, source_id, prepared, check_rev
                 )
             except BaseException:
                 try:
@@ -1036,13 +1041,19 @@ class MetadataDatabase:
         source_id: str,
         prepared: List[_PreparedRoi],
         check_rev: bool,
-        now: datetime,
     ) -> Tuple[List[RoiAnnotation], List[RoiConflict]]:
         """The body of :meth:`put_rois`, inside the lock and the transaction.
 
         Split out so the transaction is a plain try/except around one call rather
         than a second level of indentation over the whole method.
         """
+        # Sampled under the lock, not before it: a writer that waited would
+        # otherwise stamp times from before the wait, so a batch committing
+        # LATER could carry an earlier updated_at than one that committed first
+        # -- and last_seen_at, which the orphan clock reads, could move
+        # backwards.
+        now = datetime.now()
+
         stored: List[RoiAnnotation] = []
         conflicts: List[RoiConflict] = []
         source_url = self._observe_source(conn, source_id, now)

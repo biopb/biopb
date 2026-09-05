@@ -158,6 +158,11 @@ Every other query here is already array_id-scoped; the key now matches. A batch
 naming one `roi_id` twice is refused (the writes would collapse), and a
 client-supplied id is length-bounded since it becomes half the key.
 
+A client-supplied `roi_id` is stripped, length-bounded, and may not contain a
+comma — the sidecar deletes by a comma-separated `?ids=` list, so such an id
+could be created but never addressed, and the delete would report zero removals
+with no error.
+
 `set_name` groups annotations into a layer ("nuclei", "hand-drawn"). It is in the
 first version deliberately — it is what makes bulk delete and layer toggling
 possible, and retrofitting a grouping key later is a migration of every stored row.
