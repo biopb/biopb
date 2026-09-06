@@ -173,8 +173,9 @@ export interface AppState {
   roisFor: string | null;
   /** The fetch in flight, so a superseded response cannot overwrite a newer one. */
   roisPending: string | null;
-  roisLoading: boolean;
   roisError: string | null;
+  /** The tensor `roisError` is about. See `selectRoisError`. */
+  roisErrorFor: string | null;
   /** The per-tensor cap clipped the set: what is shown is not all there is. */
   roisTruncated: boolean;
   /** Rows whose geometry this client could not read -- see `decodeRoiListResult`. */
@@ -190,8 +191,13 @@ export interface AppState {
   /**
    * Sets switched off by name. Absence means visible, so a set that appears
    * later shows up rather than starting hidden.
+   *
+   * Read through `selectHiddenSets`: names mean nothing outside the tensor they
+   * were hidden in, and `hiddenSetsFor` is what scopes them to it.
    */
   hiddenSets: string[];
+  /** The tensor `hiddenSets` names sets of. See `selectHiddenSets`. */
+  hiddenSetsFor: string | null;
 
   /**
    * The axis being scrubbed automatically (a `SliderAxis.key`), or null.
@@ -361,13 +367,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   rois: [],
   roisFor: null,
   roisPending: null,
-  roisLoading: false,
   roisError: null,
+  roisErrorFor: null,
   roisTruncated: false,
   roisSkipped: 0,
   roisUnavailable: false,
   showRois: true,
   hiddenSets: [],
+  hiddenSetsFor: null,
 
   playAxis: null,
   planeReady: false,
@@ -452,17 +459,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       planeReady: false,
       appliedLimits: null,
       planeLimits: null,
-      // The set belongs to one tensor, and `hiddenSets` names sets within it.
-      // `showRois` and `roisUnavailable` are not reset: one is a preference,
-      // the other a fact about the server.
-      rois: [],
-      roisFor: null,
-      roisPending: null,
-      roisLoading: false,
-      roisError: null,
-      roisTruncated: false,
-      roisSkipped: 0,
-      hiddenSets: [],
+      // Annotation state is deliberately NOT reset here. Every piece of it
+      // carries the tensor it belongs to and is read through a selector that
+      // hides it otherwise -- the same treatment `tileInfo` gets, and for a
+      // sharper reason: `applyViewerState` changes the tensor without coming
+      // through this function at all, so a reset written here would be missed
+      // by every link the app opens.
     });
     // `fixedLimits` goes with the tensor for the reason the indices do -- a
     // grey level is a value of its dtype. The mode is a preference and stays,
@@ -517,7 +519,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // mount effect, and the 2-D subtree remounts on every render-mode flip.
     if (get().roisFor === arrayId || get().roisPending === arrayId) return;
     if (get().roisUnavailable) return;
-    set({ roisPending: arrayId, roisLoading: true, roisError: null });
+    set({ roisPending: arrayId, roisError: null });
     try {
       const result = await client.http.listRois(arrayId);
       // A response for a tensor that is no longer the one being asked about.
@@ -526,7 +528,6 @@ export const useAppStore = create<AppState>((set, get) => ({
         rois: result.rois,
         roisFor: arrayId,
         roisPending: null,
-        roisLoading: false,
         roisTruncated: result.truncated,
         roisSkipped: result.skipped,
       });
@@ -535,14 +536,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 501 is the server saying it does not do annotations. Latched for the
       // session so every later tensor skips the round trip.
       if (err instanceof TensorApiError && err.status === 501) {
-        set({ roisPending: null, roisLoading: false, roisUnavailable: true });
+        set({ roisPending: null, roisUnavailable: true });
         return;
       }
       // `roisFor` deliberately stays null so a remount or a tensor switch can
       // try again; the effect's own deps keep that from becoming a retry loop.
       set({
         roisPending: null,
-        roisLoading: false,
+        roisErrorFor: arrayId,
         roisError: err instanceof Error ? err.message : String(err),
       });
     }
@@ -553,11 +554,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   toggleSetHidden(setName) {
-    set((s) => ({
-      hiddenSets: s.hiddenSets.includes(setName)
-        ? s.hiddenSets.filter((name) => name !== setName)
-        : [...s.hiddenSets, setName],
-    }));
+    set((s) => {
+      // Scoped to the tensor in view: a list carried over from another one is
+      // not "nothing hidden here", it is a list of names that mean nothing here.
+      const arrayId = currentArrayId(s);
+      const current = s.hiddenSetsFor === arrayId ? s.hiddenSets : [];
+      return {
+        hiddenSetsFor: arrayId,
+        hiddenSets: current.includes(setName)
+          ? current.filter((name) => name !== setName)
+          : [...current, setName],
+      };
+    });
   },
 
   applyViewerState(params) {
@@ -753,6 +761,60 @@ export const useAppStore = create<AppState>((set, get) => ({
  * prop the viewer was mounted with -- rather than two spellings of one
  * identity, so no canonicalization only the server can do is involved.
  */
+/**
+ * The address the viewer is actually rendering: the exact one a link asked for,
+ * which may be content-pinned, else the selection.
+ *
+ * Single-sourced because every "is this state about the tensor in view?" guard
+ * has to agree, and two spellings of that question would disagree exactly when
+ * a pinned link is open.
+ */
+export function currentArrayId(s: AppState): string | null {
+  return s.requestedArrayId ?? s.activeTensorId;
+}
+
 export function selectTileInfo(s: AppState): TileInfo | null {
-  return s.tileInfoFor === (s.requestedArrayId ?? s.activeTensorId) ? s.tileInfo : null;
+  return s.tileInfoFor === currentArrayId(s) ? s.tileInfo : null;
+}
+
+// --- ROI annotations -------------------------------------------------------
+//
+// Every one of these hides state belonging to another tensor rather than
+// relying on someone having reset it. `selectSource` is not the only way the
+// tensor in view changes -- `applyViewerState` does it too, straight from a URL
+// -- so a reset would have to be written at every such site and kept in step
+// with the next one. Answering the question at the read instead makes that
+// impossible to get wrong, which is the same reason `tileInfo` is left alone.
+//
+// Stable empty constants: a selector returning a fresh [] on every call would
+// re-render its subscriber on every unrelated store write.
+const NO_ROIS: RoiAnnotation[] = [];
+const NO_SETS: string[] = [];
+
+/** This tensor's annotations, or none while another tensor's are still held. */
+export function selectRois(s: AppState): RoiAnnotation[] {
+  return s.roisFor === currentArrayId(s) ? s.rois : NO_ROIS;
+}
+
+/** A fetch is in flight for the tensor in view. */
+export function selectRoisLoading(s: AppState): boolean {
+  return s.roisPending !== null && s.roisPending === currentArrayId(s);
+}
+
+/** The cap clipped THIS tensor's set -- not one looked at earlier. */
+export function selectRoisTruncated(s: AppState): boolean {
+  return s.roisFor === currentArrayId(s) && s.roisTruncated;
+}
+
+export function selectRoisSkipped(s: AppState): number {
+  return s.roisFor === currentArrayId(s) ? s.roisSkipped : 0;
+}
+
+export function selectRoisError(s: AppState): string | null {
+  return s.roisErrorFor === currentArrayId(s) ? s.roisError : null;
+}
+
+/** Sets hidden in the tensor in view. Names do not carry across tensors. */
+export function selectHiddenSets(s: AppState): string[] {
+  return s.hiddenSetsFor === currentArrayId(s) ? s.hiddenSets : NO_SETS;
 }

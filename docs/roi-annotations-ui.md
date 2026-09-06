@@ -234,9 +234,23 @@ draft: DraftShape | null      // vertices placed so far
 selectedRoiId: string | null
 ```
 
-`tool` and `visibleSets` are UI state, not per-tensor data; everything else resets
-with the tensor. Overlay visibility belongs in `useViewerUrlSync` so a shared link
-carries it.
+`tool` and the overlay toggle are viewer preferences and outlive a tensor change.
+Overlay visibility belongs in `useViewerUrlSync` so a shared link carries it.
+
+**Everything else is scoped by a selector, not reset by a writer.** Each piece
+carries the tensor it belongs to (`roisFor`, `hiddenSetsFor`, `roisErrorFor`) and
+is read through `selectRois` / `selectHiddenSets` / `selectRoisTruncated` and
+friends, which hide it when it belongs to another tensor.
+
+That is not tidiness. `selectSource` is *not* the only way the tensor in view
+changes: `applyViewerState` writes `activeTensorId` straight from a URL without
+going through it, so a reset written in `selectSource` is missed by every link
+the app opens. The warnings are the ones that matter — a carried-over "this
+tensor holds more annotations than are shown" reads as a fact about the image on
+screen, and unlike a stale count nothing on screen contradicts it.
+
+It is also the treatment `tileInfo` already gets, for the same reason, which
+`applyViewerState`'s own comment spells out.
 
 ## Content staleness — deferred, and why
 

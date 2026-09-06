@@ -20,7 +20,16 @@
  */
 
 import { useMemo } from "react";
-import { selectTileInfo, useAppStore } from "../store";
+import {
+  selectHiddenSets,
+  selectRois,
+  selectRoisError,
+  selectRoisLoading,
+  selectRoisSkipped,
+  selectRoisTruncated,
+  selectTileInfo,
+  useAppStore,
+} from "../store";
 import { currentPlaneFor, roiSetCounts, setColor, visibleRois } from "../utils/roiLayers";
 import type { RoiAnnotation } from "@biopb/tensor-flight-client";
 
@@ -131,21 +140,21 @@ export function RoiPanelView({
   );
 }
 
-interface RoiPanelProps {
-  /** The tensor in view -- the same address the viewer renders. */
-  arrayId: string;
-}
-
-export function RoiPanel({ arrayId }: RoiPanelProps) {
-  const rois = useAppStore((s) => s.rois);
-  const roisFor = useAppStore((s) => s.roisFor);
-  const loading = useAppStore((s) => s.roisLoading);
-  const error = useAppStore((s) => s.roisError);
-  const truncated = useAppStore((s) => s.roisTruncated);
-  const skipped = useAppStore((s) => s.roisSkipped);
+/**
+ * Everything here comes through a scoping selector, so state belonging to a
+ * tensor that is no longer in view cannot reach the panel -- including the
+ * warnings, which are the ones that would be believed: a stale "per-tensor
+ * maximum" reads as a fact about the image on screen.
+ */
+export function RoiPanel() {
+  const rois = useAppStore(selectRois);
+  const loading = useAppStore(selectRoisLoading);
+  const error = useAppStore(selectRoisError);
+  const truncated = useAppStore(selectRoisTruncated);
+  const skipped = useAppStore(selectRoisSkipped);
+  const hiddenSets = useAppStore(selectHiddenSets);
   const unavailable = useAppStore((s) => s.roisUnavailable);
   const showRois = useAppStore((s) => s.showRois);
-  const hiddenSets = useAppStore((s) => s.hiddenSets);
   const onToggleOverlay = useAppStore((s) => s.setShowRois);
   const onToggleSet = useAppStore((s) => s.toggleSetHidden);
   const tileInfo = useAppStore(selectTileInfo);
@@ -154,9 +163,7 @@ export function RoiPanel({ arrayId }: RoiPanelProps) {
 
   return (
     <RoiPanelView
-      // `rois` outlives a tensor switch until the next fetch lands, so counts
-      // are shown only once they describe the tensor actually in view.
-      rois={roisFor === arrayId ? rois : []}
+      rois={rois}
       currentPlane={currentPlane}
       hiddenSets={hiddenSets}
       showRois={showRois}

@@ -199,7 +199,7 @@ export function HomePage() {
             {splitter("control", "Resize the control panel")}
             <div className="control-column">
               <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
-              {!render3d && <RoiPanel arrayId={requestedArrayId ?? activeTensorId} />}
+              {!render3d && <RoiPanel />}
               {/*
                 Remount per source. Without the key, a switch re-renders the
                 whole tree against the *previous* source's metadata — the new

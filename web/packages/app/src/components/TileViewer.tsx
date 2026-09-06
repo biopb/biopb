@@ -31,7 +31,7 @@ import {
   vivDtype,
   type TileInfo,
 } from "@biopb/tensor-flight-client";
-import { useAppStore } from "../store";
+import { selectHiddenSets, selectRois, useAppStore } from "../store";
 import { buildRoiLayers, currentPlaneFor } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
@@ -99,10 +99,12 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const slice = useAppStore((s) => s.slice);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
-  const rois = useAppStore((s) => s.rois);
-  const roisFor = useAppStore((s) => s.roisFor);
+  // Scoped selectors, not raw fields: a set fetched for another tensor is held
+  // until this one's fetch lands, and drawing it over a new image would be
+  // worse than drawing nothing.
+  const rois = useAppStore(selectRois);
   const showRois = useAppStore((s) => s.showRois);
-  const hiddenSets = useAppStore((s) => s.hiddenSets);
+  const hiddenSets = useAppStore(selectHiddenSets);
   const loadRois = useAppStore((s) => s.loadRois);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -407,16 +409,8 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
 
   const roiLayers = useMemo(
     () =>
-      buildRoiLayers({
-        // Only this tensor's set: `rois` outlives a switch until the next fetch
-        // lands, and drawing the previous tensor's annotations over a new image
-        // would be worse than drawing none.
-        rois: roisFor === arrayId ? rois : [],
-        currentPlane,
-        hiddenSets,
-        visible: showRois,
-      }),
-    [rois, roisFor, arrayId, currentPlane, hiddenSets, showRois],
+      buildRoiLayers({ rois, currentPlane, hiddenSets, visible: showRois }),
+    [rois, currentPlane, hiddenSets, showRois],
   );
 
   return (
