@@ -1008,6 +1008,16 @@ export function selectSelectedRoi(s: AppState): RoiAnnotation | null {
 }
 
 /**
+ * The selected annotation's id, or null when the selection is not in view.
+ *
+ * A primitive, so a subscriber re-renders on a change of selection rather than
+ * on every change to the set it lives in.
+ */
+export function selectSelectedRoiId(s: AppState): string | null {
+  return selectSelectedRoi(s)?.roiId ?? null;
+}
+
+/**
  * Axes a new annotation will broadcast across, given this tensor's defaults.
  *
  * `defaults` is computed from the grid by the caller (channel, normally -- see

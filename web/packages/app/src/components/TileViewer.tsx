@@ -36,6 +36,7 @@ import {
   selectDraft,
   selectHiddenSets,
   selectRois,
+  selectSelectedRoiId,
   useAppStore,
 } from "../store";
 import {
@@ -132,7 +133,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const loadRois = useAppStore((s) => s.loadRois);
   const tool = useAppStore((s) => s.tool);
   const draft = useAppStore(selectDraft);
-  const selectedRoiId = useAppStore((s) => s.selectedRoiId);
+  const selectedRoiId = useAppStore(selectSelectedRoiId);
   const setDraft = useAppStore((s) => s.setDraft);
   const setSelectedRoi = useAppStore((s) => s.setSelectedRoi);
   const createRoi = useAppStore((s) => s.createRoi);

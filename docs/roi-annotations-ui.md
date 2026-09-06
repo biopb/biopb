@@ -315,6 +315,16 @@ selector.
 
 The tool itself is a preference and survives all of this.
 
+**A lint rule keeps the guarded reads guarded.** Three times this state has
+shipped with a selector alongside a raw field that a second reader picked up
+instead — the previous tensor's hidden sets, a truncation warning about a tensor
+no longer on screen, an enabled Finish for a draft the viewer had dropped. The
+selector fixes the instance; it does not stop the next one, because the field
+stays public on `AppState`. So `no-restricted-syntax` refuses
+`useAppStore((s) => s.rois)` and its siblings (the list is in
+`web/packages/app/eslint.config.mjs`), while `getState()` and `setState()` stay
+open for tests.
+
 **The tool strip takes the draft as a prop rather than reading the store.** The
 viewer already holds it through `selectDraft`; a second, unguarded read there
 would show a status line and an enabled Finish for a draft the viewer considers
