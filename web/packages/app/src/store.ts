@@ -316,6 +316,7 @@ export interface AppState {
   toggleBroadcastAxis: (axis: number, defaults: number[]) => void;
   createRoi: (geometry: RoiGeometry, plane: Record<number, number>) => Promise<void>;
   deleteRoi: (roiId: string) => Promise<void>;
+  clearRoiSet: (setName: string) => Promise<void>;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -686,6 +687,34 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((s) => ({
         rois: s.rois.filter((roi) => !removed.has(roi.roiId)),
         selectedRoiId: s.selectedRoiId && removed.has(s.selectedRoiId) ? null : s.selectedRoiId,
+      }));
+    } catch (err) {
+      set({ roiWriteError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  async clearRoiSet(setName) {
+    const { client } = get();
+    const arrayId = currentArrayId(get());
+    if (!client || !arrayId) return;
+    set({ roiWriteError: null });
+    try {
+      // No ids: the server drops the whole set in one transaction, so this is
+      // not limited to the rows the cap let this client see.
+      await client.http.deleteRois(arrayId, undefined, { setName });
+      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) return;
+      // Filtered by name rather than by the ids that came back, for the same
+      // reason: what was deleted is the set, and the response enumerates only
+      // what the server chose to list.
+      set((s) => ({
+        rois: s.rois.filter((roi) => roi.setName !== setName),
+        selectedRoiId:
+          s.rois.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
+            ? null
+            : s.selectedRoiId,
+        // The name means nothing once the set is gone, and leaving it behind
+        // would start a later set of the same name hidden.
+        hiddenSets: s.hiddenSets.filter((name) => name !== setName),
       }));
     } catch (err) {
       set({ roiWriteError: err instanceof Error ? err.message : String(err) });

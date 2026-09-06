@@ -339,10 +339,25 @@ would show a status line and an enabled Finish for a draft the viewer considers
 gone, and Finish would then do nothing, because it closes over the guarded
 value. One reader is the only way the two cannot disagree.
 
-**A selection is only actionable while it is drawn.** The Delete button acts on
-it, so a plane change must not leave the user able to delete a shape they cannot
-see. The selection survives the move — scrubbing back brings it into reach —
-but the panel withholds it meanwhile.
+**A selection is only actionable while it is drawn.** Delete acts on it, so a
+plane change must not leave the user able to delete a shape they cannot see. The
+selection survives the move — scrubbing back brings it into reach — but the
+panel withholds it meanwhile, and the viewer binds the key on the same
+condition.
+
+**Clearing a set goes to the server unfiltered.** `DELETE /api/rois` with no
+ids drops the whole set in one transaction, so a clear is not limited to the
+rows the per-tensor cap let this client see — and the local list is filtered by
+set name rather than by the ids that came back, for the same reason. Arming is
+per row and one at a time, and expires: two live "Sure?" buttons is two chances
+to hit the wrong one, and an armed button left on screen is a trap the next
+time the panel is looked at.
+
+**Delete is a key, not a button.** The panel says what is selected on one
+elided line, which leaves no room for a button; the viewer binds `Delete` while
+a drawn selection exists. Not `Backspace`: finishing a shape selects it, so
+`Backspace` would mean "take back the last vertex" and "delete the whole
+annotation" one keystroke apart.
 
 ## State
 
@@ -362,8 +377,8 @@ selectedRoiId: string | null
 **The overlay toggle turns the annotation surface off, not just the stored
 shapes.** With it off nothing is drawn, no tool is offered, a click places
 nothing and selects nothing, an in-progress draft is hidden, and the authoring
-panel is gone — including the Delete button, which would otherwise act on a
-selection the user cannot see. Anything narrower makes one checkbox mean several
+panel is gone — including the selected-annotation row and the Delete key it
+names, which would otherwise act on a selection the user cannot see. Anything narrower makes one checkbox mean several
 things: gating only the rendering left a draft visible over a switched-off
 overlay and let it be finished into an annotation nobody could see.
 

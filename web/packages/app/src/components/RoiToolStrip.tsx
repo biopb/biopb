@@ -17,7 +17,7 @@ import { isCompletable, minimumPoints, type RoiTool } from "../utils/roiDraft";
 import type { RoiDraft } from "../utils/roiDraft";
 
 const TOOLS: Array<{ tool: RoiTool; glyph: string; title: string }> = [
-  { tool: "select", glyph: "▹", title: "Select (click an annotation)" },
+  { tool: "select", glyph: "↖", title: "Select (click an annotation)" },
   { tool: "point", glyph: "•", title: "Point (one click)" },
   { tool: "rectangle", glyph: "▭", title: "Rectangle (two clicks)" },
   { tool: "polygon", glyph: "⬠", title: "Polygon (click vertices, Enter to close)" },

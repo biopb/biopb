@@ -19,7 +19,7 @@
  * is therefore actually testable.
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   selectBroadcastAxes,
   selectHiddenSets,
@@ -41,6 +41,12 @@ import {
 } from "../utils/roiLayers";
 import { pinnableAxes, roiVisibleOnPlane } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, SliderAxis } from "@biopb/tensor-flight-client";
+
+/**
+ * How long a clear button stays armed. Long enough to mean the second click,
+ * short enough that it is never still armed when the panel is next looked at.
+ */
+const CLEAR_CONFIRM_MS = 4000;
 
 function swatch(setName: string) {
   const [r, g, b] = setColor(setName);
@@ -72,6 +78,8 @@ export interface RoiPanelViewProps {
   unavailable: boolean;
   onToggleOverlay: (value: boolean) => void;
   onToggleSet: (setName: string) => void;
+  /** Delete every annotation in one set. Server-side, and there is no undo. */
+  onClearSet: (setName: string) => void;
 }
 
 export function RoiPanelView({
@@ -86,7 +94,20 @@ export function RoiPanelView({
   unavailable,
   onToggleOverlay,
   onToggleSet,
+  onClearSet,
 }: RoiPanelViewProps) {
+  // Which set's clear button is armed. One at a time, so arming a second row
+  // disarms the first -- two live "Sure?" buttons is two chances to hit the
+  // wrong one.
+  const [armed, setArmed] = useState<string | null>(null);
+  // Disarms itself: an armed button left on screen becomes a trap the next
+  // time the panel is looked at, and there is nothing to undo afterwards.
+  useEffect(() => {
+    if (armed === null) return;
+    const timer = setTimeout(() => setArmed(null), CLEAR_CONFIRM_MS);
+    return () => clearTimeout(timer);
+  }, [armed]);
+
   // A server without annotations is not a fault to report: say nothing at all
   // rather than show a permanently empty panel.
   if (unavailable) return null;
@@ -125,7 +146,25 @@ export function RoiPanelView({
                   <span style={swatch(setName)} />
                   {setName}
                 </label>
-                <span className="roi-count">{count}</span>
+                <span className="roi-set-actions">
+                  <span className="roi-count">{count}</span>
+                  <button
+                    type="button"
+                    className={`roi-set-clear${armed === setName ? " armed" : ""}`}
+                    title={`Delete all ${count} annotation${count === 1 ? "" : "s"} in ${setName}`}
+                    aria-label={`Delete every annotation in ${setName}`}
+                    onClick={() => {
+                      if (armed !== setName) {
+                        setArmed(setName);
+                        return;
+                      }
+                      setArmed(null);
+                      onClearSet(setName);
+                    }}
+                  >
+                    {armed === setName ? "Sure?" : "⌫"}
+                  </button>
+                </span>
               </li>
             );
           })}
@@ -166,6 +205,7 @@ export function RoiPanel() {
   const showRois = useAppStore((s) => s.showRois);
   const onToggleOverlay = useAppStore((s) => s.setShowRois);
   const onToggleSet = useAppStore((s) => s.toggleSetHidden);
+  const onClearSet = useAppStore((s) => s.clearRoiSet);
   const tileInfo = useAppStore(selectTileInfo);
   const slice = useAppStore((s) => s.slice);
   const currentPlane = useMemo(() => currentPlaneFor(tileInfo, slice), [tileInfo, slice]);
@@ -183,6 +223,7 @@ export function RoiPanel() {
       unavailable={unavailable}
       onToggleOverlay={onToggleOverlay}
       onToggleSet={onToggleSet}
+      onClearSet={onClearSet}
     />
   );
 }
@@ -205,7 +246,6 @@ export interface RoiAuthorViewProps {
   onSetNewLabel: (label: string) => void;
   onSetNewSetName: (setName: string) => void;
   onToggleBroadcast: (axis: number) => void;
-  onDeleteSelected: () => void;
 }
 
 /**
@@ -227,13 +267,11 @@ export function RoiAuthorView({
   onSetNewLabel,
   onSetNewSetName,
   onToggleBroadcast,
-  onDeleteSelected,
 }: RoiAuthorViewProps) {
   const broadcast = new Set(broadcastAxes);
-  // Only a selection that is actually drawn. The Delete button acts on it, and
-  // a plane change must not leave the user able to delete a shape they cannot
-  // see -- the selection itself survives, so scrubbing back brings it into
-  // reach again.
+  // Only a selection that is actually drawn. Delete acts on it, and a plane
+  // change must not leave the user deleting a shape they cannot see -- the
+  // selection itself survives, so scrubbing back brings it into reach again.
   const shown = selected && roiVisibleOnPlane(selected.plane, currentPlane) ? selected : null;
   return (
     <div className="roi-author">
@@ -280,21 +318,14 @@ export function RoiAuthorView({
       )}
 
       {shown && (
-        <div className="roi-selected">
-          <div className="roi-field-head">Selected</div>
-          <div>
-            {shown.label || <em>no label</em>} — {shown.geometry.kind} in {shown.setName}
-          </div>
-          <div className="roi-count">
-            {Object.keys(shown.plane).length === 0
-              ? "on every plane"
-              : `pinned: ${Object.entries(shown.plane)
-                  .map(([axis, index]) => `${axisTitle(axes, Number(axis))} ${index}`)
-                  .join(", ")}`}
-          </div>
-          <button type="button" className="roi-tool-text" onClick={onDeleteSelected}>
-            Delete
-          </button>
+        <div
+          className="roi-selected"
+          // Elided to one line, so the whole summary lives here too -- and with
+          // the Delete button gone, this is where the key that replaced it is
+          // named.
+          title={`${selectedSummary(shown, axes)}\nPress Delete to remove it`}
+        >
+          Selected: {selectedSummary(shown, axes)}
         </div>
       )}
 
@@ -308,6 +339,23 @@ function axisTitle(axes: SliderAxis[], axis: number): string {
   return axes.find((a) => a.axis === axis)?.title ?? `axis ${axis}`;
 }
 
+/**
+ * The selected annotation in one line: what it is, then which planes it is on.
+ *
+ * The plane clause is the load-bearing half. A broadcast annotation is
+ * pixel-identical to a pinned one where the two coincide, so without it the
+ * only way to tell them apart is to scrub and see which one follows.
+ */
+function selectedSummary(roi: RoiAnnotation, axes: SliderAxis[]): string {
+  const where =
+    Object.keys(roi.plane).length === 0
+      ? "every plane"
+      : Object.entries(roi.plane)
+          .map(([axis, index]) => `${axisTitle(axes, Number(axis))} ${index}`)
+          .join(", ");
+  return `${roi.label || "no label"} — ${roi.geometry.kind} in ${roi.setName}, ${where}`;
+}
+
 export function RoiAuthor() {
   const tileInfo = useAppStore(selectTileInfo);
   const slice = useAppStore((s) => s.slice);
@@ -318,7 +366,6 @@ export function RoiAuthor() {
   const onSetNewLabel = useAppStore((s) => s.setNewLabel);
   const onSetNewSetName = useAppStore((s) => s.setNewSetName);
   const toggleBroadcastAxis = useAppStore((s) => s.toggleBroadcastAxis);
-  const deleteRoi = useAppStore((s) => s.deleteRoi);
   const unavailable = useAppStore((s) => s.roisUnavailable);
   const showRois = useAppStore((s) => s.showRois);
 
@@ -328,7 +375,7 @@ export function RoiAuthor() {
   const currentPlane = useMemo(() => currentPlaneFor(tileInfo, slice), [tileInfo, slice]);
 
   // With the overlay off there is nothing to author against and nothing drawn
-  // to act on -- including a Delete button for a selection the user cannot see.
+  // to act on -- including a selection the user cannot see.
   if (unavailable || !showRois) return null;
 
   return (
@@ -343,7 +390,6 @@ export function RoiAuthor() {
       onSetNewLabel={onSetNewLabel}
       onSetNewSetName={onSetNewSetName}
       onToggleBroadcast={(axis) => toggleBroadcastAxis(axis, defaults)}
-      onDeleteSelected={() => selected && void deleteRoi(selected.roiId)}
     />
   );
 }

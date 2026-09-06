@@ -475,6 +475,82 @@ describe("authoring state", () => {
     expect(useAppStore.getState().rois).toEqual([]);
   });
 
+  it("clears a whole set by name, leaving the other sets alone", async () => {
+    const calls: unknown[] = [];
+    seedFor({
+      http: {
+        deleteRois: (arrayId: string, roiIds: unknown, opts: unknown) => {
+          calls.push({ arrayId, roiIds, opts });
+          // Deliberately fewer ids than the set holds: the cap means this
+          // client may never have seen every row it just deleted.
+          return Promise.resolve(["srv1"]);
+        },
+      },
+    });
+    useAppStore.setState({
+      rois: [
+        stored({ roiId: "srv1", setName: "nuclei" }),
+        stored({ roiId: "srv2", setName: "nuclei" }),
+        stored({ roiId: "srv3", setName: "cells" }),
+      ],
+    });
+    await useAppStore.getState().clearRoiSet("nuclei");
+
+    // No ids: the server drops the set in one transaction rather than the
+    // subset this client happens to hold.
+    expect(calls).toEqual([{ arrayId: "first", roiIds: undefined, opts: { setName: "nuclei" } }]);
+    expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["srv3"]);
+  });
+
+  it("drops a selection that was in the cleared set, and the set's hidden flag", async () => {
+    // The name means nothing once the set is gone, and leaving it behind would
+    // start a later set of the same name hidden.
+    seedFor({ http: { deleteRois: () => Promise.resolve(["srv1"]) } });
+    useAppStore.setState({
+      rois: [stored({ roiId: "srv1", setName: "nuclei" }), stored({ roiId: "srv2", setName: "cells" })],
+      selectedRoiId: "srv1",
+      hiddenSets: ["nuclei", "cells"],
+      hiddenSetsFor: "first",
+    });
+    await useAppStore.getState().clearRoiSet("nuclei");
+    expect(useAppStore.getState().selectedRoiId).toBeNull();
+    expect(useAppStore.getState().hiddenSets).toEqual(["cells"]);
+  });
+
+  it("keeps a selection that was in another set", async () => {
+    seedFor({ http: { deleteRois: () => Promise.resolve([]) } });
+    useAppStore.setState({
+      rois: [stored({ roiId: "srv1", setName: "nuclei" }), stored({ roiId: "srv2", setName: "cells" })],
+      selectedRoiId: "srv2",
+    });
+    await useAppStore.getState().clearRoiSet("nuclei");
+    expect(useAppStore.getState().selectedRoiId).toBe("srv2");
+  });
+
+  it("reports a failed clear instead of emptying the panel", async () => {
+    seedFor({ http: { deleteRois: () => Promise.reject(new Error("500 upstream")) } });
+    useAppStore.setState({ rois: [stored({ setName: "nuclei" })] });
+    await useAppStore.getState().clearRoiSet("nuclei");
+    expect(useAppStore.getState().roiWriteError).toContain("500 upstream");
+    expect(useAppStore.getState().rois).toHaveLength(1);
+  });
+
+  it("drops a clear that landed after the tensor moved on", async () => {
+    seedFor({
+      http: {
+        deleteRois: () => {
+          useAppStore.setState({ activeTensorId: "second", roisFor: "second" });
+          return Promise.resolve(["srv1"]);
+        },
+      },
+    });
+    useAppStore.setState({ rois: [stored({ setName: "nuclei" })] });
+    await useAppStore.getState().clearRoiSet("nuclei");
+    // The rows belong to another tensor now; emptying them here would clear a
+    // panel describing an image this delete never touched.
+    expect(useAppStore.getState().rois).toHaveLength(1);
+  });
+
   it("abandons the draft when the tool changes", () => {
     useAppStore.setState({ tool: "polygon", draft: { tool: "polygon", points: [[0, 0]] } });
     useAppStore.getState().setTool("rectangle");
