@@ -320,13 +320,16 @@ export function RoiAuthor() {
   const toggleBroadcastAxis = useAppStore((s) => s.toggleBroadcastAxis);
   const deleteRoi = useAppStore((s) => s.deleteRoi);
   const unavailable = useAppStore((s) => s.roisUnavailable);
+  const showRois = useAppStore((s) => s.showRois);
 
   const defaults = useMemo(() => defaultBroadcastAxes(tileInfo), [tileInfo]);
   const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, defaults));
   const axes = useMemo(() => (tileInfo ? pinnableAxes(tileInfo) : []), [tileInfo]);
   const currentPlane = useMemo(() => currentPlaneFor(tileInfo, slice), [tileInfo, slice]);
 
-  if (unavailable) return null;
+  // With the overlay off there is nothing to author against and nothing drawn
+  // to act on -- including a Delete button for a selection the user cannot see.
+  if (unavailable || !showRois) return null;
 
   return (
     <RoiAuthorView

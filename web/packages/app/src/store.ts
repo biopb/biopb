@@ -980,6 +980,12 @@ export function selectHiddenSets(s: AppState): string[] {
  * Both conditions answered at the read, so no writer has to remember either.
  */
 export function selectDraft(s: AppState): RoiDraft | null {
+  // `showRois` off means the annotation surface is off, not just that stored
+  // shapes are hidden -- otherwise a draft keeps drawing over an overlay the
+  // user switched off, and finishing writes something they cannot see. To thin
+  // clutter while drawing, hide the noisy set instead; that is what the per-set
+  // toggles are for.
+  if (!s.showRois) return null;
   if (s.draftFor !== currentArrayId(s) || s.render3d) return null;
   // Vertices were traced against the pixels of one plane. Navigating away --
   // the slider, a keyboard scroll, or play stepping an axis -- makes them a

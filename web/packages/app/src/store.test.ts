@@ -574,3 +574,32 @@ describe("a draft does not survive a plane change", () => {
     expect(seen).toBeNull();
   });
 });
+
+describe("the overlay toggle governs the whole annotation surface", () => {
+  function drafting() {
+    useAppStore.setState({
+      activeTensorId: "first",
+      requestedArrayId: null,
+      render3d: false,
+      showRois: true,
+      slice: { ...BASE_SLICE, z: 12 },
+    });
+    useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0], [4, 0]] });
+  }
+
+  it("hides an in-progress draft, not just the stored shapes", () => {
+    // Otherwise a draft keeps drawing over an overlay the user switched off,
+    // and finishing writes an annotation they cannot see.
+    drafting();
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+    useAppStore.getState().setShowRois(false);
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("gives the draft back when the overlay comes back", () => {
+    drafting();
+    useAppStore.getState().setShowRois(false);
+    useAppStore.getState().setShowRois(true);
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+});

@@ -335,6 +335,18 @@ draft: DraftShape | null      // vertices placed so far
 selectedRoiId: string | null
 ```
 
+**The overlay toggle turns the annotation surface off, not just the stored
+shapes.** With it off nothing is drawn, no tool is offered, a click places
+nothing and selects nothing, an in-progress draft is hidden, and the authoring
+panel is gone — including the Delete button, which would otherwise act on a
+selection the user cannot see. Anything narrower makes one checkbox mean several
+things: gating only the rendering left a draft visible over a switched-off
+overlay and let it be finished into an annotation nobody could see.
+
+To thin clutter *while* drawing, hide the noisy set instead — that is what the
+per-set toggles are for. Like the plane guard, the draft is hidden rather than
+destroyed, so toggling back restores it.
+
 `tool` and the overlay toggle are viewer preferences and outlive a tensor change.
 Overlay visibility belongs in `useViewerUrlSync` so a shared link carries it.
 

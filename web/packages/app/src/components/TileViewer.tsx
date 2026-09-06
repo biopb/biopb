@@ -509,6 +509,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
 
   const onDeckClick = useCallback(
     (info_: { coordinate?: number[]; viewport?: { zoom?: number | number[] } }) => {
+      // Nothing is drawn, so nothing is placeable or selectable: the toggle
+      // turns the surface off rather than only hiding what is stored.
+      if (!showRois) return;
       const c = info_?.coordinate;
       if (!c || c[0] === undefined || c[1] === undefined) return;
       const at: XY = [c[0], c[1]];
@@ -535,7 +538,18 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
         void createRoi(completed, pinForNewRoi(info, shownPlane ?? {}, broadcastAxes));
       }
     },
-    [tool, shown, setSelectedRoi, finishDraft, setDraft, createRoi, info, shownPlane, broadcastAxes],
+    [
+      tool,
+      shown,
+      showRois,
+      setSelectedRoi,
+      finishDraft,
+      setDraft,
+      createRoi,
+      info,
+      shownPlane,
+      broadcastAxes,
+    ],
   );
 
   // Enter finishes, Escape abandons, Backspace takes back the last vertex.
