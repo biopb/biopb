@@ -98,7 +98,8 @@ user gets an ROI that follows a z-stack or a time course without duplicating it
 per plane.
 
 **The map is keyed by wire axis index, not by dim_label** — `{2: 12, 0: 0}`, not
-`{"z": 12, "t": 0}`. Labels were the first design and are wrong for a reason
+`{"z": 12, "t": 0}`. The axis is a 0-based position in the tensor's own
+`dim_labels`, and so is the index on it. Labels were the first design and are wrong for a reason
 that only shows up on real data: a label is neither guaranteed present nor
 guaranteed unique. A TIFF sequence's opaque file axis has none, and two axes of
 one tensor may share one. A label-keyed pin cannot address those axes *at all*,

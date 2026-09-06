@@ -44,8 +44,9 @@ message RoiAnnotation {
   // rescales geometry.
   ROI roi = 5;
 
-  // Sparse plane pin: axis index -> index on that axis, e.g. {2: 12} for z=12 of
-  // a TZCYX tensor. An axis ABSENT from the map applies at every index of it,
+  // Sparse plane pin: axis -> index on that axis, both 0-based. The axis is a
+  // position in the tensor's own dim_labels, so {2: 12} means "index 12 of
+  // dim_labels[2]". An axis ABSENT from the map applies at every index of it,
   // which is how one ROI follows a z-stack without being duplicated per plane.
   //
   // Keyed by position rather than dim_label, because a label is neither

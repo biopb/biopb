@@ -57,7 +57,7 @@ class TestStore:
 
     def test_round_trip_preserves_geometry_and_plane(self):
         db = MetadataDatabase()
-        # Keyed by wire axis index: 0 and 2 of a TZCYX tensor, not "t" and "z".
+        # Keyed by 0-based axis position, not by label: dim_labels[2] and [0].
         ann = _annotation(label="nucleus", set_name="nuclei", plane={2: 12, 0: 0})
         db.put_rois(ARRAY_ID, [ann])
 
