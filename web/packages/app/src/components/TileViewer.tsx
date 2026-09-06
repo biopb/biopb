@@ -32,7 +32,7 @@ import {
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import { selectHiddenSets, selectRois, useAppStore } from "../store";
-import { buildRoiLayers, currentPlaneFor } from "../utils/roiLayers";
+import { buildRoiLayers, planeFromSelection } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
 import {
@@ -405,12 +405,32 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     void loadRois(arrayId);
   }, [client, arrayId, loadRois]);
 
-  const currentPlane = useMemo(() => currentPlaneFor(info, slice), [info, slice]);
+  // The plane the overlay is drawn for is the one ON SCREEN, not the one asked
+  // for. They are the same except while a read is outstanding -- and during
+  // play the cover is deliberately dropped, so the stale plane stays visible
+  // while `slice` has already moved on. Driving the overlay from `slice` there
+  // would put plane N+1's annotations over plane N's pixels for the whole of
+  // playback: a systematic off-by-one, not a flicker.
+  //
+  // Gating on `dataValid` instead would strobe: the play driver paces on
+  // exactly that flag, so it toggles ~10 times a second while playing.
+  const shownPlane = useMemo(() => {
+    if (!info || loadedKey === null) return null;
+    return planeFromSelection(info, JSON.parse(loadedKey) as Record<string, number>);
+  }, [info, loadedKey]);
 
   const roiLayers = useMemo(
     () =>
-      buildRoiLayers({ rois, currentPlane, hiddenSets, visible: showRois }),
-    [rois, currentPlane, hiddenSets, showRois],
+      buildRoiLayers({
+        rois,
+        currentPlane: shownPlane ?? {},
+        hiddenSets,
+        // Nothing has landed yet, so no plane is on screen to annotate. An
+        // empty pin would match every unpinned annotation and draw them over a
+        // frame that is not there.
+        visible: showRois && shownPlane !== null,
+      }),
+    [rois, shownPlane, hiddenSets, showRois],
   );
 
   return (

@@ -21,7 +21,7 @@ import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { DETAIL_VIEW_ID } from "@hms-dbmi/viv";
 import { pinnableAxes, planePinFor, roiVisibleOnPlane, sliderAxes } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-client";
-import type { SliceIndices } from "./vivUtils";
+import { vivSelection, type SliceIndices } from "./vivUtils";
 
 /** An `[x, y]` in level-0 image pixels, the space deck.gl draws these in. */
 export type XY = [number, number];
@@ -36,26 +36,45 @@ export function roiLayerId(name: string): string {
 }
 
 /**
- * `dim_label -> index` for the plane on screen.
+ * `dim_label -> index` for a Viv selection (keyed by `SliderAxis.key`).
  *
- * Derived through `sliderAxes`, the same resolver the sliders use, so the
- * overlay and the controls cannot disagree about which index an axis sits on.
- * `planePinFor` then keeps only the axes an annotation can be pinned to at all.
+ * The two spellings of a plane meet here: Viv addresses axes by `t`/`z`/`c`/`a3`
+ * and the proto pins annotations by dim label. Derived through `sliderAxes`, the
+ * same resolver the sliders use, so the overlay and the controls cannot disagree
+ * about which index an axis sits on; `planePinFor` then keeps only the axes an
+ * annotation can be pinned to at all.
+ */
+export function planeFromSelection(
+  info: TileInfo | null,
+  selection: Record<string, number>,
+): Record<string, number> {
+  if (!info) return {};
+  const indexByAxis: Record<number, number> = {};
+  for (const axis of sliderAxes(info.dim_labels, info.shape)) {
+    indexByAxis[axis.axis] = selection[axis.key] ?? 0;
+  }
+  return planePinFor(pinnableAxes(info), indexByAxis);
+}
+
+/**
+ * The plane the viewer has been *asked* for.
  *
- * One implementation shared by the viewer and the panel: two derivations of
- * "which plane is this" could drift, and the symptom would be a panel count
- * that does not match what is drawn.
+ * What the panel counts against. The overlay instead draws the plane that is
+ * actually on screen -- see `planeFromSelection` at the `loadedKey` call site in
+ * TileViewer -- because during play those differ.
+ *
+ * One implementation shared by both: two derivations of "which plane is this"
+ * could drift, and the symptom would be a panel count that does not match what
+ * is drawn.
  */
 export function currentPlaneFor(
   info: TileInfo | null,
   slice: SliceIndices,
 ): Record<string, number> {
   if (!info) return {};
-  const indexByAxis: Record<number, number> = {};
-  for (const axis of sliderAxes(info.dim_labels, info.shape)) {
-    indexByAxis[axis.axis] = axis.named ? slice[axis.named] : slice.axes[axis.key] ?? 0;
-  }
-  return planePinFor(pinnableAxes(info), indexByAxis);
+  // Through vivSelection, so the indices are clamped to the tensor's extents
+  // exactly as the read path clamps them.
+  return planeFromSelection(info, vivSelection(info, slice));
 }
 
 /** Segments used to tessellate an ellipse into a polygon ring. */

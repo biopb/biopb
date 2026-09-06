@@ -5,6 +5,7 @@ import {
   buildRoiLayers,
   currentPlaneFor,
   roiLayerId,
+  planeFromSelection,
   roiPath,
   roiRing,
   roiSetCounts,
@@ -227,5 +228,46 @@ describe("buildRoiLayers", () => {
       visible: true,
     }) as Array<{ props: { pickable: boolean } }>;
     for (const layer of layers) expect(layer.props.pickable).toBe(false);
+  });
+});
+
+describe("planeFromSelection", () => {
+  const info: TileInfo = {
+    array_id: "src/Image:0",
+    dim_labels: ["t", "z", "y", "x"],
+    shape: [10, 20, 512, 512],
+    chunk_shape: [1, 1, 256, 256],
+    dtype: "uint16",
+    tile_size: 256,
+    plane: { y: 2, x: 3, s: null },
+    selectable: { t: 0, z: 1, c: null },
+    sel_axes: [],
+    levels: [],
+  };
+
+  it("translates Viv's key-addressed selection into dim-label pins", () => {
+    // This is how the overlay reads the plane that is actually on screen:
+    // TileViewer's `loadedKey` is a serialised selection of exactly this shape.
+    expect(planeFromSelection(info, { t: 3, z: 12 })).toEqual({ t: 3, z: 12 });
+  });
+
+  it("agrees with currentPlaneFor for the same position", () => {
+    // The two must not drift: one drives the overlay, the other the panel count.
+    const slice = { t: 3, z: 12, c: 0, axes: {} };
+    expect(currentPlaneFor(info, slice)).toEqual(planeFromSelection(info, { t: 3, z: 12 }));
+  });
+
+  it("reads an unnamed axis under its slider key", () => {
+    const unnamed: TileInfo = {
+      ...info,
+      dim_labels: ["POS", "z", "y", "x"],
+      shape: [5, 20, 512, 512],
+      selectable: { t: null, z: 1, c: null },
+    };
+    expect(planeFromSelection(unnamed, { a0: 2, z: 7 })).toEqual({ POS: 2, z: 7 });
+  });
+
+  it("is empty before the grid is known", () => {
+    expect(planeFromSelection(null, { z: 3 })).toEqual({});
   });
 });

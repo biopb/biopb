@@ -186,6 +186,20 @@ The current plane comes from `SliceState`, but its `axes` are keyed `a0`/`a3`
 `tileInfo.selectable` and `tileInfo.sel_axes`, which carry the wire index of each
 named and unnamed axis.
 
+**The overlay is drawn for the plane on screen, not the plane requested.** They
+differ only while a read is outstanding — and during play the "Reading plane…"
+cover is deliberately dropped, so the stale image stays visible while the slice
+index has already moved on. Driving the overlay from the requested slice there
+puts plane N+1's annotations over plane N's pixels for the whole of playback: a
+systematic off-by-one, not a flicker. So the overlay derives its pin from
+`loadedKey` (the selection that actually landed) via `planeFromSelection`, while
+the panel counts against the requested plane.
+
+Hiding the overlay on `!dataValid` instead would strobe — the play driver paces
+on exactly that flag, so it toggles ~10 times a second while playing. Outside
+play it would also be redundant: the cover is opaque and full-bleed over the
+deck canvas, so it already hides the overlay along with the stale image.
+
 Selection state (which ROI is active) is SPA-local and never written.
 
 **Every overlay layer is `pickable: false`, and not only because nothing is
