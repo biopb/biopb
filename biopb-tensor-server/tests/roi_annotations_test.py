@@ -12,9 +12,10 @@ import time
 import pyarrow.flight as flight
 import pytest
 from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
-from biopb.image.annotation_pb2 import RoiAnnotation
+from biopb.image.annotation_pb2 import RoiAnnotation, RoiPutRequest
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from google.protobuf import json_format
 
 ARRAY_ID = "zarr_a1b2c3/Image:0"
 
@@ -56,7 +57,8 @@ class TestStore:
 
     def test_round_trip_preserves_geometry_and_plane(self):
         db = MetadataDatabase()
-        ann = _annotation(label="nucleus", set_name="nuclei", plane={"z": 12, "t": 0})
+        # Keyed by 0-based axis position, not by label: dim_labels[2] and [0].
+        ann = _annotation(label="nucleus", set_name="nuclei", plane={2: 12, 0: 0})
         db.put_rois(ARRAY_ID, [ann])
 
         rois, truncated = db.list_rois(ARRAY_ID)
@@ -64,7 +66,7 @@ class TestStore:
         assert len(rois) == 1
         got = rois[0]
         assert got.label == "nucleus"
-        assert dict(got.plane) == {"z": 12, "t": 0}
+        assert dict(got.plane) == {2: 12, 0: 0}
         assert [(p.x, p.y) for p in got.roi.polygon.points] == [
             (1.0, 2.0),
             (10.0, 2.0),
@@ -704,7 +706,7 @@ class TestSidecarRoutes:
                 {
                     "label": "nucleus",
                     "setName": "nuclei",
-                    "plane": {"z": "12"},
+                    "plane": {"2": "12"},
                     "roi": {
                         "polygon": {
                             "points": [
@@ -724,7 +726,9 @@ class TestSidecarRoutes:
 
         got = client.get(f"/api/rois/{ARRAY_ID}").json()
         assert len(got["rois"]) == 1
-        assert got["rois"][0]["plane"] == {"z": "12"}
+        # A map key is always a JSON string; a uint32 VALUE is a number, since
+        # proto3 JSON stringifies only the 64-bit integer types.
+        assert got["rois"][0]["plane"] == {"2": 12}
         assert len(got["rois"][0]["roi"]["polygon"]["points"]) == 3
 
     def test_version_token_is_stripped_on_write_and_restored_on_read(
@@ -840,3 +844,61 @@ class TestSidecarRoutes:
             headers={"Sec-Fetch-Site": "cross-site"},
         )
         assert resp.status_code == 403
+
+
+class TestPositionalPlanePin:
+    """The pin is keyed by wire axis index, which is what lets it address an
+    axis the labels cannot name (biopb#935's sibling: a TIFF sequence's opaque
+    file axis, or two axes sharing a label)."""
+
+    def test_an_unlabelled_axis_can_be_pinned(self):
+        db = MetadataDatabase()
+        # Axis 0 of a tensor whose labels are ("", "z", "y", "x"): under a
+        # label-keyed pin this axis had no key at all and every annotation on it
+        # broadcast across every index.
+        db.put_rois(ARRAY_ID, [_annotation(plane={0: 3})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {0: 3}
+
+    def test_two_axes_sharing_a_label_stay_distinct(self):
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(plane={0: 1, 1: 7})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {0: 1, 1: 7}
+
+    def test_an_empty_pin_still_means_every_index(self):
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(plane={})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {}
+
+    def test_a_negative_axis_cannot_even_be_built(self):
+        # uint32 key: protobuf refuses it at assignment, so the store never
+        # needs a check and no binding can smuggle one past.
+        with pytest.raises(ValueError):
+            _annotation(plane={-1: 0})
+
+    def test_a_negative_axis_over_the_wire_is_a_422(self):
+        # The sidecar maps a ParseError to 422, so this is the client-facing
+        # rejection: no route needs its own guard.
+        with pytest.raises(json_format.ParseError):
+            json_format.ParseDict({"rois": [{"plane": {"-1": "0"}}]}, RoiPutRequest())
+
+    def test_a_negative_index_cannot_be_built_either(self):
+        # Unsigned on both halves. A negative index is not harmless nonsense:
+        # it matches no real index, so an annotation carrying one would be
+        # hidden on every plane rather than shown on all of them.
+        with pytest.raises(ValueError):
+            _annotation(plane={0: -5})
+
+    def test_a_negative_index_over_the_wire_is_a_422(self):
+        with pytest.raises(json_format.ParseError):
+            json_format.ParseDict({"rois": [{"plane": {"0": "-5"}}]}, RoiPutRequest())
+
+    def test_an_out_of_range_axis_is_accepted_and_simply_matches_nothing(self):
+        # The write path binds no tensor, so it has no rank to check against.
+        # Storing it is harmless: no reader is ever on axis 99.
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(plane={99: 0})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {99: 0}

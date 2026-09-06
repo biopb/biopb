@@ -141,10 +141,22 @@ export function encodeRoiGeometry(geometry: RoiGeometry): Json {
 // Annotation
 // ---------------------------------------------------------------------------
 
-function decodePlane(value: unknown): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const [label, index] of Object.entries(obj(value))) {
-    out[label] = num(index);
+/**
+ * The plane pin, `{"2": 12}` on the wire: axis 2 at index 12.
+ *
+ * Both halves are uint32, so unlike the int64 fields the VALUE is a plain JSON
+ * number -- proto3 stringifies only the 64-bit integer types. The key is a
+ * string regardless, because a JSON object key always is.
+ *
+ * Neither half can be negative from a conforming server, so the guards below
+ * are belt-and-braces against one that is not.
+ */
+function decodePlane(value: unknown): Record<number, number> {
+  const out: Record<number, number> = {};
+  for (const [axis, index] of Object.entries(obj(value))) {
+    const key = Number(axis);
+    const at = num(index);
+    if (Number.isInteger(key) && key >= 0 && at >= 0) out[key] = at;
   }
   return out;
 }
@@ -206,9 +218,10 @@ export function encodeRoiAnnotation(input: RoiAnnotationInput): Json {
   if (input.setName) out.setName = input.setName;
   if (input.label) out.label = input.label;
   if (input.plane && Object.keys(input.plane).length > 0) {
-    // int64 map values: strings, the canonical form.
+    // Numbers, not strings: uint32 is small enough that proto3 JSON spells it
+    // as a number, and this is what the server echoes back.
     out.plane = Object.fromEntries(
-      Object.entries(input.plane).map(([label, index]) => [label, String(Math.trunc(index))]),
+      Object.entries(input.plane).map(([axis, index]) => [axis, Math.trunc(index)]),
     );
   }
   if (input.props && Object.keys(input.props).length > 0) {

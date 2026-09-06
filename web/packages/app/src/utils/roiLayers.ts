@@ -36,18 +36,16 @@ export function roiLayerId(name: string): string {
 }
 
 /**
- * `dim_label -> index` for a Viv selection (keyed by `SliderAxis.key`).
+ * `axis -> index` for a Viv selection (which is keyed by `SliderAxis.key`).
  *
  * The two spellings of a plane meet here: Viv addresses axes by `t`/`z`/`c`/`a3`
- * and the proto pins annotations by dim label. Derived through `sliderAxes`, the
- * same resolver the sliders use, so the overlay and the controls cannot disagree
- * about which index an axis sits on; `planePinFor` then keeps only the axes an
- * annotation can be pinned to at all.
+ * and the proto pins annotations by wire axis index. Both come from
+ * `sliderAxes`, so they cannot disagree about which axis a key names.
  */
 export function planeFromSelection(
   info: TileInfo | null,
   selection: Record<string, number>,
-): Record<string, number> {
+): Record<number, number> {
   if (!info) return {};
   const indexByAxis: Record<number, number> = {};
   for (const axis of sliderAxes(info.dim_labels, info.shape)) {
@@ -70,7 +68,7 @@ export function planeFromSelection(
 export function currentPlaneFor(
   info: TileInfo | null,
   slice: SliceIndices,
-): Record<string, number> {
+): Record<number, number> {
   if (!info) return {};
   // Through vivSelection, so the indices are clamped to the tensor's extents
   // exactly as the read path clamps them.
@@ -154,7 +152,7 @@ export function roiPath(geometry: RoiGeometry): XY[] | null {
  */
 export function visibleRois(
   rois: RoiAnnotation[],
-  currentPlane: Record<string, number>,
+  currentPlane: Record<number, number>,
   hiddenSets: string[],
 ): RoiAnnotation[] {
   const hidden = new Set(hiddenSets);
@@ -174,8 +172,8 @@ export function roiSetCounts(rois: RoiAnnotation[]): Array<{ setName: string; co
 
 export interface RoiLayerOptions {
   rois: RoiAnnotation[];
-  /** `dim_label -> index` for the plane on screen; see `planePinFor`. */
-  currentPlane: Record<string, number>;
+  /** `axis -> index` for the plane on screen; see `planePinFor`. */
+  currentPlane: Record<number, number>;
   hiddenSets: string[];
   /** The overlay toggle. False yields no layers at all rather than hidden ones. */
   visible: boolean;

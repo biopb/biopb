@@ -58,13 +58,13 @@ describe("RoiPanelView", () => {
   it("counts what is on this plane against the whole set", () => {
     const html = render({
       rois: [
-        roi({ roiId: "a", plane: { z: 4 } }),
-        roi({ roiId: "b", plane: { z: 9 } }),
+        roi({ roiId: "a", plane: { 1: 4 } }),
+        roi({ roiId: "b", plane: { 1: 9 } }),
         roi({ roiId: "c" }),
       ],
-      currentPlane: { z: 4 },
+      currentPlane: { 1: 4 },
     });
-    // The z=4 one and the unpinned one, out of three.
+    // The axis-1=4 one and the unpinned one, out of three.
     expect(html).toContain("2 of 3 here");
   });
 

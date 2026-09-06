@@ -44,12 +44,21 @@ message RoiAnnotation {
   // rescales geometry.
   ROI roi = 5;
 
-  // Sparse plane pin: dim_label -> index (e.g. {"z": 12, "t": 0}). A dimension
-  // ABSENT from the map means "applies at every index of that dimension", which
-  // is how one ROI follows a z-stack or a time course without being duplicated
-  // per plane. Keyed by label rather than fixed t/z/c fields because dim_labels
-  // are per-tensor.
-  map<string, int64> plane = 6;
+  // Sparse plane pin: axis -> index on that axis, both 0-based. The axis is a
+  // position in the tensor's own dim_labels, so {2: 12} means "index 12 of
+  // dim_labels[2]". An axis ABSENT from the map applies at every index of it,
+  // which is how one ROI follows a z-stack without being duplicated per plane.
+  //
+  // Keyed by position rather than dim_label, because a label is neither
+  // guaranteed present nor unique -- a TIFF sequence's file axis has none, two
+  // axes may share one -- and an axis the pin cannot name is one every
+  // annotation silently broadcasts across. Show the label, store the index.
+  //
+  // Field 6 held the label-keyed form; reserved rather than reused, because the
+  // map entry's key changes wire type and an old encoder's bytes would misparse
+  // rather than fail.
+  reserved 6;
+  map<uint32, uint32> plane = 12;
 
   // Free-form client JSON (colour, score, author, ...). Opaque to the server.
   string props_json = 7;

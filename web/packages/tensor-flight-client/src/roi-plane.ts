@@ -2,64 +2,46 @@
  * Which axes an annotation can be pinned to, and whether one shows on the plane
  * currently in view.
  *
- * Pure and free of any app state on purpose: the SPA's slice selection is keyed
- * by `SliderAxis.key` (`a0`, `a3`), while the proto keys `plane` by *dim label*.
- * The caller translates its own selection into `indexByAxis` (wire index ->
- * index) and this owns the label half.
+ * Pins are keyed by **wire axis index**, matching `RoiAnnotation.plane`. A label
+ * cannot address every axis -- a TIFF sequence's opaque file axis has none, and
+ * two axes of one tensor may share one -- and an axis a pin cannot name is an
+ * axis every annotation silently broadcasts across.
+ *
+ * Pure and free of app state: the SPA's slice selection is keyed by
+ * `SliderAxis.key`, so the caller translates its own selection into
+ * `indexByAxis` and this owns the rest.
  */
 
+import { sliderAxes, type SliderAxis } from "./tensor-array.js";
 import type { TileInfo } from "./types.js";
-
-/** A non-plane axis that can carry a plane pin, with the label it is keyed by. */
-export interface PinnableAxis {
-  /** Wire index, i.e. position in `dim_labels`/`shape`. */
-  axis: number;
-  label: string;
-}
 
 /**
  * The axes a new annotation can be pinned to.
  *
- * Excluded, in each case because there is no key to hold the pin under:
+ * `sliderAxes` already drops the display plane's own axes (`y`, `x`, and `s` for
+ * interleaved RGB), which geometry addresses rather than the pin. This drops one
+ * more: an axis of extent 1, where a pin says nothing because every annotation
+ * is on index 0.
  *
- * - The display plane's own axes (`y`, `x`, and `s` for interleaved RGB) --
- *   geometry addresses those, not the pin.
- * - Axes of extent 1: pinning one says nothing, since every ROI is on index 0.
- * - **Unlabelled or duplicate-labelled axes.** A TIFF sequence's `i` or the
- *   second of two axes sharing a label cannot be named, and inventing a
- *   synthetic key (`"3"`, say) would be a client-side dialect the Python SDK
- *   does not share. An ROI on such a tensor is simply not pinned on that axis,
- *   so it shows at every index of it.
+ * Deliberately derived from `sliderAxes` rather than from `TileInfo.plane`: the
+ * pin has to name axes the user can actually navigate, and those are the ones
+ * the sliders offer. Two derivations of "is this a plane axis?" could disagree,
+ * and the pin would then name an axis with no control behind it.
  */
-export function pinnableAxes(tileInfo: TileInfo): PinnableAxis[] {
-  const planeAxes = new Set<number>([tileInfo.plane.y, tileInfo.plane.x]);
-  if (tileInfo.plane.s !== null) planeAxes.add(tileInfo.plane.s);
-
-  const seen = new Map<string, number>();
-  for (const label of tileInfo.dim_labels) {
-    seen.set(label, (seen.get(label) ?? 0) + 1);
-  }
-
-  const out: PinnableAxis[] = [];
-  tileInfo.dim_labels.forEach((label, axis) => {
-    if (planeAxes.has(axis)) return;
-    if ((tileInfo.shape[axis] ?? 1) <= 1) return;
-    if (!label || (seen.get(label) ?? 0) > 1) return;
-    out.push({ axis, label });
-  });
-  return out;
+export function pinnableAxes(tileInfo: TileInfo): SliderAxis[] {
+  return sliderAxes(tileInfo.dim_labels, tileInfo.shape).filter((axis) => axis.extent > 1);
 }
 
-/** The `dim_label -> index` pin for a view sitting at `indexByAxis`. */
+/** The `axis -> index` pin for a view sitting at `indexByAxis`. */
 export function planePinFor(
-  axes: PinnableAxis[],
+  axes: SliderAxis[],
   indexByAxis: Record<number, number>,
-): Record<string, number> {
-  const pin: Record<string, number> = {};
-  for (const { axis, label } of axes) {
+): Record<number, number> {
+  const pin: Record<number, number> = {};
+  for (const { axis } of axes) {
     const index = indexByAxis[axis];
     if (typeof index === "number" && Number.isFinite(index)) {
-      pin[label] = Math.trunc(index);
+      pin[axis] = Math.trunc(index);
     }
   }
   return pin;
@@ -73,16 +55,16 @@ export function planePinFor(
  * without being duplicated per plane, and reading it the other way round would
  * hide nearly everything.
  *
- * A pin naming a dimension `current` says nothing about is treated as visible:
- * the pin cannot be evaluated, and showing an extra ROI is recoverable where
+ * A pin naming an axis `current` says nothing about is treated as visible: the
+ * pin cannot be evaluated, and showing an extra ROI is recoverable where
  * silently hiding one is not.
  */
 export function roiVisibleOnPlane(
-  roiPlane: Record<string, number>,
-  current: Record<string, number>,
+  roiPlane: Record<number, number>,
+  current: Record<number, number>,
 ): boolean {
-  for (const [label, index] of Object.entries(roiPlane)) {
-    const here = current[label];
+  for (const [key, index] of Object.entries(roiPlane)) {
+    const here = current[Number(key)];
     if (here !== undefined && here !== index) return false;
   }
   return true;

@@ -139,7 +139,7 @@ class _PreparedRoi:
     set_name: str
     label: str
     shape_kind: str
-    plane: Dict[str, int]
+    plane: Dict[int, int]
     bbox: List[float]
     geometry: str
     props_json: Optional[str]
@@ -179,8 +179,8 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
     """Validate one annotation and derive its stored columns.
 
     Raises:
-        ValueError: unusable geometry, an array_id that contradicts the batch's,
-            or a negative plane index.
+        ValueError: unusable geometry, or an array_id that contradicts the
+            batch's.
     """
     if roi.array_id and roi.array_id != array_id:
         raise ValueError(
@@ -213,9 +213,9 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
             f"segmentation belongs in a label tensor."
         )
 
-    for dim, index in roi.plane.items():
-        if index < 0:
-            raise ValueError(f"Plane index for {dim!r} is negative: {index}")
+    # The plane pin is unvalidated: uint32 rules out a negative axis or index,
+    # and the rank cannot be checked because this path binds no tensor -- a pin
+    # naming an axis the tensor lacks simply matches nothing.
 
     return _PreparedRoi(
         roi_id=roi_id or uuid.uuid4().hex,
@@ -522,11 +522,14 @@ class MetadataDatabase:
                 -- point|rectangle|ellipse|polygon, denormalized from the geometry
                 -- for filtering. mask/mesh are rejected on write.
                 shape_kind TEXT NOT NULL,
-                -- Sparse plane pin, dim_label -> index. A dimension ABSENT from
-                -- the map applies at every index of that dimension, so one ROI
-                -- can follow a z-stack without being duplicated per plane. Keyed
-                -- by label because dim_labels are per-tensor.
-                plane MAP(VARCHAR, BIGINT),
+                -- Sparse plane pin, WIRE AXIS INDEX -> index on that axis. A
+                -- dimension ABSENT from the map applies at every index of it, so
+                -- one ROI can follow a z-stack without being duplicated per
+                -- plane. Keyed by position, not label: a label is neither
+                -- guaranteed present nor unique, so it cannot address every axis
+                -- (see annotation.proto). Reading this column against a tensor's
+                -- dim_labels is what turns an index back into a name.
+                plane MAP(UINTEGER, UINTEGER),
                 -- [x0, y0, x1, y1] in level-0 pixels, derived server-side. Unused
                 -- by the viewer read path (which fetches a tensor's whole set);
                 -- it is what makes the SQL surface useful.
