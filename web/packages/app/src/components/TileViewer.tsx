@@ -499,7 +499,12 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     };
   }, [draft]);
 
-  const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, defaultBroadcastAxes(info)));
+  // Memoised because the selector hands `defaults` straight back when the store
+  // holds no per-tensor choice: computing it inside the selector would return a
+  // new array on every snapshot read, which zustand v5 reads as a changed slice
+  // and React turns into an unbounded re-render.
+  const broadcastDefaults = useMemo(() => defaultBroadcastAxes(info), [info]);
+  const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, broadcastDefaults));
 
   const finishDraft = useCallback(() => {
     const geometry = closeDraft(draftRef.current);
