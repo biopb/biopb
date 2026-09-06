@@ -213,12 +213,9 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
             f"segmentation belongs in a label tensor."
         )
 
-    # The plane pin needs no validation here. Both halves are uint32, so a
-    # negative axis or index cannot reach this point -- protobuf refuses one at
-    # assignment and json_format refuses it on parse, which covers every binding
-    # rather than only this one. The rank is deliberately unchecked: the write
-    # path binds no tensor, so it has no descriptor to check against, and a pin
-    # naming an axis the tensor does not have simply matches nothing.
+    # The plane pin is unvalidated: uint32 rules out a negative axis or index,
+    # and the rank cannot be checked because this path binds no tensor -- a pin
+    # naming an axis the tensor lacks simply matches nothing.
 
     return _PreparedRoi(
         roi_id=roi_id or uuid.uuid4().hex,

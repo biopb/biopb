@@ -44,43 +44,18 @@ message RoiAnnotation {
   // rescales geometry.
   ROI roi = 5;
 
-  // Sparse plane pin: WIRE AXIS INDEX -> index on that axis (e.g. {2: 12} for
-  // z=12 of a TZCYX tensor). A dimension ABSENT from the map means "applies at
-  // every index of that dimension", which is how one ROI follows a z-stack or a
-  // time course without being duplicated per plane.
+  // Sparse plane pin: axis index -> index on that axis, e.g. {2: 12} for z=12 of
+  // a TZCYX tensor. An axis ABSENT from the map applies at every index of it,
+  // which is how one ROI follows a z-stack without being duplicated per plane.
   //
-  // Keyed by position, not by dim_label. A label is neither guaranteed present
-  // nor guaranteed unique -- a TIFF sequence's opaque file axis has none, and
-  // two axes of one tensor may share one -- so a label-keyed pin simply cannot
-  // address those axes, and an annotation on them silently broadcasts across
-  // every index instead. Position can address every axis, and it is the same
-  // basis the geometry already uses (coordinates are in the tensor's own Y/X
-  // axes, found positionally).
+  // Keyed by position rather than dim_label, because a label is neither
+  // guaranteed present nor unique -- a TIFF sequence's file axis has none, two
+  // axes may share one -- and an axis the pin cannot name is one every
+  // annotation silently broadcasts across. Show the label, store the index.
   //
-  // The label remains the right thing to SHOW; any client with the descriptor
-  // has it. It is deliberately not carried here as well: two spellings of one
-  // axis could disagree, and then neither would be authoritative.
-  //
-  // Both halves are uint32, following biopb.image throughout: every integer in
-  // this package is unsigned (Mesh.Face's vertex indices, image_data's sizes,
-  // offsets and dims), because none of them can be negative.
-  //
-  // That is a correctness choice, not tidiness. A negative index is not a
-  // harmless nonsense value: it matches no real index, so an annotation
-  // carrying one is hidden on EVERY plane rather than shown on all of them --
-  // the failure disappears instead of announcing itself. Unsigned makes it
-  // unrepresentable, and both client paths refuse one at the boundary (direct
-  // assignment raises; json_format rejects it, so the sidecar answers 422),
-  // which no hand-written check could cover for every binding.
-  //
-  // The ceiling this accepts is ~4.3e9 per axis and ~4.3e9 axes. descriptor.proto
-  // types a tensor's shape int64, so an axis longer than that is expressible
-  // there and not here; it is not a physical image, and biopb.image has already
-  // taken the same ceiling for its own sizes and offsets.
-  //
-  // Field 6 held the label-keyed form (map<string, int64>) and is reserved
-  // rather than reused: the map entry's key changes wire type, so an old
-  // encoder's bytes would misparse rather than fail.
+  // Field 6 held the label-keyed form; reserved rather than reused, because the
+  // map entry's key changes wire type and an old encoder's bytes would misparse
+  // rather than fail.
   reserved 6;
   map<uint32, uint32> plane = 12;
 
