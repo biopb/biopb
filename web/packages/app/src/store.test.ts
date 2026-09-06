@@ -511,3 +511,66 @@ describe("authoring state", () => {
     expect(selectSelectedRoi(useAppStore.getState())).toBeNull();
   });
 });
+
+describe("a draft does not survive a plane change", () => {
+  function startDraft() {
+    useAppStore.setState({
+      activeTensorId: "first",
+      requestedArrayId: null,
+      render3d: false,
+      slice: { ...BASE_SLICE, z: 12 },
+    });
+    useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0], [4, 0]] });
+  }
+
+  it("is there while the plane holds still", () => {
+    startDraft();
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+
+  it("goes when the slider moves", () => {
+    // The vertices were traced against another plane's pixels; finishing here
+    // would pin the shape to a plane it was not drawn on.
+    startDraft();
+    useAppStore.getState().setSlice({ z: 13 });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("goes when play steps any axis", () => {
+    startDraft();
+    useAppStore.getState().setSlice({ t: 1 });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("goes when an unnamed axis moves", () => {
+    startDraft();
+    useAppStore.getState().setSlice({ axes: { a0: 2 } });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("survives a contrast or gamma change", () => {
+    // Those ride SliceState too, and neither invalidates a shape being drawn.
+    startDraft();
+    useAppStore.getState().setSlice({ gamma: 2.2 });
+    useAppStore.getState().setSlice({ contrastMode: "fixed" });
+    useAppStore.getState().setSlice({ percentileScale: 2 });
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+
+  it("comes back if the plane comes back", () => {
+    // A stray scroll costs nothing; the draft is hidden, not destroyed.
+    startDraft();
+    useAppStore.getState().setSlice({ z: 13 });
+    useAppStore.getState().setSlice({ z: 12 });
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+
+  it("a click after the plane moved starts a fresh draft, not a continuation", () => {
+    // TileViewer places through `selectDraft`, so the stale vertices are not
+    // extended -- this is the behaviour the hidden-not-destroyed choice rests on.
+    startDraft();
+    useAppStore.getState().setSlice({ z: 13 });
+    const seen = selectDraft(useAppStore.getState());
+    expect(seen).toBeNull();
+  });
+});

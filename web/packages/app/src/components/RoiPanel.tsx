@@ -39,7 +39,7 @@ import {
   setColor,
   visibleRois,
 } from "../utils/roiLayers";
-import { pinnableAxes } from "@biopb/tensor-flight-client";
+import { pinnableAxes, roiVisibleOnPlane } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, SliderAxis } from "@biopb/tensor-flight-client";
 
 function swatch(setName: string) {
@@ -230,6 +230,11 @@ export function RoiAuthorView({
   onDeleteSelected,
 }: RoiAuthorViewProps) {
   const broadcast = new Set(broadcastAxes);
+  // Only a selection that is actually drawn. The Delete button acts on it, and
+  // a plane change must not leave the user able to delete a shape they cannot
+  // see -- the selection itself survives, so scrubbing back brings it into
+  // reach again.
+  const shown = selected && roiVisibleOnPlane(selected.plane, currentPlane) ? selected : null;
   return (
     <div className="roi-author">
       <label className="roi-field">
@@ -274,16 +279,16 @@ export function RoiAuthorView({
         </>
       )}
 
-      {selected && (
+      {shown && (
         <div className="roi-selected">
           <div className="roi-field-head">Selected</div>
           <div>
-            {selected.label || <em>no label</em>} — {selected.geometry.kind} in {selected.setName}
+            {shown.label || <em>no label</em>} — {shown.geometry.kind} in {shown.setName}
           </div>
           <div className="roi-count">
-            {Object.keys(selected.plane).length === 0
+            {Object.keys(shown.plane).length === 0
               ? "on every plane"
-              : `pinned: ${Object.entries(selected.plane)
+              : `pinned: ${Object.entries(shown.plane)
                   .map(([axis, index]) => `${axisTitle(axes, Number(axis))} ${index}`)
                   .join(", ")}`}
           </div>

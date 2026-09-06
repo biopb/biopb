@@ -208,6 +208,8 @@ export interface AppState {
   draft: RoiDraft | null;
   /** The tensor the draft is being drawn on. See `selectDraft`. */
   draftFor: string | null;
+  /** The slice position it is being drawn at. See `selectDraft`. */
+  draftSliceKey: string | null;
   /** Selected annotation. Read through `selectSelectedRoi`, which validates it. */
   selectedRoiId: string | null;
   /** Label and set the next new annotation gets. Preferences, kept across tensors. */
@@ -412,6 +414,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   tool: "select",
   draft: null,
   draftFor: null,
+  draftSliceKey: null,
   selectedRoiId: null,
   newLabel: "",
   newSetName: "",
@@ -600,11 +603,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   setTool(tool) {
     // A draft belongs to the tool that started it; switching abandons it rather
     // than reinterpreting placed vertices under different rules.
-    set((s) => (s.tool === tool ? s : { tool, draft: null, draftFor: null }));
+    set((s) =>
+      s.tool === tool ? s : { tool, draft: null, draftFor: null, draftSliceKey: null },
+    );
   },
 
   setDraft(draft) {
-    set({ draft, draftFor: draft ? currentArrayId(get()) : null });
+    set({
+      draft,
+      draftFor: draft ? currentArrayId(get()) : null,
+      draftSliceKey: draft ? sliceKey(get().slice) : null,
+    });
   },
 
   setSelectedRoi(roiId) {
@@ -948,6 +957,16 @@ export function selectRoisError(s: AppState): string | null {
   return s.roisErrorFor === currentArrayId(s) ? s.roisError : null;
 }
 
+/**
+ * A stable key for the slice position, for spotting that it has moved.
+ *
+ * Only the indices: contrast, gamma and the percentile window ride `SliceState`
+ * too, and none of them invalidate a shape being drawn.
+ */
+export function sliceKey(slice: SliceState): string {
+  return `${slice.t}|${slice.z}|${slice.c}|${JSON.stringify(slice.axes)}`;
+}
+
 /** Sets hidden in the tensor in view. Names do not carry across tensors. */
 export function selectHiddenSets(s: AppState): string[] {
   return s.hiddenSetsFor === currentArrayId(s) ? s.hiddenSets : NO_SETS;
@@ -961,7 +980,13 @@ export function selectHiddenSets(s: AppState): string[] {
  * Both conditions answered at the read, so no writer has to remember either.
  */
 export function selectDraft(s: AppState): RoiDraft | null {
-  return s.draftFor === currentArrayId(s) && !s.render3d ? s.draft : null;
+  if (s.draftFor !== currentArrayId(s) || s.render3d) return null;
+  // Vertices were traced against the pixels of one plane. Navigating away --
+  // the slider, a keyboard scroll, or play stepping an axis -- makes them a
+  // shape drawn on an image nobody is looking at any more, and finishing there
+  // would pin it to the plane it was NOT drawn on. Answered at the read, so
+  // every route that moves the slice is covered without naming any of them.
+  return s.draftSliceKey === sliceKey(s.slice) ? s.draft : null;
 }
 
 /**

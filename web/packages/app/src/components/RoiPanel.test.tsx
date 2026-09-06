@@ -205,3 +205,37 @@ describe("RoiAuthorView", () => {
     expect(renderAuthor({ writeError: "422 rejected" })).toContain("422 rejected");
   });
 });
+
+describe("RoiAuthorView selection and the plane", () => {
+  const pinned = {
+    roiId: "r1",
+    arrayId: "src",
+    setName: "nuclei",
+    label: "cell",
+    geometry: { kind: "point" as const, at: { x: 1, y: 1 } },
+    plane: { 2: 12 },
+    props: {},
+    rev: 1,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+
+  it("offers Delete for a selection on this plane", () => {
+    expect(renderAuthor({ selected: pinned, currentPlane: { 2: 12 } })).toContain("Delete");
+  });
+
+  it("withholds it once the plane moves off the selection", () => {
+    // Deleting a shape the user cannot see is what a plane change must not set
+    // up. The selection itself survives, so scrubbing back brings it into reach.
+    const html = renderAuthor({ selected: pinned, currentPlane: { 2: 13 } });
+    expect(html).not.toContain("Delete");
+    // The set name is unique to the selected block; "cell" is also the Label
+    // input's placeholder, so it is in the markup either way.
+    expect(html).not.toContain("nuclei");
+  });
+
+  it("keeps an unpinned selection reachable on every plane", () => {
+    const html = renderAuthor({ selected: { ...pinned, plane: {} }, currentPlane: { 2: 99 } });
+    expect(html).toContain("Delete");
+  });
+});

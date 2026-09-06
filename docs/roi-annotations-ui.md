@@ -287,9 +287,30 @@ section can promise a control for every axis rather than a silent exception.
 **Vertex editing** needs the `DetailView` subclass described above to toggle
 `dragPan` for the duration of a drag.
 
-**The draft is cleared on a render-mode flip as well as on a tensor change.** The
-tool is a preference and can survive a trip through 3-D; a half-placed polygon
-reappearing afterwards is only confusing.
+**A draft does not survive a plane change**, nor a render-mode flip or a tensor
+change. Vertices are traced against the pixels of one plane, so navigating away
+leaves a shape drawn on an image nobody is looking at — and finishing it there
+would pin it to the plane it was *not* drawn on, which is silently wrong data
+rather than a visible mistake.
+
+`selectDraft` answers all three at the read, comparing a key built from the
+slice indices only: contrast, gamma and the percentile window ride `SliceState`
+too and none of them invalidate a shape. That covers every route that moves the
+slice — slider, keyboard, play, a link — without enumerating them, which matters
+because play steps an axis every 100 ms and would otherwise let a polygon be
+finished several frames from where it began.
+
+The draft is hidden rather than destroyed, so a stray scroll costs nothing:
+scrub back and it is there. A click after the plane moved starts a fresh draft
+rather than extending the stale one, because placement goes through the same
+selector.
+
+The tool itself is a preference and survives all of this.
+
+**A selection is only actionable while it is drawn.** The Delete button acts on
+it, so a plane change must not leave the user able to delete a shape they cannot
+see. The selection survives the move — scrubbing back brings it into reach —
+but the panel withholds it meanwhile.
 
 ## State
 
