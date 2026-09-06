@@ -292,3 +292,79 @@ describe("ROI state across a tensor change", () => {
     expect(selectRoisLoading(useAppStore.getState())).toBe(true);
   });
 });
+
+describe("loadRois", () => {
+  /** A client whose listRois records what it was asked for. */
+  function stubClient(asked: string[]) {
+    return {
+      http: {
+        listRois: (arrayId: string) => {
+          asked.push(arrayId);
+          return Promise.resolve({ rois: [], truncated: false, skipped: 0 });
+        },
+      },
+    } as unknown as TensorFlightClient;
+  }
+
+  it("fetches the tensor in view", async () => {
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: null,
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first"]);
+    expect(useAppStore.getState().roisFor).toBe("first");
+  });
+
+  it("refuses a tensor that is not in view", async () => {
+    // Nothing could display it: every selector hides a set whose tensor is not
+    // the current one, so the round trip would be pure waste.
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: null,
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("second");
+    expect(asked).toEqual([]);
+  });
+
+  it("follows the pinned address when a link named one", async () => {
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: "first@9f1c4e2b",
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual([]);
+    await useAppStore.getState().loadRois("first@9f1c4e2b");
+    expect(asked).toEqual(["first@9f1c4e2b"]);
+  });
+
+  it("asks once for a set it already holds", async () => {
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: null,
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first"]);
+  });
+});

@@ -515,6 +515,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   async loadRois(arrayId) {
     const { client } = get();
     if (!client) return;
+    // Only the tensor in view is worth asking about. Every selector above hides
+    // a set belonging to another tensor, so a fetch for anything else could
+    // never be shown -- enforced here rather than trusted to the callers, the
+    // same way the reads are guarded rather than the writers.
+    if (currentArrayId(get()) !== arrayId) return;
     // Idempotent: already held, or already asked for. Callers fire this from a
     // mount effect, and the 2-D subtree remounts on every render-mode flip.
     if (get().roisFor === arrayId || get().roisPending === arrayId) return;
