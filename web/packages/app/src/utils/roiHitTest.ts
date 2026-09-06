@@ -56,15 +56,27 @@ function distanceToPath(at: XY, path: XY[]): number {
  * Whether `at` hits this annotation, with `slop` in world units.
  *
  * A filled shape hits anywhere inside it *or* within slop of its outline, so a
- * thin sliver is still selectable; an open path and a point hit by proximity.
+ * thin sliver is still selectable; a point hits by proximity.
+ *
+ * A polyline hits within its own stroke plus the slop. `width` is geometry --
+ * the band of pixels the scribble covered, in world units -- so a fat stroke is
+ * grabbable anywhere it is drawn, not only near its centreline. Same half-width
+ * the store pads the bbox by (`_roi_bbox`), so what is selectable and what the
+ * SQL surface reports as covered agree.
  */
 export function hitsRoi(roi: RoiAnnotation, at: XY, slop: number): boolean {
   if (roi.geometry.kind === "point") {
     const { x, y } = roi.geometry.at;
     return Math.hypot(at[0] - x, at[1] - y) <= slop;
   }
-  const path = roiPath(roi.geometry);
-  if (path) return path.length > 1 && distanceToPath(at, path) <= slop;
+  if (roi.geometry.kind === "polyline") {
+    const path = roiPath(roi.geometry);
+    if (!path || path.length < 2) return false;
+    // Slop stays screen-constant while the stroke scales with the image, which
+    // is what each of them is for: one is pointing tolerance, the other is the
+    // shape.
+    return distanceToPath(at, path) <= Math.abs(roi.geometry.width) / 2 + slop;
+  }
   const ring = roiRing(roi.geometry);
   if (!ring || ring.length === 0) return false;
   if (pointInRing(at, ring)) return true;

@@ -67,7 +67,7 @@ describe("hitsRoi", () => {
     expect(hitsRoi(roi(SQUARE), [-20, 50], 5)).toBe(false);
   });
 
-  it("hits a polyline by proximity to the stroke", () => {
+  it("hits a hairline polyline by proximity alone", () => {
     const line: RoiGeometry = {
       kind: "polyline",
       points: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
@@ -75,6 +75,45 @@ describe("hitsRoi", () => {
     };
     expect(hitsRoi(roi(line), [50, 3], 5)).toBe(true);
     expect(hitsRoi(roi(line), [50, 30], 5)).toBe(false);
+  });
+
+  it("hits a fat polyline anywhere inside its stroke", () => {
+    // `width` is geometry -- the band of pixels the scribble covered -- so a
+    // click on the drawn band must land even far from the centreline.
+    const fat: RoiGeometry = {
+      kind: "polyline",
+      points: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+      width: 40,
+    };
+    expect(hitsRoi(roi(fat), [50, 18], 1)).toBe(true);
+    // 20 of half-width plus 1 of slop.
+    expect(hitsRoi(roi(fat), [50, 20.5], 1)).toBe(true);
+    expect(hitsRoi(roi(fat), [50, 22], 1)).toBe(false);
+  });
+
+  it("adds the slop to the stroke rather than replacing it", () => {
+    const fat: RoiGeometry = {
+      kind: "polyline",
+      points: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+      width: 10,
+    };
+    // Half-width 5; slop 5 reaches 10, slop 1 only 6.
+    expect(hitsRoi(roi(fat), [50, 9], 5)).toBe(true);
+    expect(hitsRoi(roi(fat), [50, 9], 1)).toBe(false);
+  });
+
+  it("takes a negative width as its magnitude, as the bbox does", () => {
+    const odd: RoiGeometry = {
+      kind: "polyline",
+      points: [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+      width: -40,
+    };
+    expect(hitsRoi(roi(odd), [50, 18], 1)).toBe(true);
+  });
+
+  it("refuses a polyline of one vertex, which has no segment", () => {
+    const stub: RoiGeometry = { kind: "polyline", points: [{ x: 0, y: 0 }], width: 40 };
+    expect(hitsRoi(roi(stub), [0, 0], 5)).toBe(false);
   });
 
   it("hits a point by proximity", () => {
@@ -105,6 +144,19 @@ describe("roiAt", () => {
 
   it("returns null where nothing is", () => {
     expect(roiAt(rois, [500, 500], 1)).toBeNull();
+  });
+
+  it("keeps a stroke's own width fixed while the slop scales with zoom", () => {
+    // The band is part of the image; the tolerance is part of the pointer.
+    const fat = [
+      roi({ kind: "polyline", points: [{ x: 0, y: 0 }, { x: 100, y: 0 }], width: 40 }),
+    ];
+    // 18 is inside the stroke at any zoom.
+    expect(roiAt(fat, [50, 18], 1)?.roiId).toBe("r");
+    expect(roiAt(fat, [50, 18], 4)?.roiId).toBe("r");
+    // 40 is outside it, and only the zoomed-out slop can reach.
+    expect(roiAt(fat, [50, 40], 1)).toBeNull();
+    expect(roiAt(fat, [50, 40], 4)?.roiId).toBe("r");
   });
 
   it("scales its tolerance with the zoom", () => {

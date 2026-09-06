@@ -212,7 +212,15 @@ picking. That costs nothing extra — the whole annotation set is already reside
 which is one of the reasons the read path fetches it whole — and it is what the
 whole-set fetch was justified by in the first place. A filled shape hits anywhere
 inside it *or* within a few screen pixels of its outline, so a thin sliver stays
-selectable; an open path and a point hit by proximity. The tolerance is scaled by
+selectable, and a point hits by proximity.
+
+A polyline hits within **its own stroke plus** that tolerance. `width` is
+geometry — the band of pixels the scribble covered — so a fat stroke has to be
+grabbable anywhere it is drawn, not only near its centreline. The two terms are
+different things and scale differently: the stroke is part of the image and
+scales with it, the tolerance is part of the pointer and stays screen-constant.
+It is the same half-width the store pads the bbox by, so what is selectable and
+what the SQL surface reports as covered agree. The tolerance is scaled by
 world-units-per-pixel, read off `info.viewport.zoom` at click time rather than
 from the store's mirrored camera, which trails a gesture by `CAMERA_MIRROR_MS`.
 
