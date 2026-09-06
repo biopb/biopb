@@ -7,6 +7,8 @@ import {
   selectRoisLoading,
   selectRoisSkipped,
   selectRoisTruncated,
+  selectDraft,
+  selectSelectedRoi,
   selectTileInfo,
   useAppStore,
 } from "./store";
@@ -366,5 +368,146 @@ describe("loadRois", () => {
     await useAppStore.getState().loadRois("first");
     await useAppStore.getState().loadRois("first");
     expect(asked).toEqual(["first"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authoring
+// ---------------------------------------------------------------------------
+
+describe("authoring state", () => {
+  const GEOM = { kind: "point" as const, at: { x: 1, y: 2 } };
+
+  function stored(over: Record<string, unknown> = {}) {
+    return {
+      roiId: "srv1",
+      arrayId: "first",
+      setName: "default",
+      label: "",
+      geometry: GEOM,
+      plane: {},
+      props: {},
+      rev: 1,
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      ...over,
+    };
+  }
+
+  function seedFor(client: unknown) {
+    useAppStore.setState({
+      client: client as TensorFlightClient,
+      activeTensorId: "first",
+      requestedArrayId: null,
+      rois: [],
+      roisFor: "first",
+      selectedRoiId: null,
+      roiWriteError: null,
+      newLabel: "",
+      newSetName: "",
+      draft: null,
+      draftFor: null,
+      render3d: false,
+      broadcastAxes: null,
+      broadcastAxesFor: null,
+    });
+  }
+
+  it("sends the label, set and pin, and adopts what the server stored", async () => {
+    const calls: unknown[] = [];
+    seedFor({
+      http: {
+        putRois: (arrayId: string, rois: unknown[], opts: unknown) => {
+          calls.push({ arrayId, rois, opts });
+          return Promise.resolve({ stored: [stored({ label: "cell" })], conflicts: [], skipped: 0 });
+        },
+      },
+    });
+    useAppStore.setState({ newLabel: "cell", newSetName: "nuclei" });
+    await useAppStore.getState().createRoi(GEOM, { 2: 12 });
+
+    expect(calls).toEqual([
+      {
+        arrayId: "first",
+        rois: [{ geometry: GEOM, plane: { 2: 12 }, label: "cell", setName: "nuclei" }],
+        opts: { checkRev: true },
+      },
+    ]);
+    // The server assigns the id, so the local copy has to be its answer, not
+    // the shape that was sent.
+    expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["srv1"]);
+    expect(useAppStore.getState().selectedRoiId).toBe("srv1");
+  });
+
+  it("drops a write that landed after the tensor moved on", async () => {
+    // The annotation is stored; appending it would draw it over another image.
+    seedFor({
+      http: {
+        putRois: () => {
+          useAppStore.setState({ activeTensorId: "second", roisFor: "second", rois: [] });
+          return Promise.resolve({ stored: [stored()], conflicts: [], skipped: 0 });
+        },
+      },
+    });
+    await useAppStore.getState().createRoi(GEOM, {});
+    expect(useAppStore.getState().rois).toEqual([]);
+  });
+
+  it("reports a failed write instead of pretending it landed", async () => {
+    seedFor({ http: { putRois: () => Promise.reject(new Error("422 rejected")) } });
+    await useAppStore.getState().createRoi(GEOM, {});
+    expect(useAppStore.getState().roiWriteError).toContain("422 rejected");
+    expect(useAppStore.getState().rois).toEqual([]);
+  });
+
+  it("removes a deleted annotation and clears the selection with it", async () => {
+    seedFor({ http: { deleteRois: () => Promise.resolve(["srv1"]) } });
+    useAppStore.setState({ rois: [stored()], selectedRoiId: "srv1" });
+    await useAppStore.getState().deleteRoi("srv1");
+    expect(useAppStore.getState().rois).toEqual([]);
+    expect(useAppStore.getState().selectedRoiId).toBeNull();
+  });
+
+  it("drops a row the server says it never had, rather than leaving it stuck", async () => {
+    seedFor({ http: { deleteRois: () => Promise.resolve([]) } });
+    useAppStore.setState({ rois: [stored()], selectedRoiId: "srv1" });
+    await useAppStore.getState().deleteRoi("srv1");
+    expect(useAppStore.getState().rois).toEqual([]);
+  });
+
+  it("abandons the draft when the tool changes", () => {
+    useAppStore.setState({ tool: "polygon", draft: { tool: "polygon", points: [[0, 0]] } });
+    useAppStore.getState().setTool("rectangle");
+    expect(useAppStore.getState().draft).toBeNull();
+  });
+
+  it("materialises the default before the first broadcast toggle", () => {
+    // Otherwise toggling one axis would silently also pin whatever the default
+    // was broadcasting.
+    seedFor({ http: {} });
+    useAppStore.getState().toggleBroadcastAxis(2, [1]);
+    expect(useAppStore.getState().broadcastAxes?.sort()).toEqual([1, 2]);
+  });
+
+  it("hides the draft in 3-D and on another tensor", () => {
+    seedFor({ http: {} });
+    useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0]] });
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+
+    useAppStore.setState({ render3d: true });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+
+    useAppStore.setState({ render3d: false, activeTensorId: "second" });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("resolves the selection against the set in view, so it cannot go stale", () => {
+    seedFor({ http: {} });
+    useAppStore.setState({ rois: [stored()], selectedRoiId: "srv1" });
+    expect(selectSelectedRoi(useAppStore.getState())?.roiId).toBe("srv1");
+
+    // The annotation is gone from the set: no cleanup needed anywhere.
+    useAppStore.setState({ rois: [] });
+    expect(selectSelectedRoi(useAppStore.getState())).toBeNull();
   });
 });

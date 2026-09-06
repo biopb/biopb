@@ -202,19 +202,44 @@ deck canvas, so it already hides the overlay along with the stale image.
 
 Selection state (which ROI is active) is SPA-local and never written.
 
-**Every overlay layer is `pickable: false`, and not only because nothing is
-interactive yet.** `TileViewer`'s hover badge reads `info.sourceLayer` and
-`info.tile` to report the pixel under the pointer; a pickable overlay sits on top
-and would answer that hover itself, blanking the readout wherever an annotation
-lies. Authoring has to route around that — read the pixel from the tile layer
-explicitly, or re-report it from the overlay — rather than just flipping the flag.
+**Every overlay layer is `pickable: false`.** `TileViewer`'s hover badge reads
+`info.sourceLayer` and `info.tile` to report the pixel under the pointer; a
+pickable overlay sits on top and would answer that hover itself, blanking the
+readout wherever an annotation lies.
+
+Selection therefore hit-tests in JS (`roiHitTest.ts`) rather than using deck.gl
+picking. That costs nothing extra — the whole annotation set is already resident,
+which is one of the reasons the read path fetches it whole — and it is what the
+whole-set fetch was justified by in the first place. A filled shape hits anywhere
+inside it *or* within a few screen pixels of its outline, so a thin sliver stays
+selectable; an open path and a point hit by proximity. The tolerance is scaled by
+world-units-per-pixel, read off `info.viewport.zoom` at click time rather than
+from the store's mirrored camera, which trails a gesture by `CAMERA_MIRROR_MS`.
 
 ## Authoring
 
-**Creation is click-to-place.** Click each vertex; double-click or `Enter` closes a
-polygon, `Escape` cancels. A rectangle is two clicks (opposite corners), a point is
-one. This avoids the controller conflict entirely, and it is the better interaction
-for tracing anyway — a drag-traced polygon at zoom is worse than placed vertices.
+**Creation is click-to-place.** A point is one click and a rectangle is two
+(opposite corners, normalised on store), because their vertex count is fixed and
+a separate "finish" would be ceremony. A polygon or polyline runs until the user
+ends it: `Enter`, the Finish button, or a click on the first vertex, which grows
+into a handle once the shape has enough vertices to close. `Escape` abandons the
+draft and `Backspace` takes back the last vertex; those keys are bound only while
+a draft is open, so the viewer never swallows a key it has no use for.
+
+This avoids the controller conflict entirely, and it is the better interaction for
+tracing anyway — a drag-traced polygon at zoom is worse than placed vertices.
+
+The click arrives through `deckProps.onClick`. Viv overrides `layerFilter`,
+`layers`, `onViewStateChange`, `views`, `viewState`, `useDevicePixels` and
+`getCursor` after spreading `deckProps`, but not the pointer callbacks — and
+because the overlay is unpickable the click arrives with no picked layer and
+`coordinate` set, which is exactly what placing a vertex needs.
+
+**The draft is its own layer set**, memoised apart from the overlay. The segment
+trailing the pointer has to follow it to be worth anything, so that one path
+re-renders at pointer rate — but only while a draft is open, and rebuilding the
+whole overlay there would re-tessellate every annotation on every mouse move
+(the same cost the plane-switch rebuild pays).
 
 **Shapes authored in v1:** point, rectangle, polygon, polyline. Ellipse is
 **render-only** — the store accepts one and another client may write one, but the

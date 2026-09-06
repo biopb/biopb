@@ -21,17 +21,26 @@
 
 import { useMemo } from "react";
 import {
+  selectBroadcastAxes,
   selectHiddenSets,
   selectRois,
   selectRoisError,
   selectRoisLoading,
   selectRoisSkipped,
   selectRoisTruncated,
+  selectSelectedRoi,
   selectTileInfo,
   useAppStore,
 } from "../store";
-import { currentPlaneFor, roiSetCounts, setColor, visibleRois } from "../utils/roiLayers";
-import type { RoiAnnotation } from "@biopb/tensor-flight-client";
+import {
+  currentPlaneFor,
+  defaultBroadcastAxes,
+  roiSetCounts,
+  setColor,
+  visibleRois,
+} from "../utils/roiLayers";
+import { pinnableAxes } from "@biopb/tensor-flight-client";
+import type { RoiAnnotation, SliderAxis } from "@biopb/tensor-flight-client";
 
 function swatch(setName: string) {
   const [r, g, b] = setColor(setName);
@@ -174,6 +183,159 @@ export function RoiPanel() {
       unavailable={unavailable}
       onToggleOverlay={onToggleOverlay}
       onToggleSet={onToggleSet}
+    />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Authoring
+// ---------------------------------------------------------------------------
+
+export interface RoiAuthorViewProps {
+  newLabel: string;
+  newSetName: string;
+  /** Every axis a new annotation could pin, with what to call it. */
+  axes: SliderAxis[];
+  /** Axes it will NOT pin, i.e. broadcast across. */
+  broadcastAxes: number[];
+  /** `axis -> index` for the plane on screen, so each row can show its value. */
+  currentPlane: Record<number, number>;
+  selected: RoiAnnotation | null;
+  writeError: string | null;
+  onSetNewLabel: (label: string) => void;
+  onSetNewSetName: (setName: string) => void;
+  onToggleBroadcast: (axis: number) => void;
+  onDeleteSelected: () => void;
+}
+
+/**
+ * What a new annotation will be, and what the selected one is.
+ *
+ * The pin rows are the load-bearing part. Broadcast is not something the user
+ * sets, it is an axis the pin omits -- and a broadcast annotation is
+ * pixel-identical to a pinned one on the plane where they coincide, so without
+ * this the only way to tell them apart is to scrub and see what follows.
+ */
+export function RoiAuthorView({
+  newLabel,
+  newSetName,
+  axes,
+  broadcastAxes,
+  currentPlane,
+  selected,
+  writeError,
+  onSetNewLabel,
+  onSetNewSetName,
+  onToggleBroadcast,
+  onDeleteSelected,
+}: RoiAuthorViewProps) {
+  const broadcast = new Set(broadcastAxes);
+  return (
+    <div className="roi-author">
+      <label className="roi-field">
+        <span>Label</span>
+        <input value={newLabel} placeholder="cell" onChange={(e) => onSetNewLabel(e.target.value)} />
+      </label>
+      <label className="roi-field">
+        <span>Set</span>
+        <input
+          value={newSetName}
+          placeholder="default"
+          onChange={(e) => onSetNewSetName(e.target.value)}
+        />
+      </label>
+
+      {axes.length > 0 && (
+        <>
+          <div className="roi-field-head">New annotations apply to</div>
+          <ul className="roi-sets">
+            {axes.map((axis) => {
+              const all = broadcast.has(axis.axis);
+              return (
+                <li key={axis.axis}>
+                  <span>{axis.title}</span>
+                  <button
+                    type="button"
+                    className="roi-pin-toggle"
+                    aria-pressed={all}
+                    title={
+                      all
+                        ? `Every index of ${axis.title}`
+                        : `Only ${axis.title} ${currentPlane[axis.axis] ?? 0}`
+                    }
+                    onClick={() => onToggleBroadcast(axis.axis)}
+                  >
+                    {all ? "all" : `${currentPlane[axis.axis] ?? 0}`}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+
+      {selected && (
+        <div className="roi-selected">
+          <div className="roi-field-head">Selected</div>
+          <div>
+            {selected.label || <em>no label</em>} — {selected.geometry.kind} in {selected.setName}
+          </div>
+          <div className="roi-count">
+            {Object.keys(selected.plane).length === 0
+              ? "on every plane"
+              : `pinned: ${Object.entries(selected.plane)
+                  .map(([axis, index]) => `${axisTitle(axes, Number(axis))} ${index}`)
+                  .join(", ")}`}
+          </div>
+          <button type="button" className="roi-tool-text" onClick={onDeleteSelected}>
+            Delete
+          </button>
+        </div>
+      )}
+
+      {writeError && <p className="roi-note roi-error">{writeError}</p>}
+    </div>
+  );
+}
+
+/** An axis's display name, falling back to its position when the grid is gone. */
+function axisTitle(axes: SliderAxis[], axis: number): string {
+  return axes.find((a) => a.axis === axis)?.title ?? `axis ${axis}`;
+}
+
+export function RoiAuthor() {
+  const tileInfo = useAppStore(selectTileInfo);
+  const slice = useAppStore((s) => s.slice);
+  const newLabel = useAppStore((s) => s.newLabel);
+  const newSetName = useAppStore((s) => s.newSetName);
+  const selected = useAppStore(selectSelectedRoi);
+  const writeError = useAppStore((s) => s.roiWriteError);
+  const onSetNewLabel = useAppStore((s) => s.setNewLabel);
+  const onSetNewSetName = useAppStore((s) => s.setNewSetName);
+  const toggleBroadcastAxis = useAppStore((s) => s.toggleBroadcastAxis);
+  const deleteRoi = useAppStore((s) => s.deleteRoi);
+  const unavailable = useAppStore((s) => s.roisUnavailable);
+
+  const defaults = useMemo(() => defaultBroadcastAxes(tileInfo), [tileInfo]);
+  const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, defaults));
+  const axes = useMemo(() => (tileInfo ? pinnableAxes(tileInfo) : []), [tileInfo]);
+  const currentPlane = useMemo(() => currentPlaneFor(tileInfo, slice), [tileInfo, slice]);
+
+  if (unavailable) return null;
+
+  return (
+    <RoiAuthorView
+      newLabel={newLabel}
+      newSetName={newSetName}
+      axes={axes}
+      broadcastAxes={broadcastAxes}
+      currentPlane={currentPlane}
+      selected={selected}
+      writeError={writeError}
+      onSetNewLabel={onSetNewLabel}
+      onSetNewSetName={onSetNewSetName}
+      onToggleBroadcast={(axis) => toggleBroadcastAxis(axis, defaults)}
+      onDeleteSelected={() => selected && void deleteRoi(selected.roiId)}
     />
   );
 }

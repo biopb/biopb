@@ -542,6 +542,49 @@ html, body {
 .roi-note { color: #64748b; margin: 0.5rem 0 0; }
 .roi-error { color: #fca5a5; }
 
+.roi-author {
+  background: #141820;
+  border-top: 1px solid #232a38;
+  color: #94a3b8;
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0.6rem 1rem 0.7rem;
+}
+.roi-field { align-items: center; display: flex; gap: 8px; margin-bottom: 4px; }
+.roi-field span { color: #64748b; width: 34px; }
+.roi-field input {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 4px;
+  color: #cbd5e1; flex: 1; font: inherit; min-width: 0; padding: 2px 6px;
+}
+.roi-field-head { color: #64748b; margin: 8px 0 2px; }
+.roi-pin-toggle, .roi-tool-text {
+  background: none; border: 1px solid #2d3748; border-radius: 4px;
+  color: #cbd5e1; cursor: pointer; font: inherit; padding: 0 6px;
+}
+.roi-pin-toggle[aria-pressed="true"] { border-color: #38bdf8; color: #38bdf8; }
+.roi-tool-text:disabled { color: #475569; cursor: default; }
+.roi-selected { border-top: 1px solid #232a38; margin-top: 8px; padding-top: 6px; }
+.roi-selected > * { margin-bottom: 4px; }
+
+.roi-tools {
+  background: rgba(15, 17, 23, 0.85);
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  padding: 4px;
+}
+.roi-tool-row { display: flex; gap: 2px; }
+.roi-tool {
+  background: none; border: 1px solid transparent; border-radius: 4px;
+  color: #94a3b8; cursor: pointer; font-size: 15px; line-height: 1;
+  padding: 4px 7px;
+}
+.roi-tool:hover { background: #1e2435; color: #e2e8f0; }
+.roi-tool.active { border-color: #38bdf8; color: #38bdf8; }
+.roi-draft-status {
+  align-items: center; color: #94a3b8; display: flex; font-size: 11px;
+  gap: 6px; padding: 4px 2px 2px;
+}
+
 .icon-btn {
   background: none; border: 1px solid #2d3748; border-radius: 6px;
   color: #94a3b8; cursor: pointer; font-size: 12px; padding: 4px 10px;

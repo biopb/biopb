@@ -22,6 +22,7 @@ import { DETAIL_VIEW_ID } from "@hms-dbmi/viv";
 import { pinnableAxes, planePinFor, roiVisibleOnPlane, sliderAxes } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-client";
 import { vivSelection, type SliceIndices } from "./vivUtils";
+import { CLOSE_HANDLE_PX, type RoiDraft } from "./roiDraft";
 
 /** An `[x, y]` in level-0 image pixels, the space deck.gl draws these in. */
 export type XY = [number, number];
@@ -92,6 +93,9 @@ const PALETTE: Array<[number, number, number]> = [
   [45, 212, 191],
   [251, 146, 60],
 ];
+
+/** Selection emphasis: one colour, so a selected shape reads the same anywhere. */
+const SELECTED_COLOR: [number, number, number, number] = [255, 255, 255, 255];
 
 export function setColor(setName: string): [number, number, number] {
   let hash = 0;
@@ -170,6 +174,40 @@ export function roiSetCounts(rois: RoiAnnotation[]): Array<{ setName: string; co
   return [...counts].map(([setName, count]) => ({ setName, count }));
 }
 
+/**
+ * Axes a new annotation should broadcast across unless the user says otherwise.
+ *
+ * Channel, and only channel. The viewer shows one channel at a time and an
+ * annotation names an object rather than a channel, so a c-pinned ROI would
+ * vanish the moment the user switches channel.
+ *
+ * Everything else pins, because the two mistakes are not symmetric: an
+ * over-specific pin announces itself (draw on z=12, scrub to z=13, the shape is
+ * gone) while an over-broadcast one is silent -- the shape follows you through
+ * every plane and looks right. Prefer the mistake the user can see.
+ */
+export function defaultBroadcastAxes(info: TileInfo | null): number[] {
+  if (!info) return [];
+  return pinnableAxes(info)
+    .filter((axis) => axis.named === "c")
+    .map((axis) => axis.axis);
+}
+
+/** The pin a new annotation gets: every pinnable axis except the broadcast ones. */
+export function pinForNewRoi(
+  info: TileInfo | null,
+  currentPlane: Record<number, number>,
+  broadcastAxes: number[],
+): Record<number, number> {
+  if (!info) return {};
+  const broadcast = new Set(broadcastAxes);
+  const pin: Record<number, number> = {};
+  for (const [axis, index] of Object.entries(currentPlane)) {
+    if (!broadcast.has(Number(axis))) pin[Number(axis)] = index;
+  }
+  return pin;
+}
+
 export interface RoiLayerOptions {
   rois: RoiAnnotation[];
   /** `axis -> index` for the plane on screen; see `planePinFor`. */
@@ -177,6 +215,8 @@ export interface RoiLayerOptions {
   hiddenSets: string[];
   /** The overlay toggle. False yields no layers at all rather than hidden ones. */
   visible: boolean;
+  /** Drawn brighter and thicker, so the panel and the canvas agree. */
+  selectedRoiId?: string | null;
 }
 
 /**
@@ -189,7 +229,7 @@ export interface RoiLayerOptions {
  * annotation lies. Phase 3 has to route around that rather than just flip this.
  */
 export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
-  const { rois, currentPlane, hiddenSets, visible } = options;
+  const { rois, currentPlane, hiddenSets, visible, selectedRoiId = null } = options;
   if (!visible) return [];
   const shown = visibleRois(rois, currentPlane, hiddenSets);
   if (shown.length === 0) return [];
@@ -214,11 +254,13 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         stroked: true,
         getPolygon: (d: { ring: XY[] }) => d.ring,
         getFillColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), 40],
-        getLineColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), 230],
+        getLineColor: (d: { roi: RoiAnnotation }) =>
+          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), 230],
         // Pixels, not world units: an outline is a way of seeing the shape, so
         // it should not thin out as the user zooms out of a large field.
         lineWidthUnits: "pixels",
-        getLineWidth: 1.5,
+        getLineWidth: (d: { roi: RoiAnnotation }) => (d.roi.roiId === selectedRoiId ? 3 : 1.5),
+        updateTriggers: { getLineColor: selectedRoiId, getLineWidth: selectedRoiId },
       }),
     );
   }
@@ -237,9 +279,11 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         capRounded: true,
         jointRounded: true,
         getPath: (d: { path: XY[] }) => d.path,
-        getColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), 230],
+        getColor: (d: { roi: RoiAnnotation }) =>
+          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), 230],
         getWidth: (d: { roi: RoiAnnotation }) =>
           d.roi.geometry.kind === "polyline" ? Math.abs(d.roi.geometry.width) : 0,
+        updateTriggers: { getColor: selectedRoiId },
       }),
     );
   }
@@ -259,10 +303,86 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         getPosition: (d: RoiAnnotation) =>
           d.geometry.kind === "point" ? [d.geometry.at.x, d.geometry.at.y] : [0, 0],
         getFillColor: (d: RoiAnnotation) => [...setColor(d.setName), 90],
-        getLineColor: (d: RoiAnnotation) => [...setColor(d.setName), 230],
+        getLineColor: (d: RoiAnnotation) =>
+          d.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.setName), 230],
+        updateTriggers: { getLineColor: selectedRoiId },
       }),
     );
   }
 
   return layers;
+}
+
+// ---------------------------------------------------------------------------
+// The shape being drawn
+// ---------------------------------------------------------------------------
+
+/** Colour of an in-progress draft: distinct from every set colour. */
+const DRAFT_COLOR: [number, number, number, number] = [250, 204, 21, 240];
+
+export interface DraftLayerOptions {
+  draft: RoiDraft | null;
+  /** Where the pointer is, for the segment that trails it. Null when off-image. */
+  cursor: XY | null;
+  /** The draft has enough vertices to close, so its first vertex is a handle. */
+  closeable: boolean;
+}
+
+/**
+ * The in-progress shape: placed vertices, the edges between them, and the
+ * segment trailing the pointer.
+ *
+ * Its own builder, memoised apart from {@link buildRoiLayers}, because the
+ * trailing segment follows the pointer: rebuilding the whole overlay at pointer
+ * rate would re-tessellate every annotation for every mouse move.
+ */
+export function buildDraftLayers(options: DraftLayerOptions): unknown[] {
+  const { draft, cursor, closeable } = options;
+  if (!draft || draft.points.length === 0) return [];
+
+  const placed = draft.points;
+  // A rectangle previews as the box it will become, not as the two clicks that
+  // define it -- otherwise the second click's effect is invisible until it lands.
+  const preview: XY[] =
+    draft.tool === "rectangle" && cursor && placed.length === 1
+      ? rectanglePreview(placed[0] as XY, cursor)
+      : cursor
+        ? [...placed, cursor]
+        : placed;
+
+  const layers: unknown[] = [
+    new PathLayer({
+      id: roiLayerId("draft-path"),
+      data: [{ path: preview }],
+      pickable: false,
+      widthUnits: "pixels",
+      getWidth: 2,
+      capRounded: true,
+      jointRounded: true,
+      getPath: (d: { path: XY[] }) => d.path,
+      getColor: DRAFT_COLOR,
+      updateTriggers: { getPath: preview },
+    }),
+    new ScatterplotLayer({
+      id: roiLayerId("draft-vertices"),
+      data: placed.map((at, i) => ({ at, first: i === 0 })),
+      pickable: false,
+      radiusUnits: "pixels",
+      // The first vertex grows into a handle once clicking it would close the
+      // shape, which is the only affordance saying that is possible.
+      getRadius: (d: { first: boolean }) => (d.first && closeable ? CLOSE_HANDLE_PX / 2 : 3),
+      stroked: true,
+      lineWidthUnits: "pixels",
+      getLineWidth: 1.5,
+      getPosition: (d: { at: XY }) => d.at,
+      getFillColor: [250, 204, 21, 140],
+      getLineColor: DRAFT_COLOR,
+      updateTriggers: { getRadius: closeable },
+    }),
+  ];
+  return layers;
+}
+
+function rectanglePreview(a: XY, b: XY): XY[] {
+  return [a, [b[0], a[1]], b, [a[0], b[1]], a];
 }

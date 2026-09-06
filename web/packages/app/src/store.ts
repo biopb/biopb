@@ -4,8 +4,10 @@ import type {
   DataSourceDescriptor,
   QuerySourcesResult,
   RoiAnnotation,
+  RoiGeometry,
   TileInfo,
 } from "@biopb/tensor-flight-client";
+import type { RoiDraft, RoiTool } from "./utils/roiDraft";
 import { TensorApiError } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
@@ -199,6 +201,29 @@ export interface AppState {
   /** The tensor `hiddenSets` names sets of. See `selectHiddenSets`. */
   hiddenSetsFor: string | null;
 
+  // --- authoring ----------------------------------------------------------
+  /** Which tool the pointer carries. A preference: it outlives a tensor change. */
+  tool: RoiTool;
+  /** The shape being placed. Read through `selectDraft`. */
+  draft: RoiDraft | null;
+  /** The tensor the draft is being drawn on. See `selectDraft`. */
+  draftFor: string | null;
+  /** Selected annotation. Read through `selectSelectedRoi`, which validates it. */
+  selectedRoiId: string | null;
+  /** Label and set the next new annotation gets. Preferences, kept across tensors. */
+  newLabel: string;
+  newSetName: string;
+  /**
+   * Axes a new annotation should NOT pin, i.e. broadcast across. `null` means
+   * "the default for this tensor" (see `selectBroadcastAxes`), which is not the
+   * same as "none" -- an empty array is a deliberate choice to pin everything.
+   */
+  broadcastAxes: number[] | null;
+  /** The tensor `broadcastAxes` names axes of. */
+  broadcastAxesFor: string | null;
+  /** A write that failed or lost a conditional put, for the panel to report. */
+  roiWriteError: string | null;
+
   /**
    * The axis being scrubbed automatically (a `SliderAxis.key`), or null.
    *
@@ -281,6 +306,14 @@ export interface AppState {
   loadRois: (arrayId: string) => Promise<void>;
   setShowRois: (value: boolean) => void;
   toggleSetHidden: (setName: string) => void;
+  setTool: (tool: RoiTool) => void;
+  setDraft: (draft: RoiDraft | null) => void;
+  setSelectedRoi: (roiId: string | null) => void;
+  setNewLabel: (label: string) => void;
+  setNewSetName: (setName: string) => void;
+  toggleBroadcastAxis: (axis: number, defaults: number[]) => void;
+  createRoi: (geometry: RoiGeometry, plane: Record<number, number>) => Promise<void>;
+  deleteRoi: (roiId: string) => Promise<void>;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -375,6 +408,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   showRois: true,
   hiddenSets: [],
   hiddenSetsFor: null,
+
+  tool: "select",
+  draft: null,
+  draftFor: null,
+  selectedRoiId: null,
+  newLabel: "",
+  newSetName: "",
+  broadcastAxes: null,
+  broadcastAxesFor: null,
+  roiWriteError: null,
 
   playAxis: null,
   planeReady: false,
@@ -551,6 +594,92 @@ export const useAppStore = create<AppState>((set, get) => ({
         roisErrorFor: arrayId,
         roisError: err instanceof Error ? err.message : String(err),
       });
+    }
+  },
+
+  setTool(tool) {
+    // A draft belongs to the tool that started it; switching abandons it rather
+    // than reinterpreting placed vertices under different rules.
+    set((s) => (s.tool === tool ? s : { tool, draft: null, draftFor: null }));
+  },
+
+  setDraft(draft) {
+    set({ draft, draftFor: draft ? currentArrayId(get()) : null });
+  },
+
+  setSelectedRoi(roiId) {
+    set({ selectedRoiId: roiId });
+  },
+
+  setNewLabel(label) {
+    set({ newLabel: label });
+  },
+
+  setNewSetName(setName) {
+    set({ newSetName: setName });
+  },
+
+  toggleBroadcastAxis(axis, defaults) {
+    set((s) => {
+      const arrayId = currentArrayId(s);
+      // `null` means "this tensor's default", so materialise that before
+      // editing -- otherwise the first toggle would silently also pin whatever
+      // the default was broadcasting.
+      const current =
+        s.broadcastAxesFor === arrayId && s.broadcastAxes !== null ? s.broadcastAxes : defaults;
+      return {
+        broadcastAxesFor: arrayId,
+        broadcastAxes: current.includes(axis)
+          ? current.filter((a) => a !== axis)
+          : [...current, axis],
+      };
+    });
+  },
+
+  async createRoi(geometry, plane) {
+    const { client, newLabel, newSetName } = get();
+    const arrayId = currentArrayId(get());
+    if (!client || !arrayId) return;
+    set({ roiWriteError: null });
+    try {
+      const result = await client.http.putRois(
+        arrayId,
+        [{ geometry, plane, label: newLabel, setName: newSetName || undefined }],
+        { checkRev: true },
+      );
+      // Dropped if the tensor moved on mid-write: the annotation is stored, and
+      // appending it to a list that now describes another tensor would put it
+      // on screen over the wrong image.
+      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) return;
+      const stored = result.stored[0];
+      if (!stored) {
+        set({ roiWriteError: "The server stored no annotation" });
+        return;
+      }
+      set((s) => ({ rois: [...s.rois, stored], selectedRoiId: stored.roiId }));
+    } catch (err) {
+      set({ roiWriteError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  async deleteRoi(roiId) {
+    const { client } = get();
+    const arrayId = currentArrayId(get());
+    if (!client || !arrayId) return;
+    set({ roiWriteError: null });
+    try {
+      const deleted = await client.http.deleteRois(arrayId, [roiId]);
+      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) return;
+      // An id the server did not have is already gone as far as the UI is
+      // concerned, so drop it locally either way rather than leaving a row that
+      // cannot be removed.
+      const removed = new Set(deleted.length > 0 ? deleted : [roiId]);
+      set((s) => ({
+        rois: s.rois.filter((roi) => !removed.has(roi.roiId)),
+        selectedRoiId: s.selectedRoiId && removed.has(s.selectedRoiId) ? null : s.selectedRoiId,
+      }));
+    } catch (err) {
+      set({ roiWriteError: err instanceof Error ? err.message : String(err) });
     }
   },
 
@@ -822,4 +951,39 @@ export function selectRoisError(s: AppState): string | null {
 /** Sets hidden in the tensor in view. Names do not carry across tensors. */
 export function selectHiddenSets(s: AppState): string[] {
   return s.hiddenSetsFor === currentArrayId(s) ? s.hiddenSets : NO_SETS;
+}
+
+/**
+ * The shape being placed, if it belongs here.
+ *
+ * Scoped to the tensor AND to 2-D: the volume viewer has no drawing surface, and
+ * a half-placed polygon reappearing after a trip through 3-D is only confusing.
+ * Both conditions answered at the read, so no writer has to remember either.
+ */
+export function selectDraft(s: AppState): RoiDraft | null {
+  return s.draftFor === currentArrayId(s) && !s.render3d ? s.draft : null;
+}
+
+/**
+ * The selected annotation, resolved against the set actually in view.
+ *
+ * Resolving rather than storing it means a selection cannot outlive the
+ * annotation: deleting it, switching tensor, or a refetch that no longer
+ * contains it all leave this null with nothing to clean up.
+ */
+export function selectSelectedRoi(s: AppState): RoiAnnotation | null {
+  if (!s.selectedRoiId) return null;
+  return selectRois(s).find((roi) => roi.roiId === s.selectedRoiId) ?? null;
+}
+
+/**
+ * Axes a new annotation will broadcast across, given this tensor's defaults.
+ *
+ * `defaults` is computed from the grid by the caller (channel, normally -- see
+ * `defaultBroadcastAxes`), because the store does not read `TileInfo`.
+ */
+export function selectBroadcastAxes(s: AppState, defaults: number[]): number[] {
+  return s.broadcastAxesFor === currentArrayId(s) && s.broadcastAxes !== null
+    ? s.broadcastAxes
+    : defaults;
 }
