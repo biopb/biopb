@@ -353,58 +353,6 @@ function Assert-LastExit {
 # in gui mode those write tagged records to stdout (Emit-Gui), which would arrive
 # folded into this function's return value.
 #
-# A function rather than a dozen lines inside Invoke-BiopbInstall so a test can
-# drive it (install/test/test_python_probe.py) -- the engine is executed by nothing
-# else, and this probe is where a fresh Windows machine actually fails. Two traps
-# live here, and BOTH shipped as install-time crashes that users reported as "the
-# Python stage failed":
-#
-#   1. `2>$null` on a NATIVE command makes Windows PowerShell 5.1 wrap every stderr
-#      line in an ErrorRecord, which under this engine's EAP='Stop' is a
-#      TERMINATING NativeCommandError -- the same trap Invoke-Precompile and
-#      Start-ControlPlane already document. It fires on exactly the machine this
-#      probe exists to serve: a fresh Windows box with no Python still has a 0-byte
-#      Microsoft Store *App Execution Alias* at
-#      %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe, on PATH by default, which
-#      prints "Python was not found; run without arguments to install from the
-#      Microsoft Store..." to stderr and exits 9009. Unsoftened, the install died
-#      quoting that message instead of falling through to the uv-managed Python
-#      that handles the case fine. A Python that merely warns on stderr (a conda
-#      banner, a DLL or deprecation notice) tripped it too, while being perfectly
-#      usable. So: soften EAP across the call and let the exit code decide.
-#
-#   2. An interpreter that greets on STDOUT (conda, a sitecustomize banner) puts a
-#      non-numeric line ahead of the answer, and [int] on it throws -- under
-#      EAP='Stop' that is another terminating error in the same place. So: take the
-#      LAST non-empty line and match it strictly. Anything unrecognized is $null,
-#      and the caller falls back instead of dying.
-#
-# Neither trap reproduces under pwsh 7, which is what CI runs -- see the Windows
-# leg of install-scripts.yaml, added with this function so they cannot come back.
-function Get-SystemPythonVersion {
-    [OutputType([psobject])]
-    param([Parameter(Mandatory)][string]$PythonExe)
-
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $out = & $PythonExe -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>$null
-        $code = $LASTEXITCODE
-    } catch {
-        # A stub that cannot be launched at all still means "no usable Python".
-        return $null
-    } finally {
-        $ErrorActionPreference = $prevEAP
-    }
-    if ($code -ne 0) { return $null }
-
-    # $LASTEXITCODE is stale when the command never ran, so the strict match below
-    # -- not the exit code alone -- is what actually vouches for the answer.
-    $line = (@($out) | Where-Object { "$_".Trim() } | Select-Object -Last 1)
-    if ("$line" -notmatch '^\s*(\d+)\s+(\d+)\s*$') { return $null }
-    return [pscustomobject]@{ Major = [int]$Matches[1]; Minor = [int]$Matches[2] }
-}
-
 # Read <ConfigDir>\extra-packages.txt into the requirement list to replay into the
 # shared environment. Returns the requirements in file order; nothing at all when
 # the file (or the directory) is absent, which is every machine until the user
@@ -1262,61 +1210,42 @@ function Invoke-BiopbInstall {
     # ===== 2. Python =====
     Report-Step 2 "Ensuring Python..."
 
-    # biopb-mcp (always installed) requires Python >= 3.10.
-    $minMinor = 10
-
-    # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
-    # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
-    # installer's `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
-    # ships no cp313 wheel yet -- on 3.13+ uv would build it from source (cmake +
-    # libCZI + an MSVC compiler), which fails on a fresh Windows box. If the
-    # system Python is newer we fall back to a uv-managed 3.12 below. Mirrors
-    # install.sh (MAX_MINOR).
-    $maxMinor = 12
-
-    $pythonOk = $false
-    $pythonSpec = ""
-    $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if ($pyExe) {
-        # Get-SystemPythonVersion returns $null for an interpreter it cannot read
-        # -- a Microsoft Store alias stub, a banner-printing conda shim, anything
-        # unrecognized -- rather than throwing, so those machines fall through to
-        # the uv-managed Python below instead of failing the install. See the
-        # function's own comment for the two traps that live in that call.
-        $ver = Get-SystemPythonVersion -PythonExe $pyExe
-        if ($ver) {
-            $maj = $ver.Major; $min = $ver.Minor
-            if ($maj -eq 3 -and $min -ge $minMinor -and $min -le $maxMinor) {
-                Report-Ok "Using system Python: $(& $pyExe --version)"
-                $pythonOk = $true
-                $pythonSpec = $pyExe
-            } elseif ($maj -gt 3 -or ($maj -eq 3 -and $min -gt $maxMinor)) {
-                Report-Warn "System Python too new ($(& $pyExe --version)); using a managed 3.$maxMinor (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
-            } else {
-                Report-Warn "System Python too old ($(& $pyExe --version)), need >= 3.$minMinor"
-            }
-        }
+    # A uv-managed interpreter, always -- never whatever `python` is on PATH. A
+    # version in range does not mean uv can use the interpreter: the mingw-w64
+    # python Inkscape puts on the PATH answers "3.12" and then aborts the install
+    # ("Unknown operating system: mingw_x86_64_ucrt_gnu"); the Microsoft Store
+    # alias stub and conda banner shims were earlier versions of the same lesson.
+    # The download is ~30 MB and cached, and uv and the wheels already need the
+    # network.
+    #
+    # 3.12 is the ceiling: the biopb packages declare requires-python
+    # ">=3.10,<3.13", and the CZI reader (pylibczirw / aicspylibczi) has no cp313
+    # wheel, so 3.13 would build it from source (cmake + libCZI + MSVC) on a fresh
+    # Windows box. $pythonSpec is what `uv tool install --python` gets below;
+    # pinning it keeps uv from discovering a system Python of its own.
+    #
+    # install.sh deliberately still prefers a system python3 in range: a POSIX box
+    # presents far fewer broken interpreters, and nearly every install failure this
+    # rule was written for was reported on Windows.
+    $pythonMinor = 12
+    Report-Info "Installing Python 3.$pythonMinor via uv..."
+    # Through Invoke-Uv like every other uv call, rather than bare. This one
+    # downloads a ~30MB interpreter build, so it is both the call most likely
+    # to fail on a lab network (proxy, TLS interception, no route to
+    # python-build-standalone) and -- as a bare call -- the one that said
+    # least about it: Assert-LastExit reported "exit code 2" while uv's actual
+    # `error:` line went to a console the GUI front-end does not have.
+    $pyOutLog = Join-Path $env:TEMP "biopb-uv-python.out.log"
+    $pyErrLog = Join-Path $env:TEMP "biopb-uv-python.err.log"
+    try {
+        Invoke-Uv -UvArgs @("python", "install", "3.$pythonMinor") `
+            -OutLog $pyOutLog -ErrLog $pyErrLog -Activity "downloading Python"
+        Assert-UvExit "Python install" $pyErrLog
+    } finally {
+        Remove-Item -LiteralPath $pyOutLog, $pyErrLog -Force -ErrorAction SilentlyContinue
     }
-    if (-not $pythonOk) {
-        Report-Info "Installing Python 3.$maxMinor via uv..."
-        # Through Invoke-Uv like every other uv call, rather than bare. This one
-        # downloads a ~30MB interpreter build, so it is both the call most likely
-        # to fail on a lab network (proxy, TLS interception, no route to
-        # python-build-standalone) and -- as a bare call -- the one that said
-        # least about it: Assert-LastExit reported "exit code 2" while uv's actual
-        # `error:` line went to a console the GUI front-end does not have.
-        $pyOutLog = Join-Path $env:TEMP "biopb-uv-python.out.log"
-        $pyErrLog = Join-Path $env:TEMP "biopb-uv-python.err.log"
-        try {
-            Invoke-Uv -UvArgs @("python", "install", "3.$maxMinor") `
-                -OutLog $pyOutLog -ErrLog $pyErrLog -Activity "downloading Python"
-            Assert-UvExit "Python install" $pyErrLog
-        } finally {
-            Remove-Item -LiteralPath $pyOutLog, $pyErrLog -Force -ErrorAction SilentlyContinue
-        }
-        Report-Ok "Python 3.$maxMinor ready"
-        $pythonSpec = "3.$maxMinor"
-    }
+    Report-Ok "Python 3.$pythonMinor ready"
+    $pythonSpec = "3.$pythonMinor"
 
     # ===== 3. Install biopb packages =====
     Report-Step 3 "Installing biopb packages..."
