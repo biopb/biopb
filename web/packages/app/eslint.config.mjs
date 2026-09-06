@@ -57,6 +57,17 @@ export default tseslint.config(
           message:
             "This store field is only correct through its selector (selectRois, selectDraft, selectTileInfo, ...): the raw field is not scoped to the tensor, plane or render mode in view. See src/store.ts.",
         },
+        {
+          // zustand v5 reads the snapshot on every render and compares by
+          // identity, so a selector that computes an argument computes a fresh
+          // array or object each time and React never settles. Cost of getting
+          // it wrong is the whole viewer, and no test here can see it: this
+          // workspace renders to static markup, which renders once.
+          selector:
+            'CallExpression[callee.name="useAppStore"] > ArrowFunctionExpression > CallExpression > CallExpression',
+          message:
+            "Compute this outside the selector (useMemo) and pass the value in: a fresh array or object per snapshot read loops React until it gives up.",
+        },
       ],
     },
   },
