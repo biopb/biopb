@@ -488,8 +488,17 @@ class ChatConfig:
     )
     base_url: str = _h(
         "https://api.openai.com/v1",
-        "OpenAI-compatible chat-completions base URL. Any gateway speaking that "
-        "shape works; '/chat/completions' is appended.",
+        "OpenAI-compatible API root. Any gateway speaking that shape works; the "
+        "route ('/chat/completions' or '/responses', per chat.api) is appended, "
+        "so this is the root and not the endpoint itself.",
+    )
+    api: str = _h(
+        "completions",
+        "Which API shape chat.model speaks: 'completions' (POST "
+        "{base_url}/chat/completions) or 'responses' (POST {base_url}/responses). "
+        "One gateway can serve both and disagree per model, and GET /models does "
+        "not say which, so it is configured rather than probed -- a probe costs a "
+        "billed call and reads a wrong-route 500 as an outage.",
     )
     api_key_env: str = _h(
         "BIOPB_CHAT_API_KEY",
@@ -628,6 +637,7 @@ _CONSTRAINTS = {
     "ChatConfig": {
         "request_timeout": Range(exclusive_min=0),
         "engine": Enum({"builtin", "acp"}),
+        "api": Enum({"completions", "responses"}),
         "acp_agent": Enum({"opencode"}),
         "acp_permission": Enum({"ask", "allow"}),
         "vision": Enum({"auto", "on", "off"}),
