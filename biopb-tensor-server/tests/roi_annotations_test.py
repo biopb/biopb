@@ -12,9 +12,10 @@ import time
 import pyarrow.flight as flight
 import pytest
 from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
-from biopb.image.annotation_pb2 import RoiAnnotation
+from biopb.image.annotation_pb2 import RoiAnnotation, RoiPutRequest
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from google.protobuf import json_format
 
 ARRAY_ID = "zarr_a1b2c3/Image:0"
 
@@ -725,8 +726,9 @@ class TestSidecarRoutes:
 
         got = client.get(f"/api/rois/{ARRAY_ID}").json()
         assert len(got["rois"]) == 1
-        # proto3 JSON stringifies both an int32 map key and an int64 value.
-        assert got["rois"][0]["plane"] == {"2": "12"}
+        # A map key is always a JSON string; a uint32 VALUE is a number, since
+        # proto3 JSON stringifies only the 64-bit integer types.
+        assert got["rois"][0]["plane"] == {"2": 12}
         assert len(got["rois"][0]["roi"]["polygon"]["points"]) == 3
 
     def test_version_token_is_stripped_on_write_and_restored_on_read(
@@ -870,17 +872,28 @@ class TestPositionalPlanePin:
         rois, _ = db.list_rois(ARRAY_ID)
         assert dict(rois[0].plane) == {}
 
-    def test_a_negative_axis_is_refused(self):
-        db = MetadataDatabase()
-        with pytest.raises(Exception) as exc:
-            db.put_rois(ARRAY_ID, [_annotation(plane={-1: 0})])
-        assert "axis" in str(exc.value).lower()
+    def test_a_negative_axis_cannot_even_be_built(self):
+        # uint32 key: protobuf refuses it at assignment, so the store never
+        # needs a check and no binding can smuggle one past.
+        with pytest.raises(ValueError):
+            _annotation(plane={-1: 0})
 
-    def test_a_negative_index_is_refused(self):
-        db = MetadataDatabase()
-        with pytest.raises(Exception) as exc:
-            db.put_rois(ARRAY_ID, [_annotation(plane={0: -5})])
-        assert "negative" in str(exc.value).lower()
+    def test_a_negative_axis_over_the_wire_is_a_422(self):
+        # The sidecar maps a ParseError to 422, so this is the client-facing
+        # rejection: no route needs its own guard.
+        with pytest.raises(json_format.ParseError):
+            json_format.ParseDict({"rois": [{"plane": {"-1": "0"}}]}, RoiPutRequest())
+
+    def test_a_negative_index_cannot_be_built_either(self):
+        # Unsigned on both halves. A negative index is not harmless nonsense:
+        # it matches no real index, so an annotation carrying one would be
+        # hidden on every plane rather than shown on all of them.
+        with pytest.raises(ValueError):
+            _annotation(plane={0: -5})
+
+    def test_a_negative_index_over_the_wire_is_a_422(self):
+        with pytest.raises(json_format.ParseError):
+            json_format.ParseDict({"rois": [{"plane": {"0": "-5"}}]}, RoiPutRequest())
 
     def test_an_out_of_range_axis_is_accepted_and_simply_matches_nothing(self):
         # The write path binds no tensor, so it has no rank to check against.

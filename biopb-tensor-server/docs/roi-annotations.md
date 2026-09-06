@@ -133,7 +133,7 @@ CREATE TABLE rois (
     set_name   TEXT NOT NULL DEFAULT 'default',
     label      TEXT,                    -- user class/name
     shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon|polyline
-    plane      MAP(INTEGER, BIGINT),    -- axis -> index; absent key = all indices
+    plane      MAP(UINTEGER, UINTEGER), -- axis -> index; absent key = all indices
     bbox       DOUBLE[4],               -- [x0,y0,x1,y1], level-0 px, derived server-side
     geometry   TEXT,                    -- biopb.image.ROI as canonical proto3 JSON
     props_json TEXT,                    -- free-form client JSON (color, score, author)
@@ -227,7 +227,7 @@ message RoiAnnotation {
   string label = 4;
   biopb.image.ROI roi = 5;        // geometry, level-0 pixel coords
   reserved 6;                     // was the dim_label-keyed pin
-  map<int32, int64> plane = 12;   // wire axis index -> index; absent = all
+  map<uint32, uint32> plane = 12; // wire axis index -> index; absent = all
   string props_json = 7;
   optional bytes drawn_against_version = 8;
   int64 rev = 9;                  // server-assigned; echo it back to write safely

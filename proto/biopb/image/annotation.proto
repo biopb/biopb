@@ -61,11 +61,28 @@ message RoiAnnotation {
   // has it. It is deliberately not carried here as well: two spellings of one
   // axis could disagree, and then neither would be authoritative.
   //
+  // Both halves are uint32, following biopb.image throughout: every integer in
+  // this package is unsigned (Mesh.Face's vertex indices, image_data's sizes,
+  // offsets and dims), because none of them can be negative.
+  //
+  // That is a correctness choice, not tidiness. A negative index is not a
+  // harmless nonsense value: it matches no real index, so an annotation
+  // carrying one is hidden on EVERY plane rather than shown on all of them --
+  // the failure disappears instead of announcing itself. Unsigned makes it
+  // unrepresentable, and both client paths refuse one at the boundary (direct
+  // assignment raises; json_format rejects it, so the sidecar answers 422),
+  // which no hand-written check could cover for every binding.
+  //
+  // The ceiling this accepts is ~4.3e9 per axis and ~4.3e9 axes. descriptor.proto
+  // types a tensor's shape int64, so an axis longer than that is expressible
+  // there and not here; it is not a physical image, and biopb.image has already
+  // taken the same ceiling for its own sizes and offsets.
+  //
   // Field 6 held the label-keyed form (map<string, int64>) and is reserved
   // rather than reused: the map entry's key changes wire type, so an old
   // encoder's bytes would misparse rather than fail.
   reserved 6;
-  map<int32, int64> plane = 12;
+  map<uint32, uint32> plane = 12;
 
   // Free-form client JSON (colour, score, author, ...). Opaque to the server.
   string props_json = 7;

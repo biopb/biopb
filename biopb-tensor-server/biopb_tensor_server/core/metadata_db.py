@@ -179,8 +179,8 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
     """Validate one annotation and derive its stored columns.
 
     Raises:
-        ValueError: unusable geometry, an array_id that contradicts the batch's,
-            or a negative plane index.
+        ValueError: unusable geometry, or an array_id that contradicts the
+            batch's.
     """
     if roi.array_id and roi.array_id != array_id:
         raise ValueError(
@@ -213,15 +213,12 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
             f"segmentation belongs in a label tensor."
         )
 
-    for axis, index in roi.plane.items():
-        # The rank is not checked: the write path deliberately binds no tensor,
-        # so it has no descriptor to check against. A pin naming an axis the
-        # tensor does not have simply matches nothing, which is the same outcome
-        # as a pin the client never reads.
-        if axis < 0:
-            raise ValueError(f"Plane axis index is negative: {axis}")
-        if index < 0:
-            raise ValueError(f"Plane index for axis {axis} is negative: {index}")
+    # The plane pin needs no validation here. Both halves are uint32, so a
+    # negative axis or index cannot reach this point -- protobuf refuses one at
+    # assignment and json_format refuses it on parse, which covers every binding
+    # rather than only this one. The rank is deliberately unchecked: the write
+    # path binds no tensor, so it has no descriptor to check against, and a pin
+    # naming an axis the tensor does not have simply matches nothing.
 
     return _PreparedRoi(
         roi_id=roi_id or uuid.uuid4().hex,
@@ -535,7 +532,7 @@ class MetadataDatabase:
                 -- guaranteed present nor unique, so it cannot address every axis
                 -- (see annotation.proto). Reading this column against a tensor's
                 -- dim_labels is what turns an index back into a name.
-                plane MAP(INTEGER, BIGINT),
+                plane MAP(UINTEGER, UINTEGER),
                 -- [x0, y0, x1, y1] in level-0 pixels, derived server-side. Unused
                 -- by the viewer read path (which fetches a tensor's whole set);
                 -- it is what makes the SQL surface useful.
