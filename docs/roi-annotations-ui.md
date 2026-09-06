@@ -226,6 +226,14 @@ into a handle once the shape has enough vertices to close. `Escape` abandons the
 draft and `Backspace` takes back the last vertex; those keys are bound only while
 a draft is open, so the viewer never swallows a key it has no use for.
 
+They are bound on `window` — the canvas is not focusable, and a shape has to be
+finishable wherever the pointer is — so the handler has to hand back the keys it
+should not have. It ignores anything mid-IME-composition (committing a candidate
+is not finishing a polygon) and anything aimed at a text field: the source
+search, the chat composer, the annotation's own label and set inputs and the
+slice inputs are all within that reach, and `Backspace` in any of them must edit
+text rather than take back a vertex.
+
 This avoids the controller conflict entirely, and it is the better interaction for
 tracing anyway — a drag-traced polygon at zoom is worse than placed vertices.
 

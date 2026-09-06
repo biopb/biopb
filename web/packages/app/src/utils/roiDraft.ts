@@ -47,6 +47,25 @@ export function minimumPoints(tool: Exclude<RoiTool, "select">): number {
   }
 }
 
+const TEXT_ENTRY_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
+
+/**
+ * Whether a keystroke belongs to something being typed into rather than to the
+ * drawing tools.
+ *
+ * The draft's keys are bound on `window`, because the canvas is not focusable
+ * and a shape has to be finishable wherever the pointer is. That reach is the
+ * problem: the viewer route keeps the source search, the chat composer, the
+ * annotation's own label and set fields, and the slice inputs all within it, and
+ * Backspace would take back a vertex instead of a character in any of them.
+ */
+export function isTextEntryTarget(target: EventTarget | null): boolean {
+  const el = target as (HTMLElement & { tagName?: unknown }) | null;
+  if (!el || typeof el.tagName !== "string") return false;
+  if (el.isContentEditable) return true;
+  return TEXT_ENTRY_TAGS.has(el.tagName.toUpperCase());
+}
+
 /** A draft that has enough vertices to become a shape. */
 export function isCompletable(draft: RoiDraft | null): boolean {
   return draft !== null && draft.points.length >= minimumPoints(draft.tool);

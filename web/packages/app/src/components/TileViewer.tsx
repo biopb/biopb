@@ -42,6 +42,7 @@ import {
   closeDraft,
   closesOnFirstVertex,
   isCompletable,
+  isTextEntryTarget,
   placePoint,
   undoPoint,
 } from "../utils/roiDraft";
@@ -543,6 +544,13 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   useEffect(() => {
     if (!draft) return;
     const onKey = (event: KeyboardEvent) => {
+      // Mid-composition an IME owns Enter and Backspace -- committing a
+      // candidate is not finishing a polygon. `keyCode === 229` is the same
+      // state in browsers that do not set `isComposing` on keydown.
+      if (event.isComposing || event.keyCode === 229) return;
+      // Nor are they ours while someone is typing. These are window-level, so
+      // they reach the source search and every other field on the route.
+      if (isTextEntryTarget(event.target)) return;
       if (event.key === "Enter") {
         event.preventDefault();
         finishDraft();

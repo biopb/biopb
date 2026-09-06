@@ -4,6 +4,7 @@ import {
   closeDraft,
   closesOnFirstVertex,
   isCompletable,
+  isTextEntryTarget,
   minimumPoints,
   placePoint,
   undoPoint,
@@ -137,5 +138,37 @@ describe("closesOnFirstVertex", () => {
 
   it("never closes a fixed-vertex tool", () => {
     expect(closesOnFirstVertex({ tool: "rectangle", points: [[0, 0]] }, [0, 0], 1)).toBe(false);
+  });
+});
+
+describe("isTextEntryTarget", () => {
+  const target = (tagName: string, isContentEditable = false) =>
+    ({ tagName, isContentEditable }) as unknown as EventTarget;
+
+  it("claims the fields a draft's window-level keys would otherwise reach", () => {
+    // The source search, the chat composer, the label/set fields, the slice
+    // inputs: Backspace in any of them must edit text, not take back a vertex.
+    expect(isTextEntryTarget(target("INPUT"))).toBe(true);
+    expect(isTextEntryTarget(target("TEXTAREA"))).toBe(true);
+    expect(isTextEntryTarget(target("SELECT"))).toBe(true);
+  });
+
+  it("claims a contenteditable host whatever its tag", () => {
+    expect(isTextEntryTarget(target("DIV", true))).toBe(true);
+  });
+
+  it("leaves the canvas and the document body alone", () => {
+    expect(isTextEntryTarget(target("CANVAS"))).toBe(false);
+    expect(isTextEntryTarget(target("BODY"))).toBe(false);
+    expect(isTextEntryTarget(target("BUTTON"))).toBe(false);
+  });
+
+  it("is case-insensitive, for a target reported in lower case", () => {
+    expect(isTextEntryTarget(target("input"))).toBe(true);
+  });
+
+  it("survives a target that is not an element", () => {
+    expect(isTextEntryTarget(null)).toBe(false);
+    expect(isTextEntryTarget({} as EventTarget)).toBe(false);
   });
 });
