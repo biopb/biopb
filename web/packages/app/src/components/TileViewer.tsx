@@ -138,6 +138,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const setSelectedRoi = useAppStore((s) => s.setSelectedRoi);
   const createRoi = useAppStore((s) => s.createRoi);
   const deleteRoi = useAppStore((s) => s.deleteRoi);
+  const polylineWidth = useAppStore((s) => s.newPolylineWidth);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
@@ -508,11 +509,11 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, broadcastDefaults));
 
   const finishDraft = useCallback(() => {
-    const geometry = closeDraft(draftRef.current);
+    const geometry = closeDraft(draftRef.current, polylineWidth);
     if (!geometry) return;
     setDraft(null);
     void createRoi(geometry, pinForNewRoi(info, shownPlane ?? {}, broadcastAxes));
-  }, [setDraft, createRoi, info, shownPlane, broadcastAxes]);
+  }, [setDraft, createRoi, info, shownPlane, broadcastAxes, polylineWidth]);
 
   const onDeckClick = useCallback(
     (info_: { coordinate?: number[]; viewport?: { zoom?: number | number[] } }) => {
@@ -612,8 +613,14 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   }, [draft, selectedRoiId, shown, deleteRoi]);
 
   const draftLayers = useMemo(
-    () => buildDraftLayers({ draft, cursor: draftCursor, closeable: isCompletable(draft) }),
-    [draft, draftCursor],
+    () =>
+      buildDraftLayers({
+        draft,
+        cursor: draftCursor,
+        closeable: isCompletable(draft),
+        polylineWidth,
+      }),
+    [draft, draftCursor, polylineWidth],
   );
 
   const overlayLayers = useMemo(

@@ -97,6 +97,25 @@ const PALETTE: Array<[number, number, number]> = [
 /** Selection emphasis: one colour, so a selected shape reads the same anywhere. */
 const SELECTED_COLOR: [number, number, number, number] = [255, 255, 255, 255];
 
+/**
+ * Every annotation is a translucent area under an opaque outline, and these are
+ * what make that true of all of them rather than of each of them separately.
+ *
+ * The area is what the annotation claims and the pixels under it have to stay
+ * readable through it; the outline is the shape itself, so it is opaque, drawn
+ * in screen units, and is the only part selection touches. A polyline's band is
+ * an area by this reckoning even though it is drawn by a stroke -- which is
+ * what it was getting wrong: one opaque band, hiding the pixels it pointed at
+ * and turning white as a whole when selected, where every other kind keeps its
+ * fill and brightens an edge.
+ */
+const AREA_ALPHA = 40;
+/** A dot is small enough that the area alpha would leave nothing to see. */
+const POINT_AREA_ALPHA = 90;
+const OUTLINE_ALPHA = 230;
+const OUTLINE_PX = 1.5;
+const SELECTED_OUTLINE_PX = 3;
+
 export function setColor(setName: string): [number, number, number] {
   let hash = 0;
   for (let i = 0; i < setName.length; i++) {
@@ -253,13 +272,14 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         filled: true,
         stroked: true,
         getPolygon: (d: { ring: XY[] }) => d.ring,
-        getFillColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), 40],
+        getFillColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), AREA_ALPHA],
         getLineColor: (d: { roi: RoiAnnotation }) =>
-          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), 230],
+          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), OUTLINE_ALPHA],
         // Pixels, not world units: an outline is a way of seeing the shape, so
         // it should not thin out as the user zooms out of a large field.
         lineWidthUnits: "pixels",
-        getLineWidth: (d: { roi: RoiAnnotation }) => (d.roi.roiId === selectedRoiId ? 3 : 1.5),
+        getLineWidth: (d: { roi: RoiAnnotation }) =>
+          d.roi.roiId === selectedRoiId ? SELECTED_OUTLINE_PX : OUTLINE_PX,
         updateTriggers: { getLineColor: selectedRoiId, getLineWidth: selectedRoiId },
       }),
     );
@@ -267,23 +287,41 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
 
   if (paths.length > 0) {
     layers.push(
+      // The band the stroke claims: this shape's area, so it takes the area's
+      // alpha and world units -- the width is geometry, the pixels it covers,
+      // so it scales with the image. No pixel floor, unlike the centreline
+      // below: a stored width of 0 has no extent to draw, and drawing it a
+      // floor's worth would invent one.
+      new PathLayer({
+        id: roiLayerId("path-bands"),
+        data: paths,
+        pickable: false,
+        widthUnits: "common",
+        widthMinPixels: 0,
+        capRounded: true,
+        jointRounded: true,
+        getPath: (d: { path: XY[] }) => d.path,
+        getColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), AREA_ALPHA],
+        getWidth: (d: { roi: RoiAnnotation }) =>
+          d.roi.geometry.kind === "polyline" ? Math.abs(d.roi.geometry.width) : 0,
+      }),
+      // The centreline stands in for the outline the other kinds have: a band
+      // cannot be stroked along its edges here, and the centreline is the trace
+      // the user actually made. Screen units and the outline alpha, so it reads
+      // the same as a polygon's edge, and it is the only part selection touches.
       new PathLayer({
         id: roiLayerId("paths"),
         data: paths,
         pickable: false,
-        // World units here, unlike the outlines above: a polyline's width is
-        // geometry -- the band of pixels the stroke covers -- so it has to scale
-        // with the image. The pixel floor only keeps a hairline visible.
-        widthUnits: "common",
-        widthMinPixels: 1.5,
+        widthUnits: "pixels",
         capRounded: true,
         jointRounded: true,
         getPath: (d: { path: XY[] }) => d.path,
         getColor: (d: { roi: RoiAnnotation }) =>
-          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), 230],
+          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), OUTLINE_ALPHA],
         getWidth: (d: { roi: RoiAnnotation }) =>
-          d.roi.geometry.kind === "polyline" ? Math.abs(d.roi.geometry.width) : 0,
-        updateTriggers: { getColor: selectedRoiId },
+          d.roi.roiId === selectedRoiId ? SELECTED_OUTLINE_PX : OUTLINE_PX,
+        updateTriggers: { getColor: selectedRoiId, getWidth: selectedRoiId },
       }),
     );
   }
@@ -299,12 +337,12 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         getRadius: 4,
         stroked: true,
         lineWidthUnits: "pixels",
-        getLineWidth: 1.5,
+        getLineWidth: OUTLINE_PX,
         getPosition: (d: RoiAnnotation) =>
           d.geometry.kind === "point" ? [d.geometry.at.x, d.geometry.at.y] : [0, 0],
-        getFillColor: (d: RoiAnnotation) => [...setColor(d.setName), 90],
+        getFillColor: (d: RoiAnnotation) => [...setColor(d.setName), POINT_AREA_ALPHA],
         getLineColor: (d: RoiAnnotation) =>
-          d.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.setName), 230],
+          d.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.setName), OUTLINE_ALPHA],
         updateTriggers: { getLineColor: selectedRoiId },
       }),
     );
@@ -319,6 +357,8 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
 
 /** Colour of an in-progress draft: distinct from every set colour. */
 const DRAFT_COLOR: [number, number, number, number] = [250, 204, 21, 240];
+/** The same colour as the band a finished polyline becomes. */
+const DRAFT_BAND_COLOR: [number, number, number, number] = [250, 204, 21, AREA_ALPHA];
 
 export interface DraftLayerOptions {
   draft: RoiDraft | null;
@@ -326,6 +366,8 @@ export interface DraftLayerOptions {
   cursor: XY | null;
   /** The draft has enough vertices to close, so its first vertex is a handle. */
   closeable: boolean;
+  /** Width a polyline draft will be stored at, in image pixels. */
+  polylineWidth: number;
 }
 
 /**
@@ -337,8 +379,15 @@ export interface DraftLayerOptions {
  * rate would re-tessellate every annotation for every mouse move.
  */
 export function buildDraftLayers(options: DraftLayerOptions): unknown[] {
-  const { draft, cursor, closeable } = options;
+  const { draft, cursor, closeable, polylineWidth } = options;
   if (!draft || draft.points.length === 0) return [];
+
+  // A polyline previews as the band it will become -- same world units, same
+  // area alpha -- because the width is the pixels it claims, and tracing at a
+  // hairline only to find out afterwards is tracing blind. The construction
+  // line stays on top of it, as the centreline does on a finished one, so what
+  // is on screen while drawing is what commit leaves behind.
+  const asBand = draft.tool === "polyline";
 
   const placed = draft.points;
   // A rectangle previews as the box it will become, not as the two clicks that
@@ -351,6 +400,23 @@ export function buildDraftLayers(options: DraftLayerOptions): unknown[] {
         : placed;
 
   const layers: unknown[] = [
+    ...(asBand
+      ? [
+          new PathLayer({
+            id: roiLayerId("draft-band"),
+            data: [{ path: preview }],
+            pickable: false,
+            widthUnits: "common",
+            widthMinPixels: 0,
+            getWidth: polylineWidth,
+            capRounded: true,
+            jointRounded: true,
+            getPath: (d: { path: XY[] }) => d.path,
+            getColor: DRAFT_BAND_COLOR,
+            updateTriggers: { getPath: preview, getWidth: polylineWidth },
+          }),
+        ]
+      : []),
     new PathLayer({
       id: roiLayerId("draft-path"),
       data: [{ path: preview }],

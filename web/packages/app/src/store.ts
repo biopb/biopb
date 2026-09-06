@@ -7,6 +7,7 @@ import type {
   RoiGeometry,
   TileInfo,
 } from "@biopb/tensor-flight-client";
+import { DEFAULT_POLYLINE_WIDTH, clampPolylineWidth } from "./utils/roiDraft";
 import type { RoiDraft, RoiTool } from "./utils/roiDraft";
 import { TensorApiError } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
@@ -216,6 +217,12 @@ export interface AppState {
   newLabel: string;
   newSetName: string;
   /**
+   * Width a new polyline gets, in image pixels. A preference like the two
+   * above, and geometry rather than styling -- it is the band of pixels the
+   * stroke claims, so it is stored on the annotation and scales with the image.
+   */
+  newPolylineWidth: number;
+  /**
    * Axes a new annotation should NOT pin, i.e. broadcast across. `null` means
    * "the default for this tensor" (see `selectBroadcastAxes`), which is not the
    * same as "none" -- an empty array is a deliberate choice to pin everything.
@@ -313,6 +320,7 @@ export interface AppState {
   setSelectedRoi: (roiId: string | null) => void;
   setNewLabel: (label: string) => void;
   setNewSetName: (setName: string) => void;
+  setNewPolylineWidth: (width: number) => void;
   toggleBroadcastAxis: (axis: number, defaults: number[]) => void;
   createRoi: (geometry: RoiGeometry, plane: Record<number, number>) => Promise<void>;
   deleteRoi: (roiId: string) => Promise<void>;
@@ -419,6 +427,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedRoiId: null,
   newLabel: "",
   newSetName: "",
+  newPolylineWidth: DEFAULT_POLYLINE_WIDTH,
   broadcastAxes: null,
   broadcastAxesFor: null,
   roiWriteError: null,
@@ -627,6 +636,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setNewSetName(setName) {
     set({ newSetName: setName });
+  },
+
+  setNewPolylineWidth(width) {
+    set({ newPolylineWidth: clampPolylineWidth(width) });
   },
 
   toggleBroadcastAxis(axis, defaults) {

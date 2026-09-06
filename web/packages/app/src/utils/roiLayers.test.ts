@@ -191,7 +191,9 @@ describe("buildRoiLayers", () => {
       hiddenSets: [],
       visible: true,
     }) as Array<{ id: string }>;
-    expect(layers).toHaveLength(3);
+    // Four, not three: a polyline is a band plus its centreline, which is how
+    // every other kind is drawn too -- a translucent area under an opaque edge.
+    expect(layers).toHaveLength(4);
     for (const layer of layers) expect(layer.id).toContain("-#detail#");
   });
 
@@ -216,6 +218,67 @@ describe("buildRoiLayers", () => {
     expect(
       buildRoiLayers({ rois: pinned, currentPlane: { 1: 2 }, hiddenSets: [], visible: true }),
     ).toEqual([]);
+  });
+
+  it("draws every kind as a translucent area under an opaque outline", () => {
+    // The polyline used to be the exception: one opaque band, which hid the
+    // pixels it was pointing at and left it looking nothing like the rest.
+    const layers = buildRoiLayers({
+      rois: set,
+      currentPlane: {},
+      hiddenSets: [],
+      visible: true,
+    }) as Array<{ id: string; props: Record<string, unknown> }>;
+    const alpha = (id: string, accessor: string) => {
+      const layer = layers.find((l) => l.id === roiLayerId(id));
+      const get = layer?.props[accessor] as (d: unknown) => number[];
+      const datum = (layer?.props.data as unknown[])[0];
+      return get(datum)[3];
+    };
+    for (const [id, accessor] of [
+      ["shapes", "getFillColor"],
+      ["path-bands", "getColor"],
+      ["points", "getFillColor"],
+    ] as const) {
+      expect(alpha(id, accessor)).toBeLessThan(128);
+    }
+    for (const [id, accessor] of [
+      ["shapes", "getLineColor"],
+      ["paths", "getColor"],
+      ["points", "getLineColor"],
+    ] as const) {
+      expect(alpha(id, accessor)).toBeGreaterThan(200);
+    }
+  });
+
+  it("emphasises a selection on the outline, never on the area", () => {
+    // Selecting a polyline used to turn the whole band white, where every other
+    // kind keeps its fill and brightens an edge.
+    const probe = (selectedRoiId: string | null) => {
+      const layers = buildRoiLayers({
+        rois: set,
+        currentPlane: {},
+        hiddenSets: [],
+        visible: true,
+        selectedRoiId,
+      }) as Array<{ id: string; props: Record<string, unknown> }>;
+      const read = (id: string, accessor: string) => {
+        const layer = layers.find((l) => l.id === roiLayerId(id));
+        const get = layer?.props[accessor] as (d: unknown) => unknown;
+        return get((layer?.props.data as unknown[])[0]);
+      };
+      return {
+        band: read("path-bands", "getColor"),
+        line: read("paths", "getColor"),
+        lineWidth: read("paths", "getWidth"),
+      };
+    };
+    const idle = probe(null);
+    const picked = probe("b");
+    expect(picked.line).toEqual([255, 255, 255, 255]);
+    expect(picked.lineWidth).toBeGreaterThan(idle.lineWidth as number);
+    // The area is what the annotation claims; selecting it does not change it.
+    expect(picked.band).toEqual(idle.band);
   });
 
   it("leaves every layer unpickable, so the pixel readout still answers", () => {

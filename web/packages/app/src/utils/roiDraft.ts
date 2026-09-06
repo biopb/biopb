@@ -110,16 +110,48 @@ export function placePoint(draft: RoiDraft | null, tool: RoiTool, at: XY): Place
 }
 
 /**
+ * Width a new polyline gets, in image pixels.
+ *
+ * Not zero, which is what this used to be: a stroke of no extent renders at the
+ * layer's hairline floor whatever the zoom, so every polyline came out looking
+ * like a construction line rather than something traced over structure. Width
+ * is geometry here -- the band of pixels the stroke covers -- so the default has
+ * to be a width somebody would have chosen, not the additive identity.
+ */
+export const DEFAULT_POLYLINE_WIDTH = 4;
+
+/**
+ * What the width control offers, in image pixels.
+ *
+ * The floor is 1 rather than 0: zero is a legitimate stored value, but it is
+ * not one to hand somebody a slider for -- it draws as a hairline and nothing
+ * about the control would say why.
+ */
+export const MIN_POLYLINE_WIDTH = 1;
+export const MAX_POLYLINE_WIDTH = 64;
+
+/** Hold a width inside the range the control offers. */
+export function clampPolylineWidth(width: number): number {
+  if (!Number.isFinite(width)) return DEFAULT_POLYLINE_WIDTH;
+  return Math.min(MAX_POLYLINE_WIDTH, Math.max(MIN_POLYLINE_WIDTH, width));
+}
+
+/**
  * Finish an open-ended draft, or return null when it has too few vertices.
  *
  * Null rather than a partial shape: a two-vertex "polygon" is not a lesser
  * polygon, it is a line the store would reject anyway.
  */
-export function closeDraft(draft: RoiDraft | null): RoiGeometry | null {
+export function closeDraft(
+  draft: RoiDraft | null,
+  polylineWidth: number = DEFAULT_POLYLINE_WIDTH,
+): RoiGeometry | null {
   if (!isCompletable(draft) || !draft) return null;
   const points = draft.points.map(([x, y]) => ({ x, y }));
   if (draft.tool === "polygon") return { kind: "polygon", points };
-  if (draft.tool === "polyline") return { kind: "polyline", points, width: 0 };
+  if (draft.tool === "polyline") {
+    return { kind: "polyline", points, width: clampPolylineWidth(polylineWidth) };
+  }
   return null;
 }
 
