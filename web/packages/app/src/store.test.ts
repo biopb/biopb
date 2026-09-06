@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DataSourceDescriptor, TensorFlightClient, TileInfo } from "@biopb/tensor-flight-client";
+import type {
+  DataSourceDescriptor,
+  RoiAnnotation,
+  TensorFlightClient,
+  TileInfo,
+} from "@biopb/tensor-flight-client";
 import {
   selectHiddenSets,
   selectRois,
@@ -437,6 +442,114 @@ describe("authoring state", () => {
     // the shape that was sent.
     expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["srv1"]);
     expect(useAppStore.getState().selectedRoiId).toBe("srv1");
+  });
+
+  it("draws the annotation before the server has stored it", async () => {
+    // The click that finishes a shape also clears the draft, so without this
+    // the shape vanishes for a round trip. Nothing about the click should wait
+    // on the network.
+    let seen: RoiAnnotation[] = [];
+    let release = () => {};
+    const landed = new Promise<void>((resolve) => (release = resolve));
+    seedFor({
+      http: {
+        putRois: async () => {
+          seen = useAppStore.getState().rois;
+          await landed;
+          return { stored: [stored({ label: "cell" })], conflicts: [], skipped: 0 };
+        },
+      },
+    });
+    const writing = useAppStore.getState().createRoi(GEOM, { 2: 12 });
+    // Drawn already, with the geometry that was traced.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.geometry).toEqual(GEOM);
+    expect(seen[0]?.plane).toEqual({ 2: 12 });
+    // Not selected yet: the id is this client's invention until the server
+    // answers with its own.
+    expect(useAppStore.getState().selectedRoiId).toBeNull();
+
+    release();
+    await writing;
+    // Swapped in place for the stored row, not appended beside it.
+    expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["srv1"]);
+    expect(useAppStore.getState().selectedRoiId).toBe("srv1");
+  });
+
+  it("takes the provisional row back out when the write fails", async () => {
+    seedFor({ http: { putRois: () => Promise.reject(new Error("422 rejected")) } });
+    await useAppStore.getState().createRoi(GEOM, {});
+    expect(useAppStore.getState().rois).toEqual([]);
+    expect(useAppStore.getState().roiWriteError).toContain("422 rejected");
+  });
+
+  it("puts a provisional row in the set its stored form will land in", async () => {
+    // The server substitutes "default" for an empty set name, so a blank one
+    // here would show a nameless set row for the length of a round trip.
+    let seen: RoiAnnotation[] = [];
+    seedFor({
+      http: {
+        putRois: () => {
+          seen = useAppStore.getState().rois;
+          return Promise.resolve({ stored: [stored()], conflicts: [], skipped: 0 });
+        },
+      },
+    });
+    await useAppStore.getState().createRoi(GEOM, {});
+    expect(seen[0]?.setName).toBe("default");
+  });
+
+  it("leaves a provisional row alone when Delete reaches it mid-write", async () => {
+    // Its id is one this client invented; the server has never heard of it.
+    let asked = false;
+    seedFor({ http: { deleteRois: () => ((asked = true), Promise.resolve([])) } });
+    const provisional = { ...stored(), roiId: "pending,1" };
+    useAppStore.setState({ rois: [provisional] });
+    await useAppStore.getState().deleteRoi("pending,1");
+    expect(asked).toBe(false);
+    expect(useAppStore.getState().rois).toHaveLength(1);
+  });
+
+  it("removes a deleted annotation on the keystroke, not on the answer", async () => {
+    let seen: RoiAnnotation[] = [];
+    seedFor({
+      http: {
+        deleteRois: () => {
+          seen = useAppStore.getState().rois;
+          return Promise.resolve(["srv1"]);
+        },
+      },
+    });
+    useAppStore.setState({ rois: [stored()], selectedRoiId: "srv1" });
+    await useAppStore.getState().deleteRoi("srv1");
+    // Gone before the request was made, not after it came back.
+    expect(seen).toEqual([]);
+  });
+
+  it("puts a row back where it was when the delete fails", async () => {
+    // Not at the end: the overlay draws later annotations over earlier ones, so
+    // a failed delete must not reorder what covers what.
+    seedFor({ http: { deleteRois: () => Promise.reject(new Error("503 upstream")) } });
+    useAppStore.setState({
+      rois: [stored({ roiId: "a" }), stored({ roiId: "b" }), stored({ roiId: "c" })],
+    });
+    await useAppStore.getState().deleteRoi("b");
+    expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["a", "b", "c"]);
+    expect(useAppStore.getState().roiWriteError).toContain("503 upstream");
+  });
+
+  it("does not restore a failed delete into another tensor's list", async () => {
+    seedFor({
+      http: {
+        deleteRois: () => {
+          useAppStore.setState({ activeTensorId: "second", roisFor: "second", rois: [] });
+          return Promise.reject(new Error("503 upstream"));
+        },
+      },
+    });
+    useAppStore.setState({ rois: [stored()] });
+    await useAppStore.getState().deleteRoi("srv1");
+    expect(useAppStore.getState().rois).toEqual([]);
   });
 
   it("drops a write that landed after the tensor moved on", async () => {

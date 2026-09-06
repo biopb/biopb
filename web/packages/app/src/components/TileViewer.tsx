@@ -17,6 +17,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
+import { OrthographicView } from "@deck.gl/core";
 import {
   ColorPaletteExtension,
   DETAIL_VIEW_ID,
@@ -43,6 +44,7 @@ import {
   closeDraft,
   closesOnFirstVertex,
   isCompletable,
+  isRealClick,
   isTextEntryTarget,
   placePoint,
   undoPoint,
@@ -52,6 +54,7 @@ import { RoiToolStrip } from "./RoiToolStrip";
 import {
   buildDraftLayers,
   buildRoiLayers,
+  buildSelectionLayers,
   defaultBroadcastAxes,
   pinForNewRoi,
   planeFromSelection,
@@ -107,6 +110,64 @@ const SLICE_WHEEL_QUIET_MS = 120;
  * catalog or a moment of load -- no longer costing the tensor its viewer.
  */
 const TILE_INFO_RETRY_MS = [500];
+
+/**
+ * Stops deck.gl holding every click for a third of a second.
+ *
+ * deck wires its click recognizer as `requireFailure(['dblclick'])`, and
+ * mjolnir answers that by deferring the emit by the recognizer's `interval`
+ * (300 ms by default) -- then cancelling that pending emit outright if another
+ * press arrives first, because `TapRecognizer.process` opens with a `reset()`
+ * that clears the timer and overwrites the input it would have reported. Three
+ * vertices placed a tenth of a second apart therefore arrive as one click, at
+ * the last position: the first two are cancelled, not queued.
+ *
+ * Zero here means the emit lands on the next task instead. Nothing else pushes
+ * the recognizer through `process` in between -- mouse moves reach it only
+ * while a button is down -- so the only thing that ever cancelled a click was
+ * the next click. `dblclick` keeps its own recognizer and its own interval, so
+ * double-click zoom is untouched.
+ */
+const CLICK_OPTIONS = { click: { interval: 0 } };
+
+/**
+ * Viv's detail view, with a say over whether a double click zooms.
+ *
+ * `VivView.getDeckGlView` hard-codes `controller: true`, which is deck's whole
+ * default gesture set. That is the wrong set while a click places a vertex: the
+ * two taps of a double click are two vertices, and zooming out from under them
+ * on the same gesture moves everything already placed relative to what is on
+ * screen. Suppressing the vertices instead would mean waiting to find out
+ * whether a second tap is coming, which is the 300 ms {@link CLICK_OPTIONS}
+ * exists to get rid of.
+ *
+ * Only the double click goes: scroll still zooms, and drag still pans, so the
+ * gesture that is actually used to navigate while drawing is untouched.
+ */
+class BiopbDetailView extends DetailView {
+  private readonly doubleClickZoom: boolean;
+
+  constructor(props: {
+    id: string;
+    height: number;
+    width: number;
+    doubleClickZoom: boolean;
+  }) {
+    super(props);
+    this.doubleClickZoom = props.doubleClickZoom;
+  }
+
+  getDeckGlView() {
+    return new OrthographicView({
+      controller: { doubleClickZoom: this.doubleClickZoom },
+      id: this.id,
+      height: this.height,
+      width: this.width,
+      x: this.x,
+      y: this.y,
+    });
+  }
+}
 
 /**
  * Viv's default palette plus gamma. Module-level because deck.gl treats a change
@@ -460,6 +521,10 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     return planeFromSelection(info, JSON.parse(loadedKey) as Record<string, number>);
   }, [info, loadedKey]);
 
+  // Selection is deliberately not a dependency: it would change this memo's
+  // output identity, and deck.gl answers a changed `data` by regenerating every
+  // attribute of every layer -- re-tessellating the whole set for a click. The
+  // emphasis is its own layer, over one annotation, below.
   const roiLayers = useMemo(
     () =>
       buildRoiLayers({
@@ -470,9 +535,8 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
         // empty pin would match every unpinned annotation and draw them over a
         // frame that is not there.
         visible: showRois && shownPlane !== null,
-        selectedRoiId,
       }),
-    [rois, shownPlane, hiddenSets, showRois, selectedRoiId],
+    [rois, shownPlane, hiddenSets, showRois],
   );
 
   // --- authoring -----------------------------------------------------------
@@ -516,7 +580,13 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   }, [setDraft, createRoi, info, shownPlane, broadcastAxes, polylineWidth]);
 
   const onDeckClick = useCallback(
-    (info_: { coordinate?: number[]; viewport?: { zoom?: number | number[] } }) => {
+    (
+      info_: { coordinate?: number[]; viewport?: { zoom?: number | number[] } },
+      event?: { type?: string },
+    ) => {
+      // deck reports the second tap of a double click twice -- once as a click,
+      // once as a dblclick -- and routes both here.
+      if (!isRealClick(event)) return;
       // Nothing is drawn, so nothing is placeable or selectable: the toggle
       // turns the surface off rather than only hiding what is stored.
       if (!showRois) return;
@@ -623,9 +693,17 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     [draft, draftCursor, polylineWidth],
   );
 
+  // Only what is drawn can be emphasised, which is the same condition the panel
+  // and the Delete key use -- so a selection the plane has moved off is not
+  // marked on a shape that is not there.
+  const selectionLayers = useMemo(
+    () => buildSelectionLayers(shown.find((roi) => roi.roiId === selectedRoiId) ?? null),
+    [shown, selectedRoiId],
+  );
+
   const overlayLayers = useMemo(
-    () => [...roiLayers, ...draftLayers],
-    [roiLayers, draftLayers],
+    () => [...roiLayers, ...selectionLayers, ...draftLayers],
+    [roiLayers, selectionLayers, draftLayers],
   );
 
   return (
@@ -842,9 +920,24 @@ function VivStage({
     [setCamera2d],
   );
 
+  // Only while a click would place something. With the overlay off, with no
+  // annotation support on the server, or with the select tool held, a double
+  // click has nothing to collide with and keeps deck's zoom.
+  const placing = useAppStore((s) => s.showRois && !s.roisUnavailable && s.tool !== "select");
+
+  // A new instance, but the same id, height and width -- which is all
+  // `VivViewer.getDerivedStateFromProps` looks at, so switching tools
+  // reconfigures the controller without touching the camera.
   const views = useMemo(
-    () => [new DetailView({ id: DETAIL_VIEW_ID, height, width })],
-    [height, width],
+    () => [
+      new BiopbDetailView({
+        id: DETAIL_VIEW_ID,
+        height,
+        width,
+        doubleClickZoom: !placing,
+      }),
+    ],
+    [height, width, placing],
   );
 
   // Its own memo: this array's identity is what Viv's ImageLayer diffs on, so it
@@ -883,7 +976,7 @@ function VivStage({
   // survives. The overlay is unpickable, so it arrives with no picked layer and
   // `coordinate` set, which is exactly what placing a vertex needs.
   const deckProps = useMemo(
-    () => ({ layers: overlayLayers, onClick: onDeckClick }),
+    () => ({ layers: overlayLayers, onClick: onDeckClick, eventRecognizerOptions: CLICK_OPTIONS }),
     [overlayLayers, onDeckClick],
   );
 

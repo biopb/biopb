@@ -369,6 +369,62 @@ per row and one at a time, and expires: two live "Sure?" buttons is two chances
 to hit the wrong one, and an armed button left on screen is a trap the next
 time the panel is looked at.
 
+**deck.gl's click recognizer is reconfigured, and that is what made clicking
+feel slow.** deck wires it as `requireFailure(['dblclick'])`; mjolnir answers
+that by deferring the emit by the recognizer's `interval` — 300 ms — and
+`TapRecognizer.process` opens with a `reset()` that clears the pending timer and
+overwrites the input it would have reported. So every click was held for a third
+of a second, and vertices placed faster than that arrived as a single click at
+the last position, the earlier ones cancelled rather than queued.
+`eventRecognizerOptions: {click: {interval: 0}}` lands the emit on the next task
+instead. Nothing else drives the recognizer through `process` in between — mouse
+moves reach it only while a button is down — so the only thing that ever
+cancelled a click was the next one. `dblclick` keeps its own recognizer and
+interval; deck routes it to `onClick` as well, and `isRealClick` drops that
+duplicate so a double click does not place a third vertex.
+
+**Double-click zoom is off while a click would place something.** The two taps
+of a double click are two vertices, and zooming out from under them on the same
+gesture moves everything already placed relative to what is on screen.
+Suppressing the vertices instead would mean waiting to find out whether a
+second tap is coming, which is the 300 ms the paragraph above exists to get rid
+of. `VivView.getDeckGlView` hard-codes `controller: true`, so the detail view is
+subclassed to pass `{doubleClickZoom}` through; the new instance keeps the same
+id, height and width, which is all `VivViewer.getDerivedStateFromProps`
+inspects, so switching tools reconfigures the controller without touching the
+camera. Scroll and drag are untouched — they are what navigation while drawing
+actually uses — and with the overlay off, no annotation support, or the select
+tool held, the gesture comes back.
+
+**Selection is its own layer, over one annotation.** Every `buildRoiLayers`
+call rebuilds each layer's `data`, and deck.gl answers a changed `data`
+identity by regenerating every attribute — earcut included, which is the
+dominant term (see the plane-switch measurement). Folding selection into those
+accessors made a click pay that for the whole set. Drawing the emphasis
+separately keeps the layers below identical across a click, so deck.gl does
+nothing at all: measured flat at ~0.002 ms from 100 to 5000 annotations,
+against 0.06–1.9 ms of rebuild plus its earcut. It composes because selection
+is outline-only — a wider opaque outline covers the one it stands in for, and
+the area underneath is still the layer below's.
+
+**A create is drawn before it is stored, and a delete disappears on the
+keystroke.** The click that finishes a shape also clears the draft, so a
+blocking write meant the traced shape vanished for a whole round trip and came
+back when the server answered; a blocking delete left the row under the pointer
+after Delete was pressed. Both are optimistic now. A provisional row carries a
+`pending,`-prefixed id — the wire cannot produce one, since the delete route
+splits ids on `,` — and is swapped in place for the stored row when the write
+lands, or taken back out when it fails. It is not selected until the server
+answers with its own id: selecting a row whose identity is about to change puts
+this client's invention in front of the user, and `deleteRoi` ignores such an
+id rather than asking the server about a row it has never heard of. A failed
+delete goes back at its old index, because the overlay draws later annotations
+over earlier ones.
+
+Clearing a set stays blocking: it is a deliberate, confirmed action, not a
+per-click path, and watching the rows actually go is the feedback that matters
+there.
+
 **A polyline's width is set before the first click, with the tool.** It is
 geometry, not styling — the band of pixels the stroke covers, stored on the
 annotation and scaling with the image — so tracing at a hairline and choosing

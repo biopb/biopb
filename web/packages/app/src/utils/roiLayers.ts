@@ -234,12 +234,17 @@ export interface RoiLayerOptions {
   hiddenSets: string[];
   /** The overlay toggle. False yields no layers at all rather than hidden ones. */
   visible: boolean;
-  /** Drawn brighter and thicker, so the panel and the canvas agree. */
-  selectedRoiId?: string | null;
 }
 
 /**
  * The overlay's layers, ready for `VivViewer`'s `deckProps.layers`.
+ *
+ * Selection is deliberately not an input. Every call rebuilds each layer's
+ * `data`, which deck.gl reads as a changed identity and answers by regenerating
+ * every attribute -- earcut included, which is the dominant term. Folding
+ * selection in here made a click pay that for the whole set; it is drawn by
+ * {@link buildSelectionLayers} instead, over one annotation, so the layers
+ * below keep their identity and deck.gl does nothing at all.
  *
  * `pickable: false` throughout, and not only because nothing is interactive
  * yet: the hover readout in `TileViewer` reads `info.sourceLayer` and
@@ -248,7 +253,7 @@ export interface RoiLayerOptions {
  * annotation lies. Phase 3 has to route around that rather than just flip this.
  */
 export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
-  const { rois, currentPlane, hiddenSets, visible, selectedRoiId = null } = options;
+  const { rois, currentPlane, hiddenSets, visible } = options;
   if (!visible) return [];
   const shown = visibleRois(rois, currentPlane, hiddenSets);
   if (shown.length === 0) return [];
@@ -273,14 +278,11 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         stroked: true,
         getPolygon: (d: { ring: XY[] }) => d.ring,
         getFillColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), AREA_ALPHA],
-        getLineColor: (d: { roi: RoiAnnotation }) =>
-          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), OUTLINE_ALPHA],
+        getLineColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), OUTLINE_ALPHA],
         // Pixels, not world units: an outline is a way of seeing the shape, so
         // it should not thin out as the user zooms out of a large field.
         lineWidthUnits: "pixels",
-        getLineWidth: (d: { roi: RoiAnnotation }) =>
-          d.roi.roiId === selectedRoiId ? SELECTED_OUTLINE_PX : OUTLINE_PX,
-        updateTriggers: { getLineColor: selectedRoiId, getLineWidth: selectedRoiId },
+        getLineWidth: OUTLINE_PX,
       }),
     );
   }
@@ -317,11 +319,8 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         capRounded: true,
         jointRounded: true,
         getPath: (d: { path: XY[] }) => d.path,
-        getColor: (d: { roi: RoiAnnotation }) =>
-          d.roi.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.roi.setName), OUTLINE_ALPHA],
-        getWidth: (d: { roi: RoiAnnotation }) =>
-          d.roi.roiId === selectedRoiId ? SELECTED_OUTLINE_PX : OUTLINE_PX,
-        updateTriggers: { getColor: selectedRoiId, getWidth: selectedRoiId },
+        getColor: (d: { roi: RoiAnnotation }) => [...setColor(d.roi.setName), OUTLINE_ALPHA],
+        getWidth: OUTLINE_PX,
       }),
     );
   }
@@ -341,14 +340,82 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
         getPosition: (d: RoiAnnotation) =>
           d.geometry.kind === "point" ? [d.geometry.at.x, d.geometry.at.y] : [0, 0],
         getFillColor: (d: RoiAnnotation) => [...setColor(d.setName), POINT_AREA_ALPHA],
-        getLineColor: (d: RoiAnnotation) =>
-          d.roiId === selectedRoiId ? SELECTED_COLOR : [...setColor(d.setName), OUTLINE_ALPHA],
-        updateTriggers: { getLineColor: selectedRoiId },
+        getLineColor: (d: RoiAnnotation) => [...setColor(d.setName), OUTLINE_ALPHA],
       }),
     );
   }
 
   return layers;
+}
+
+/**
+ * The emphasis on the selected annotation, drawn over the overlay.
+ *
+ * Its own layers, over one datum, so selecting costs the same whether the
+ * tensor holds ten annotations or the server's five thousand -- see
+ * {@link buildRoiLayers} for what it used to cost.
+ *
+ * Outline only. The area underneath is still drawn by the layer below, which is
+ * both why this composes (a wider opaque outline covers the one it replaces)
+ * and what keeps selection an emphasis rather than a different shape.
+ */
+export function buildSelectionLayers(roi: RoiAnnotation | null): unknown[] {
+  if (!roi) return [];
+
+  if (roi.geometry.kind === "point") {
+    return [
+      new ScatterplotLayer({
+        id: roiLayerId("selection-point"),
+        data: [roi],
+        pickable: false,
+        radiusUnits: "pixels",
+        getRadius: 4,
+        stroked: true,
+        filled: false,
+        lineWidthUnits: "pixels",
+        getLineWidth: OUTLINE_PX,
+        getPosition: (d: RoiAnnotation) =>
+          d.geometry.kind === "point" ? [d.geometry.at.x, d.geometry.at.y] : [0, 0],
+        getLineColor: SELECTED_COLOR,
+      }),
+    ];
+  }
+
+  const path = roiPath(roi.geometry);
+  if (path) {
+    // The centreline, as in the overlay: the band stays the set's colour,
+    // because the area is what the annotation claims and selecting it does not
+    // change that.
+    return [
+      new PathLayer({
+        id: roiLayerId("selection-path"),
+        data: [{ path }],
+        pickable: false,
+        widthUnits: "pixels",
+        capRounded: true,
+        jointRounded: true,
+        getPath: (d: { path: XY[] }) => d.path,
+        getColor: SELECTED_COLOR,
+        getWidth: SELECTED_OUTLINE_PX,
+      }),
+    ];
+  }
+
+  const ring = roiRing(roi.geometry);
+  if (!ring) return [];
+  return [
+    new PolygonLayer({
+      id: roiLayerId("selection-shape"),
+      data: [{ ring }],
+      pickable: false,
+      filled: false,
+      stroked: true,
+      getPolygon: (d: { ring: XY[] }) => d.ring,
+      lineWidthUnits: "pixels",
+      getLineWidth: SELECTED_OUTLINE_PX,
+      getLineColor: SELECTED_COLOR,
+    }),
+  ];
 }
 
 // ---------------------------------------------------------------------------

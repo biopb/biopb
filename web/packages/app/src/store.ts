@@ -663,7 +663,36 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { client, newLabel, newSetName } = get();
     const arrayId = currentArrayId(get());
     if (!client || !arrayId) return;
-    set({ roiWriteError: null });
+
+    // Drawn before it is stored. The click that finishes a shape also clears
+    // the draft, so without this the shape the user just traced disappears for
+    // the length of a round trip and comes back when the server answers --
+    // which is the whole of the felt latency of drawing.
+    //
+    // Not selected yet: the id is this client's invention until the server
+    // answers with its own, and selecting a row whose identity is about to
+    // change puts that invention in front of the user.
+    const provisional: RoiAnnotation = {
+      roiId: provisionalRoiId(),
+      arrayId,
+      setName: newSetName || DEFAULT_ROI_SET,
+      label: newLabel,
+      geometry,
+      plane,
+      props: {},
+      rev: 0,
+      createdAtMs: Date.now(),
+      updatedAtMs: Date.now(),
+    };
+    set((s) => ({
+      roiWriteError: null,
+      rois: s.roisFor === arrayId ? [...s.rois, provisional] : s.rois,
+    }));
+
+    /** Take the provisional row back out, wherever the list has moved on to. */
+    const withoutProvisional = (rois: RoiAnnotation[]) =>
+      rois.filter((roi) => roi.roiId !== provisional.roiId);
+
     try {
       const result = await client.http.putRois(
         arrayId,
@@ -672,16 +701,30 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
       // Dropped if the tensor moved on mid-write: the annotation is stored, and
       // appending it to a list that now describes another tensor would put it
-      // on screen over the wrong image.
-      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) return;
-      const stored = result.stored[0];
-      if (!stored) {
-        set({ roiWriteError: "The server stored no annotation" });
+      // on screen over the wrong image. The provisional row goes with it.
+      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) {
+        set((s) => ({ rois: withoutProvisional(s.rois) }));
         return;
       }
-      set((s) => ({ rois: [...s.rois, stored], selectedRoiId: stored.roiId }));
+      const stored = result.stored[0];
+      if (!stored) {
+        set((s) => ({
+          rois: withoutProvisional(s.rois),
+          roiWriteError: "The server stored no annotation",
+        }));
+        return;
+      }
+      // Swapped in place rather than appended, so the annotation does not jump
+      // to the end of a list it was already drawn in.
+      set((s) => ({
+        rois: s.rois.map((roi) => (roi.roiId === provisional.roiId ? stored : roi)),
+        selectedRoiId: stored.roiId,
+      }));
     } catch (err) {
-      set({ roiWriteError: err instanceof Error ? err.message : String(err) });
+      set((s) => ({
+        rois: withoutProvisional(s.rois),
+        roiWriteError: err instanceof Error ? err.message : String(err),
+      }));
     }
   },
 
@@ -689,20 +732,39 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { client } = get();
     const arrayId = currentArrayId(get());
     if (!client || !arrayId) return;
-    set({ roiWriteError: null });
+    // Nothing to ask the server about: this row is a local placeholder for a
+    // write still in flight, and its id is one this client invented. Left for
+    // the write to resolve, which is a round trip away.
+    if (isProvisionalRoiId(roiId)) return;
+
+    // Gone on the keystroke, not on the answer. The row is under the pointer
+    // when Delete is pressed, so leaving it there for a round trip reads as the
+    // key having missed -- and the far commoner outcome by far is that the
+    // delete succeeds.
+    const index = get().rois.findIndex((roi) => roi.roiId === roiId);
+    const removed = get().rois[index];
+    set((s) => ({
+      roiWriteError: null,
+      rois: s.rois.filter((roi) => roi.roiId !== roiId),
+      selectedRoiId: s.selectedRoiId === roiId ? null : s.selectedRoiId,
+    }));
+
     try {
-      const deleted = await client.http.deleteRois(arrayId, [roiId]);
-      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) return;
+      await client.http.deleteRois(arrayId, [roiId]);
       // An id the server did not have is already gone as far as the UI is
-      // concerned, so drop it locally either way rather than leaving a row that
-      // cannot be removed.
-      const removed = new Set(deleted.length > 0 ? deleted : [roiId]);
-      set((s) => ({
-        rois: s.rois.filter((roi) => !removed.has(roi.roiId)),
-        selectedRoiId: s.selectedRoiId && removed.has(s.selectedRoiId) ? null : s.selectedRoiId,
-      }));
+      // concerned, so an empty answer is not a failure: the row stays removed
+      // rather than coming back as one that cannot be got rid of.
     } catch (err) {
-      set({ roiWriteError: err instanceof Error ? err.message : String(err) });
+      set((s) => {
+        const failed = { roiWriteError: err instanceof Error ? err.message : String(err) };
+        // Only back into the list it came out of. After a tensor change the
+        // list describes another image, and restoring there would draw this
+        // annotation over it.
+        if (!removed || currentArrayId(get()) !== arrayId || s.roisFor !== arrayId) return failed;
+        const rois = [...s.rois];
+        rois.splice(Math.min(index, rois.length), 0, removed);
+        return { ...failed, rois };
+      });
     }
   },
 
@@ -973,6 +1035,34 @@ export function selectTileInfo(s: AppState): TileInfo | null {
 //
 // Stable empty constants: a selector returning a fresh [] on every call would
 // re-render its subscriber on every unrelated store write.
+/**
+ * Prefix for a row drawn before the server has stored it.
+ *
+ * Namespaced with a character the wire cannot produce, so it can never collide
+ * with a server id: the delete route splits ids on "," and the Flight action
+ * rejects one containing it, which is the same reasoning that lets ids be
+ * joined into a query string.
+ */
+const PROVISIONAL_PREFIX = "pending,";
+let provisionalSeq = 0;
+
+function provisionalRoiId(): string {
+  return `${PROVISIONAL_PREFIX}${++provisionalSeq}`;
+}
+
+/** A row that exists only in this client, because its write is still in flight. */
+export function isProvisionalRoiId(roiId: string): boolean {
+  return roiId.startsWith(PROVISIONAL_PREFIX);
+}
+
+/**
+ * What the server substitutes for an empty set name before storing.
+ *
+ * Repeated here so a provisional row lands in the set row its stored form will,
+ * rather than appearing under a blank name for the length of a round trip.
+ */
+const DEFAULT_ROI_SET = "default";
+
 const NO_ROIS: RoiAnnotation[] = [];
 const NO_SETS: string[] = [];
 
