@@ -7,6 +7,7 @@ import type {
   RoiGeometry,
   TileInfo,
 } from "@biopb/tensor-flight-client";
+import { DEFAULT_POLYLINE_WIDTH, clampPolylineWidth } from "./utils/roiDraft";
 import type { RoiDraft, RoiTool } from "./utils/roiDraft";
 import { TensorApiError } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
@@ -216,6 +217,12 @@ export interface AppState {
   newLabel: string;
   newSetName: string;
   /**
+   * Width a new polyline gets, in image pixels. A preference like the two
+   * above, and geometry rather than styling -- it is the band of pixels the
+   * stroke claims, so it is stored on the annotation and scales with the image.
+   */
+  newPolylineWidth: number;
+  /**
    * Axes a new annotation should NOT pin, i.e. broadcast across. `null` means
    * "the default for this tensor" (see `selectBroadcastAxes`), which is not the
    * same as "none" -- an empty array is a deliberate choice to pin everything.
@@ -313,9 +320,11 @@ export interface AppState {
   setSelectedRoi: (roiId: string | null) => void;
   setNewLabel: (label: string) => void;
   setNewSetName: (setName: string) => void;
+  setNewPolylineWidth: (width: number) => void;
   toggleBroadcastAxis: (axis: number, defaults: number[]) => void;
   createRoi: (geometry: RoiGeometry, plane: Record<number, number>) => Promise<void>;
   deleteRoi: (roiId: string) => Promise<void>;
+  clearRoiSet: (setName: string) => Promise<void>;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -418,6 +427,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedRoiId: null,
   newLabel: "",
   newSetName: "",
+  newPolylineWidth: DEFAULT_POLYLINE_WIDTH,
   broadcastAxes: null,
   broadcastAxesFor: null,
   roiWriteError: null,
@@ -628,6 +638,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ newSetName: setName });
   },
 
+  setNewPolylineWidth(width) {
+    set({ newPolylineWidth: clampPolylineWidth(width) });
+  },
+
   toggleBroadcastAxis(axis, defaults) {
     set((s) => {
       const arrayId = currentArrayId(s);
@@ -686,6 +700,34 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((s) => ({
         rois: s.rois.filter((roi) => !removed.has(roi.roiId)),
         selectedRoiId: s.selectedRoiId && removed.has(s.selectedRoiId) ? null : s.selectedRoiId,
+      }));
+    } catch (err) {
+      set({ roiWriteError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  async clearRoiSet(setName) {
+    const { client } = get();
+    const arrayId = currentArrayId(get());
+    if (!client || !arrayId) return;
+    set({ roiWriteError: null });
+    try {
+      // No ids: the server drops the whole set in one transaction, so this is
+      // not limited to the rows the cap let this client see.
+      await client.http.deleteRois(arrayId, undefined, { setName });
+      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) return;
+      // Filtered by name rather than by the ids that came back, for the same
+      // reason: what was deleted is the set, and the response enumerates only
+      // what the server chose to list.
+      set((s) => ({
+        rois: s.rois.filter((roi) => roi.setName !== setName),
+        selectedRoiId:
+          s.rois.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
+            ? null
+            : s.selectedRoiId,
+        // The name means nothing once the set is gone, and leaving it behind
+        // would start a later set of the same name hidden.
+        hiddenSets: s.hiddenSets.filter((name) => name !== setName),
       }));
     } catch (err) {
       set({ roiWriteError: err instanceof Error ? err.message : String(err) });

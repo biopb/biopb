@@ -48,6 +48,7 @@ const render = (over: Partial<RoiPanelViewProps> = {}) =>
       skipped={0}
       unavailable={false}
       onToggleOverlay={() => {}}
+      onClearSet={() => {}}
       onToggleSet={() => {}}
       {...over}
     />,
@@ -110,6 +111,23 @@ describe("RoiPanelView", () => {
     expect(html).toContain("nuclei");
     expect(html).not.toContain('checked=""/> <span');
   });
+
+  it("offers a clear button per set, disarmed", () => {
+    const html = render({ rois: [roi({ setName: "nuclei" }), roi({ setName: "cells" })] });
+    // Two rows, two buttons, neither armed: the word that means the next click
+    // deletes something only appears after the first one.
+    expect(html.match(/roi-set-clear/g) ?? []).toHaveLength(2);
+    expect(html).not.toContain("Sure?");
+    expect(html).toContain("Delete every annotation in nuclei");
+  });
+
+  it("counts what a clear would delete, in the set it would delete from", () => {
+    const html = render({
+      rois: [roi({ setName: "nuclei" }), roi({ setName: "nuclei" }), roi({ setName: "cells" })],
+    });
+    expect(html).toContain("Delete all 2 annotations in nuclei");
+    expect(html).toContain("Delete all 1 annotation in cells");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -135,7 +153,6 @@ const renderAuthor = (over: Partial<RoiAuthorViewProps> = {}) =>
       onSetNewLabel={() => {}}
       onSetNewSetName={() => {}}
       onToggleBroadcast={() => {}}
-      onDeleteSelected={() => {}}
       {...over}
     />,
   );
@@ -179,7 +196,27 @@ describe("RoiAuthorView", () => {
     expect(html).toContain("cell");
     expect(html).toContain("nuclei");
     expect(html).toContain("Z 12");
-    expect(html).toContain("Delete");
+  });
+
+  it("says what a selection is on one line", () => {
+    // It elides rather than wrapping, so everything about the selection has to
+    // fit in a single run of text.
+    const html = renderAuthor({
+      selected: {
+        roiId: "r1",
+        arrayId: "src",
+        setName: "nuclei",
+        label: "cell",
+        geometry: { kind: "polygon", points: [] },
+        plane: { 2: 12 },
+        props: {},
+        rev: 1,
+        createdAtMs: 0,
+        updatedAtMs: 0,
+      },
+      currentPlane: { 2: 12 },
+    });
+    expect(html).toContain("Selected: cell — polygon in nuclei, Z 12");
   });
 
   it("says when a selected annotation is on every plane", () => {
@@ -198,7 +235,7 @@ describe("RoiAuthorView", () => {
         updatedAtMs: 0,
       },
     });
-    expect(html).toContain("on every plane");
+    expect(html).toContain("no label — point in default, every plane");
   });
 
   it("reports a failed write", () => {
@@ -220,15 +257,16 @@ describe("RoiAuthorView selection and the plane", () => {
     updatedAtMs: 0,
   };
 
-  it("offers Delete for a selection on this plane", () => {
-    expect(renderAuthor({ selected: pinned, currentPlane: { 2: 12 } })).toContain("Delete");
+  it("names a selection on this plane", () => {
+    expect(renderAuthor({ selected: pinned, currentPlane: { 2: 12 } })).toContain("Selected:");
   });
 
   it("withholds it once the plane moves off the selection", () => {
-    // Deleting a shape the user cannot see is what a plane change must not set
-    // up. The selection itself survives, so scrubbing back brings it into reach.
+    // What the row says is deletable -- the viewer binds Delete on the same
+    // condition -- so a shape the user cannot see must drop out of it. The
+    // selection itself survives, so scrubbing back brings it into reach.
     const html = renderAuthor({ selected: pinned, currentPlane: { 2: 13 } });
-    expect(html).not.toContain("Delete");
+    expect(html).not.toContain("Selected:");
     // The set name is unique to the selected block; "cell" is also the Label
     // input's placeholder, so it is in the markup either way.
     expect(html).not.toContain("nuclei");
@@ -236,6 +274,6 @@ describe("RoiAuthorView selection and the plane", () => {
 
   it("keeps an unpinned selection reachable on every plane", () => {
     const html = renderAuthor({ selected: { ...pinned, plane: {} }, currentPlane: { 2: 99 } });
-    expect(html).toContain("Delete");
+    expect(html).toContain("Selected:");
   });
 });

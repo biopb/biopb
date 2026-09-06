@@ -7,7 +7,9 @@ const render = (over: Partial<RoiToolStripViewProps> = {}) =>
     <RoiToolStripView
       tool="select"
       draft={null}
+      polylineWidth={4}
       onSetTool={() => {}}
+      onSetPolylineWidth={() => {}}
       onFinish={() => {}}
       onCancel={() => {}}
       {...over}
@@ -15,6 +17,20 @@ const render = (over: Partial<RoiToolStripViewProps> = {}) =>
   );
 
 describe("RoiToolStripView", () => {
+  it("offers the width control with the polyline tool, and only then", () => {
+    // A polyline's width is geometry, so it is decided before the first click
+    // -- but it means nothing to any other tool.
+    expect(render({ tool: "polyline" })).toContain("Width");
+    expect(render({ tool: "polygon" })).not.toContain("Width");
+    expect(render({ tool: "select" })).not.toContain("Width");
+  });
+
+  it("shows the width it will store", () => {
+    const html = render({ tool: "polyline", polylineWidth: 12 });
+    expect(html).toContain('value="12"');
+    expect(html).toContain(">12<");
+  });
+
   it("marks the active tool, and only it", () => {
     const html = render({ tool: "polygon" });
     expect((html.match(/aria-pressed="true"/g) ?? [])).toHaveLength(1);

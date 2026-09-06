@@ -137,6 +137,8 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const setDraft = useAppStore((s) => s.setDraft);
   const setSelectedRoi = useAppStore((s) => s.setSelectedRoi);
   const createRoi = useAppStore((s) => s.createRoi);
+  const deleteRoi = useAppStore((s) => s.deleteRoi);
+  const polylineWidth = useAppStore((s) => s.newPolylineWidth);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
@@ -507,11 +509,11 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, broadcastDefaults));
 
   const finishDraft = useCallback(() => {
-    const geometry = closeDraft(draftRef.current);
+    const geometry = closeDraft(draftRef.current, polylineWidth);
     if (!geometry) return;
     setDraft(null);
     void createRoi(geometry, pinForNewRoi(info, shownPlane ?? {}, broadcastAxes));
-  }, [setDraft, createRoi, info, shownPlane, broadcastAxes]);
+  }, [setDraft, createRoi, info, shownPlane, broadcastAxes, polylineWidth]);
 
   const onDeckClick = useCallback(
     (info_: { coordinate?: number[]; viewport?: { zoom?: number | number[] } }) => {
@@ -586,9 +588,39 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     return () => window.removeEventListener("keydown", onKey);
   }, [draft, finishDraft, setDraft]);
 
+  // Delete removes the selection -- the only way to, now that the panel says
+  // what is selected on one line and has no button.
+  //
+  // Bound only while the selection is one of the shapes actually drawn: the
+  // panel refuses to act on a selection the plane has moved off, and a key that
+  // ignored that would be the way around it.
+  //
+  // Delete alone, not Backspace: finishing a shape selects it, so Backspace
+  // would mean "take back the last vertex" and "delete the whole annotation"
+  // one keystroke apart.
+  useEffect(() => {
+    if (draft || !selectedRoiId) return;
+    if (!shown.some((roi) => roi.roiId === selectedRoiId)) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
+      if (isTextEntryTarget(event.target)) return;
+      if (event.key !== "Delete") return;
+      event.preventDefault();
+      void deleteRoi(selectedRoiId);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [draft, selectedRoiId, shown, deleteRoi]);
+
   const draftLayers = useMemo(
-    () => buildDraftLayers({ draft, cursor: draftCursor, closeable: isCompletable(draft) }),
-    [draft, draftCursor],
+    () =>
+      buildDraftLayers({
+        draft,
+        cursor: draftCursor,
+        closeable: isCompletable(draft),
+        polylineWidth,
+      }),
+    [draft, draftCursor, polylineWidth],
   );
 
   const overlayLayers = useMemo(

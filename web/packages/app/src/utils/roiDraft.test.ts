@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   CLOSE_HANDLE_PX,
+  DEFAULT_POLYLINE_WIDTH,
+  MAX_POLYLINE_WIDTH,
+  MIN_POLYLINE_WIDTH,
   closeDraft,
   closesOnFirstVertex,
   isCompletable,
@@ -62,14 +65,26 @@ describe("closeDraft", () => {
     });
   });
 
-  it("turns a polyline draft into geometry, width 0", () => {
-    // A zero-width path is a mathematical one; the store reads the width as
-    // geometry, so it is not a styling default to guess at here.
+  it("turns a polyline draft into geometry, at a width somebody would choose", () => {
+    // Zero was the old default. Width is geometry -- the band of pixels the
+    // stroke covers -- and a zero-width one renders at the layer's hairline
+    // floor at every zoom, so it came out a construction line rather than
+    // something traced over structure.
     expect(closeDraft({ tool: "polyline", points: ring.slice(0, 2) })).toEqual({
       kind: "polyline",
       points: [{ x: 0, y: 0 }, { x: 4, y: 0 }],
-      width: 0,
+      width: DEFAULT_POLYLINE_WIDTH,
     });
+    expect(DEFAULT_POLYLINE_WIDTH).toBeGreaterThan(1);
+  });
+
+  it("stores the width it is given, clamped to what the control offers", () => {
+    const at = (width: number) =>
+      (closeDraft({ tool: "polyline", points: ring.slice(0, 2) }, width) as { width: number }).width;
+    expect(at(12)).toBe(12);
+    expect(at(0)).toBe(MIN_POLYLINE_WIDTH);
+    expect(at(1e6)).toBe(MAX_POLYLINE_WIDTH);
+    expect(at(Number.NaN)).toBe(DEFAULT_POLYLINE_WIDTH);
   });
 
   it("refuses a polygon of two vertices", () => {

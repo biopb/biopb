@@ -13,11 +13,17 @@
  */
 
 import { useAppStore } from "../store";
-import { isCompletable, minimumPoints, type RoiTool } from "../utils/roiDraft";
+import {
+  MAX_POLYLINE_WIDTH,
+  MIN_POLYLINE_WIDTH,
+  isCompletable,
+  minimumPoints,
+  type RoiTool,
+} from "../utils/roiDraft";
 import type { RoiDraft } from "../utils/roiDraft";
 
 const TOOLS: Array<{ tool: RoiTool; glyph: string; title: string }> = [
-  { tool: "select", glyph: "▹", title: "Select (click an annotation)" },
+  { tool: "select", glyph: "↖", title: "Select (click an annotation)" },
   { tool: "point", glyph: "•", title: "Point (one click)" },
   { tool: "rectangle", glyph: "▭", title: "Rectangle (two clicks)" },
   { tool: "polygon", glyph: "⬠", title: "Polygon (click vertices, Enter to close)" },
@@ -27,7 +33,10 @@ const TOOLS: Array<{ tool: RoiTool; glyph: string; title: string }> = [
 export interface RoiToolStripViewProps {
   tool: RoiTool;
   draft: RoiDraft | null;
+  /** Width a new polyline gets, in image pixels. */
+  polylineWidth: number;
   onSetTool: (tool: RoiTool) => void;
+  onSetPolylineWidth: (width: number) => void;
   onFinish: () => void;
   onCancel: () => void;
 }
@@ -35,7 +44,9 @@ export interface RoiToolStripViewProps {
 export function RoiToolStripView({
   tool,
   draft,
+  polylineWidth,
   onSetTool,
+  onSetPolylineWidth,
   onFinish,
   onCancel,
 }: RoiToolStripViewProps) {
@@ -59,6 +70,26 @@ export function RoiToolStripView({
           </button>
         ))}
       </div>
+      {/*
+        Shown whenever the tool is held, rather than behind a gesture on its
+        icon: a polyline's width is geometry, so it is a decision taken before
+        the first click, and one nobody would think to look for under a
+        double-click. It rides with the tool that uses it and disappears with it.
+      */}
+      {tool === "polyline" && (
+        <label className="roi-width" title="Stroke width of a new polyline, in image pixels">
+          <span>Width</span>
+          <input
+            type="range"
+            min={MIN_POLYLINE_WIDTH}
+            max={MAX_POLYLINE_WIDTH}
+            step={1}
+            value={polylineWidth}
+            onChange={(e) => onSetPolylineWidth(Number(e.target.value))}
+          />
+          <span className="roi-width-value">{polylineWidth}</span>
+        </label>
+      )}
       {draft && (
         <div className="roi-draft-status">
           <span>
@@ -97,13 +128,17 @@ export function RoiToolStrip({
   const tool = useAppStore((s) => s.tool);
   const onSetTool = useAppStore((s) => s.setTool);
   const setDraft = useAppStore((s) => s.setDraft);
+  const polylineWidth = useAppStore((s) => s.newPolylineWidth);
+  const onSetPolylineWidth = useAppStore((s) => s.setNewPolylineWidth);
   const unavailable = useAppStore((s) => s.roisUnavailable);
   if (unavailable) return null;
   return (
     <RoiToolStripView
       tool={tool}
       draft={draft}
+      polylineWidth={polylineWidth}
       onSetTool={onSetTool}
+      onSetPolylineWidth={onSetPolylineWidth}
       onFinish={onFinish}
       onCancel={() => setDraft(null)}
     />

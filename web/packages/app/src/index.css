@@ -531,6 +531,15 @@ html, body {
   justify-content: space-between;
   padding: 1px 0;
 }
+.roi-set-actions { align-items: center; display: flex; flex: 0 0 auto; gap: 6px; }
+.roi-set-clear {
+  background: none; border: none; border-radius: 3px;
+  color: #475569; cursor: pointer; font: inherit; line-height: 1; padding: 1px 4px;
+}
+.roi-set-clear:hover { background: #232a38; color: #cbd5e1; }
+/* Armed, and the next click deletes the set: red, and no longer a glyph the
+   eye slides over. */
+.roi-set-clear.armed, .roi-set-clear.armed:hover { color: #f87171; }
 .roi-sets label {
   align-items: center;
   cursor: pointer;
@@ -563,8 +572,16 @@ html, body {
 }
 .roi-pin-toggle[aria-pressed="true"] { border-color: #38bdf8; color: #38bdf8; }
 .roi-tool-text:disabled { color: #475569; cursor: default; }
-.roi-selected { border-top: 1px solid #232a38; margin-top: 8px; padding-top: 6px; }
-.roi-selected > * { margin-bottom: 4px; }
+/* One line: the panel is narrow and draggable, so the summary elides rather
+   than reflowing the controls above it. The full text is in the title. */
+.roi-selected {
+  border-top: 1px solid #232a38;
+  margin-top: 8px;
+  overflow: hidden;
+  padding-top: 6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .roi-tools {
   background: rgba(15, 17, 23, 0.85);
@@ -573,6 +590,18 @@ html, body {
   padding: 4px;
 }
 .roi-tool-row { display: flex; gap: 2px; }
+/* Rides with the polyline tool, so it has to fit the strip's width rather than
+   widen it: the slider takes what is left after the label and the number. */
+.roi-width {
+  align-items: center;
+  color: #94a3b8;
+  display: flex;
+  font-size: 11px;
+  gap: 6px;
+  padding: 4px 2px 0;
+}
+.roi-width input[type="range"] { accent-color: #38bdf8; flex: 1 1 auto; min-width: 0; width: 72px; }
+.roi-width-value { color: #cbd5e1; font-variant-numeric: tabular-nums; min-width: 2ch; text-align: right; }
 .roi-tool {
   background: none; border: 1px solid transparent; border-radius: 4px;
   color: #94a3b8; cursor: pointer; font-size: 15px; line-height: 1;

@@ -175,8 +175,24 @@ One deck.gl layer per geometry family, all from packages already in
 | Shape | Layer |
 |-------|-------|
 | polygon, rectangle, ellipse | `PolygonLayer` (ellipse tessellated client-side) |
-| polyline | `PathLayer`, width from `Polyline.width` (geometry, not styling) |
+| polyline | two `PathLayer`s — the band, width from `Polyline.width` (geometry, not styling), and its centreline |
 | point | `ScatterplotLayer` |
+
+**Every kind is a translucent area under an opaque outline, and the alphas are
+shared constants so that stays true of all of them rather than of each of them
+separately.** The area is what the annotation claims, so the pixels under it
+have to read through it; the outline is the shape itself, so it is opaque, in
+screen units — it should not thin out as the user zooms out of a large field —
+and it is the only part selection touches, by colour and by weight.
+
+A polyline is an area by that reckoning even though a stroke draws it, which is
+why it takes two layers. It used to take one, opaque: it hid the pixels it was
+pointing at, and selecting it turned the whole band white where every other kind
+keeps its fill and brightens an edge. A band cannot be stroked along its edges
+here, so the centreline stands in for the outline — which is also the trace the
+user actually made. The band has no pixel floor, unlike the centreline: a stored
+width of 0 has no extent to draw, and drawing it a floor's worth would invent
+one.
 
 Plane filtering follows the proto's rule exactly: **an axis absent from `plane`
 means the ROI applies at every index of that axis.** That is what lets one ROI
@@ -339,10 +355,34 @@ would show a status line and an enabled Finish for a draft the viewer considers
 gone, and Finish would then do nothing, because it closes over the guarded
 value. One reader is the only way the two cannot disagree.
 
-**A selection is only actionable while it is drawn.** The Delete button acts on
-it, so a plane change must not leave the user able to delete a shape they cannot
-see. The selection survives the move — scrubbing back brings it into reach —
-but the panel withholds it meanwhile.
+**A selection is only actionable while it is drawn.** Delete acts on it, so a
+plane change must not leave the user able to delete a shape they cannot see. The
+selection survives the move — scrubbing back brings it into reach — but the
+panel withholds it meanwhile, and the viewer binds the key on the same
+condition.
+
+**Clearing a set goes to the server unfiltered.** `DELETE /api/rois` with no
+ids drops the whole set in one transaction, so a clear is not limited to the
+rows the per-tensor cap let this client see — and the local list is filtered by
+set name rather than by the ids that came back, for the same reason. Arming is
+per row and one at a time, and expires: two live "Sure?" buttons is two chances
+to hit the wrong one, and an armed button left on screen is a trap the next
+time the panel is looked at.
+
+**A polyline's width is set before the first click, with the tool.** It is
+geometry, not styling — the band of pixels the stroke covers, stored on the
+annotation and scaling with the image — so tracing at a hairline and choosing
+the width afterwards is tracing blind. The control rides with the polyline tool
+in the strip rather than hiding behind a gesture on its icon, and the draft
+previews at the width it will be stored at. The default is 4 image pixels: it
+used to be 0, which renders at the layer's hairline floor at every zoom, so
+every polyline came out a construction line.
+
+**Delete is a key, not a button.** The panel says what is selected on one
+elided line, which leaves no room for a button; the viewer binds `Delete` while
+a drawn selection exists. Not `Backspace`: finishing a shape selects it, so
+`Backspace` would mean "take back the last vertex" and "delete the whole
+annotation" one keystroke apart.
 
 ## State
 
@@ -362,8 +402,8 @@ selectedRoiId: string | null
 **The overlay toggle turns the annotation surface off, not just the stored
 shapes.** With it off nothing is drawn, no tool is offered, a click places
 nothing and selects nothing, an in-progress draft is hidden, and the authoring
-panel is gone — including the Delete button, which would otherwise act on a
-selection the user cannot see. Anything narrower makes one checkbox mean several
+panel is gone — including the selected-annotation row and the Delete key it
+names, which would otherwise act on a selection the user cannot see. Anything narrower makes one checkbox mean several
 things: gating only the rendering left a draft visible over a switched-off
 overlay and let it be finished into an annotation nobody could see.
 
