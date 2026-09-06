@@ -31,7 +31,8 @@ import {
   vivDtype,
   type TileInfo,
 } from "@biopb/tensor-flight-client";
-import { useAppStore } from "../store";
+import { selectHiddenSets, selectRois, useAppStore } from "../store";
+import { buildRoiLayers, planeFromSelection } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
 import {
@@ -98,6 +99,13 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const slice = useAppStore((s) => s.slice);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
+  // Scoped selectors, not raw fields: a set fetched for another tensor is held
+  // until this one's fetch lands, and drawing it over a new image would be
+  // worse than drawing nothing.
+  const rois = useAppStore(selectRois);
+  const showRois = useAppStore((s) => s.showRois);
+  const hiddenSets = useAppStore(selectHiddenSets);
+  const loadRois = useAppStore((s) => s.loadRois);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
@@ -386,6 +394,45 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     };
   }, []);
 
+  // --- ROI annotations -----------------------------------------------------
+  // Fetched from here rather than from the store's tensor-change path, so the
+  // 3-D viewer never pays for a set it cannot draw: this component does not
+  // exist in volume mode. `loadRois` is idempotent on the array_id, which is
+  // what keeps a 2-D -> 3-D -> 2-D round trip (a full remount, see ViewerPane's
+  // key) from refetching.
+  useEffect(() => {
+    if (!client) return;
+    void loadRois(arrayId);
+  }, [client, arrayId, loadRois]);
+
+  // The plane the overlay is drawn for is the one ON SCREEN, not the one asked
+  // for. They are the same except while a read is outstanding -- and during
+  // play the cover is deliberately dropped, so the stale plane stays visible
+  // while `slice` has already moved on. Driving the overlay from `slice` there
+  // would put plane N+1's annotations over plane N's pixels for the whole of
+  // playback: a systematic off-by-one, not a flicker.
+  //
+  // Gating on `dataValid` instead would strobe: the play driver paces on
+  // exactly that flag, so it toggles ~10 times a second while playing.
+  const shownPlane = useMemo(() => {
+    if (!info || loadedKey === null) return null;
+    return planeFromSelection(info, JSON.parse(loadedKey) as Record<string, number>);
+  }, [info, loadedKey]);
+
+  const roiLayers = useMemo(
+    () =>
+      buildRoiLayers({
+        rois,
+        currentPlane: shownPlane ?? {},
+        hiddenSets,
+        // Nothing has landed yet, so no plane is on screen to annotate. An
+        // empty pin would match every unpinned annotation and draw them over a
+        // frame that is not there.
+        visible: showRois && shownPlane !== null,
+      }),
+    [rois, shownPlane, hiddenSets, showRois],
+  );
+
   return (
     <div
       ref={hostRef}
@@ -408,6 +455,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           onViewportLoad={onViewportLoad}
           onHover={hover.onHover}
           hoverHooks={hover.hooks}
+          overlayLayers={roiLayers}
           width={size.width}
           height={size.height}
         />
@@ -521,6 +569,7 @@ function VivStage({
   onViewportLoad,
   onHover,
   hoverHooks,
+  overlayLayers,
   width,
   height,
 }: {
@@ -533,6 +582,8 @@ function VivStage({
   onViewportLoad: (loaded?: unknown) => void;
   onHover: (info: HoverInfo) => void;
   hoverHooks: { handleValue: (values: number[]) => void; handleCoordinate: () => void };
+  /** Drawn over the image; see utils/roiLayers.ts for the id constraint. */
+  overlayLayers: unknown[];
   width: number;
   height: number;
 }) {
@@ -614,6 +665,12 @@ function VivStage({
     [sources, selections, contrastLimits, gamma, color, maxCacheSize, onViewportLoad],
   );
 
+  // VivViewer concatenates these after its own layers -- but only draws the
+  // ones whose id contains its view id, which is why they are built through
+  // `roiLayerId`. Memoised on the array itself: `deckProps` is spread into
+  // DeckGL, and a fresh object every render would be a prop change every frame.
+  const deckProps = useMemo(() => ({ layers: overlayLayers }), [overlayLayers]);
+
   return (
     <VivViewer
       views={views}
@@ -622,6 +679,7 @@ function VivStage({
       onViewStateChange={onViewStateChange}
       onHover={onHover}
       hoverHooks={hoverHooks}
+      deckProps={deckProps}
     />
   );
 }

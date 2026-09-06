@@ -1,6 +1,12 @@
 import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
-import type { DataSourceDescriptor, QuerySourcesResult, TileInfo } from "@biopb/tensor-flight-client";
+import type {
+  DataSourceDescriptor,
+  QuerySourcesResult,
+  RoiAnnotation,
+  TileInfo,
+} from "@biopb/tensor-flight-client";
+import { TensorApiError } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
@@ -153,6 +159,46 @@ export interface AppState {
    */
   tileInfoFor: string | null;
 
+  // --- ROI annotations (docs/roi-annotations-ui.md) -----------------------
+  /** The tensor's whole annotation set. Filtered to the plane at render time. */
+  rois: RoiAnnotation[];
+  /**
+   * The `array_id` `rois` was fetched for, as `tileInfoFor` is for the grid.
+   *
+   * This is what makes `loadRois` idempotent, and that is load-bearing rather
+   * than an optimisation: switching to the 3-D viewer and back remounts the
+   * whole 2-D subtree (`ViewerPane` keys on the render mode), so without it a
+   * round trip through 3-D would refetch a set that can reach megabytes.
+   */
+  roisFor: string | null;
+  /** The fetch in flight, so a superseded response cannot overwrite a newer one. */
+  roisPending: string | null;
+  roisError: string | null;
+  /** The tensor `roisError` is about. See `selectRoisError`. */
+  roisErrorFor: string | null;
+  /** The per-tensor cap clipped the set: what is shown is not all there is. */
+  roisTruncated: boolean;
+  /** Rows whose geometry this client could not read -- see `decodeRoiListResult`. */
+  roisSkipped: number;
+  /**
+   * The server does not offer annotations at all (501: disabled, or no metadata
+   * DB). Distinct from an error, because it is a fact about the deployment
+   * rather than a failure -- the UI hides itself instead of reporting a fault.
+   */
+  roisUnavailable: boolean;
+  /** Overlay on/off. A view preference, so it outlives a tensor change. */
+  showRois: boolean;
+  /**
+   * Sets switched off by name. Absence means visible, so a set that appears
+   * later shows up rather than starting hidden.
+   *
+   * Read through `selectHiddenSets`: names mean nothing outside the tensor they
+   * were hidden in, and `hiddenSetsFor` is what scopes them to it.
+   */
+  hiddenSets: string[];
+  /** The tensor `hiddenSets` names sets of. See `selectHiddenSets`. */
+  hiddenSetsFor: string | null;
+
   /**
    * The axis being scrubbed automatically (a `SliderAxis.key`), or null.
    *
@@ -232,6 +278,9 @@ export interface AppState {
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
   setTileInfo: (value: TileInfo | null, forArrayId: string) => void;
+  loadRois: (arrayId: string) => Promise<void>;
+  setShowRois: (value: boolean) => void;
+  toggleSetHidden: (setName: string) => void;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -314,6 +363,18 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   tileInfo: null,
   tileInfoFor: null,
+
+  rois: [],
+  roisFor: null,
+  roisPending: null,
+  roisError: null,
+  roisErrorFor: null,
+  roisTruncated: false,
+  roisSkipped: 0,
+  roisUnavailable: false,
+  showRois: true,
+  hiddenSets: [],
+  hiddenSetsFor: null,
 
   playAxis: null,
   planeReady: false,
@@ -398,6 +459,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       planeReady: false,
       appliedLimits: null,
       planeLimits: null,
+      // Annotation state is deliberately NOT reset here. Every piece of it
+      // carries the tensor it belongs to and is read through a selector that
+      // hides it otherwise -- the same treatment `tileInfo` gets, and for a
+      // sharper reason: `applyViewerState` changes the tensor without coming
+      // through this function at all, so a reset written here would be missed
+      // by every link the app opens.
     });
     // `fixedLimits` goes with the tensor for the reason the indices do -- a
     // grey level is a value of its dtype. The mode is a preference and stays,
@@ -443,6 +510,67 @@ export const useAppStore = create<AppState>((set, get) => ({
       tileInfoFor: forArrayId,
       slice: clampSliceTo(s.slice, value),
     }));
+  },
+
+  async loadRois(arrayId) {
+    const { client } = get();
+    if (!client) return;
+    // Only the tensor in view is worth asking about. Every selector above hides
+    // a set belonging to another tensor, so a fetch for anything else could
+    // never be shown -- enforced here rather than trusted to the callers, the
+    // same way the reads are guarded rather than the writers.
+    if (currentArrayId(get()) !== arrayId) return;
+    // Idempotent: already held, or already asked for. Callers fire this from a
+    // mount effect, and the 2-D subtree remounts on every render-mode flip.
+    if (get().roisFor === arrayId || get().roisPending === arrayId) return;
+    if (get().roisUnavailable) return;
+    set({ roisPending: arrayId, roisError: null });
+    try {
+      const result = await client.http.listRois(arrayId);
+      // A response for a tensor that is no longer the one being asked about.
+      if (get().roisPending !== arrayId) return;
+      set({
+        rois: result.rois,
+        roisFor: arrayId,
+        roisPending: null,
+        roisTruncated: result.truncated,
+        roisSkipped: result.skipped,
+      });
+    } catch (err) {
+      if (get().roisPending !== arrayId) return;
+      // 501 is the server saying it does not do annotations. Latched for the
+      // session so every later tensor skips the round trip.
+      if (err instanceof TensorApiError && err.status === 501) {
+        set({ roisPending: null, roisUnavailable: true });
+        return;
+      }
+      // `roisFor` deliberately stays null so a remount or a tensor switch can
+      // try again; the effect's own deps keep that from becoming a retry loop.
+      set({
+        roisPending: null,
+        roisErrorFor: arrayId,
+        roisError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  setShowRois(value) {
+    set((s) => (s.showRois === value ? s : { showRois: value }));
+  },
+
+  toggleSetHidden(setName) {
+    set((s) => {
+      // Scoped to the tensor in view: a list carried over from another one is
+      // not "nothing hidden here", it is a list of names that mean nothing here.
+      const arrayId = currentArrayId(s);
+      const current = s.hiddenSetsFor === arrayId ? s.hiddenSets : [];
+      return {
+        hiddenSetsFor: arrayId,
+        hiddenSets: current.includes(setName)
+          ? current.filter((name) => name !== setName)
+          : [...current, setName],
+      };
+    });
   },
 
   applyViewerState(params) {
@@ -638,6 +766,60 @@ export const useAppStore = create<AppState>((set, get) => ({
  * prop the viewer was mounted with -- rather than two spellings of one
  * identity, so no canonicalization only the server can do is involved.
  */
+/**
+ * The address the viewer is actually rendering: the exact one a link asked for,
+ * which may be content-pinned, else the selection.
+ *
+ * Single-sourced because every "is this state about the tensor in view?" guard
+ * has to agree, and two spellings of that question would disagree exactly when
+ * a pinned link is open.
+ */
+export function currentArrayId(s: AppState): string | null {
+  return s.requestedArrayId ?? s.activeTensorId;
+}
+
 export function selectTileInfo(s: AppState): TileInfo | null {
-  return s.tileInfoFor === (s.requestedArrayId ?? s.activeTensorId) ? s.tileInfo : null;
+  return s.tileInfoFor === currentArrayId(s) ? s.tileInfo : null;
+}
+
+// --- ROI annotations -------------------------------------------------------
+//
+// Every one of these hides state belonging to another tensor rather than
+// relying on someone having reset it. `selectSource` is not the only way the
+// tensor in view changes -- `applyViewerState` does it too, straight from a URL
+// -- so a reset would have to be written at every such site and kept in step
+// with the next one. Answering the question at the read instead makes that
+// impossible to get wrong, which is the same reason `tileInfo` is left alone.
+//
+// Stable empty constants: a selector returning a fresh [] on every call would
+// re-render its subscriber on every unrelated store write.
+const NO_ROIS: RoiAnnotation[] = [];
+const NO_SETS: string[] = [];
+
+/** This tensor's annotations, or none while another tensor's are still held. */
+export function selectRois(s: AppState): RoiAnnotation[] {
+  return s.roisFor === currentArrayId(s) ? s.rois : NO_ROIS;
+}
+
+/** A fetch is in flight for the tensor in view. */
+export function selectRoisLoading(s: AppState): boolean {
+  return s.roisPending !== null && s.roisPending === currentArrayId(s);
+}
+
+/** The cap clipped THIS tensor's set -- not one looked at earlier. */
+export function selectRoisTruncated(s: AppState): boolean {
+  return s.roisFor === currentArrayId(s) && s.roisTruncated;
+}
+
+export function selectRoisSkipped(s: AppState): number {
+  return s.roisFor === currentArrayId(s) ? s.roisSkipped : 0;
+}
+
+export function selectRoisError(s: AppState): string | null {
+  return s.roisErrorFor === currentArrayId(s) ? s.roisError : null;
+}
+
+/** Sets hidden in the tensor in view. Names do not carry across tensors. */
+export function selectHiddenSets(s: AppState): string[] {
+  return s.hiddenSetsFor === currentArrayId(s) ? s.hiddenSets : NO_SETS;
 }

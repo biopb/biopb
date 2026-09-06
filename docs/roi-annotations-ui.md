@@ -110,9 +110,53 @@ export interface RoiAnnotation {
 
 ## Fetching
 
-`GET /api/rois/{array_id}` returns the tensor's whole set — no plane or bbox
-filter, by design (a viewport-filtered fetch would make the ROI being edited vanish
-on a pan). One fetch per tensor change, held in the store, filtered in memory.
+`GET /api/rois/{array_id}` returns the tensor's whole set. One fetch per tensor,
+held in the store, filtered in memory.
+
+**Why not a viewport filter.** The ROI being edited would vanish on a pan.
+
+**Why not a per-plane filter**, which is the more tempting version and needs its
+own answer — the viewport argument does *not* carry over, since a per-plane fetch
+would return exactly the ROIs the user can interact with:
+
+- **The play driver steps a slice axis every 100 ms** (`PLAY_FPS = 10`), and a
+  slider drag does it at pointer rate. Per-plane means a round trip per frame,
+  with the overlay trailing the image by at least one. This is the one that
+  decides it.
+- **The pin is sparse, so the filter does not push down cleanly.** A dimension
+  absent from `plane` applies at every index, so the predicate is
+  `(plane['z'] IS NULL OR plane['z'] = ?)` per pinnable dim, and every unpinned
+  ROI matches every plane. On a 2-D tensor, or one whose axes cannot be named,
+  *nothing* is pinned and a per-plane fetch returns the whole set anyway.
+- **It does not exist server-side.** `RoiListRequest` carries only `array_id` and
+  `set_name`. Adding a plane filter means a proto field, the Flight action, a
+  per-tensor predicate over a `MAP(VARCHAR, BIGINT)` column, and the route — to
+  optimise something the 5000-per-tensor cap already bounds.
+
+It would also foreclose showing which planes carry annotations as tick marks on
+the z/t slider, which is a one-line derivation with the set resident.
+
+**The cost of whole-set, honestly.** There is no compression anywhere in the
+stack (the sidecar mounts only `CORSMiddleware`; control's proxy adds none), so
+at the cap a polygon set measures 2.6 MB (8 vertices each) to 9.7 MB (50)
+uncompressed. Hand-drawn sets are tens of KB, so this bites only at the cap — and
+the fix there is `GZipMiddleware` (the same payload gzips 3.7x), not a plane
+filter.
+
+### Nothing is fetched in 3-D
+
+`ViewerPane` keys the viewer on `` `${tensorId}#${render3d ? "3d" : "2d"}#...` ``,
+so flipping to the volume viewer unmounts the whole 2-D subtree. The overlay and
+the panel are the only two callers of `loadRois`, and the panel is not rendered
+in volume mode — so 3-D issues no request for a set it cannot draw.
+
+That makes `loadRois` idempotent on `roisFor` load-bearing rather than an
+optimisation: the mode flip is a full remount, so without it a 2-D → 3-D → 2-D
+round trip would refetch a set that can reach megabytes.
+
+Rendering ROIs *in* the volume is a separate feature, not a gap: `Point` has an
+optional z, but a plane-pinned polygon under an orbit camera needs a
+billboard-or-extrude decision the 2-D geometry does not answer.
 
 The array_id passed is whatever the viewer is already using —
 `requestedArrayId ?? activeTensorId`, possibly content-versioned. The sidecar
@@ -142,7 +186,28 @@ The current plane comes from `SliceState`, but its `axes` are keyed `a0`/`a3`
 `tileInfo.selectable` and `tileInfo.sel_axes`, which carry the wire index of each
 named and unnamed axis.
 
+**The overlay is drawn for the plane on screen, not the plane requested.** They
+differ only while a read is outstanding — and during play the "Reading plane…"
+cover is deliberately dropped, so the stale image stays visible while the slice
+index has already moved on. Driving the overlay from the requested slice there
+puts plane N+1's annotations over plane N's pixels for the whole of playback: a
+systematic off-by-one, not a flicker. So the overlay derives its pin from
+`loadedKey` (the selection that actually landed) via `planeFromSelection`, while
+the panel counts against the requested plane.
+
+Hiding the overlay on `!dataValid` instead would strobe — the play driver paces
+on exactly that flag, so it toggles ~10 times a second while playing. Outside
+play it would also be redundant: the cover is opaque and full-bleed over the
+deck canvas, so it already hides the overlay along with the stale image.
+
 Selection state (which ROI is active) is SPA-local and never written.
+
+**Every overlay layer is `pickable: false`, and not only because nothing is
+interactive yet.** `TileViewer`'s hover badge reads `info.sourceLayer` and
+`info.tile` to report the pixel under the pointer; a pickable overlay sits on top
+and would answer that hover itself, blanking the readout wherever an annotation
+lies. Authoring has to route around that — read the pixel from the tile layer
+explicitly, or re-report it from the overlay — rather than just flipping the flag.
 
 ## Authoring
 
@@ -164,6 +229,10 @@ navigation. A failed write leaves the shape on screen marked unsaved, retryable.
 **Vertex editing is Phase 3**, and needs the `DetailView` subclass described above
 to toggle `dragPan` for the duration of a drag.
 
+**The draft is cleared on a render-mode flip as well as on a tensor change.** The
+tool is a preference and can survive a trip through 3-D; a half-placed polygon
+reappearing afterwards is only confusing.
+
 ## State
 
 New store slice, cleared on tensor change alongside the existing per-tensor state:
@@ -179,9 +248,23 @@ draft: DraftShape | null      // vertices placed so far
 selectedRoiId: string | null
 ```
 
-`tool` and `visibleSets` are UI state, not per-tensor data; everything else resets
-with the tensor. Overlay visibility belongs in `useViewerUrlSync` so a shared link
-carries it.
+`tool` and the overlay toggle are viewer preferences and outlive a tensor change.
+Overlay visibility belongs in `useViewerUrlSync` so a shared link carries it.
+
+**Everything else is scoped by a selector, not reset by a writer.** Each piece
+carries the tensor it belongs to (`roisFor`, `hiddenSetsFor`, `roisErrorFor`) and
+is read through `selectRois` / `selectHiddenSets` / `selectRoisTruncated` and
+friends, which hide it when it belongs to another tensor.
+
+That is not tidiness. `selectSource` is *not* the only way the tensor in view
+changes: `applyViewerState` writes `activeTensorId` straight from a URL without
+going through it, so a reset written in `selectSource` is missed by every link
+the app opens. The warnings are the ones that matter — a carried-over "this
+tensor holds more annotations than are shown" reads as a fact about the image on
+screen, and unlike a stale count nothing on screen contradicts it.
+
+It is also the treatment `tileInfo` already gets, for the same reason, which
+`applyViewerState`'s own comment spells out.
 
 ## Content staleness — deferred, and why
 

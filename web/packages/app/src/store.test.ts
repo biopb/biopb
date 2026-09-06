@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DataSourceDescriptor, TensorFlightClient, TileInfo } from "@biopb/tensor-flight-client";
-import { selectTileInfo, useAppStore } from "./store";
+import {
+  selectHiddenSets,
+  selectRois,
+  selectRoisError,
+  selectRoisLoading,
+  selectRoisSkipped,
+  selectRoisTruncated,
+  selectTileInfo,
+  useAppStore,
+} from "./store";
 
 const SOURCE: DataSourceDescriptor = {
   source_id: "listed",
@@ -165,5 +174,197 @@ describe("the grid in view", () => {
     useAppStore.setState({ activeTensorId: "first", requestedArrayId: "first@abcd1234" });
 
     expect(selectTileInfo(useAppStore.getState())).toBe(TILE_INFO);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROI annotation state is scoped to the tensor in view
+//
+// `selectSource` is not the only way that tensor changes -- `applyViewerState`
+// does it straight from a URL, without going through it -- so these are read
+// through selectors rather than reset at each writer. Everything below is a
+// leak that a reset written in `selectSource` alone would not have caught.
+// ---------------------------------------------------------------------------
+
+const ROI_FIXTURE = [
+  {
+    roiId: "a",
+    arrayId: "first",
+    setName: "nuclei",
+    label: "",
+    geometry: { kind: "point" as const, at: { x: 1, y: 1 } },
+    plane: {},
+    props: {},
+    rev: 1,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  },
+];
+
+/** State as it stands after a set has been fetched and used on `first`. */
+function seedAnnotated() {
+  useAppStore.setState({
+    activeSourceId: "first",
+    activeTensorId: "first",
+    requestedArrayId: null,
+    rois: ROI_FIXTURE,
+    roisFor: "first",
+    roisTruncated: true,
+    roisSkipped: 3,
+    roisError: "boom",
+    roisErrorFor: "first",
+    hiddenSets: ["nuclei"],
+    hiddenSetsFor: "first",
+  });
+}
+
+describe("ROI state across a tensor change", () => {
+  it("shows a tensor its own annotations", () => {
+    seedAnnotated();
+    const s = useAppStore.getState();
+    expect(selectRois(s)).toHaveLength(1);
+    expect(selectRoisTruncated(s)).toBe(true);
+    expect(selectRoisSkipped(s)).toBe(3);
+    expect(selectRoisError(s)).toBe("boom");
+    expect(selectHiddenSets(s)).toEqual(["nuclei"]);
+  });
+
+  it("hides all of it once another tensor is selected", () => {
+    seedAnnotated();
+    useAppStore.getState().selectSource("second");
+    const s = useAppStore.getState();
+    expect(selectRois(s)).toEqual([]);
+    expect(selectRoisTruncated(s)).toBe(false);
+    expect(selectRoisSkipped(s)).toBe(0);
+    expect(selectRoisError(s)).toBeNull();
+    expect(selectHiddenSets(s)).toEqual([]);
+  });
+
+  it("hides all of it when a LINK changes the tensor", () => {
+    // The path a reset in `selectSource` would miss entirely.
+    seedAnnotated();
+    useAppStore.getState().applyViewerState(new URLSearchParams({ id: "second/Image:0" }));
+    const s = useAppStore.getState();
+    expect(selectRois(s)).toEqual([]);
+    expect(selectHiddenSets(s)).toEqual([]);
+    // And the raw fields are untouched, which is the point: nothing cleared
+    // them, so reading them directly is what the leak was.
+    expect(s.hiddenSets).toEqual(["nuclei"]);
+    expect(s.roisTruncated).toBe(true);
+  });
+
+  it("does not carry a warning onto a tensor it is not about", () => {
+    // The worst of the leaks: "this tensor holds more than is shown" reads as a
+    // fact about the image on screen.
+    seedAnnotated();
+    useAppStore.getState().applyViewerState(new URLSearchParams({ id: "second" }));
+    const s = useAppStore.getState();
+    expect(selectRoisTruncated(s)).toBe(false);
+    expect(selectRoisSkipped(s)).toBe(0);
+    expect(selectRoisError(s)).toBeNull();
+  });
+
+  it("follows a content-pinned link to the same source", () => {
+    // `requestedArrayId` is the address in view when a link pins one, so the
+    // guard has to use it -- not `activeTensorId`.
+    seedAnnotated();
+    useAppStore.getState().applyViewerState(new URLSearchParams({ id: "first@9f1c4e2b" }));
+    expect(selectRois(useAppStore.getState())).toEqual([]);
+    useAppStore.setState({ rois: ROI_FIXTURE, roisFor: "first@9f1c4e2b" });
+    expect(selectRois(useAppStore.getState())).toHaveLength(1);
+  });
+
+  it("starts a fresh hidden list rather than editing another tensor's", () => {
+    seedAnnotated();
+    useAppStore.getState().selectSource("second");
+    useAppStore.getState().toggleSetHidden("debris");
+    expect(selectHiddenSets(useAppStore.getState())).toEqual(["debris"]);
+  });
+
+  it("reports loading only for the tensor in view", () => {
+    useAppStore.setState({
+      activeTensorId: "first",
+      requestedArrayId: null,
+      roisPending: "second",
+    });
+    expect(selectRoisLoading(useAppStore.getState())).toBe(false);
+    useAppStore.setState({ roisPending: "first" });
+    expect(selectRoisLoading(useAppStore.getState())).toBe(true);
+  });
+});
+
+describe("loadRois", () => {
+  /** A client whose listRois records what it was asked for. */
+  function stubClient(asked: string[]) {
+    return {
+      http: {
+        listRois: (arrayId: string) => {
+          asked.push(arrayId);
+          return Promise.resolve({ rois: [], truncated: false, skipped: 0 });
+        },
+      },
+    } as unknown as TensorFlightClient;
+  }
+
+  it("fetches the tensor in view", async () => {
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: null,
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first"]);
+    expect(useAppStore.getState().roisFor).toBe("first");
+  });
+
+  it("refuses a tensor that is not in view", async () => {
+    // Nothing could display it: every selector hides a set whose tensor is not
+    // the current one, so the round trip would be pure waste.
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: null,
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("second");
+    expect(asked).toEqual([]);
+  });
+
+  it("follows the pinned address when a link named one", async () => {
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: "first@9f1c4e2b",
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual([]);
+    await useAppStore.getState().loadRois("first@9f1c4e2b");
+    expect(asked).toEqual(["first@9f1c4e2b"]);
+  });
+
+  it("asks once for a set it already holds", async () => {
+    const asked: string[] = [];
+    useAppStore.setState({
+      client: stubClient(asked),
+      activeTensorId: "first",
+      requestedArrayId: null,
+      roisFor: null,
+      roisPending: null,
+      roisUnavailable: false,
+    });
+    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first"]);
   });
 });
