@@ -104,24 +104,24 @@ describe("setColor", () => {
 
 describe("visibleRois", () => {
   const set = [
-    roi({ roiId: "a", geometry: POLY, plane: { z: 4 } }),
-    roi({ roiId: "b", geometry: POLY, plane: { z: 9 } }),
+    roi({ roiId: "a", geometry: POLY, plane: { 1: 4 } }),
+    roi({ roiId: "b", geometry: POLY, plane: { 1: 9 } }),
     roi({ roiId: "c", geometry: POLY, plane: {} }),
-    roi({ roiId: "d", geometry: POLY, setName: "other", plane: { z: 4 } }),
+    roi({ roiId: "d", geometry: POLY, setName: "other", plane: { 1: 4 } }),
   ];
 
   it("keeps this plane's annotations and the unpinned ones", () => {
-    const ids = visibleRois(set, { z: 4 }, []).map((r) => r.roiId);
+    const ids = visibleRois(set, { 1: 4 }, []).map((r) => r.roiId);
     expect(ids).toEqual(["a", "c", "d"]);
   });
 
   it("drops a hidden set", () => {
-    const ids = visibleRois(set, { z: 4 }, ["other"]).map((r) => r.roiId);
+    const ids = visibleRois(set, { 1: 4 }, ["other"]).map((r) => r.roiId);
     expect(ids).toEqual(["a", "c"]);
   });
 
   it("keeps an unpinned annotation on every plane", () => {
-    expect(visibleRois(set, { z: 99 }, []).map((r) => r.roiId)).toEqual(["c"]);
+    expect(visibleRois(set, { 1: 99 }, []).map((r) => r.roiId)).toEqual(["c"]);
   });
 });
 
@@ -155,7 +155,7 @@ describe("currentPlaneFor", () => {
   };
 
   it("keys the viewer's current indices by dim label", () => {
-    expect(currentPlaneFor(info, { t: 3, z: 12, c: 0, axes: {} })).toEqual({ t: 3, z: 12 });
+    expect(currentPlaneFor(info, { t: 3, z: 12, c: 0, axes: {} })).toEqual({ 0: 3, 1: 12 });
   });
 
   it("is empty before the grid is known", () => {
@@ -169,10 +169,10 @@ describe("currentPlaneFor", () => {
       shape: [5, 20, 512, 512],
       selectable: { t: null, z: 1, c: null },
     };
-    // "POS" is a real label, so it can hold a pin; its index lives under `a0`.
+    // Its index lives under the slider key `a0`; the pin names axis 0.
     expect(currentPlaneFor(unnamed, { t: 0, z: 7, c: 0, axes: { a0: 2 } })).toEqual({
-      POS: 2,
-      z: 7,
+      0: 2,
+      1: 7,
     });
   });
 });
@@ -212,9 +212,9 @@ describe("buildRoiLayers", () => {
   });
 
   it("draws nothing when the plane filter empties the set", () => {
-    const pinned = [roi({ geometry: POLY, plane: { z: 1 } })];
+    const pinned = [roi({ geometry: POLY, plane: { 1: 1 } })];
     expect(
-      buildRoiLayers({ rois: pinned, currentPlane: { z: 2 }, hiddenSets: [], visible: true }),
+      buildRoiLayers({ rois: pinned, currentPlane: { 1: 2 }, hiddenSets: [], visible: true }),
     ).toEqual([]);
   });
 
@@ -248,7 +248,7 @@ describe("planeFromSelection", () => {
   it("translates Viv's key-addressed selection into dim-label pins", () => {
     // This is how the overlay reads the plane that is actually on screen:
     // TileViewer's `loadedKey` is a serialised selection of exactly this shape.
-    expect(planeFromSelection(info, { t: 3, z: 12 })).toEqual({ t: 3, z: 12 });
+    expect(planeFromSelection(info, { t: 3, z: 12 })).toEqual({ 0: 3, 1: 12 });
   });
 
   it("agrees with currentPlaneFor for the same position", () => {
@@ -264,7 +264,7 @@ describe("planeFromSelection", () => {
       shape: [5, 20, 512, 512],
       selectable: { t: null, z: 1, c: null },
     };
-    expect(planeFromSelection(unnamed, { a0: 2, z: 7 })).toEqual({ POS: 2, z: 7 });
+    expect(planeFromSelection(unnamed, { a0: 2, z: 7 })).toEqual({ 0: 2, 1: 7 });
   });
 
   it("is empty before the grid is known", () => {

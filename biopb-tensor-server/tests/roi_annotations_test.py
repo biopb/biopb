@@ -56,7 +56,8 @@ class TestStore:
 
     def test_round_trip_preserves_geometry_and_plane(self):
         db = MetadataDatabase()
-        ann = _annotation(label="nucleus", set_name="nuclei", plane={"z": 12, "t": 0})
+        # Keyed by wire axis index: 0 and 2 of a TZCYX tensor, not "t" and "z".
+        ann = _annotation(label="nucleus", set_name="nuclei", plane={2: 12, 0: 0})
         db.put_rois(ARRAY_ID, [ann])
 
         rois, truncated = db.list_rois(ARRAY_ID)
@@ -64,7 +65,7 @@ class TestStore:
         assert len(rois) == 1
         got = rois[0]
         assert got.label == "nucleus"
-        assert dict(got.plane) == {"z": 12, "t": 0}
+        assert dict(got.plane) == {2: 12, 0: 0}
         assert [(p.x, p.y) for p in got.roi.polygon.points] == [
             (1.0, 2.0),
             (10.0, 2.0),
@@ -704,7 +705,7 @@ class TestSidecarRoutes:
                 {
                     "label": "nucleus",
                     "setName": "nuclei",
-                    "plane": {"z": "12"},
+                    "plane": {"2": "12"},
                     "roi": {
                         "polygon": {
                             "points": [
@@ -724,7 +725,8 @@ class TestSidecarRoutes:
 
         got = client.get(f"/api/rois/{ARRAY_ID}").json()
         assert len(got["rois"]) == 1
-        assert got["rois"][0]["plane"] == {"z": "12"}
+        # proto3 JSON stringifies both an int32 map key and an int64 value.
+        assert got["rois"][0]["plane"] == {"2": "12"}
         assert len(got["rois"][0]["roi"]["polygon"]["points"]) == 3
 
     def test_version_token_is_stripped_on_write_and_restored_on_read(
@@ -840,3 +842,50 @@ class TestSidecarRoutes:
             headers={"Sec-Fetch-Site": "cross-site"},
         )
         assert resp.status_code == 403
+
+
+class TestPositionalPlanePin:
+    """The pin is keyed by wire axis index, which is what lets it address an
+    axis the labels cannot name (biopb#935's sibling: a TIFF sequence's opaque
+    file axis, or two axes sharing a label)."""
+
+    def test_an_unlabelled_axis_can_be_pinned(self):
+        db = MetadataDatabase()
+        # Axis 0 of a tensor whose labels are ("", "z", "y", "x"): under a
+        # label-keyed pin this axis had no key at all and every annotation on it
+        # broadcast across every index.
+        db.put_rois(ARRAY_ID, [_annotation(plane={0: 3})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {0: 3}
+
+    def test_two_axes_sharing_a_label_stay_distinct(self):
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(plane={0: 1, 1: 7})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {0: 1, 1: 7}
+
+    def test_an_empty_pin_still_means_every_index(self):
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(plane={})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {}
+
+    def test_a_negative_axis_is_refused(self):
+        db = MetadataDatabase()
+        with pytest.raises(Exception) as exc:
+            db.put_rois(ARRAY_ID, [_annotation(plane={-1: 0})])
+        assert "axis" in str(exc.value).lower()
+
+    def test_a_negative_index_is_refused(self):
+        db = MetadataDatabase()
+        with pytest.raises(Exception) as exc:
+            db.put_rois(ARRAY_ID, [_annotation(plane={0: -5})])
+        assert "negative" in str(exc.value).lower()
+
+    def test_an_out_of_range_axis_is_accepted_and_simply_matches_nothing(self):
+        # The write path binds no tensor, so it has no rank to check against.
+        # Storing it is harmless: no reader is ever on axis 99.
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(plane={99: 0})])
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert dict(rois[0].plane) == {99: 0}

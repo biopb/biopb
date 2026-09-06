@@ -19,18 +19,14 @@ function tileInfo(over: Partial<TileInfo>): TileInfo {
 }
 
 describe("pinnableAxes", () => {
-  it("names every non-plane axis with extent", () => {
-    expect(pinnableAxes(tileInfo({}))).toEqual([
-      { axis: 0, label: "t" },
-      { axis: 1, label: "c" },
-      { axis: 2, label: "z" },
-    ]);
+  it("offers every non-plane axis with extent, by position", () => {
+    expect(pinnableAxes(tileInfo({})).map((a) => a.axis)).toEqual([0, 1, 2]);
   });
 
   it("leaves out the display plane's own axes", () => {
-    const axes = pinnableAxes(tileInfo({})).map((a) => a.label);
-    expect(axes).not.toContain("y");
-    expect(axes).not.toContain("x");
+    // Geometry addresses y/x; a pin would be meaningless there.
+    expect(pinnableAxes(tileInfo({})).map((a) => a.axis)).not.toContain(3);
+    expect(pinnableAxes(tileInfo({})).map((a) => a.axis)).not.toContain(4);
   });
 
   it("leaves out the samples axis of an interleaved RGB tensor", () => {
@@ -39,75 +35,95 @@ describe("pinnableAxes", () => {
       shape: [8, 512, 512, 3],
       plane: { y: 1, x: 2, s: 3 },
     });
-    expect(pinnableAxes(info)).toEqual([{ axis: 0, label: "z" }]);
+    expect(pinnableAxes(info).map((a) => a.axis)).toEqual([0]);
   });
 
   it("leaves out a singleton axis, where a pin would say nothing", () => {
     const info = tileInfo({ shape: [1, 3, 20, 512, 512] });
-    expect(pinnableAxes(info).map((a) => a.label)).toEqual(["c", "z"]);
+    expect(pinnableAxes(info).map((a) => a.axis)).toEqual([1, 2]);
   });
 
-  it("leaves out an unlabelled axis rather than inventing a key", () => {
-    // A TIFF sequence's opaque file axis: nothing to key a pin under, and a
-    // synthetic key would be a dialect the Python SDK does not share.
+  it("OFFERS an unlabelled axis, which a label-keyed pin could not address", () => {
+    // A TIFF sequence's opaque file axis. Under the old label-keyed pin this
+    // had no key at all, so every annotation on it broadcast across every file.
     const info = tileInfo({
       dim_labels: ["", "z", "y", "x"],
       shape: [4, 8, 512, 512],
       plane: { y: 2, x: 3, s: null },
     });
-    expect(pinnableAxes(info)).toEqual([{ axis: 1, label: "z" }]);
+    expect(pinnableAxes(info).map((a) => a.axis)).toEqual([0, 1]);
   });
 
-  it("leaves out both axes when two share a label", () => {
+  it("OFFERS both axes when two share a label", () => {
     const info = tileInfo({
       dim_labels: ["z", "z", "y", "x"],
       shape: [4, 8, 512, 512],
       plane: { y: 2, x: 3, s: null },
     });
-    expect(pinnableAxes(info)).toEqual([]);
+    expect(pinnableAxes(info).map((a) => a.axis)).toEqual([0, 1]);
+  });
+
+  it("still carries a title, so the UI has something to call each axis", () => {
+    const info = tileInfo({
+      dim_labels: ["POS", "", "y", "x"],
+      shape: [4, 8, 512, 512],
+      plane: { y: 2, x: 3, s: null },
+    });
+    expect(pinnableAxes(info).map((a) => a.title)).toEqual(["POS", "axis 1"]);
   });
 });
 
 describe("planePinFor", () => {
-  it("keys the current indices by label", () => {
+  it("keys the current indices by axis position", () => {
     const axes = pinnableAxes(tileInfo({}));
-    expect(planePinFor(axes, { 0: 4, 1: 1, 2: 12 })).toEqual({ t: 4, c: 1, z: 12 });
+    expect(planePinFor(axes, { 0: 4, 1: 1, 2: 12 })).toEqual({ 0: 4, 1: 1, 2: 12 });
   });
 
   it("skips an axis the caller has no index for", () => {
     const axes = pinnableAxes(tileInfo({}));
-    expect(planePinFor(axes, { 2: 12 })).toEqual({ z: 12 });
+    expect(planePinFor(axes, { 2: 12 })).toEqual({ 2: 12 });
+  });
+
+  it("never pins a plane axis, even when handed an index for one", () => {
+    const axes = pinnableAxes(tileInfo({}));
+    expect(planePinFor(axes, { 2: 12, 3: 100, 4: 200 })).toEqual({ 2: 12 });
   });
 });
 
 describe("roiVisibleOnPlane", () => {
   it("shows an unpinned annotation everywhere", () => {
-    expect(roiVisibleOnPlane({}, { z: 4, t: 2 })).toBe(true);
+    expect(roiVisibleOnPlane({}, { 2: 4, 0: 2 })).toBe(true);
   });
 
   it("hides one pinned to another index", () => {
-    expect(roiVisibleOnPlane({ z: 12 }, { z: 4 })).toBe(false);
+    expect(roiVisibleOnPlane({ 2: 12 }, { 2: 4 })).toBe(false);
   });
 
   it("shows one pinned to this index", () => {
-    expect(roiVisibleOnPlane({ z: 4 }, { z: 4, t: 9 })).toBe(true);
+    expect(roiVisibleOnPlane({ 2: 4 }, { 2: 4, 0: 9 })).toBe(true);
   });
 
   it("follows a z-stack when only t is pinned", () => {
-    // The absent dimension is the whole point: one ROI, every z.
-    const pin = { t: 2 };
-    expect(roiVisibleOnPlane(pin, { t: 2, z: 0 })).toBe(true);
-    expect(roiVisibleOnPlane(pin, { t: 2, z: 19 })).toBe(true);
-    expect(roiVisibleOnPlane(pin, { t: 3, z: 19 })).toBe(false);
+    // The absent axis is the whole point: one ROI, every z.
+    const pin = { 0: 2 };
+    expect(roiVisibleOnPlane(pin, { 0: 2, 2: 0 })).toBe(true);
+    expect(roiVisibleOnPlane(pin, { 0: 2, 2: 19 })).toBe(true);
+    expect(roiVisibleOnPlane(pin, { 0: 3, 2: 19 })).toBe(false);
   });
 
-  it("needs every pinned dimension to agree", () => {
-    expect(roiVisibleOnPlane({ t: 2, z: 4 }, { t: 2, z: 5 })).toBe(false);
-    expect(roiVisibleOnPlane({ t: 2, z: 4 }, { t: 2, z: 4 })).toBe(true);
+  it("needs every pinned axis to agree", () => {
+    expect(roiVisibleOnPlane({ 0: 2, 2: 4 }, { 0: 2, 2: 5 })).toBe(false);
+    expect(roiVisibleOnPlane({ 0: 2, 2: 4 }, { 0: 2, 2: 4 })).toBe(true);
+  });
+
+  it("distinguishes two axes that a label-keyed pin would have collided", () => {
+    // Both labelled "z": under the old scheme the second had no key of its own.
+    expect(roiVisibleOnPlane({ 0: 1, 1: 7 }, { 0: 1, 1: 7 })).toBe(true);
+    expect(roiVisibleOnPlane({ 0: 1, 1: 7 }, { 0: 1, 1: 8 })).toBe(false);
   });
 
   it("shows rather than hides when a pin cannot be evaluated", () => {
     // An extra ROI on screen is recoverable; a silently hidden one is not.
-    expect(roiVisibleOnPlane({ q: 3 }, { z: 4 })).toBe(true);
+    expect(roiVisibleOnPlane({ 9: 3 }, { 2: 4 })).toBe(true);
   });
 });

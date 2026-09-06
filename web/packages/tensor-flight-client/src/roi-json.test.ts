@@ -73,7 +73,7 @@ describe("decodeRoiAnnotation", () => {
     arrayId: "src/Image:0",
     setName: "default",
     roi: { polygon: { points: [{}, { x: 5.5, y: 2 }] } },
-    plane: { z: "12" },
+    plane: { "2": "12" },
     drawnAgainstVersion: "AQL/",
     rev: "3",
     createdAtUnixMs: "1757000000123",
@@ -83,7 +83,8 @@ describe("decodeRoiAnnotation", () => {
     const a = decodeRoiAnnotation(WIRE)!;
     expect(a.rev).toBe(3);
     expect(a.createdAtMs).toBe(1757000000123);
-    expect(a.plane).toEqual({ z: 12 });
+    // Both halves arrive as strings: an int32 map key and an int64 value.
+    expect(a.plane).toEqual({ 2: 12 });
   });
 
   it("defaults every absent field rather than failing", () => {
@@ -122,9 +123,9 @@ describe("decodeRoiAnnotation", () => {
 describe("encodeRoiAnnotation", () => {
   const GEOM: RoiGeometry = { kind: "polygon", points: [{ x: 0, y: 0 }, { x: 4, y: 1 }] };
 
-  it("emits int64 fields as strings", () => {
-    const out = encodeRoiAnnotation({ geometry: GEOM, plane: { z: 12, t: 0 }, rev: 3 });
-    expect(out.plane).toEqual({ z: "12", t: "0" });
+  it("emits int64 fields as strings, under positional keys", () => {
+    const out = encodeRoiAnnotation({ geometry: GEOM, plane: { 2: 12, 0: 0 }, rev: 3 });
+    expect(out.plane).toEqual({ "2": "12", "0": "0" });
     expect(out.rev).toBe("3");
   });
 

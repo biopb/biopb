@@ -44,12 +44,28 @@ message RoiAnnotation {
   // rescales geometry.
   ROI roi = 5;
 
-  // Sparse plane pin: dim_label -> index (e.g. {"z": 12, "t": 0}). A dimension
-  // ABSENT from the map means "applies at every index of that dimension", which
-  // is how one ROI follows a z-stack or a time course without being duplicated
-  // per plane. Keyed by label rather than fixed t/z/c fields because dim_labels
-  // are per-tensor.
-  map<string, int64> plane = 6;
+  // Sparse plane pin: WIRE AXIS INDEX -> index on that axis (e.g. {2: 12} for
+  // z=12 of a TZCYX tensor). A dimension ABSENT from the map means "applies at
+  // every index of that dimension", which is how one ROI follows a z-stack or a
+  // time course without being duplicated per plane.
+  //
+  // Keyed by position, not by dim_label. A label is neither guaranteed present
+  // nor guaranteed unique -- a TIFF sequence's opaque file axis has none, and
+  // two axes of one tensor may share one -- so a label-keyed pin simply cannot
+  // address those axes, and an annotation on them silently broadcasts across
+  // every index instead. Position can address every axis, and it is the same
+  // basis the geometry already uses (coordinates are in the tensor's own Y/X
+  // axes, found positionally).
+  //
+  // The label remains the right thing to SHOW; any client with the descriptor
+  // has it. It is deliberately not carried here as well: two spellings of one
+  // axis could disagree, and then neither would be authoritative.
+  //
+  // Field 6 held the label-keyed form (map<string, int64>) and is reserved
+  // rather than reused: the map entry's key changes wire type, so an old
+  // encoder's bytes would misparse rather than fail.
+  reserved 6;
+  map<int32, int64> plane = 12;
 
   // Free-form client JSON (colour, score, author, ...). Opaque to the server.
   string props_json = 7;

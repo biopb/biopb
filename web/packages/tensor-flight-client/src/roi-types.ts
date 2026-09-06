@@ -40,11 +40,15 @@ export interface RoiAnnotation {
   label: string;
   geometry: RoiGeometry;
   /**
-   * Sparse plane pin, `dim_label -> index`. A dimension ABSENT from this map
-   * applies at every index of that dimension -- that is how one ROI follows a
-   * z-stack. See {@link roiVisibleOnPlane}.
+   * Sparse plane pin, **wire axis index** -> index on that axis. A dimension
+   * ABSENT from this map applies at every index of it -- that is how one ROI
+   * follows a z-stack. See {@link roiVisibleOnPlane}.
+   *
+   * Positional, not label-keyed: a label cannot address an unlabelled axis or
+   * one of two sharing a label, and such an axis would then broadcast silently.
+   * Turn an index into a name with the tensor's `dim_labels` when displaying it.
    */
-  plane: Record<string, number>;
+  plane: Record<number, number>;
   /** Parsed `props_json`. `{}` when the server held nothing or unparsable text. */
   props: Record<string, unknown>;
   /** Server-assigned, bumped on every write. Echo it back for a conditional put. */
@@ -72,7 +76,7 @@ export interface RoiAnnotationInput {
   setName?: string;
   label?: string;
   geometry: RoiGeometry;
-  plane?: Record<string, number>;
+  plane?: Record<number, number>;
   props?: Record<string, unknown>;
   /** Required only under `checkRev`, where it is the rev the edit was based on. */
   rev?: number;

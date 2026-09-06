@@ -92,10 +92,24 @@ Y/X axes, floating point. A polygon drawn on a downsampled level is scaled up by
 the client before the write. The server never rescales geometry.
 
 **Plane pinning is a sparse map, not t/z/c fields.** A 2-D ROI lives on one plane
-of an N-D tensor, and `dim_labels` are per-tensor, so the pin is
-`map<dim_label, index>` — `{"z": 12, "t": 0}`. A missing key means "applies at
-every index of that dimension", which is how a user gets an ROI that follows a
-z-stack or a time course without duplicating it per plane.
+of an N-D tensor, and the axes are per-tensor, so the pin is a map — and a
+missing key means "applies at every index of that dimension", which is how a
+user gets an ROI that follows a z-stack or a time course without duplicating it
+per plane.
+
+**The map is keyed by wire axis index, not by dim_label** — `{2: 12, 0: 0}`, not
+`{"z": 12, "t": 0}`. Labels were the first design and are wrong for a reason
+that only shows up on real data: a label is neither guaranteed present nor
+guaranteed unique. A TIFF sequence's opaque file axis has none, and two axes of
+one tensor may share one. A label-keyed pin cannot address those axes *at all*,
+so an annotation on them silently broadcasts across every index — usually every
+field of view, which is the worst case to get wrong quietly. Position addresses
+every axis, and it is the basis the geometry already uses (coordinates are in
+the tensor's own Y/X axes, found positionally).
+
+The label is still the right thing to *show*; any client holding the descriptor
+can turn an index back into one. It is deliberately not stored alongside: two
+spellings of one axis could disagree, and then neither would be authoritative.
 
 **Annotations are not source metadata.** They do not go in `sources.metadata_json`
 and are not merged into `GET /api/sources/{id}/metadata`. That column is
@@ -119,7 +133,7 @@ CREATE TABLE rois (
     set_name   TEXT NOT NULL DEFAULT 'default',
     label      TEXT,                    -- user class/name
     shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon|polyline
-    plane      MAP(VARCHAR, BIGINT),    -- sparse pin; absent key = all indices
+    plane      MAP(INTEGER, BIGINT),    -- axis -> index; absent key = all indices
     bbox       DOUBLE[4],               -- [x0,y0,x1,y1], level-0 px, derived server-side
     geometry   TEXT,                    -- biopb.image.ROI as canonical proto3 JSON
     props_json TEXT,                    -- free-form client JSON (color, score, author)
@@ -212,7 +226,8 @@ message RoiAnnotation {
   string set_name = 3;            // empty -> "default"
   string label = 4;
   biopb.image.ROI roi = 5;        // geometry, level-0 pixel coords
-  map<string, int64> plane = 6;   // dim_label -> index; absent = all
+  reserved 6;                     // was the dim_label-keyed pin
+  map<int32, int64> plane = 12;   // wire axis index -> index; absent = all
   string props_json = 7;
   optional bytes drawn_against_version = 8;
   int64 rev = 9;                  // server-assigned; echo it back to write safely

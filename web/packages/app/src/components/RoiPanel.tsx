@@ -49,8 +49,8 @@ function swatch(setName: string) {
 export interface RoiPanelViewProps {
   /** This tensor's annotations. The caller has already checked they are its own. */
   rois: RoiAnnotation[];
-  /** `dim_label -> index` for the plane on screen. */
-  currentPlane: Record<string, number>;
+  /** `axis -> index` for the plane on screen. */
+  currentPlane: Record<number, number>;
   hiddenSets: string[];
   showRois: boolean;
   loading: boolean;

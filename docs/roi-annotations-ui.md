@@ -100,7 +100,7 @@ export interface RoiAnnotation {
   setName: string;
   label: string;
   geometry: RoiGeometry;              // discriminated union on `kind`
-  plane: Record<string, number>;      // dim_label -> index; absent = all indices
+  plane: Record<number, number>;      // wire axis index -> index; absent = all
   props: Record<string, unknown>;     // parsed props_json
   rev: number;
   createdAtMs: number;
@@ -178,13 +178,13 @@ One deck.gl layer per geometry family, all from packages already in
 | polyline | `PathLayer`, width from `Polyline.width` (geometry, not styling) |
 | point | `ScatterplotLayer` |
 
-Plane filtering follows the proto's rule exactly: **a dimension absent from
-`plane` means the ROI applies at every index of that dimension.** That is what lets
-one ROI follow a z-stack, and getting it backwards would hide most annotations.
-The current plane comes from `SliceState`, but its `axes` are keyed `a0`/`a3`
-(`SliderAxis.key`), not by dim label — so the map is built from
-`tileInfo.selectable` and `tileInfo.sel_axes`, which carry the wire index of each
-named and unnamed axis.
+Plane filtering follows the proto's rule exactly: **an axis absent from `plane`
+means the ROI applies at every index of that axis.** That is what lets one ROI
+follow a z-stack, and getting it backwards would hide most annotations.
+
+The pin is keyed by wire axis index, so the only translation left is from
+`SliceState`'s `SliderAxis.key` (`t`, `z`, `a3`) to that index — `sliderAxes`
+gives both, and `planeFromSelection` does it in one place.
 
 **The overlay is drawn for the plane on screen, not the plane requested.** They
 differ only while a read is outstanding — and during play the "Reading plane…"
@@ -226,8 +226,41 @@ per-shape writes make a conflict actionable (`RoiPutResult.conflicts` names the
 `roi_id` and the stored `rev`), and they leave no dirty buffer to lose on
 navigation. A failed write leaves the shape on screen marked unsaved, retryable.
 
-**Vertex editing is Phase 3**, and needs the `DetailView` subclass described above
-to toggle `dragPan` for the duration of a drag.
+### Which axes a new shape pins
+
+Broadcast is not something the user sets — it is an axis the pin *omits* — so the
+authoring question is which axes a new shape leaves out.
+
+**Default: pin every pinnable axis except channel.** Channel is the clear
+broadcast case: the viewer shows one channel at a time, an annotation names an
+object rather than a channel, and a c-pinned ROI would vanish the moment the user
+switches channel. Marking a channel-specific artifact is the exception, so it
+must be available, not the default.
+
+Everything else pins, and the asymmetry is what decides it. An over-specific pin
+announces itself — draw on z=12, scrub to z=13, the shape is gone, and the user
+reaches for the control. An over-broadcast pin is silent: the shape follows you
+through all 40 planes and looks correct, and the mistake surfaces later in
+whatever consumes the data. Given a visible mistake and an invisible one, pin.
+
+**The control is one row per pinnable axis** (`Z: 12` / `Z: all`), appearing both
+as the pre-draw default and on a selected ROI, where changing it is an ordinary
+rev-bumping write. Per-set defaults — nuclei per-slice, a wound boundary global —
+are natural, but stay **client-side**, remembered per set name for the session:
+the proto has no set-level metadata, and inventing server state for a UI default
+would be a dialect the Python SDK does not share.
+
+**Broadcast has to be visible.** On the plane where they coincide, a broadcast ROI
+and a pinned one are pixel-identical, so without a readout the only way to tell
+them apart is to scrub. The selection shows its pin at minimum; a dashed outline
+for anything with a broadcast axis is worth trying after that.
+
+Every axis the sliders offer can be pinned, including unlabelled ones and two
+sharing a label — that is what the positional pin bought, and it is why this
+section can promise a control for every axis rather than a silent exception.
+
+**Vertex editing** needs the `DetailView` subclass described above to toggle
+`dragPan` for the duration of a drag.
 
 **The draft is cleared on a render-mode flip as well as on a tensor change.** The
 tool is a preference and can survive a trip through 3-D; a half-placed polygon
@@ -296,7 +329,7 @@ array_id — correct behaviour (annotations must outlive an edit), just unlabell
 ## Implementation order
 
 1. **SDK.** `listRois` / `putRois` / `deleteRois` on `TensorHttpClient` beside
-   `tileInfo`; `roi-types.ts` + `roi-json.ts`; the `dim_label -> index` plane
+   `tileInfo`; `roi-types.ts` + `roi-json.ts`; the `axis -> index` plane
    mapping from `TileInfo`. Delete the dead `src/gen/` tree. Vitest against a
    mocked `fetch`, as the rest of the client is tested.
 2. **Read-only overlay.** Store slice, fetch on tensor change, plane filter, the
