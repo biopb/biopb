@@ -78,9 +78,23 @@ export function RoiToolStripView({
   );
 }
 
-export function RoiToolStrip({ onFinish }: { onFinish: () => void }) {
+/**
+ * The draft comes from the caller, not from the store.
+ *
+ * TileViewer already holds it through `selectDraft`, which hides a draft whose
+ * plane, tensor or render mode has moved on. Reading `s.draft` here instead
+ * would show a status line and an enabled Finish for a draft the viewer
+ * considers gone -- and Finish would then no-op, because it closes over the
+ * guarded value. Taking it as a prop makes the two impossible to disagree.
+ */
+export function RoiToolStrip({
+  draft,
+  onFinish,
+}: {
+  draft: RoiDraft | null;
+  onFinish: () => void;
+}) {
   const tool = useAppStore((s) => s.tool);
-  const draft = useAppStore((s) => s.draft);
   const onSetTool = useAppStore((s) => s.setTool);
   const setDraft = useAppStore((s) => s.setDraft);
   const unavailable = useAppStore((s) => s.roisUnavailable);

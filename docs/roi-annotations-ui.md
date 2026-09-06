@@ -315,6 +315,12 @@ selector.
 
 The tool itself is a preference and survives all of this.
 
+**The tool strip takes the draft as a prop rather than reading the store.** The
+viewer already holds it through `selectDraft`; a second, unguarded read there
+would show a status line and an enabled Finish for a draft the viewer considers
+gone, and Finish would then do nothing, because it closes over the guarded
+value. One reader is the only way the two cannot disagree.
+
 **A selection is only actionable while it is drawn.** The Delete button acts on
 it, so a plane change must not leave the user able to delete a shape they cannot
 see. The selection survives the move — scrubbing back brings it into reach —

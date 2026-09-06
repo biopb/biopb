@@ -649,7 +649,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
         // is a per-gesture action, and it should not disappear while a read is
         // outstanding.
         <div style={{ position: "absolute", top: 10, left: 10, zIndex: 2 }}>
-          <RoiToolStrip onFinish={finishDraft} />
+          <RoiToolStrip draft={draft} onFinish={finishDraft} />
         </div>
       )}
       {tileError && (
