@@ -3,6 +3,7 @@ import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-
 import {
   ELLIPSE_SEGMENTS,
   buildRoiLayers,
+  buildSelectionLayers,
   currentPlaneFor,
   roiLayerId,
   planeFromSelection,
@@ -251,34 +252,24 @@ describe("buildRoiLayers", () => {
     }
   });
 
-  it("emphasises a selection on the outline, never on the area", () => {
-    // Selecting a polyline used to turn the whole band white, where every other
-    // kind keeps its fill and brightens an edge.
-    const probe = (selectedRoiId: string | null) => {
-      const layers = buildRoiLayers({
-        rois: set,
-        currentPlane: {},
-        hiddenSets: [],
-        visible: true,
-        selectedRoiId,
-      }) as Array<{ id: string; props: Record<string, unknown> }>;
-      const read = (id: string, accessor: string) => {
-        const layer = layers.find((l) => l.id === roiLayerId(id));
-        const get = layer?.props[accessor] as (d: unknown) => unknown;
-        return get((layer?.props.data as unknown[])[0]);
-      };
-      return {
-        band: read("path-bands", "getColor"),
-        line: read("paths", "getColor"),
-        lineWidth: read("paths", "getWidth"),
-      };
-    };
-    const idle = probe(null);
-    const picked = probe("b");
-    expect(picked.line).toEqual([255, 255, 255, 255]);
-    expect(picked.lineWidth).toBeGreaterThan(idle.lineWidth as number);
-    // The area is what the annotation claims; selecting it does not change it.
-    expect(picked.band).toEqual(idle.band);
+  it("builds the same layers whatever is selected", () => {
+    // The point of splitting selection out: a click must not change this
+    // memo's output, or deck.gl regenerates every attribute of every layer --
+    // earcut included -- for the whole set.
+    const opts = { rois: set, currentPlane: {}, hiddenSets: [], visible: true };
+    const layers = buildRoiLayers(opts) as Array<{ id: string; props: Record<string, unknown> }>;
+    for (const layer of layers) {
+      for (const accessor of ["getLineColor", "getColor", "getFillColor"]) {
+        const get = layer.props[accessor];
+        // Not a function of the datum's id: nothing here can vary by selection.
+        if (typeof get === "function") {
+          const datum = (layer.props.data as unknown[])[0] as Record<string, unknown>;
+          const roi = (datum.roi ?? datum) as Record<string, unknown>;
+          expect((get as (d: unknown) => number[])({ ...datum, roi: { ...roi, roiId: "other" } }))
+            .toEqual((get as (d: unknown) => number[])(datum));
+        }
+      }
+    }
   });
 
   it("leaves every layer unpickable, so the pixel readout still answers", () => {
@@ -291,6 +282,57 @@ describe("buildRoiLayers", () => {
       visible: true,
     }) as Array<{ props: { pickable: boolean } }>;
     for (const layer of layers) expect(layer.props.pickable).toBe(false);
+  });
+});
+
+describe("buildSelectionLayers", () => {
+  const line = roi({ roiId: "b", geometry: LINE });
+
+  it("draws nothing without a selection", () => {
+    expect(buildSelectionLayers(null)).toEqual([]);
+  });
+
+  it("emphasises one annotation, whatever the set holds", () => {
+    // One datum, so a click costs the same at ten annotations and at the
+    // server's five thousand.
+    const layers = buildSelectionLayers(line) as Array<{
+      id: string;
+      props: Record<string, unknown>;
+    }>;
+    expect(layers).toHaveLength(1);
+    expect(layers[0]!.id).toContain("-#detail#");
+    expect((layers[0]!.props.data as unknown[])).toHaveLength(1);
+    expect(layers[0]!.props.pickable).toBe(false);
+  });
+
+  it("emphasises the outline, and draws no area of its own", () => {
+    // The area belongs to the layer underneath: selecting an annotation is not
+    // supposed to change what it claims, only to mark which one it is.
+    for (const geometry of [POLY, LINE, POINT]) {
+      const layers = buildSelectionLayers(roi({ geometry })) as Array<{
+        props: Record<string, unknown>;
+      }>;
+      const props = layers[0]!.props;
+      expect(props.filled ?? false).toBe(false);
+      const color = (props.getLineColor ?? props.getColor) as number[];
+      expect(color).toEqual([255, 255, 255, 255]);
+    }
+  });
+
+  it("outlines a selected shape more heavily than the overlay does", () => {
+    const base = buildRoiLayers({
+      rois: [roi({ geometry: POLY })],
+      currentPlane: {},
+      hiddenSets: [],
+      visible: true,
+    }) as Array<{ props: Record<string, unknown> }>;
+    const picked = buildSelectionLayers(roi({ geometry: POLY })) as Array<{
+      props: Record<string, unknown>;
+    }>;
+    // Wider, so it covers the outline it stands in for rather than fringing it.
+    expect(picked[0]!.props.getLineWidth as number).toBeGreaterThan(
+      base[0]!.props.getLineWidth as number,
+    );
   });
 });
 

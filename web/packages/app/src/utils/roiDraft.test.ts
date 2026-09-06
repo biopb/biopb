@@ -7,6 +7,7 @@ import {
   closeDraft,
   closesOnFirstVertex,
   isCompletable,
+  isRealClick,
   isTextEntryTarget,
   minimumPoints,
   placePoint,
@@ -52,6 +53,25 @@ describe("placePoint", () => {
 
   it("does nothing under the select tool", () => {
     expect(placePoint(null, "select", [1, 1])).toEqual({ draft: null });
+  });
+});
+
+describe("isRealClick", () => {
+  it("takes a click", () => {
+    expect(isRealClick({ type: "click" })).toBe(true);
+  });
+
+  it("refuses deck's second report of the same tap", () => {
+    // deck maps both `click` and `dblclick` to `onClick`, so a double click
+    // would otherwise place three vertices for two taps.
+    expect(isRealClick({ type: "dblclick" })).toBe(false);
+  });
+
+  it("takes an event it was told nothing about", () => {
+    // Only the duplicate is refused; an absent event is not evidence of one.
+    expect(isRealClick(undefined)).toBe(true);
+    expect(isRealClick(null)).toBe(true);
+    expect(isRealClick({})).toBe(true);
   });
 });
 

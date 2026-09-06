@@ -155,6 +155,18 @@ export function closeDraft(
   return null;
 }
 
+/**
+ * Whether a deck.gl pointer event is a real click rather than deck's duplicate.
+ *
+ * deck maps BOTH `click` and `dblclick` to `onClick` (its `EVENT_HANDLERS`), so
+ * a double click arrives as two clicks *and* a dblclick -- three vertices for
+ * two taps. The taps are the gesture; the dblclick is a second report of the
+ * one that ended it.
+ */
+export function isRealClick(event?: { type?: string } | null): boolean {
+  return event?.type !== "dblclick";
+}
+
 /** Undo the last placed vertex; an empty draft becomes null. */
 export function undoPoint(draft: RoiDraft | null): RoiDraft | null {
   if (!draft) return null;
