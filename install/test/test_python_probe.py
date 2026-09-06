@@ -1,26 +1,18 @@
-"""Hold both system-Python probes to one table of interpreter shapes.
+"""Hold install.sh's system-Python probe to a table of interpreter shapes.
 
-Step 2 of the install asks whatever `python` is on PATH for its version, and what
-this module exists to pin down is that the ASKING -- not the answer, and not the
-Python install that follows -- is what fails on a fresh machine. It failed two
-ways, both of which reached users as "the installer fails at the Python stage":
+Step 2 of the POSIX install asks whatever `python3` is on PATH for its version,
+and what this module exists to pin down is that the ASKING -- not the answer, and
+not the Python install that follows -- is what fails on a real machine. An
+interpreter that greets on stdout (conda, a sitecustomize banner) puts a
+non-numeric line ahead of the answer, and handing that word to `[ "$MAJOR" -eq 3 ]`
+is an "integer expression expected" error rather than a fallback: the machine is
+told its Python is "too old" and the real version is never looked at.
 
-  * A Microsoft Store *App Execution Alias*. A Windows box with no Python still
-    has a 0-byte python.exe on PATH that prints to stderr and exits 9009. Under
-    the engine's EAP='Stop', Windows PowerShell 5.1 turns a redirected native
-    command's stderr line into a TERMINATING error, so the install died quoting
-    "Python was not found..." instead of falling through to a uv-managed Python.
-  * An interpreter that greets on stdout (conda, a sitecustomize banner), whose
-    banner line was cast with [int] -- another terminating error, same place.
-
-Neither reproduces under pwsh 7, which is the only PowerShell CI ran until the
-Windows leg in install-scripts.yaml.
-
-The rule is implemented twice -- biopb-engine.ps1::Get-SystemPythonVersion and
-install.sh::_system_python_version -- so, like the extras parsers before it
-(#648, #653), it gets ONE table and both halves are held to it. The bash half
-never had the terminating-stderr problem, but it had the stdout-banner one, and
-two implementations of one rule with only one under test is how they drift.
+The Windows half of this contract is gone with the probe it held: biopb-engine.ps1
+no longer looks at a system interpreter at all (see its step 2). The shapes below
+that only Windows can present -- the Microsoft Store alias stub above all -- stay
+anyway, because they describe what the bash probe must make of an interpreter that
+declines to answer, and Git Bash reaches them.
 
 Cases live in python-probe-contract.json, never inline here. They are written
 against stub interpreters rather than real ones because the thing under test is
@@ -39,15 +31,7 @@ import os
 import stat
 
 import pytest
-from conftest import (
-    TEST_DIR,
-    bash,
-    ps_literal,
-    pwsh,
-    requires_posix,
-    requires_pwsh,
-    sh,
-)
+from conftest import TEST_DIR, bash, requires_posix, sh
 
 IS_WINDOWS = os.name == "nt"
 
@@ -57,9 +41,9 @@ CONTRACT = json.loads(
 CONTRACT_CASES = CONTRACT["cases"]
 CASE_IDS = [c["id"] for c in CONTRACT_CASES]
 
-# What a probe returns for "I cannot read this interpreter". Both halves signal it
-# natively as null/empty; the drivers below normalise to this so one table can
-# describe both.
+# What the probe returns for "I cannot read this interpreter". It signals that
+# natively as empty output; the driver below normalises to this so the table can
+# state it.
 NONE = "NONE"
 
 
@@ -79,10 +63,10 @@ def _cmd_escape(text: str) -> str:
 def write_stub(tmp_path, name, *, stdout=(), stderr=(), exit_code=0):
     """Write a fake interpreter emitting fixed lines, then exiting `exit_code`.
 
-    Two dialects because the probes run on two platforms: a .cmd batch file for
-    Windows PowerShell, a /bin/sh script everywhere else. Both are invoked the way
-    the installers invoke a real interpreter -- with `-c <program>` -- which the
-    stub accepts and ignores.
+    Two dialects, kept from when the PowerShell engine had a probe of its own: a
+    .cmd batch file on Windows, a /bin/sh script everywhere else. Both are invoked
+    the way the installer invokes a real interpreter -- with `-c <program>` --
+    which the stub accepts and ignores.
     """
     if IS_WINDOWS:
         path = tmp_path / f"{name}.cmd"
@@ -118,28 +102,14 @@ def write_stub(tmp_path, name, *, stdout=(), stderr=(), exit_code=0):
     return path
 
 
-def _probe_pwsh(exe) -> str:
-    """biopb-engine.ps1's Get-SystemPythonVersion, as "MAJOR.MINOR" or NONE.
-
-    Runs through conftest.pwsh, which dot-sources the engine -- so this executes
-    under the engine's own EAP='Stop', the setting both bugs needed. check=True
-    means a terminating error inside the probe fails the case as a nonzero exit,
-    which is exactly the production symptom.
-    """
-    out = pwsh(
-        f"$v = Get-SystemPythonVersion -PythonExe {ps_literal(exe)}\n"
-        f'if ($null -eq $v) {{ "{NONE}" }} else {{ "$($v.Major).$($v.Minor)" }}\n'
-    )
-    return out.stdout.strip()
-
-
 def _probe_bash(exe) -> str:
-    """install.sh's _system_python_version, in the same shape.
+    """install.sh's _system_python_version, as "MAJOR.MINOR" or NONE.
 
-    It answers "MAJOR MINOR" or nothing at all; the reshaping to MAJOR.MINOR here
-    is only so one table can describe both halves. Empty output is the bash way of
-    saying $null, and `set -e` is in force (conftest.bash), so a helper that exits
-    nonzero on an unreadable interpreter fails the case rather than returning.
+    It answers "MAJOR MINOR" or nothing at all; the reshaping here is only so the
+    table can state one expectation per case. Empty output is the bash way of
+    saying "I cannot read this", and `set -e` is in force (conftest.bash), so a
+    helper that exits nonzero on an unreadable interpreter fails the case rather
+    than returning.
     """
     out = bash(
         f"v=$(_system_python_version {sh(exe)})\n"
@@ -148,12 +118,9 @@ def _probe_bash(exe) -> str:
     return out.stdout.strip()
 
 
-PROBE_PARAMS = [
-    # install.sh is the POSIX installer and is never run on Windows, so its half
-    # of the contract is held on the Linux leg -- same call as test_install_sh.py.
-    pytest.param(_probe_bash, id="install.sh", marks=requires_posix),
-    pytest.param(_probe_pwsh, id="biopb-engine.ps1", marks=requires_pwsh),
-]
+# install.sh is the POSIX installer and is never run on Windows, so the contract
+# is held on the Linux leg -- same call as test_install_sh.py.
+PROBE_PARAMS = [pytest.param(_probe_bash, id="install.sh", marks=requires_posix)]
 
 
 @pytest.mark.parametrize("probe", PROBE_PARAMS)
