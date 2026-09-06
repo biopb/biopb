@@ -31,8 +31,33 @@ import {
   vivDtype,
   type TileInfo,
 } from "@biopb/tensor-flight-client";
-import { selectHiddenSets, selectRois, useAppStore } from "../store";
-import { buildRoiLayers, planeFromSelection } from "../utils/roiLayers";
+import {
+  selectBroadcastAxes,
+  selectDraft,
+  selectHiddenSets,
+  selectRois,
+  selectSelectedRoiId,
+  useAppStore,
+} from "../store";
+import {
+  closeDraft,
+  closesOnFirstVertex,
+  isCompletable,
+  isTextEntryTarget,
+  placePoint,
+  undoPoint,
+} from "../utils/roiDraft";
+import { roiAt } from "../utils/roiHitTest";
+import { RoiToolStrip } from "./RoiToolStrip";
+import {
+  buildDraftLayers,
+  buildRoiLayers,
+  defaultBroadcastAxes,
+  pinForNewRoi,
+  planeFromSelection,
+  visibleRois,
+  type XY,
+} from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
 import {
@@ -106,6 +131,12 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const showRois = useAppStore((s) => s.showRois);
   const hiddenSets = useAppStore(selectHiddenSets);
   const loadRois = useAppStore((s) => s.loadRois);
+  const tool = useAppStore((s) => s.tool);
+  const draft = useAppStore(selectDraft);
+  const selectedRoiId = useAppStore(selectSelectedRoiId);
+  const setDraft = useAppStore((s) => s.setDraft);
+  const setSelectedRoi = useAppStore((s) => s.setSelectedRoi);
+  const createRoi = useAppStore((s) => s.createRoi);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
@@ -351,6 +382,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // a pointer move at 60/s that re-rendered here would rebuild `VivStage` and,
   // with it, every deck.gl layer.
   const hoverSinkRef = useRef<((sample: HoverSample | null) => void) | null>(null);
+  // Null unless a draft is open, which is what keeps the hover handler from
+  // re-rendering this component on every pointer move the rest of the time.
+  const draftCursorSinkRef = useRef<((at: XY | null) => void) | null>(null);
   const bindHover = useCallback((sink: ((sample: HoverSample | null) => void) | null) => {
     hoverSinkRef.current = sink;
   }, []);
@@ -366,6 +400,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
         if (!c || !info.sourceLayer || c[0] === undefined || c[1] === undefined) {
           at = null;
           hoverSinkRef.current?.(null);
+          draftCursorSinkRef.current?.(null);
           return;
         }
         // Viv reads `2 ** round(-z)` as the level's scale, so this is the same
@@ -378,6 +413,10 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           scale: typeof z === "number" ? Math.max(1, 2 ** Math.round(-z)) : 1,
         };
         hoverSinkRef.current?.(at);
+        // The one place this component re-renders at pointer rate, and only
+        // while a shape is being placed: the trailing segment has to follow the
+        // pointer to be worth anything.
+        if (draftCursorSinkRef.current) draftCursorSinkRef.current([c[0], c[1]]);
       },
       hooks: {
         handleValue: (values: number[]) => {
@@ -429,8 +468,127 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
         // empty pin would match every unpinned annotation and draw them over a
         // frame that is not there.
         visible: showRois && shownPlane !== null,
+        selectedRoiId,
       }),
+    [rois, shownPlane, hiddenSets, showRois, selectedRoiId],
+  );
+
+  // --- authoring -----------------------------------------------------------
+  // What a click can hit: exactly what is drawn, so selection cannot pick an
+  // annotation the user cannot see.
+  const shown = useMemo(
+    () => (showRois ? visibleRois(rois, shownPlane ?? {}, hiddenSets) : []),
     [rois, shownPlane, hiddenSets, showRois],
+  );
+
+  // Where the pointer is, for the segment trailing an in-progress shape. State,
+  // not a ref, because a deck.gl layer reads it -- but written only while a
+  // draft is open, so an idle viewer pays nothing for it.
+  const [draftCursor, setDraftCursor] = useState<XY | null>(null);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  useEffect(() => {
+    if (!draft) {
+      setDraftCursor(null);
+      draftCursorSinkRef.current = null;
+      return;
+    }
+    draftCursorSinkRef.current = setDraftCursor;
+    return () => {
+      draftCursorSinkRef.current = null;
+    };
+  }, [draft]);
+
+  const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, defaultBroadcastAxes(info)));
+
+  const finishDraft = useCallback(() => {
+    const geometry = closeDraft(draftRef.current);
+    if (!geometry) return;
+    setDraft(null);
+    void createRoi(geometry, pinForNewRoi(info, shownPlane ?? {}, broadcastAxes));
+  }, [setDraft, createRoi, info, shownPlane, broadcastAxes]);
+
+  const onDeckClick = useCallback(
+    (info_: { coordinate?: number[]; viewport?: { zoom?: number | number[] } }) => {
+      // Nothing is drawn, so nothing is placeable or selectable: the toggle
+      // turns the surface off rather than only hiding what is stored.
+      if (!showRois) return;
+      const c = info_?.coordinate;
+      if (!c || c[0] === undefined || c[1] === undefined) return;
+      const at: XY = [c[0], c[1]];
+      // World units per screen pixel, so a tolerance stays constant on screen.
+      // Read off the viewport the click came through rather than the store's
+      // mirrored camera, which trails a gesture by CAMERA_MIRROR_MS.
+      const z = info_.viewport?.zoom;
+      const zoom = Array.isArray(z) ? (z[0] ?? 0) : (z ?? 0);
+      const scale = 2 ** -zoom;
+
+      if (tool === "select") {
+        setSelectedRoi(roiAt(shown, at, scale)?.roiId ?? null);
+        return;
+      }
+      // Clicking the first vertex closes the shape -- the one affordance saying
+      // an open-ended draft can end without reaching for the keyboard.
+      if (closesOnFirstVertex(draftRef.current, at, scale)) {
+        finishDraft();
+        return;
+      }
+      const { draft: next, completed } = placePoint(draftRef.current, tool, at);
+      setDraft(next);
+      if (completed) {
+        void createRoi(completed, pinForNewRoi(info, shownPlane ?? {}, broadcastAxes));
+      }
+    },
+    [
+      tool,
+      shown,
+      showRois,
+      setSelectedRoi,
+      finishDraft,
+      setDraft,
+      createRoi,
+      info,
+      shownPlane,
+      broadcastAxes,
+    ],
+  );
+
+  // Enter finishes, Escape abandons, Backspace takes back the last vertex.
+  // Bound only while a draft is open, so the viewer never swallows a key it has
+  // no use for.
+  useEffect(() => {
+    if (!draft) return;
+    const onKey = (event: KeyboardEvent) => {
+      // Mid-composition an IME owns Enter and Backspace -- committing a
+      // candidate is not finishing a polygon. `keyCode === 229` is the same
+      // state in browsers that do not set `isComposing` on keydown.
+      if (event.isComposing || event.keyCode === 229) return;
+      // Nor are they ours while someone is typing. These are window-level, so
+      // they reach the source search and every other field on the route.
+      if (isTextEntryTarget(event.target)) return;
+      if (event.key === "Enter") {
+        event.preventDefault();
+        finishDraft();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        setDraft(null);
+      } else if (event.key === "Backspace") {
+        event.preventDefault();
+        setDraft(undoPoint(draftRef.current));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [draft, finishDraft, setDraft]);
+
+  const draftLayers = useMemo(
+    () => buildDraftLayers({ draft, cursor: draftCursor, closeable: isCompletable(draft) }),
+    [draft, draftCursor],
+  );
+
+  const overlayLayers = useMemo(
+    () => [...roiLayers, ...draftLayers],
+    [roiLayers, draftLayers],
   );
 
   return (
@@ -455,7 +613,8 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           onViewportLoad={onViewportLoad}
           onHover={hover.onHover}
           hoverHooks={hover.hooks}
-          overlayLayers={roiLayers}
+          overlayLayers={overlayLayers}
+          onDeckClick={onDeckClick}
           width={size.width}
           height={size.height}
         />
@@ -484,6 +643,14 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
             </div>
           )}
           <HoverReadout bind={bindHover} />
+        </div>
+      )}
+      {loaded && selection && size && showRois && (
+        // Over the canvas, and above the "Reading plane" cover: switching tool
+        // is a per-gesture action, and it should not disappear while a read is
+        // outstanding.
+        <div style={{ position: "absolute", top: 10, left: 10, zIndex: 2 }}>
+          <RoiToolStrip draft={draft} onFinish={finishDraft} />
         </div>
       )}
       {tileError && (
@@ -570,6 +737,7 @@ function VivStage({
   onHover,
   hoverHooks,
   overlayLayers,
+  onDeckClick,
   width,
   height,
 }: {
@@ -584,6 +752,8 @@ function VivStage({
   hoverHooks: { handleValue: (values: number[]) => void; handleCoordinate: () => void };
   /** Drawn over the image; see utils/roiLayers.ts for the id constraint. */
   overlayLayers: unknown[];
+  /** Reaches DeckGL's root `onClick`, which Viv does not override. */
+  onDeckClick: (info: { coordinate?: number[]; viewport?: { zoom?: number | number[] } }) => void;
   width: number;
   height: number;
 }) {
@@ -669,7 +839,16 @@ function VivStage({
   // ones whose id contains its view id, which is why they are built through
   // `roiLayerId`. Memoised on the array itself: `deckProps` is spread into
   // DeckGL, and a fresh object every render would be a prop change every frame.
-  const deckProps = useMemo(() => ({ layers: overlayLayers }), [overlayLayers]);
+  //
+  // `onClick` rides the same object. Viv overrides `layerFilter`, `layers`,
+  // `onViewStateChange`, `views`, `viewState`, `useDevicePixels` and `getCursor`
+  // AFTER spreading deckProps -- but not the pointer callbacks, so this one
+  // survives. The overlay is unpickable, so it arrives with no picked layer and
+  // `coordinate` set, which is exactly what placing a vertex needs.
+  const deckProps = useMemo(
+    () => ({ layers: overlayLayers, onClick: onDeckClick }),
+    [overlayLayers, onDeckClick],
+  );
 
   return (
     <VivViewer

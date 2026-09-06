@@ -202,19 +202,60 @@ deck canvas, so it already hides the overlay along with the stale image.
 
 Selection state (which ROI is active) is SPA-local and never written.
 
-**Every overlay layer is `pickable: false`, and not only because nothing is
-interactive yet.** `TileViewer`'s hover badge reads `info.sourceLayer` and
-`info.tile` to report the pixel under the pointer; a pickable overlay sits on top
-and would answer that hover itself, blanking the readout wherever an annotation
-lies. Authoring has to route around that — read the pixel from the tile layer
-explicitly, or re-report it from the overlay — rather than just flipping the flag.
+**Every overlay layer is `pickable: false`.** `TileViewer`'s hover badge reads
+`info.sourceLayer` and `info.tile` to report the pixel under the pointer; a
+pickable overlay sits on top and would answer that hover itself, blanking the
+readout wherever an annotation lies.
+
+Selection therefore hit-tests in JS (`roiHitTest.ts`) rather than using deck.gl
+picking. That costs nothing extra — the whole annotation set is already resident,
+which is one of the reasons the read path fetches it whole — and it is what the
+whole-set fetch was justified by in the first place. A filled shape hits anywhere
+inside it *or* within a few screen pixels of its outline, so a thin sliver stays
+selectable, and a point hits by proximity.
+
+A polyline hits within **its own stroke plus** that tolerance. `width` is
+geometry — the band of pixels the scribble covered — so a fat stroke has to be
+grabbable anywhere it is drawn, not only near its centreline. The two terms are
+different things and scale differently: the stroke is part of the image and
+scales with it, the tolerance is part of the pointer and stays screen-constant.
+It is the same half-width the store pads the bbox by, so what is selectable and
+what the SQL surface reports as covered agree. The tolerance is scaled by
+world-units-per-pixel, read off `info.viewport.zoom` at click time rather than
+from the store's mirrored camera, which trails a gesture by `CAMERA_MIRROR_MS`.
 
 ## Authoring
 
-**Creation is click-to-place.** Click each vertex; double-click or `Enter` closes a
-polygon, `Escape` cancels. A rectangle is two clicks (opposite corners), a point is
-one. This avoids the controller conflict entirely, and it is the better interaction
-for tracing anyway — a drag-traced polygon at zoom is worse than placed vertices.
+**Creation is click-to-place.** A point is one click and a rectangle is two
+(opposite corners, normalised on store), because their vertex count is fixed and
+a separate "finish" would be ceremony. A polygon or polyline runs until the user
+ends it: `Enter`, the Finish button, or a click on the first vertex, which grows
+into a handle once the shape has enough vertices to close. `Escape` abandons the
+draft and `Backspace` takes back the last vertex; those keys are bound only while
+a draft is open, so the viewer never swallows a key it has no use for.
+
+They are bound on `window` — the canvas is not focusable, and a shape has to be
+finishable wherever the pointer is — so the handler has to hand back the keys it
+should not have. It ignores anything mid-IME-composition (committing a candidate
+is not finishing a polygon) and anything aimed at a text field: the source
+search, the chat composer, the annotation's own label and set inputs and the
+slice inputs are all within that reach, and `Backspace` in any of them must edit
+text rather than take back a vertex.
+
+This avoids the controller conflict entirely, and it is the better interaction for
+tracing anyway — a drag-traced polygon at zoom is worse than placed vertices.
+
+The click arrives through `deckProps.onClick`. Viv overrides `layerFilter`,
+`layers`, `onViewStateChange`, `views`, `viewState`, `useDevicePixels` and
+`getCursor` after spreading `deckProps`, but not the pointer callbacks — and
+because the overlay is unpickable the click arrives with no picked layer and
+`coordinate` set, which is exactly what placing a vertex needs.
+
+**The draft is its own layer set**, memoised apart from the overlay. The segment
+trailing the pointer has to follow it to be worth anything, so that one path
+re-renders at pointer rate — but only while a draft is open, and rebuilding the
+whole overlay there would re-tessellate every annotation on every mouse move
+(the same cost the plane-switch rebuild pays).
 
 **Shapes authored in v1:** point, rectangle, polygon, polyline. Ellipse is
 **render-only** — the store accepts one and another client may write one, but the
@@ -262,9 +303,46 @@ section can promise a control for every axis rather than a silent exception.
 **Vertex editing** needs the `DetailView` subclass described above to toggle
 `dragPan` for the duration of a drag.
 
-**The draft is cleared on a render-mode flip as well as on a tensor change.** The
-tool is a preference and can survive a trip through 3-D; a half-placed polygon
-reappearing afterwards is only confusing.
+**A draft does not survive a plane change**, nor a render-mode flip or a tensor
+change. Vertices are traced against the pixels of one plane, so navigating away
+leaves a shape drawn on an image nobody is looking at — and finishing it there
+would pin it to the plane it was *not* drawn on, which is silently wrong data
+rather than a visible mistake.
+
+`selectDraft` answers all three at the read, comparing a key built from the
+slice indices only: contrast, gamma and the percentile window ride `SliceState`
+too and none of them invalidate a shape. That covers every route that moves the
+slice — slider, keyboard, play, a link — without enumerating them, which matters
+because play steps an axis every 100 ms and would otherwise let a polygon be
+finished several frames from where it began.
+
+The draft is hidden rather than destroyed, so a stray scroll costs nothing:
+scrub back and it is there. A click after the plane moved starts a fresh draft
+rather than extending the stale one, because placement goes through the same
+selector.
+
+The tool itself is a preference and survives all of this.
+
+**A lint rule keeps the guarded reads guarded.** Three times this state has
+shipped with a selector alongside a raw field that a second reader picked up
+instead — the previous tensor's hidden sets, a truncation warning about a tensor
+no longer on screen, an enabled Finish for a draft the viewer had dropped. The
+selector fixes the instance; it does not stop the next one, because the field
+stays public on `AppState`. So `no-restricted-syntax` refuses
+`useAppStore((s) => s.rois)` and its siblings (the list is in
+`web/packages/app/eslint.config.mjs`), while `getState()` and `setState()` stay
+open for tests.
+
+**The tool strip takes the draft as a prop rather than reading the store.** The
+viewer already holds it through `selectDraft`; a second, unguarded read there
+would show a status line and an enabled Finish for a draft the viewer considers
+gone, and Finish would then do nothing, because it closes over the guarded
+value. One reader is the only way the two cannot disagree.
+
+**A selection is only actionable while it is drawn.** The Delete button acts on
+it, so a plane change must not leave the user able to delete a shape they cannot
+see. The selection survives the move — scrubbing back brings it into reach —
+but the panel withholds it meanwhile.
 
 ## State
 
@@ -280,6 +358,18 @@ tool: "none" | "point" | "rect" | "polygon" | "polyline"
 draft: DraftShape | null      // vertices placed so far
 selectedRoiId: string | null
 ```
+
+**The overlay toggle turns the annotation surface off, not just the stored
+shapes.** With it off nothing is drawn, no tool is offered, a click places
+nothing and selects nothing, an in-progress draft is hidden, and the authoring
+panel is gone — including the Delete button, which would otherwise act on a
+selection the user cannot see. Anything narrower makes one checkbox mean several
+things: gating only the rendering left a draft visible over a switched-off
+overlay and let it be finished into an annotation nobody could see.
+
+To thin clutter *while* drawing, hide the noisy set instead — that is what the
+per-set toggles are for. Like the plane guard, the draft is hidden rather than
+destroyed, so toggling back restores it.
 
 `tool` and the overlay toggle are viewer preferences and outlive a tensor change.
 Overlay visibility belongs in `useViewerUrlSync` so a shared link carries it.

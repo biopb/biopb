@@ -4,7 +4,7 @@ import type { CSSProperties } from "react";
 import { useAppStore } from "../store";
 import { ViewerPane } from "../components/ViewerPane";
 import { MetaPanel } from "../components/MetaPanel";
-import { RoiPanel } from "../components/RoiPanel";
+import { RoiAuthor, RoiPanel } from "../components/RoiPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
 import { TipBar } from "../components/TipBar";
@@ -199,7 +199,12 @@ export function HomePage() {
             {splitter("control", "Resize the control panel")}
             <div className="control-column">
               <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
-              {!render3d && <RoiPanel />}
+              {!render3d && (
+                <>
+                  <RoiPanel />
+                  <RoiAuthor />
+                </>
+              )}
               {/*
                 Remount per source. Without the key, a switch re-renders the
                 whole tree against the *previous* source's metadata — the new

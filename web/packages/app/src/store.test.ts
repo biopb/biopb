@@ -7,6 +7,8 @@ import {
   selectRoisLoading,
   selectRoisSkipped,
   selectRoisTruncated,
+  selectDraft,
+  selectSelectedRoi,
   selectTileInfo,
   useAppStore,
 } from "./store";
@@ -366,5 +368,238 @@ describe("loadRois", () => {
     await useAppStore.getState().loadRois("first");
     await useAppStore.getState().loadRois("first");
     expect(asked).toEqual(["first"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authoring
+// ---------------------------------------------------------------------------
+
+describe("authoring state", () => {
+  const GEOM = { kind: "point" as const, at: { x: 1, y: 2 } };
+
+  function stored(over: Record<string, unknown> = {}) {
+    return {
+      roiId: "srv1",
+      arrayId: "first",
+      setName: "default",
+      label: "",
+      geometry: GEOM,
+      plane: {},
+      props: {},
+      rev: 1,
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      ...over,
+    };
+  }
+
+  function seedFor(client: unknown) {
+    useAppStore.setState({
+      client: client as TensorFlightClient,
+      activeTensorId: "first",
+      requestedArrayId: null,
+      rois: [],
+      roisFor: "first",
+      selectedRoiId: null,
+      roiWriteError: null,
+      newLabel: "",
+      newSetName: "",
+      draft: null,
+      draftFor: null,
+      render3d: false,
+      broadcastAxes: null,
+      broadcastAxesFor: null,
+    });
+  }
+
+  it("sends the label, set and pin, and adopts what the server stored", async () => {
+    const calls: unknown[] = [];
+    seedFor({
+      http: {
+        putRois: (arrayId: string, rois: unknown[], opts: unknown) => {
+          calls.push({ arrayId, rois, opts });
+          return Promise.resolve({ stored: [stored({ label: "cell" })], conflicts: [], skipped: 0 });
+        },
+      },
+    });
+    useAppStore.setState({ newLabel: "cell", newSetName: "nuclei" });
+    await useAppStore.getState().createRoi(GEOM, { 2: 12 });
+
+    expect(calls).toEqual([
+      {
+        arrayId: "first",
+        rois: [{ geometry: GEOM, plane: { 2: 12 }, label: "cell", setName: "nuclei" }],
+        opts: { checkRev: true },
+      },
+    ]);
+    // The server assigns the id, so the local copy has to be its answer, not
+    // the shape that was sent.
+    expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["srv1"]);
+    expect(useAppStore.getState().selectedRoiId).toBe("srv1");
+  });
+
+  it("drops a write that landed after the tensor moved on", async () => {
+    // The annotation is stored; appending it would draw it over another image.
+    seedFor({
+      http: {
+        putRois: () => {
+          useAppStore.setState({ activeTensorId: "second", roisFor: "second", rois: [] });
+          return Promise.resolve({ stored: [stored()], conflicts: [], skipped: 0 });
+        },
+      },
+    });
+    await useAppStore.getState().createRoi(GEOM, {});
+    expect(useAppStore.getState().rois).toEqual([]);
+  });
+
+  it("reports a failed write instead of pretending it landed", async () => {
+    seedFor({ http: { putRois: () => Promise.reject(new Error("422 rejected")) } });
+    await useAppStore.getState().createRoi(GEOM, {});
+    expect(useAppStore.getState().roiWriteError).toContain("422 rejected");
+    expect(useAppStore.getState().rois).toEqual([]);
+  });
+
+  it("removes a deleted annotation and clears the selection with it", async () => {
+    seedFor({ http: { deleteRois: () => Promise.resolve(["srv1"]) } });
+    useAppStore.setState({ rois: [stored()], selectedRoiId: "srv1" });
+    await useAppStore.getState().deleteRoi("srv1");
+    expect(useAppStore.getState().rois).toEqual([]);
+    expect(useAppStore.getState().selectedRoiId).toBeNull();
+  });
+
+  it("drops a row the server says it never had, rather than leaving it stuck", async () => {
+    seedFor({ http: { deleteRois: () => Promise.resolve([]) } });
+    useAppStore.setState({ rois: [stored()], selectedRoiId: "srv1" });
+    await useAppStore.getState().deleteRoi("srv1");
+    expect(useAppStore.getState().rois).toEqual([]);
+  });
+
+  it("abandons the draft when the tool changes", () => {
+    useAppStore.setState({ tool: "polygon", draft: { tool: "polygon", points: [[0, 0]] } });
+    useAppStore.getState().setTool("rectangle");
+    expect(useAppStore.getState().draft).toBeNull();
+  });
+
+  it("materialises the default before the first broadcast toggle", () => {
+    // Otherwise toggling one axis would silently also pin whatever the default
+    // was broadcasting.
+    seedFor({ http: {} });
+    useAppStore.getState().toggleBroadcastAxis(2, [1]);
+    expect(useAppStore.getState().broadcastAxes?.sort()).toEqual([1, 2]);
+  });
+
+  it("hides the draft in 3-D and on another tensor", () => {
+    seedFor({ http: {} });
+    useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0]] });
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+
+    useAppStore.setState({ render3d: true });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+
+    useAppStore.setState({ render3d: false, activeTensorId: "second" });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("resolves the selection against the set in view, so it cannot go stale", () => {
+    seedFor({ http: {} });
+    useAppStore.setState({ rois: [stored()], selectedRoiId: "srv1" });
+    expect(selectSelectedRoi(useAppStore.getState())?.roiId).toBe("srv1");
+
+    // The annotation is gone from the set: no cleanup needed anywhere.
+    useAppStore.setState({ rois: [] });
+    expect(selectSelectedRoi(useAppStore.getState())).toBeNull();
+  });
+});
+
+describe("a draft does not survive a plane change", () => {
+  function startDraft() {
+    useAppStore.setState({
+      activeTensorId: "first",
+      requestedArrayId: null,
+      render3d: false,
+      slice: { ...BASE_SLICE, z: 12 },
+    });
+    useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0], [4, 0]] });
+  }
+
+  it("is there while the plane holds still", () => {
+    startDraft();
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+
+  it("goes when the slider moves", () => {
+    // The vertices were traced against another plane's pixels; finishing here
+    // would pin the shape to a plane it was not drawn on.
+    startDraft();
+    useAppStore.getState().setSlice({ z: 13 });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("goes when play steps any axis", () => {
+    startDraft();
+    useAppStore.getState().setSlice({ t: 1 });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("goes when an unnamed axis moves", () => {
+    startDraft();
+    useAppStore.getState().setSlice({ axes: { a0: 2 } });
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("survives a contrast or gamma change", () => {
+    // Those ride SliceState too, and neither invalidates a shape being drawn.
+    startDraft();
+    useAppStore.getState().setSlice({ gamma: 2.2 });
+    useAppStore.getState().setSlice({ contrastMode: "fixed" });
+    useAppStore.getState().setSlice({ percentileScale: 2 });
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+
+  it("comes back if the plane comes back", () => {
+    // A stray scroll costs nothing; the draft is hidden, not destroyed.
+    startDraft();
+    useAppStore.getState().setSlice({ z: 13 });
+    useAppStore.getState().setSlice({ z: 12 });
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+
+  it("a click after the plane moved starts a fresh draft, not a continuation", () => {
+    // TileViewer places through `selectDraft`, so the stale vertices are not
+    // extended -- this is the behaviour the hidden-not-destroyed choice rests on.
+    startDraft();
+    useAppStore.getState().setSlice({ z: 13 });
+    const seen = selectDraft(useAppStore.getState());
+    expect(seen).toBeNull();
+  });
+});
+
+describe("the overlay toggle governs the whole annotation surface", () => {
+  function drafting() {
+    useAppStore.setState({
+      activeTensorId: "first",
+      requestedArrayId: null,
+      render3d: false,
+      showRois: true,
+      slice: { ...BASE_SLICE, z: 12 },
+    });
+    useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0], [4, 0]] });
+  }
+
+  it("hides an in-progress draft, not just the stored shapes", () => {
+    // Otherwise a draft keeps drawing over an overlay the user switched off,
+    // and finishing writes an annotation they cannot see.
+    drafting();
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
+    useAppStore.getState().setShowRois(false);
+    expect(selectDraft(useAppStore.getState())).toBeNull();
+  });
+
+  it("gives the draft back when the overlay comes back", () => {
+    drafting();
+    useAppStore.getState().setShowRois(false);
+    useAppStore.getState().setShowRois(true);
+    expect(selectDraft(useAppStore.getState())).not.toBeNull();
   });
 });
