@@ -348,13 +348,14 @@ _install_opencode() {
 # a stub, a nonzero exit, or output that is not a version. The caller decides what
 # to do with the answer; this function only reads it.
 #
-# The PowerShell twin is biopb-engine.ps1::Get-SystemPythonVersion, and the two are
-# held to one shared table of interpreter shapes (install/test/python-probe-contract.json,
-# via test_python_probe.py) for the same reason the extras parsers are: one rule,
-# implemented twice, which is exactly how #648 happened.
+# POSIX only. biopb-engine.ps1 had a twin of this and no longer does: on Windows
+# the installer stopped looking at a system interpreter entirely, because a version
+# in range does not mean uv can use it (see that file's step 2). Held to a table of
+# interpreter shapes at install/test/python-probe-contract.json, via
+# test_python_probe.py.
 #
-# The trap on this side is not PowerShell's terminating-stderr one -- it is that an
-# interpreter which greets on STDOUT (conda, a sitecustomize banner) puts a
+# The trap here is that an interpreter which greets on STDOUT (conda, a
+# sitecustomize banner) puts a
 # non-numeric line ahead of the answer. Handing that word to `[ "$MAJOR" -eq 3 ]`
 # is an "integer expression expected" error rather than a fallback, so the machine
 # is told its Python is "too old" and the real version is never looked at. Hence:
@@ -1203,8 +1204,19 @@ install_biopb() {
             MAJOR=${PYTHON_VERSION% *}
             MINOR=${PYTHON_VERSION#* }
             if [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge "$MIN_MINOR" ] && [ "$MINOR" -le "$MAX_MINOR" ]; then
-                _ok "Using system Python: $(python3 --version)"
-                PYTHON_SPEC=$(command -v python3)
+                # A version in range is not proof uv can USE the interpreter, and
+                # the difference is an aborted install: a mingw-w64 python3 -- Git
+                # Bash on a Windows box with Inkscape on PATH -- answers "3 12" and
+                # then dies in `uv tool install` with "Unknown operating system:
+                # mingw_x86_64_ucrt_gnu". So ask uv the same question here, where
+                # falling back to a managed interpreter still costs nothing.
+                if uv python find "$(command -v python3)" >/dev/null 2>&1; then
+                    _ok "Using system Python: $(python3 --version)"
+                    PYTHON_SPEC=$(command -v python3)
+                else
+                    _warn "System Python ($(python3 --version)) is not usable by uv; using a managed 3.$MAX_MINOR"
+                    PYTHON_VERSION=""
+                fi
             elif [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -gt "$MAX_MINOR" ]; }; then
                 _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
                 PYTHON_VERSION=""

@@ -12,7 +12,7 @@ console one-liner share **one install brain**.
 ## The core constraint
 
 `install.ps1` is **not a file-copy install** — it is a multi-minute network
-*orchestration*: install `uv`, provision Python ≥3.10, download the wheel set
+*orchestration*: install `uv`, provision a uv-managed Python, download the wheel set
 (biopb + tensor-server + mcp + control) from the latest `release-v*`, pull
 `napari[all]` from PyPI, unpack the webapp,
 write `biopb.json`, start the tensor server, and wire MCP clients. It is
@@ -40,6 +40,29 @@ makes Exec launch the **64-bit** PowerShell, and the engine reads
 
 Per-machine / GPO mass-deployment for managed lab fleets (WiX/MSI) is explicitly
 *out of scope for v1* — kept in reserve for that audience.
+
+## Python: always a uv-managed 3.12
+
+Step 2 never looks at whatever `python` is on PATH. It runs `uv python install
+3.12` and pins `--python 3.12` for the tool env.
+
+Windows presents too many interpreters that answer a version question correctly
+and are still unusable. The one that broke a user install was Inkscape's bundled
+mingw-w64 python — its `bin` is on the default PATH, it reports 3.12, it passes
+any version gate, and it then aborts `uv tool install` with `Unknown operating
+system: mingw_x86_64_ucrt_gnu`. The Microsoft Store `python.exe` alias stub and
+conda banner shims were earlier versions of the same shape.
+
+The version gate that used to guard this is deleted rather than hardened, because
+CI cannot cover what it admitted: the end-to-end installer scenarios
+(`installer-scenarios.yaml`) are Linux Docker images, and the Windows leg of
+`install-scripts.yaml` only unit-tests the engine. A managed 3.12 is the only
+interpreter a Windows deployment is ever exercised on, so pinning it makes what
+users run the thing CI covers. The cost is a ~30 MB download that uv caches.
+
+`install.sh` deliberately keeps preferring a system `python3` in range — a POSIX
+box presents far fewer broken interpreters — but validates its pick with `uv
+python find` before handing it to `uv tool install`.
 
 ## Architecture: one engine, two front-ends
 
