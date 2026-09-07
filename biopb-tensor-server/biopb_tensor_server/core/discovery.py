@@ -1020,27 +1020,49 @@ class DiscoveryState:
         return set(self.source_to_paths.get(source_id, set()))
 
 
+# ``file://`` is a LOCAL url (see ``is_remote_url``): every adapter that meets one
+# strips this prefix and hands the rest to a filesystem reader, so the functions
+# below -- which decide the same url's identity -- must strip it the same way. A
+# naive prefix strip is deliberate: it is what the adapters do, and a cleverer
+# one (url2pathname, percent-decoding) would make a source's id name a different
+# file from the one its adapter opens.
+_FILE_URL_PREFIX = "file://"
+
+
+def _as_filesystem_path(path: str) -> str:
+    """The filesystem path a local path-or-``file://``-url names."""
+    if path.startswith(_FILE_URL_PREFIX):
+        return path[len(_FILE_URL_PREFIX) :]
+    return path
+
+
 def resolve_local_path(path: str) -> str:
-    """Canonical absolute form of a LOCAL filesystem path.
+    """Canonical absolute form of a LOCAL filesystem path or ``file://`` url.
 
     The single canonicalizer for local-path identity across the server: the
-    ``source_id`` hash (``generate_source_id``) and -- in ``source_manager`` --
-    the drag-drop containment guard and the static-config seed all reduce a path
-    to this form, so the same physical location compares equal however it was
-    spelled (symlink / junction / mapped drive / 8.3 / case / trailing sep). The
-    monitored walk reaches the same form via ``Path.resolve`` on its root.
-    ``Path.resolve`` resolves reparse points on Python 3.8+, so it folds those on
-    Windows too.
+    ``source_id`` hash (``generate_source_id``), ``SourceConfig.local_path``, and
+    -- in ``source_manager`` -- the drag-drop containment guard and the
+    static-config seed all reduce a path to this form, so the same physical
+    location compares equal however it was spelled (``file://`` / symlink /
+    junction / mapped drive / 8.3 / case / trailing sep). The monitored walk
+    reaches the same form via ``Path.resolve`` on its root. ``Path.resolve``
+    resolves reparse points on Python 3.8+, so it folds those on Windows too.
+
+    Stripping ``file://`` here is what makes that url form share one identity
+    with the plain path it names. Without it ``Path.resolve`` treated the whole
+    url as a relative path, producing ``$PWD/file:/data/x`` -- a location that
+    does not exist and an id that moved with the launch directory
+    (biopb/biopb#947).
 
     Local paths only: a remote URL must NOT be passed here -- ``Path.resolve``
     mangles the scheme (collapsing ``//`` and prepending the cwd); callers gate
     on ``is_remote_url`` first.
     """
-    return str(Path(path).resolve())
+    return str(Path(_as_filesystem_path(path)).resolve())
 
 
 def local_path_is_rooted(path: str) -> bool:
-    """True if a LOCAL path names a location starting from a filesystem root.
+    """True if a LOCAL path or ``file://`` url starts from a filesystem root.
 
     The companion guard to :func:`resolve_local_path`: that function completes a
     rootless path from the *process* cwd, which is never what a config file or a
@@ -1057,11 +1079,10 @@ def local_path_is_rooted(path: str) -> bool:
     fixtures spell a source), while drive-relative ``C:x`` and plain ``data/x``
     do not.
 
-    Takes a filesystem PATH. A caller whose input may be a ``file://`` url
-    strips the scheme first -- what that url form means is each surface's own
-    policy, not this predicate's.
+    Judges a ``file://`` url on the path it carries, so the check agrees with
+    what :func:`resolve_local_path` will make of it.
     """
-    return bool(Path(path).root)
+    return bool(Path(_as_filesystem_path(path)).root)
 
 
 def generate_source_id(url: str, source_type: str) -> str:

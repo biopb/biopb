@@ -118,6 +118,7 @@ from biopb_tensor_server.core.discovery import (
     generate_source_id,
     get_file_identity,
     local_path_is_rooted,
+    resolve_local_path,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import (
@@ -128,25 +129,6 @@ from biopb_tensor_server.core.remote import (
 
 # Alias for backward compatibility with internal usage
 _is_remote_url = is_remote_url
-
-# ``file://`` is a LOCAL url here (see ``is_remote_url``); the adapters strip the
-# prefix and hand the rest to a filesystem reader.
-_FILE_URL_PREFIX = "file://"
-
-
-def _local_url_is_rooted(url: str) -> bool:
-    """True if a local source URL names a path from a filesystem root.
-
-    The url-level half of the check: a config source url may be spelled
-    ``file://``, so the scheme comes off before the shared path predicate
-    (:func:`discovery.local_path_is_rooted`) judges what is left. The root rule
-    itself is not restated here -- the wire's ``add_source`` guard applies the
-    same one, and two copies of it would drift.
-    """
-    if url.startswith(_FILE_URL_PREFIX):
-        url = url[len(_FILE_URL_PREFIX) :]
-    return local_path_is_rooted(url)
-
 
 logger = logging.getLogger(__name__)
 
@@ -491,7 +473,7 @@ class SourceConfig:
         # different source_ids, per launch (biopb/biopb#947). Config parsing
         # drops such an entry before it reaches here, so this is the backstop for
         # a programmatic construction.
-        if not _is_remote_url(self.url) and not _local_url_is_rooted(self.url):
+        if not _is_remote_url(self.url) and not local_path_is_rooted(self.url):
             raise ValueError(
                 f"Source 'url' must be a rooted path or a remote URL, got: "
                 f"{self.url!r}. A path with no root is completed from whatever "
@@ -512,14 +494,16 @@ class SourceConfig:
     def local_path(self) -> Optional[Path]:
         """Return Path if url is a local file path, else None.
 
-        For remote URLs (s3://, http://, etc.), returns None. For local paths,
-        the canonical Path: `url` is already absolute (``__post_init__`` refuses
-        a relative one), so ``resolve()`` here only folds symlinks and ``..``,
-        never the cwd.
+        For remote URLs (s3://, http://, etc.), returns None. For a local url --
+        a plain path or a ``file://`` one -- the canonical Path, through the same
+        :func:`resolve_local_path` the ``source_id`` hash uses, so a source's
+        identity and the location it reads can never disagree. ``__post_init__``
+        refuses a rootless url, so the resolution here only folds ``file://``,
+        symlinks and ``..``, never the cwd.
         """
         if _is_remote_url(self.url):
             return None
-        return Path(self.url).resolve()
+        return Path(resolve_local_path(self.url))
 
 
 @dataclass
@@ -1299,7 +1283,7 @@ def _normalized_source_url(url: str) -> Optional[str]:
             return None
     else:
         expanded = url
-    return expanded if _local_url_is_rooted(expanded) else None
+    return expanded if local_path_is_rooted(expanded) else None
 
 
 def parse_config(data: Dict[str, Any]) -> ServerConfig:

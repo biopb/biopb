@@ -316,17 +316,21 @@ class TestAddLocalSource:
         with pytest.raises(ValueError, match="rooted path"):
             _drain(manager.add_local_source(spelling))
 
-    def test_file_url_rejected_here_though_a_config_accepts_one(self):
-        """The deliberate difference between the two surfaces.
+    def test_file_url_registers_under_the_path_it_names(self, tmp_path):
+        """`file://` and the plain path are one source, not two.
 
-        A config records a `file://` source and lets the adapter strip the
-        scheme. This entrypoint stats the path immediately and `resolve_local_path`
-        would mangle the scheme first, so it is refused up front rather than
-        surfacing as a FileNotFoundError naming a path nobody wrote.
+        `resolve_local_path` strips the scheme, so the url form reaches the same
+        identity -- an id equal to the plain path's, and a second add that
+        deduplicates instead of registering a twin.
         """
+        zpath = _make_zarr(str(tmp_path), "s.zarr")
         manager, _ = _make_manager()
-        with pytest.raises(ValueError, match="rooted path"):
-            _drain(manager.add_local_source("file:///data/s.zarr"))
+
+        added, *_ = _drain(manager.add_local_source(f"file://{zpath}"))
+        assert len(added) == 1
+
+        again_added, already, _ = _drain(manager.add_local_source(zpath))
+        assert again_added == [] and already == [added[0].source_id]
 
     def test_cancel_keeps_already_committed(self, tmp_path):
         """A cancel between sources stops discovery but keeps what registered."""

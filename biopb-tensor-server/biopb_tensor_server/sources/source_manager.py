@@ -1138,14 +1138,11 @@ class SourceManager:
         # A rootless path has no meaning across the wire: `resolve_local_path`
         # below would complete it from the *server's* cwd, which the caller does
         # not know and did not pick (biopb/biopb#947). Same predicate the config
-        # loader uses, for the same reason and from the same place. The drag-drop
-        # client always sends a rooted path (Qt's ``QUrl.toLocalFile``), so this
-        # only catches a hand-built call.
-        #
-        # A `file://` url is refused here even though a config accepts one: this
-        # entrypoint stats the path immediately, and `resolve_local_path` would
-        # mangle the scheme into a cwd-relative mess first. Refusing it up front
-        # beats a FileNotFoundError naming a path nobody wrote.
+        # loader uses, for the same reason and from the same place -- and it
+        # judges a `file://` url on the path it carries, which `resolve_local_path`
+        # then strips, so both url forms land on one identity here too. The
+        # drag-drop client always sends a rooted path (Qt's ``QUrl.toLocalFile``),
+        # so this only catches a hand-built call.
         if not local_path_is_rooted(url):
             raise ValueError(
                 "Runtime source add requires a rooted path; one without a root "

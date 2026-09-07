@@ -204,6 +204,54 @@ class TestTheRootRule:
         assert not local_path_is_rooted(path)
 
 
+class TestFileUrlIdentity:
+    """`file://` is a local url; it must name the same source the path does.
+
+    `Path.resolve()` used to treat the whole url as a relative path, so
+    `local_path` came back `$PWD/file:/data/x` -- a location that does not exist,
+    and an id that moved with the launch directory. That is biopb/biopb#947 in
+    the one url form the plain-path fix did not reach.
+    """
+
+    def test_it_resolves_to_the_path_it_names(self, tmp_path, monkeypatch):
+        data = tmp_path / "plate3.zarr"
+        data.mkdir()
+        config = _write_config(tmp_path / "project", f"file://{data}")
+        monkeypatch.chdir(tmp_path)
+
+        local_path = load_config(config).sources[0].local_path
+
+        assert local_path == data
+        assert local_path.exists()
+
+    def test_it_shares_one_id_with_the_plain_path(self, tmp_path, monkeypatch):
+        """Two spellings of one directory must not become two catalog rows."""
+        data = tmp_path / "plate3.zarr"
+        data.mkdir()
+        as_url = _write_config(tmp_path / "a", f"file://{data}")
+        as_path = _write_config(tmp_path / "b", str(data))
+        monkeypatch.chdir(tmp_path)
+
+        assert (
+            load_config(as_url).sources[0].source_id
+            == load_config(as_path).sources[0].source_id
+        )
+
+    def test_its_id_does_not_move_with_the_cwd(self, tmp_path, monkeypatch):
+        data = tmp_path / "plate3.zarr"
+        data.mkdir()
+        config = _write_config(tmp_path / "project", f"file://{data}")
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+
+        monkeypatch.chdir(tmp_path / "a")
+        first = load_config(config).sources[0].source_id
+        monkeypatch.chdir(tmp_path / "b")
+        second = load_config(config).sources[0].source_id
+
+        assert first == second
+
+
 class TestSourceConfigBackstop:
     """The invariant `local_path` and `source_id` rely on, held at construction."""
 
