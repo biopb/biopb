@@ -1039,6 +1039,31 @@ def resolve_local_path(path: str) -> str:
     return str(Path(path).resolve())
 
 
+def local_path_is_rooted(path: str) -> bool:
+    """True if a LOCAL path names a location starting from a filesystem root.
+
+    The companion guard to :func:`resolve_local_path`: that function completes a
+    rootless path from the *process* cwd, which is never what a config file or a
+    wire request meant, so every surface that accepts a path from a user checks
+    this first (biopb/biopb#947). One spelling, in one place, because the two
+    obvious spellings disagree.
+
+    Deliberately not ``os.path.isabs``: on Windows that returns True for a
+    driveless ``/data/x``, which CPython's own source marks "LEGACY BUG" in
+    ``ntpath.isabs`` and reserves the right to fix. Two callers spelling this
+    check differently would then diverge on a *Python upgrade* rather than on an
+    edit -- drift with no diff to notice. ``Path.root`` is stable: rooted
+    ``/data/x`` passes on both platforms (it is how this repo's configs and
+    fixtures spell a source), while drive-relative ``C:x`` and plain ``data/x``
+    do not.
+
+    Takes a filesystem PATH. A caller whose input may be a ``file://`` url
+    strips the scheme first -- what that url form means is each surface's own
+    policy, not this predicate's.
+    """
+    return bool(Path(path).root)
+
+
 def generate_source_id(url: str, source_type: str) -> str:
     """Generate deterministic unique source_id from URL.
 

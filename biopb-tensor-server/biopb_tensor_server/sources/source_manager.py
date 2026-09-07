@@ -23,6 +23,7 @@ from biopb_tensor_server.core.discovery import (
     discover_sources,
     discover_sources_from_entries,
     generate_source_id,
+    local_path_is_rooted,
     resolve_local_path,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
@@ -1134,14 +1135,21 @@ class SourceManager:
                 f"got remote URL: {url}"
             )
 
-        # A relative path has no meaning across the wire: it would be anchored
-        # on the *server's* cwd, which the caller does not know and did not pick
-        # (biopb/biopb#947). The drag-drop client always sends an absolute path
-        # (Qt's ``QUrl.toLocalFile``), so this only catches a hand-built call.
-        if not os.path.isabs(url):
+        # A rootless path has no meaning across the wire: `resolve_local_path`
+        # below would complete it from the *server's* cwd, which the caller does
+        # not know and did not pick (biopb/biopb#947). Same predicate the config
+        # loader uses, for the same reason and from the same place. The drag-drop
+        # client always sends a rooted path (Qt's ``QUrl.toLocalFile``), so this
+        # only catches a hand-built call.
+        #
+        # A `file://` url is refused here even though a config accepts one: this
+        # entrypoint stats the path immediately, and `resolve_local_path` would
+        # mangle the scheme into a cwd-relative mess first. Refusing it up front
+        # beats a FileNotFoundError naming a path nobody wrote.
+        if not local_path_is_rooted(url):
             raise ValueError(
-                "Runtime source add requires an absolute path; a relative one "
-                f"would be resolved against the server's own directory: {url}"
+                "Runtime source add requires a rooted path; one without a root "
+                f"would be completed from the server's own directory: {url}"
             )
 
         # Server-side locality/existence check (belt-and-suspenders; the client

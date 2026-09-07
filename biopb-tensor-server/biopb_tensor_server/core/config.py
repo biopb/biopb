@@ -117,6 +117,7 @@ from biopb_tensor_server.core.discovery import (
     discover_sources as claim_based_discover,
     generate_source_id,
     get_file_identity,
+    local_path_is_rooted,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import (
@@ -134,20 +135,17 @@ _FILE_URL_PREFIX = "file://"
 
 
 def _local_url_is_rooted(url: str) -> bool:
-    """True if a local source url names a path starting from a filesystem root.
+    """True if a local source URL names a path from a filesystem root.
 
-    Deliberately not ``Path.is_absolute()``: on Windows that is False for a
-    rooted-but-driveless path like ``/data/plate3``, which the config format has
-    always accepted and which every cross-platform fixture spells. What has to be
-    caught is a path with no root at all -- ``data/plate3``, ``./x``, ``../x`` --
-    since that is the only shape ``resolve()`` completes from the *cwd*
-    (biopb/biopb#947). A drive-relative ``C:x`` has no root either, so it is
-    caught too; what stays unpoliced is the implicit *drive* in a rooted Windows
-    path, a narrower ambiguity than the one this closes.
+    The url-level half of the check: a config source url may be spelled
+    ``file://``, so the scheme comes off before the shared path predicate
+    (:func:`discovery.local_path_is_rooted`) judges what is left. The root rule
+    itself is not restated here -- the wire's ``add_source`` guard applies the
+    same one, and two copies of it would drift.
     """
     if url.startswith(_FILE_URL_PREFIX):
         url = url[len(_FILE_URL_PREFIX) :]
-    return bool(Path(url).root)
+    return local_path_is_rooted(url)
 
 
 logger = logging.getLogger(__name__)

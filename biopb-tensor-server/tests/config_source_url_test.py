@@ -28,6 +28,7 @@ from biopb_tensor_server.core.config import (
     parse_config,
     validate_config_dict,
 )
+from biopb_tensor_server.core.discovery import local_path_is_rooted
 
 
 def _write_config(dirpath: Path, url: str, key: str = "url") -> Path:
@@ -179,6 +180,28 @@ class TestAbsoluteUrlIsUntouched:
         monkeypatch.chdir(tmp_path)
 
         assert load_config(config).sources[0].url == "grpc://lab:8815"
+
+
+class TestTheRootRule:
+    """One predicate, shared with the wire's `add_source` guard.
+
+    `os.path.isabs` is the spelling NOT used: on Windows it calls a driveless
+    "/data/x" absolute, which CPython's own `ntpath.isabs` marks "LEGACY BUG" and
+    reserves the right to fix. Two surfaces spelling this differently would then
+    diverge on a Python upgrade, with no diff to notice.
+    """
+
+    @pytest.mark.parametrize(
+        "path", ["/data/plate3.zarr", "/", "//server/share/plate3.zarr"]
+    )
+    def test_rooted_paths_pass(self, path):
+        assert local_path_is_rooted(path)
+
+    @pytest.mark.parametrize(
+        "path", ["data/plate3.zarr", "./plate3.zarr", "../plate3.zarr", "", "C:x"]
+    )
+    def test_rootless_paths_fail(self, path):
+        assert not local_path_is_rooted(path)
 
 
 class TestSourceConfigBackstop:
