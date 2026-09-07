@@ -10,6 +10,15 @@ Database Schema:
 - rois table: user-drawn ROI annotations, one row per ROI, anchored on the
   unversioned array_id (docs/roi-annotations.md)
 
+Persistence:
+- In memory by default. Given a store_path the connection is file-backed, which
+  is how annotations survive a restart -- they are the only rows here that no
+  rescan can reproduce.
+- `sources` rides along because DuckDB has one database per connection and the
+  sandbox below blocks ATTACH. It is truncated on open, and the rois table's
+  derived columns are recomputed there, so the file's only load-bearing content
+  is the annotations themselves.
+
 Security Model:
 - DuckDB connection runs with enable_external_access=False, so all file/network
   access (read_csv, read_text, glob, COPY, ATTACH, extension loading) is blocked
@@ -38,6 +47,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import duckdb
@@ -45,6 +55,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.image.annotation_pb2 import RoiAnnotation, RoiConflict
+from biopb.image.roi_pb2 import ROI
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from google.protobuf import json_format
 
@@ -52,6 +63,17 @@ if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
 
 logger = logging.getLogger(__name__)
+
+
+def _quarantine(path: Path) -> Path:
+    """Move an unopenable catalog (and its WAL) aside, returning where it went."""
+    moved = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%dT%H%M%S')}")
+    path.rename(moved)
+    wal = path.with_name(path.name + ".wal")
+    if wal.exists():
+        # A WAL left next to a fresh database would be replayed into it.
+        wal.rename(moved.with_name(moved.name + ".wal"))
+    return moved
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -393,10 +415,13 @@ class MetadataDatabase:
         max_query_results: int = 100000,
         query_timeout_ms: int = 30000,
         max_rois_per_tensor: int = 5000,
+        store_path: Optional[Path] = None,
     ):
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
         self._max_rois_per_tensor = max_rois_per_tensor
+        # None -> in-memory, and the annotations die with the process.
+        self._store_path = Path(store_path) if store_path else None
 
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
         self._write_lock = threading.Lock()  # Lock for write operations only
@@ -419,23 +444,76 @@ class MetadataDatabase:
         if self._conn is None:
             with self._write_lock:
                 if self._conn is None:
-                    # Disable all external file/network access. This is the
-                    # real defense against file exfiltration via read_csv /
-                    # read_text / glob / COPY / ATTACH etc., which the keyword
-                    # denylist in _validate_query cannot reliably cover (e.g.
-                    # comma-joins like `FROM sources, read_text('/etc/passwd')`
-                    # slip past the FROM-only table check). Once disabled it
-                    # cannot be re-enabled within a running instance, so a
-                    # `SET enable_external_access=true` in a query is rejected.
-                    # The server itself needs no external access: it only does
-                    # parameterized INSERT/DELETE and JSON-operator SELECTs.
-                    self._conn = duckdb.connect(
-                        ":memory:", config={"enable_external_access": False}
-                    )
-                    self._create_schema()
+                    # Built fully before it is published: the check above is
+                    # unlocked, so a reader would otherwise be handed a cursor
+                    # on a database mid-open -- a window the derived-column pass
+                    # makes long enough to matter.
+                    conn = self._open_database()
+                    self._create_schema(conn)
+                    self._reset_derived_state(conn)
+                    self._conn = conn
                     self._initialized = True
-                    logger.info("MetadataDatabase initialized with in-memory DuckDB")
+                    logger.info(
+                        "MetadataDatabase initialized (%s)",
+                        self._store_path or "in-memory",
+                    )
         return self._conn
+
+    def _connect(self, target: str) -> duckdb.DuckDBPyConnection:
+        """Open *target* with external access disabled.
+
+        Disabling it is the real defense against file exfiltration via read_csv
+        / read_text / glob / COPY / ATTACH etc., which the keyword denylist in
+        _validate_query cannot reliably cover (e.g. comma-joins like `FROM
+        sources, read_text('/etc/passwd')` slip past the FROM-only table check).
+        Once disabled it cannot be re-enabled within a running instance, so a
+        `SET enable_external_access=true` in a query is rejected. The server
+        itself needs no external access: it only does parameterized
+        INSERT/DELETE and JSON-operator SELECTs.
+
+        It does not stop DuckDB opening its OWN database file, which is what
+        makes a persistent catalog possible without reopening the sandbox.
+        """
+        return duckdb.connect(target, config={"enable_external_access": False})
+
+    def _open_database(self) -> duckdb.DuckDBPyConnection:
+        """The connection, from a file when one is configured.
+
+        A file that will not open is moved aside rather than deleted or allowed
+        to stop the server. Merging the annotations into the catalog means the
+        obvious recovery for a bad catalog -- throw it away and rescan -- would
+        also throw away the one thing in it nobody can regenerate, so neither
+        branch here destroys anything.
+        """
+        if self._store_path is None:
+            return self._connect(":memory:")
+
+        try:
+            self._store_path.parent.mkdir(parents=True, exist_ok=True)
+            return self._connect(str(self._store_path))
+        except Exception as exc:
+            logger.error("Catalog %s did not open: %s", self._store_path, exc)
+
+        try:
+            moved = _quarantine(self._store_path)
+            conn = self._connect(str(self._store_path))
+            logger.error(
+                "Moved it to %s and started an empty catalog. Any annotations it "
+                "held are in that file, not lost.",
+                moved,
+            )
+            return conn
+        except Exception as exc:
+            # The directory itself is unusable. Staying up beats refusing to
+            # serve pixels over an annotation store, but say so loudly: writes
+            # from here on will not survive a restart.
+            logger.error(
+                "Could not replace it either (%s). Falling back to an in-memory "
+                "catalog -- ANNOTATIONS WILL NOT PERSIST.",
+                exc,
+            )
+            self._store_path = None
+            return self._connect(":memory:")
 
     def _get_cursor(self) -> duckdb.DuckDBPyConnection:
         """Get a cursor for thread-safe read operations.
@@ -446,12 +524,15 @@ class MetadataDatabase:
         conn = self._get_connection()
         return conn.cursor()
 
-    def _create_schema(self) -> None:
-        """Create sources table and indexes."""
-        conn = self._conn
+    def _create_schema(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Create the sources and rois tables and their indexes.
+
+        IF NOT EXISTS throughout: a persistent catalog runs this against a file
+        that already has them.
+        """
         # Main table
         conn.execute("""
-            CREATE TABLE sources (
+            CREATE TABLE IF NOT EXISTS sources (
                 source_id TEXT PRIMARY KEY,
                 source_url TEXT,
                 source_type TEXT,
@@ -493,7 +574,7 @@ class MetadataDatabase:
             )
         """)
         # Index on source_url for path filtering
-        conn.execute("CREATE INDEX idx_source_url ON sources(source_url)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_source_url ON sources(source_url)")
 
         # User-drawn ROI annotations, one row per ROI (design:
         # docs/roi-annotations.md). A sibling table, deliberately NOT a field
@@ -502,7 +583,7 @@ class MetadataDatabase:
         # annotation parked there would be destroyed by the next rescan.
         conn.execute(
             """
-            CREATE TABLE rois (
+            CREATE TABLE IF NOT EXISTS rois (
                 -- Unique WITHIN a tensor, not globally: a client may name its
                 -- own ids, and two tensors independently choosing "roi-1" is
                 -- ordinary, not a conflict. The key must be composite for that
@@ -569,9 +650,76 @@ class MetadataDatabase:
             )
             """
         )
-        conn.execute("CREATE INDEX idx_rois_array ON rois(array_id)")
-        conn.execute("CREATE INDEX idx_rois_source ON rois(source_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_array ON rois(array_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_source ON rois(source_id)")
         logger.debug("Created sources and rois tables and indexes")
+
+    def _reset_derived_state(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Discard what a rescan rebuilds; recompute what a formula owns.
+
+        Runs on every open, so a fresh in-memory catalog and a reopened file
+        take one path -- against empty tables both halves do nothing.
+        """
+        # `sources` is scan output, and nothing prunes rows for a source that
+        # went away while the server was down. Cheaper and more honest to drop
+        # the lot: discovery repopulates it, and a stale row would otherwise
+        # advertise a tensor no read path can serve.
+        conn.execute("TRUNCATE sources")
+        self._rederive_roi_columns(conn)
+
+    def _rederive_roi_columns(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Recompute `shape_kind` and `bbox` from each row's stored geometry.
+
+        `geometry` is the annotation; these two are `_roi_bbox` output cached in
+        columns for the SQL surface. Deriving them again at open is what keeps
+        that cache honest across a change to the formula -- adding rotation to
+        Ellipse (biopb#935) moved every rotated ellipse's box, and this is the
+        difference between that landing on restart and it needing a migration.
+        """
+        rows = conn.execute("SELECT array_id, roi_id, geometry FROM rois").fetchall()
+        if not rows:
+            return
+
+        updates: List[List[object]] = []
+        unreadable = 0
+        for array_id, roi_id, geometry in rows:
+            try:
+                shape = ROI()
+                json_format.Parse(geometry, shape)
+                kind = shape.WhichOneof("shape")
+                if kind is None:
+                    raise ValueError("row carries no geometry")
+                updates.append([kind, _roi_bbox(shape, kind), array_id, roi_id])
+            except Exception as exc:
+                # Leave the row alone rather than dropping it: a stale bounding
+                # box costs a SQL filter, and the geometry the viewer draws from
+                # is the column we could not read, so deleting would turn an
+                # unreadable annotation into a missing one.
+                unreadable += 1
+                logger.warning(
+                    "Kept ROI %s/%s with its stored bbox: %s", array_id, roi_id, exc
+                )
+
+        if updates:
+            # One transaction, not one per row: on a file-backed catalog the
+            # difference is an fsync per annotation at every startup.
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.executemany(
+                    "UPDATE rois SET shape_kind = ?, bbox = ? "
+                    "WHERE array_id = ? AND roi_id = ?",
+                    updates,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        logger.info(
+            "Restored %d annotation(s)%s",
+            len(rows),
+            f", {unreadable} with an unreadable geometry" if unreadable else "",
+        )
 
     def _validate_query(self, sql: str) -> None:
         """Validate SQL query for security.

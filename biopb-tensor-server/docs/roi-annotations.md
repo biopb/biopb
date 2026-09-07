@@ -1,7 +1,7 @@
 # ROI annotations — backend design
 
 Lets a user draw 2-D ROIs (points, polygons, rectangles, ellipses) on a tensor in
-the viewer SPA and have them persist for the life of the server process. The store
+the viewer SPA and have them persist across restarts. The store
 is a new table in the tensor server's DuckDB catalog, reached over a small Flight
 action set and re-exposed by the HTTP sidecar.
 
@@ -12,7 +12,7 @@ tooling is `docs/roi-annotations-ui.md`.
 
 **Instance segmentation is a separate tensor, not an annotation set.** A
 segmentation's objects belong in a label tensor the server already serves as
-pixels — not as 10⁴–10⁶ rows in an in-memory catalog. This is the load-bearing
+pixels — not as 10⁴–10⁶ rows in the catalog. This is the load-bearing
 scope decision: it is what lets the read path be a single whole-set fetch over
 DoAction, keeps the per-tensor cap human-scale, and confines the store to the
 2-D vector shapes. If bulk objects ever need a home here, revisit storage and
@@ -319,23 +319,59 @@ SPA) so one schema serves both ends and neither hand-writes a DTO. The handler s
 `array_id` in the body — because responses carry versioned ids, so a read-edit-write
 round trip hands one straight back and the store only ever sees bare ids.
 
-## Persistence and staleness
+## Persistence
 
-The catalog is `duckdb.connect(":memory:")`, so annotations die with the process.
-Accepted for now — and worth noting that while that holds, **there is no
-staleness problem at all**: the table cannot outlive the catalog it references.
-Everything below is the cost of closing the gap, not work for the first version.
+The whole catalog is file-backed: `MetadataDatabase(store_path=...)` opens a
+DuckDB file instead of `":memory:"`. `sources` comes along for the ride because
+DuckDB has one database per connection and the sandbox blocks `ATTACH` — but it
+is truncated on open, so the only content the file really carries is the
+annotations. They are the only rows here no rescan can reproduce.
 
-Three things keep the fill-in cheap:
+Reloaded rows re-attach with no fixup: `array_id` is deterministic across
+restarts for file-backed sources (`generate_source_id` is a SHA-256 of the
+resolved path). The exception is upload/scratch sources whose URL is synthesized
+per run.
 
-- every write funnels through three `MetadataDatabase` methods, so a write-behind
-  has exactly three call sites;
-- the row is flat and serializable — a per-catalog `rois.jsonl` or a file-backed
-  DuckDB attachment stores it verbatim;
-- `array_id` is deterministic across restarts for file-backed sources
-  (`generate_source_id` is a SHA-256 of the resolved path), so reloaded rows
-  re-attach to the same tensors with no fixup. The exception is upload/scratch
-  sources whose URL is synthesized per run.
+**Why not a separate SQLite mirror**, keeping the catalog in memory. It was the
+first plan, on the theory that authored data deserves its own file in a format
+that outlives DuckDB versions. Two of the three arguments for it turned out to
+be wrong on measurement: a durable single-row write is 1329 µs in SQLite against
+2317 µs in DuckDB (both just fsync), and the multi-process case does not exist —
+a Flight server is a singleton with respect to one set of data. What survives is
+file-format longevity, which is insurance rather than function, and the escape
+hatch stays open: an exporter is additive and needs no migration.
+
+### Three things happen on open
+
+- **`TRUNCATE sources`.** It is scan output, and nothing prunes rows for a
+  source deleted while the server was down; a stale row would advertise a tensor
+  no read path can serve. Discovery repopulates it.
+- **`shape_kind` and `bbox` are recomputed** from each row's stored `geometry`.
+  Those two are `_roi_bbox` output cached in columns; `geometry` is the
+  annotation. Deriving them again is what lets the formula change without a
+  migration — adding `rotation` to `Ellipse` (biopb#935) moved every rotated
+  ellipse's box, and this is the difference between that landing on restart and
+  it needing a backfill. A row whose geometry will not parse keeps its stored
+  values rather than being dropped.
+- **A file that will not open is renamed aside** (`.corrupt-<stamp>`, with its
+  WAL) and the server starts on an empty one. Merging authored data into the
+  catalog means the obvious recovery for a bad catalog — delete it and rescan —
+  would also destroy the annotations, so neither branch does. If even the rename
+  fails the server falls back to memory and logs that writes will not survive.
+
+### Which file
+
+`annotations.store_path` when set; otherwise `state_dir()/catalogs/<digest of
+the resolved config path>.duckdb`. Keyed by config path because the singleton is
+per data set: two servers on two `biopb.json` files are ordinary, and a shared
+file would have them take turns clearing each other's `sources`. A server
+started with no config file has nothing to derive a name from and stays in
+memory, which is also what `annotations.persist = false` selects.
+
+State tree, not cache: `cache_dir()` is documented as safe for a janitor to
+empty, and half this file is not.
+
+## Staleness
 
 ### Two kinds of stale
 
@@ -448,7 +484,9 @@ of the same name, size and mtime — re-attach?" rather than silently losing the
 3. Three Flight actions + `TensorFlightClient` methods; round-trip test.
 4. Three sidecar routes; test through the app with a mocked client.
 5. Config: `annotations.enabled`, `annotations.max_rois_per_tensor` in
-   `config_schema.py`. (`prune_unseen_days` lands with persistence, not now — but
-   `source_url` is written from step 2, since rows without it can never be
-   reported or re-attached.)
+   `config_schema.py`. (`source_url` is written from step 2, since rows without
+   it can never be reported or re-attached.)
 6. Docs: this file linked from `docs/http-server.md` and `ARCHITECTURE.md`.
+7. Persistence: `annotations.persist` / `annotations.store_path`, the file-backed
+   connection and its on-open pass. `prune_unseen_days` is still unbuilt — see
+   "Pruning, when it is needed", which is now reachable rather than hypothetical.

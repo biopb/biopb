@@ -47,7 +47,10 @@ dependencies = [
   "scipy",
   "typer >= 0.12.0",
   "tomli >= 2.0.0; python_version < '3.11'",
-  "duckdb",
+  # >=1.0 for the stable on-disk format: the catalog is a file now, and it
+  # holds the annotations, which no rescan can reproduce. Pre-1.0 releases
+  # broke the storage format between versions.
+  "duckdb >= 1.0",
 ]
 
 [project.optional-dependencies]

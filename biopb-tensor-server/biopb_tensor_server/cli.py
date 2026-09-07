@@ -19,7 +19,7 @@ import typer
 from biopb import _tls_material, _tls_record, _web_auth
 from biopb._fs_detect import unsafe_cache_dir_reason
 from biopb._lifecycle import deathwatch as _deathwatch
-from biopb._locations import tls_server_cert
+from biopb._locations import tensor_catalog_path, tls_server_cert
 from rich.console import Console
 from rich.markup import escape as _rich_escape
 from rich.table import Table
@@ -664,6 +664,31 @@ def cert_init(
     )
 
 
+def _annotation_store_path(
+    server_config: ServerConfig, config_path: Optional[Path]
+) -> Optional[Path]:
+    """Where this server's catalog lives on disk, or None to stay in memory.
+
+    An explicit ``store_path`` wins. Otherwise the default is derived from the
+    config file, which is the thing that identifies "this set of data" -- and
+    with no config file there is nothing to derive from, so a server started
+    without one keeps annotations only for its own lifetime.
+    """
+    annotations = server_config.annotations
+    if not annotations.persist:
+        return None
+    if annotations.store_path:
+        return Path(annotations.store_path).expanduser()
+    if config_path is None:
+        logger.warning(
+            "No config file, so no name to give a persistent catalog: "
+            "annotations will not survive a restart. Set annotations.store_path "
+            "to choose one."
+        )
+        return None
+    return tensor_catalog_path(config_path)
+
+
 def _setup_flight_server(
     server_config: ServerConfig,
     host: str = DEFAULT_FLIGHT_HOST,
@@ -672,6 +697,7 @@ def _setup_flight_server(
     token: Optional[str] = None,
     tls_cert_chain: Optional[bytes] = None,
     tls_private_key: Optional[bytes] = None,
+    config_path: Optional[Path] = None,
 ) -> Tuple[
     TensorFlightServer, Optional[object], Optional[object], Optional[PrecacheWorker]
 ]:
@@ -685,6 +711,8 @@ def _setup_flight_server(
         tls_cert_chain: PEM cert chain -- serves TLS (grpc+tls://) when supplied
             together with ``tls_private_key`` (see ``TensorFlightServer``).
         tls_private_key: PEM private key paired with ``tls_cert_chain``.
+        config_path: The config file this server was started from. Names the
+            persistent catalog, so two servers on two configs get two files.
 
     Returns:
         Tuple of (flight_server, source_manager, watcher, precache_worker)
@@ -810,16 +838,19 @@ def _setup_flight_server(
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
     # it is the canonical source-browsing surface (`client.query_sources`).
+    catalog_store = _annotation_store_path(server_config, config_path)
     metadata_db = MetadataDatabase(
         max_query_results=server_config.metadata_db.max_query_results,
         query_timeout_ms=server_config.metadata_db.query_timeout_ms,
         max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
+        store_path=catalog_store,
     )
     console.print(
         "[green]Metadata database initialized:[/green] "
         f"max_query_results={server_config.metadata_db.max_query_results}, "
         f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
-        f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
+        f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}, "
+        f"annotations={catalog_store or 'in-memory (not persisted)'}"
     )
 
     # Create and start server with gRPC message size tuned for 64MB chunks
@@ -1171,6 +1202,7 @@ def serve(
             token=effective_token,
             tls_cert_chain=tls_cert_chain,
             tls_private_key=tls_private_key,
+            config_path=config,
         )
 
         location = _grpc_location(effective_host, port)
@@ -1708,6 +1740,7 @@ def launch(
             token=effective_token,
             tls_cert_chain=tls_cert_chain,
             tls_private_key=tls_private_key,
+            config_path=config,
         )
 
         # The HTTP sidecar is co-located with the Flight server and reaches it over

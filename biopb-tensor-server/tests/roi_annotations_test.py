@@ -930,3 +930,156 @@ class TestPositionalPlanePin:
         db.put_rois(ARRAY_ID, [_annotation(plane={99: 0})])
         rois, _ = db.list_rois(ARRAY_ID)
         assert dict(rois[0].plane) == {99: 0}
+
+
+class TestPersistence:
+    """A file-backed catalog: what survives a restart, and what deliberately does not."""
+
+    def test_annotations_survive_a_reopen(self, tmp_path):
+        store = tmp_path / "nested" / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        (written,), _ = db.put_rois(
+            ARRAY_ID, [_annotation(label="nucleus", set_name="nuclei", plane={2: 12})]
+        )
+        db.close()
+
+        back, _ = MetadataDatabase(store_path=store).list_rois(ARRAY_ID)
+        assert [(r.roi_id, r.label, r.set_name, dict(r.plane)) for r in back] == [
+            (written.roi_id, "nucleus", "nuclei", {2: 12})
+        ]
+        assert back[0].roi == written.roi
+        assert back[0].rev == written.rev
+
+    def test_without_a_store_path_nothing_persists(self, tmp_path):
+        # The default is unchanged: persistence is something a caller asks for.
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation()])
+        db.close()
+        assert MetadataDatabase().list_rois(ARRAY_ID) == ([], False)
+
+    def test_sources_are_dropped_on_reopen(self, tmp_path):
+        # `sources` rides in the same file only because DuckDB has one database
+        # per connection. It is scan output, and a row for a source deleted
+        # while the server was down would otherwise advertise an unservable
+        # tensor forever.
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
+        db.put_rois(ARRAY_ID, [_annotation()])
+        db.close()
+
+        db = MetadataDatabase(store_path=store)
+        assert db._get_cursor().execute("SELECT count(*) FROM sources").fetchone() == (
+            0,
+        )
+        assert len(db.list_rois(ARRAY_ID)[0]) == 1
+
+    def test_derived_columns_are_recomputed_from_the_geometry(self, tmp_path):
+        # bbox and shape_kind are _roi_bbox output cached in columns, so a
+        # change to the formula has to land on restart rather than needing a
+        # migration -- adding rotation to Ellipse moved every rotated one.
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.put_rois(
+            ARRAY_ID,
+            [
+                _annotation(
+                    roi=ROI(
+                        ellipse=Ellipse(
+                            center=Point(x=10, y=10),
+                            radius=Point(x=3, y=4),
+                            rotation=math.pi / 2,
+                        )
+                    )
+                )
+            ],
+        )
+        # Stand in for a row written by the older formula.
+        db._get_connection().execute(
+            "UPDATE rois SET bbox = [7.0, 6.0, 13.0, 14.0], shape_kind = 'polygon'"
+        )
+        db.close()
+
+        db = MetadataDatabase(store_path=store)
+        kind, bbox = (
+            db._get_cursor().execute("SELECT shape_kind, bbox FROM rois").fetchone()
+        )
+        assert kind == "ellipse"
+        # The quarter turn exchanges the half-extents, as _roi_bbox now says.
+        assert bbox == pytest.approx((6.0, 7.0, 14.0, 13.0), abs=1e-6)
+
+    def test_an_unreadable_geometry_keeps_its_row(self, tmp_path):
+        # Deleting would turn an annotation we cannot re-derive a bbox for into
+        # one the user simply lost.
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.put_rois(ARRAY_ID, [_annotation(label="keep me")])
+        db._get_connection().execute("UPDATE rois SET geometry = 'not json'")
+        db.close()
+
+        db = MetadataDatabase(store_path=store)
+        assert db._get_cursor().execute("SELECT label FROM rois").fetchall() == [
+            ("keep me",)
+        ]
+
+    def test_an_unopenable_file_is_moved_aside_not_deleted(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        MetadataDatabase(store_path=store).close()
+        store.write_bytes(b"not a duckdb file")
+
+        db = MetadataDatabase(store_path=store)
+        assert db.list_rois(ARRAY_ID) == ([], False)
+
+        quarantined = [p for p in tmp_path.iterdir() if ".corrupt-" in p.name]
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == b"not a duckdb file"
+
+
+class TestStorePathResolution:
+    """Which file a server picks, which is what keeps two servers apart."""
+
+    @staticmethod
+    def _config(**annotations):
+        from biopb_tensor_server.core.config import AnnotationsConfig, ServerConfig
+
+        return ServerConfig(annotations=AnnotationsConfig(**annotations))
+
+    def test_the_default_is_derived_from_the_config_path(self, tmp_path):
+        from biopb._locations import tensor_catalog_path
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        config = tmp_path / "biopb.json"
+        assert _annotation_store_path(self._config(), config) == tensor_catalog_path(
+            config
+        )
+
+    def test_two_configs_get_two_files(self, tmp_path):
+        from biopb._locations import tensor_catalog_path
+
+        assert tensor_catalog_path(tmp_path / "a.json") != tensor_catalog_path(
+            tmp_path / "b.json"
+        )
+
+    def test_an_explicit_path_wins(self, tmp_path):
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        chosen = tmp_path / "somewhere.duckdb"
+        assert (
+            _annotation_store_path(self._config(store_path=str(chosen)), None) == chosen
+        )
+
+    def test_persist_off_stays_in_memory(self, tmp_path):
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        assert (
+            _annotation_store_path(
+                self._config(persist=False, store_path=str(tmp_path / "x.duckdb")),
+                tmp_path / "biopb.json",
+            )
+            is None
+        )
+
+    def test_no_config_file_means_no_derived_name(self):
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        assert _annotation_store_path(self._config(), None) is None
