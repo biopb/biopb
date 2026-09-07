@@ -240,6 +240,25 @@ _ACCEPTED_SHAPES: Set[str] = {
 }
 
 
+# Set names in this namespace are server-owned, not client data: an importer
+# fills them from the source file and replaces them WHOLESALE when that file
+# changes (biopb/biopb#951). A client edit landing there is not merely filed in
+# the wrong layer -- it is destroyed at the next re-import, with nothing to show
+# for it. So the store refuses the write rather than trusting every client to
+# honour a naming convention, the same posture _require_bare_array_id takes.
+#
+# A prefix, not a fixed name, so a second importer (ImageJ overlays, a GeoJSON
+# sidecar) becomes read-only without a client release. Punctuation because the
+# namespace has to be one no existing catalog can already be using: a user set
+# called "ome" is plausible where "@ome" is not.
+RESERVED_SET_PREFIX = "@"
+
+
+def is_reserved_set(set_name: str) -> bool:
+    """Whether ``set_name`` is server-owned, and so read-only to clients."""
+    return set_name.startswith(RESERVED_SET_PREFIX)
+
+
 @dataclass(frozen=True)
 class UnseenRois:
     """One tensor's annotations whose source has gone unobserved.
@@ -332,6 +351,15 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
     if "," in roi_id:
         raise ValueError(f"roi_id may not contain a comma: {roi_id!r}")
 
+    set_name = roi.set_name or "default"
+    if is_reserved_set(set_name):
+        raise ValueError(
+            f"set_name {set_name!r} is in the reserved {RESERVED_SET_PREFIX!r} "
+            f"namespace: the server fills it from the source file and replaces "
+            f"it when that file changes, so an edit here would be discarded. "
+            f"Copy the set into one of your own to edit it."
+        )
+
     shape_kind = roi.roi.WhichOneof("shape")
     if shape_kind is None:
         raise ValueError("Annotation has no geometry")
@@ -348,7 +376,7 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
 
     return _PreparedRoi(
         roi_id=roi_id or uuid.uuid4().hex,
-        set_name=roi.set_name or "default",
+        set_name=set_name,
         label=roi.label,
         shape_kind=shape_kind,
         plane=dict(roi.plane),
@@ -1394,12 +1422,33 @@ class MetadataDatabase:
         # does not carry it, so an existing row's value is preserved by not
         # being mentioned.
         existing = {
-            roi_id: (rev, created_at)
-            for roi_id, rev, created_at in conn.execute(
-                "SELECT roi_id, rev, created_at FROM rois WHERE array_id = ?",
+            roi_id: (rev, created_at, set_name)
+            for roi_id, rev, created_at, set_name in conn.execute(
+                "SELECT roi_id, rev, created_at, set_name FROM rois WHERE array_id = ?",
                 [array_id],
             ).fetchall()
         }
+
+        # The other half of the reserved-namespace guard: _prepare_roi refuses an
+        # incoming reserved set_name, this refuses a write landing on a row that
+        # is already in one. Needed because a put naming an existing roi_id takes
+        # the UPDATE branch below and set_name is in _ROI_CLIENT_COLUMNS -- so
+        # reusing an imported id would not COPY that row into the caller's set, it
+        # would MOVE it out of the reserved one, beyond both the importer's reach
+        # and the next re-import's replacement, without erroring. Cloning an
+        # imported set therefore mints fresh ids (biopb/biopb#951).
+        trespass = sorted(
+            p.roi_id
+            for p in prepared
+            if p.roi_id in existing and is_reserved_set(existing[p.roi_id][2])
+        )
+        if trespass:
+            raise ValueError(
+                f"{', '.join(trespass)}: already stored in a reserved "
+                f"{RESERVED_SET_PREFIX!r} set, which the server owns. Reusing the "
+                f"id would move that row out of it rather than copy it -- give "
+                f"the copy a new roi_id."
+            )
 
         # Cap on the post-write count, so a batch cannot straddle the limit.
         new_ids = {p.roi_id for p in prepared if p.roi_id not in existing}
@@ -1643,28 +1692,67 @@ class MetadataDatabase:
         With ``roi_ids``, deletes exactly those. Without, deletes every
         annotation on ``array_id`` -- narrowed to ``set_name`` when given, which
         is how a client drops a whole layer.
+
+        A reserved set is server-owned and cannot be deleted through here, named
+        either directly or by one of its ids. An unqualified "clear this tensor"
+        is the one case that neither refuses nor deletes: see below.
         """
         if not array_id:
             raise ValueError("array_id is required")
         _require_bare_array_id(array_id)
+        if is_reserved_set(set_name):
+            raise ValueError(
+                f"set_name {set_name!r} is reserved: the server fills it from "
+                f"the source file and replaces it when that file changes, so "
+                f"there is nothing here for a client to delete."
+            )
 
         roi_ids = list(roi_ids)
         conn = self._get_connection()
         with self._write_lock:
             if roi_ids:
                 placeholders = ", ".join("?" for _ in roi_ids)
+                # Ids reach a reserved row without naming its set, so this path
+                # needs its own check. Refused, not skipped: a delete that
+                # silently drops part of what it was handed reports success for
+                # work it did not do.
+                reserved = sorted(
+                    row[0]
+                    for row in conn.execute(
+                        f"SELECT roi_id FROM rois WHERE array_id = ? "
+                        f"AND roi_id IN ({placeholders}) "
+                        f"AND starts_with(set_name, ?)",
+                        [array_id, *roi_ids, RESERVED_SET_PREFIX],
+                    ).fetchall()
+                )
+                if reserved:
+                    raise ValueError(
+                        f"{', '.join(reserved)}: stored in a reserved "
+                        f"{RESERVED_SET_PREFIX!r} set, which the server owns and "
+                        f"refills from the source file. Nothing was deleted."
+                    )
                 sql = (
                     f"DELETE FROM rois WHERE array_id = ? "
                     f"AND roi_id IN ({placeholders}) RETURNING roi_id"
                 )
                 params: List[object] = [array_id, *roi_ids]
+            elif set_name:
+                sql = (
+                    "DELETE FROM rois WHERE array_id = ? AND set_name = ? "
+                    "RETURNING roi_id"
+                )
+                params = [array_id, set_name]
             else:
-                sql = "DELETE FROM rois WHERE array_id = ?"
-                params = [array_id]
-                if set_name:
-                    sql += " AND set_name = ?"
-                    params.append(set_name)
-                sql += " RETURNING roi_id"
+                # "Clear this tensor" means the caller's own annotations. A
+                # reserved set is the file's copy, not theirs, and re-import
+                # would restore it regardless -- so it is scoped out rather than
+                # deleted. Not a silent partial failure the way the id path
+                # would be: nothing here was addressed to it.
+                sql = (
+                    "DELETE FROM rois WHERE array_id = ? "
+                    "AND NOT starts_with(set_name, ?) RETURNING roi_id"
+                )
+                params = [array_id, RESERVED_SET_PREFIX]
             deleted = [row[0] for row in conn.execute(sql, params).fetchall()]
 
         logger.debug("delete_rois: removed %s from %s", len(deleted), array_id)

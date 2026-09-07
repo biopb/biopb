@@ -119,6 +119,40 @@ on every re-registration, so an annotation parked there would be destroyed by th
 next rescan. "Read as metadata" here means a sibling table in the same catalog DB,
 queryable next to `sources` — not a field inside a source row.
 
+## Reserved set names
+
+A `set_name` beginning with `@` is server-owned. Nothing fills one yet; the
+namespace exists so the rule is in place before an importer can write to it
+(biopb/biopb#951, which imports OME-embedded ROIs into `@ome`).
+
+Such a set is a **cache of the source file**: filled from it, and replaced
+wholesale when the file changes. So a client edit landing there is not merely
+filed in the wrong layer — it is destroyed at the next re-import, silently. The
+store refuses the write rather than trusting clients to honour the convention,
+the same posture it takes toward a versioned `array_id`.
+
+A prefix rather than a fixed name, so a second importer (ImageJ overlays, a
+GeoJSON sidecar) becomes read-only with no client release. Punctuation because
+the namespace must be one no existing catalog can already be using — a user set
+called `ome` is plausible where `@ome` is not.
+
+**Editing is a clone, and it is client-side**: read the set, mint fresh ids, write
+them into a set of your own. No server operation, and clients tell mutable from
+immutable by the name alone.
+
+Fresh ids are not a style preference. `_put_rois_locked` looks up existing rows by
+`(array_id, roi_id)` — `set_name` is not in the key, and it *is* one of the
+columns an update writes. A clone reusing an imported id would therefore take the
+update branch and **move** the row out of the reserved set rather than copy it,
+with no error. That write is refused too, from the other side.
+
+Deleting is refused when a reserved set is addressed, by name or by one of its
+ids — a delete that silently dropped part of what it was handed would report
+success for work it did not do. The exception is an unqualified "clear this
+tensor", which scopes reserved sets out instead: nothing in that request was
+addressed to them, they are not the caller's data, and re-import would restore
+them anyway.
+
 ## Schema
 
 New table in `MetadataDatabase._create_schema()`:
