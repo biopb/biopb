@@ -353,11 +353,9 @@ hatch stays open: an exporter is additive and needs no migration.
   ellipse's box, and this is the difference between that landing on restart and
   it needing a backfill. A row whose geometry will not parse keeps its stored
   values rather than being dropped.
-- **A file that will not open is renamed aside** (`.corrupt-<stamp>`, with its
-  WAL) and the server starts on an empty one. Merging authored data into the
-  catalog means the obvious recovery for a bad catalog — delete it and rescan —
-  would also destroy the annotations, so neither branch does. If even the rename
-  fails the server falls back to memory and logs that writes will not survive.
+- **A file that will not open is fatal** (`AnnotationStoreError`), after a
+  short retry. See below — this is the one part of the on-open pass that is a
+  policy rather than a mechanism.
 
 ### Which file
 
@@ -370,6 +368,40 @@ memory, which is also what `annotations.persist = false` selects.
 
 State tree, not cache: `cache_dir()` is documented as safe for a janitor to
 empty, and half this file is not.
+
+### A store that will not open is fatal
+
+Neither of the two tempting recoveries is safe.
+
+**Not "rename it aside and start clean."** DuckDB raises the same `IOException`
+for a corrupt file and for one another process holds, so the two are
+indistinguishable at the point of decision — and guessing wrong on a lock is the
+worse error by a distance. The rename *succeeds* while the other server has the
+file open; it keeps writing to the renamed inode, this one starts a fresh
+catalog at the original path, and the annotations split across two files with
+nothing anywhere to say so. That is the exact failure the per-config path exists
+to prevent, reintroduced by the error handler.
+
+**Not "fall back to memory."** `annotations.persist` is a promise about
+durability. Serving anyway keeps the server up while every ROI drawn on it goes
+to a catalog that vanishes at the next restart — loss discovered a day later,
+with the work already gone. A health flag does not fix that; nobody reads health
+before they start tracing.
+
+So the server refuses to start, with a message naming the file and the four
+things it can be. All four are decisions for a person — restore the file, fix
+the permissions, match the DuckDB version that wrote it, or stop the other
+server — and the operator who genuinely wants a session-only store says
+`annotations.persist = false`, which is not an error at all.
+
+**The retry comes first** (3 attempts, 0.5 s apart), and it is the only
+distinction available between the four: a lock held by a server on its way down
+clears within a second, and a restart race is the one open failure that resolves
+itself. Nothing else does.
+
+`health` reports `annotations_persisted` — false only for a deliberately
+session-only server, since the accidental case cannot start. A client can say so
+before someone spends a morning tracing.
 
 ## Staleness
 

@@ -16,6 +16,8 @@ import pytest
 from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
 from biopb.image.annotation_pb2 import RoiAnnotation, RoiPutRequest
 from biopb_tensor_server import TensorFlightServer
+from biopb_tensor_server.core import metadata_db
+from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from google.protobuf import json_format
 
@@ -1023,17 +1025,44 @@ class TestPersistence:
             ("keep me",)
         ]
 
-    def test_an_unopenable_file_is_moved_aside_not_deleted(self, tmp_path):
+    def test_an_unopenable_store_is_fatal_and_the_file_is_untouched(self, tmp_path):
+        # Never a fallback to memory: the alternative to refusing is serving
+        # while every ROI drawn goes somewhere that disappears at the next
+        # restart. And never a rename -- a held lock raises the same
+        # IOException as corruption, and moving a file another server has open
+        # splits the annotations across two catalogs silently.
         store = tmp_path / "catalog.duckdb"
         MetadataDatabase(store_path=store).close()
         store.write_bytes(b"not a duckdb file")
 
-        db = MetadataDatabase(store_path=store)
-        assert db.list_rois(ARRAY_ID) == ([], False)
+        with pytest.raises(AnnotationStoreError, match="persist"):
+            MetadataDatabase(store_path=store).open()
+        assert store.read_bytes() == b"not a duckdb file"
+        assert list(tmp_path.iterdir()) == [store]
 
-        quarantined = [p for p in tmp_path.iterdir() if ".corrupt-" in p.name]
-        assert len(quarantined) == 1
-        assert quarantined[0].read_bytes() == b"not a duckdb file"
+    def test_a_transient_failure_is_retried(self, tmp_path, monkeypatch):
+        # A DuckDB lock held by a server on its way down is the one open
+        # failure that clears by itself, and it is indistinguishable from
+        # corruption except by outliving a retry.
+        monkeypatch.setattr(metadata_db, "_OPEN_RETRY_SECONDS", 0)
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+
+        real, attempts = db._connect, []
+
+        def _locked_once(target):
+            attempts.append(target)
+            if len(attempts) == 1:
+                raise OSError("Could not set lock on file: Conflicting lock is held")
+            return real(target)
+
+        monkeypatch.setattr(db, "_connect", _locked_once)
+        db.open()
+        assert len(attempts) == 2
+        assert db.annotations_persisted
+
+    def test_a_session_only_server_says_so(self):
+        assert MetadataDatabase().annotations_persisted is False
 
 
 class TestStorePathResolution:

@@ -747,6 +747,15 @@ class TensorFlightServer(flight.FlightServerBase):
                 "full_scan_in_progress": full_scan_in_progress,
                 "last_full_scan_finished_at": last_full_scan_at,
             }
+            if self._metadata_db is not None:
+                # Whether drawn ROIs survive a restart. A store that was asked
+                # for and could not be opened is fatal at startup, so this is
+                # False only for a deliberately session-only server -- which a
+                # client may still want to say out loud before someone spends a
+                # morning tracing.
+                health_status["annotations_persisted"] = (
+                    self._metadata_db.annotations_persisted
+                )
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "create_source":
             if not self._writable:

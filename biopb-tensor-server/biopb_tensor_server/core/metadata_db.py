@@ -59,21 +59,18 @@ from biopb.image.roi_pb2 import ROI
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from google.protobuf import json_format
 
+from biopb_tensor_server.core.errors import AnnotationStoreError
+
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
 
 logger = logging.getLogger(__name__)
 
-
-def _quarantine(path: Path) -> Path:
-    """Move an unopenable catalog (and its WAL) aside, returning where it went."""
-    moved = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%dT%H%M%S')}")
-    path.rename(moved)
-    wal = path.with_name(path.name + ".wal")
-    if wal.exists():
-        # A WAL left next to a fresh database would be replayed into it.
-        wal.rename(moved.with_name(moved.name + ".wal"))
-    return moved
+# Opening a persistent catalog is retried this many times: a DuckDB lock held by
+# a server on its way down clears in about a second, and a restart race is the
+# one open failure that fixes itself.
+_OPEN_ATTEMPTS = 3
+_OPEN_RETRY_SECONDS = 0.5
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -474,6 +471,19 @@ class MetadataDatabase:
                     )
         return self._conn
 
+    def open(self) -> None:
+        """Open the database now, so a bad store fails at startup.
+
+        The connection is otherwise built on first use, which for a persistent
+        store would put :class:`AnnotationStoreError` in front of whichever
+        request happened to touch the catalog first rather than in front of the
+        operator starting the server.
+
+        Raises:
+            AnnotationStoreError: a configured store that will not open.
+        """
+        self._get_connection()
+
     def _connect(self, target: str) -> duckdb.DuckDBPyConnection:
         """Open *target* with external access disabled.
 
@@ -494,41 +504,63 @@ class MetadataDatabase:
     def _open_database(self) -> duckdb.DuckDBPyConnection:
         """The connection, from a file when one is configured.
 
-        A file that will not open is moved aside rather than deleted or allowed
-        to stop the server. Merging the annotations into the catalog means the
-        obvious recovery for a bad catalog -- throw it away and rescan -- would
-        also throw away the one thing in it nobody can regenerate, so neither
-        branch here destroys anything.
+        Two things this deliberately does not do.
+
+        It never **moves the file aside** to start clean. DuckDB raises the same
+        ``IOException`` for a corrupt file and for one another process holds,
+        and only the first of those wants the file touched. Getting it wrong on
+        a lock is the bad case: the rename succeeds while the other server has
+        the file open, so it keeps writing to the renamed inode while this one
+        starts a fresh catalog at the original path, and the annotations split
+        across two files with nothing to say so.
+
+        It never **falls back to memory**. ``annotations.persist`` is a promise
+        about durability; serving anyway would keep the server up while every
+        ROI drawn on it went to a catalog that disappears at the next restart,
+        and that loss surfaces a day later with the work already gone. So this
+        raises, and the operator who wants a session-only store asks for one.
+
+        The retry is the only distinction available between the four causes. A
+        lock held by a server on its way down clears within a second -- a
+        restart race is the one open failure that resolves itself -- while
+        corruption, a permission problem and a version mismatch do not.
         """
         if self._store_path is None:
             return self._connect(":memory:")
 
-        try:
-            self._store_path.parent.mkdir(parents=True, exist_ok=True)
-            return self._connect(str(self._store_path))
-        except Exception as exc:
-            logger.error("Catalog %s did not open: %s", self._store_path, exc)
+        for attempt in range(1, _OPEN_ATTEMPTS + 1):
+            try:
+                self._store_path.parent.mkdir(parents=True, exist_ok=True)
+                return self._connect(str(self._store_path))
+            except Exception as exc:
+                if attempt == _OPEN_ATTEMPTS:
+                    raise AnnotationStoreError(
+                        f"Could not open the annotation catalog {self._store_path} "
+                        f"after {_OPEN_ATTEMPTS} attempts: {exc}. The file has "
+                        f"been left untouched. Restore it, fix its permissions, "
+                        f"match the DuckDB version that wrote it, or stop the "
+                        f"other server holding it -- or set "
+                        f'"annotations": {{"persist": false}} to run with a '
+                        f"session-only annotation store."
+                    ) from exc
+                logger.warning(
+                    "Catalog %s did not open (attempt %d/%d): %s",
+                    self._store_path,
+                    attempt,
+                    _OPEN_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(_OPEN_RETRY_SECONDS)
+        raise AssertionError("unreachable")  # pragma: no cover
 
-        try:
-            moved = _quarantine(self._store_path)
-            conn = self._connect(str(self._store_path))
-            logger.error(
-                "Moved it to %s and started an empty catalog. Any annotations it "
-                "held are in that file, not lost.",
-                moved,
-            )
-            return conn
-        except Exception as exc:
-            # The directory itself is unusable. Staying up beats refusing to
-            # serve pixels over an annotation store, but say so loudly: writes
-            # from here on will not survive a restart.
-            logger.error(
-                "Could not replace it either (%s). Falling back to an in-memory "
-                "catalog -- ANNOTATIONS WILL NOT PERSIST.",
-                exc,
-            )
-            self._store_path = None
-            return self._connect(":memory:")
+    @property
+    def annotations_persisted(self) -> bool:
+        """Whether drawn ROIs reach a file, for ``health``.
+
+        False only when the server was asked for a session-only store: an open
+        failure is fatal, so there is no state where this is False by accident.
+        """
+        return self._store_path is not None
 
     def _get_cursor(self) -> duckdb.DuckDBPyConnection:
         """Get a cursor for thread-safe read operations.

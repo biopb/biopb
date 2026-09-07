@@ -38,6 +38,7 @@ from biopb_tensor_server.core.config import (
     resolve_all_sources,
     validate_config_dict,
 )
+from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.logging_config import (
     get_log_level_from_env,
     setup_logging,
@@ -845,6 +846,10 @@ def _setup_flight_server(
         max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
         store_path=catalog_store,
     )
+    # Open it here rather than letting the lazy init fire on whichever request
+    # first touches the catalog: a store that cannot be opened is fatal, and it
+    # should be fatal at startup, where the operator is watching.
+    metadata_db.open()
     console.print(
         "[green]Metadata database initialized:[/green] "
         f"max_query_results={server_config.metadata_db.max_query_results}, "
@@ -1221,6 +1226,11 @@ def serve(
         _deathwatch.install()
 
         server.serve()
+    except AnnotationStoreError as exc:
+        # Operator-actionable and the message is the whole point of raising;
+        # a traceback would bury it.
+        console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        raise typer.Exit(1) from None
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
@@ -1823,6 +1833,11 @@ def launch(
             config_path=str(config),
             tls_fingerprint=flight_fingerprint,
         )
+    except AnnotationStoreError as exc:
+        # Operator-actionable and the message is the whole point of raising;
+        # a traceback would bury it.
+        console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        raise typer.Exit(1) from None
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
