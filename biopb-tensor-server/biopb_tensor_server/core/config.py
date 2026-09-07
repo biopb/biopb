@@ -128,6 +128,28 @@ from biopb_tensor_server.core.remote import (
 # Alias for backward compatibility with internal usage
 _is_remote_url = is_remote_url
 
+# ``file://`` is a LOCAL url here (see ``is_remote_url``); the adapters strip the
+# prefix and hand the rest to a filesystem reader.
+_FILE_URL_PREFIX = "file://"
+
+
+def _local_url_is_rooted(url: str) -> bool:
+    """True if a local source url names a path starting from a filesystem root.
+
+    Deliberately not ``Path.is_absolute()``: on Windows that is False for a
+    rooted-but-driveless path like ``/data/plate3``, which the config format has
+    always accepted and which every cross-platform fixture spells. What has to be
+    caught is a path with no root at all -- ``data/plate3``, ``./x``, ``../x`` --
+    since that is the only shape ``resolve()`` completes from the *cwd*
+    (biopb/biopb#947). A drive-relative ``C:x`` has no root either, so it is
+    caught too; what stays unpoliced is the implicit *drive* in a rooted Windows
+    path, a narrower ambiguity than the one this closes.
+    """
+    if url.startswith(_FILE_URL_PREFIX):
+        url = url[len(_FILE_URL_PREFIX) :]
+    return bool(Path(url).root)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -463,19 +485,19 @@ class SourceConfig:
                 f"SourceConfig 'alias' must be slash-free, got: {self.alias!r}"
             )
 
-        # A local url must be absolute. `Path.resolve()` -- which `local_path`
-        # and the `source_id` hash both run -- anchors a relative path on the
-        # *process* cwd, and a server is started by the control plane, by systemd
-        # or by a container entrypoint, each leaving a different one: the same
-        # config would name different directories, under different source_ids,
-        # per launch (biopb/biopb#947). Config parsing drops such an entry before
-        # it reaches here, so this is the backstop for a programmatic
-        # construction.
-        if not _is_remote_url(self.url) and not Path(self.url).is_absolute():
+        # A local url must name a path from a filesystem root. `Path.resolve()`
+        # -- which `local_path` and the `source_id` hash both run -- completes a
+        # rootless path from the *process* cwd, and a server is started by the
+        # control plane, by systemd or by a container entrypoint, each leaving a
+        # different one: the same config would name different directories, under
+        # different source_ids, per launch (biopb/biopb#947). Config parsing
+        # drops such an entry before it reaches here, so this is the backstop for
+        # a programmatic construction.
+        if not _is_remote_url(self.url) and not _local_url_is_rooted(self.url):
             raise ValueError(
-                f"Source 'url' must be an absolute path or a remote URL, got: "
-                f"{self.url!r}. A relative path would be resolved against "
-                "whatever directory the server happened to be started in."
+                f"Source 'url' must be a rooted path or a remote URL, got: "
+                f"{self.url!r}. A path with no root is completed from whatever "
+                "directory the server happened to be started in."
             )
 
         # Compute is_remote from URL
@@ -1252,19 +1274,23 @@ def _carry(
         dst[field] = cast(value) if cast is not None else value
 
 
-def _absolute_source_url(url: str) -> Optional[str]:
-    """The absolute form of a source url, or None if it has no absolute form.
+def _normalized_source_url(url: str) -> Optional[str]:
+    """The url to record for a source, or None if it names no fixed location.
 
     A remote url passes through untouched (``Path`` would mangle the scheme's
-    ``//`` and prepend the cwd) and ``~`` expands. What is still relative after
-    that names nothing the server can honor -- there is no anchor it could use
-    that the person writing the config would recognize (biopb/biopb#947) -- so it
-    comes back None for the caller to report.
+    ``//`` and prepend the cwd) and ``~`` expands -- it used to become
+    ``$PWD/~/...``. Anything else is returned exactly as written: pushing a
+    rooted path through ``Path`` would flip its separators on Windows and take
+    the ``source_id`` with them.
+
+    A url with no root names nothing the server can honor -- there is no anchor
+    it could use that the person writing the config would recognize
+    (biopb/biopb#947) -- so it comes back None for the caller to report.
     """
     if _is_remote_url(url):
         return url
-    path = Path(url).expanduser()
-    return str(path) if path.is_absolute() else None
+    expanded = str(Path(url).expanduser()) if url.startswith("~") else url
+    return expanded if _local_url_is_rooted(expanded) else None
 
 
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
@@ -1492,8 +1518,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         if url is None:
             raise ValueError("Source config requires 'url' field")
 
-        absolute_url = _absolute_source_url(url)
-        if absolute_url is None:
+        normalized_url = _normalized_source_url(url)
+        if normalized_url is None:
             # A relative url has no anchor the server can trust: `Path.resolve`
             # would take the process cwd, which the control plane, systemd and a
             # container entrypoint each leave set differently, so the entry names
@@ -1503,15 +1529,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
             # keep the other sources off the air. `validate` is the surface that
             # fails hard on it.
             logger.error(
-                "NOT SERVING %s: a source url must be an absolute path (or a "
-                "remote URL). A relative path is resolved against whatever "
-                "directory the server was started in, so it names different data "
-                "per launch. This will not resolve until the config is corrected.",
+                "NOT SERVING %s: a source url must be a rooted path (or a remote "
+                "URL). A path with no root is completed from whatever directory "
+                "the server was started in, so it names different data per "
+                "launch. This will not resolve until the config is corrected.",
                 url,
             )
             continue
 
-        src_kwargs: Dict[str, Any] = {"url": absolute_url}
+        src_kwargs: Dict[str, Any] = {"url": normalized_url}
         _carry(src_kwargs, "type", src_data)  # auto-detected when omitted
         # `source_id` is derived from the resolved URL (a stable content
         # identity), never user-assigned. Honoring an explicit id let two configs
@@ -1606,13 +1632,13 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not isinstance(src_data, dict):
             continue
         url = src_data.get("url") or src_data.get("path")
-        if isinstance(url, str) and url and _absolute_source_url(url) is None:
+        if isinstance(url, str) and url and _normalized_source_url(url) is None:
             problems.append(
                 {
                     "path": ["sources", "url"],
                     "message": (
-                        f"url={url!r}: a source url must be an absolute path or "
-                        "a remote URL. A relative path is resolved against "
+                        f"url={url!r}: a source url must be a rooted path or a "
+                        "remote URL. A path with no root is completed from "
                         "whatever directory the server was started in, so it "
                         "names different data per launch."
                     ),

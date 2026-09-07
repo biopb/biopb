@@ -100,7 +100,14 @@ class TestRelativeUrlIsNotServed:
 
 
 class TestAbsoluteUrlIsUntouched:
-    def test_absolute_url_is_left_alone(self, tmp_path, monkeypatch):
+    def test_rooted_url_is_left_alone(self, tmp_path, monkeypatch):
+        """Recorded verbatim -- and on Windows `/data/...` is rooted, not absolute.
+
+        `Path.is_absolute()` is False there for a driveless path, so judging by it
+        would refuse a spelling the config format has always taken (and every
+        cross-platform fixture in this repo uses). Passing it through `Path` would
+        be no better: it would flip the separators and change the `source_id`.
+        """
         config = _write_config(tmp_path / "project", "/data/plate3.zarr")
         monkeypatch.chdir(tmp_path)
 
@@ -108,13 +115,31 @@ class TestAbsoluteUrlIsUntouched:
 
     def test_home_relative_url_expands(self, tmp_path, monkeypatch):
         """`~` names one directory unambiguously; it used to become `$PWD/~/...`."""
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))  # what expanduser reads on Windows
         config = _write_config(tmp_path / "project", "~/plate3.zarr")
         monkeypatch.chdir(tmp_path)
 
-        assert load_config(config).sources[0].url == str(
-            tmp_path / "home" / "plate3.zarr"
-        )
+        assert load_config(config).sources[0].url == str(home / "plate3.zarr")
+
+    def test_file_url_is_accepted_and_left_intact(self, tmp_path, monkeypatch):
+        """`file://` is a local url here, judged on the path it carries.
+
+        The adapters strip the prefix themselves and read what is left, so the
+        url is recorded exactly as written -- rewriting it would change the
+        `source_id` and hand the adapters something they do not expect.
+        """
+        config = _write_config(tmp_path / "project", "file:///data/plate3.zarr")
+        monkeypatch.chdir(tmp_path)
+
+        assert load_config(config).sources[0].url == "file:///data/plate3.zarr"
+
+    def test_rootless_file_url_is_refused(self, tmp_path, monkeypatch):
+        config = _write_config(tmp_path / "project", "file://data/plate3.zarr")
+        monkeypatch.chdir(tmp_path)
+
+        assert load_config(config).sources == []
 
     def test_remote_url_is_left_alone(self, tmp_path, monkeypatch):
         """`Path` would mangle a scheme's `//` and prepend the cwd."""
@@ -135,7 +160,7 @@ class TestSourceConfigBackstop:
     """The invariant `local_path` and `source_id` rely on, held at construction."""
 
     def test_relative_url_is_refused(self):
-        with pytest.raises(ValueError, match="absolute path"):
+        with pytest.raises(ValueError, match="rooted path"):
             SourceConfig(url="data/plate3.zarr")
 
     def test_absolute_url_is_accepted(self):
