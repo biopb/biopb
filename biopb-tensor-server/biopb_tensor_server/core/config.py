@@ -1289,7 +1289,18 @@ def _normalized_source_url(url: str) -> Optional[str]:
     """
     if _is_remote_url(url):
         return url
-    expanded = str(Path(url).expanduser()) if url.startswith("~") else url
+    if url.startswith("~"):
+        try:
+            expanded = str(Path(url).expanduser())
+        except RuntimeError:
+            # No home directory to expand against: POSIX with no HOME and no
+            # passwd entry, or Windows with neither USERPROFILE nor HOMEPATH (a
+            # service account). `~` then names nothing, which is this function's
+            # None -- the entry is dropped like any other unusable url rather
+            # than taking the whole config load down with a RuntimeError.
+            return None
+    else:
+        expanded = url
     return expanded if _local_url_is_rooted(expanded) else None
 
 

@@ -114,14 +114,39 @@ class TestAbsoluteUrlIsUntouched:
         assert load_config(config).sources[0].url == "/data/plate3.zarr"
 
     def test_home_relative_url_expands(self, tmp_path, monkeypatch):
-        """`~` names one directory unambiguously; it used to become `$PWD/~/...`."""
+        """`~` names one directory unambiguously; it used to become `$PWD/~/...`.
+
+        Both env vars, because they are read on different platforms and neither
+        implementation consults the other: `posixpath.expanduser` reads HOME (then
+        the passwd entry), `ntpath.expanduser` reads USERPROFILE, then
+        HOMEDRIVE+HOMEPATH -- never HOME. Patching HOME alone leaves Windows
+        expanding against the *real* profile directory, which is not a crash but a
+        test asserting against someone else's home.
+        """
         home = tmp_path / "home"
         monkeypatch.setenv("HOME", str(home))
-        monkeypatch.setenv("USERPROFILE", str(home))  # what expanduser reads on Windows
+        monkeypatch.setenv("USERPROFILE", str(home))
         config = _write_config(tmp_path / "project", "~/plate3.zarr")
         monkeypatch.chdir(tmp_path)
 
         assert load_config(config).sources[0].url == str(home / "plate3.zarr")
+
+    def test_undeterminable_home_drops_the_source_instead_of_raising(
+        self, tmp_path, monkeypatch
+    ):
+        """`Path.expanduser()` raises when there is no home to expand against.
+
+        POSIX with no HOME and no passwd entry, or a Windows service account with
+        neither USERPROFILE nor HOMEPATH. That must not take the whole config load
+        down: `~` names nothing there, so the entry is dropped like any other
+        unusable url.
+        """
+        monkeypatch.setattr(
+            Path, "expanduser", lambda self: (_ for _ in ()).throw(RuntimeError())
+        )
+        config = _write_config(tmp_path / "project", "~/plate3.zarr")
+
+        assert load_config(config).sources == []
 
     def test_file_url_is_accepted_and_left_intact(self, tmp_path, monkeypatch):
         """`file://` is a local url here, judged on the path it carries.
