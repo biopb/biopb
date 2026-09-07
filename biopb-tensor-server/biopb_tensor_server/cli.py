@@ -680,7 +680,22 @@ def _annotation_store_path(
     if not annotations.persist:
         return None
     if annotations.store_path:
-        return Path(annotations.store_path).expanduser()
+        chosen = Path(annotations.store_path).expanduser()
+        if chosen.is_absolute():
+            return chosen
+        # Relative to the config file, never to the cwd. A server is started by
+        # the control plane, by systemd, or by hand from wherever the user
+        # happened to be standing, so a cwd-relative store means the same config
+        # silently names a different catalog per invocation -- and the one place
+        # it would appear to work is the developer's own shell. Anchoring on the
+        # config keeps a config directory portable.
+        if config_path is None:
+            raise AnnotationStoreError(
+                f"annotations.store_path {annotations.store_path!r} is relative "
+                f"and there is no config file to resolve it against. Give an "
+                f"absolute path."
+            )
+        return (Path(config_path).expanduser().resolve().parent / chosen).resolve()
     if config_path is None:
         logger.warning(
             "No config file, so no name to give a persistent catalog: "

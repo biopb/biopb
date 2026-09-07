@@ -353,14 +353,23 @@ hatch stays open: an exporter is additive and needs no migration.
   ellipse's box, and this is the difference between that landing on restart and
   it needing a backfill. A row whose geometry will not parse keeps its stored
   values rather than being dropped.
-- **A file that will not open is fatal** (`AnnotationStoreError`), after a
-  short retry. See below — this is the one part of the on-open pass that is a
-  policy rather than a mechanism.
+- **`sources` is dropped and recreated**, not truncated. It is scan output, so
+  rebuilding it also keeps its columns current and exempts it from schema
+  versioning entirely.
+- **A file that will not open, or whose `rois` shape this build does not
+  understand, is fatal** (`AnnotationStoreError`), after a short retry. See
+  below — these are the parts of the on-open pass that are policy rather than
+  mechanism.
 
 ### Which file
 
 `annotations.store_path` when set; otherwise `state_dir()/catalogs/<digest of
-the resolved config path>.duckdb`. Keyed by config path because the singleton is
+the resolved config path>.duckdb`. A **relative** `store_path` anchors on the
+config file's directory, never on the cwd: a server is started by the control
+plane, by systemd, or by hand from wherever the user was standing, so a
+cwd-relative store would mean one config silently naming a different catalog per
+launch — and the one place it appears to work is the developer's own shell.
+(`SourceConfig.local_path` still has this bug for source urls: biopb#947.) Keyed by config path because the singleton is
 per data set: two servers on two `biopb.json` files are ordinary, and a shared
 file would have them take turns clearing each other's `sources`. A server
 started with no config file has nothing to derive a name from and stays in
@@ -368,6 +377,32 @@ memory, which is also what `annotations.persist = false` selects.
 
 State tree, not cache: `cache_dir()` is documented as safe for a janitor to
 empty, and half this file is not.
+
+### Schema versioning
+
+Persistence is what created this problem. The schema used to be rebuilt every
+boot, so changing it cost nothing; now the file outlives the code, and
+`CREATE TABLE IF NOT EXISTS` against an older file is a **silent no-op** — the
+server starts, reports SERVING, and every annotation read and write then fails
+on a missing column.
+
+The split is the same one that runs through the rest of this design:
+
+- **`sources` is not versioned at all.** It is scan output, so it is dropped and
+  recreated on open. A change to its columns needs nothing.
+- **`rois` carries `_ROI_SCHEMA_VERSION`**, stamped in a `catalog_meta` key/value
+  table (not in `ALLOWED_TABLES`, so the SQL surface cannot reach it). Older
+  files run the `_ROI_MIGRATIONS` ladder; a file from a **newer** build is
+  refused rather than misread; a version with no migration to reach it is
+  refused rather than skipped. A `rois` table with no marker is version 1 by
+  definition — the marker shipped in the same release.
+
+**The expected column set is built from `_ROIS_DDL` in a throwaway in-memory
+database**, not written out by hand. The version marker only helps if every
+schema change remembers to bump it, and the edit that forgets is the same edit
+that would not have updated a hand-written list either. Deriving it means a
+forgotten bump surfaces as a refusal at startup instead of a `Binder Error` on
+the first annotation.
 
 ### A store that will not open is fatal
 

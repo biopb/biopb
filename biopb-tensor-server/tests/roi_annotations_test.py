@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta
 from unittest import mock
 
+import duckdb
 import pyarrow.flight as flight
 import pytest
 from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
@@ -1363,3 +1364,174 @@ class TestPruneCli:
         assert "needs the server stopped" in " ".join(result.output.split())
         # And nothing was deleted.
         assert MetadataDatabase(store_path=store).list_rois(ARRAY_ID)[0]
+
+
+class TestSchemaVersioning:
+    """The catalog file outlives the code now, so its shape has to be checked."""
+
+    @staticmethod
+    def _older_rois_table(store):
+        """A `rois` table from a build before two columns existed."""
+        conn = duckdb.connect(str(store), config={"enable_external_access": False})
+        conn.execute(
+            "CREATE TABLE rois (roi_id TEXT, array_id TEXT, source_id TEXT, "
+            "set_name TEXT, label TEXT, shape_kind TEXT, "
+            "plane MAP(UINTEGER, UINTEGER), bbox DOUBLE[4], geometry TEXT, "
+            "rev BIGINT, created_at TIMESTAMP, updated_at TIMESTAMP, "
+            "source_url TEXT, last_seen_at TIMESTAMP, "
+            "PRIMARY KEY (array_id, roi_id))"
+        )
+        conn.close()
+
+    def test_a_stale_rois_shape_is_refused_at_startup(self, tmp_path):
+        # Without this the server starts, reports SERVING, and every annotation
+        # read and write then dies on a missing column -- CREATE TABLE IF NOT
+        # EXISTS against an older file is a silent no-op.
+        store = tmp_path / "catalog.duckdb"
+        self._older_rois_table(store)
+
+        with pytest.raises(AnnotationStoreError, match="missing column"):
+            MetadataDatabase(store_path=store).open()
+
+    def test_a_file_from_a_newer_build_is_refused(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.put_rois(ARRAY_ID, [_annotation()])
+        db._get_connection().execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('roi_schema_version', '99')"
+        )
+        db.close()
+
+        with pytest.raises(AnnotationStoreError, match="newer biopb"):
+            MetadataDatabase(store_path=store).open()
+
+    def test_a_fresh_catalog_is_stamped(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        assert db._get_cursor().execute(
+            "SELECT value FROM catalog_meta WHERE key = 'roi_schema_version'"
+        ).fetchone() == (str(metadata_db._ROI_SCHEMA_VERSION),)
+
+    def test_an_unmarked_catalog_reads_as_version_one(self, tmp_path):
+        # The marker shipped in the same release as v1, so a rois table without
+        # one can only have been written by that release.
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.put_rois(ARRAY_ID, [_annotation(label="drawn")])
+        db._get_connection().execute("DELETE FROM catalog_meta")
+        db.close()
+
+        db = MetadataDatabase(store_path=store)
+        assert [r.label for r in db.list_rois(ARRAY_ID)[0]] == ["drawn"]
+
+    def test_a_missing_migration_is_refused_rather_than_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        store = tmp_path / "catalog.duckdb"
+        MetadataDatabase(store_path=store).open()
+        # This build now believes in a v2 it has no way to reach.
+        monkeypatch.setattr(metadata_db, "_ROI_SCHEMA_VERSION", 2)
+
+        with pytest.raises(AnnotationStoreError, match="No migration"):
+            MetadataDatabase(store_path=store).open()
+
+    def test_a_migration_runs_and_the_stamp_advances(self, tmp_path, monkeypatch):
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.put_rois(ARRAY_ID, [_annotation(label="kept")])
+        db.close()
+
+        ran = []
+
+        def _v1_to_v2(conn):
+            ran.append(True)
+            conn.execute("ALTER TABLE rois ADD COLUMN note TEXT")
+
+        monkeypatch.setattr(metadata_db, "_ROI_SCHEMA_VERSION", 2)
+        monkeypatch.setattr(metadata_db, "_ROI_MIGRATIONS", {1: _v1_to_v2})
+
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        assert ran
+        assert db._get_cursor().execute(
+            "SELECT value FROM catalog_meta WHERE key = 'roi_schema_version'"
+        ).fetchone() == ("2",)
+        assert [r.label for r in db.list_rois(ARRAY_ID)[0]] == ["kept"]
+
+    def test_a_stale_sources_shape_is_rebuilt_not_refused(self, tmp_path):
+        # `sources` is scan output, so it is exempt from versioning entirely:
+        # dropping it makes a change to its columns free.
+        store = tmp_path / "catalog.duckdb"
+        conn = duckdb.connect(str(store), config={"enable_external_access": False})
+        conn.execute("CREATE TABLE sources (source_id TEXT PRIMARY KEY)")
+        conn.execute(metadata_db._ROIS_DDL)
+        conn.close()
+
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        columns = {
+            r[0] for r in db._get_cursor().execute("DESCRIBE sources").fetchall()
+        }
+        assert {"data_resident", "tensors", "source_url"} <= columns
+
+    def test_the_expected_columns_come_from_the_ddl_itself(self, tmp_path):
+        # The check must not rest on a hand-written column list, because the
+        # edit that forgets to bump the version is the same edit that would
+        # forget to update the list.
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        actual = {r[0] for r in db._get_cursor().execute("DESCRIBE rois").fetchall()}
+        assert "drawn_against_version" in actual
+        assert set(MetadataDatabase._ROI_CLIENT_COLUMNS) <= actual
+
+
+class TestStorePathIsNotCwdRelative:
+    """A relative store_path anchors on the config file, never on the cwd."""
+
+    @staticmethod
+    def _config(**annotations):
+        from biopb_tensor_server.core.config import AnnotationsConfig, ServerConfig
+
+        return ServerConfig(annotations=AnnotationsConfig(**annotations))
+
+    def test_a_relative_path_resolves_against_the_config(self, tmp_path):
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        config = tmp_path / "deploy" / "biopb.json"
+        resolved = _annotation_store_path(
+            self._config(store_path="rois.duckdb"), config
+        )
+        assert resolved == tmp_path / "deploy" / "rois.duckdb"
+
+    def test_the_cwd_does_not_change_the_answer(self, tmp_path, monkeypatch):
+        # The whole point: a server is started by the control plane, by systemd,
+        # or by hand from wherever the user was standing.
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        config = tmp_path / "biopb.json"
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        first = _annotation_store_path(self._config(store_path="a.duckdb"), config)
+        monkeypatch.chdir(elsewhere)
+        assert (
+            _annotation_store_path(self._config(store_path="a.duckdb"), config) == first
+        )
+
+    def test_an_absolute_path_is_left_alone(self, tmp_path):
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        chosen = tmp_path / "somewhere" / "x.duckdb"
+        assert (
+            _annotation_store_path(
+                self._config(store_path=str(chosen)), tmp_path / "c.json"
+            )
+            == chosen
+        )
+
+    def test_a_relative_path_with_no_config_is_refused(self):
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        with pytest.raises(AnnotationStoreError, match="relative"):
+            _annotation_store_path(self._config(store_path="rois.duckdb"), None)

@@ -48,7 +48,17 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import duckdb
 import numpy as np
@@ -71,6 +81,86 @@ logger = logging.getLogger(__name__)
 # one open failure that fixes itself.
 _OPEN_ATTEMPTS = 3
 _OPEN_RETRY_SECONDS = 0.5
+
+# Shape of the `rois` table. Bump on any change to it and add the matching entry
+# to _ROI_MIGRATIONS, whose keys are the version each step upgrades FROM.
+#
+# `sources` is deliberately exempt: it is scan output, so it is dropped and
+# recreated on every open and its columns are always this build's. Only the
+# annotations are old enough to need carrying forward.
+_ROI_SCHEMA_VERSION = 1
+_ROI_MIGRATIONS: Dict[int, Callable[[duckdb.DuckDBPyConnection], None]] = {}
+
+# The `rois` DDL, module level because the schema self-check builds a throwaway
+# copy from it (_expected_roi_columns) rather than keeping a second hand-written
+# column list that the edit forgetting to bump the version would also forget.
+_ROIS_DDL = """
+CREATE TABLE IF NOT EXISTS rois (
+    -- Unique WITHIN a tensor, not globally: a client may name its
+    -- own ids, and two tensors independently choosing "roi-1" is
+    -- ordinary, not a conflict. The key must be composite for that
+    -- to be safe -- with roi_id alone as the PK, an INSERT OR
+    -- REPLACE for one tensor silently overwrote another tensor's
+    -- row, because the create-or-update lookup is scoped by
+    -- array_id while the key was not.
+    roi_id TEXT NOT NULL,
+    -- The tensor, in its UNVERSIONED array_id form. Annotations must
+    -- outlive an in-place edit of the image, so the sidecar's
+    -- `source@token/field` version token never reaches this column.
+    array_id TEXT NOT NULL,
+    -- array_id split on the first '/': joins, authorization, and the
+    -- catalog-presence check last_seen_at is built on.
+    source_id TEXT NOT NULL,
+    -- The catalog URL at write time. NOT a liveness probe -- there is
+    -- no existence oracle spanning file / proxy / cloud / upload
+    -- sources -- but array_id is a SHA-256 and cannot be inverted, so
+    -- without this an orphan report can only say "annotations for
+    -- zarr_a3f2b1c4", which no one can act on. Also what a
+    -- re-attach-after-move prompt would key on.
+    source_url TEXT,
+    -- Grouping key: the "layer" ("nuclei", "hand-drawn").
+    set_name TEXT NOT NULL DEFAULT 'default',
+    label TEXT,
+    -- point|rectangle|ellipse|polygon, denormalized from the geometry
+    -- for filtering. mask/mesh are rejected on write.
+    shape_kind TEXT NOT NULL,
+    -- Sparse plane pin, WIRE AXIS INDEX -> index on that axis. A
+    -- dimension ABSENT from the map applies at every index of it, so
+    -- one ROI can follow a z-stack without being duplicated per
+    -- plane. Keyed by position, not label: a label is neither
+    -- guaranteed present nor unique, so it cannot address every axis
+    -- (see annotation.proto). Reading this column against a tensor's
+    -- dim_labels is what turns an index back into a name.
+    plane MAP(UINTEGER, UINTEGER),
+    -- [x0, y0, x1, y1] in level-0 pixels, derived server-side. Unused
+    -- by the viewer read path (which fetches a tensor's whole set);
+    -- it is what makes the SQL surface useful.
+    bbox DOUBLE[4],
+    -- biopb.image.ROI as canonical proto3 JSON *text*, not a blob:
+    -- the sidecar hands it to the SPA verbatim with no
+    -- decode/re-encode, and the row stays legible to the SQL surface.
+    geometry TEXT NOT NULL,
+    -- Opaque client JSON (colour, score, author).
+    props_json TEXT,
+    -- content_version at write time -> CONTENT staleness ("the image
+    -- changed since this was drawn"), as distinct from the tensor
+    -- going away entirely.
+    drawn_against_version TEXT,
+    rev BIGINT NOT NULL,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    -- Last time the source was observed in the catalog -- stamped
+    -- by a write that could resolve it, and by the prune sweep (which
+    -- additionally gates on a COMPLETE catalog, since only a
+    -- conclusion about ABSENCE needs completeness; presence is
+    -- presence). Absence is never itself evidence of deletion
+    -- (progressive discovery, unmounted drives, a proxy upstream that
+    -- is down), so orphan age is measured from here rather than
+    -- asserted. NULL means never observed.
+    last_seen_at TIMESTAMP,
+    PRIMARY KEY (array_id, roi_id)
+)
+"""
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -574,12 +664,17 @@ class MetadataDatabase:
     def _create_schema(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Create the sources and rois tables and their indexes.
 
-        IF NOT EXISTS throughout: a persistent catalog runs this against a file
-        that already has them.
+        `sources` is dropped first. It is scan output -- discovery repopulates
+        it, and it was being truncated on open anyway -- so rebuilding it makes
+        a change to its columns free, where IF NOT EXISTS against an older file
+        would silently keep the old shape.
+
+        `rois` cannot be rebuilt, so it is versioned instead: see
+        :meth:`_reconcile_roi_schema`.
         """
-        # Main table
+        conn.execute("DROP TABLE IF EXISTS sources")
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS sources (
+            CREATE TABLE sources (
                 source_id TEXT PRIMARY KEY,
                 source_url TEXT,
                 source_type TEXT,
@@ -621,97 +716,113 @@ class MetadataDatabase:
             )
         """)
         # Index on source_url for path filtering
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_source_url ON sources(source_url)")
+        conn.execute("CREATE INDEX idx_source_url ON sources(source_url)")
 
         # User-drawn ROI annotations, one row per ROI (design:
         # docs/roi-annotations.md). A sibling table, deliberately NOT a field
         # inside a source row: sources.metadata_json is adapter-produced and
         # rewritten by the INSERT OR REPLACE in sync_source_added(), so an
         # annotation parked there would be destroyed by the next rescan.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rois (
-                -- Unique WITHIN a tensor, not globally: a client may name its
-                -- own ids, and two tensors independently choosing "roi-1" is
-                -- ordinary, not a conflict. The key must be composite for that
-                -- to be safe -- with roi_id alone as the PK, an INSERT OR
-                -- REPLACE for one tensor silently overwrote another tensor's
-                -- row, because the create-or-update lookup is scoped by
-                -- array_id while the key was not.
-                roi_id TEXT NOT NULL,
-                -- The tensor, in its UNVERSIONED array_id form. Annotations must
-                -- outlive an in-place edit of the image, so the sidecar's
-                -- `source@token/field` version token never reaches this column.
-                array_id TEXT NOT NULL,
-                -- array_id split on the first '/': joins, authorization, and the
-                -- catalog-presence check last_seen_at is built on.
-                source_id TEXT NOT NULL,
-                -- The catalog URL at write time. NOT a liveness probe -- there is
-                -- no existence oracle spanning file / proxy / cloud / upload
-                -- sources -- but array_id is a SHA-256 and cannot be inverted, so
-                -- without this an orphan report can only say "annotations for
-                -- zarr_a3f2b1c4", which no one can act on. Also what a
-                -- re-attach-after-move prompt would key on.
-                source_url TEXT,
-                -- Grouping key: the "layer" ("nuclei", "hand-drawn").
-                set_name TEXT NOT NULL DEFAULT 'default',
-                label TEXT,
-                -- point|rectangle|ellipse|polygon, denormalized from the geometry
-                -- for filtering. mask/mesh are rejected on write.
-                shape_kind TEXT NOT NULL,
-                -- Sparse plane pin, WIRE AXIS INDEX -> index on that axis. A
-                -- dimension ABSENT from the map applies at every index of it, so
-                -- one ROI can follow a z-stack without being duplicated per
-                -- plane. Keyed by position, not label: a label is neither
-                -- guaranteed present nor unique, so it cannot address every axis
-                -- (see annotation.proto). Reading this column against a tensor's
-                -- dim_labels is what turns an index back into a name.
-                plane MAP(UINTEGER, UINTEGER),
-                -- [x0, y0, x1, y1] in level-0 pixels, derived server-side. Unused
-                -- by the viewer read path (which fetches a tensor's whole set);
-                -- it is what makes the SQL surface useful.
-                bbox DOUBLE[4],
-                -- biopb.image.ROI as canonical proto3 JSON *text*, not a blob:
-                -- the sidecar hands it to the SPA verbatim with no
-                -- decode/re-encode, and the row stays legible to the SQL surface.
-                geometry TEXT NOT NULL,
-                -- Opaque client JSON (colour, score, author).
-                props_json TEXT,
-                -- content_version at write time -> CONTENT staleness ("the image
-                -- changed since this was drawn"), as distinct from the tensor
-                -- going away entirely.
-                drawn_against_version TEXT,
-                rev BIGINT NOT NULL,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP,
-                -- Last time the source was observed in the catalog -- stamped
-                -- by a write that could resolve it, and by the prune sweep (which
-                -- additionally gates on a COMPLETE catalog, since only a
-                -- conclusion about ABSENCE needs completeness; presence is
-                -- presence). Absence is never itself evidence of deletion
-                -- (progressive discovery, unmounted drives, a proxy upstream that
-                -- is down), so orphan age is measured from here rather than
-                -- asserted. NULL means never observed.
-                last_seen_at TIMESTAMP,
-                PRIMARY KEY (array_id, roi_id)
-            )
-            """
+        # Whether the annotations predate this build has to be asked before the
+        # CREATE, which is what makes them indistinguishable afterwards.
+        had_rois = bool(
+            conn.execute(
+                "SELECT 1 FROM duckdb_tables() WHERE table_name = 'rois'"
+            ).fetchone()
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        conn.execute(_ROIS_DDL)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_array ON rois(array_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_source ON rois(source_id)")
+        self._reconcile_roi_schema(conn, had_rois)
         logger.debug("Created sources and rois tables and indexes")
 
+    def _reconcile_roi_schema(
+        self, conn: duckdb.DuckDBPyConnection, had_rois: bool
+    ) -> None:
+        """Bring an existing `rois` table up to this build's shape, or refuse.
+
+        Persistence is what makes this necessary: the schema used to be rebuilt
+        every boot, so changing it cost nothing. Now the file outlives the code,
+        and `CREATE TABLE IF NOT EXISTS` against an older one is a silent no-op
+        -- the server starts, reports SERVING, and every annotation read and
+        write then fails on a missing column.
+        """
+        row = conn.execute(
+            "SELECT value FROM catalog_meta WHERE key = 'roi_schema_version'"
+        ).fetchone()
+        if row is not None:
+            stored = int(row[0])
+        elif had_rois:
+            # A file from before the marker existed, which is version 1 by
+            # definition -- the marker arrived in the same release as v1.
+            stored = 1
+        else:
+            stored = _ROI_SCHEMA_VERSION
+
+        if stored > _ROI_SCHEMA_VERSION:
+            raise AnnotationStoreError(
+                f"The annotation catalog was written by a newer biopb "
+                f"(rois schema v{stored}; this build understands "
+                f"v{_ROI_SCHEMA_VERSION}). Upgrade, or point "
+                f"annotations.store_path somewhere else. The file is untouched."
+            )
+
+        while stored < _ROI_SCHEMA_VERSION:
+            upgrade = _ROI_MIGRATIONS.get(stored)
+            if upgrade is None:
+                raise AnnotationStoreError(
+                    f"No migration from rois schema v{stored} to "
+                    f"v{stored + 1}. The file is untouched."
+                )
+            logger.info("Migrating annotations from schema v%d", stored)
+            upgrade(conn)
+            stored += 1
+
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('roi_schema_version', ?)",
+            [str(stored)],
+        )
+        self._verify_roi_columns(conn)
+
+    @staticmethod
+    def _verify_roi_columns(conn: duckdb.DuckDBPyConnection) -> None:
+        """Refuse a `rois` table that is not the shape this build writes.
+
+        The version marker only helps if every schema change remembers to bump
+        it, and the edit that forgets is the same edit a hand-written column
+        list would not have been updated in either. So the expectation is built
+        from _ROIS_DDL itself, in a throwaway in-memory database: there is
+        nothing here to keep in sync, and a forgotten bump surfaces at startup
+        rather than as a Binder Error on the first annotation.
+        """
+        probe = duckdb.connect(":memory:")
+        try:
+            probe.execute(_ROIS_DDL)
+            expected = {r[0] for r in probe.execute("DESCRIBE rois").fetchall()}
+        finally:
+            probe.close()
+        actual = {r[0] for r in conn.execute("DESCRIBE rois").fetchall()}
+        if missing := expected - actual:
+            raise AnnotationStoreError(
+                f"The annotation catalog is missing column(s) "
+                f"{', '.join(sorted(missing))} that this build requires. Its "
+                f"schema version claims to be current, so a migration is "
+                f"missing rather than un-run. The file is untouched."
+            )
+
     def _reset_derived_state(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Discard what a rescan rebuilds; recompute what a formula owns.
+        """Recompute what a formula owns, once the tables exist.
+
+        Clearing `sources` used to happen here; _create_schema drops and
+        recreates the table instead, which does the same job and additionally
+        keeps its columns current.
 
         Runs on every open, so a fresh in-memory catalog and a reopened file
-        take one path -- against empty tables both halves do nothing.
+        take one path -- against an empty table it does nothing.
         """
-        # `sources` is scan output, and nothing prunes rows for a source that
-        # went away while the server was down. Cheaper and more honest to drop
-        # the lot: discovery repopulates it, and a stale row would otherwise
-        # advertise a tensor no read path can serve.
-        conn.execute("TRUNCATE sources")
         self._rederive_roi_columns(conn)
 
     def _rederive_roi_columns(self, conn: duckdb.DuckDBPyConnection) -> None:
