@@ -128,9 +128,9 @@ CREATE TABLE rois (
     roi_id     TEXT NOT NULL,           -- uuid4 hex; client-supplied or server-minted
     array_id   TEXT NOT NULL,           -- the anchor, unversioned
     source_id  TEXT NOT NULL,           -- array_id split on the first '/'; joins + authz
-    source_url TEXT,                    -- catalog URL at write time; names the image in an
-                                        -- orphan report, and anchors re-attach after a move.
-                                        -- NULL only until the source is first seen
+    source_url TEXT,                    -- catalog URL at the last sighting; names the image
+                                        -- in an orphan report, and anchors re-attach after a
+                                        -- move. NULL only until the source is first seen
     set_name   TEXT NOT NULL DEFAULT 'default',
     label      TEXT,                    -- user class/name
     shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon|polyline
@@ -486,7 +486,7 @@ absence be measured in elapsed time rather than judged.
 `MetadataDatabase.mark_sources_seen()` — one set-based statement:
 
 ```sql
-UPDATE rois SET source_url = COALESCE(rois.source_url, s.source_url),
+UPDATE rois SET source_url = COALESCE(NULLIF(s.source_url, ''), rois.source_url),
                 last_seen_at = now()
   FROM sources s WHERE rois.source_id = s.source_id;
 ```
@@ -497,8 +497,9 @@ would score its annotations as unseen while the source is sitting right there.
 
 That is the whole mechanism — no I/O, no per-adapter probe, uniform across every
 source type, and it degrades correctly: a drive offline for a week simply does
-not advance `last_seen_at`. It also backfills a `source_url` that a write could
-not resolve, which until now only another write could.
+not advance `last_seen_at`. It also refreshes `source_url` — backfilling one a
+write could not resolve, and following a source whose display url moved without
+its identity moving (an `alias` re-root, a `dnd://` stamp).
 
 **The seam is scan completion, not a timer.** `SourceManager._mark_catalog_complete()`
 is where the three paths that can finish a full scan converge — a forced full
@@ -579,15 +580,25 @@ gone.)
 Presence is recorded once per call, for the whole source:
 
 ```sql
-UPDATE rois SET source_url = COALESCE(source_url, ?), last_seen_at = ?
+UPDATE rois SET source_url = COALESCE(?, source_url), last_seen_at = ?
  WHERE source_id = ?;
 ```
 
-`COALESCE` backfills a URL that is still NULL — closing the window where
-annotations were written before discovery caught up — while leaving an existing
-one alone. And this is the *same statement the prune sweep runs*: the sweep adds
-only the catalog-completeness gate, which a presence observation does not need
-(only a conclusion about absence does). Absence writes nothing at all.
+The catalog's answer wins, which both backfills a URL that is still NULL —
+closing the window where annotations were written before discovery caught up —
+and follows a rename. A catalog row that names nothing (NULL, or the `""` the
+descriptor path writes for a source with no url of its own) leaves the stored
+label alone: an unnamed source is not a rename. And this is the *same statement
+the prune sweep runs*: the sweep adds only the catalog-completeness gate, which a
+presence observation does not need (only a conclusion about absence does).
+Absence writes nothing at all.
+
+Because the write happens **only on presence**, the column freezes by itself at
+the last sighting — the name to show for a source that is gone. It used to
+freeze at the *first*, so a source renamed and later unmounted was reported under
+a name the catalog had abandoned long before it went away, at the one moment the
+column is load-bearing. Nothing matches on `source_url` (both statements join on
+`source_id`), so refreshing it cannot change which rows are stamped or when.
 
 A write against a source the catalog does not know is still stored — refusing it
 would turn a rescan window into lost work, and absence proves nothing. It lands
@@ -610,6 +621,11 @@ orphan. Pruning is not the fix — re-attachment is, and it is a separate proble
 The stored `source_url` plus `drawn_against_version` (`mtime_ns:size`, which
 survives a plain `mv`) is enough to offer "these annotations were drawn on a file
 of the same name, size and mtime — re-attach?" rather than silently losing them.
+
+A **proxied** source is the deliberate opposite: its id is built from
+`(alias, upstream_source_id)` and carries no endpoint, so moving the upstream
+leaves annotations attached. The equivalent event there is renaming the `alias`,
+which is part of the identity by design — see *remote-tensor-cache.md*.
 
 ## Implementation order
 

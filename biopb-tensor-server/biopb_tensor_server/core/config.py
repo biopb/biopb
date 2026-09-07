@@ -431,9 +431,11 @@ class SourceConfig:
     alias: Optional[str] = field(
         default=None,
         metadata={
-            "help": "(experimental) Display name this source appears under: a "
-            "namespace prefix for a tensor-server upstream, or the catalog tree "
-            "root for a local source. Must be slash-free."
+            "help": "(experimental) Name this source appears under: the catalog "
+            "tree root for a local source (display-only), or the id namespace for "
+            "a tensor-server upstream -- there it is part of source_id, so "
+            "renaming it re-keys the cache and detaches ROI annotations. Must be "
+            "slash-free."
         },
     )
     # Internal/derived (leading underscore): not user-facing config keys, so they
@@ -483,7 +485,17 @@ class SourceConfig:
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
 
-        # Generate source_id from URL hash if not provided
+        # Mint the id from the URL unless the caller supplied one. This is
+        # durable identity -- the metadata DB's ROI rows and the segment-cache
+        # keys hang off it -- so whatever enters the hash becomes something a
+        # user cannot change without detaching their data. Url-derivation's known
+        # cost is that `mv` re-keys a local source (docs/roi-annotations.md).
+        # Supplying an id explicitly is how the tensor-server proxy opts out:
+        # `_namespaced_source_id` builds one from (alias, upstream_source_id)
+        # with no endpoint in it, so a moved upstream keeps its cache and its
+        # annotations (docs/remote-tensor-cache.md). Config never reaches this
+        # branch -- `sources.source_id` is ignored with a warning
+        # (biopb/biopb#308) -- so an explicit id is always internal.
         if self.source_id is None:
             detected_type = self.type or detect_source_type(self.url) or "data"
             object.__setattr__(
@@ -1667,6 +1679,17 @@ def _namespaced_source_id(alias: Optional[str], upstream_source_id: str) -> str:
     ``<alias>__<upstream_source_id>`` (slash-free -- ``__`` is a cosmetic
     separator, and the upstream id is slash-free by the array_id spec). A lone
     upstream with no alias keeps the verbatim id.
+
+    Note what is deliberately absent: the endpoint. A local id carries no host,
+    port or scheme, so moving an upstream changes only the source's ``url`` --
+    source_id, array_ids and the route inside every chunk_id all survive, and with
+    them the segment cache and the ROI rows keyed on source_id. ``host:port``
+    would disambiguate two upstreams just as well, but would re-key the whole
+    mirror on a move; the alias is the stable stand-in that does not.
+
+    The contract: an alias is part of the identity, not a label. Renaming one
+    re-keys every source mirrored from that upstream. See
+    ``docs/remote-tensor-cache.md``.
     """
     return f"{alias}__{upstream_source_id}" if alias else upstream_source_id
 

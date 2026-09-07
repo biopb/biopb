@@ -111,12 +111,16 @@ CREATE TABLE IF NOT EXISTS rois (
     -- array_id split on the first '/': joins, authorization, and the
     -- catalog-presence check last_seen_at is built on.
     source_id TEXT NOT NULL,
-    -- The catalog URL at write time. NOT a liveness probe -- there is
-    -- no existence oracle spanning file / proxy / cloud / upload
-    -- sources -- but array_id is a SHA-256 and cannot be inverted, so
-    -- without this an orphan report can only say "annotations for
-    -- zarr_a3f2b1c4", which no one can act on. Also what a
-    -- re-attach-after-move prompt would key on.
+    -- What the catalog called this source when it was last SEEN, which
+    -- for a row a report can reach is when it was last present. NOT a
+    -- liveness probe -- there is no existence oracle spanning file /
+    -- proxy / cloud / upload sources -- but array_id is a SHA-256 and
+    -- cannot be inverted, so without this an orphan report can only
+    -- say "annotations for zarr_a3f2b1c4", which no one can act on.
+    -- Also what a re-attach-after-move prompt would key on: a move
+    -- changes the path, hence source_id AND array_id, so the name is
+    -- what survives to match on. A label, never an identifier --
+    -- nothing joins or filters on it.
     source_url TEXT,
     -- Grouping key: the "layer" ("nuclei", "hand-drawn").
     set_name TEXT NOT NULL DEFAULT 'default',
@@ -1469,11 +1473,18 @@ class MetadataDatabase:
         On presence it does two things in one statement, for every row of the
         source:
 
-        * ``COALESCE`` backfills a ``source_url`` that is still NULL, closing the
-          window where annotations were written before discovery caught up. Rows
-          that already have one keep it -- the URL is a human-readable label for
-          a source_id, not an identifier, so filling a blank is always safe but
-          overwriting is not the intent.
+        * refreshes ``source_url`` to whatever the catalog now calls the source,
+          which also backfills the NULL a write could not resolve. The catalog's
+          answer wins because this column is a human-readable *label* for a
+          source_id, not an identifier -- nothing matches on it (this statement
+          joins on source_id) -- and a label is only useful if it says what the
+          source is called now. Since the write happens only on presence, the
+          stored value freezes by itself at the last sighting, which is the one a
+          report should show; it used to freeze at the FIRST, so a source that was
+          renamed and later vanished got reported under a name the catalog had
+          abandoned long before it went away. A catalog row that names nothing
+          (NULL or empty) leaves the stored label alone -- an unnamed source is
+          not a rename.
         * stamps ``last_seen_at``. :meth:`mark_sources_seen` is this statement
           over the whole catalog; the difference is only its gate, which a
           *presence* observation does not need -- a conclusion about absence
@@ -1489,11 +1500,11 @@ class MetadataDatabase:
                 source_id,
             )
             return False, None
-        source_url = row[0]
+        source_url = row[0] or None  # "" names nothing; treat it as absent
         # One source's half of what mark_sources_seen() does for the whole
         # catalog -- keep the two statements the same shape.
         conn.execute(
-            "UPDATE rois SET source_url = COALESCE(source_url, ?), last_seen_at = ? "
+            "UPDATE rois SET source_url = COALESCE(?, source_url), last_seen_at = ? "
             "WHERE source_id = ?",
             [source_url, now, source_id],
         )
@@ -1522,7 +1533,8 @@ class MetadataDatabase:
         conn = self._get_connection()
         with self._write_lock:
             seen = conn.execute(
-                "UPDATE rois SET source_url = COALESCE(rois.source_url, s.source_url), "
+                "UPDATE rois SET "
+                "source_url = COALESCE(NULLIF(s.source_url, ''), rois.source_url), "
                 "last_seen_at = ? FROM sources s WHERE rois.source_id = s.source_id "
                 "RETURNING rois.roi_id",
                 [datetime.now()],

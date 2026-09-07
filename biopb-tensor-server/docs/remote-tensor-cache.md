@@ -183,6 +183,34 @@ not `experiment1` — not id-transparent to the upstream. A lone upstream may se
 `alias` (ids pass through verbatim, transparency recovered), but a second upstream
 or a colliding local id makes an `alias` required.
 
+### The endpoint is deliberately not in the id
+
+A local id is built from `(alias, upstream_source_id)` — no host, port or scheme.
+Moving an upstream (new port, new host, `grpc://` → `grpcs://`) therefore changes
+only each mirrored source's `url`: its `source_id`, its `array_id`s and the
+`route` inside every `chunk_id` are untouched, so the persistent segment cache
+stays warm and (since #946) ROI annotations stay attached. Contrast a *local*
+source, whose id hashes its path — there an `mv` re-keys everything, and that is
+a known limitation, not a design.
+
+This is what the `alias` buys. Two upstreams offering the same
+`upstream_source_id` have to be told apart somehow, and the obvious
+discriminator — `host:port` — would fold the volatile half of the address back
+into the identity and re-key the whole mirror on a move. The alias is a stable,
+human-chosen stand-in for the endpoint.
+
+The contract that follows: **an alias is part of the data's identity, not a
+display label.** Renaming one re-keys every source mirrored from that upstream —
+cached chunks orphan (their `route` changed) and ROI annotations detach from
+their `source_id`, going invisible to `roi_list` and ageing toward
+`prune_unseen_days`. Two corollaries:
+
+- A lone upstream with no alias keeps verbatim ids, so *adding* an alias later is
+  itself a rename. Set one from the start if a second upstream is ever likely.
+- Do not reuse a retired alias for a different upstream: if an
+  `upstream_source_id` coincides, old rows re-attach to new data, which is worse
+  than orphaning them.
+
 ## Catalog mirroring, expansion & refresh
 
 A `tensor-server` source **expands like a directory**. `config.discover_sources`'s
