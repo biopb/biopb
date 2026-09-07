@@ -1417,9 +1417,10 @@ def prune_annotations(
 ):
     """Report, and optionally delete, annotations whose image is gone.
 
-    The manual counterpart to ``annotations.prune_unseen_days``, which is off by
-    default and, when on, only arms after the server has been up longer than the
-    threshold. This is how a person cleans up without waiting for either.
+    The offline counterpart to ``biopb tensor prune-annotations``, which does
+    the same job against a *running* server with two ordinary client calls
+    (``rois`` is queryable through the SQL surface and ``roi_delete`` takes
+    explicit ids). Prefer that one; this is for when there is no server to dial.
 
     **The server must be stopped.** DuckDB takes an exclusive lock on the
     catalog for readers as well as writers, so nothing can read the file while

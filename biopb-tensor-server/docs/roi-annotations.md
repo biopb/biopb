@@ -474,19 +474,24 @@ never) rather than a claim about the world. `prune_unseen(before)` applies it an
 `unseen_rois(before)` reports what it would take, per tensor and named by
 `source_url` — one predicate, so a dry run and the real thing cannot drift.
 
-**`biopb-tensor-server prune-annotations <config> --days N` is the escape
-hatch**, and reports unless given `--apply`. It exists because the automatic
-path is off by default and, when on, will not fire until the server has been up
-for the whole threshold — so without it there is no way to clear orphans on
-demand.
+Both are exposed on demand, because the automatic path is off by default and,
+when on, will not fire until the server has been up for the whole threshold.
 
-**It requires the server to be stopped**, which is worth stating plainly because
-the intuition runs the other way. DuckDB's lock on the catalog is exclusive for
-*readers* as well as writers — `read_only=True` is refused too — so nothing can
-open the file while the server has it. The command detects that case and says
-so rather than surfacing the lock error. Serving this online would mean a
-`roi_prune` Flight action and a client method, which is the natural follow-up if
-stopping the server turns out to be the wrong ask.
+**`biopb tensor prune-annotations --days N`** is the one to reach for. It needs
+nothing the server does not already expose: `rois` is in `ALLOWED_TABLES`, so
+the SQL surface reads it, and `roi_delete` takes explicit ids — two ordinary
+client calls against a *running* server, through the usual `_data_plane`
+endpoint and credential resolution. Deleting by id, per tensor, means a delete
+issued from a report can only ever remove what the report listed.
+
+**`biopb-tensor-server prune-annotations <config> --days N`** is the same thing
+against the file, for when there is no server to dial. It **requires the server
+to be stopped**, which is worth stating because the intuition runs the other
+way: DuckDB's lock on the catalog is exclusive for *readers* as well as writers
+— `read_only=True` is refused too — so nothing can open the file while the
+server has it. The command recognises that case and says so.
+
+Both report unless given `--apply`.
 
 Two conditions in `_mark_catalog_complete` are load-bearing:
 
