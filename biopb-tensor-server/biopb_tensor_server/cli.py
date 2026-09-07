@@ -677,6 +677,13 @@ def _annotation_store_path(
     without one keeps annotations only for its own lifetime.
     """
     annotations = server_config.annotations
+    if not annotations.enabled:
+        # A server that does not serve the annotation actions has no business
+        # holding the catalog open: DuckDB's lock is exclusive, so it would
+        # block `prune-annotations` and any other reader for a feature it is
+        # not offering -- and, with an unopenable store being fatal, could
+        # refuse to start over annotations it was told not to serve.
+        return None
     if not annotations.persist:
         return None
     if annotations.store_path:
@@ -861,6 +868,7 @@ def _setup_flight_server(
         query_timeout_ms=server_config.metadata_db.query_timeout_ms,
         max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
         store_path=catalog_store,
+        annotations_enabled=server_config.annotations.enabled,
     )
     # Open it here rather than letting the lazy init fire on whichever request
     # first touches the catalog: a store that cannot be opened is fatal, and it

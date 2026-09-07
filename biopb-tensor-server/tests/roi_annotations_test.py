@@ -1535,3 +1535,53 @@ class TestStorePathIsNotCwdRelative:
 
         with pytest.raises(AnnotationStoreError, match="relative"):
             _annotation_store_path(self._config(store_path="rois.duckdb"), None)
+
+
+class TestDisabledAnnotationsTouchNothing:
+    """`annotations.enabled = false` means the store is not opened at all."""
+
+    @staticmethod
+    def _config(**annotations):
+        from biopb_tensor_server.core.config import AnnotationsConfig, ServerConfig
+
+        return ServerConfig(annotations=AnnotationsConfig(**annotations))
+
+    def test_no_store_path_so_no_lock(self, tmp_path):
+        # DuckDB's lock is exclusive, so holding the catalog open would block
+        # prune-annotations and any other reader for a feature this server is
+        # not offering.
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        assert (
+            _annotation_store_path(
+                self._config(enabled=False, store_path=str(tmp_path / "x.duckdb")),
+                tmp_path / "biopb.json",
+            )
+            is None
+        )
+
+    def test_a_broken_store_cannot_stop_a_server_that_does_not_serve_it(self, tmp_path):
+        # Fail-closed is about a promise of durability. A server told not to
+        # serve annotations made no such promise.
+        from biopb_tensor_server.cli import _annotation_store_path
+
+        store = tmp_path / "catalog.duckdb"
+        store.write_bytes(b"not a duckdb file")
+        config = self._config(enabled=False, store_path=str(store))
+
+        path = _annotation_store_path(config, tmp_path / "biopb.json")
+        assert path is None
+        MetadataDatabase(store_path=path, annotations_enabled=False).open()
+
+    def test_the_sql_surface_drops_rois_too(self):
+        # Returning empty rows would be the wrong answer: the table is
+        # unserved, not unpopulated, and a result set cannot say which.
+        db = MetadataDatabase(annotations_enabled=False)
+        assert db.allowed_tables == {"sources"}
+        with pytest.raises(ValueError, match="disallowed table: rois"):
+            db._validate_query("SELECT * FROM rois")
+        db._validate_query("SELECT * FROM sources")
+
+    def test_rois_stays_queryable_when_enabled(self):
+        db = MetadataDatabase()
+        db._validate_query("SELECT count(*) FROM rois")

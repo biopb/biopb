@@ -363,8 +363,16 @@ hatch stays open: an exporter is additive and needs no migration.
 
 ### Which file
 
-`annotations.store_path` when set; otherwise `state_dir()/catalogs/<digest of
-the resolved config path>.duckdb`. A **relative** `store_path` anchors on the
+Nothing at all when `annotations.enabled` is false. DuckDB's lock is exclusive,
+so a server holding the catalog open would block `prune-annotations` and every
+other reader for a feature it is not serving — and, since an unopenable store is
+fatal, could refuse to start over annotations it was told not to serve. Being
+disabled drops `rois` from the SQL surface too: empty rows would be the wrong
+answer, because the table is unserved rather than unpopulated and a result set
+cannot say which.
+
+Otherwise `annotations.store_path` when set, else `state_dir()/catalogs/<digest
+of the resolved config path>.duckdb`. A **relative** `store_path` anchors on the
 config file's directory, never on the cwd: a server is started by the control
 plane, by systemd, or by hand from wherever the user was standing, so a
 cwd-relative store would mean one config silently naming a different catalog per

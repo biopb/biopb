@@ -496,7 +496,9 @@ class MetadataDatabase:
         r"\b(" + "|".join(sorted(FORBIDDEN_KEYWORDS)) + r")\b"
     )
 
-    # Only these tables can be referenced in queries. ``rois`` is readable here
+    # The tables a query may reference when everything is enabled;
+    # ``allowed_tables`` on the instance is what is actually enforced, and drops
+    # ``rois`` when the annotation actions are off. ``rois`` is readable here
     # as an ANALYSIS affordance (count labels, join against sources, find
     # annotations overlapping a region); the viewer never composes SQL -- it
     # calls list_rois(), which builds parameterized SQL itself. Writes stay off
@@ -518,12 +520,20 @@ class MetadataDatabase:
         query_timeout_ms: int = 30000,
         max_rois_per_tensor: int = 5000,
         store_path: Optional[Path] = None,
+        annotations_enabled: bool = True,
     ):
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
         self._max_rois_per_tensor = max_rois_per_tensor
         # None -> in-memory, and the annotations die with the process.
         self._store_path = Path(store_path) if store_path else None
+        # A server not serving the annotation actions does not offer them
+        # through the SQL surface either. Empty rows would be the wrong answer:
+        # the table is unserved, not unpopulated, and a query cannot tell those
+        # apart from a result set.
+        self.allowed_tables: Set[str] = (
+            set(self.ALLOWED_TABLES) if annotations_enabled else {"sources"}
+        )
 
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
         self._write_lock = threading.Lock()  # Lock for write operations only
@@ -909,10 +919,10 @@ class MetadataDatabase:
 
         # Only allow references to permitted tables
         for table in referenced_tables:
-            if table not in self.ALLOWED_TABLES:
+            if table not in self.allowed_tables:
                 raise ValueError(
                     f"SQL query references disallowed table: {table}. "
-                    f"Only the 'sources' table is accessible."
+                    f"Accessible here: {', '.join(sorted(self.allowed_tables))}."
                 )
 
     def handle_query(self, sql: str) -> flight.FlightInfo:
