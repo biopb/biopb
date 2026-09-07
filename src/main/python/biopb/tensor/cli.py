@@ -19,7 +19,7 @@ import pickle
 import sys
 import time
 from pathlib import Path
-from typing import Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import dask
 import typer
@@ -290,6 +290,101 @@ def query(
     except Exception as exc:
         stderr_console.print(
             f"[red]{_operation_error(exc, endpoint, 'Error querying server')}[/red]"
+        )
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+
+@app.command(
+    "prune-annotations",
+    help="Report, and optionally delete, ROI annotations whose image is gone.",
+)
+def prune_annotations(
+    days: int = typer.Option(
+        ..., "--days", help="Delete annotations unseen for this many days."
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete. Without it this only reports."
+    ),
+    server: Optional[str] = _OPT_SERVER,
+    token: Optional[str] = _OPT_TOKEN,
+    cache_bytes: int = _OPT_CACHE_BYTES,
+):
+    """Clear annotations whose source the server has not seen in a while.
+
+    Needs nothing the server does not already expose: ``rois`` is queryable
+    through the SQL surface and ``roi_delete`` takes explicit ids, so this is
+    two ordinary client calls against a *running* server.
+
+    The server's own ``annotations.prune_unseen_days`` is off by default and,
+    when on, will not fire until the server has been up for the whole threshold.
+    This is how a person does it on demand instead.
+
+    Reports unless given ``--apply``. Absence is not proof of deletion -- an
+    unmounted drive and a removed image look identical from here -- so the
+    confirmation is the point, not a formality.
+
+    Example:
+        biopb tensor prune-annotations --days 30
+        biopb tensor prune-annotations --days 30 --apply
+    """
+    client, endpoint = _connect(server, token, cache_bytes)
+    try:
+        # `days` is an int from typer, so the interval cannot carry SQL.
+        rows = client.query_sources(
+            "SELECT array_id, source_url, roi_id, label, last_seen_at FROM rois "
+            f"WHERE COALESCE(last_seen_at, created_at) < now() - INTERVAL {days} DAY "
+            "ORDER BY last_seen_at, array_id",
+            format="records",
+        )
+        if not rows:
+            console.print(f"[green]Nothing unseen for {days} days.[/green]")
+            return
+
+        by_tensor: Dict[str, List[dict]] = {}
+        for row in rows:
+            by_tensor.setdefault(row["array_id"], []).append(row)
+
+        table = Table(
+            title=f"Annotations whose source has not been seen in {days} days"
+        )
+        table.add_column("Annotations", justify="right", style="cyan")
+        table.add_column("Last seen", style="magenta")
+        table.add_column("Image")
+        table.add_column("Tensor", style="dim")
+        for array_id, group in by_tensor.items():
+            seen = group[0]["last_seen_at"]
+            table.add_row(
+                str(len(group)),
+                seen.strftime("%Y-%m-%d") if seen else "never",
+                # NULL means the source was never in the catalog while these
+                # were written, so there is no name to give the image.
+                str(group[0]["source_url"] or "[red]unknown[/red]"),
+                array_id,
+            )
+        console.print(table)
+
+        if not apply:
+            console.print(
+                f"\n[yellow]{len(rows)} annotation(s) would be deleted. "
+                f"Re-run with --apply to do it.[/yellow]"
+            )
+            return
+
+        # By explicit id, per tensor: a re-drawn ROI gets a new id, so a delete
+        # issued from this report can only ever remove what the report listed.
+        removed = 0
+        for array_id, group in by_tensor.items():
+            removed += len(
+                client.delete_rois(array_id, [r["roi_id"] for r in group]).deleted
+            )
+        console.print(f"[red]Deleted {removed} annotation(s).[/red]")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Error pruning annotations')}[/red]"
         )
         raise typer.Exit(1)
     finally:

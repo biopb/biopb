@@ -2658,6 +2658,7 @@ async def admin_status(request: Request) -> JSONResponse:
             "uptime_seconds": _h("uptime_seconds"),
             "full_scan_in_progress": _h("full_scan_in_progress"),
             "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
+            "annotations_persisted": _h("annotations_persisted"),
         }
     )
 

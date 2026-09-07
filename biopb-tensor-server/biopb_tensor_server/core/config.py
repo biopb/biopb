@@ -723,6 +723,34 @@ class AnnotationsConfig:
             "segmentation belongs in a label tensor."
         },
     )
+    persist: bool = field(
+        default=True,
+        metadata={
+            "help": "Keep annotations across restarts by backing the catalog "
+            "with a file. Off means the whole catalog is in memory and drawn "
+            "ROIs are lost when the server stops."
+        },
+    )
+    store_path: str = field(
+        default="",
+        metadata={
+            "help": "Where the on-disk catalog lives. Empty derives it from the "
+            "config file's path, which is what keeps two servers on two configs "
+            "off each other's file."
+        },
+    )
+    prune_unseen_days: int = field(
+        default=0,
+        metadata={
+            "help": "Delete annotations whose source has not been seen in this "
+            "many days. 0 (the default) never deletes: these are hand-drawn, and "
+            "a source can be absent because a drive is unmounted or a proxy "
+            "upstream is down rather than because the image is gone. Even when "
+            "set, deleting only arms once the server has been up longer than "
+            "this -- before that it has not watched long enough to conclude "
+            "anything. `unseen_rois` reports orphans either way."
+        },
+    )
 
 
 @dataclass
@@ -1415,6 +1443,9 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     annotations_kwargs: Dict[str, Any] = {}
     _carry(annotations_kwargs, "enabled", annotations_data)
     _carry(annotations_kwargs, "max_rois_per_tensor", annotations_data)
+    _carry(annotations_kwargs, "persist", annotations_data)
+    _carry(annotations_kwargs, "store_path", annotations_data)
+    _carry(annotations_kwargs, "prune_unseen_days", annotations_data, cast=int)
     annotations_config = AnnotationsConfig(**annotations_kwargs)
 
     # Parse sources. `url` accepts the legacy `path` alias; every other field is

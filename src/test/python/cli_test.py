@@ -8,6 +8,8 @@ import json
 import os
 import socket
 import tempfile
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -646,3 +648,99 @@ class TestEveryCommandClassifiesItsFailures:
         assert result.exit_code == 1
         assert "Failed to compute statistics" in result.stderr
         assert "data plane" not in result.stderr
+
+
+class TestPruneAnnotations:
+    """`biopb tensor prune-annotations`: SQL on `rois`, then `roi_delete` by id.
+
+    Needs nothing the server does not already expose, which is why this lives on
+    the client rather than behind a new Flight action.
+    """
+
+    @staticmethod
+    def _rows():
+        seen = datetime(2026, 6, 9)
+        return [
+            {
+                "array_id": "zarr_gone/Image:0",
+                "source_url": "file:///data/plate3.zarr",
+                "roi_id": "r1",
+                "label": "a",
+                "last_seen_at": seen,
+            },
+            {
+                "array_id": "zarr_gone/Image:0",
+                "source_url": "file:///data/plate3.zarr",
+                "roi_id": "r2",
+                "label": "b",
+                "last_seen_at": seen,
+            },
+        ]
+
+    def _client(self, rows):
+        client = _build_mock_client()
+        client.query_sources.return_value = rows
+        client.delete_rois.return_value = SimpleNamespace(
+            deleted=[r["roi_id"] for r in rows]
+        )
+        return client
+
+    def test_it_reports_without_deleting(self):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client(self._rows())
+            mock_fc_class.return_value = client
+
+            result = runner.invoke(app, ["prune-annotations", "--days", "30"])
+
+            assert result.exit_code == 0
+            assert "plate3.zarr" in result.stdout
+            assert "2026-06-09" in result.stdout
+            assert "would be deleted" in result.stdout
+            client.delete_rois.assert_not_called()
+
+    def test_apply_deletes_by_explicit_id(self):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client(self._rows())
+            mock_fc_class.return_value = client
+
+            result = runner.invoke(
+                app, ["prune-annotations", "--days", "30", "--apply"]
+            )
+
+            assert result.exit_code == 0
+            assert "Deleted 2" in result.stdout
+            # One call per tensor, naming ids -- never a set_name-wide delete,
+            # which would also take annotations the report never listed.
+            client.delete_rois.assert_called_once_with(
+                "zarr_gone/Image:0", ["r1", "r2"]
+            )
+
+    def test_nothing_unseen_says_so(self):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client([])
+            mock_fc_class.return_value = client
+
+            result = runner.invoke(
+                app, ["prune-annotations", "--days", "30", "--apply"]
+            )
+
+            assert result.exit_code == 0
+            assert "Nothing unseen" in result.stdout
+            client.delete_rois.assert_not_called()
+
+    def test_the_threshold_reaches_the_query(self):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client([])
+            mock_fc_class.return_value = client
+
+            runner.invoke(app, ["prune-annotations", "--days", "7"])
+
+            sql = client.query_sources.call_args[0][0]
+            assert "INTERVAL 7 DAY" in sql
+            # Aged from creation when nothing ever saw it, or the never-observed
+            # row -- the strongest orphan -- would be the one a prune cannot reach.
+            assert "COALESCE(last_seen_at, created_at)" in sql
+
+    def test_days_is_required(self):
+        result = runner.invoke(app, ["prune-annotations"])
+        assert result.exit_code != 0

@@ -12,6 +12,7 @@ import os
 import secrets
 import signal
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -19,7 +20,7 @@ import typer
 from biopb import _tls_material, _tls_record, _web_auth
 from biopb._fs_detect import unsafe_cache_dir_reason
 from biopb._lifecycle import deathwatch as _deathwatch
-from biopb._locations import tls_server_cert
+from biopb._locations import tensor_catalog_path, tls_server_cert
 from rich.console import Console
 from rich.markup import escape as _rich_escape
 from rich.table import Table
@@ -38,6 +39,7 @@ from biopb_tensor_server.core.config import (
     resolve_all_sources,
     validate_config_dict,
 )
+from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.logging_config import (
     get_log_level_from_env,
     setup_logging,
@@ -664,6 +666,53 @@ def cert_init(
     )
 
 
+def _annotation_store_path(
+    server_config: ServerConfig, config_path: Optional[Path]
+) -> Optional[Path]:
+    """Where this server's catalog lives on disk, or None to stay in memory.
+
+    An explicit ``store_path`` wins. Otherwise the default is derived from the
+    config file, which is the thing that identifies "this set of data" -- and
+    with no config file there is nothing to derive from, so a server started
+    without one keeps annotations only for its own lifetime.
+    """
+    annotations = server_config.annotations
+    if not annotations.enabled:
+        # A server that does not serve the annotation actions has no business
+        # holding the catalog open: DuckDB's lock is exclusive, so it would
+        # block `prune-annotations` and any other reader for a feature it is
+        # not offering -- and, with an unopenable store being fatal, could
+        # refuse to start over annotations it was told not to serve.
+        return None
+    if not annotations.persist:
+        return None
+    if annotations.store_path:
+        chosen = Path(annotations.store_path).expanduser()
+        if chosen.is_absolute():
+            return chosen
+        # Relative to the config file, never to the cwd. A server is started by
+        # the control plane, by systemd, or by hand from wherever the user
+        # happened to be standing, so a cwd-relative store means the same config
+        # silently names a different catalog per invocation -- and the one place
+        # it would appear to work is the developer's own shell. Anchoring on the
+        # config keeps a config directory portable.
+        if config_path is None:
+            raise AnnotationStoreError(
+                f"annotations.store_path {annotations.store_path!r} is relative "
+                f"and there is no config file to resolve it against. Give an "
+                f"absolute path."
+            )
+        return (Path(config_path).expanduser().resolve().parent / chosen).resolve()
+    if config_path is None:
+        logger.warning(
+            "No config file, so no name to give a persistent catalog: "
+            "annotations will not survive a restart. Set annotations.store_path "
+            "to choose one."
+        )
+        return None
+    return tensor_catalog_path(config_path)
+
+
 def _setup_flight_server(
     server_config: ServerConfig,
     host: str = DEFAULT_FLIGHT_HOST,
@@ -672,6 +721,7 @@ def _setup_flight_server(
     token: Optional[str] = None,
     tls_cert_chain: Optional[bytes] = None,
     tls_private_key: Optional[bytes] = None,
+    config_path: Optional[Path] = None,
 ) -> Tuple[
     TensorFlightServer, Optional[object], Optional[object], Optional[PrecacheWorker]
 ]:
@@ -685,6 +735,8 @@ def _setup_flight_server(
         tls_cert_chain: PEM cert chain -- serves TLS (grpc+tls://) when supplied
             together with ``tls_private_key`` (see ``TensorFlightServer``).
         tls_private_key: PEM private key paired with ``tls_cert_chain``.
+        config_path: The config file this server was started from. Names the
+            persistent catalog, so two servers on two configs get two files.
 
     Returns:
         Tuple of (flight_server, source_manager, watcher, precache_worker)
@@ -810,16 +862,24 @@ def _setup_flight_server(
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
     # it is the canonical source-browsing surface (`client.query_sources`).
+    catalog_store = _annotation_store_path(server_config, config_path)
     metadata_db = MetadataDatabase(
         max_query_results=server_config.metadata_db.max_query_results,
         query_timeout_ms=server_config.metadata_db.query_timeout_ms,
         max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
+        store_path=catalog_store,
+        annotations_enabled=server_config.annotations.enabled,
     )
+    # Open it here rather than letting the lazy init fire on whichever request
+    # first touches the catalog: a store that cannot be opened is fatal, and it
+    # should be fatal at startup, where the operator is watching.
+    metadata_db.open()
     console.print(
         "[green]Metadata database initialized:[/green] "
         f"max_query_results={server_config.metadata_db.max_query_results}, "
         f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
-        f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
+        f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}, "
+        f"annotations={catalog_store or 'in-memory (not persisted)'}"
     )
 
     # Create and start server with gRPC message size tuned for 64MB chunks
@@ -885,6 +945,7 @@ def _setup_flight_server(
         full_rescan_interval=server_config.full_rescan_interval,
         stable_rescans_required=server_config.stable_rescans_required,
         aggressive_dir_pruning=server_config.aggressive_dir_pruning,
+        prune_unseen_days=server_config.annotations.prune_unseen_days,
         # An empty (or all-invalid) source set is a valid runtime state: build an
         # empty manager and serve an empty catalog rather than refusing to boot
         # (biopb/biopb#515).
@@ -1171,6 +1232,7 @@ def serve(
             token=effective_token,
             tls_cert_chain=tls_cert_chain,
             tls_private_key=tls_private_key,
+            config_path=config,
         )
 
         location = _grpc_location(effective_host, port)
@@ -1188,6 +1250,11 @@ def serve(
         _deathwatch.install()
 
         server.serve()
+    except AnnotationStoreError as exc:
+        # Operator-actionable and the message is the whole point of raising;
+        # a traceback would bury it.
+        console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        raise typer.Exit(1) from None
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
@@ -1351,6 +1418,127 @@ def list_tensors(
     except Exception as e:
         console.print(f"[red]Error: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
+
+
+@app.command(name="prune-annotations")
+def prune_annotations(
+    config: Path = typer.Argument(
+        ...,
+        exists=True,
+        help="Path to config file (biopb.json)",
+    ),
+    days: Optional[int] = typer.Option(
+        None,
+        "--days",
+        help="Age threshold. Defaults to annotations.prune_unseen_days.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Actually delete. Without it this only reports.",
+    ),
+):
+    """Report, and optionally delete, annotations whose image is gone.
+
+    The offline counterpart to ``biopb tensor prune-annotations``, which does
+    the same job against a *running* server with two ordinary client calls
+    (``rois`` is queryable through the SQL surface and ``roi_delete`` takes
+    explicit ids). Prefer that one; this is for when there is no server to dial.
+
+    **The server must be stopped.** DuckDB takes an exclusive lock on the
+    catalog for readers as well as writers, so nothing can read the file while
+    the server has it open.
+
+    Reports by default; ``--apply`` is the one that deletes. Absence is not
+    proof of deletion -- an unmounted drive and a removed image look the same
+    from here -- so the confirmation is the point, not a formality.
+
+    Example:
+        biopb-tensor-server prune-annotations biopb.json --days 30
+        biopb-tensor-server prune-annotations biopb.json --days 30 --apply
+    """
+    server_config = _load_config_or_exit(config)
+    threshold = (
+        days if days is not None else server_config.annotations.prune_unseen_days
+    )
+    if threshold <= 0:
+        console.print(
+            "[red]No age threshold: pass --days, or set "
+            "annotations.prune_unseen_days.[/red]"
+        )
+        raise typer.Exit(2)
+
+    store = _annotation_store_path(server_config, config)
+    if store is None:
+        console.print(
+            "[yellow]This config has no persistent annotation store, so there is "
+            "nothing on disk to prune.[/yellow]"
+        )
+        raise typer.Exit(0)
+    if not store.exists():
+        console.print(f"[yellow]No catalog at {store} yet.[/yellow]")
+        raise typer.Exit(0)
+
+    # The open retries a held lock, which is right for a server racing a restart
+    # but is only noise ahead of a message this command formats itself.
+    logging.getLogger(MetadataDatabase.__module__).setLevel(logging.ERROR)
+
+    db = MetadataDatabase(store_path=store)
+    try:
+        db.open()
+    except AnnotationStoreError as exc:
+        if "Conflicting lock" in str(exc):
+            # Much the likeliest reason to land here, and the server-facing
+            # message ("set persist false") is beside the point for this command.
+            console.print(
+                "[red]The catalog is open in another process -- almost certainly "
+                "the server itself.[/red]\n"
+                "DuckDB's lock is exclusive for readers as well as writers, so "
+                "this command needs the server stopped."
+            )
+        else:
+            console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        console.print(f"\n[dim]{_rich_escape(str(exc.__cause__ or exc))}[/dim]")
+        raise typer.Exit(1) from None
+
+    try:
+        cutoff = datetime.now() - timedelta(days=threshold)
+        groups = db.unseen_rois(cutoff)
+        if not groups:
+            console.print(f"[green]Nothing unseen for {threshold} days.[/green]")
+            return
+
+        table = Table(
+            title=f"Annotations whose source has not been seen in {threshold} days"
+        )
+        table.add_column("Annotations", justify="right", style="cyan")
+        table.add_column("Last seen", style="magenta")
+        table.add_column("Image")
+        table.add_column("Tensor", style="dim")
+        for group in groups:
+            table.add_row(
+                str(group.count),
+                group.last_seen_at.strftime("%Y-%m-%d")
+                if group.last_seen_at
+                else "never",
+                # NULL means the source was never in the catalog while these
+                # were written, so there is no name to give the image.
+                group.source_url or "[red]unknown[/red]",
+                group.array_id,
+            )
+        console.print(table)
+
+        total = sum(g.count for g in groups)
+        if not apply:
+            console.print(
+                f"\n[yellow]{total} annotation(s) would be deleted. "
+                f"Re-run with --apply to do it.[/yellow]"
+            )
+            return
+
+        console.print(f"[red]Deleted {db.prune_unseen(cutoff)} annotation(s).[/red]")
+    finally:
+        db.close()
 
 
 @app.command()
@@ -1708,6 +1896,7 @@ def launch(
             token=effective_token,
             tls_cert_chain=tls_cert_chain,
             tls_private_key=tls_private_key,
+            config_path=config,
         )
 
         # The HTTP sidecar is co-located with the Flight server and reaches it over
@@ -1789,6 +1978,11 @@ def launch(
             config_path=str(config),
             tls_fingerprint=flight_fingerprint,
         )
+    except AnnotationStoreError as exc:
+        # Operator-actionable and the message is the whole point of raising;
+        # a traceback would bury it.
+        console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        raise typer.Exit(1) from None
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:

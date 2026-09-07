@@ -51,6 +51,7 @@ install fails with the fix rather than with a phantom missing file.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -474,6 +475,27 @@ def tensor_stop_sentinel() -> Path:
     (they previously duplicated the literal and relied on a "keep in sync" note).
     """
     return state_dir() / "tensor-server.stop"
+
+
+def tensor_catalog_path(config_path: Path) -> Path:
+    """The tensor server's on-disk DuckDB catalog for *config_path*.
+
+    Named by a digest of the resolved config path, because a tensor server is a
+    singleton only with respect to one set of data: two servers started from two
+    ``biopb.json`` files are a normal deployment, and a single shared file would
+    have them take turns clearing each other's ``sources``. DuckDB takes an
+    exclusive lock on the file, so the collision would surface as the second
+    server failing to start rather than as corruption -- but a per-config path
+    means it never arises.
+
+    In the state tree, not the cache tree: the catalog's ``sources`` rows are
+    regenerable, but its ``rois`` rows are hand-drawn and are not, and
+    :func:`cache_dir` is documented as safe for a janitor to empty.
+    """
+    digest = hashlib.sha256(
+        str(Path(config_path).expanduser().resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return state_dir() / "catalogs" / f"{digest}.duckdb"
 
 
 # --- portable assets (data tree) ----------------------------------------- #

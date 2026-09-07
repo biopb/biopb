@@ -1,7 +1,7 @@
 # ROI annotations — backend design
 
 Lets a user draw 2-D ROIs (points, polygons, rectangles, ellipses) on a tensor in
-the viewer SPA and have them persist for the life of the server process. The store
+the viewer SPA and have them persist across restarts. The store
 is a new table in the tensor server's DuckDB catalog, reached over a small Flight
 action set and re-exposed by the HTTP sidecar.
 
@@ -12,7 +12,7 @@ tooling is `docs/roi-annotations-ui.md`.
 
 **Instance segmentation is a separate tensor, not an annotation set.** A
 segmentation's objects belong in a label tensor the server already serves as
-pixels — not as 10⁴–10⁶ rows in an in-memory catalog. This is the load-bearing
+pixels — not as 10⁴–10⁶ rows in the catalog. This is the load-bearing
 scope decision: it is what lets the read path be a single whole-set fetch over
 DoAction, keeps the per-tensor cap human-scale, and confines the store to the
 2-D vector shapes. If bulk objects ever need a home here, revisit storage and
@@ -319,23 +319,134 @@ SPA) so one schema serves both ends and neither hand-writes a DTO. The handler s
 `array_id` in the body — because responses carry versioned ids, so a read-edit-write
 round trip hands one straight back and the store only ever sees bare ids.
 
-## Persistence and staleness
+## Persistence
 
-The catalog is `duckdb.connect(":memory:")`, so annotations die with the process.
-Accepted for now — and worth noting that while that holds, **there is no
-staleness problem at all**: the table cannot outlive the catalog it references.
-Everything below is the cost of closing the gap, not work for the first version.
+The whole catalog is file-backed: `MetadataDatabase(store_path=...)` opens a
+DuckDB file instead of `":memory:"`. `sources` comes along for the ride because
+DuckDB has one database per connection and the sandbox blocks `ATTACH` — but it
+is truncated on open, so the only content the file really carries is the
+annotations. They are the only rows here no rescan can reproduce.
 
-Three things keep the fill-in cheap:
+Reloaded rows re-attach with no fixup: `array_id` is deterministic across
+restarts for file-backed sources (`generate_source_id` is a SHA-256 of the
+resolved path). The exception is upload/scratch sources whose URL is synthesized
+per run.
 
-- every write funnels through three `MetadataDatabase` methods, so a write-behind
-  has exactly three call sites;
-- the row is flat and serializable — a per-catalog `rois.jsonl` or a file-backed
-  DuckDB attachment stores it verbatim;
-- `array_id` is deterministic across restarts for file-backed sources
-  (`generate_source_id` is a SHA-256 of the resolved path), so reloaded rows
-  re-attach to the same tensors with no fixup. The exception is upload/scratch
-  sources whose URL is synthesized per run.
+**Why not a separate SQLite mirror**, keeping the catalog in memory. It was the
+first plan, on the theory that authored data deserves its own file in a format
+that outlives DuckDB versions. Two of the three arguments for it turned out to
+be wrong on measurement: a durable single-row write is 1329 µs in SQLite against
+2317 µs in DuckDB (both just fsync), and the multi-process case does not exist —
+a Flight server is a singleton with respect to one set of data. What survives is
+file-format longevity, which is insurance rather than function, and the escape
+hatch stays open: an exporter is additive and needs no migration.
+
+### Three things happen on open
+
+- **`TRUNCATE sources`.** It is scan output, and nothing prunes rows for a
+  source deleted while the server was down; a stale row would advertise a tensor
+  no read path can serve. Discovery repopulates it.
+- **`shape_kind` and `bbox` are recomputed** from each row's stored `geometry`.
+  Those two are `_roi_bbox` output cached in columns; `geometry` is the
+  annotation. Deriving them again is what lets the formula change without a
+  migration — adding `rotation` to `Ellipse` (biopb#935) moved every rotated
+  ellipse's box, and this is the difference between that landing on restart and
+  it needing a backfill. A row whose geometry will not parse keeps its stored
+  values rather than being dropped.
+- **`sources` is dropped and recreated**, not truncated. It is scan output, so
+  rebuilding it also keeps its columns current and exempts it from schema
+  versioning entirely.
+- **A file that will not open, or whose `rois` shape this build does not
+  understand, is fatal** (`AnnotationStoreError`), after a short retry. See
+  below — these are the parts of the on-open pass that are policy rather than
+  mechanism.
+
+### Which file
+
+Nothing at all when `annotations.enabled` is false. DuckDB's lock is exclusive,
+so a server holding the catalog open would block `prune-annotations` and every
+other reader for a feature it is not serving — and, since an unopenable store is
+fatal, could refuse to start over annotations it was told not to serve. Being
+disabled drops `rois` from the SQL surface too: empty rows would be the wrong
+answer, because the table is unserved rather than unpopulated and a result set
+cannot say which.
+
+Otherwise `annotations.store_path` when set, else `state_dir()/catalogs/<digest
+of the resolved config path>.duckdb`. A **relative** `store_path` anchors on the
+config file's directory, never on the cwd: a server is started by the control
+plane, by systemd, or by hand from wherever the user was standing, so a
+cwd-relative store would mean one config silently naming a different catalog per
+launch — and the one place it appears to work is the developer's own shell.
+(`SourceConfig.local_path` still has this bug for source urls: biopb#947.) Keyed by config path because the singleton is
+per data set: two servers on two `biopb.json` files are ordinary, and a shared
+file would have them take turns clearing each other's `sources`. A server
+started with no config file has nothing to derive a name from and stays in
+memory, which is also what `annotations.persist = false` selects.
+
+State tree, not cache: `cache_dir()` is documented as safe for a janitor to
+empty, and half this file is not.
+
+### Schema versioning
+
+Persistence is what created this problem. The schema used to be rebuilt every
+boot, so changing it cost nothing; now the file outlives the code, and
+`CREATE TABLE IF NOT EXISTS` against an older file is a **silent no-op** — the
+server starts, reports SERVING, and every annotation read and write then fails
+on a missing column.
+
+The split is the same one that runs through the rest of this design:
+
+- **`sources` is not versioned at all.** It is scan output, so it is dropped and
+  recreated on open. A change to its columns needs nothing.
+- **`rois` carries `_ROI_SCHEMA_VERSION`**, stamped in a `catalog_meta` key/value
+  table (not in `ALLOWED_TABLES`, so the SQL surface cannot reach it). Older
+  files run the `_ROI_MIGRATIONS` ladder; a file from a **newer** build is
+  refused rather than misread; a version with no migration to reach it is
+  refused rather than skipped. A `rois` table with no marker is version 1 by
+  definition — the marker shipped in the same release.
+
+**The expected column set is built from `_ROIS_DDL` in a throwaway in-memory
+database**, not written out by hand. The version marker only helps if every
+schema change remembers to bump it, and the edit that forgets is the same edit
+that would not have updated a hand-written list either. Deriving it means a
+forgotten bump surfaces as a refusal at startup instead of a `Binder Error` on
+the first annotation.
+
+### A store that will not open is fatal
+
+Neither of the two tempting recoveries is safe.
+
+**Not "rename it aside and start clean."** DuckDB raises the same `IOException`
+for a corrupt file and for one another process holds, so the two are
+indistinguishable at the point of decision — and guessing wrong on a lock is the
+worse error by a distance. The rename *succeeds* while the other server has the
+file open; it keeps writing to the renamed inode, this one starts a fresh
+catalog at the original path, and the annotations split across two files with
+nothing anywhere to say so. That is the exact failure the per-config path exists
+to prevent, reintroduced by the error handler.
+
+**Not "fall back to memory."** `annotations.persist` is a promise about
+durability. Serving anyway keeps the server up while every ROI drawn on it goes
+to a catalog that vanishes at the next restart — loss discovered a day later,
+with the work already gone. A health flag does not fix that; nobody reads health
+before they start tracing.
+
+So the server refuses to start, with a message naming the file and the four
+things it can be. All four are decisions for a person — restore the file, fix
+the permissions, match the DuckDB version that wrote it, or stop the other
+server — and the operator who genuinely wants a session-only store says
+`annotations.persist = false`, which is not an error at all.
+
+**The retry comes first** (3 attempts, 0.5 s apart), and it is the only
+distinction available between the four: a lock held by a server on its way down
+clears within a second, and a restart race is the one open failure that resolves
+itself. Nothing else does.
+
+`health` reports `annotations_persisted` — false only for a deliberately
+session-only server, since the accidental case cannot start. A client can say so
+before someone spends a morning tracing.
+
+## Staleness
 
 ### Two kinds of stale
 
@@ -370,15 +481,14 @@ catalog has dropped.
 So: **never assert deletion.** Record presence when it is observed, and let
 absence be measured in elapsed time rather than judged.
 
-### Pruning, when it is needed
+### The orphan clock
 
-One set-based statement, run on a long interval and only while the catalog is
-known-complete (`full_scan_in_progress == false` and a
-`last_full_scan_finished_at` from this process):
+`MetadataDatabase.mark_sources_seen()` — one set-based statement:
 
 ```sql
-UPDATE rois SET last_seen_at = now()
- WHERE source_id IN (SELECT source_id FROM sources);
+UPDATE rois SET source_url = COALESCE(rois.source_url, s.source_url),
+                last_seen_at = now()
+  FROM sources s WHERE rois.source_id = s.source_id;
 ```
 
 Matching on `source_id`, not `array_id`, is deliberate: an unresolved cloud
@@ -387,9 +497,74 @@ would score its annotations as unseen while the source is sitting right there.
 
 That is the whole mechanism — no I/O, no per-adapter probe, uniform across every
 source type, and it degrades correctly: a drive offline for a week simply does
-not advance `last_seen_at`. Deletion is then a policy over age
-(`annotations.prune_unseen_days`, default `0` = never) rather than a claim about
-the world.
+not advance `last_seen_at`. It also backfills a `source_url` that a write could
+not resolve, which until now only another write could.
+
+**The seam is scan completion, not a timer.** `SourceManager._mark_catalog_complete()`
+is where the three paths that can finish a full scan converge — a forced full
+rescan, an upstream re-list pass, and a static-only config with nothing to walk.
+The gate the sweep needs (`full_scan_in_progress == false` plus a
+`last_full_scan_finished_at` from this process) is that method's postcondition,
+so it is held rather than checked; a separate long-interval worker would be
+re-deriving an edge from a level and could not tell "complete and fresh" from
+"complete an hour ago, and two mounts have dropped since". The cadence comes
+free: `full_rescan_interval`, an hour by default.
+
+### Deleting, which is a separate decision
+
+Deletion is a policy over age (`annotations.prune_unseen_days`, default `0` =
+never) rather than a claim about the world. `prune_unseen(before)` applies it and
+`unseen_rois(before)` reports what it would take, per tensor and named by
+`source_url` — one predicate, so a dry run and the real thing cannot drift.
+
+Both are exposed on demand, because the automatic path is off by default and,
+when on, will not fire until the server has been up for the whole threshold.
+
+**`biopb tensor prune-annotations --days N`** is the one to reach for. It needs
+nothing the server does not already expose: `rois` is in `ALLOWED_TABLES`, so
+the SQL surface reads it, and `roi_delete` takes explicit ids — two ordinary
+client calls against a *running* server, through the usual `_data_plane`
+endpoint and credential resolution. Deleting by id, per tensor, means a delete
+issued from a report can only ever remove what the report listed.
+
+**`biopb-tensor-server prune-annotations <config> --days N`** is the same thing
+against the file, for when there is no server to dial. It **requires the server
+to be stopped**, which is worth stating because the intuition runs the other
+way: DuckDB's lock on the catalog is exclusive for *readers* as well as writers
+— `read_only=True` is refused too — so nothing can open the file while the
+server has it. The command recognises that case and says so.
+
+Both report unless given `--apply`.
+
+Two conditions in `_mark_catalog_complete` are load-bearing:
+
+- **The sweep runs before the delete, in the same pass.** `last_seen_at` does
+  not advance while the server is off, so after a week down every annotation
+  looks a week unseen; deleting first would take out rows whose images are
+  sitting right there.
+- **Deleting arms only once this process has been up longer than the
+  threshold.** The sweep is the only thing that advances `last_seen_at`, so a
+  row can be *known* unseen for N days only if the server has been running the
+  sweep for N days; anything shorter reads a gap the server was not present for
+  as evidence about the world, and a restart is when that gap is largest.
+
+  Gating on the first scan instead — the obvious version — is not enough. It
+  assumes whatever makes a source visible is reachable at boot, and a proxy
+  upstream that is down then is usually still down an hour later, so the second
+  completed scan would delete its annotations. Uptime does not care why a source
+  was absent.
+
+  The cost is that a server restarted more often than the threshold never
+  auto-prunes. That is the intended trade, and it is why the reporting path
+  exists: a person can act on `unseen_rois` whenever they like.
+
+The clock is `time.monotonic()`, so an NTP correction cannot age the server into
+deleting.
+
+Age is `COALESCE(last_seen_at, created_at)`. A row written before its source
+ever reached the catalog has no sighting to measure from, and reading that as
+"infinitely fresh" would make the strongest orphan the one row a prune can never
+reach.
 
 Both catalog-derived columns are written **only when the catalog answered** —
 and a write states that structurally rather than by reconstruction. A create is
@@ -416,17 +591,16 @@ only the catalog-completeness gate, which a presence observation does not need
 
 A write against a source the catalog does not know is still stored — refusing it
 would turn a rescan window into lost work, and absence proves nothing. It lands
-with a NULL `source_url`, which is precisely the unreportable row above, and the
-next write that *can* resolve the URL backfills it.
+with a NULL `source_url`, which is precisely the unreportable row above; the
+sweep, or the next write that can resolve the URL, backfills it.
 
-Auto-delete stays **opt-in** — the default above is off. These are hand-drawn
-user data; the safe default is to surface orphans, sorted by `last_seen_at` and
-named by `source_url`, and let a person confirm via an admin route or a
-`biopb roi prune --dry-run`. `source_url` is stored for exactly this: `array_id`
-is a SHA-256 and cannot be inverted, so without it an orphan report can only say
-"annotations for `zarr_a3f2b1c4`", which no one can act on. **That is the part
-that must be decided now** — rows written today without a URL can never be
-reported or re-attached later.
+Auto-delete stays **opt-in** — `prune_unseen_days` defaults to 0. These are
+hand-drawn user data; the safe default is to surface orphans, sorted by
+`last_seen_at` and named by `source_url`, and let a person confirm. `source_url`
+is stored for exactly this: `array_id` is a SHA-256 and cannot be inverted, so
+without it an orphan report can only say "annotations for `zarr_a3f2b1c4`",
+which no one can act on — and a row written before its source was ever in the
+catalog is the one orphan nobody can be told about.
 
 ### Known limitation: a move orphans annotations
 
@@ -448,7 +622,11 @@ of the same name, size and mtime — re-attach?" rather than silently losing the
 3. Three Flight actions + `TensorFlightClient` methods; round-trip test.
 4. Three sidecar routes; test through the app with a mocked client.
 5. Config: `annotations.enabled`, `annotations.max_rois_per_tensor` in
-   `config_schema.py`. (`prune_unseen_days` lands with persistence, not now — but
-   `source_url` is written from step 2, since rows without it can never be
-   reported or re-attached.)
+   `config_schema.py`. (`source_url` is written from step 2, since rows without
+   it can never be reported or re-attached.)
 6. Docs: this file linked from `docs/http-server.md` and `ARCHITECTURE.md`.
+7. Persistence: `annotations.persist` / `annotations.store_path`, the file-backed
+   connection and its on-open pass.
+8. The orphan clock: `mark_sources_seen` / `unseen_rois` / `prune_unseen`, driven
+   from `SourceManager._mark_catalog_complete`. No UI yet — `unseen_rois` is the
+   query an admin route or `biopb roi prune --dry-run` would render.

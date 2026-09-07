@@ -148,3 +148,20 @@ class WriteNotSupportedError(Exception):
     read-path ``except ValueError`` guards -- a write rejection is unrelated to
     read planning.
     """
+
+
+class AnnotationStoreError(RuntimeError):
+    """The persistent annotation catalog was configured but could not be opened.
+
+    Fatal on purpose. ``annotations.persist`` is a promise about durability, and
+    the alternative to refusing here is serving normally while every ROI a user
+    draws goes to an in-memory catalog and disappears at the next restart --
+    loss that is discovered a day later, by which time the work is gone.
+
+    Every cause survives a retry and is a decision for a person: a corrupt file
+    wants restoring, a permission error wants fixing, a file written by a newer
+    DuckDB wants the versions matched, and a held lock means another server is
+    already serving this catalog. Running anyway is wrong for all four; the
+    operator who genuinely wants a session-only store says so with
+    ``annotations.persist = false``.
+    """
