@@ -539,7 +539,15 @@ class TestStore:
         after = db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()[0]
         assert after >= before
 
-    def test_backfill_only_touches_rows_that_have_no_url(self):
+    def test_a_renamed_source_refreshes_every_row(self):
+        """The label follows the catalog; it does not freeze at the first write.
+
+        A source's display url moves without its identity moving -- an `alias`
+        re-roots a local source, a drag-drop stamps `dnd://`. `source_id` is
+        unchanged, so these rows are the same annotations on the same image, and
+        a report that named them by the pre-rename url would name something the
+        catalog no longer lists.
+        """
         db = MetadataDatabase()
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
@@ -554,7 +562,34 @@ class TestStore:
             .execute("SELECT roi_id, source_url FROM rois ORDER BY roi_id")
             .fetchall()
         )
-        assert urls == [("a", "/data/exp.zarr"), ("b", "dnd://exp.zarr")]
+        assert urls == [("a", "dnd://exp.zarr"), ("b", "dnd://exp.zarr")]
+
+    @pytest.mark.parametrize("unnamed", [None, ""])
+    def test_a_catalog_row_that_names_nothing_leaves_the_label_alone(self, unnamed):
+        """An unnamed source is not a rename.
+
+        Refreshing from it would wipe the only human-readable thing an orphan
+        report has -- and `sources.source_url` is nullable, with the descriptor
+        path writing "" when a source carries no url of its own.
+        """
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
+        db._get_connection().execute(
+            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            [unnamed, "zarr_a1b2c3"],
+        )
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
+
+        urls = (
+            db._get_cursor()
+            .execute("SELECT roi_id, source_url FROM rois ORDER BY roi_id")
+            .fetchall()
+        )
+        # "a" keeps what it knew; "b" is created while the catalog names
+        # nothing, so it lands NULL for a later sighting to backfill -- a new
+        # row cannot inherit a label the catalog is no longer offering.
+        assert urls == [("a", "/data/exp.zarr"), ("b", None)]
 
 
 class TestBatchAtomicity:
@@ -1180,6 +1215,48 @@ class TestOrphanClock:
         assert db._get_cursor().execute("SELECT source_url FROM rois").fetchone() == (
             "file:///data/a.zarr",
         )
+
+    def test_the_sweep_refreshes_a_renamed_url(self):
+        # Same rule as the write path, in the statement that runs for the whole
+        # catalog: the label tracks what the catalog calls the source now.
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
+        db.put_rois(ARRAY_ID, [_annotation()])
+        db._get_connection().execute(
+            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            ["lab/a.zarr", "zarr_a1b2c3"],
+        )
+
+        db.mark_sources_seen()
+
+        assert db._get_cursor().execute("SELECT source_url FROM rois").fetchone() == (
+            "lab/a.zarr",
+        )
+
+    def test_a_vanished_source_is_reported_under_its_last_name(self):
+        """The point of refreshing: freeze at the LAST sighting, not the first.
+
+        A source renamed and then unmounted used to be reported under the name it
+        had when the first annotation was drawn -- a value the catalog had
+        abandoned long before the source went away, shown at the one moment the
+        column is load-bearing.
+        """
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
+        db.put_rois(ARRAY_ID, [_annotation()])
+        db._get_connection().execute(
+            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            ["lab/exp.zarr", "zarr_a1b2c3"],
+        )
+        db.mark_sources_seen()
+
+        # The source goes away; absence writes nothing, so the label stands.
+        db._get_connection().execute("DELETE FROM sources")
+        self._age(db, ARRAY_ID, days=40)
+        db.mark_sources_seen()
+
+        report = db.unseen_rois(datetime.now() - timedelta(days=30))
+        assert [r.source_url for r in report] == ["lab/exp.zarr"]
 
     def test_a_present_source_with_no_url_still_counts_as_seen(self):
         # in_catalog and source_url are separate answers: presence is what
