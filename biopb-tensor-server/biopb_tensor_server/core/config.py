@@ -744,8 +744,11 @@ class AnnotationsConfig:
         metadata={
             "help": "Delete annotations whose source has not been seen in this "
             "many days. 0 (the default) never deletes: these are hand-drawn, and "
-            "a source can be absent because a drive is unmounted rather than "
-            "because the image is gone."
+            "a source can be absent because a drive is unmounted or a proxy "
+            "upstream is down rather than because the image is gone. Even when "
+            "set, deleting only arms once the server has been up longer than "
+            "this -- before that it has not watched long enough to conclude "
+            "anything. `unseen_rois` reports orphans either way."
         },
     )
 

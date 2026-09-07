@@ -203,22 +203,30 @@ class TestOrphanClockSeam:
         # Freshness is still published; the clock rides along, it does not replace it.
         assert server.last_full_scan_at is not None
 
-    def test_the_first_pass_never_prunes(self, tmp_path):
-        # On boot an unmounted drive looks exactly like a deleted one, and the
-        # rows are already as old as the downtime.
+    def test_a_young_server_never_prunes_however_many_scans_it_finishes(self, tmp_path):
+        # The scan count is not the question. An upstream that is down at boot
+        # is usually still down an hour later, so gating on the first scan
+        # alone would let the second one delete its annotations.
         server = _FakeServer()
         manager = self._manager(server, tmp_path, prune_unseen_days=7)
-        manager.complete_initial_scan()
-        assert server._metadata_db.seen_calls == 1
+        for _ in range(5):
+            manager._mark_catalog_complete()
+        assert server._metadata_db.seen_calls == 5
         assert server._metadata_db.pruned == []
 
-    def test_a_later_pass_prunes_at_the_configured_age(self, tmp_path):
+    def test_pruning_arms_once_the_server_has_outlived_the_threshold(self, tmp_path):
         server = _FakeServer()
         manager = self._manager(server, tmp_path, prune_unseen_days=7)
-        manager.complete_initial_scan()
         manager._mark_catalog_complete()
+        assert server._metadata_db.pruned == []
 
-        assert server._metadata_db.seen_calls == 2
+        # Seven days of uptime, less a second.
+        manager._started_at -= 7 * 86400 - 1
+        manager._mark_catalog_complete()
+        assert server._metadata_db.pruned == []
+
+        manager._started_at -= 2
+        manager._mark_catalog_complete()
         assert len(server._metadata_db.pruned) == 1
         age = datetime.now() - server._metadata_db.pruned[0]
         assert timedelta(days=7) <= age < timedelta(days=7, seconds=30)
@@ -226,9 +234,11 @@ class TestOrphanClockSeam:
     def test_prune_is_off_by_default(self, tmp_path):
         server = _FakeServer()
         manager = self._manager(server, tmp_path)
-        manager.complete_initial_scan()
+        manager._started_at -= 10 * 365 * 86400  # a decade of uptime
         manager._mark_catalog_complete()
         assert server._metadata_db.pruned == []
+        # ... and the sweep still runs; it is the deleting that is opt-in.
+        assert server._metadata_db.seen_calls == 1
 
     def test_a_failing_clock_does_not_fail_the_scan(self, tmp_path):
         server = _FakeServer()

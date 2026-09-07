@@ -474,17 +474,30 @@ never) rather than a claim about the world. `prune_unseen(before)` applies it an
 `unseen_rois(before)` reports what it would take, per tensor and named by
 `source_url` — one predicate, so a dry run and the real thing cannot drift.
 
-Two orderings in `_mark_catalog_complete` are load-bearing:
+Two conditions in `_mark_catalog_complete` are load-bearing:
 
 - **The sweep runs before the delete, in the same pass.** `last_seen_at` does
   not advance while the server is off, so after a week down every annotation
   looks a week unseen; deleting first would take out rows whose images are
   sitting right there.
-- **The delete is skipped on the first pass after boot.** A drive that has not
-  mounted yet is indistinguishable from one that is gone, and its rows are
-  already as old as the downtime — so the one pass with no evidence behind it is
-  exactly the one that would delete the most. Waiting for the second full scan
-  costs an hour.
+- **Deleting arms only once this process has been up longer than the
+  threshold.** The sweep is the only thing that advances `last_seen_at`, so a
+  row can be *known* unseen for N days only if the server has been running the
+  sweep for N days; anything shorter reads a gap the server was not present for
+  as evidence about the world, and a restart is when that gap is largest.
+
+  Gating on the first scan instead — the obvious version — is not enough. It
+  assumes whatever makes a source visible is reachable at boot, and a proxy
+  upstream that is down then is usually still down an hour later, so the second
+  completed scan would delete its annotations. Uptime does not care why a source
+  was absent.
+
+  The cost is that a server restarted more often than the threshold never
+  auto-prunes. That is the intended trade, and it is why the reporting path
+  exists: a person can act on `unseen_rois` whenever they like.
+
+The clock is `time.monotonic()`, so an NTP correction cannot age the server into
+deleting.
 
 Age is `COALESCE(last_seen_at, created_at)`. A row written before its source
 ever reached the catalog has no sighting to measure from, and reading that as

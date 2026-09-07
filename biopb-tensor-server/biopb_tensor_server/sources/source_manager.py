@@ -140,6 +140,9 @@ class SourceManager:
         # from here, at the only point where the catalog is known complete.
         self._metadata_db = metadata_db
         self._prune_unseen_days = max(0, prune_unseen_days)
+        # Arms auto-prune, and nothing else reads it. Monotonic, not wall clock:
+        # an NTP correction must not be able to age the server into deleting.
+        self._started_at = time.monotonic()
         # Kept for the runtime add_local_source discovery walk; the confirmed-
         # catalog write path uses the Reconciler's own copy.
         self._registry = registry
@@ -333,10 +336,13 @@ class SourceManager:
         than by a timer that would have to re-derive it. "Complete" is not
         checked here; at this point it is held.
 
-        Auto-prune is skipped on the first pass. On boot a drive that has not
-        mounted yet is indistinguishable from one that is gone, and its rows are
-        already as old as the downtime -- so the one pass with no evidence behind
-        it is exactly the one that would delete the most.
+        Auto-prune is armed only once this process has been up longer than the
+        threshold it would delete on. Until then it cannot have watched anything
+        for long enough to conclude absence: at boot an unmounted drive and an
+        unreachable proxy upstream look exactly like deleted ones, and their rows
+        are already as old as the downtime. A gate on the first scan alone would
+        not do -- an upstream that is down at boot is usually still down an hour
+        later, and the second completed scan would delete its annotations.
         """
         self._last_full_rescan_at = time.time()
         self._server.set_last_full_scan(self._last_full_rescan_at)
@@ -349,13 +355,29 @@ class SourceManager:
             # week unseen. Pruning first would take out rows whose images are
             # sitting right there.
             self._metadata_db.mark_sources_seen()
-            if self._prune_unseen_days > 0 and self._initial_scan_done:
+            if self._prune_unseen_days > 0 and self._auto_prune_armed():
                 cutoff = datetime.now() - timedelta(days=self._prune_unseen_days)
                 self._metadata_db.prune_unseen(cutoff)
         except Exception:
             # A scan must not fail over annotation bookkeeping; the next
             # completed scan retries the whole thing.
             logger.exception("Orphan clock update failed")
+
+    def _auto_prune_armed(self) -> bool:
+        """Whether this process has watched long enough to conclude absence.
+
+        Uptime, not scan count: the sweep is the only thing that advances
+        ``last_seen_at``, so a row can only be *known* unseen for N days if this
+        process has been running the sweep for N days. Anything shorter is
+        reading a gap the server was not present for as evidence about the
+        world -- and a restart is exactly when that gap is largest.
+
+        The cost is that a server restarted more often than the threshold never
+        auto-prunes at all. That is the intended trade: these are hand-drawn
+        annotations, and the reporting path (``unseen_rois``) stays available
+        for a person to act on whenever they like.
+        """
+        return time.monotonic() - self._started_at >= self._prune_unseen_days * 86400
 
     def complete_initial_scan(self) -> None:
         """Advance the startup protocol when there is nothing to walk.
