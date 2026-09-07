@@ -150,6 +150,21 @@ _ACCEPTED_SHAPES: Set[str] = {
 
 
 @dataclass(frozen=True)
+class UnseenRois:
+    """One tensor's annotations whose source has gone unobserved.
+
+    What an orphan report or a ``--dry-run`` prints. ``source_url`` is None for
+    rows written before their source ever reached the catalog.
+    """
+
+    source_id: str
+    source_url: Optional[str]
+    array_id: str
+    count: int
+    last_seen_at: Optional[datetime]
+
+
+@dataclass(frozen=True)
 class _PreparedRoi:
     """A validated annotation, normalized into the column values it will occupy.
 
@@ -1216,7 +1231,7 @@ class MetadataDatabase:
 
         stored: List[RoiAnnotation] = []
         conflicts: List[RoiConflict] = []
-        source_url = self._observe_source(conn, source_id, now)
+        in_catalog, source_url = self._observe_source(conn, source_id, now)
 
         # created_at is read for the RESPONSE only -- the update statement
         # does not carry it, so an existing row's value is preserved by not
@@ -1265,7 +1280,7 @@ class MetadataDatabase:
                     [prep.roi_id, array_id, source_id, *values, rev, now, now]
                     # A fresh row is only "seen" if the catalog answered;
                     # inventing a sighting would reset an orphan clock.
-                    + [source_url, now if source_url is not None else None],
+                    + [source_url, now if in_catalog else None],
                 )
             else:
                 rev, created_at = prior[0] + 1, prior[1]
@@ -1283,8 +1298,15 @@ class MetadataDatabase:
         return stored, conflicts
 
     @staticmethod
-    def _observe_source(conn, source_id: str, now: datetime) -> Optional[str]:
-        """Record a catalog sighting of *source_id*, returning its URL or None.
+    def _observe_source(
+        conn, source_id: str, now: datetime
+    ) -> Tuple[bool, Optional[str]]:
+        """Record a catalog sighting of *source_id*.
+
+        Returns ``(in_catalog, source_url)``. The two are separate answers: a
+        source can be present and carry no URL, and it is *presence* that a
+        fresh row's ``last_seen_at`` turns on. Reporting only the URL would make
+        the caller decide a sighting from a value that does not mean one.
 
         Presence in the catalog is evidence; absence is not (progressive
         discovery, an unmounted drive, a proxy upstream that is down). So this
@@ -1299,10 +1321,10 @@ class MetadataDatabase:
           that already have one keep it -- the URL is a human-readable label for
           a source_id, not an identifier, so filling a blank is always safe but
           overwriting is not the intent.
-        * stamps ``last_seen_at``. This is the same statement the future prune
-          sweep runs (docs/roi-annotations.md); the sweep adds only a
-          catalog-completeness gate, which a *presence* observation does not
-          need -- only a conclusion about absence does.
+        * stamps ``last_seen_at``. :meth:`mark_sources_seen` is this statement
+          over the whole catalog; the difference is only its gate, which a
+          *presence* observation does not need -- a conclusion about absence
+          does.
         """
         row = conn.execute(
             "SELECT source_url FROM sources WHERE source_id = ?", [source_id]
@@ -1313,14 +1335,102 @@ class MetadataDatabase:
                 "source_url / last_seen_at they already had",
                 source_id,
             )
-            return None
+            return False, None
         source_url = row[0]
+        # One source's half of what mark_sources_seen() does for the whole
+        # catalog -- keep the two statements the same shape.
         conn.execute(
             "UPDATE rois SET source_url = COALESCE(source_url, ?), last_seen_at = ? "
             "WHERE source_id = ?",
             [source_url, now, source_id],
         )
-        return source_url
+        return True, source_url
+
+    # ------------------------------------------------------------------
+    # The orphan clock (docs/roi-annotations.md, "Staleness")
+    # ------------------------------------------------------------------
+
+    def mark_sources_seen(self) -> int:
+        """Stamp a catalog sighting on every annotation whose source is present.
+
+        :meth:`_observe_source` generalized from one source to all of them, and
+        the reason the clock means anything: a write only ever refreshes the
+        tensor being drawn on, so without this an untouched annotation would
+        look unseen however often its source is rescanned.
+
+        Presence is the only evidence recorded. A source the catalog does not
+        list is left entirely alone -- absence is not deletion (progressive
+        discovery, an unmounted drive, an upstream that is down), so it must
+        register as "no news", not as a sighting that failed to happen.
+
+        The caller owns the gate: this is only meaningful just after a full scan
+        completed, which is where SourceManager calls it from.
+        """
+        conn = self._get_connection()
+        with self._write_lock:
+            seen = conn.execute(
+                "UPDATE rois SET source_url = COALESCE(rois.source_url, s.source_url), "
+                "last_seen_at = ? FROM sources s WHERE rois.source_id = s.source_id "
+                "RETURNING rois.roi_id",
+                [datetime.now()],
+            ).fetchall()
+        logger.debug("mark_sources_seen: %d annotation(s) observed", len(seen))
+        return len(seen)
+
+    def unseen_rois(self, before: datetime) -> List[UnseenRois]:
+        """Annotations whose source has not been observed since *before*.
+
+        Grouped per tensor, because that is the unit a person confirms: "47
+        annotations on /data/plate3.zarr, last seen 12 June". ``source_url`` is
+        what makes such a line actionable at all -- ``array_id`` is a SHA-256
+        and cannot be inverted -- and it is NULL for rows written before their
+        source was ever in the catalog, which is the one orphan nobody can be
+        told about.
+
+        Age is ``COALESCE(last_seen_at, created_at)``: a row whose source has
+        never once appeared has no sighting to measure from, and treating that
+        as "infinitely fresh" would make exactly the strongest orphan immortal.
+        """
+        rows = (
+            self._get_cursor()
+            .execute(
+                "SELECT source_id, any_value(source_url), array_id, count(*), "
+                "max(COALESCE(last_seen_at, created_at)) AS seen FROM rois "
+                "WHERE COALESCE(last_seen_at, created_at) < ? "
+                "GROUP BY source_id, array_id ORDER BY seen, array_id",
+                [before],
+            )
+            .fetchall()
+        )
+        return [
+            UnseenRois(
+                source_id=source_id,
+                source_url=source_url,
+                array_id=array_id,
+                count=count,
+                last_seen_at=seen,
+            )
+            for source_id, source_url, array_id, count, seen in rows
+        ]
+
+    def prune_unseen(self, before: datetime) -> int:
+        """Delete the annotations :meth:`unseen_rois` reports, returning how many.
+
+        Destructive and unconditional -- every gate (is the catalog complete, is
+        auto-prune even on, has a person confirmed) belongs to the caller. Kept
+        that way so the dry-run path and the real one share one predicate
+        instead of two that can drift.
+        """
+        conn = self._get_connection()
+        with self._write_lock:
+            deleted = conn.execute(
+                "DELETE FROM rois WHERE COALESCE(last_seen_at, created_at) < ? "
+                "RETURNING roi_id",
+                [before],
+            ).fetchall()
+        if deleted:
+            logger.info("prune_unseen: removed %d annotation(s)", len(deleted))
+        return len(deleted)
 
     def list_rois(
         self, array_id: str, set_name: str = ""

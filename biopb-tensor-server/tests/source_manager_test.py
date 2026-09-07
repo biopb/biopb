@@ -3,6 +3,7 @@
 import os
 import time
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,17 @@ class _FakeMetadataDb:
     def __init__(self):
         self.added = []
         self.removed = []
+        # The orphan clock, driven from _mark_catalog_complete.
+        self.seen_calls = 0
+        self.pruned = []
+
+    def mark_sources_seen(self):
+        self.seen_calls += 1
+        return 0
+
+    def prune_unseen(self, before):
+        self.pruned.append(before)
+        return 0
 
     def sync_source_added(self, source_id, adapter):
         self.added.append(source_id)
@@ -165,6 +177,71 @@ def _make_manager(server, **kwargs):
     tests don't repeat it; all other SourceManager kwargs pass straight through.
     """
     return SourceManager(server=server, metadata_db=server._metadata_db, **kwargs)
+
+
+class TestOrphanClockSeam:
+    """The sweep hangs off scan completion, which is where completeness is held."""
+
+    @staticmethod
+    def _manager(server, tmp_path, **kwargs):
+        return _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs={tmp_path / "data"},
+            stability_window=0.0,
+            probe_open_files=False,
+            **kwargs,
+        )
+
+    def test_a_completed_scan_records_presence(self, tmp_path):
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path)
+        manager.complete_initial_scan()
+        assert server._metadata_db.seen_calls == 1
+        # Freshness is still published; the clock rides along, it does not replace it.
+        assert server.last_full_scan_at is not None
+
+    def test_the_first_pass_never_prunes(self, tmp_path):
+        # On boot an unmounted drive looks exactly like a deleted one, and the
+        # rows are already as old as the downtime.
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path, prune_unseen_days=7)
+        manager.complete_initial_scan()
+        assert server._metadata_db.seen_calls == 1
+        assert server._metadata_db.pruned == []
+
+    def test_a_later_pass_prunes_at_the_configured_age(self, tmp_path):
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path, prune_unseen_days=7)
+        manager.complete_initial_scan()
+        manager._mark_catalog_complete()
+
+        assert server._metadata_db.seen_calls == 2
+        assert len(server._metadata_db.pruned) == 1
+        age = datetime.now() - server._metadata_db.pruned[0]
+        assert timedelta(days=7) <= age < timedelta(days=7, seconds=30)
+
+    def test_prune_is_off_by_default(self, tmp_path):
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path)
+        manager.complete_initial_scan()
+        manager._mark_catalog_complete()
+        assert server._metadata_db.pruned == []
+
+    def test_a_failing_clock_does_not_fail_the_scan(self, tmp_path):
+        server = _FakeServer()
+
+        def _boom():
+            raise RuntimeError("catalog is wedged")
+
+        server._metadata_db.mark_sources_seen = _boom
+        manager = self._manager(server, tmp_path)
+        manager.complete_initial_scan()
+        # Freshness published and the startup gate flipped regardless.
+        assert server.last_full_scan_at is not None
+        assert manager._initial_scan_done
 
 
 class TestSourceManagerRegressions:

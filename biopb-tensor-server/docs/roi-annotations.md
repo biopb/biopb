@@ -406,15 +406,14 @@ catalog has dropped.
 So: **never assert deletion.** Record presence when it is observed, and let
 absence be measured in elapsed time rather than judged.
 
-### Pruning, when it is needed
+### The orphan clock
 
-One set-based statement, run on a long interval and only while the catalog is
-known-complete (`full_scan_in_progress == false` and a
-`last_full_scan_finished_at` from this process):
+`MetadataDatabase.mark_sources_seen()` — one set-based statement:
 
 ```sql
-UPDATE rois SET last_seen_at = now()
- WHERE source_id IN (SELECT source_id FROM sources);
+UPDATE rois SET source_url = COALESCE(rois.source_url, s.source_url),
+                last_seen_at = now()
+  FROM sources s WHERE rois.source_id = s.source_id;
 ```
 
 Matching on `source_id`, not `array_id`, is deliberate: an unresolved cloud
@@ -423,9 +422,42 @@ would score its annotations as unseen while the source is sitting right there.
 
 That is the whole mechanism — no I/O, no per-adapter probe, uniform across every
 source type, and it degrades correctly: a drive offline for a week simply does
-not advance `last_seen_at`. Deletion is then a policy over age
-(`annotations.prune_unseen_days`, default `0` = never) rather than a claim about
-the world.
+not advance `last_seen_at`. It also backfills a `source_url` that a write could
+not resolve, which until now only another write could.
+
+**The seam is scan completion, not a timer.** `SourceManager._mark_catalog_complete()`
+is where the three paths that can finish a full scan converge — a forced full
+rescan, an upstream re-list pass, and a static-only config with nothing to walk.
+The gate the sweep needs (`full_scan_in_progress == false` plus a
+`last_full_scan_finished_at` from this process) is that method's postcondition,
+so it is held rather than checked; a separate long-interval worker would be
+re-deriving an edge from a level and could not tell "complete and fresh" from
+"complete an hour ago, and two mounts have dropped since". The cadence comes
+free: `full_rescan_interval`, an hour by default.
+
+### Deleting, which is a separate decision
+
+Deletion is a policy over age (`annotations.prune_unseen_days`, default `0` =
+never) rather than a claim about the world. `prune_unseen(before)` applies it and
+`unseen_rois(before)` reports what it would take, per tensor and named by
+`source_url` — one predicate, so a dry run and the real thing cannot drift.
+
+Two orderings in `_mark_catalog_complete` are load-bearing:
+
+- **The sweep runs before the delete, in the same pass.** `last_seen_at` does
+  not advance while the server is off, so after a week down every annotation
+  looks a week unseen; deleting first would take out rows whose images are
+  sitting right there.
+- **The delete is skipped on the first pass after boot.** A drive that has not
+  mounted yet is indistinguishable from one that is gone, and its rows are
+  already as old as the downtime — so the one pass with no evidence behind it is
+  exactly the one that would delete the most. Waiting for the second full scan
+  costs an hour.
+
+Age is `COALESCE(last_seen_at, created_at)`. A row written before its source
+ever reached the catalog has no sighting to measure from, and reading that as
+"infinitely fresh" would make the strongest orphan the one row a prune can never
+reach.
 
 Both catalog-derived columns are written **only when the catalog answered** —
 and a write states that structurally rather than by reconstruction. A create is
@@ -452,17 +484,16 @@ only the catalog-completeness gate, which a presence observation does not need
 
 A write against a source the catalog does not know is still stored — refusing it
 would turn a rescan window into lost work, and absence proves nothing. It lands
-with a NULL `source_url`, which is precisely the unreportable row above, and the
-next write that *can* resolve the URL backfills it.
+with a NULL `source_url`, which is precisely the unreportable row above; the
+sweep, or the next write that can resolve the URL, backfills it.
 
-Auto-delete stays **opt-in** — the default above is off. These are hand-drawn
-user data; the safe default is to surface orphans, sorted by `last_seen_at` and
-named by `source_url`, and let a person confirm via an admin route or a
-`biopb roi prune --dry-run`. `source_url` is stored for exactly this: `array_id`
-is a SHA-256 and cannot be inverted, so without it an orphan report can only say
-"annotations for `zarr_a3f2b1c4`", which no one can act on. **That is the part
-that must be decided now** — rows written today without a URL can never be
-reported or re-attached later.
+Auto-delete stays **opt-in** — `prune_unseen_days` defaults to 0. These are
+hand-drawn user data; the safe default is to surface orphans, sorted by
+`last_seen_at` and named by `source_url`, and let a person confirm. `source_url`
+is stored for exactly this: `array_id` is a SHA-256 and cannot be inverted, so
+without it an orphan report can only say "annotations for `zarr_a3f2b1c4`",
+which no one can act on — and a row written before its source was ever in the
+catalog is the one orphan nobody can be told about.
 
 ### Known limitation: a move orphans annotations
 
@@ -488,5 +519,7 @@ of the same name, size and mtime — re-attach?" rather than silently losing the
    it can never be reported or re-attached.)
 6. Docs: this file linked from `docs/http-server.md` and `ARCHITECTURE.md`.
 7. Persistence: `annotations.persist` / `annotations.store_path`, the file-backed
-   connection and its on-open pass. `prune_unseen_days` is still unbuilt — see
-   "Pruning, when it is needed", which is now reachable rather than hypothetical.
+   connection and its on-open pass.
+8. The orphan clock: `mark_sources_seen` / `unseen_rois` / `prune_unseen`, driven
+   from `SourceManager._mark_catalog_complete`. No UI yet — `unseen_rois` is the
+   query an admin route or `biopb roi prune --dry-run` would render.

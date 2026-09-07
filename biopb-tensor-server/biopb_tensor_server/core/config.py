@@ -739,6 +739,15 @@ class AnnotationsConfig:
             "off each other's file."
         },
     )
+    prune_unseen_days: int = field(
+        default=0,
+        metadata={
+            "help": "Delete annotations whose source has not been seen in this "
+            "many days. 0 (the default) never deletes: these are hand-drawn, and "
+            "a source can be absent because a drive is unmounted rather than "
+            "because the image is gone."
+        },
+    )
 
 
 @dataclass
@@ -1433,6 +1442,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(annotations_kwargs, "max_rois_per_tensor", annotations_data)
     _carry(annotations_kwargs, "persist", annotations_data)
     _carry(annotations_kwargs, "store_path", annotations_data)
+    _carry(annotations_kwargs, "prune_unseen_days", annotations_data, cast=int)
     annotations_config = AnnotationsConfig(**annotations_kwargs)
 
     # Parse sources. `url` accepts the legacy `path` alias; every other field is

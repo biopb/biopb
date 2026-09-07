@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -132,8 +133,13 @@ class SourceManager:
         aggressive_dir_pruning: bool = False,
         cloud_roots: Optional[Set[Path]] = None,
         monitored_upstreams: Optional[List[SourceConfig]] = None,
+        prune_unseen_days: int = 0,
     ):
         self._server = server
+        # Kept, not just forwarded to the Reconciler: the orphan clock is driven
+        # from here, at the only point where the catalog is known complete.
+        self._metadata_db = metadata_db
+        self._prune_unseen_days = max(0, prune_unseen_days)
         # Kept for the runtime add_local_source discovery walk; the confirmed-
         # catalog write path uses the Reconciler's own copy.
         self._registry = registry
@@ -318,6 +324,39 @@ class SourceManager:
         """
         self._handle_rescan()
 
+    def _mark_catalog_complete(self) -> None:
+        """Publish that a full scan just finished, and run the orphan clock.
+
+        The three paths that can complete one -- a forced full rescan, an
+        upstream re-list pass, and a static-only config with nothing to walk --
+        all end here, which is what lets the clock be driven by the event rather
+        than by a timer that would have to re-derive it. "Complete" is not
+        checked here; at this point it is held.
+
+        Auto-prune is skipped on the first pass. On boot a drive that has not
+        mounted yet is indistinguishable from one that is gone, and its rows are
+        already as old as the downtime -- so the one pass with no evidence behind
+        it is exactly the one that would delete the most.
+        """
+        self._last_full_rescan_at = time.time()
+        self._server.set_last_full_scan(self._last_full_rescan_at)
+        if self._metadata_db is None:
+            return
+
+        try:
+            # Always, and before any delete: last_seen_at does not advance while
+            # the server is down, so after a week off every annotation looks a
+            # week unseen. Pruning first would take out rows whose images are
+            # sitting right there.
+            self._metadata_db.mark_sources_seen()
+            if self._prune_unseen_days > 0 and self._initial_scan_done:
+                cutoff = datetime.now() - timedelta(days=self._prune_unseen_days)
+                self._metadata_db.prune_unseen(cutoff)
+        except Exception:
+            # A scan must not fail over annotation bookkeeping; the next
+            # completed scan retries the whole thing.
+            logger.exception("Orphan clock update failed")
+
     def complete_initial_scan(self) -> None:
         """Advance the startup protocol when there is nothing to walk.
 
@@ -328,8 +367,7 @@ class SourceManager:
         private members (biopb/biopb#277 item C). Idempotent: the hook fires only
         on the transition to done.
         """
-        self._last_full_rescan_at = time.time()
-        self._server.set_last_full_scan(self._last_full_rescan_at)
+        self._mark_catalog_complete()
         if not self._initial_scan_done:
             self._initial_scan_done = True
             self._fire_initial_scan_complete()
@@ -540,8 +578,7 @@ class SourceManager:
                     self._skipped_stable_dirs = previous_skipped_dirs
 
             if force_full_rescan and rescan_succeeded:
-                self._last_full_rescan_at = time.time()
-                self._server.set_last_full_scan(self._last_full_rescan_at)
+                self._mark_catalog_complete()
                 # Partition the just-walked cloud entries out of _entry_states into
                 # the cloud partition. This runs only after the force_full claim +
                 # reconcile have already seen the full _entry_states (cloud
@@ -877,8 +914,7 @@ class SourceManager:
             if upstream_only:
                 # Each completed pass re-verifies the (remote) catalog -> advance
                 # freshness. in_progress / the first-scan gate fire once, on boot.
-                self._last_full_rescan_at = time.time()
-                self._server.set_last_full_scan(self._last_full_rescan_at)
+                self._mark_catalog_complete()
                 if first_pass:
                     self._server.set_full_scan_in_progress(False)
                     self._initial_scan_done = True
@@ -1223,6 +1259,7 @@ def create_source_manager(
     full_rescan_interval: float = 3600.0,
     stable_rescans_required: int = 0,
     aggressive_dir_pruning: bool = False,
+    prune_unseen_days: int = 0,
     allow_empty: bool = False,
 ) -> Optional[SourceManager]:
     """Create a SourceManager for all configured sources.
@@ -1373,6 +1410,7 @@ def create_source_manager(
         aggressive_dir_pruning=aggressive_dir_pruning,
         cloud_roots=cloud_roots,
         monitored_upstreams=monitored_upstreams,
+        prune_unseen_days=prune_unseen_days,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)

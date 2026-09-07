@@ -916,6 +916,7 @@ def _setup_flight_server(
         full_rescan_interval=server_config.full_rescan_interval,
         stable_rescans_required=server_config.stable_rescans_required,
         aggressive_dir_pruning=server_config.aggressive_dir_pruning,
+        prune_unseen_days=server_config.annotations.prune_unseen_days,
         # An empty (or all-invalid) source set is a valid runtime state: build an
         # empty manager and serve an empty catalog rather than refusing to boot
         # (biopb/biopb#515).

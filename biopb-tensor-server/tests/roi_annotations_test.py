@@ -9,6 +9,7 @@ exercise the wire in each direction.
 import math
 import threading
 import time
+from datetime import datetime, timedelta
 
 import pyarrow.flight as flight
 import pytest
@@ -1083,3 +1084,134 @@ class TestStorePathResolution:
         from biopb_tensor_server.cli import _annotation_store_path
 
         assert _annotation_store_path(self._config(), None) is None
+
+
+class TestOrphanClock:
+    """`last_seen_at`: what advances it, and what a prune makes of it."""
+
+    @staticmethod
+    def _age(db, array_id, *, days):
+        """Backdate a tensor's sighting, standing in for elapsed time."""
+        db._get_connection().execute(
+            "UPDATE rois SET last_seen_at = ?, created_at = ? WHERE array_id = ?",
+            [
+                datetime.now() - timedelta(days=days),
+                datetime.now() - timedelta(days=days),
+                array_id,
+            ],
+        )
+
+    def test_a_sighting_reaches_annotations_nobody_touched(self):
+        # The reason the sweep exists: a write only refreshes the tensor being
+        # drawn on, so without it an untouched annotation looks unseen however
+        # often its source is rescanned.
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
+        db.put_rois(ARRAY_ID, [_annotation()])
+        self._age(db, ARRAY_ID, days=40)
+
+        assert db.mark_sources_seen() == 1
+        (seen,) = db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()
+        assert datetime.now() - seen < timedelta(seconds=30)
+
+    def test_a_source_the_catalog_cannot_answer_for_is_left_alone(self):
+        # Absence is not deletion -- an unmounted drive must register as no
+        # news, not as a sighting that failed to happen.
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
+        db.put_rois(ARRAY_ID, [_annotation()])
+        db.put_rois("zarr_gone/Image:0", [_annotation()])
+        self._age(db, "zarr_gone/Image:0", days=40)
+
+        assert db.mark_sources_seen() == 1
+        (seen,) = (
+            db._get_cursor()
+            .execute(
+                "SELECT last_seen_at FROM rois WHERE array_id = ?",
+                ["zarr_gone/Image:0"],
+            )
+            .fetchone()
+        )
+        assert datetime.now() - seen > timedelta(days=39)
+
+    def test_the_sweep_backfills_a_url_the_write_could_not_resolve(self):
+        # Written before discovery caught up: the row is unreportable until
+        # something fills the URL in, and until now only another write could.
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation()])
+        assert db._get_cursor().execute("SELECT source_url FROM rois").fetchone() == (
+            None,
+        )
+
+        _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
+        db.mark_sources_seen()
+        assert db._get_cursor().execute("SELECT source_url FROM rois").fetchone() == (
+            "file:///data/a.zarr",
+        )
+
+    def test_a_present_source_with_no_url_still_counts_as_seen(self):
+        # in_catalog and source_url are separate answers: presence is what
+        # turns a fresh row's clock on, not whether a URL came with it.
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", None)
+        db.put_rois(ARRAY_ID, [_annotation()])
+        (seen,) = db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()
+        assert seen is not None
+
+    def test_unseen_rois_groups_per_tensor_and_names_the_image(self):
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(), _annotation()])
+        db.put_rois("zarr_gone/Image:0", [_annotation()])
+        self._age(db, "zarr_gone/Image:0", days=40)
+
+        db.mark_sources_seen()
+        report = db.unseen_rois(datetime.now() - timedelta(days=30))
+        assert [(r.array_id, r.count, r.source_url) for r in report] == [
+            ("zarr_gone/Image:0", 1, None)
+        ]
+
+    def test_a_row_never_observed_is_aged_from_its_creation(self):
+        # Otherwise the strongest orphan -- a source that has never once
+        # appeared -- is the one row a prune can never reach.
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation()])
+        db._get_connection().execute(
+            "UPDATE rois SET created_at = ?", [datetime.now() - timedelta(days=40)]
+        )
+        assert db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone() == (
+            None,
+        )
+
+        report = db.unseen_rois(datetime.now() - timedelta(days=30))
+        assert [r.count for r in report] == [1]
+
+    def test_prune_removes_exactly_what_the_report_named(self):
+        db = MetadataDatabase()
+        _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
+        db.put_rois(ARRAY_ID, [_annotation(label="keep")])
+        db.put_rois("zarr_gone/Image:0", [_annotation(label="drop")])
+        self._age(db, "zarr_gone/Image:0", days=40)
+        db.mark_sources_seen()
+
+        cutoff = datetime.now() - timedelta(days=30)
+        named = sum(r.count for r in db.unseen_rois(cutoff))
+        assert db.prune_unseen(cutoff) == named == 1
+        assert db._get_cursor().execute("SELECT label FROM rois").fetchall() == [
+            ("keep",)
+        ]
+
+    def test_pruning_survives_a_restart_with_the_catalog(self, tmp_path):
+        # The clock is only worth anything now that the rows outlive the process.
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.put_rois(ARRAY_ID, [_annotation()])
+        self._age(db, ARRAY_ID, days=40)
+        db.close()
+
+        db = MetadataDatabase(store_path=store)
+        assert (
+            sum(r.count for r in db.unseen_rois(datetime.now() - timedelta(days=30)))
+            == 1
+        )
+        assert db.prune_unseen(datetime.now() - timedelta(days=30)) == 1
