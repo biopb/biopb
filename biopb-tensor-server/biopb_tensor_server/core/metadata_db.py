@@ -1165,9 +1165,16 @@ class MetadataDatabase:
         # get_metadata() has just been called, so this is a dict walk, not a
         # second parse.
         imported, report = imported_annotations(
-            metadata,
+            # `or {}`: get_metadata is typed -> dict, but an upload-backed
+            # source returns whatever OME metadata it was given, which may be
+            # None. The line below has always tolerated that; this one must too.
+            metadata or {},
             [(t.array_id, list(t.dim_labels)) for t in source_desc.tensors],
-            content_version=adapter.content_version,
+            # getattr, not attribute access: content_version is a SourceAdapter
+            # property, but this method only ever duck-types its argument (it
+            # calls four methods on it), and several adapters here and in the
+            # tests supply that surface without inheriting the base.
+            content_version=getattr(adapter, "content_version", None),
             max_per_tensor=self._max_rois_per_tensor,
         )
         if report:
