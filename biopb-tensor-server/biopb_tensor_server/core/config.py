@@ -485,7 +485,17 @@ class SourceConfig:
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
 
-        # Generate source_id from URL hash if not provided
+        # Mint the id from the URL unless the caller supplied one. This is
+        # durable identity -- the metadata DB's ROI rows and the segment-cache
+        # keys hang off it -- so whatever enters the hash becomes something a
+        # user cannot change without detaching their data. Url-derivation's known
+        # cost is that `mv` re-keys a local source (docs/roi-annotations.md).
+        # Supplying an id explicitly is how the tensor-server proxy opts out:
+        # `_namespaced_source_id` builds one from (alias, upstream_source_id)
+        # with no endpoint in it, so a moved upstream keeps its cache and its
+        # annotations (docs/remote-tensor-cache.md). Config never reaches this
+        # branch -- `sources.source_id` is ignored with a warning
+        # (biopb/biopb#308) -- so an explicit id is always internal.
         if self.source_id is None:
             detected_type = self.type or detect_source_type(self.url) or "data"
             object.__setattr__(
