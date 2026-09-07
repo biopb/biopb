@@ -167,6 +167,41 @@ does not cover. Without the exclusion the CLI would delete rows the API refuses
 to touch, and `prune-annotations` would count imported copies in the total it
 asks a person to confirm.
 
+### They share the `sources` lifecycle
+
+An imported set is **scan output**, exactly like a `sources` row — derived from a
+file, rewritten when that file is re-registered. So it gets that lifecycle rather
+than machinery of its own: cleared in `_create_schema` alongside
+`DROP TABLE IF EXISTS sources`, written by `sync_source_added` in the same
+transaction as the upsert, removed by `sync_source_removed` with the row.
+
+That is deliberately *not* a watermark table. `sync_source_added` is already the
+replace-on-rescan mechanism — re-registration is driven by the same stat
+signature `content_version` comes from — so there is no separate freshness
+question to track, nothing to keep in sync with the rows, no "have I imported an
+empty set?" ambiguity, and no reaper to write. Deriving there is also free:
+`get_metadata()` has just been called, so the import is a dict walk rather than a
+second parse.
+
+Two consequences. A **rebuildable subset now lives in the table whose whole
+justification is being unrebuildable** — which cuts the useful way, since
+`_ROI_MIGRATIONS` may delete and re-derive reserved rows instead of migrating
+them. And **availability couples to registration**: imported ROIs exist only
+while their source does, and appear progressively as discovery proceeds. Correct
+rather than unfortunate — a tensor that is not registered cannot be opened.
+
+The `rois` key is stripped from `metadata` before it is serialised into
+`sources.metadata_json`. Once the store owns them a second copy is duplicated
+bulk, and it would keep annotations visible on
+`GET /api/sources/{id}/metadata` — the surface this design says they do not
+appear on. Safe because the derivation reads the adapter's fresh
+`get_metadata()` return, never the stored column.
+
+Imported rows are also outside `max_rois_per_tensor`. The cap exists to keep this
+an annotation store rather than a segmentation store; a user should not be pushed
+toward it by rows they did not author, and cloning an imported set — which is how
+editing one works — is exactly what would trip it.
+
 ## Schema
 
 New table in `MetadataDatabase._create_schema()`:
