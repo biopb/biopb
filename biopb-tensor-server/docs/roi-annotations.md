@@ -622,6 +622,11 @@ The stored `source_url` plus `drawn_against_version` (`mtime_ns:size`, which
 survives a plain `mv`) is enough to offer "these annotations were drawn on a file
 of the same name, size and mtime — re-attach?" rather than silently losing them.
 
+A **proxied** source is the deliberate opposite: its id is built from
+`(alias, upstream_source_id)` and carries no endpoint, so moving the upstream
+leaves annotations attached. The equivalent event there is renaming the `alias`,
+which is part of the identity by design — see *remote-tensor-cache.md*.
+
 ## Implementation order
 
 1. `annotation.proto` + `buf generate` (Python and Java only — `buf.gen.yaml`
