@@ -67,6 +67,7 @@ describe("roiRing", () => {
       kind: "ellipse",
       center: { x: 10, y: 20 },
       radius: { x: 4, y: 2 },
+      rotation: 0,
     })!;
     expect(ring).toHaveLength(ELLIPSE_SEGMENTS);
     const xs = ring.map((p) => p[0]);
@@ -75,6 +76,36 @@ describe("roiRing", () => {
     expect(Math.max(...xs)).toBeCloseTo(14, 6);
     expect(Math.min(...ys)).toBeCloseTo(18, 6);
     expect(Math.max(...ys)).toBeCloseTo(22, 6);
+  });
+
+  it("turns an ellipse a quarter turn onto its other axis", () => {
+    const ring = roiRing({
+      kind: "ellipse",
+      center: { x: 10, y: 20 },
+      radius: { x: 4, y: 2 },
+      rotation: Math.PI / 2,
+    })!;
+    const xs = ring.map((p) => p[0]);
+    const ys = ring.map((p) => p[1]);
+    // The extents have swapped: what was 8 wide is now 8 tall.
+    expect(Math.min(...xs)).toBeCloseTo(8, 6);
+    expect(Math.max(...xs)).toBeCloseTo(12, 6);
+    expect(Math.min(...ys)).toBeCloseTo(16, 6);
+    expect(Math.max(...ys)).toBeCloseTo(24, 6);
+  });
+
+  it("rotates about the centre rather than the origin", () => {
+    const ring = roiRing({
+      kind: "ellipse",
+      center: { x: 100, y: 200 },
+      radius: { x: 5, y: 5 },
+      rotation: 0.9,
+    })!;
+    // A circle is rotation-invariant, so a rotation that moved the centre
+    // would show up here as a displaced ring and nowhere else.
+    for (const [x, y] of ring) {
+      expect(Math.hypot(x - 100, y - 200)).toBeCloseTo(5, 6);
+    }
   });
 
   it("declines the arms that are not polygons", () => {

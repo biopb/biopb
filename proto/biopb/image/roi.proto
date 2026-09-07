@@ -47,6 +47,14 @@ message Ellipse {
 
   // If the `center`` has no z field, neither should `radius`
   Point radius = 2;
+
+  // In-plane rotation about `center`, in radians, from +x toward +y.
+  //
+  // A fitted ellipse -- a cell, a nucleus -- is rarely axis-aligned, and an
+  // orientation dropped on the way in comes back as a well-formed ellipse at
+  // the wrong angle, which nothing downstream can detect. 0 is axis-aligned,
+  // so rows written before this field existed decode correctly.
+  float rotation = 3;
 }
 
 // The Polygon defines closed shapes formed of straight lines. Note: Polygon

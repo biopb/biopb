@@ -47,8 +47,18 @@ describe("decodeRoiGeometry", () => {
   });
 
   it("reads an ellipse", () => {
+    expect(
+      decodeRoiGeometry({
+        ellipse: { center: { x: 4, y: 4 }, radius: { x: 2, y: 1 }, rotation: 0.75 },
+      }),
+    ).toEqual({ kind: "ellipse", center: { x: 4, y: 4 }, radius: { x: 2, y: 1 }, rotation: 0.75 });
+  });
+
+  it("reads an ellipse written before rotation existed as axis-aligned", () => {
+    // proto3 JSON omits a zero float, so this is also what a rotation of 0
+    // looks like on the wire -- the two are the same reading by construction.
     expect(decodeRoiGeometry({ ellipse: { center: { x: 4, y: 4 }, radius: { x: 2, y: 1 } } })).toEqual(
-      { kind: "ellipse", center: { x: 4, y: 4 }, radius: { x: 2, y: 1 } },
+      { kind: "ellipse", center: { x: 4, y: 4 }, radius: { x: 2, y: 1 }, rotation: 0 },
     );
   });
 
@@ -150,7 +160,8 @@ describe("encodeRoiAnnotation", () => {
     const arms: RoiGeometry[] = [
       { kind: "point", at: { x: 1, y: 2 } },
       { kind: "rectangle", topLeft: { x: 0, y: 0 }, bottomRight: { x: 4, y: 4 } },
-      { kind: "ellipse", center: { x: 2, y: 2 }, radius: { x: 1, y: 3 } },
+      { kind: "ellipse", center: { x: 2, y: 2 }, radius: { x: 1, y: 3 }, rotation: 0 },
+      { kind: "ellipse", center: { x: 2, y: 2 }, radius: { x: 1, y: 3 }, rotation: -1.25 },
       GEOM,
       { kind: "polyline", points: [{ x: 0, y: 0 }, { x: 9, y: 9 }], width: 2.5 },
     ];

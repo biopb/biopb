@@ -6,6 +6,7 @@ per-ROI rev/conflict, the cap -- while one gRPC round-trip and one FastAPI pass
 exercise the wire in each direction.
 """
 
+import math
 import threading
 import time
 
@@ -18,6 +19,9 @@ from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from google.protobuf import json_format
 
 ARRAY_ID = "zarr_a1b2c3/Image:0"
+
+# Half-extent of a 3x4 ellipse turned 45 degrees: hypot(3, 4) / sqrt(2).
+_HALF_DIAG = 5.0 / math.sqrt(2.0)
 
 
 def _polygon(*pts):
@@ -129,6 +133,29 @@ class TestStore:
                 ROI(ellipse=Ellipse(center=Point(x=10, y=10), radius=Point(x=3, y=4))),
                 (7.0, 6.0, 13.0, 14.0),
             ),
+            # A quarter turn exchanges the two half-extents ...
+            (
+                ROI(
+                    ellipse=Ellipse(
+                        center=Point(x=10, y=10),
+                        radius=Point(x=3, y=4),
+                        rotation=math.pi / 2,
+                    )
+                ),
+                (6.0, 7.0, 14.0, 13.0),
+            ),
+            # ... and at 45 degrees the x extent grows past rx, which a bbox
+            # taken from the radii alone would under-report by half a pixel.
+            (
+                ROI(
+                    ellipse=Ellipse(
+                        center=Point(x=0, y=0),
+                        radius=Point(x=3, y=4),
+                        rotation=math.pi / 4,
+                    )
+                ),
+                (-_HALF_DIAG, -_HALF_DIAG, _HALF_DIAG, _HALF_DIAG),
+            ),
             (_polygon((1, 2), (10, 2), (5, 9)), (1.0, 2.0, 10.0, 9.0)),
             # A zero-width scribble is its vertex extent ...
             (
@@ -150,9 +177,10 @@ class TestStore:
     def test_bbox_is_derived_per_shape(self, roi, expected):
         db = MetadataDatabase()
         db.put_rois(ARRAY_ID, [_annotation(roi=roi)])
-        assert (
-            db._get_cursor().execute("SELECT bbox FROM rois").fetchone()[0] == expected
-        )
+        # approx, not ==: a rotated bbox goes through cos/sin, and the float32
+        # radii on the wire do not land on the exact decimal either way.
+        stored = db._get_cursor().execute("SELECT bbox FROM rois").fetchone()[0]
+        assert stored == pytest.approx(expected, abs=1e-6)
 
     def test_mask_and_mesh_are_refused(self):
         db = MetadataDatabase()

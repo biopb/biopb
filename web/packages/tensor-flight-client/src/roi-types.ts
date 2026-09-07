@@ -28,7 +28,8 @@ export type RoiShapeKind = "point" | "rectangle" | "ellipse" | "polygon" | "poly
 export type RoiGeometry =
   | { kind: "point"; at: RoiPoint }
   | { kind: "rectangle"; topLeft: RoiPoint; bottomRight: RoiPoint }
-  | { kind: "ellipse"; center: RoiPoint; radius: RoiPoint }
+  /** `rotation` is in-plane, radians about `center`, +x toward +y; 0 is axis-aligned. */
+  | { kind: "ellipse"; center: RoiPoint; radius: RoiPoint; rotation: number }
   | { kind: "polygon"; points: RoiPoint[] }
   /** `width` is geometry, not styling: the stroke has real extent in pixels. */
   | { kind: "polyline"; points: RoiPoint[]; width: number };
