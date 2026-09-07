@@ -9,7 +9,7 @@ The importer does not exist yet; these plant reserved rows with direct SQL, whic
 is also the only way to get one past the guard being tested.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from biopb.image import ROI, Point, Polygon
@@ -34,9 +34,9 @@ def _annotation(**kwargs):
     return RoiAnnotation(**kwargs)
 
 
-def _plant_imported(db, roi_id, *, set_name=RESERVED, label="from-file"):
+def _plant(db, roi_id, *, set_name=RESERVED, label="from-file", when=None):
     """Insert a row as the importer eventually will -- past the public guard."""
-    now = datetime.now()
+    now = when or datetime.now()
     geometry = json_format.MessageToJson(
         _polygon((0, 0), (4, 0), (4, 4)), indent=0
     ).replace("\n", "")
@@ -90,14 +90,14 @@ class TestReusingAnImportedId:
 
     def test_is_refused(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
 
         with pytest.raises(ValueError, match="ROI:3"):
             db.put_rois(ARRAY_ID, [_annotation(roi_id="ROI:3", set_name="mine")])
 
     def test_the_imported_row_does_not_move(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
 
         with pytest.raises(ValueError):
             db.put_rois(ARRAY_ID, [_annotation(roi_id="ROI:3", set_name="mine")])
@@ -108,7 +108,7 @@ class TestReusingAnImportedId:
 
     def test_it_takes_the_whole_batch_with_it(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
 
         with pytest.raises(ValueError):
             db.put_rois(
@@ -123,7 +123,7 @@ class TestReusingAnImportedId:
 
     def test_a_fresh_id_is_how_a_clone_works(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
 
         (stored,), conflicts = db.put_rois(
             ARRAY_ID, [_annotation(roi_id="clone-1", set_name="mine")]
@@ -137,7 +137,7 @@ class TestReusingAnImportedId:
 class TestDeletingAReservedSet:
     def test_naming_the_set_is_refused(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
 
         with pytest.raises(ValueError, match="reserved"):
             db.delete_rois(ARRAY_ID, set_name=RESERVED)
@@ -145,7 +145,7 @@ class TestDeletingAReservedSet:
 
     def test_an_id_inside_it_is_refused_without_naming_it(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
 
         with pytest.raises(ValueError, match="ROI:3"):
             db.delete_rois(ARRAY_ID, ["ROI:3"])
@@ -153,7 +153,7 @@ class TestDeletingAReservedSet:
 
     def test_one_reserved_id_refuses_the_batch(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="mine-1", set_name="mine")])
 
         with pytest.raises(ValueError, match="ROI:3"):
@@ -162,7 +162,7 @@ class TestDeletingAReservedSet:
 
     def test_ordinary_ids_still_delete(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="mine-1", set_name="mine")])
 
         assert db.delete_rois(ARRAY_ID, ["mine-1"]) == ["mine-1"]
@@ -174,7 +174,7 @@ class TestClearingATensor:
 
     def test_leaves_the_imported_set_and_takes_the_rest(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
         db.put_rois(
             ARRAY_ID,
             [
@@ -188,7 +188,61 @@ class TestClearingATensor:
 
     def test_a_tensor_holding_only_an_import_loses_nothing(self):
         db = MetadataDatabase()
-        _plant_imported(db, "ROI:3")
+        _plant(db, "ROI:3")
 
         assert db.delete_rois(ARRAY_ID) == []
         assert _sets(db) == {"ROI:3": RESERVED}
+
+
+class TestTheOrphanClock:
+    """A reserved set is a cache, so `unseen_rois` / `prune_unseen` skip it.
+
+    The clock exists to give hand-drawn work a grace period before anything
+    deletes it. `prune_unseen` also deletes with raw SQL rather than through
+    `delete_rois`, so without this it would remove rows the API refuses to.
+    """
+
+    STALE = datetime.now() - timedelta(days=90)
+    CUTOFF = datetime.now() - timedelta(days=30)
+
+    def test_an_imported_set_is_not_reported_as_unseen(self):
+        db = MetadataDatabase()
+        _plant(db, "ROI:3", when=self.STALE)
+
+        assert db.unseen_rois(self.CUTOFF) == []
+
+    def test_an_imported_set_survives_the_prune(self):
+        db = MetadataDatabase()
+        _plant(db, "ROI:3", when=self.STALE)
+
+        assert db.prune_unseen(self.CUTOFF) == 0
+        assert _sets(db) == {"ROI:3": RESERVED}
+
+    def test_hand_drawn_rows_are_still_reported_and_pruned(self):
+        db = MetadataDatabase()
+        _plant(db, "mine-1", set_name="mine", when=self.STALE)
+
+        (group,) = db.unseen_rois(self.CUTOFF)
+        assert group.count == 1
+        assert group.array_id == ARRAY_ID
+        assert db.prune_unseen(self.CUTOFF) == 1
+        assert _sets(db) == {}
+
+    def test_an_imported_row_does_not_inflate_a_real_group(self):
+        db = MetadataDatabase()
+        _plant(db, "ROI:3", when=self.STALE)
+        _plant(db, "mine-1", set_name="mine", when=self.STALE)
+
+        (group,) = db.unseen_rois(self.CUTOFF)
+        assert group.count == 1  # the hand-drawn one, not both
+        assert db.prune_unseen(self.CUTOFF) == 1
+        assert _sets(db) == {"ROI:3": RESERVED}
+
+    def test_the_report_and_the_delete_agree(self):
+        db = MetadataDatabase()
+        _plant(db, "ROI:3", when=self.STALE)
+        _plant(db, "mine-1", set_name="mine", when=self.STALE)
+        _plant(db, "mine-2", set_name="mine", when=self.STALE)
+
+        promised = sum(g.count for g in db.unseen_rois(self.CUTOFF))
+        assert db.prune_unseen(self.CUTOFF) == promised

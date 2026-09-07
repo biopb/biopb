@@ -259,6 +259,22 @@ def is_reserved_set(set_name: str) -> bool:
     return set_name.startswith(RESERVED_SET_PREFIX)
 
 
+# The orphan predicate, bound to `(before, RESERVED_SET_PREFIX)`. One constant
+# rather than the same SQL written twice, because unseen_rois is the dry run for
+# prune_unseen and a difference between them would show a person one set of rows
+# and delete another.
+#
+# Reserved sets are outside the orphan machinery entirely. The clock exists to
+# give hand-drawn work a long grace period before anything deletes it; an
+# imported set is a cache of the source file, so there is nothing to protect and
+# nothing is reclaimed that a re-import would not rebuild. Leaving them in would
+# also let this path delete rows that put_rois and delete_rois refuse to touch,
+# which is not an invariant (biopb/biopb#951).
+_UNSEEN_PREDICATE = (
+    "COALESCE(last_seen_at, created_at) < ? AND NOT starts_with(set_name, ?)"
+)
+
+
 @dataclass(frozen=True)
 class UnseenRois:
     """One tensor's annotations whose source has gone unobserved.
@@ -1610,9 +1626,9 @@ class MetadataDatabase:
             .execute(
                 "SELECT source_id, any_value(source_url), array_id, count(*), "
                 "max(COALESCE(last_seen_at, created_at)) AS seen FROM rois "
-                "WHERE COALESCE(last_seen_at, created_at) < ? "
+                f"WHERE {_UNSEEN_PREDICATE} "
                 "GROUP BY source_id, array_id ORDER BY seen, array_id",
-                [before],
+                [before, RESERVED_SET_PREFIX],
             )
             .fetchall()
         )
@@ -1638,9 +1654,8 @@ class MetadataDatabase:
         conn = self._get_connection()
         with self._write_lock:
             deleted = conn.execute(
-                "DELETE FROM rois WHERE COALESCE(last_seen_at, created_at) < ? "
-                "RETURNING roi_id",
-                [before],
+                f"DELETE FROM rois WHERE {_UNSEEN_PREDICATE} RETURNING roi_id",
+                [before, RESERVED_SET_PREFIX],
             ).fetchall()
         if deleted:
             logger.info("prune_unseen: removed %d annotation(s)", len(deleted))

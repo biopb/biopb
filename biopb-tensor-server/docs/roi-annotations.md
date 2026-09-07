@@ -153,6 +153,20 @@ tensor", which scopes reserved sets out instead: nothing in that request was
 addressed to them, they are not the caller's data, and re-import would restore
 them anyway.
 
+**A reserved set is outside the orphan machinery too** — `unseen_rois` skips it
+and `prune_unseen` will not delete it. The clock exists to give hand-drawn work a
+long grace period before anything removes it; a cache of the source file has
+nothing to protect, and pruning it reclaims nothing a re-import would not
+rebuild. Both share `_UNSEEN_PREDICATE` rather than repeating the SQL, because
+the report is the dry run for the delete and a difference between them would show
+a person one set of rows and remove another.
+
+This one is load-bearing rather than tidy: `prune_unseen` deletes with raw SQL,
+not through `delete_rois`, so it is a second deletion path that the guard above
+does not cover. Without the exclusion the CLI would delete rows the API refuses
+to touch, and `prune-annotations` would count imported copies in the total it
+asks a person to confirm.
+
 ## Schema
 
 New table in `MetadataDatabase._create_schema()`:
