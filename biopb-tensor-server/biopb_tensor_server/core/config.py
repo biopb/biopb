@@ -117,6 +117,8 @@ from biopb_tensor_server.core.discovery import (
     discover_sources as claim_based_discover,
     generate_source_id,
     get_file_identity,
+    local_path_is_rooted,
+    resolve_local_path,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import (
@@ -354,8 +356,9 @@ class SourceConfig:
 
     url: str = field(
         metadata={
-            "help": "URL or path to the data source. Local paths are stable; "
-            "remote URLs (s3://, http(s)://, grpc://) are experimental."
+            "help": "URL or path to the data source. A local path must be "
+            "absolute. Local paths are stable; remote URLs (s3://, http(s)://, "
+            "grpc://) are experimental."
         }
     )
     type: Optional[
@@ -462,6 +465,21 @@ class SourceConfig:
                 f"SourceConfig 'alias' must be slash-free, got: {self.alias!r}"
             )
 
+        # A local url must name a path from a filesystem root. `Path.resolve()`
+        # -- which `local_path` and the `source_id` hash both run -- completes a
+        # rootless path from the *process* cwd, and a server is started by the
+        # control plane, by systemd or by a container entrypoint, each leaving a
+        # different one: the same config would name different directories, under
+        # different source_ids, per launch (biopb/biopb#947). Config parsing
+        # drops such an entry before it reaches here, so this is the backstop for
+        # a programmatic construction.
+        if not _is_remote_url(self.url) and not local_path_is_rooted(self.url):
+            raise ValueError(
+                f"Source 'url' must be a rooted path or a remote URL, got: "
+                f"{self.url!r}. A path with no root is completed from whatever "
+                "directory the server happened to be started in."
+            )
+
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
 
@@ -476,12 +494,16 @@ class SourceConfig:
     def local_path(self) -> Optional[Path]:
         """Return Path if url is a local file path, else None.
 
-        For remote URLs (s3://, http://, etc.), returns None.
-        For local paths, returns the resolved absolute Path.
+        For remote URLs (s3://, http://, etc.), returns None. For a local url --
+        a plain path or a ``file://`` one -- the canonical Path, through the same
+        :func:`resolve_local_path` the ``source_id`` hash uses, so a source's
+        identity and the location it reads can never disagree. ``__post_init__``
+        refuses a rootless url, so the resolution here only folds ``file://``,
+        symlinks and ``..``, never the cwd.
         """
         if _is_remote_url(self.url):
             return None
-        return Path(self.url).resolve()
+        return Path(resolve_local_path(self.url))
 
 
 @dataclass
@@ -1234,6 +1256,36 @@ def _carry(
         dst[field] = cast(value) if cast is not None else value
 
 
+def _normalized_source_url(url: str) -> Optional[str]:
+    """The url to record for a source, or None if it names no fixed location.
+
+    A remote url passes through untouched (``Path`` would mangle the scheme's
+    ``//`` and prepend the cwd) and ``~`` expands -- it used to become
+    ``$PWD/~/...``. Anything else is returned exactly as written: pushing a
+    rooted path through ``Path`` would flip its separators on Windows and take
+    the ``source_id`` with them.
+
+    A url with no root names nothing the server can honor -- there is no anchor
+    it could use that the person writing the config would recognize
+    (biopb/biopb#947) -- so it comes back None for the caller to report.
+    """
+    if _is_remote_url(url):
+        return url
+    if url.startswith("~"):
+        try:
+            expanded = str(Path(url).expanduser())
+        except RuntimeError:
+            # No home directory to expand against: POSIX with no HOME and no
+            # passwd entry, or Windows with neither USERPROFILE nor HOMEPATH (a
+            # service account). `~` then names nothing, which is this function's
+            # None -- the entry is dropped like any other unusable url rather
+            # than taking the whole config load down with a RuntimeError.
+            return None
+    else:
+        expanded = url
+    return expanded if local_path_is_rooted(expanded) else None
+
+
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
     """Build a :class:`ServerConfig` from a raw config dict, checked and clamped.
 
@@ -1459,7 +1511,26 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         if url is None:
             raise ValueError("Source config requires 'url' field")
 
-        src_kwargs: Dict[str, Any] = {"url": url}
+        normalized_url = _normalized_source_url(url)
+        if normalized_url is None:
+            # A relative url has no anchor the server can trust: `Path.resolve`
+            # would take the process cwd, which the control plane, systemd and a
+            # container entrypoint each leave set differently, so the entry names
+            # different data per launch (biopb/biopb#947). Drop it rather than
+            # serve a guess -- at the volume biopb/biopb#608 set for a config
+            # that will never come right on its own, since one bad line must not
+            # keep the other sources off the air. `validate` is the surface that
+            # fails hard on it.
+            logger.error(
+                "NOT SERVING %s: a source url must be a rooted path (or a remote "
+                "URL). A path with no root is completed from whatever directory "
+                "the server was started in, so it names different data per "
+                "launch. This will not resolve until the config is corrected.",
+                url,
+            )
+            continue
+
+        src_kwargs: Dict[str, Any] = {"url": normalized_url}
         _carry(src_kwargs, "type", src_data)  # auto-detected when omitted
         # `source_id` is derived from the resolved URL (a stable content
         # identity), never user-assigned. Honoring an explicit id let two configs
@@ -1545,6 +1616,27 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         if on_key != key and message.startswith(f"{key}="):
             message = f"{on_key}=" + message[len(key) + 1 :]
         problems.append({"path": [on_section, on_key], "message": message})
+
+    # `_build_config` drops a source whose url is not absolute and keeps serving
+    # the rest -- right for a supervised start, wrong here, where a human is
+    # asking whether the file is good. Report the skip, per field, so `validate`
+    # fails and the admin form can mark it (biopb/biopb#947).
+    for src_data in data.get("sources") or []:
+        if not isinstance(src_data, dict):
+            continue
+        url = src_data.get("url") or src_data.get("path")
+        if isinstance(url, str) and url and _normalized_source_url(url) is None:
+            problems.append(
+                {
+                    "path": ["sources", "url"],
+                    "message": (
+                        f"url={url!r}: a source url must be a rooted path or a "
+                        "remote URL. A path with no root is completed from "
+                        "whatever directory the server was started in, so it "
+                        "names different data per launch."
+                    ),
+                }
+            )
     return problems
 
 

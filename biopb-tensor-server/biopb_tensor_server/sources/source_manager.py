@@ -23,6 +23,7 @@ from biopb_tensor_server.core.discovery import (
     discover_sources,
     discover_sources_from_entries,
     generate_source_id,
+    local_path_is_rooted,
     resolve_local_path,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
@@ -1125,12 +1126,27 @@ class SourceManager:
 
         Whole-request problems raise before the first yield:
         ``FileNotFoundError`` / ``PermissionError`` (server-side path check) or
-        ``ValueError`` (remote URL -- runtime add is local-only for now).
+        ``ValueError`` (a remote URL -- runtime add is local-only for now -- or a
+        relative path, which has no anchor on this side of the wire).
         """
         if is_remote_url(url):
             raise ValueError(
                 "Runtime source add supports local filesystem paths only; "
                 f"got remote URL: {url}"
+            )
+
+        # A rootless path has no meaning across the wire: `resolve_local_path`
+        # below would complete it from the *server's* cwd, which the caller does
+        # not know and did not pick (biopb/biopb#947). Same predicate the config
+        # loader uses, for the same reason and from the same place -- and it
+        # judges a `file://` url on the path it carries, which `resolve_local_path`
+        # then strips, so both url forms land on one identity here too. The
+        # drag-drop client always sends a rooted path (Qt's ``QUrl.toLocalFile``),
+        # so this only catches a hand-built call.
+        if not local_path_is_rooted(url):
+            raise ValueError(
+                "Runtime source add requires a rooted path; one without a root "
+                f"would be completed from the server's own directory: {url}"
             )
 
         # Server-side locality/existence check (belt-and-suspenders; the client

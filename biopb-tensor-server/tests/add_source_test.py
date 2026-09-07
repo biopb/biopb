@@ -298,6 +298,40 @@ class TestAddLocalSource:
         with pytest.raises(ValueError, match="local filesystem paths only"):
             _drain(manager.add_local_source("grpc://host:8815/x"))
 
+    @pytest.mark.parametrize("spelling", ["s.zarr", "./s.zarr", "../tmp/s.zarr"])
+    def test_rootless_path_rejected(self, tmp_path, monkeypatch, spelling):
+        """A rootless path over the wire would silently mean the server's cwd.
+
+        The caller cannot see that directory and did not choose it, so the same
+        request means different data depending on how the server was launched
+        (biopb/biopb#947). The path here EXISTS relative to the cwd, so nothing
+        but the explicit check stops it.
+
+        The predicate is `discovery.local_path_is_rooted`, shared with the config
+        loader so the two surfaces cannot drift apart.
+        """
+        _make_zarr(str(tmp_path), "s.zarr")
+        monkeypatch.chdir(tmp_path)
+        manager, _ = _make_manager()
+        with pytest.raises(ValueError, match="rooted path"):
+            _drain(manager.add_local_source(spelling))
+
+    def test_file_url_registers_under_the_path_it_names(self, tmp_path):
+        """`file://` and the plain path are one source, not two.
+
+        `resolve_local_path` strips the scheme, so the url form reaches the same
+        identity -- an id equal to the plain path's, and a second add that
+        deduplicates instead of registering a twin.
+        """
+        zpath = _make_zarr(str(tmp_path), "s.zarr")
+        manager, _ = _make_manager()
+
+        added, *_ = _drain(manager.add_local_source(f"file://{zpath}"))
+        assert len(added) == 1
+
+        again_added, already, _ = _drain(manager.add_local_source(zpath))
+        assert again_added == [] and already == [added[0].source_id]
+
     def test_cancel_keeps_already_committed(self, tmp_path):
         """A cancel between sources stops discovery but keeps what registered."""
         manager, server = _make_manager()
