@@ -298,6 +298,20 @@ class TestAddLocalSource:
         with pytest.raises(ValueError, match="local filesystem paths only"):
             _drain(manager.add_local_source("grpc://host:8815/x"))
 
+    def test_relative_path_rejected(self, tmp_path, monkeypatch):
+        """A relative path over the wire would silently mean the server's cwd.
+
+        The caller cannot see that directory and did not choose it, so the same
+        request means different data depending on how the server was launched
+        (biopb/biopb#947). The path here EXISTS relative to the cwd, so nothing
+        but the explicit check stops it.
+        """
+        _make_zarr(str(tmp_path), "s.zarr")
+        monkeypatch.chdir(tmp_path)
+        manager, _ = _make_manager()
+        with pytest.raises(ValueError, match="absolute path"):
+            _drain(manager.add_local_source("s.zarr"))
+
     def test_cancel_keeps_already_committed(self, tmp_path):
         """A cancel between sources stops discovery but keeps what registered."""
         manager, server = _make_manager()

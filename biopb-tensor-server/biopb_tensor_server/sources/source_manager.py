@@ -1125,12 +1125,23 @@ class SourceManager:
 
         Whole-request problems raise before the first yield:
         ``FileNotFoundError`` / ``PermissionError`` (server-side path check) or
-        ``ValueError`` (remote URL -- runtime add is local-only for now).
+        ``ValueError`` (a remote URL -- runtime add is local-only for now -- or a
+        relative path, which has no anchor on this side of the wire).
         """
         if is_remote_url(url):
             raise ValueError(
                 "Runtime source add supports local filesystem paths only; "
                 f"got remote URL: {url}"
+            )
+
+        # A relative path has no meaning across the wire: it would be anchored
+        # on the *server's* cwd, which the caller does not know and did not pick
+        # (biopb/biopb#947). The drag-drop client always sends an absolute path
+        # (Qt's ``QUrl.toLocalFile``), so this only catches a hand-built call.
+        if not os.path.isabs(url):
+            raise ValueError(
+                "Runtime source add requires an absolute path; a relative one "
+                f"would be resolved against the server's own directory: {url}"
             )
 
         # Server-side locality/existence check (belt-and-suspenders; the client

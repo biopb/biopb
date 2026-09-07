@@ -354,8 +354,9 @@ class SourceConfig:
 
     url: str = field(
         metadata={
-            "help": "URL or path to the data source. Local paths are stable; "
-            "remote URLs (s3://, http(s)://, grpc://) are experimental."
+            "help": "URL or path to the data source. A local path must be "
+            "absolute. Local paths are stable; remote URLs (s3://, http(s)://, "
+            "grpc://) are experimental."
         }
     )
     type: Optional[
@@ -462,6 +463,21 @@ class SourceConfig:
                 f"SourceConfig 'alias' must be slash-free, got: {self.alias!r}"
             )
 
+        # A local url must be absolute. `Path.resolve()` -- which `local_path`
+        # and the `source_id` hash both run -- anchors a relative path on the
+        # *process* cwd, and a server is started by the control plane, by systemd
+        # or by a container entrypoint, each leaving a different one: the same
+        # config would name different directories, under different source_ids,
+        # per launch (biopb/biopb#947). Config parsing drops such an entry before
+        # it reaches here, so this is the backstop for a programmatic
+        # construction.
+        if not _is_remote_url(self.url) and not Path(self.url).is_absolute():
+            raise ValueError(
+                f"Source 'url' must be an absolute path or a remote URL, got: "
+                f"{self.url!r}. A relative path would be resolved against "
+                "whatever directory the server happened to be started in."
+            )
+
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
 
@@ -476,8 +492,10 @@ class SourceConfig:
     def local_path(self) -> Optional[Path]:
         """Return Path if url is a local file path, else None.
 
-        For remote URLs (s3://, http://, etc.), returns None.
-        For local paths, returns the resolved absolute Path.
+        For remote URLs (s3://, http://, etc.), returns None. For local paths,
+        the canonical Path: `url` is already absolute (``__post_init__`` refuses
+        a relative one), so ``resolve()`` here only folds symlinks and ``..``,
+        never the cwd.
         """
         if _is_remote_url(self.url):
             return None
@@ -1234,6 +1252,21 @@ def _carry(
         dst[field] = cast(value) if cast is not None else value
 
 
+def _absolute_source_url(url: str) -> Optional[str]:
+    """The absolute form of a source url, or None if it has no absolute form.
+
+    A remote url passes through untouched (``Path`` would mangle the scheme's
+    ``//`` and prepend the cwd) and ``~`` expands. What is still relative after
+    that names nothing the server can honor -- there is no anchor it could use
+    that the person writing the config would recognize (biopb/biopb#947) -- so it
+    comes back None for the caller to report.
+    """
+    if _is_remote_url(url):
+        return url
+    path = Path(url).expanduser()
+    return str(path) if path.is_absolute() else None
+
+
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
     """Build a :class:`ServerConfig` from a raw config dict, checked and clamped.
 
@@ -1459,7 +1492,26 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         if url is None:
             raise ValueError("Source config requires 'url' field")
 
-        src_kwargs: Dict[str, Any] = {"url": url}
+        absolute_url = _absolute_source_url(url)
+        if absolute_url is None:
+            # A relative url has no anchor the server can trust: `Path.resolve`
+            # would take the process cwd, which the control plane, systemd and a
+            # container entrypoint each leave set differently, so the entry names
+            # different data per launch (biopb/biopb#947). Drop it rather than
+            # serve a guess -- at the volume biopb/biopb#608 set for a config
+            # that will never come right on its own, since one bad line must not
+            # keep the other sources off the air. `validate` is the surface that
+            # fails hard on it.
+            logger.error(
+                "NOT SERVING %s: a source url must be an absolute path (or a "
+                "remote URL). A relative path is resolved against whatever "
+                "directory the server was started in, so it names different data "
+                "per launch. This will not resolve until the config is corrected.",
+                url,
+            )
+            continue
+
+        src_kwargs: Dict[str, Any] = {"url": absolute_url}
         _carry(src_kwargs, "type", src_data)  # auto-detected when omitted
         # `source_id` is derived from the resolved URL (a stable content
         # identity), never user-assigned. Honoring an explicit id let two configs
@@ -1545,6 +1597,27 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         if on_key != key and message.startswith(f"{key}="):
             message = f"{on_key}=" + message[len(key) + 1 :]
         problems.append({"path": [on_section, on_key], "message": message})
+
+    # `_build_config` drops a source whose url is not absolute and keeps serving
+    # the rest -- right for a supervised start, wrong here, where a human is
+    # asking whether the file is good. Report the skip, per field, so `validate`
+    # fails and the admin form can mark it (biopb/biopb#947).
+    for src_data in data.get("sources") or []:
+        if not isinstance(src_data, dict):
+            continue
+        url = src_data.get("url") or src_data.get("path")
+        if isinstance(url, str) and url and _absolute_source_url(url) is None:
+            problems.append(
+                {
+                    "path": ["sources", "url"],
+                    "message": (
+                        f"url={url!r}: a source url must be an absolute path or "
+                        "a remote URL. A relative path is resolved against "
+                        "whatever directory the server was started in, so it "
+                        "names different data per launch."
+                    ),
+                }
+            )
     return problems
 
 
