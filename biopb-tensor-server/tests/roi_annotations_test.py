@@ -6,10 +6,12 @@ per-ROI rev/conflict, the cap -- while one gRPC round-trip and one FastAPI pass
 exercise the wire in each direction.
 """
 
+import json
 import math
 import threading
 import time
 from datetime import datetime, timedelta
+from unittest import mock
 
 import pyarrow.flight as flight
 import pytest
@@ -1244,3 +1246,120 @@ class TestOrphanClock:
             == 1
         )
         assert db.prune_unseen(datetime.now() - timedelta(days=30)) == 1
+
+
+class TestPruneCli:
+    """`prune-annotations`: the escape hatch, and the fact that it needs the server down."""
+
+    @staticmethod
+    def _config(tmp_path, store, **annotations):
+        path = tmp_path / "biopb.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "sources": [],
+                    "annotations": {"store_path": str(store), **annotations},
+                }
+            )
+        )
+        return path
+
+    @staticmethod
+    def _seed(store, *, days_old):
+        db = MetadataDatabase(store_path=store)
+        db.put_rois(ARRAY_ID, [_annotation(label="stale")])
+        db._get_connection().execute(
+            "UPDATE rois SET last_seen_at = ?, created_at = ?, source_url = ?",
+            [
+                datetime.now() - timedelta(days=days_old),
+                datetime.now() - timedelta(days=days_old),
+                "file:///data/plate3.zarr",
+            ],
+        )
+        db.close()
+
+    def _run(self, *args):
+        from biopb_tensor_server.cli import app
+        from typer.testing import CliRunner
+
+        return CliRunner().invoke(app, ["prune-annotations", *args])
+
+    def test_it_reports_without_deleting(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        self._seed(store, days_old=90)
+        config = self._config(tmp_path, store)
+
+        result = self._run(str(config), "--days", "30")
+        assert result.exit_code == 0
+        assert "plate3.zarr" in result.output
+        assert "would be deleted" in result.output
+        assert MetadataDatabase(store_path=store).list_rois(ARRAY_ID)[0]
+
+    def test_apply_deletes(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        self._seed(store, days_old=90)
+        config = self._config(tmp_path, store)
+
+        result = self._run(str(config), "--days", "30", "--apply")
+        assert result.exit_code == 0
+        assert "Deleted 1" in result.output
+        assert MetadataDatabase(store_path=store).list_rois(ARRAY_ID) == ([], False)
+
+    def test_a_fresh_annotation_is_left_alone(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        self._seed(store, days_old=2)
+        config = self._config(tmp_path, store)
+
+        result = self._run(str(config), "--days", "30", "--apply")
+        assert "Nothing unseen" in result.output
+        assert MetadataDatabase(store_path=store).list_rois(ARRAY_ID)[0]
+
+    def test_it_takes_the_threshold_from_the_config(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        self._seed(store, days_old=90)
+        config = self._config(tmp_path, store, prune_unseen_days=30)
+
+        assert "would be deleted" in self._run(str(config)).output
+
+    def test_no_threshold_anywhere_is_refused(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        self._seed(store, days_old=90)
+        config = self._config(tmp_path, store)
+
+        result = self._run(str(config))
+        assert result.exit_code == 2
+        assert "No age threshold" in result.output
+
+    def test_a_session_only_config_has_nothing_to_prune(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        self._seed(store, days_old=90)
+        config = self._config(tmp_path, store, persist=False)
+
+        result = self._run(str(config), "--days", "30")
+        assert result.exit_code == 0
+        assert "nothing on disk" in result.output
+
+    def test_a_catalog_held_open_says_to_stop_the_server(self, tmp_path):
+        # The whole answer to "can I run this while the server is up": no.
+        # DuckDB's lock is exclusive for readers too.
+        store = tmp_path / "catalog.duckdb"
+        self._seed(store, days_old=90)
+        config = self._config(tmp_path, store)
+
+        holder = MetadataDatabase(store_path=store)
+        holder.open()
+        try:
+            with mock.patch.object(
+                metadata_db.MetadataDatabase,
+                "_connect",
+                side_effect=OSError("Conflicting lock is held in ... (PID 1)"),
+            ):
+                result = self._run(str(config), "--days", "30", "--apply")
+        finally:
+            holder.close()
+
+        assert result.exit_code == 1
+        # Rich hard-wraps to the terminal width, so match on flattened text.
+        assert "needs the server stopped" in " ".join(result.output.split())
+        # And nothing was deleted.
+        assert MetadataDatabase(store_path=store).list_rois(ARRAY_ID)[0]

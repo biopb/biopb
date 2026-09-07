@@ -474,6 +474,20 @@ never) rather than a claim about the world. `prune_unseen(before)` applies it an
 `unseen_rois(before)` reports what it would take, per tensor and named by
 `source_url` — one predicate, so a dry run and the real thing cannot drift.
 
+**`biopb-tensor-server prune-annotations <config> --days N` is the escape
+hatch**, and reports unless given `--apply`. It exists because the automatic
+path is off by default and, when on, will not fire until the server has been up
+for the whole threshold — so without it there is no way to clear orphans on
+demand.
+
+**It requires the server to be stopped**, which is worth stating plainly because
+the intuition runs the other way. DuckDB's lock on the catalog is exclusive for
+*readers* as well as writers — `read_only=True` is refused too — so nothing can
+open the file while the server has it. The command detects that case and says
+so rather than surfacing the lock error. Serving this online would mean a
+`roi_prune` Flight action and a client method, which is the natural follow-up if
+stopping the server turns out to be the wrong ask.
+
 Two conditions in `_mark_catalog_complete` are load-bearing:
 
 - **The sweep runs before the delete, in the same pass.** `last_seen_at` does

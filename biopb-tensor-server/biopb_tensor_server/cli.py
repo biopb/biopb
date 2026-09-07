@@ -12,6 +12,7 @@ import os
 import secrets
 import signal
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -1394,6 +1395,126 @@ def list_tensors(
     except Exception as e:
         console.print(f"[red]Error: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
+
+
+@app.command(name="prune-annotations")
+def prune_annotations(
+    config: Path = typer.Argument(
+        ...,
+        exists=True,
+        help="Path to config file (biopb.json)",
+    ),
+    days: Optional[int] = typer.Option(
+        None,
+        "--days",
+        help="Age threshold. Defaults to annotations.prune_unseen_days.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Actually delete. Without it this only reports.",
+    ),
+):
+    """Report, and optionally delete, annotations whose image is gone.
+
+    The manual counterpart to ``annotations.prune_unseen_days``, which is off by
+    default and, when on, only arms after the server has been up longer than the
+    threshold. This is how a person cleans up without waiting for either.
+
+    **The server must be stopped.** DuckDB takes an exclusive lock on the
+    catalog for readers as well as writers, so nothing can read the file while
+    the server has it open.
+
+    Reports by default; ``--apply`` is the one that deletes. Absence is not
+    proof of deletion -- an unmounted drive and a removed image look the same
+    from here -- so the confirmation is the point, not a formality.
+
+    Example:
+        biopb-tensor-server prune-annotations biopb.json --days 30
+        biopb-tensor-server prune-annotations biopb.json --days 30 --apply
+    """
+    server_config = _load_config_or_exit(config)
+    threshold = (
+        days if days is not None else server_config.annotations.prune_unseen_days
+    )
+    if threshold <= 0:
+        console.print(
+            "[red]No age threshold: pass --days, or set "
+            "annotations.prune_unseen_days.[/red]"
+        )
+        raise typer.Exit(2)
+
+    store = _annotation_store_path(server_config, config)
+    if store is None:
+        console.print(
+            "[yellow]This config has no persistent annotation store, so there is "
+            "nothing on disk to prune.[/yellow]"
+        )
+        raise typer.Exit(0)
+    if not store.exists():
+        console.print(f"[yellow]No catalog at {store} yet.[/yellow]")
+        raise typer.Exit(0)
+
+    # The open retries a held lock, which is right for a server racing a restart
+    # but is only noise ahead of a message this command formats itself.
+    logging.getLogger(MetadataDatabase.__module__).setLevel(logging.ERROR)
+
+    db = MetadataDatabase(store_path=store)
+    try:
+        db.open()
+    except AnnotationStoreError as exc:
+        if "Conflicting lock" in str(exc):
+            # Much the likeliest reason to land here, and the server-facing
+            # message ("set persist false") is beside the point for this command.
+            console.print(
+                "[red]The catalog is open in another process -- almost certainly "
+                "the server itself.[/red]\n"
+                "DuckDB's lock is exclusive for readers as well as writers, so "
+                "this command needs the server stopped."
+            )
+        else:
+            console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        console.print(f"\n[dim]{_rich_escape(str(exc.__cause__ or exc))}[/dim]")
+        raise typer.Exit(1) from None
+
+    try:
+        cutoff = datetime.now() - timedelta(days=threshold)
+        groups = db.unseen_rois(cutoff)
+        if not groups:
+            console.print(f"[green]Nothing unseen for {threshold} days.[/green]")
+            return
+
+        table = Table(
+            title=f"Annotations whose source has not been seen in {threshold} days"
+        )
+        table.add_column("Annotations", justify="right", style="cyan")
+        table.add_column("Last seen", style="magenta")
+        table.add_column("Image")
+        table.add_column("Tensor", style="dim")
+        for group in groups:
+            table.add_row(
+                str(group.count),
+                group.last_seen_at.strftime("%Y-%m-%d")
+                if group.last_seen_at
+                else "never",
+                # NULL means the source was never in the catalog while these
+                # were written, so there is no name to give the image.
+                group.source_url or "[red]unknown[/red]",
+                group.array_id,
+            )
+        console.print(table)
+
+        total = sum(g.count for g in groups)
+        if not apply:
+            console.print(
+                f"\n[yellow]{total} annotation(s) would be deleted. "
+                f"Re-run with --apply to do it.[/yellow]"
+            )
+            return
+
+        console.print(f"[red]Deleted {db.prune_unseen(cutoff)} annotation(s).[/red]")
+    finally:
+        db.close()
 
 
 @app.command()
