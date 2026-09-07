@@ -274,9 +274,10 @@ whole overlay there would re-tessellate every annotation on every mouse move
 (the same cost the plane-switch rebuild pays).
 
 **Shapes authored in v1:** point, rectangle, polygon, polyline. Ellipse is
-**render-only** — the store accepts one and another client may write one, but the
-proto's `Ellipse{center, radius}` is axis-aligned with no rotation, so authoring
-it earns little.
+**render-only** — the store accepts one, another client may write one, and the
+overlay draws it at its `rotation` (biopb#935) — but drawing one by hand wants a
+rotate handle, which is the drag-editing machinery v1 does not have. Until then
+a rectangle drag would only ever produce the axis-aligned case.
 
 **Writes are per completed shape, with `check_rev` on.** Not a global Save button:
 per-shape writes make a conflict actionable (`RoiPutResult.conflicts` names the

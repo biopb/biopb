@@ -145,14 +145,18 @@ export function roiRing(geometry: RoiGeometry, segments = ELLIPSE_SEGMENTS): XY[
       ];
     }
     case "ellipse": {
-      const { center, radius } = geometry;
+      const { center, radius, rotation } = geometry;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
       const ring: XY[] = [];
       for (let i = 0; i < segments; i++) {
         const theta = (2 * Math.PI * i) / segments;
-        // Axis-aligned: biopb.image.Ellipse carries no rotation (biopb#935).
-        // When it gains one, it rotates this pair about the centre and nothing
-        // else here changes.
-        ring.push([center.x + radius.x * Math.cos(theta), center.y + radius.y * Math.sin(theta)]);
+        const x = radius.x * Math.cos(theta);
+        const y = radius.y * Math.sin(theta);
+        // Rotated about the centre. Y grows downward in image coordinates, so a
+        // positive rotation reads clockwise on screen -- the same convention
+        // the geometry is stored in, not a separate screen-space one.
+        ring.push([center.x + x * cos - y * sin, center.y + x * sin + y * cos]);
       }
       return ring;
     }

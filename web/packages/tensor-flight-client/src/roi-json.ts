@@ -101,7 +101,12 @@ export function decodeRoiGeometry(value: unknown): RoiGeometry | null {
   }
   if (roi.ellipse !== undefined) {
     const e = obj(roi.ellipse);
-    return { kind: "ellipse", center: decodePoint(e.center), radius: decodePoint(e.radius) };
+    return {
+      kind: "ellipse",
+      center: decodePoint(e.center),
+      radius: decodePoint(e.radius),
+      rotation: num(e.rotation),
+    };
   }
   if (roi.polygon !== undefined) {
     return { kind: "polygon", points: decodePoints(obj(roi.polygon).points) };
@@ -126,7 +131,11 @@ export function encodeRoiGeometry(geometry: RoiGeometry): Json {
       };
     case "ellipse":
       return {
-        ellipse: { center: encodePoint(geometry.center), radius: encodePoint(geometry.radius) },
+        ellipse: {
+          center: encodePoint(geometry.center),
+          radius: encodePoint(geometry.radius),
+          rotation: geometry.rotation,
+        },
       };
     case "polygon":
       return { polygon: { points: geometry.points.map(encodePoint) } };

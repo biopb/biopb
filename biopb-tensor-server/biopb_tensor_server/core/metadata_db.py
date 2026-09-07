@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -251,7 +252,15 @@ def _roi_bbox(roi, shape_kind: str) -> List[float]:
         return [min(xs), min(ys), max(xs), max(ys)]
     if shape_kind == "ellipse":
         c, r = roi.ellipse.center, roi.ellipse.radius
-        return [c.x - abs(r.x), c.y - abs(r.y), c.x + abs(r.x), c.y + abs(r.y)]
+        # Half-extents of the rotated ellipse's axis-aligned bounding box. The
+        # supporting extent along x is max over t of |rx*cos(t)*cos(rot) -
+        # ry*sin(t)*sin(rot)|, which is the hypotenuse of the two terms; y is
+        # the same with the angles exchanged. At rot=0 this is (|rx|, |ry|), so
+        # the boxes already stored are unchanged.
+        cos, sin = math.cos(roi.ellipse.rotation), math.sin(roi.ellipse.rotation)
+        hx = math.hypot(r.x * cos, r.y * sin)
+        hy = math.hypot(r.x * sin, r.y * cos)
+        return [c.x - hx, c.y - hy, c.x + hx, c.y + hy]
     if shape_kind == "polyline":
         points = roi.polyline.points
         if len(points) < 2:

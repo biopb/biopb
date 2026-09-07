@@ -127,11 +127,24 @@ describe("hitsRoi", () => {
       kind: "ellipse",
       center: { x: 50, y: 50 },
       radius: { x: 20, y: 10 },
+      rotation: 0,
     };
     expect(hitsRoi(roi(ellipse), [50, 50], 1)).toBe(true);
     expect(hitsRoi(roi(ellipse), [50, 45], 1)).toBe(true);
     // Inside the bounding box, outside the ellipse.
     expect(hitsRoi(roi(ellipse), [68, 58], 1)).toBe(false);
+  });
+
+  it("follows a rotated ellipse rather than its unrotated footprint", () => {
+    const turned: RoiGeometry = {
+      kind: "ellipse",
+      center: { x: 50, y: 50 },
+      radius: { x: 20, y: 10 },
+      rotation: Math.PI / 2,
+    };
+    // Along the long axis, which the quarter turn moved from x to y.
+    expect(hitsRoi(roi(turned), [50, 66], 1)).toBe(true);
+    expect(hitsRoi(roi(turned), [66, 50], 1)).toBe(false);
   });
 });
 
