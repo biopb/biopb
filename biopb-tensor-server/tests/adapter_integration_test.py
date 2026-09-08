@@ -1016,12 +1016,20 @@ class TestBioioReadPath:
             # BioIO still serves the layouts that adapter declines, which is the
             # read path `source_type` exercises here.
             ("bioio_czi", ".czi", "zeiss", "czi"),
-            ("bioio_nd2", ".nd2", "nikon", "nikon"),
-            ("bioio_lif", ".lif", "leica", "leica"),
+            # A local .nd2/.lif is claimed by the native Nd2Adapter/LifAdapter
+            # instead (biopb/biopb#799 phase 3), with no decline case for a
+            # resident file -- unlike CZI, BioIO's NikonAdapter/LeicaAdapter
+            # never win the local claim, so `claim_type` differs from
+            # `source_type` here (what the directly-constructed BioIO class
+            # still reports) rather than matching it.
+            ("bioio_nd2", ".nd2", "nikon", "nd2"),
+            ("bioio_lif", ".lif", "leica", "lif"),
         ],
     )
     def test_vendor_fixture_read_via_bioio(self, plugin, ext, source_type, claim_type):
-        """A real CZI/ND2/LIF sample claims + reads through its adapter.
+        """A real CZI/ND2/LIF sample claims natively; BioIO still reads it when
+        constructed directly (the ``[aics]`` extra's read path, independent of
+        discovery routing).
 
         Skips cleanly when the plugin is absent (slim install) or no sample is
         provisioned, so it never fails spuriously -- but catches a dropped
