@@ -527,10 +527,12 @@ class Reconciler:
             self._clear_failed_source_attempt(claim.source_id)
 
         logger.info(f"Refreshed source: {claim.source_id}")
-        # Precache only when the content_version moved. The rebuild is cheap and
-        # runs unconditionally, but a warm re-reads the whole source -- and an
-        # unmoved token means the cache namespace did not move either, so what
-        # is already warm is still what a read would look up.
+        # Precache only when the content_version moved. An unmoved token means
+        # unchanged chunk_ids, so a warm would hit the cache for every chunk and
+        # read nothing -- but it would still walk the whole chunk grid on the
+        # precache thread, waiting for the server to go idle between chunks
+        # (PrecacheWorker._warm_level). Worth skipping when a folder of unchanged
+        # sources is re-dropped; the saving is queue time, not I/O.
         now = getattr(
             self._server.sources.get(claim.source_id), "content_version", None
         )

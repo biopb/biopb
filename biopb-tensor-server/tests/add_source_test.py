@@ -669,9 +669,9 @@ class TestReDropRebuilds:
         assert server.sources.get(sid).content_version != before
 
     def test_rebuild_precaches_only_when_the_version_moved(self, tmp_path):
-        """A warm re-reads the whole source. An unmoved content_version means
-        the cache namespace did not move either, so what is warm is still what
-        a read would look up."""
+        """An unchanged token means unchanged chunk_ids, so a warm would hit
+        the cache for every chunk -- but it still walks the whole grid on the
+        precache thread. A bulk re-drop should not queue that per source."""
         manager, _ = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
         _drain(manager.add_local_source(zpath))
