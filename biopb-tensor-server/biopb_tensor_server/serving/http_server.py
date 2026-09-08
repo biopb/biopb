@@ -755,8 +755,14 @@ def _scale_magnitude(scale: Sequence[int]) -> int:
 
 def _advertised_levels(
     client: TensorFlightClient, td: Any, version: Optional[str]
-) -> Tuple[_Level, ...]:
-    """The server's pyramid for *td*, coarsest first; ``()`` when it advertises none.
+) -> Optional[Tuple[_Level, ...]]:
+    """The server's pyramid for *td*, coarsest first.
+
+    ``()`` when the server advertises no coarser level; **``None`` when the
+    ladder could not be learned**. :func:`_tile_read` reads the two
+    differently, because "this tensor has no coarser level" is a fact about a
+    tensor the planner left at full resolution -- under ``plane_max_pixels`` by
+    construction -- where "we do not know" says nothing about the size.
 
     Fetched with a second ``get_descriptor`` rather than by flipping the
     ``with_pyramid=False`` in :func:`_tensor_desc_by_array_id`: that one runs on
@@ -776,7 +782,10 @@ def _advertised_levels(
     Level 0 is dropped: an identity scale names full resolution, which is what a
     caller gets without asking for a level at all. A level whose arity does not
     match the shape is dropped rather than raised on -- a ladder this cannot read
-    is one this route does not use, and the tile still has to be served.
+    is one this route does not use, and the tile still has to be served. Where
+    that drops *every* coarser rung the answer is ``None``, not ``()``: the
+    server has a ladder and this route cannot address it, which is the unknown
+    case and not the full-resolution one.
     """
     key = td.array_id
     if version is not None:
@@ -793,7 +802,7 @@ def _advertised_levels(
         # reading the rung itself. Not cached, so a transient failure does not
         # pin the tensor to the slow path for the life of the process.
         logger.debug("tile: pyramid fetch failed for %s", key, exc_info=True)
-        return ()
+        return None
 
     levels = [
         _Level(
@@ -804,13 +813,17 @@ def _advertised_levels(
         )
         for level in pyramid
     ]
+    coarser = [level for level in levels if any(int(s) > 1 for s in level.scale)]
     levels = [
         level
-        for level in levels
-        if len(level.scale) == ndim
-        and all(s >= 1 for s in level.scale)
-        and any(s > 1 for s in level.scale)
+        for level in coarser
+        if len(level.scale) == ndim and all(s >= 1 for s in level.scale)
     ]
+    if coarser and not levels:
+        # Not memoized, for the same reason a failed fetch is not: nothing here
+        # is a fact about the content, so a stored answer would outlive it.
+        logger.debug("tile: no addressable pyramid level for %s", key)
+        return None
     levels.sort(key=lambda level: _scale_magnitude(level.scale), reverse=True)
     result = tuple(levels)
 
@@ -931,7 +944,7 @@ def _tile_read(
     y_idx: int,
     x_idx: int,
     level: int,
-    levels: Sequence[_Level],
+    levels: Optional[Sequence[_Level]],
 ) -> _TileRead:
     """Serve one rung from the coarsest advertised level that divides it.
 
@@ -954,7 +967,15 @@ def _tile_read(
     above it is still reduced from there. That is the shape the old
     ``warm_level == 0`` case had, kept because it is the right one -- reducing
     in-process reuses the level-0 chunks every other rung reads, where asking
-    the data plane for the scale mints a second entry that nothing warmed.
+    the data plane for the scale mints a second entry that nothing warmed. It is
+    also only ever a small read: the planner leaves a tensor at full resolution
+    exactly when its plane already fits ``plane_max_pixels``.
+
+    ``levels is None`` -- the ladder is *unknown*, not empty -- takes none of
+    that. The full-resolution anchor is bounded by the tensor rather than by
+    that gate, and it puts the whole level-0 window on the wire to make one
+    tile; the rung itself is read instead, where the data plane streams the
+    reduction and sends only the reduced bytes.
 
     A level whose stored extent disagrees with the grid's arithmetic is skipped
     (:func:`_level_matches_grid`), so a rung never promises pixels the store does
@@ -978,6 +999,8 @@ def _tile_read(
     client following the advertised pyramid already gets, and the reason the
     pyramid is worth reading at all.
     """
+    if levels is None:
+        return _TileRead(None, level, None, None)
     target = [1] * len(shape)
     target[y_idx] = target[x_idx] = 1 << level
     picked = _pick_level(
@@ -996,6 +1019,51 @@ def _tile_read(
         residual[y_idx] = residual[x_idx] = 1 << level
         return _TileRead([1] * len(shape), None, None, residual)
     return _TileRead(None, level, None, None)
+
+
+def _reduce_residual(arr_lazy: Any, residual: Sequence[int]) -> np.ndarray:
+    """Apply a :class:`_TileRead` residual, one unit at a time.
+
+    A residual read covers ``residual`` times the tile on every axis, so
+    materialising it whole is what bounds this route's memory -- and the only
+    thing bounding *that* is the level being read. A computed ladder caps its
+    coarsest rung at ``plane_max_pixels``, but a native pyramid is advertised
+    *instead of* that plan (``adapter_base._advertised_pyramid``) and may stop
+    coarsening early: a slide with levels to 16x tops its tile ladder out at one
+    6250x12500 tile -- 156 MB, doubled by the response copy and paid per
+    concurrent request. ``_volume_plan`` already refuses to trust a native
+    coarsest level's size for the same reason (biopb/biopb#891).
+
+    Reading the rung itself instead is not the answer here: the level is not
+    advertised, so the adapter would decimate full resolution on the fly, which
+    on that slide is the whole level-0 plane per tile.
+
+    A unit is the read's own delivered chunk, raised to whole reduction blocks,
+    so this costs nothing where it does not bite: a window inside one chunk --
+    every rung of a computed ladder -- is a single fetch and the work it always
+    was. :func:`~.stream_reduce.stream_reduce` is byte-identical to reducing the
+    extent whole, because a unit never splits a reduction block.
+    """
+    from biopb_tensor_server.core.stream_reduce import stream_reduce, streaming_unit
+
+    extent = tuple(int(dim) for dim in arr_lazy.shape)
+    factors = tuple(max(1, int(factor)) for factor in residual)
+    return stream_reduce(
+        lambda start, stop: np.asarray(
+            arr_lazy[
+                tuple(slice(lo, hi) for lo, hi in zip(start, stop, strict=True))
+            ].compute()
+        ),
+        start=(0,) * len(extent),
+        stop=extent,
+        tensor_shape=extent,
+        unit=streaming_unit(
+            extent, [max(sizes) for sizes in arr_lazy.chunks], None, factors
+        ),
+        scale_hint=factors,
+        reduction_method="nearest",
+        dtype=str(arr_lazy.dtype),
+    )
 
 
 # -- Volume (3-D) -----------------------------------------------------------
@@ -2067,7 +2135,10 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
         # delivery mechanism -- no new field, no client change (biopb/biopb#780).
         td, version = _tensor_desc_by_array_id(client, array_id)
         candidates = [] if td is not None else _tensor_candidates(client, array_id)
-        levels = () if td is None else _advertised_levels(client, td, version)
+        # `or ()`: a ladder this route could not learn leaves the volume plan
+        # and the published grid where they would be with none -- full
+        # resolution -- which is the conservative answer for both.
+        levels = () if td is None else (_advertised_levels(client, td, version) or ())
     except HTTPException:
         raise
     except Exception as exc:
@@ -2245,7 +2316,6 @@ async def get_tile(
         )
 
     from biopb_tensor_server.core.axes import plane_axes
-    from biopb_tensor_server.core.downsample import downsample_block
 
     shape = [int(d) for d in td.shape]
     dim_labels = list(td.dim_labels)
@@ -2345,10 +2415,9 @@ async def get_tile(
             scale_hint=scale_hint,
             reduction_method=plan.method,
         )
-        arr = _normalize_array(arr_lazy.compute())
         if plan.residual is None:
-            return arr
-        return _normalize_array(downsample_block(arr, tuple(plan.residual), "nearest"))
+            return _normalize_array(arr_lazy.compute())
+        return _normalize_array(_reduce_residual(arr_lazy, plan.residual))
 
     try:
         # Off the event loop, and not only to keep this request responsive: a
@@ -2445,7 +2514,9 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         # Only a delegating read needs the ladder, and fetching it costs a
         # descriptor call on a cold cache -- so a caller that named its own
         # scale does not pay for one.
-        levels = _advertised_levels(client, td, version) if req.scale_policy else ()
+        levels = (
+            (_advertised_levels(client, td, version) or ()) if req.scale_policy else ()
+        )
         scale_hint, scale_method = _resolve_scale(req, td, levels)
 
         # Last chance to skip the read, and the one that matters most on this

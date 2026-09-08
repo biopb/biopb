@@ -11,13 +11,16 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import dask.array as da
 import numpy as np
 import pyarrow.flight as flight
 import pytest
+from biopb_tensor_server.core.downsample import downsample_block
 from biopb_tensor_server.serving.http_server import (
     _ADVERTISED,
     _advertised_levels,
     _Level,
+    _reduce_residual,
     _split_array_version,
     _tile_edge,
     _tile_levels,
@@ -31,6 +34,21 @@ from fastapi.testclient import TestClient
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+
+def _raise(exc):
+    """Raise from inside a lambda -- for a side_effect that fails selectively."""
+    raise exc
+
+
+def _lazy_plane(shape=(1, 1, 1, 512, 512), dtype=np.uint16, chunks=None):
+    """What ``get_tensor`` returns: a lazy array of zeros, one chunk by default.
+
+    One chunk is what a tile read of a single delivered chunk is, and it keeps
+    the residual a single fetch -- the shape every fixture here reads at.
+    """
+    arr = np.zeros(tuple(int(dim) for dim in shape), dtype=dtype)
+    return da.from_array(arr, chunks=chunks or arr.shape)
 
 
 @pytest.fixture(autouse=True)
@@ -146,11 +164,10 @@ def _build_mock_client(src_desc=None) -> MagicMock:
         "full_scan_in_progress": False,
     }
 
-    # get_tensor → lazy array whose .compute() returns a numpy array
-    arr = np.zeros(src.tensors[0].shape, dtype=src.tensors[0].dtype)
-    lazy = MagicMock()
-    lazy.compute.return_value = arr
-    mc.get_tensor.return_value = lazy
+    # get_tensor → a lazy array. Real, not a MagicMock: the residual path
+    # slices it (`_reduce_residual` streams the reduction), so `.compute()` is
+    # no longer the whole of a lazy array's behaviour.
+    mc.get_tensor.return_value = _lazy_plane(src.tensors[0].shape, src.tensors[0].dtype)
 
     # _sources is accessed directly in the slice route for dim_labels
     mc._sources = {src.source_id: src}
@@ -1487,9 +1504,7 @@ def tile_client():
     """TestClient over a tiled tensor; compute() yields one 512x512 plane."""
     src = _tile_source_desc()
     mock_fc = _build_mock_client(src)
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_tensor.return_value = _lazy_plane()
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -1947,10 +1962,7 @@ def _tile_client_for(dim_labels, shape):
     )
     src = _make_source_desc(source_id="s", tensors=[td])
     mock_fc = _build_mock_client(src)
-    plane = np.zeros([1] * (len(shape) - 2) + [8, 8], dtype=np.uint16)
-    lazy = MagicMock()
-    lazy.compute.return_value = plane
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_tensor.return_value = _lazy_plane([1] * (len(shape) - 2) + [8, 8])
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -2174,9 +2186,7 @@ def _multi_tensor_client():
     ]
     src = _make_source_desc(source_id="multi", tensors=tensors)
     mock_fc = _build_mock_client(src)
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_tensor.return_value = _lazy_plane()
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -2325,9 +2335,7 @@ class TestTileArrayIdAddressing:
 def _versioned_tile_client(content_version):
     """A tile client whose source publishes *content_version* (or None)."""
     mock_fc = _build_mock_client(_tile_source_desc(content_version))
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_tensor.return_value = _lazy_plane()
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -2443,9 +2451,7 @@ class TestVersionedTileRequests:
             mock_fc = _build_mock_client(_tile_source_desc(listing_cv))
             fresh = _tile_source_desc(descriptor_cv).tensors[0]
             mock_fc.get_descriptor.side_effect = lambda aid, **k: fresh
-            lazy = MagicMock()
-            lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-            mock_fc.get_tensor.return_value = lazy
+            mock_fc.get_tensor.return_value = _lazy_plane()
             return mock_fc
 
         def serve(mock_fc, fn):
@@ -2940,9 +2946,7 @@ def native_tile_client():
     """The tile fixture, but shipping a real 3-level on-disk pyramid."""
     src = _native_source_desc()
     mock_fc = _build_mock_client(src)
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_tensor.return_value = _lazy_plane()
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -3024,6 +3028,135 @@ class TestTileReadPicksALevel:
             self.SHAPE, 3, 4, 3, self._levels(4, native=False, method="nearest")
         )
         assert plan.method == "nearest"
+
+    def test_an_unknown_ladder_reads_the_rung_itself(self):
+        """`None` is not `[]`.
+
+        An empty ladder is a tensor the planner left at full resolution, whose
+        plane is under `plane_max_pixels` -- reducing from level 0 there is a
+        small read. An unknown one says nothing about the size, so the rung is
+        read at its own scale and the data plane streams the reduction.
+        """
+        plan = _tile_read(self.SHAPE, 3, 4, 2, None)
+        assert plan.scale_hint is None
+        assert plan.read_level == 2
+        assert plan.residual is None
+
+
+class TestAnUnknownLadderIsNotAnEmptyOne:
+    """`_advertised_levels` distinguishes "no coarser level" from "we do not know"."""
+
+    @staticmethod
+    def _client(pyramid=None, fail=False):
+        client = MagicMock()
+        if fail:
+            client.get_descriptor.side_effect = RuntimeError("flight down")
+        else:
+            client.get_descriptor.return_value = SimpleNamespace(pyramid=pyramid or [])
+        return client
+
+    def test_a_failed_fetch_is_unknown(self):
+        td = SimpleNamespace(array_id="a", shape=[1, 3, 16, 1024, 1024])
+        assert _advertised_levels(self._client(fail=True), td, "v1") is None
+
+    def test_a_level_zero_only_ladder_is_empty(self):
+        # The planner's answer for a plane already under plane_max_pixels: one
+        # identity level, dropped -- and nothing unknown about it.
+        td = SimpleNamespace(array_id="a", shape=[1, 3, 16, 1024, 1024])
+        pyramid = [_pyramid_level([1, 1, 1, 1, 1], [1, 3, 16, 1024, 1024])]
+        assert _advertised_levels(self._client(pyramid), td, "v1") == ()
+
+    def test_a_ladder_this_route_cannot_address_is_unknown(self):
+        # Every coarser rung dropped (arity disagrees with the shape), so the
+        # server has a ladder and this route cannot use it.
+        td = SimpleNamespace(array_id="a", shape=[1, 3, 16, 1024, 1024])
+        pyramid = [_pyramid_level([2, 2], [512, 512])]
+        assert _advertised_levels(self._client(pyramid), td, "v1") is None
+
+    def test_an_unknown_ladder_is_not_memoized(self):
+        td = SimpleNamespace(array_id="a", shape=[1, 3, 16, 1024, 1024])
+        client = self._client(fail=True)
+        for _ in range(3):
+            assert _advertised_levels(client, td, "v1") is None
+        assert client.get_descriptor.call_count == 3
+
+    def test_the_tile_route_reads_the_rung_when_the_ladder_fails(
+        self, native_tile_client
+    ):
+        """End to end: the whole level-0 window must not cross the wire."""
+        tc, mock_fc = native_tile_client
+        mock_fc.get_descriptor.side_effect = lambda aid, **kw: (
+            _raise(RuntimeError("flight down"))
+            if kw.get("with_pyramid")
+            else _native_source_desc().tensors[0]
+        )
+        r = tc.get("/api/tile/native", params={"level": 3, "col": 0, "row": 0})
+        assert r.status_code == 200
+        kwargs = mock_fc.get_tensor.call_args.kwargs
+        # The rung's own scale, not [1,1,1,1,1] with a residual of 8.
+        assert kwargs["scale_hint"] == [1, 1, 1, 8, 8]
+        assert r.headers["X-Shape"] == "1,1,1,512,512"
+
+
+class _RecordingLazy:
+    """A lazy array that records the extent of every unit fetched from it."""
+
+    def __init__(self, arr, chunks):
+        self._arr = da.from_array(arr, chunks=chunks)
+        self.fetched = []
+
+    @property
+    def shape(self):
+        return self._arr.shape
+
+    @property
+    def dtype(self):
+        return self._arr.dtype
+
+    @property
+    def chunks(self):
+        return self._arr.chunks
+
+    def __getitem__(self, key):
+        block = self._arr[key]
+        self.fetched.append(block.shape)
+        return block
+
+
+class TestTheResidualIsStreamed:
+    """A residual read is `residual`x the tile per axis; it is never held whole.
+
+    Nothing bounds that window but the level being read, and a native pyramid
+    that stops coarsening early makes the top rung hundreds of MB
+    (biopb/biopb#891 is the same gap on the volume plan).
+    """
+
+    DATA = np.arange(1 * 1 * 1 * 300 * 500, dtype=np.uint16).reshape(1, 1, 1, 300, 500)
+    RESIDUAL = [1, 1, 1, 4, 4]
+
+    def test_it_is_identical_to_reducing_the_extent_whole(self):
+        streamed = _reduce_residual(
+            da.from_array(self.DATA, chunks=(1, 1, 1, 64, 64)), self.RESIDUAL
+        )
+        np.testing.assert_array_equal(
+            streamed, downsample_block(self.DATA, tuple(self.RESIDUAL), "nearest")
+        )
+        assert streamed.dtype == self.DATA.dtype
+
+    def test_no_unit_holds_the_whole_extent(self):
+        lazy = _RecordingLazy(self.DATA, chunks=(1, 1, 1, 64, 64))
+        _reduce_residual(lazy, self.RESIDUAL)
+        assert len(lazy.fetched) > 1
+        # The chunk grid, raised to whole reduction blocks (64 is one already).
+        assert max(np.prod(shape) for shape in lazy.fetched) <= 64 * 64
+        assert sum(np.prod(shape) for shape in lazy.fetched) == self.DATA.size
+
+    def test_a_window_inside_one_chunk_is_a_single_fetch(self):
+        """The common case pays nothing: every rung of a computed ladder is one
+        delivered chunk, and streaming it is the work it always was."""
+        lazy = _RecordingLazy(self.DATA, chunks=self.DATA.shape)
+        _reduce_residual(lazy, self.RESIDUAL)
+        assert lazy.fetched == [self.DATA.shape]
 
 
 class TestNativeLevelsOnTheTileRoute:
