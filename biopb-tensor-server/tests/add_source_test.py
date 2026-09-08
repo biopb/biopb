@@ -668,10 +668,10 @@ class TestReDropRebuilds:
 
         assert server.sources.get(sid).content_version != before
 
-    def test_rebuild_precaches_only_when_the_version_moved(self, tmp_path):
-        """An unchanged token means unchanged chunk_ids, so a warm would hit
-        the cache for every chunk -- but it still walks the whole grid on the
-        precache thread. A bulk re-drop should not queue that per source."""
+    def test_rebuild_always_offers_the_source_to_precache(self, tmp_path):
+        """A drop is the user saying they care about this data, and the cache
+        evicts under LRU -- so an unchanged re-drop is still worth warming. It
+        costs little: the chunk_ids are identical, so the warm hits."""
         manager, _ = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
         _drain(manager.add_local_source(zpath))
@@ -679,12 +679,12 @@ class TestReDropRebuilds:
         committed = []
         manager._reconciler._notify_source_committed = committed.append
 
-        _drain(manager.add_local_source(zpath))
-        assert committed == [], "an unchanged re-drop re-warmed the source"
-
-        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
         _, _, refreshed, _, _ = _drain_all(manager.add_local_source(zpath))
         assert committed == refreshed
+
+        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
+        _, _, refreshed_again, _, _ = _drain_all(manager.add_local_source(zpath))
+        assert committed == refreshed + refreshed_again
 
     def test_rebuild_keeps_the_dnd_display_root(self, tmp_path):
         """Re-deriving the url would hand the source its native ``file://`` one

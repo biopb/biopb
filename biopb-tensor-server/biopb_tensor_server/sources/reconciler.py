@@ -496,7 +496,6 @@ class Reconciler:
         # promise that nothing will re-add it.
         live = self._server.sources.get(claim.source_id)
         catalog_url = getattr(live, "_catalog_url", None) if live is not None else None
-        was = getattr(live, "content_version", None) if live is not None else None
 
         if not self._register_source_claim(
             claim, catalog_url=catalog_url, replace=True
@@ -527,17 +526,13 @@ class Reconciler:
             self._clear_failed_source_attempt(claim.source_id)
 
         logger.info(f"Refreshed source: {claim.source_id}")
-        # Precache only when the content_version moved. An unmoved token means
-        # unchanged chunk_ids, so a warm would hit the cache for every chunk and
-        # read nothing -- but it would still walk the whole chunk grid on the
-        # precache thread, waiting for the server to go idle between chunks
-        # (PrecacheWorker._warm_level). Worth skipping when a folder of unchanged
-        # sources is re-dropped; the saving is queue time, not I/O.
-        now = getattr(
-            self._server.sources.get(claim.source_id), "content_version", None
-        )
-        if now != was:
-            self._notify_source_committed(claim.source_id)
+        # Warm unconditionally, exactly as a fresh add does -- not only when the
+        # content_version moved. A drop is the user saying they care about this
+        # data, and the cache evicts under LRU, so an unchanged source can still
+        # have holes a warm would refill. Costs little when there are none: an
+        # unmoved token leaves every chunk_id, and so every cache key, identical,
+        # and resolve_chunk_data calls compute_fn only on a miss.
+        self._notify_source_committed(claim.source_id)
         return True
 
     def _commit_remove_source(self, source_id: str) -> bool:
