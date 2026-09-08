@@ -197,6 +197,24 @@ bulk, and it would keep annotations visible on
 appear on. Safe because the derivation reads the adapter's fresh
 `get_metadata()` return, never the stored column.
 
+**The adapter also resolves the join.** An OME ROI names an *image*; the store
+anchors to an `array_id`. Relating the two is a fact about the format, not
+something the shared parser can infer from strings, so `imported_annotations`
+takes a resolved `image_id -> (array_id, dim_labels)` map and the adapter builds
+it: `tensors_by_field` for OME-TIFF, where `_ome_scene_ids` puts the OME image
+id straight into the array_id's field half, and `tensors_by_image_order` for
+bioio, whose fields are named by `BioImage.scenes` — a CZI scene label, an ND2
+point name — so equality would match nothing at all. Position is what
+`_build_tensor_descriptors` already pairs those on, behind the same length
+guard; an unequal count pairs nothing, because an unknown correspondence beats a
+wrong one.
+
+Latent rather than live: probing the readers, bioio-czi names its scenes
+`Scene:N` but reports no `rois`, while bioio-ome-tiff does report them and names
+its scenes `Image:N` — so equality happens to work there. Both conditions have
+to hold, and `bioformats`, whose job is synthesising OME ROIs from vendor
+formats, is where they plausibly would.
+
 **The format decides, through the adapter API.** `SourceAdapter.get_embedded_rois`
 returns `({}, None)` by default; `OmeTiffAdapter` and `_BioioAdapterBase` (hence
 every vendor subclass) implement it. The server does not police what

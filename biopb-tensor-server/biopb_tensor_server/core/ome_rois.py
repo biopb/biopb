@@ -322,19 +322,66 @@ def _axis_index(dim_labels: Sequence[str]) -> Dict[str, int]:
     return index
 
 
+Tensor = Tuple[str, Sequence[str]]
+
+
+def tensors_by_field(tensors: Sequence[Tensor]) -> Dict[str, Tensor]:
+    """Index tensors by the field half of their ``array_id``.
+
+    For OME-TIFF that field IS the OME image id: ``_ome_scene_ids`` reads the
+    ``Image`` ``ID`` attributes verbatim and ``array_id`` is
+    ``f"{source_id}/{scene_id}"``. So the match is string equality, with no
+    inference. Its one failure mode is that function's documented fallback to
+    positional ``Image:{i}`` on a count mismatch, where the two id spaces
+    disagree -- the misses are then counted, not assumed away.
+    """
+    return {array_id.partition("/")[2]: (array_id, dims) for array_id, dims in tensors}
+
+
+def tensors_by_image_order(
+    metadata: Mapping[str, Any], tensors: Sequence[Tensor]
+) -> Dict[str, Tensor]:
+    """Pair OME images to tensors by position.
+
+    For a reader whose field names are its OWN scene names rather than the OME
+    image ids -- bioio, whose ``array_id`` field comes from
+    ``BioImage.scenes`` and can be a CZI scene label or an ND2 point name --
+    equality on the id would match nothing at all. Position is the relation the
+    adapter already relies on: ``_build_tensor_descriptors`` pairs
+    ``ome_meta.images[i]`` with ``scene_ids[i]`` behind the same length guard
+    used here.
+
+    An unequal count means the correspondence is unknown, so nothing is paired
+    rather than something being paired wrongly.
+    """
+    images = metadata.get("images") or []
+    if not isinstance(images, (list, tuple)) or len(images) != len(tensors):
+        return {}
+    return {
+        str(image["id"]): tensor
+        for image, tensor in zip(images, tensors, strict=True)
+        if isinstance(image, Mapping) and image.get("id") is not None
+    }
+
+
 def imported_annotations(
     metadata: Mapping[str, Any],
-    tensors: Sequence[Tuple[str, Sequence[str]]],
+    by_image_id: Mapping[str, Tensor],
     *,
     content_version: Optional[bytes] = None,
     max_per_tensor: Optional[int] = None,
 ) -> Tuple[Dict[str, List[RoiAnnotation]], ImportReport]:
     """Annotations a source's OME metadata carries, keyed by ``array_id``.
 
-    ``tensors`` is ``(array_id, dim_labels)`` per tensor -- both already on the
-    source descriptor at registration. ``content_version`` is stamped as
-    ``drawn_against_version``, which for an imported row means what it says: the
-    file revision this geometry was read from.
+    ``by_image_id`` maps an OME image id to ``(array_id, dim_labels)``. The
+    caller resolves it -- with :func:`tensors_by_field` or
+    :func:`tensors_by_image_order` -- because how a format's field names relate
+    to its OME image ids is a fact about that format, not something this module
+    can infer from the strings.
+
+    ``content_version`` is stamped as ``drawn_against_version``, which for an
+    imported row means what it says: the file revision this geometry was read
+    from.
     """
     report = ImportReport()
     ome_rois = metadata.get("rois") or []
@@ -346,8 +393,8 @@ def imported_annotations(
         return {}, report
 
     by_scene = {
-        array_id.partition("/")[2]: (array_id, _axis_index(dim_labels))
-        for array_id, dim_labels in tensors
+        image_id: (array_id, _axis_index(dim_labels))
+        for image_id, (array_id, dim_labels) in by_image_id.items()
     }
     # Which images reference which ROI. The edge is per-image, so one OME ROI
     # shared by several images becomes a row on each -- the store anchors to one

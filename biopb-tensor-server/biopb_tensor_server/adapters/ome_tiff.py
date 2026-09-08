@@ -48,7 +48,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
-from biopb_tensor_server.core.ome_rois import imported_annotations
+from biopb_tensor_server.core.ome_rois import (
+    imported_annotations,
+    tensors_by_field,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -662,10 +665,14 @@ class OmeTiffAdapter(TensorAdapter):
         return {}
 
     def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
-        """The OME-XML ``<ROI>`` elements this file carries (see the base)."""
+        """The OME-XML ``<ROI>`` elements this file carries (see the base).
+
+        Matched by id: ``_ome_scene_ids`` puts the OME image id straight into
+        the array_id's field half, so the two id spaces are the same one.
+        """
         return imported_annotations(
             metadata,
-            tensors,
+            tensors_by_field(tensors),
             content_version=self.content_version,
             max_per_tensor=max_per_tensor,
         )

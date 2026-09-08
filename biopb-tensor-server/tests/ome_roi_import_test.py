@@ -16,7 +16,12 @@ from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
-from biopb_tensor_server.core.ome_rois import OME_SET_NAME, imported_annotations
+from biopb_tensor_server.core.ome_rois import (
+    OME_SET_NAME,
+    imported_annotations,
+    tensors_by_field,
+    tensors_by_image_order,
+)
 
 SOURCE_ID = "ometiff_a1b2c3"
 ARRAY_0 = f"{SOURCE_ID}/Image:0"
@@ -46,8 +51,13 @@ def _meta(*shapes, images=("Image:0",), roi_id="ROI:0", name=None, extra_images=
     }
 
 
+def _import(metadata, tensors=TENSORS, **kwargs):
+    """The OME-TIFF join: field half of array_id == OME image id."""
+    return imported_annotations(metadata, tensors_by_field(tensors), **kwargs)
+
+
 def _one(metadata, tensors=TENSORS, **kwargs):
-    out, report = imported_annotations(metadata, tensors, **kwargs)
+    out, report = _import(metadata, tensors, **kwargs)
     assert list(out) == [ARRAY_0], out
     (annotation,) = out[ARRAY_0]
     return annotation, report
@@ -62,7 +72,7 @@ class TestTheJoin:
         assert report.imported == 1
 
     def test_one_roi_on_two_images_becomes_a_row_on_each(self):
-        out, report = imported_annotations(
+        out, report = _import(
             _meta(_shape("points", x=1, y=1), images=("Image:0", "Image:1")), TENSORS
         )
 
@@ -73,13 +83,13 @@ class TestTheJoin:
         metadata = _meta(_shape("points", x=1, y=1))
         metadata["images"] = [{"id": "Image:0", "roi_refs": []}]
 
-        out, report = imported_annotations(metadata, TENSORS)
+        out, report = _import(metadata, TENSORS)
         assert out == {}
         assert report.unreferenced == 1
 
     def test_a_ref_to_an_unknown_scene_is_counted(self):
         """The `_ome_scene_ids` positional fallback is where this comes from."""
-        out, report = imported_annotations(
+        out, report = _import(
             _meta(_shape("points", x=1, y=1), images=("Image:99",)), TENSORS
         )
 
@@ -87,7 +97,7 @@ class TestTheJoin:
         assert report.unmatched_refs == 1
 
     def test_no_rois_is_not_an_import(self):
-        out, report = imported_annotations({"images": []}, TENSORS)
+        out, report = _import({"images": []}, TENSORS)
         assert out == {}
         assert not report
 
@@ -140,7 +150,7 @@ class TestShapeKinds:
         assert annotation.roi.polyline.width == 0.0
 
     def test_a_mask_is_dropped_and_counted(self):
-        out, report = imported_annotations(
+        out, report = _import(
             _meta(_shape("masks", x=0, y=0, width=4, height=4)), TENSORS
         )
         assert out == {}
@@ -199,7 +209,7 @@ class TestProvenance:
 class TestTheCap:
     def test_the_remainder_is_dropped_and_counted(self):
         shapes = [_shape("points", x=i, y=0, id=f"Shape:{i}") for i in range(5)]
-        out, report = imported_annotations(_meta(*shapes), TENSORS, max_per_tensor=2)
+        out, report = _import(_meta(*shapes), TENSORS, max_per_tensor=2)
 
         assert len(out[ARRAY_0]) == 2
         assert report.imported == 2
@@ -361,7 +371,7 @@ class TestTransforms:
             assert u * u + v * v == pytest.approx(1.0, abs=1e-6)
 
     def test_a_singular_transform_drops_the_shape(self):
-        out, report = imported_annotations(
+        out, report = _import(
             _meta(
                 _shape(
                     "polygons",
@@ -392,7 +402,7 @@ class _FakeAdapter:
         self.released = False
 
     def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
-        return imported_annotations(
+        return _import(
             metadata,
             tensors,
             content_version=self.content_version,
@@ -574,14 +584,14 @@ class TestMalformedInput:
         }
 
     def test_a_coordinate_that_is_not_a_number(self):
-        out, report = imported_annotations(
+        out, report = _import(
             self._with({"id": "S:0", "x": "left", "y": 1}, self.GOOD), TENSORS
         )
         assert [r.roi_id for r in out[ARRAY_0]] == ["S:good"]
         assert report.malformed == 1
 
     def test_a_plane_index_outside_uint32(self):
-        out, report = imported_annotations(
+        out, report = _import(
             self._with({"id": "S:0", "x": 1, "y": 1, "the_z": 2**40}, self.GOOD),
             TENSORS,
         )
@@ -597,7 +607,7 @@ class TestMalformedInput:
 
     def test_an_infinite_coordinate_is_not_stored(self):
         """Nothing downstream would catch it: proto, DuckDB and bbox all take it."""
-        out, report = imported_annotations(
+        out, report = _import(
             self._with({"id": "S:0", "x": float("inf"), "y": 1}, self.GOOD), TENSORS
         )
         assert [r.roi_id for r in out[ARRAY_0]] == ["S:good"]
@@ -607,7 +617,7 @@ class TestMalformedInput:
         "union", [[], "polygons", {"points": {"id": "S:0"}}, {"points": ["nope"]}]
     )
     def test_a_union_that_is_not_shaped_like_one(self, union):
-        out, report = imported_annotations(
+        out, report = _import(
             {
                 "images": [{"id": "Image:0", "roi_refs": [{"id": "ROI:0"}]}],
                 "rois": [{"id": "ROI:0", "union": union}],
@@ -619,12 +629,12 @@ class TestMalformedInput:
 
     @pytest.mark.parametrize("rois", [{"ROI:0": {}}, "ROI:0", ["ROI:0"]])
     def test_a_rois_field_that_is_not_a_list_of_mappings(self, rois):
-        out, _ = imported_annotations({"images": [], "rois": rois}, TENSORS)
+        out, _ = _import({"images": [], "rois": rois}, TENSORS)
         assert out == {}
 
     @pytest.mark.parametrize("images", [{"Image:0": {}}, "Image:0", [None]])
     def test_an_images_field_that_is_not_a_list_of_mappings(self, images):
-        out, _ = imported_annotations(
+        out, _ = _import(
             {"images": images, "rois": [{"id": "ROI:0", "union": {}}]}, TENSORS
         )
         assert out == {}
@@ -800,3 +810,94 @@ class TestOpenTimeClear:
         assert _reserved(reopened) == []
         # Hand-drawn work is what persistence is for.
         assert [r.roi_id for r in reopened.list_rois(ARRAY_0)[0]] == ["mine"]
+
+
+class TestResolvingTheJoin:
+    """How a format's field names relate to its OME image ids is per-format.
+
+    OME-TIFF puts the image id straight into the array_id, so equality works.
+    A bioio field is named by `BioImage.scenes`, which is a different namespace:
+    measured against the CZI fixtures, `BioImage.scenes` is `['Scene:0']` /
+    `['Scene:0', 'Scene:1']` where the OME images are `Image:N`. Position is the
+    relation the adapter already pairs these on (`_build_tensor_descriptors`).
+
+    Latent rather than live today: the same probe shows bioio-czi reports no
+    `rois` at all, while bioio-ome-tiff -- which does report them -- names its
+    scenes `Image:0`, so equality happens to work there. The two conditions have
+    to co-occur, and `bioformats` (whose job IS synthesising OME ROIs from
+    vendor formats) is where they plausibly would.
+    """
+
+    # Measured, not invented: bioio-czi's scene ids for the repo's CZI fixtures.
+    SCENES = [
+        (f"{SOURCE_ID}/Scene:0", DIMS),
+        (f"{SOURCE_ID}/Scene:1", DIMS),
+    ]
+
+    def _two_images(self):
+        return {
+            "images": [
+                {"id": "Image:0", "roi_refs": [{"id": "ROI:0"}]},
+                {"id": "Image:1", "roi_refs": [{"id": "ROI:1"}]},
+            ],
+            "rois": [
+                {"id": "ROI:0", "union": {"points": [{"id": "S:0", "x": 1, "y": 1}]}},
+                {"id": "ROI:1", "union": {"points": [{"id": "S:1", "x": 2, "y": 2}]}},
+            ],
+        }
+
+    def test_by_field_matches_ome_tiff(self):
+        assert tensors_by_field(TENSORS) == {
+            "Image:0": TENSORS[0],
+            "Image:1": TENSORS[1],
+        }
+
+    def test_by_field_finds_nothing_for_bioio_scene_names(self):
+        """The miss this class exists to prevent -- total, and counted."""
+        out, report = imported_annotations(
+            self._two_images(), tensors_by_field(self.SCENES)
+        )
+
+        assert out == {}
+        assert report.unmatched_refs == 2
+
+    def test_by_image_order_pairs_them(self):
+        out, report = imported_annotations(
+            self._two_images(), tensors_by_image_order(self._two_images(), self.SCENES)
+        )
+
+        assert sorted(out) == [t[0] for t in self.SCENES]
+        assert report.imported == 2
+        assert report.unmatched_refs == 0
+
+    def test_by_image_order_keeps_the_pairing_straight(self):
+        out, _ = imported_annotations(
+            self._two_images(), tensors_by_image_order(self._two_images(), self.SCENES)
+        )
+
+        first = out[self.SCENES[0][0]][0]
+        second = out[self.SCENES[1][0]][0]
+        assert (first.roi_id, first.roi.point.x) == ("S:0", 1.0)
+        assert (second.roi_id, second.roi.point.x) == ("S:1", 2.0)
+
+    def test_an_unequal_count_pairs_nothing(self):
+        """Unknown correspondence beats a wrong one."""
+        metadata = self._two_images()
+
+        assert tensors_by_image_order(metadata, self.SCENES[:1]) == {}
+        out, report = imported_annotations(
+            metadata, tensors_by_image_order(metadata, self.SCENES[:1])
+        )
+        assert out == {}
+        assert report.unmatched_refs == 2
+
+    def test_each_adapter_picks_its_own(self):
+        import inspect
+
+        from biopb_tensor_server.adapters.bioio import _BioioAdapterBase
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        ome = inspect.getsource(OmeTiffAdapter.get_embedded_rois)
+        bio = inspect.getsource(_BioioAdapterBase.get_embedded_rois)
+        assert "tensors_by_field" in ome and "tensors_by_image_order" not in ome
+        assert "tensors_by_image_order" in bio and "tensors_by_field(" not in bio
