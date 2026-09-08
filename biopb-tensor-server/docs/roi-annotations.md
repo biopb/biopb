@@ -167,6 +167,110 @@ does not cover. Without the exclusion the CLI would delete rows the API refuses
 to touch, and `prune-annotations` would count imported copies in the total it
 asks a person to confirm.
 
+### They share the `sources` lifecycle
+
+An imported set is **scan output**, exactly like a `sources` row — derived from a
+file, rewritten when that file is re-registered. So it gets that lifecycle rather
+than machinery of its own: cleared in `_create_schema` alongside
+`DROP TABLE IF EXISTS sources`, written by `sync_source_added` in the same
+transaction as the upsert, removed by `sync_source_removed` with the row.
+
+That is deliberately *not* a watermark table. `sync_source_added` is already the
+replace-on-rescan mechanism — re-registration is driven by the same stat
+signature `content_version` comes from — so there is no separate freshness
+question to track, nothing to keep in sync with the rows, no "have I imported an
+empty set?" ambiguity, and no reaper to write. Deriving there is also free:
+`get_metadata()` has just been called, so the import is a dict walk rather than a
+second parse.
+
+Two consequences. A **rebuildable subset now lives in the table whose whole
+justification is being unrebuildable** — which cuts the useful way, since
+`_ROI_MIGRATIONS` may delete and re-derive reserved rows instead of migrating
+them. And **availability couples to registration**: imported ROIs exist only
+while their source does, and appear progressively as discovery proceeds. Correct
+rather than unfortunate — a tensor that is not registered cannot be opened.
+
+The `rois` key is stripped from `metadata` before it is serialised into
+`sources.metadata_json`. Once the store owns them a second copy is duplicated
+bulk, and it would keep annotations visible on
+`GET /api/sources/{id}/metadata` — the surface this design says they do not
+appear on. Safe because the derivation reads the adapter's fresh
+`get_metadata()` return, never the stored column.
+
+**The adapter also resolves the join.** An OME ROI names an *image*; the store
+anchors to an `array_id`. Relating the two is a fact about the format, not
+something the shared parser can infer from strings, so `imported_annotations`
+takes a resolved `image_id -> (array_id, dim_labels)` map and the adapter builds
+it: `tensors_by_field` for OME-TIFF, where `_ome_scene_ids` puts the OME image
+id straight into the array_id's field half, and `tensors_by_image_order` for
+bioio, whose fields are named by `BioImage.scenes` — a CZI scene label, an ND2
+point name — so equality would match nothing at all. Position is what
+`_build_tensor_descriptors` already pairs those on, behind the same length
+guard; an unequal count pairs nothing, because an unknown correspondence beats a
+wrong one.
+
+Latent rather than live: probing the readers, bioio-czi names its scenes
+`Scene:N` but reports no `rois`, while bioio-ome-tiff does report them and names
+its scenes `Image:N` — so equality happens to work there. Both conditions have
+to hold, and `bioformats`, whose job is synthesising OME ROIs from vendor
+formats, is where they plausibly would.
+
+**The format decides, through the adapter API.** `SourceAdapter.get_embedded_rois`
+returns `({}, None)` by default; `OmeTiffAdapter` and `_BioioAdapterBase` (hence
+every vendor subclass) implement it. The server does not police what
+`get_metadata()` returns, so a `rois` key means whatever that format meant by it
+— reading an EMD's `original_metadata` or an OME-Zarr's `.zattrs` as OME-XML
+would invent annotations.
+
+Not keyed on `source_type` either. That is a name, and it lies in both
+directions: `ome-zarr` carries NGFF rather than OME-XML, while `zeiss`,
+`leica`, `nikon` and the rest are ome-types dumps through bioio. A hook also
+generalises the way this design expects — ImageJ overlays or a GeoJSON sidecar
+are a method on their own adapter, not another branch here.
+
+The metadata dict and the tensor list are passed *in* rather than recomputed:
+the caller holds both, and `get_metadata` is a documented pure producer that
+would re-parse.
+
+`annotations.enabled = false` skips the parse entirely. Those rows would be
+unreadable through every surface — the SQL one drops `rois` from
+`allowed_tables` too — so the work and the storage buy nothing, and `rois` stays
+in `metadata_json` because nothing read it.
+
+The open-time clear runs **after** `_reconcile_roi_schema`, not beside the
+`DROP TABLE sources` that motivates it. That check can refuse the catalog, and
+it promises "The file is untouched" when it does — a delete before it would make
+that a lie, and would run against a schema this build has not established it
+understands.
+
+**The import cannot fail a registration.** It runs on a file nobody here wrote,
+and it sits inside `sync_source_added` — so an unguarded raise would cost a
+source its pixels over an annotation, which is backwards: an imported set is
+disposable (the next registration rebuilds it, and open clears it anyway) where
+a source that will not register is an outage.
+
+Three layers, because the raises are of three kinds. A malformed *shape* — a
+coordinate that is not a number, a `TheZ` outside uint32 — is dropped on its own
+and counted, so one bad shape cannot cost a file its other forty. A malformed
+*structure* (`union` that is not a mapping, `rois` that is not a list) is skipped
+the same way. And the whole read is wrapped, since reaching that handler means
+something the module does not model at all.
+
+The write is likewise after the source row commits, not inside its transaction,
+and swallows its own failures. `_prepare_roi` stays the single authority on what
+is storable — the importer skips rows it rejects rather than carrying a second
+copy of the rules.
+
+The one thing not dropped on a failure is `sources.metadata_json`'s `rois` key:
+it is stripped only when the read completed, so a wholesale failure leaves the
+last copy in place instead of losing it silently. Per-shape drops are counted in
+the log line.
+
+Imported rows are also outside `max_rois_per_tensor`. The cap exists to keep this
+an annotation store rather than a segmentation store; a user should not be pushed
+toward it by rows they did not author, and cloning an imported set — which is how
+editing one works — is exactly what would trip it.
+
 ## Schema
 
 New table in `MetadataDatabase._create_schema()`:

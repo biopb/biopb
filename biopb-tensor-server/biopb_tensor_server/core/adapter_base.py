@@ -23,7 +23,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -449,6 +449,45 @@ class SourceAdapter(ABC):
         metadata that the source row cannot represent is exposed on the tensor
         adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
         """
+
+    def get_embedded_rois(
+        self,
+        metadata: Mapping[str, Any],
+        tensors: Sequence[Tuple[str, Sequence[str]]],
+        *,
+        max_per_tensor: Optional[int] = None,
+    ) -> Tuple[Dict[str, List[Any]], Any]:
+        """ROIs this source's own file carries, keyed by ``array_id``.
+
+        Some formats store annotations beside their pixels -- OME-XML ``<ROI>``
+        elements, ImageJ overlays, a GeoJSON sidecar. Those land in the reserved
+        ``@ome``-style set the catalog keeps read-only (biopb/biopb#951), and
+        this is where a format says how to read its own.
+
+        Default ``({}, None)``: no source carries annotations unless it says so.
+        That is the safe default rather than a conservative one -- the server
+        does not police what :meth:`get_metadata` returns, so a ``rois`` key in
+        an EMD's ``original_metadata`` or an OME-Zarr's ``.zattrs`` means
+        whatever that format meant by it, and reading it as OME-XML would invent
+        annotations. It is deliberately not keyed on ``source_type`` either:
+        that is a name, and it lies in both directions -- ``ome-zarr`` carries
+        NGFF, while ``zeiss`` / ``leica`` / ``nikon`` and the rest are ome-types
+        dumps through bioio.
+
+        ``metadata`` is what this adapter just returned from
+        :meth:`get_metadata` and ``tensors`` is ``(array_id, dim_labels)`` per
+        tensor -- both passed in rather than recomputed, since the caller holds
+        them and ``get_metadata`` is a pure producer that would re-parse.
+
+        Returns:
+            ``(rois_by_array_id, report)``. The report is opaque to the caller
+            beyond having a ``summary()`` for the log, and may be ``None``.
+
+        Raising is not fatal but IS a bug: the caller runs this inside source
+        registration and swallows failures, because a source is its pixels first
+        and an imported set is rebuilt on the next registration anyway.
+        """
+        return {}, None
 
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
@@ -1444,6 +1483,7 @@ _SOURCE_SCOPED_API = frozenset(
         "create_from_config",
         "list_tensor_descriptors",
         "get_metadata",
+        "get_embedded_rois",
         "get_source_descriptor",
         "resolve",
         "is_resident",

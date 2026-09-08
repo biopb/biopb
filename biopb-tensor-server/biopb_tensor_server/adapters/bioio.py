@@ -49,6 +49,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.ome_rois import (
+    imported_annotations,
+    tensors_by_image_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -628,6 +632,21 @@ class _BioioAdapterBase(TensorAdapter):
             return {}
         except Exception:
             return {}
+
+    def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
+        """The OME-XML ``<ROI>`` elements this file carries (see the base).
+
+        Matched by POSITION, not by id. A field here is named by
+        ``BioImage.scenes`` -- a CZI scene label, an ND2 point name -- which is
+        not the OME image id, so equality would match nothing at all. Position
+        is the relation ``_build_tensor_descriptors`` already pairs these on.
+        """
+        return imported_annotations(
+            metadata,
+            tensors_by_image_order(metadata, tensors),
+            content_version=self.content_version,
+            max_per_tensor=max_per_tensor,
+        )
 
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the bioio OME model.

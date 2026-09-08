@@ -339,7 +339,9 @@ class _PreparedRoi:
         return out
 
 
-def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
+def _prepare_roi(
+    array_id: str, roi: RoiAnnotation, *, allow_reserved: bool = False
+) -> _PreparedRoi:
     """Validate one annotation and derive its stored columns.
 
     Raises:
@@ -368,7 +370,9 @@ def _prepare_roi(array_id: str, roi: RoiAnnotation) -> _PreparedRoi:
         raise ValueError(f"roi_id may not contain a comma: {roi_id!r}")
 
     set_name = roi.set_name or "default"
-    if is_reserved_set(set_name):
+    # allow_reserved is the importer's door, and only the importer's: it is not
+    # reachable from put_rois, so no transport can set it.
+    if is_reserved_set(set_name) and not allow_reserved:
         raise ValueError(
             f"set_name {set_name!r} is in the reserved {RESERVED_SET_PREFIX!r} "
             f"namespace: the server fills it from the source file and replaces "
@@ -573,6 +577,7 @@ class MetadataDatabase:
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
         self._max_rois_per_tensor = max_rois_per_tensor
+        self._annotations_enabled = annotations_enabled
         # None -> in-memory, and the annotations die with the process.
         self._store_path = Path(store_path) if store_path else None
         # A server not serving the annotation actions does not offer them
@@ -795,6 +800,20 @@ class MetadataDatabase:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_array ON rois(array_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_source ON rois(source_id)")
         self._reconcile_roi_schema(conn, had_rois)
+
+        # Reserved sets are scan output like `sources` itself -- derived from a
+        # file and rewritten by sync_source_added -- so they are cleared at open
+        # rather than carried forward, or the window before re-registration
+        # holds last run's imported rows next to an empty `sources`, possibly
+        # derived by code this build no longer runs (biopb/biopb#951).
+        #
+        # AFTER the schema check, not beside the DROP above, because that check
+        # can refuse the catalog -- and it promises "The file is untouched" when
+        # it does. A delete before it would have made that a lie, and would have
+        # run against a schema this build has not established it understands.
+        conn.execute(
+            "DELETE FROM rois WHERE starts_with(set_name, ?)", [RESERVED_SET_PREFIX]
+        )
         logger.debug("Created sources and rois tables and indexes")
 
     def _reconcile_roi_schema(
@@ -1139,6 +1158,62 @@ class MetadataDatabase:
             for t in source_desc.tensors
         ]
 
+        # ROIs the file carries, filed in the reserved @ome set (#951). Derived
+        # HERE because this method is already the replace-on-rescan mechanism --
+        # re-registration is driven by the same stat signature content_version
+        # comes from -- so an imported set needs no freshness bookkeeping of its
+        # own, only the same lifecycle as the row below. It is also free here:
+        # get_metadata() has just been called, so this is a dict walk, not a
+        # second parse.
+        # The FORMAT decides whether its file carries annotations, because the
+        # server does not police what get_metadata() returns: a `rois` key in an
+        # EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
+        # format meant by it. getattr, because this method only duck-types its
+        # argument and several adapters supply that surface without inheriting
+        # the base -- which is also why they read as "carries nothing".
+        report = None
+        imported: Dict[str, List[RoiAnnotation]] = {}
+        get_embedded = (
+            getattr(adapter, "get_embedded_rois", None)
+            # A deployment that does not serve the annotation actions does not
+            # parse a file's ROIs either: the rows would be unreadable through
+            # every surface (the SQL one drops the table from allowed_tables
+            # too), so the work and the storage buy nothing. It also leaves
+            # `rois` in metadata_json, since nothing read them -- stripping is
+            # gated on a completed read, so that falls out.
+            if self._annotations_enabled
+            else None
+        )
+        try:
+            if get_embedded is not None:
+                imported, report = get_embedded(
+                    # `or {}`: get_metadata is typed -> dict, but an
+                    # upload-backed source returns whatever OME metadata it was
+                    # given, which may be None. The line below has always
+                    # tolerated that, so does this one.
+                    metadata or {},
+                    [(t.array_id, list(t.dim_labels)) for t in source_desc.tensors],
+                    max_per_tensor=self._max_rois_per_tensor,
+                )
+        except Exception:
+            # Documented as a bug in the adapter, and still not fatal here: a
+            # source is its pixels first, and the next registration retries.
+            logger.exception("ome rois: could not read the set for %s", source_id)
+            imported, report = {}, None
+
+        if report:
+            logger.info("ome rois for %s: %s", source_id, report.summary())
+        # Only when the read completed. A wholesale failure leaves `rois` in the
+        # column rather than dropping the one copy that is left -- partial drops
+        # are counted in the report above, but this would be silent loss.
+        if report is not None and metadata and "rois" in metadata:
+            # The store owns them now. A second copy here would be duplicated
+            # bulk and would keep them in GET /api/sources/{id}/metadata, which
+            # is the surface the design says annotations do not appear on.
+            # Safe: the derivation above reads the adapter's fresh dict, never
+            # this column, so nothing rebuilds from what is dropped.
+            metadata = {k: v for k, v in metadata.items() if k != "rois"}
+
         # Build row data
         indexed_at = datetime.now()
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
@@ -1148,9 +1223,10 @@ class MetadataDatabase:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident, tensors)
+                (source_id, source_url, source_type, dtype, indexed_at,
+                 metadata_json, shape_summary, data_resident, tensors)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+                """,
                 [
                     source_id,
                     source_desc.source_url,
@@ -1163,6 +1239,13 @@ class MetadataDatabase:
                     tensors,
                 ],
             )
+
+        # Deliberately AFTER the source row commits, and deliberately unable to
+        # raise. Registration failing here would cost a source its pixels over
+        # an annotation, which is the wrong way round: an imported set is
+        # disposable (the next registration rebuilds it, and open clears it
+        # anyway) where a source that will not register is an outage.
+        self._replace_imported(source_id, source_desc.source_url, imported, indexed_at)
 
         # The row is committed, so the catalog -- not the adapter -- now owns this
         # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
@@ -1177,6 +1260,95 @@ class MetadataDatabase:
             )
 
         logger.debug(f"Synced source to metadata database: {source_id}")
+
+    def _replace_imported(
+        self,
+        source_id: str,
+        source_url: str,
+        imported: Dict[str, List[RoiAnnotation]],
+        now: datetime,
+    ) -> None:
+        """Swap a source's reserved rows for the ones its file now carries.
+
+        Delete-then-insert scoped by ``source_id``, not per tensor: a tensor
+        whose ROIs were removed upstream has to lose its rows too, and it has no
+        entry in ``imported`` to drive that from.
+
+        No rev/created_at carry-forward, unlike :meth:`put_rois`. These rows are
+        not edited, they are re-derived -- there is no history to preserve, and
+        pretending otherwise would put a monotonic rev on a value that only ever
+        restates the file.
+
+        Never raises: its caller is source registration, and no annotation is
+        worth failing that (see the call site). One transaction all the same, so
+        a failure leaves the previous set rather than half of the new one.
+        """
+        conn = self._get_connection()
+        try:
+            with self._write_lock:
+                conn.execute("BEGIN TRANSACTION")
+                try:
+                    self._replace_imported_locked(
+                        conn, source_id, source_url, imported, now
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+        except Exception:
+            logger.exception(
+                "ome rois: could not store the imported set for %s; the source "
+                "is registered and serving, and the next registration retries",
+                source_id,
+            )
+
+    def _replace_imported_locked(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        source_id: str,
+        source_url: str,
+        imported: Dict[str, List[RoiAnnotation]],
+        now: datetime,
+    ) -> None:
+        """The body of :meth:`_replace_imported`, inside the transaction."""
+        conn.execute(
+            "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
+            [source_id, RESERVED_SET_PREFIX],
+        )
+        if not imported:
+            return
+
+        insert_sql = (
+            "INSERT INTO rois "
+            f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
+            "rev, created_at, updated_at, source_url, last_seen_at) "
+            f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})"
+        )
+        for array_id, rows in imported.items():
+            for annotation in rows:
+                # allow_reserved: this is the one writer the @ome namespace has.
+                # Still through _prepare_roi, so bbox and the canonical geometry
+                # JSON are derived exactly as they are for a hand-drawn row --
+                # the SQL surface cannot tell the two apart, which is the point.
+                try:
+                    prep = _prepare_roi(array_id, annotation, allow_reserved=True)
+                except ValueError:
+                    # _prepare_roi stays the single authority on what is
+                    # storable -- an over-long id, say -- so the importer skips
+                    # what it refuses instead of carrying a second copy of the
+                    # rules. Python-side, so the transaction is still intact.
+                    logger.debug(
+                        "ome rois: %s rejected by the store", annotation.roi_id
+                    )
+                    continue
+                conn.execute(
+                    insert_sql,
+                    [prep.roi_id, array_id, source_id]
+                    + prep.column_values(self._ROI_CLIENT_COLUMNS)
+                    # last_seen_at is `now` unconditionally: the source is being
+                    # registered, which IS the sighting these rows record.
+                    + [1, now, now, source_url, now],
+                )
 
     def get_metadata_json(self, source_id: str) -> Optional[dict]:
         """Return a source's stored metadata as a dict, or ``None`` when empty.
@@ -1311,6 +1483,14 @@ class MetadataDatabase:
         conn = self._get_connection()
         with self._write_lock:
             conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
+            # Reserved rows go with the source row: they are its scan output,
+            # re-derived on the next registration. Hand-drawn annotations are
+            # deliberately NOT touched here -- outliving their source is the
+            # whole of the orphan design (biopb/biopb#951).
+            conn.execute(
+                "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
+                [source_id, RESERVED_SET_PREFIX],
+            )
         logger.debug(f"Removed source from metadata database: {source_id}")
 
     # ------------------------------------------------------------------
@@ -1467,11 +1647,18 @@ class MetadataDatabase:
             )
 
         # Cap on the post-write count, so a batch cannot straddle the limit.
+        # Imported rows are excluded: the cap exists to keep this an annotation
+        # store rather than a segmentation store, and a user should not be
+        # pushed toward it by rows they did not author -- cloning an imported
+        # set, which is how editing one works, would be what trips it.
+        authored = sum(
+            1 for prior in existing.values() if not is_reserved_set(prior[2])
+        )
         new_ids = {p.roi_id for p in prepared if p.roi_id not in existing}
-        if len(existing) + len(new_ids) > self._max_rois_per_tensor:
+        if authored + len(new_ids) > self._max_rois_per_tensor:
             raise ValueError(
                 f"Annotation limit reached for {array_id}: "
-                f"{len(existing)} stored + {len(new_ids)} new exceeds "
+                f"{authored} stored + {len(new_ids)} new exceeds "
                 f"max_rois_per_tensor={self._max_rois_per_tensor}. This is an "
                 f"annotation store -- a segmentation belongs in a label tensor."
             )
