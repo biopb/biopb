@@ -1594,6 +1594,16 @@ class TensorFlightServer(flight.FlightServerBase):
             # under a different reduction_method is never found.
             cache_key = cache_key_for_chunk_id(chunk_id)
             try:
+                # Reject a stale chunk_id before consulting the cache: a cache
+                # HIT below returns its mmap location directly and never calls
+                # resolve_chunk_data, so without this a chunk_id from before a
+                # re-registration would silently return whatever old-version
+                # bytes are still resident instead of the StaleChunkError a
+                # do_get on the same id would raise (biopb/biopb#178). Pure
+                # in-memory comparison -- no adapter I/O -- so it costs nothing
+                # to run on every locate, hit or miss.
+                adapter.check_chunk_version(chunk_id)
+
                 # If the chunk is already cached, just locate it. Resolving first
                 # would, on a chunk whose in-RAM entry has been trimmed, re-read the
                 # whole chunk from its segment server-side for nothing. Only

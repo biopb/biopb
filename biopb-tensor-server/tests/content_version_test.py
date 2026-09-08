@@ -564,3 +564,42 @@ class TestResolveChunkDataRejectsStaleVersion:
         )
         with pytest.raises(StaleChunkError):
             adapter.resolve_chunk_data(chunk_id)
+
+
+class TestDoGetCacheHitRejectsStaleVersion:
+    """The do_get path (resolve_chunk_data + CacheManager) on a cache HIT.
+
+    check_chunk_version runs as the FIRST statement of resolve_chunk_data --
+    before the cache_key is even computed -- so it fires unconditionally on
+    every call, hit or miss (unlike the locate fast path, which used to skip
+    resolve_chunk_data entirely on a hit; see TestChunkLocateAction in
+    cachefile_test.py for that regression). This pins the do_get side of the
+    same invariant: an entry that is still resident under the OLD version's
+    cache key (cache_key_for_chunk_id namespaces by content_version) must not
+    be handed back just because a lookup would technically succeed.
+    """
+
+    def test_cached_entry_under_old_version_is_not_returned(self):
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.core.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            cache_manager = CacheManager.get_instance()
+            adapter = _VersionedStubAdapter((10, 10), b"v1")
+            bounds = ChunkBounds(start=[0, 0], stop=[5, 5])
+            scaled_v1 = wrap_content_version(
+                encode_chunk_id_with_scale(adapter.array_id, bounds, (2, 2)), b"v1"
+            )
+
+            # Warm the cache under v1 (a scaled chunk_id is always cacheable).
+            adapter.resolve_chunk_data(scaled_v1, cache_manager)
+
+            # Re-registration: the source is now v2, but a client's held
+            # chunk_id (and, if still resident, its cache entry) is still v1.
+            adapter._content_version = b"v2"
+            with pytest.raises(StaleChunkError, match="content_version"):
+                adapter.resolve_chunk_data(scaled_v1, cache_manager)
+        finally:
+            CacheManager.reset()

@@ -971,6 +971,31 @@ class RemoteTensorAdapter(TensorAdapter):
         batch = self._upstream_record_batch(upstream_chunk_id)
         return unpack_chunk_array(batch)
 
+    def check_chunk_version(self, chunk_id: bytes) -> None:
+        """Compare the proxy envelope's OWN content_version, not the base's.
+
+        Overrides :meth:`SourceAdapter.check_chunk_version` (biopb/biopb#178):
+        the base implementation calls ``content_version_of``, which parses the
+        pre-#178 ``[0xFF sentinel]`` wrapper and would misparse an envelope
+        (``[0xFE sentinel]``) -- this proxy never mints a plain chunk_id, only
+        envelopes. A non-envelope ``chunk_id`` is a different failure (a stale
+        pre-upgrade ticket) that :meth:`resolve_chunk_data` already rejects
+        explicitly, so this passes it through untouched rather than raising here
+        too -- callers that only want the version check (e.g. the chunk-locate
+        fast path) get a no-op instead of a redundant/premature error.
+        """
+        if not is_proxy_envelope(chunk_id):
+            return
+        _route, held_version, _inner = peel_proxy_envelope(chunk_id)
+        if held_version is not None and held_version != self.content_version:
+            raise StaleChunkError(
+                f"chunk_id for {self.array_id!r} was minted against a "
+                "content_version this mirror no longer has (re-synced "
+                "upstream); re-request the read plan (GetFlightInfo) rather "
+                "than retrying this chunk_id.",
+                reason="stale_content_version",
+            )
+
     def resolve_chunk_data(self, chunk_id: bytes, cache_manager=None) -> pa.RecordBatch:
         """Serve a chunk by forwarding the envelope's inner chunk_id to the upstream.
 
@@ -982,15 +1007,8 @@ class RemoteTensorAdapter(TensorAdapter):
         are inherited unchanged, namespaced by the upstream's content_version.
 
         The envelope's OWN content_version (this mirror's ``indexed_at``, folded
-        in at mint time -- see :meth:`forward_flight_info`) is checked here
-        against ``self.content_version`` before anything is forwarded: it is the
-        base :meth:`TensorAdapter.resolve_chunk_data`'s stale-chunk_id check
-        (biopb/biopb#178), reimplemented rather than inherited because this
-        override bypasses that method entirely (the base decodes and reads
-        ``chunk_id`` directly; this one peels an envelope and never calls it). A
-        held envelope surviving a mirror re-sync would otherwise be forwarded
-        unchecked -- the inner is opaque, so nothing downstream of this class can
-        tell it apart from a fresh one; only the envelope's own version can.
+        in at mint time -- see :meth:`forward_flight_info`) is checked here via
+        :meth:`check_chunk_version`, before anything is forwarded.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
@@ -1003,15 +1021,8 @@ class RemoteTensorAdapter(TensorAdapter):
                 f"(stale pre-upgrade ticket); re-open the tensor to refresh."
             )
 
-        route, held_version, inner = peel_proxy_envelope(chunk_id)
-        if held_version is not None and held_version != self.content_version:
-            raise StaleChunkError(
-                f"chunk_id for {route!r} was minted against a content_version "
-                "this mirror no longer has (re-synced upstream); re-request "
-                "the read plan (GetFlightInfo) rather than retrying this "
-                "chunk_id.",
-                reason="stale_content_version",
-            )
+        self.check_chunk_version(chunk_id)
+        _route, _held_version, inner = peel_proxy_envelope(chunk_id)
 
         should_cache = cache_manager is not None and (
             is_scaled_chunk(inner)
