@@ -19,10 +19,11 @@ import struct
 import tempfile
 import time
 
+import numpy as np
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb_tensor_server.core.adapter_base import _get_read_plan
+from biopb_tensor_server.core.adapter_base import TensorAdapter, _get_read_plan
 from biopb_tensor_server.core.chunk import (
     _CV_SENTINEL,
     cache_key_for_chunk_id,
@@ -41,6 +42,7 @@ from biopb_tensor_server.core.chunk import (
     routing_array_id,
     wrap_content_version,
 )
+from biopb_tensor_server.core.errors import StaleChunkError
 
 CV = b"1700000000000000000:4096"
 
@@ -454,3 +456,111 @@ class TestContentVersionFromPath:
                     break
                 time.sleep(0.01)
             assert after is not None and after != before
+
+
+# ==============================================================================
+# resolve_chunk_data: the read-dispatch path must reject a stale content_version
+# ==============================================================================
+#
+# chunk.py's design comment promises that a version bump makes the OLD cache
+# entry "un-lookupable, not mis-served" -- but that was cache-key-only.
+# resolve_chunk_data decoded (array_id, bounds) and read them straight through,
+# with no comparison against the CURRENT adapter's content_version, so a client
+# holding a chunk_id minted before a re-registration got it dispatched to
+# whatever is registered under that array_id now: silently wrong pixels if the
+# old bounds still fit the new shape, a bounds-validation crash if they don't.
+# A client can hold such an id for a napari layer's whole lifetime
+# (client.py's dask graph binds concrete chunk_ids once).
+
+
+class _VersionedStubAdapter(TensorAdapter):
+    """Minimal tensor adapter with a settable content_version and real get_data."""
+
+    def __init__(self, shape, content_version):
+        self.source_id = "stub"
+        self._shape = list(shape)
+        self._content_version = content_version
+
+    def get_tensor_descriptor(self):
+        return TensorDescriptor(
+            array_id=self.array_id,
+            shape=self._shape,
+            chunk_shape=self._shape,
+            dtype="uint8",
+            dim_labels=["y", "x"][: len(self._shape)],
+        )
+
+    def get_data(self, bounds):
+        super().get_data(bounds)
+        shape = tuple(b - a for a, b in zip(bounds.start, bounds.stop, strict=True))
+        return np.zeros(shape, dtype="uint8")
+
+    @classmethod
+    def create_from_config(cls, source, credentials_config=None):
+        raise NotImplementedError
+
+    def list_tensor_descriptors(self):
+        return [self.get_tensor_descriptor()]
+
+    def get_metadata(self):
+        return {}
+
+
+class TestResolveChunkDataRejectsStaleVersion:
+    def test_matching_version_reads_normally(self):
+        adapter = _VersionedStubAdapter((10, 10), b"v1")
+        chunk_id = wrap_content_version(
+            encode_chunk_id(adapter.array_id, ChunkBounds(start=[0, 0], stop=[5, 5])),
+            b"v1",
+        )
+        batch = adapter.resolve_chunk_data(chunk_id)
+        assert batch.num_rows >= 0  # resolves without raising
+
+    def test_stale_version_is_rejected_before_any_read(self):
+        # The chunk_id was minted against v1; the source has since been
+        # re-registered (e.g. new bytes on disk) and is now v2.
+        adapter = _VersionedStubAdapter((10, 10), b"v2")
+        stale_chunk_id = wrap_content_version(
+            encode_chunk_id(adapter.array_id, ChunkBounds(start=[0, 0], stop=[5, 5])),
+            b"v1",
+        )
+        with pytest.raises(StaleChunkError, match="content_version"):
+            adapter.resolve_chunk_data(stale_chunk_id)
+
+    def test_stale_version_rejected_even_when_bounds_still_fit(self):
+        # The dangerous case the bounds check alone cannot catch: a shrunk grid
+        # can still validate against the new (larger-or-equal) shape and would
+        # silently serve the wrong file's pixels if this check were absent.
+        adapter = _VersionedStubAdapter((1000, 1000), b"v2")
+        stale_chunk_id = wrap_content_version(
+            encode_chunk_id(adapter.array_id, ChunkBounds(start=[0, 0], stop=[5, 5])),
+            b"v1",
+        )
+        with pytest.raises(StaleChunkError):
+            adapter.resolve_chunk_data(stale_chunk_id)
+
+    def test_legacy_unversioned_chunk_id_still_served(self):
+        # Backward compat (chunk.py's central promise): an unversioned chunk_id
+        # is byte-identical to the pre-#178 format and must keep working even
+        # against a now-versioned source.
+        adapter = _VersionedStubAdapter((10, 10), b"v2")
+        legacy_chunk_id = encode_chunk_id(
+            adapter.array_id, ChunkBounds(start=[0, 0], stop=[5, 5])
+        )
+        batch = adapter.resolve_chunk_data(legacy_chunk_id)
+        assert batch.num_rows >= 0
+
+    def test_versioned_chunk_id_rejected_against_now_unversioned_source(self):
+        # A chunk_id carrying a version can't be confirmed against a source
+        # that currently reports no version (content_version_from_path lost its
+        # signal, or the adapter changed): "held != current" holds trivially
+        # since current is None, so treat it as stale rather than assume it's
+        # still good -- the conservative direction for a check whose whole job
+        # is catching silent mis-serves.
+        adapter = _VersionedStubAdapter((10, 10), content_version=None)
+        chunk_id = wrap_content_version(
+            encode_chunk_id(adapter.array_id, ChunkBounds(start=[0, 0], stop=[5, 5])),
+            b"some-version",
+        )
+        with pytest.raises(StaleChunkError):
+            adapter.resolve_chunk_data(chunk_id)

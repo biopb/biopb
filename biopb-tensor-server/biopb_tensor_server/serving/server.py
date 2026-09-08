@@ -1540,6 +1540,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 record_batch = adapter.resolve_chunk_data(
                     tensor_ticket.chunk_id, cache_manager
                 )
+            except TensorResolutionError as e:
+                # A stale chunk_id (biopb/biopb#178) is the client's held ticket
+                # outliving a re-registration, not a server bug -- surface it as
+                # the typed terminal taxonomy (to_flight_error) rather than
+                # burying it in "I/O error" as a bare ValueError -> INTERNAL.
+                # Must precede the ValueError clause (it subclasses ValueError).
+                raise to_flight_error(e) from e
             except (OSError, ValueError) as e:
                 # ValueError can be raised by bounds validation or parsing failures
                 raise flight.FlightInternalError(
@@ -1603,6 +1610,10 @@ class TensorFlightServer(flight.FlightServerBase):
                     # was meant to win.
                     cache_manager.await_deferred_write(cache_key)
                     location = cache_manager.locate_entry(cache_key)
+            except TensorResolutionError as e:
+                # Same stale-chunk_id mapping as do_get (biopb/biopb#178); must
+                # precede the ValueError clause (it subclasses ValueError).
+                raise to_flight_error(e) from e
             except (OSError, ValueError) as e:
                 raise flight.FlightInternalError(
                     f"I/O error locating chunk data: {e}"

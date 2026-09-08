@@ -40,6 +40,7 @@ from biopb_tensor_server.core.chunk import (
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
+    content_version_of,
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
@@ -58,6 +59,7 @@ from biopb_tensor_server.core.downsample import (
 )
 from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
+    StaleChunkError,
     TensorNotFound,
     WriteNotSupportedError,
 )
@@ -1071,10 +1073,27 @@ class TensorAdapter(SourceAdapter):
         The default implementation reads raw chunk data with ``self.get_data()``.
         Scaled chunks are always cacheable when a CacheManager is available.
         With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
+
+        Raises:
+            StaleChunkError: chunk_id carries a content_version that no longer
+                matches this source's current one -- it was minted against an
+                earlier registration (biopb/biopb#178). Checked before any
+                bytes are read: a legacy unversioned chunk_id (``held_version``
+                None) always passes, matching the byte-identical-format
+                backward-compat promise in ``chunk.py``.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
         array_id, bounds = decode_chunk_id(chunk_id)
+
+        held_version = content_version_of(chunk_id)
+        if held_version is not None and held_version != self.content_version:
+            raise StaleChunkError(
+                f"chunk_id for {array_id!r} was minted against a "
+                "content_version this source no longer has; re-request the "
+                "read plan (GetFlightInfo) rather than retrying this chunk_id.",
+                reason="stale_content_version",
+            )
 
         # Check if scaled chunk (has extra bytes after bounds encoding)
         is_scaled_chunk_flag = is_scaled_chunk(chunk_id)

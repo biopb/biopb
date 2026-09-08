@@ -64,7 +64,7 @@ from biopb_tensor_server.core.chunk import (
     is_scaled_chunk,
     peel_proxy_envelope,
 )
-from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -980,6 +980,17 @@ class RemoteTensorAdapter(TensorAdapter):
         result crosses the network. The result is cached under the envelope itself
         (its canonical key), so the segment cache and the localhost mmap fast path
         are inherited unchanged, namespaced by the upstream's content_version.
+
+        The envelope's OWN content_version (this mirror's ``indexed_at``, folded
+        in at mint time -- see :meth:`forward_flight_info`) is checked here
+        against ``self.content_version`` before anything is forwarded: it is the
+        base :meth:`TensorAdapter.resolve_chunk_data`'s stale-chunk_id check
+        (biopb/biopb#178), reimplemented rather than inherited because this
+        override bypasses that method entirely (the base decodes and reads
+        ``chunk_id`` directly; this one peels an envelope and never calls it). A
+        held envelope surviving a mirror re-sync would otherwise be forwarded
+        unchecked -- the inner is opaque, so nothing downstream of this class can
+        tell it apart from a fresh one; only the envelope's own version can.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
@@ -992,7 +1003,16 @@ class RemoteTensorAdapter(TensorAdapter):
                 f"(stale pre-upgrade ticket); re-open the tensor to refresh."
             )
 
-        route, _cv, inner = peel_proxy_envelope(chunk_id)
+        route, held_version, inner = peel_proxy_envelope(chunk_id)
+        if held_version is not None and held_version != self.content_version:
+            raise StaleChunkError(
+                f"chunk_id for {route!r} was minted against a content_version "
+                "this mirror no longer has (re-synced upstream); re-request "
+                "the read plan (GetFlightInfo) rather than retrying this "
+                "chunk_id.",
+                reason="stale_content_version",
+            )
+
         should_cache = cache_manager is not None and (
             is_scaled_chunk(inner)
             or isinstance(cache_manager.backend, ArrowFileBackend)
