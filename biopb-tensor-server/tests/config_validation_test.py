@@ -14,6 +14,7 @@ import logging
 
 import pytest
 from biopb_tensor_server.core.config import (
+    AnnotationsConfig,
     CacheConfig,
     MetadataDbConfig,
     PrecacheConfig,
@@ -40,6 +41,7 @@ def _default_of(section, field):
         "pyramid": PyramidConfig,
         "precache": PrecacheConfig,
         "metadata_db": MetadataDbConfig,
+        "annotations": AnnotationsConfig,
     }
     return getattr(defaults[section](), field)
 
@@ -88,6 +90,24 @@ def _default_of(section, field):
             "max_query_results",
         ),
         ({"metadata_db": {"query_timeout_ms": 0}}, "metadata_db", "query_timeout_ms"),
+        # A cap of 0 or less fails every annotation write with "Annotation limit
+        # reached", which is `enabled: false` reached by accident (biopb#948).
+        (
+            {"annotations": {"max_rois_per_tensor": 0}},
+            "annotations",
+            "max_rois_per_tensor",
+        ),
+        (
+            {"annotations": {"max_rois_per_tensor": -5}},
+            "annotations",
+            "max_rois_per_tensor",
+        ),
+        # SourceManager clamps a negative to 0, so accepting one silently ignores it.
+        (
+            {"annotations": {"prune_unseen_days": -1}},
+            "annotations",
+            "prune_unseen_days",
+        ),
         ({"server": {"rescan_interval": -1}}, "server", "rescan_interval"),
         ({"server": {"rescan_interval": -1.0}}, "server", "rescan_interval"),
     ],
@@ -156,6 +176,20 @@ def test_valid_defaults_do_not_warn(caplog):
             "linear",
         ),
         # boundaries are inclusive.
+        # prune_unseen_days 0 is the documented "never delete" sentinel, and the
+        # default -- the bound must not turn it into a warning.
+        (
+            {"annotations": {"prune_unseen_days": 0}},
+            "annotations",
+            "prune_unseen_days",
+            0,
+        ),
+        (
+            {"annotations": {"max_rois_per_tensor": 1}},
+            "annotations",
+            "max_rois_per_tensor",
+            1,
+        ),
         (
             {"precache": {"backlog_high_water": 0.0}},
             "precache",

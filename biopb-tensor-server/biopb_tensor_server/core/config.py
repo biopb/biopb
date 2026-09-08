@@ -240,6 +240,15 @@ _CONSTRAINTS = {
         "backlog_high_water": _Range(min=0.0, max=1.0),
         "backlog_idle_recheck_seconds": _Range(min=0),
     },
+    "AnnotationsConfig": {
+        # 0 or negative fails every write with "Annotation limit reached" -- a
+        # cap of nothing is a disabled store wearing a limit's name; `enabled`
+        # is the switch for that.
+        "max_rois_per_tensor": _Range(min=1),
+        # Negative is meaningless and SourceManager clamps it to 0 anyway, so
+        # without this the config accepts a value it silently ignores.
+        "prune_unseen_days": _Range(min=0),
+    },
     "MetadataDbConfig": {
         "max_query_results": _Range(min=1),
         "max_list_flights_results": _Range(min=1),
