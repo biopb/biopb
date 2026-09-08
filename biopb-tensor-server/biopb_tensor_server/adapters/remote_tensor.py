@@ -64,7 +64,7 @@ from biopb_tensor_server.core.chunk import (
     is_scaled_chunk,
     peel_proxy_envelope,
 )
-from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -971,6 +971,44 @@ class RemoteTensorAdapter(TensorAdapter):
         batch = self._upstream_record_batch(upstream_chunk_id)
         return unpack_chunk_array(batch)
 
+    def check_chunk_version(self, chunk_id: bytes) -> None:
+        """Reject a chunk_id this proxy would refuse to serve, before any I/O.
+
+        Overrides :meth:`SourceAdapter.check_chunk_version` (biopb/biopb#178).
+        Two failures, both structural:
+
+        - not a proxy envelope at all: the proxy only ever mints envelope
+          chunk_ids (biopb/biopb#178 W1), so this is a stale pre-upgrade
+          ticket. Rejected HERE, not left to :meth:`resolve_chunk_data` alone
+          -- the chunk-locate fast path calls this before ever consulting the
+          cache, and a persisted file-cache entry left over from before this
+          proxy started enveloping (``ArrowFileBackend`` survives restarts)
+          could otherwise satisfy a cache HIT under the old bare key and never
+          reach ``resolve_chunk_data`` at all.
+        - a proxy envelope whose OWN content_version (this mirror's
+          ``indexed_at``, folded in at mint time -- see
+          :meth:`forward_flight_info`) no longer matches ``self.content_version``:
+          the mirror has re-synced since this chunk_id was minted. The base
+          implementation's ``content_version_of`` parses the pre-#178
+          ``[0xFF sentinel]`` wrapper and would misparse an envelope
+          (``[0xFE sentinel]``), so this is reimplemented against
+          :func:`peel_proxy_envelope` instead of calling the base.
+        """
+        if not is_proxy_envelope(chunk_id):
+            raise flight.FlightServerError(
+                f"proxy source {self.source_id} received a non-envelope chunk_id "
+                f"(stale pre-upgrade ticket); re-open the tensor to refresh."
+            )
+        _route, held_version, _inner = peel_proxy_envelope(chunk_id)
+        if held_version is not None and held_version != self.content_version:
+            raise StaleChunkError(
+                f"chunk_id for {self.array_id!r} was minted against a "
+                "content_version this mirror no longer has (re-synced "
+                "upstream); re-request the read plan (GetFlightInfo) rather "
+                "than retrying this chunk_id.",
+                reason="stale_content_version",
+            )
+
     def resolve_chunk_data(self, chunk_id: bytes, cache_manager=None) -> pa.RecordBatch:
         """Serve a chunk by forwarding the envelope's inner chunk_id to the upstream.
 
@@ -980,19 +1018,16 @@ class RemoteTensorAdapter(TensorAdapter):
         result crosses the network. The result is cached under the envelope itself
         (its canonical key), so the segment cache and the localhost mmap fast path
         are inherited unchanged, namespaced by the upstream's content_version.
+
+        :meth:`check_chunk_version` runs first and rejects both a non-envelope
+        (stale pre-upgrade) chunk_id and a version-stale envelope, before
+        anything is forwarded.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
-        if not is_proxy_envelope(chunk_id):
-            # The proxy only mints envelope chunk_ids (biopb/biopb#178 W1); a
-            # non-envelope id is a stale pre-upgrade ticket. Fail clearly so the
-            # client re-opens the tensor to refresh its endpoints.
-            raise flight.FlightServerError(
-                f"proxy source {self.source_id} received a non-envelope chunk_id "
-                f"(stale pre-upgrade ticket); re-open the tensor to refresh."
-            )
+        self.check_chunk_version(chunk_id)
+        _route, _held_version, inner = peel_proxy_envelope(chunk_id)
 
-        route, _cv, inner = peel_proxy_envelope(chunk_id)
         should_cache = cache_manager is not None and (
             is_scaled_chunk(inner)
             or isinstance(cache_manager.backend, ArrowFileBackend)

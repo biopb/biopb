@@ -38,6 +38,7 @@ from biopb_tensor_server.cache.file_backend import (
 from biopb_tensor_server.core.adapter_base import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.errors import StaleChunkError
 from biopb_tensor_server.serving.server import TensorFlightServer
 
 
@@ -652,6 +653,9 @@ class TestChunkLocateAction:
             class _Probe:
                 source_id = "z"
 
+                def check_chunk_version(self, chunk_id):
+                    pass
+
                 def resolve_chunk_data(self, chunk_id, cache_manager):
                     # Called on a cold miss -- the heaviest work in the handler.
                     observed.append(server.flight_idle_for(0.0))
@@ -666,6 +670,87 @@ class TestChunkLocateAction:
             # ...and the stamp advances on the way out, so the debounce window
             # starts from the end of the read rather than from process start.
             assert server.activity._last_active > 0.0
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
+    def test_locate_rejects_stale_chunk_id_before_consulting_cache(self):
+        """A cache HIT must not bypass the stale-chunk_id check (biopb/biopb#178).
+
+        Before this, ``check_chunk_version`` only ran inside
+        ``resolve_chunk_data``, which a cache HIT never calls -- so a chunk_id
+        from before a re-registration, whose segment is still resident, would
+        return that stale location straight from the cache, silently serving
+        old-version pixels a ``do_get`` on the identical chunk_id would have
+        refused. Proven here by making a cache lookup fail the test outright:
+        the rejection must land before ``locate_entry`` is ever consulted.
+        """
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            cache_manager = CacheManager.get_instance()
+
+            class _StaleProbe:
+                source_id = "z"
+
+                def check_chunk_version(self, chunk_id):
+                    raise StaleChunkError(
+                        "stale content_version", reason="stale_content_version"
+                    )
+
+                def resolve_chunk_data(self, chunk_id, cache_manager):
+                    pytest.fail("must not read once the version check rejects it")
+
+            chunk_id = encode_chunk_id("z", ChunkBounds(start=[0, 0], stop=[8, 8]))
+            with patch.object(
+                cache_manager,
+                "locate_entry",
+                side_effect=AssertionError("locate_entry must not run"),
+            ):
+                with patch.object(
+                    server, "_get_adapter_for_chunk", return_value=_StaleProbe()
+                ):
+                    with pytest.raises(
+                        flight.FlightServerError, match="content_version"
+                    ):
+                        server._handle_chunk_locate(chunk_id)
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
+    def test_locate_rejects_non_envelope_chunk_id_before_consulting_cache(self):
+        """Same gap, on a real RemoteTensorAdapter: a stale pre-#178-W1 (bare,
+        non-envelope) ticket must not be able to ride a persisted cache HIT
+        past the proxy's own structural rejection (biopb/biopb#958 follow-up).
+        """
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.core.chunk import encode_chunk_id as _encode
+
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            cache_manager = CacheManager.get_instance()
+            proxy_adapter = RemoteTensorAdapter(
+                source_id="lab__img",
+                upstream_location="grpc://localhost:1",  # never dialed
+                upstream_source_id="img",
+            )
+            bare_chunk_id = _encode(
+                "lab__img", ChunkBounds(start=[0, 0], stop=[4, 4])
+            )  # never enveloped -- a pre-upgrade-format ticket
+
+            with patch.object(
+                cache_manager,
+                "locate_entry",
+                side_effect=AssertionError("locate_entry must not run"),
+            ):
+                with patch.object(
+                    server, "_get_adapter_for_chunk", return_value=proxy_adapter
+                ):
+                    with pytest.raises(flight.FlightServerError, match="non-envelope"):
+                        server._handle_chunk_locate(bare_chunk_id)
         finally:
             CacheManager.reset()
             server.shutdown()

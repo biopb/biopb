@@ -40,6 +40,7 @@ from biopb_tensor_server.core.chunk import (
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
+    content_version_of,
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
@@ -58,6 +59,7 @@ from biopb_tensor_server.core.downsample import (
 )
 from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
+    StaleChunkError,
     TensorNotFound,
     WriteNotSupportedError,
 )
@@ -347,6 +349,31 @@ class SourceAdapter(ABC):
         """Opaque content-version token folded into this source's chunk_ids, or
         None when the source is unversioned (see ``_content_version``)."""
         return self._content_version
+
+    def check_chunk_version(self, chunk_id: bytes) -> None:
+        """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
+
+        Pure in-memory comparison of ``content_version_of(chunk_id)`` against
+        ``self.content_version`` -- no adapter I/O -- so a caller can run it as a
+        cheap guard ahead of a cache lookup (``server._handle_chunk_locate``) as
+        well as ahead of an actual read (:meth:`TensorAdapter.resolve_chunk_data`),
+        without paying for a second adapter lookup or (for a native-pyramid
+        adapter) forcing a lazy level open just to validate. A legacy
+        unversioned chunk_id (``held_version`` None) always passes, matching the
+        byte-identical-format backward-compat promise in ``chunk.py``.
+
+        :class:`RemoteTensorAdapter` overrides this to compare the proxy
+        envelope's own version instead -- it never mints a plain (non-envelope)
+        chunk_id, so this base implementation would misparse one of its chunk_ids.
+        """
+        held_version = content_version_of(chunk_id)
+        if held_version is not None and held_version != self.content_version:
+            raise StaleChunkError(
+                f"chunk_id for {self.array_id!r} was minted against a "
+                "content_version this source no longer has; re-request the "
+                "read plan (GetFlightInfo) rather than retrying this chunk_id.",
+                reason="stale_content_version",
+            )
 
     @property
     def array_id(self) -> str:
@@ -1071,9 +1098,17 @@ class TensorAdapter(SourceAdapter):
         The default implementation reads raw chunk data with ``self.get_data()``.
         Scaled chunks are always cacheable when a CacheManager is available.
         With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
+
+        Raises:
+            StaleChunkError: chunk_id carries a content_version that no longer
+                matches this source's current one -- it was minted against an
+                earlier registration (biopb/biopb#178). See
+                :meth:`check_chunk_version`, called first, before any bytes
+                are read.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
+        self.check_chunk_version(chunk_id)
         array_id, bounds = decode_chunk_id(chunk_id)
 
         # Check if scaled chunk (has extra bytes after bounds encoding)
@@ -1479,6 +1514,7 @@ _SOURCE_SCOPED_API = frozenset(
         "source_type",
         "capability_token",
         "content_version",
+        "check_chunk_version",
         "claim",
         "create_from_config",
         "list_tensor_descriptors",

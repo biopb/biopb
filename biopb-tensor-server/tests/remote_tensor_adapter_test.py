@@ -2152,6 +2152,10 @@ def test_resolve_forwards_inner_verbatim():
         upstream_location="grpc://localhost:1",  # never dialed
         upstream_source_id="img",
     )
+    # Match the envelope's own content_version to the mirror's current one so
+    # this test isolates verbatim-forwarding: a mismatch is StaleChunkError
+    # territory (biopb/biopb#178), covered separately.
+    adapter._content_version = b"iat:99"
     bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
     # An upstream-versioned inner exercises the opacity: the proxy must forward it
     # (0xFF version wrapper included) untouched, never peeling or re-wrapping it.
@@ -2169,6 +2173,76 @@ def test_resolve_forwards_inner_verbatim():
 
     assert captured["id"] == inner  # forwarded byte-for-byte
     assert captured["id"][0] != 0xFE  # no proxy envelope sentinel leaked upstream
+
+
+def test_resolve_rejects_envelope_stale_against_current_mirror_version():
+    """A held envelope from before a mirror re-sync must not be forwarded.
+
+    resolve_chunk_data bypasses the base TensorAdapter's stale-chunk_id check
+    entirely (it never decodes chunk_id, only peels the envelope), so the same
+    protection is reimplemented here against the envelope's own content_version
+    (biopb/biopb#178). Without it, a client holding an envelope minted before a
+    re-sync would have it forwarded to the upstream unchecked -- the inner is
+    opaque, so nothing downstream could tell a stale envelope from a fresh one.
+    """
+    import pytest
+    from biopb.tensor.ticket_pb2 import ChunkBounds
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.core.chunk import encode_chunk_id, encode_proxy_envelope
+    from biopb_tensor_server.core.errors import StaleChunkError
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    adapter._content_version = b"iat:99"  # the mirror's CURRENT version
+    bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
+    inner = encode_chunk_id("img", bounds)
+    stale_env = encode_proxy_envelope(inner, "lab__img", b"iat:42")  # OLD version
+
+    adapter._upstream_record_batch = lambda upstream_chunk_id: pytest.fail(
+        "must not forward a stale envelope to the upstream"
+    )
+    with pytest.raises(StaleChunkError, match="content_version"):
+        adapter.resolve_chunk_data(stale_env, cache_manager=None)
+
+
+def test_check_chunk_version_rejects_non_envelope_chunk_id():
+    """A non-envelope chunk_id (a stale pre-#178-W1 ticket) is rejected by
+    check_chunk_version itself, not left for resolve_chunk_data alone.
+
+    Before this, the non-envelope rejection lived only in resolve_chunk_data --
+    which the chunk-locate fast path skips entirely on a cache HIT. A stale
+    bare (non-envelope) chunk_id whose key happens to have a resident file-
+    cache entry (plausible across a proxy upgrade: ArrowFileBackend persists
+    across restarts) would satisfy that hit and never reach the rejection.
+    check_chunk_version is called before the cache lookup, so folding this
+    check into it closes that gap the same way as the version-mismatch case.
+    """
+    import pyarrow.flight as flight
+    import pytest
+    from biopb.tensor.ticket_pb2 import ChunkBounds
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.core.chunk import encode_chunk_id
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    bare_chunk_id = encode_chunk_id(
+        "lab__img", ChunkBounds(start=[0, 0], stop=[4, 4])
+    )  # never enveloped -- a pre-upgrade-format ticket
+
+    with pytest.raises(flight.FlightServerError, match="non-envelope"):
+        adapter.check_chunk_version(bare_chunk_id)
+
+    adapter._upstream_record_batch = lambda upstream_chunk_id: pytest.fail(
+        "must not forward a non-envelope chunk_id to the upstream"
+    )
+    with pytest.raises(flight.FlightServerError, match="non-envelope"):
+        adapter.resolve_chunk_data(bare_chunk_id, cache_manager=None)
 
 
 def test_seed_catalog_sets_content_version_from_indexed_at():

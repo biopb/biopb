@@ -123,6 +123,28 @@ class UnknownResolutionError(TensorResolutionError):
     grpc_code = "UNKNOWN"
 
 
+class StaleChunkError(TensorResolutionError):
+    """A chunk_id's content_version no longer matches the source's current one.
+
+    The id still decodes to a well-formed (array_id, bounds) -- ``chunk.py``'s
+    versioning comment promises that mismatch makes the OLD cache entry
+    "un-lookupable, not mis-served" (biopb/biopb#178), but that guarantee is
+    cache-key-only: nothing on the read-dispatch path used to compare the
+    version a client is holding against the source's current one, so a stale
+    chunk_id decoded fine and got read against whatever is registered under
+    that array_id now -- silently wrong pixels when the new bounds still fit
+    the new shape, a confusing bounds-validation crash when they don't.
+
+    Raised by :meth:`TensorAdapter.resolve_chunk_data` before any bytes are
+    read, so a re-registration turns a held chunk_id into a clean, terminal
+    error instead of either failure mode. Canonical gRPC NOT_FOUND: the chunk
+    this id names no longer exists at that identity, so the client's fix is to
+    re-request GetFlightInfo/the read plan, not to retry the same id.
+    """
+
+    grpc_code = "NOT_FOUND"
+
+
 class UpstreamConfigError(ValueError):
     """An upstream's *configuration* is broken, not the upstream itself.
 
