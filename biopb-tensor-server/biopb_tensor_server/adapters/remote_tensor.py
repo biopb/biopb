@@ -972,20 +972,33 @@ class RemoteTensorAdapter(TensorAdapter):
         return unpack_chunk_array(batch)
 
     def check_chunk_version(self, chunk_id: bytes) -> None:
-        """Compare the proxy envelope's OWN content_version, not the base's.
+        """Reject a chunk_id this proxy would refuse to serve, before any I/O.
 
-        Overrides :meth:`SourceAdapter.check_chunk_version` (biopb/biopb#178):
-        the base implementation calls ``content_version_of``, which parses the
-        pre-#178 ``[0xFF sentinel]`` wrapper and would misparse an envelope
-        (``[0xFE sentinel]``) -- this proxy never mints a plain chunk_id, only
-        envelopes. A non-envelope ``chunk_id`` is a different failure (a stale
-        pre-upgrade ticket) that :meth:`resolve_chunk_data` already rejects
-        explicitly, so this passes it through untouched rather than raising here
-        too -- callers that only want the version check (e.g. the chunk-locate
-        fast path) get a no-op instead of a redundant/premature error.
+        Overrides :meth:`SourceAdapter.check_chunk_version` (biopb/biopb#178).
+        Two failures, both structural:
+
+        - not a proxy envelope at all: the proxy only ever mints envelope
+          chunk_ids (biopb/biopb#178 W1), so this is a stale pre-upgrade
+          ticket. Rejected HERE, not left to :meth:`resolve_chunk_data` alone
+          -- the chunk-locate fast path calls this before ever consulting the
+          cache, and a persisted file-cache entry left over from before this
+          proxy started enveloping (``ArrowFileBackend`` survives restarts)
+          could otherwise satisfy a cache HIT under the old bare key and never
+          reach ``resolve_chunk_data`` at all.
+        - a proxy envelope whose OWN content_version (this mirror's
+          ``indexed_at``, folded in at mint time -- see
+          :meth:`forward_flight_info`) no longer matches ``self.content_version``:
+          the mirror has re-synced since this chunk_id was minted. The base
+          implementation's ``content_version_of`` parses the pre-#178
+          ``[0xFF sentinel]`` wrapper and would misparse an envelope
+          (``[0xFE sentinel]``), so this is reimplemented against
+          :func:`peel_proxy_envelope` instead of calling the base.
         """
         if not is_proxy_envelope(chunk_id):
-            return
+            raise flight.FlightServerError(
+                f"proxy source {self.source_id} received a non-envelope chunk_id "
+                f"(stale pre-upgrade ticket); re-open the tensor to refresh."
+            )
         _route, held_version, _inner = peel_proxy_envelope(chunk_id)
         if held_version is not None and held_version != self.content_version:
             raise StaleChunkError(
@@ -1006,20 +1019,11 @@ class RemoteTensorAdapter(TensorAdapter):
         (its canonical key), so the segment cache and the localhost mmap fast path
         are inherited unchanged, namespaced by the upstream's content_version.
 
-        The envelope's OWN content_version (this mirror's ``indexed_at``, folded
-        in at mint time -- see :meth:`forward_flight_info`) is checked here via
-        :meth:`check_chunk_version`, before anything is forwarded.
+        :meth:`check_chunk_version` runs first and rejects both a non-envelope
+        (stale pre-upgrade) chunk_id and a version-stale envelope, before
+        anything is forwarded.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
-
-        if not is_proxy_envelope(chunk_id):
-            # The proxy only mints envelope chunk_ids (biopb/biopb#178 W1); a
-            # non-envelope id is a stale pre-upgrade ticket. Fail clearly so the
-            # client re-opens the tensor to refresh its endpoints.
-            raise flight.FlightServerError(
-                f"proxy source {self.source_id} received a non-envelope chunk_id "
-                f"(stale pre-upgrade ticket); re-open the tensor to refresh."
-            )
 
         self.check_chunk_version(chunk_id)
         _route, _held_version, inner = peel_proxy_envelope(chunk_id)

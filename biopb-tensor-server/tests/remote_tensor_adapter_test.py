@@ -2208,6 +2208,43 @@ def test_resolve_rejects_envelope_stale_against_current_mirror_version():
         adapter.resolve_chunk_data(stale_env, cache_manager=None)
 
 
+def test_check_chunk_version_rejects_non_envelope_chunk_id():
+    """A non-envelope chunk_id (a stale pre-#178-W1 ticket) is rejected by
+    check_chunk_version itself, not left for resolve_chunk_data alone.
+
+    Before this, the non-envelope rejection lived only in resolve_chunk_data --
+    which the chunk-locate fast path skips entirely on a cache HIT. A stale
+    bare (non-envelope) chunk_id whose key happens to have a resident file-
+    cache entry (plausible across a proxy upgrade: ArrowFileBackend persists
+    across restarts) would satisfy that hit and never reach the rejection.
+    check_chunk_version is called before the cache lookup, so folding this
+    check into it closes that gap the same way as the version-mismatch case.
+    """
+    import pyarrow.flight as flight
+    import pytest
+    from biopb.tensor.ticket_pb2 import ChunkBounds
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.core.chunk import encode_chunk_id
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    bare_chunk_id = encode_chunk_id(
+        "lab__img", ChunkBounds(start=[0, 0], stop=[4, 4])
+    )  # never enveloped -- a pre-upgrade-format ticket
+
+    with pytest.raises(flight.FlightServerError, match="non-envelope"):
+        adapter.check_chunk_version(bare_chunk_id)
+
+    adapter._upstream_record_batch = lambda upstream_chunk_id: pytest.fail(
+        "must not forward a non-envelope chunk_id to the upstream"
+    )
+    with pytest.raises(flight.FlightServerError, match="non-envelope"):
+        adapter.resolve_chunk_data(bare_chunk_id, cache_manager=None)
+
+
 def test_seed_catalog_sets_content_version_from_indexed_at():
     """The upstream's register timestamp becomes the mirror's content_version, so a
     re-register re-namespaces the proxy chunk cache (biopb/biopb#178 W1)."""

@@ -719,6 +719,42 @@ class TestChunkLocateAction:
             CacheManager.reset()
             server.shutdown()
 
+    def test_locate_rejects_non_envelope_chunk_id_before_consulting_cache(self):
+        """Same gap, on a real RemoteTensorAdapter: a stale pre-#178-W1 (bare,
+        non-envelope) ticket must not be able to ride a persisted cache HIT
+        past the proxy's own structural rejection (biopb/biopb#958 follow-up).
+        """
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.core.chunk import encode_chunk_id as _encode
+
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory"))
+        try:
+            cache_manager = CacheManager.get_instance()
+            proxy_adapter = RemoteTensorAdapter(
+                source_id="lab__img",
+                upstream_location="grpc://localhost:1",  # never dialed
+                upstream_source_id="img",
+            )
+            bare_chunk_id = _encode(
+                "lab__img", ChunkBounds(start=[0, 0], stop=[4, 4])
+            )  # never enveloped -- a pre-upgrade-format ticket
+
+            with patch.object(
+                cache_manager,
+                "locate_entry",
+                side_effect=AssertionError("locate_entry must not run"),
+            ):
+                with patch.object(
+                    server, "_get_adapter_for_chunk", return_value=proxy_adapter
+                ):
+                    with pytest.raises(flight.FlightServerError, match="non-envelope"):
+                        server._handle_chunk_locate(bare_chunk_id)
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
     def test_locate_releases_the_activity_slot_on_error(self):
         """A failing locate must not leak an in-flight count (precache would
         then never run again)."""
