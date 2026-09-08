@@ -1038,6 +1038,12 @@ class Reconciler:
                 self._restore_displaced_source(claim.source_id, displaced)
             elif registered:
                 self._rollback_source_registration(claim.source_id)
+            if self._server.sources.get(claim.source_id) is not adapter:
+                # The adapter this call built is not the one serving -- the swap
+                # never took, or was undone above -- and nothing else holds it,
+                # so its handles are ours to release. Harmless where the
+                # rollback already closed it: close() must be safe twice.
+                close_adapter(adapter)
             return False
 
     def _restore_displaced_source(self, source_id: str, displaced: Any) -> None:
