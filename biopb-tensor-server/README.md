@@ -30,9 +30,9 @@ The Arrow data are then served to the user via an Arrow Flight server, which bri
 | Akoya | `.qptiff` | Native, Akoya PhenoImager multiplex whole-slide format |
 | Micro-Manager | NDTiff (`NDTiff.index`), legacy (`metadata.txt`) | Multi-file MM acquisitions; native (`ndtiff`) |
 | Zeiss | `.czi`, `.lsm` | Native (`.czi` via `pylibCZIrw`, `.lsm` via `tifffile`) |
-| Leica | `.lif` | Native (`bioio-lif`) |
-| Nikon | `.nd2` | Native (`bioio-nd2`) |
-| DeltaVision | `.dv` | Native (`bioio-dv`) |
+| Leica | `.lif` | Native (`readlif`) |
+| Nikon | `.nd2` | Native (`nd2`) |
+| DeltaVision | `.dv` | Native (`mrc`) |
 | DICOM | `.dcm` | Single files and multi-file series; native (`pydicom`) |
 | NIfTI | `.nii`, `.nii.gz` | Native (`nibabel`) |
 | MRC | `.mrc` | Native (`rosettasciio`) |
