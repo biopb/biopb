@@ -62,23 +62,39 @@ except ImportError:
 # Native phase-3 vendor adapters (biopb/biopb#799): readlif / mrc / nd2 direct,
 # no bioio dependency. Each is optional on its own package, independent of the
 # others and of the bioio-based fallback group below.
+#
+# The reader is probed here rather than left to the module import: every adapter
+# in this file imports its reader lazily, inside the method that uses it, so the
+# module imports fine with the package absent and the adapter would register,
+# claim its extension, and only then fail at read. Probing makes "not installed"
+# mean "not claimed".
 try:
+    import readlif  # noqa: F401
+
     from .lif import LifAdapter
 except ImportError:
     LifAdapter = None  # type: ignore
 
 try:
+    import mrc  # noqa: F401
+
     from .dv import DeltaVisionAdapter
 except ImportError:
     DeltaVisionAdapter = None  # type: ignore
 
 try:
+    import nd2  # noqa: F401
+
     from .nd2 import Nd2Adapter
 except ImportError:
     Nd2Adapter = None  # type: ignore
 
-# Optional bioio adapters (format-specific subclasses)
+# Optional bioio adapters (format-specific subclasses). Out of the default
+# install since biopb/biopb#799; ``bioio`` itself is probed for the reason given
+# above -- adapters/bioio.py imports BioImage inside create_from_config.
 try:
+    import bioio  # noqa: F401
+
     from .bioio import (
         AicsImageIoAdapter,
         BioformatsAdapter,

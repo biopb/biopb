@@ -38,9 +38,6 @@ The Arrow data are then served to the user via an Arrow Flight server, which bri
 | MRC | `.mrc` | Native (`rosettasciio`) |
 | EMD | `.emd` | Native (`rosettasciio`) both Berkeley and Velox flavors |
 | HDF5 | `.h5`, `.hdf5` | Requires explicit dataset path in config |
-| Olympus | `.oif`, `.oib` | Java Bio-Formats (`bioio-bioformats`) |
-| Imaris | `.ims` | Java Bio-Formats (`bioio-bioformats`) |
-| Zeiss (legacy) | `.zvi` | Java Bio-Formats (`bioio-bioformats`) |
 
 ## Client
 
