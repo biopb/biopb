@@ -436,9 +436,9 @@ class TensorConnection:
         ``on_progress`` (an ``AddSourceProgress`` per registered source) and
         ``should_cancel`` (polled per message; a cancel stops the walk but keeps
         what is already registered) are forwarded verbatim. Returns the terminal
-        ``AddSourceResult`` (added / already_present / failed); a directory
-        dropped above the server's large-scan threshold comes back as a
-        ``failed`` entry.
+        ``AddSourceResult`` (added / already_present / refreshed / removed /
+        failed); a directory dropped above the server's large-scan threshold
+        comes back as a ``failed`` entry.
         """
         if self.client is None:
             raise RuntimeError("Not connected")

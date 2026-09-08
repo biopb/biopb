@@ -977,6 +977,48 @@ class DiscoveryState:
 
         return True
 
+    def replace_claim(self, claim: SourceClaim, notify: bool = True) -> Set[str]:
+        """Force a claim into state even where its membership overlaps another.
+
+        Used by a rebuild whose adapter is already live under this source_id
+        (the caller already swapped it in) but whose rediscovered membership
+        conflicts with another source's claim -- add_claim's reject-on-conflict
+        semantics would otherwise leave this source with no claims entry at
+        all, out of sync with what is actually being served.
+
+        Paths already owned by a *different* source_id are left with that
+        owner rather than stolen; those are returned so the caller can log
+        them.
+
+        Args:
+            claim: SourceClaim to store, superseding any existing entry for
+                its source_id.
+            notify: Whether to invoke on_source_added after storing the claim
+
+        Returns:
+            The subset of claim.member_paths still owned by another source_id.
+        """
+        source_id = claim.source_id
+        member_paths = set(claim.member_paths)
+
+        conflicting = {
+            path
+            for path in member_paths
+            if self.path_to_source.get(path) not in (None, source_id)
+        }
+
+        claim.member_paths = member_paths
+        self.claims[source_id] = claim
+        self.source_to_paths[source_id] = member_paths
+        for path in member_paths - conflicting:
+            self.path_to_source[path] = source_id
+            self.consumed_paths.add(path)
+
+        if notify and self.on_source_added:
+            self.on_source_added(claim)
+
+        return conflicting
+
     def remove_claim(self, path: str, notify: bool = True) -> Optional[str]:
         """Remove claim by path (for file deletion events).
 

@@ -399,7 +399,7 @@ class _AddSourceWorker(QThread):
     walk (the client closes the stream; sources already registered stay).
 
     One drop == one path == one ``add_source`` call == one terminal result
-    ``(added, already_present, failed)``. Multi-item drops are refused upstream
+    ``(added, refreshed, removed, failed)``. Multi-item drops are refused upstream
     (``_local_paths_from_mime``), so there is no cross-path aggregation here — a
     single call keeps the progress count monotone. An oversized folder is caught
     *before* this worker starts, by the widget's client-side confirm prompt
@@ -407,7 +407,7 @@ class _AddSourceWorker(QThread):
     """
 
     progress = Signal(object)  # AddSourceProgress
-    done = Signal(object)  # (added, already_present, failed)
+    done = Signal(object)  # (added, refreshed, removed, failed)
     failed = Signal(str)
 
     def __init__(self, conn: TensorConnection, path: str):
@@ -431,9 +431,13 @@ class _AddSourceWorker(QThread):
             self.failed.emit(str(exc))
             return
         added = list(result.added)
-        already = list(result.already_present)
+        # `refreshed` rather than `already_present`: re-dropping a known path
+        # rebuilds it, so "already present" would report a no-op that did not
+        # happen. A rebuild that failed is reported in `failed` instead.
+        refreshed = list(result.refreshed)
+        removed = list(result.removed)
         failed = [(f.path, f.reason) for f in result.failed]
-        self.done.emit((added, already, failed))
+        self.done.emit((added, refreshed, removed, failed))
 
 
 class _RemoveSourceWorker(QThread):
@@ -1427,13 +1431,14 @@ class TensorBrowserWidget(QWidget):
 
     def _on_add_done(self, payload):
         """Terminal add tally: refresh, summarize, report failures."""
-        added, already, failed = payload
+        added, refreshed, removed, failed = payload
         self._add_worker = None
         self._add_cancel_btn.setVisible(False)
 
         # Prompt sources appear immediately; the background watcher would also
-        # catch up, but an explicit refresh is prompt.
-        if added or already:
+        # catch up, but an explicit refresh is prompt. A rebuilt source changes
+        # shape/dtype in place, so the tree needs re-rendering for that too.
+        if added or refreshed or removed:
             try:
                 self._refresh()
             except Exception:
@@ -1442,8 +1447,10 @@ class TensorBrowserWidget(QWidget):
         parts = []
         if added:
             parts.append(f"added {len(added)}")
-        if already:
-            parts.append(f"{len(already)} already present")
+        if refreshed:
+            parts.append(f"{len(refreshed)} refreshed")
+        if removed:
+            parts.append(f"{len(removed)} removed")
         if failed:
             parts.append(f"{len(failed)} failed")
         self._show_status("Add data: " + (", ".join(parts) if parts else "nothing"))

@@ -61,13 +61,19 @@ def _make_manager():
     return manager, server
 
 
-def _drain(gen):
+def _drain_all(gen):
     """Run an add_local_source generator to its terminal ``(added, already,
-    failed)`` result tuple."""
-    added, already, failed = [], [], []
+    refreshed, removed, failed)`` result tuple."""
+    result = ([], [], [], [], [])
     for event in gen:
         if event[0] == "result":
-            _, added, already, failed = event
+            result = event[1:]
+    return result
+
+
+def _drain(gen):
+    """The three original tallies; ``_drain_all`` for the refresh/removal ones."""
+    added, already, _refreshed, _removed, failed = _drain_all(gen)
     return added, already, failed
 
 
@@ -350,7 +356,7 @@ class TestAddLocalSource:
             if event[0] == "progress":
                 state["n"] += 1
             else:
-                _, added, already, failed = event
+                _, added, already, _refreshed, _removed, failed = event
 
         assert 1 <= len(added) < 3  # stopped early, kept what was registered
         for desc in added:
@@ -605,3 +611,198 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
         assert sid in server.sources, "reaped by the initial force_full rescan"
         manager._rescan_monitored_dirs()
         assert sid in server.sources, "reaped by the steady-state incremental rescan"
+
+
+class TestReDropRebuilds:
+    """A re-drop of an already-registered path rebuilds it (biopb/biopb#944).
+
+    ``add_source`` used to report a known ``source_id`` as ``already_present``
+    and stop there, so a ``monitor: false`` root had a way to pick up new files
+    and none at all to notice a changed or removed one. The descriptor AND the
+    ``content_version`` that namespaces the chunk cache are both sampled when
+    the adapter is built, so noticing means building a new adapter.
+    """
+
+    def test_redrop_reports_refreshed_and_already_present(self, tmp_path):
+        manager, _ = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0].source_id
+
+        _, already, refreshed, removed, failed = _drain_all(
+            manager.add_local_source(zpath)
+        )
+
+        assert refreshed == [sid]
+        # Still already_present: an older client reads a re-drop as "already
+        # present" rather than "nothing happened".
+        assert already == [sid]
+        assert not removed and not failed
+
+    def test_redrop_picks_up_an_in_place_rewrite(self, tmp_path):
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0].source_id
+        before = server.sources.get(sid)
+
+        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
+        _drain(manager.add_local_source(zpath))
+
+        adapter = server.sources.get(sid)
+        assert adapter is not before, "the adapter was not rebuilt"
+        shape = tuple(adapter.get_source_descriptor().tensors[0].shape)
+        assert shape[-2:] == (5, 5)
+
+    def test_rebuild_moves_the_content_version(self, tmp_path):
+        """The cache namespaces on this token, so a rebuild that left it alone
+        would keep serving the pre-edit chunks."""
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0].source_id
+        before = server.sources.get(sid).content_version
+
+        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
+        _drain(manager.add_local_source(zpath))
+
+        assert server.sources.get(sid).content_version != before
+
+    def test_rebuild_always_offers_the_source_to_precache(self, tmp_path):
+        """A drop is the user saying they care about this data, and the cache
+        evicts under LRU -- so an unchanged re-drop is still worth warming. It
+        costs little: the chunk_ids are identical, so the warm hits."""
+        manager, _ = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
+        _drain(manager.add_local_source(zpath))
+
+        committed = []
+        manager._reconciler._notify_source_committed = committed.append
+
+        _, _, refreshed, _, _ = _drain_all(manager.add_local_source(zpath))
+        assert committed == refreshed
+
+        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
+        _, _, refreshed_again, _, _ = _drain_all(manager.add_local_source(zpath))
+        assert committed == refreshed + refreshed_again
+
+    def test_rebuild_keeps_the_dnd_display_root(self, tmp_path):
+        """Re-deriving the url would hand the source its native ``file://`` one
+        back, and ``remove_source`` authorizes on the ``dnd://`` scheme."""
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        _drain(manager.add_local_source(zpath))
+
+        _, _, refreshed, _, _ = _drain_all(manager.add_local_source(zpath))
+
+        assert server.sources.get(refreshed[0]).get_source_descriptor().source_url == (
+            "dnd://exp.zarr"
+        )
+
+    def test_a_failed_rebuild_keeps_the_source_served(self, tmp_path):
+        """Register-before-unregister: the replacement goes in on top of the
+        live adapter, so a rebuild that fails costs nothing."""
+
+        class _FailingDb:
+            def sync_source_added(self, *a, **kw):
+                raise RuntimeError("catalog write failed")
+
+            def sync_source_removed(self, *a, **kw):
+                pass
+
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0].source_id
+        original = server.sources.get(sid)
+
+        manager._reconciler._metadata_db = _FailingDb()
+        _, already, refreshed, _, failed = _drain_all(manager.add_local_source(zpath))
+
+        assert not refreshed
+        assert already == [sid]
+        assert len(failed) == 1
+        assert sid in server.sources
+        assert server.sources.get(sid) is original
+
+
+class TestReDropRemovesVanished:
+    """The removal half: a registered source whose files are gone."""
+
+    def test_redrop_deregisters_a_deleted_source(self, tmp_path):
+        import shutil
+
+        manager, server = _make_manager()
+        root = tmp_path / "exp"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        _make_zarr(str(root), "b.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+        by_url = {d.source_url: d.source_id for d in added}
+
+        shutil.rmtree(str(root / "a.zarr"))
+        _, _, _, removed, failed = _drain_all(manager.add_local_source(str(root)))
+
+        assert removed == [by_url["dnd://exp/a.zarr"]]
+        assert by_url["dnd://exp/a.zarr"] not in server.sources
+        assert by_url["dnd://exp/b.zarr"] in server.sources
+        assert not failed
+
+    def test_emptied_folder_removes_instead_of_failing(self, tmp_path):
+        """A folder whose only dataset was deleted is how a stale entry gets
+        noticed, so the drop reports the removal rather than "nothing here"."""
+        import shutil
+
+        manager, server = _make_manager()
+        root = tmp_path / "exp"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+        sid = added[0].source_id
+
+        shutil.rmtree(str(root / "a.zarr"))
+        _, _, _, removed, failed = _drain_all(manager.add_local_source(str(root)))
+
+        assert removed == [sid]
+        assert not failed
+        assert sid not in server.sources
+
+    def test_removal_is_scoped_to_the_drop(self, tmp_path):
+        """The periodic reconcile's diff is whole-catalog; run against a subtree
+        walk it would deregister everything outside the drop."""
+        import shutil
+
+        manager, server = _make_manager()
+        outside = _make_zarr(str(tmp_path), "outside.zarr")
+        added_outside, *_ = _drain(manager.add_local_source(outside))
+
+        root = tmp_path / "exp"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+
+        shutil.rmtree(str(root / "a.zarr"))
+        _, _, _, removed, _ = _drain_all(manager.add_local_source(str(root)))
+
+        assert removed == [added[0].source_id]
+        assert added_outside[0].source_id in server.sources
+
+    def test_a_still_present_but_unclaimed_path_is_kept(self, tmp_path):
+        """Absence from the walk is not evidence of deletion -- a drop has none
+        of the stability gating the periodic path removes under -- so only a
+        vanished path deregisters."""
+        manager, server = _make_manager()
+        root = tmp_path / "exp"
+        root.mkdir()
+        zpath = _make_zarr(str(root), "a.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+        sid = added[0].source_id
+
+        # Break the store so nothing claims it, but leave the path in place.
+        for meta in ("zarr.json", ".zarray"):
+            if os.path.exists(os.path.join(zpath, meta)):
+                os.remove(os.path.join(zpath, meta))
+        _, _, _, removed, _ = _drain_all(manager.add_local_source(str(root)))
+
+        assert not removed
+        assert sid in server.sources

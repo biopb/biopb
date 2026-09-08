@@ -51,6 +51,30 @@ class _FakeAdapter:
         return {"url": source_config.url, "type": source_config.type}
 
 
+class _ClosingAdapter:
+    """An adapter that records ``close()``, so a leaked one is visible."""
+
+    built = []
+
+    def __init__(self, url):
+        self.url = url
+        self.closed = 0
+        _ClosingAdapter.built.append(self)
+
+    def close(self):
+        self.closed += 1
+
+
+class _ClosingAdapterFactory:
+    @classmethod
+    def claim(cls, ctx, state):
+        return _FakeAdapter.claim(ctx, state)
+
+    @classmethod
+    def create_from_config(cls, source_config, credentials_config=None):
+        return _ClosingAdapter(source_config.url)
+
+
 class _FakeMetadataDb:
     def __init__(self):
         self.added = []
@@ -95,6 +119,8 @@ class _FakeServer:
     def __init__(self):
         self.registered = []
         self.unregistered = []
+        self.swapped = []
+        self.sources = {}
         self._metadata_db = _FakeMetadataDb()
         # Progressive-discovery freshness signals, recorded for assertions.
         self.full_scan_in_progress = False
@@ -103,9 +129,17 @@ class _FakeServer:
 
     def register_source(self, source_id, adapter):
         self.registered.append(source_id)
+        self.sources[source_id] = adapter
+
+    def swap_source(self, source_id, adapter):
+        self.swapped.append(source_id)
+        displaced = self.sources.get(source_id)
+        self.sources[source_id] = adapter
+        return adapter, displaced
 
     def unregister_source(self, source_id):
         self.unregistered.append(source_id)
+        self.sources.pop(source_id, None)
 
     def set_full_scan_in_progress(self, in_progress):
         self.full_scan_in_progress = bool(in_progress)
@@ -141,6 +175,13 @@ class _FailingAdapter:
     @classmethod
     def create_from_config(cls, source_config, credentials_config=None):
         raise RuntimeError("adapter create failed")
+
+
+class _ClosingRegistry(_FakeRegistry):
+    def get_adapter_for_type(self, source_type):
+        if source_type == "fake":
+            return _ClosingAdapterFactory
+        return None
 
 
 class _RegistryWithFailingAdapter(_FakeRegistry):
@@ -1061,9 +1102,86 @@ class TestSourceManagerRegressions:
         assert claim.primary_path not in manager._reconciler._path_to_source_id
         assert claim.source_id not in state.claims
 
-    def test_reconcile_changed_source_removes_old_source_when_readd_fails(
-        self, tmp_path
-    ):
+    def test_reconcile_changed_source_rebuilds_it_in_place(self, tmp_path):
+        """A rewritten file is rebuilt on top of the live adapter, never removed
+        and re-added: the source stays in ListFlights and in the catalog for the
+        whole rebuild (biopb/biopb#944)."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+
+        server.registered.clear()
+        server.unregistered.clear()
+        server.swapped.clear()
+        server._metadata_db.added.clear()
+        server._metadata_db.removed.clear()
+
+        data_path.write_text("hello world")
+        manager._handle_rescan()
+
+        assert server.swapped == [source_id]
+        assert server.unregistered == []
+        assert server._metadata_db.removed == []
+        # sync_source_added is an upsert, so the row is replaced in place.
+        assert server._metadata_db.added == [source_id]
+        assert source_id in state.claims
+
+    def test_a_rebuild_that_does_not_take_closes_the_adapter_it_built(self, tmp_path):
+        """The replacement holds the handles it opened. Restoring the previous
+        adapter leaves it referenced by nothing, so this call is the only one
+        that can release it -- the mirror of the leak a bare ``register`` over a
+        live id causes."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_ClosingRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        _ClosingAdapter.built.clear()
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+        (serving,) = _ClosingAdapter.built
+
+        # The swap lands, then the catalog write fails.
+        manager._reconciler._metadata_db = _FailingMetadataDb(fail_add=True)
+        data_path.write_text("hello world")
+        manager._handle_rescan()
+
+        built = [a for a in _ClosingAdapter.built if a is not serving]
+        assert len(built) == 1, "expected exactly one replacement to be built"
+        assert built[0].closed == 1, "the replacement was dropped still open"
+        # And the one that was serving is still serving, still open.
+        assert server.sources[source_id] is serving
+        assert serving.closed == 0
+
+    def test_reconcile_changed_source_keeps_serving_when_rebuild_fails(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -1094,12 +1212,15 @@ class TestSourceManagerRegressions:
 
         manager._handle_rescan()
 
-        assert state.claims == {}
+        # The rebuild failed, and that must cost nothing: the previously
+        # registered adapter is still the one serving. Remove-then-add used to
+        # deregister the source here -- a *rescan request* losing a working
+        # source (biopb/biopb#944).
+        assert source_id in state.claims
         assert server.registered == []
-        assert server.unregistered == [source_id]
-        assert server._metadata_db.added == []
-        assert server._metadata_db.removed == [source_id]
-        assert source_id not in manager._reconciler._source_signatures
+        assert server.unregistered == []
+        assert server._metadata_db.removed == []
+        assert source_id in manager._reconciler._source_signatures
 
     def test_rollback_source_registration_survives_rollback_errors(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
