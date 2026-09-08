@@ -703,18 +703,14 @@ class TestTheFormatDecides:
 
         assert "rois" in db.get_metadata_json(SOURCE_ID)
 
-    def test_an_adapter_that_does_not_answer_at_all_is_fine(self):
+    def test_an_adapter_that_does_not_answer_at_all_is_fine(self, monkeypatch):
         """Most test doubles, and anything predating the hook."""
         db = MetadataDatabase()
-        adapter = _FakeAdapter(_meta(_shape("points", x=1, y=1)))
-        del type(adapter).get_embedded_rois
-        try:
-            db.sync_source_added(SOURCE_ID, adapter)
-            assert _reserved(db) == []
-        finally:
-            type(adapter).get_embedded_rois = _FakeAdapter.__dict__.get(
-                "get_embedded_rois", None
-            )
+        monkeypatch.delattr(_FakeAdapter, "get_embedded_rois")
+
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+
+        assert _reserved(db) == []
 
     def test_the_base_carries_nothing(self):
         assert SourceAdapter.get_embedded_rois(object(), {"rois": [1]}, []) == (
@@ -734,3 +730,73 @@ class TestTheFormatDecides:
         # .zattrs is NGFF, not an ome-types dump -- the name is the trap.
         assert not declares(OmeZarrAdapter)
         assert not declares(ZarrAdapter)
+
+
+class TestAnnotationsDisabled:
+    """A server not serving the annotation actions does not import them."""
+
+    def test_nothing_is_parsed(self):
+        db = MetadataDatabase(annotations_enabled=False)
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+
+        rows = db._get_connection().execute("SELECT count(*) FROM rois").fetchone()
+        assert rows[0] == 0
+
+    def test_and_the_metadata_keeps_them(self):
+        """Nothing read them, so this is the only copy left."""
+        db = MetadataDatabase(annotations_enabled=False)
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+
+        assert "rois" in db.get_metadata_json(SOURCE_ID)
+
+    def test_the_source_still_registers(self):
+        db = MetadataDatabase(annotations_enabled=False)
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+
+        assert db.get_metadata_json(SOURCE_ID) is not None
+
+
+class TestOpenTimeClear:
+    def test_a_catalog_from_a_newer_build_is_left_untouched(self, tmp_path):
+        """The refusal promises exactly that, so the clear must come after it."""
+        from biopb_tensor_server.core.errors import AnnotationStoreError
+        from biopb_tensor_server.core.metadata_db import _ROI_SCHEMA_VERSION
+
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+        assert _reserved(db) == ["Shape:0"]
+        db._get_connection().execute(
+            "UPDATE catalog_meta SET value = ? WHERE key = 'roi_schema_version'",
+            [str(_ROI_SCHEMA_VERSION + 1)],
+        )
+        db.close()
+
+        with pytest.raises(AnnotationStoreError, match="untouched"):
+            MetadataDatabase(store_path=store)._get_connection()
+
+        # Reopened by a build that does understand it: the rows are still there.
+        import duckdb
+
+        conn = duckdb.connect(str(store))
+        conn.execute(
+            "UPDATE catalog_meta SET value = ? WHERE key = 'roi_schema_version'",
+            [str(_ROI_SCHEMA_VERSION)],
+        )
+        rows = conn.execute("SELECT roi_id FROM rois").fetchall()
+        conn.close()
+        assert [r[0] for r in rows] == ["Shape:0"]
+
+    def test_imported_rows_do_not_survive_a_restart(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+        db.put_rois(
+            ARRAY_0, [RoiAnnotation(roi_id="mine", set_name="mine", roi=_point())]
+        )
+        db.close()
+
+        reopened = MetadataDatabase(store_path=store)
+        assert _reserved(reopened) == []
+        # Hand-drawn work is what persistence is for.
+        assert [r.roi_id for r in reopened.list_rois(ARRAY_0)[0]] == ["mine"]

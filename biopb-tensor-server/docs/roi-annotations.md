@@ -214,6 +214,17 @@ The metadata dict and the tensor list are passed *in* rather than recomputed:
 the caller holds both, and `get_metadata` is a documented pure producer that
 would re-parse.
 
+`annotations.enabled = false` skips the parse entirely. Those rows would be
+unreadable through every surface — the SQL one drops `rois` from
+`allowed_tables` too — so the work and the storage buy nothing, and `rois` stays
+in `metadata_json` because nothing read it.
+
+The open-time clear runs **after** `_reconcile_roi_schema`, not beside the
+`DROP TABLE sources` that motivates it. That check can refuse the catalog, and
+it promises "The file is untouched" when it does — a delete before it would make
+that a lie, and would run against a schema this build has not established it
+understands.
+
 **The import cannot fail a registration.** It runs on a file nobody here wrote,
 and it sits inside `sync_source_added` — so an unguarded raise would cost a
 source its pixels over an annotation, which is backwards: an imported set is

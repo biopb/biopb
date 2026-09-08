@@ -577,6 +577,7 @@ class MetadataDatabase:
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
         self._max_rois_per_tensor = max_rois_per_tensor
+        self._annotations_enabled = annotations_enabled
         # None -> in-memory, and the annotations die with the process.
         self._store_path = Path(store_path) if store_path else None
         # A server not serving the annotation actions does not offer them
@@ -735,19 +736,6 @@ class MetadataDatabase:
         :meth:`_reconcile_roi_schema`.
         """
         conn.execute("DROP TABLE IF EXISTS sources")
-        # Reserved sets are scan output like `sources` itself -- derived from a
-        # file and rewritten by sync_source_added -- so they are cleared here
-        # rather than carried forward. Otherwise the window between open and
-        # re-registration holds last run's imported rows next to an empty
-        # `sources`, possibly derived by code this build no longer runs. The
-        # table may not exist yet on a fresh catalog (biopb/biopb#951).
-        if conn.execute(
-            "SELECT 1 FROM duckdb_tables() WHERE table_name = 'rois'"
-        ).fetchone():
-            conn.execute(
-                "DELETE FROM rois WHERE starts_with(set_name, ?)",
-                [RESERVED_SET_PREFIX],
-            )
         conn.execute("""
             CREATE TABLE sources (
                 source_id TEXT PRIMARY KEY,
@@ -812,6 +800,20 @@ class MetadataDatabase:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_array ON rois(array_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_source ON rois(source_id)")
         self._reconcile_roi_schema(conn, had_rois)
+
+        # Reserved sets are scan output like `sources` itself -- derived from a
+        # file and rewritten by sync_source_added -- so they are cleared at open
+        # rather than carried forward, or the window before re-registration
+        # holds last run's imported rows next to an empty `sources`, possibly
+        # derived by code this build no longer runs (biopb/biopb#951).
+        #
+        # AFTER the schema check, not beside the DROP above, because that check
+        # can refuse the catalog -- and it promises "The file is untouched" when
+        # it does. A delete before it would have made that a lie, and would have
+        # run against a schema this build has not established it understands.
+        conn.execute(
+            "DELETE FROM rois WHERE starts_with(set_name, ?)", [RESERVED_SET_PREFIX]
+        )
         logger.debug("Created sources and rois tables and indexes")
 
     def _reconcile_roi_schema(
@@ -1171,7 +1173,17 @@ class MetadataDatabase:
         # the base -- which is also why they read as "carries nothing".
         report = None
         imported: Dict[str, List[RoiAnnotation]] = {}
-        get_embedded = getattr(adapter, "get_embedded_rois", None)
+        get_embedded = (
+            getattr(adapter, "get_embedded_rois", None)
+            # A deployment that does not serve the annotation actions does not
+            # parse a file's ROIs either: the rows would be unreadable through
+            # every surface (the SQL one drops the table from allowed_tables
+            # too), so the work and the storage buy nothing. It also leaves
+            # `rois` in metadata_json, since nothing read them -- stripping is
+            # gated on a completed read, so that falls out.
+            if self._annotations_enabled
+            else None
+        )
         try:
             if get_embedded is not None:
                 imported, report = get_embedded(
