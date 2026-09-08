@@ -261,6 +261,22 @@ export interface AppState {
    */
   planeLimits: [number, number] | null;
   /**
+   * The widest window the data has shown so far, per channel, and the tensor it
+   * was sampled from.
+   *
+   * A float dtype names no range of its own, so the track a fixed window is
+   * chosen on is the levels that have actually appeared. Taking that from the
+   * plane in view alone would shrink the track on a dim plane -- exactly when a
+   * fixed window needs to reach the levels of a bright one. Per channel because
+   * two channels of one tensor need not share a scale.
+   *
+   * Read through `selectObservedLimits`, which hides a union sampled from
+   * another tensor rather than trusting a reset, for the reason `tileInfo` is
+   * read through `selectTileInfo`.
+   */
+  observedLimits: Record<number, [number, number]>;
+  observedLimitsFor: string | null;
+  /**
    * Whether what is on the canvas is the slice that was last asked for.
    *
    * Published by whichever viewer is mounted. Play reads it to pace itself to
@@ -339,6 +355,11 @@ export interface AppState {
   setPlayAxis: (key: string | null) => void;
   setAppliedLimits: (value: [number, number]) => void;
   setPlaneLimits: (value: [number, number]) => void;
+  noteObservedLimits: (
+    value: [number, number],
+    forArrayId: string,
+    channel: number,
+  ) => void;
   setPlaneReady: (value: boolean) => void;
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
@@ -436,6 +457,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   planeReady: false,
   appliedLimits: null,
   planeLimits: null,
+  observedLimits: {},
+  observedLimitsFor: null,
 
   showAdvancedOptions: false,
   render3d: false,
@@ -552,6 +575,25 @@ export const useAppStore = create<AppState>((set, get) => ({
         ? s
         : { planeLimits: value },
     );
+  },
+
+  noteObservedLimits(value, forArrayId, channel) {
+    set((s) => {
+      // A union carried over from another tensor is not narrowed back by a
+      // union, so the switch starts one rather than widening the old one.
+      const carried = s.observedLimitsFor === forArrayId;
+      const prev = carried ? s.observedLimits[channel] : undefined;
+      if (prev && prev[0] <= value[0] && prev[1] >= value[1]) return s;
+      const next: [number, number] = prev
+        ? [Math.min(prev[0], value[0]), Math.max(prev[1], value[1])]
+        : [value[0], value[1]];
+      return {
+        observedLimits: carried
+          ? { ...s.observedLimits, [channel]: next }
+          : { [channel]: next },
+        observedLimitsFor: forArrayId,
+      };
+    });
   },
 
   setPlaneReady(value) {
@@ -1022,6 +1064,12 @@ export function currentArrayId(s: AppState): string | null {
 
 export function selectTileInfo(s: AppState): TileInfo | null {
   return s.tileInfoFor === currentArrayId(s) ? s.tileInfo : null;
+}
+
+/** The levels this tensor's current channel has shown, or null if none yet. */
+export function selectObservedLimits(s: AppState): [number, number] | null {
+  if (s.observedLimitsFor !== currentArrayId(s)) return null;
+  return s.observedLimits[s.slice.c] ?? null;
 }
 
 // --- ROI annotations -------------------------------------------------------
