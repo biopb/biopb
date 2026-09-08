@@ -34,10 +34,12 @@ def _qapp():
     yield QApplication.instance() or QApplication([])
 
 
-def _result(added=(), already=(), failed=()):
+def _result(added=(), already=(), refreshed=(), removed=(), failed=()):
     r = MagicMock()
     r.added = list(added)
     r.already_present = list(already)
+    r.refreshed = list(refreshed)
+    r.removed = list(removed)
     r.failed = [MagicMock(path=p, reason=why) for p, why in failed]
     return r
 
@@ -47,6 +49,8 @@ def test_worker_maps_single_result(_qapp):
     conn.add_source.return_value = _result(
         added=[MagicMock(source_id="a")],
         already=["c"],
+        refreshed=["c"],
+        removed=["d"],
         failed=[("/p/bad", "not a recognized image format")],
     )
     worker = _AddSourceWorker(conn, "/A")
@@ -54,7 +58,7 @@ def test_worker_maps_single_result(_qapp):
     captured = {}
     worker.done.connect(
         lambda payload: captured.update(
-            zip(("added", "already", "failed"), payload, strict=True)
+            zip(("added", "refreshed", "removed", "failed"), payload, strict=True)
         )
     )
     worker.run()  # synchronous; direct-connected slot fires inline
@@ -62,7 +66,10 @@ def test_worker_maps_single_result(_qapp):
     conn.add_source.assert_called_once()
     assert conn.add_source.call_args.args[0] == "/A"
     assert [d.source_id for d in captured["added"]] == ["a"]
-    assert captured["already"] == ["c"]
+    # A re-dropped path is reported as REBUILT, not as a no-op: the worker
+    # relays `refreshed`, not `already_present` (biopb/biopb#944).
+    assert captured["refreshed"] == ["c"]
+    assert captured["removed"] == ["d"]
     assert captured["failed"] == [("/p/bad", "not a recognized image format")]
 
 

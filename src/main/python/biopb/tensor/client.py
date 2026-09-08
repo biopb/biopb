@@ -561,10 +561,20 @@ class TensorFlightClient:
                 stops discovery -- sources already registered stay registered.
 
         Returns:
-            The terminal ``AddSourceResult`` (``added`` descriptors,
-            ``already_present`` source_ids, ``failed`` ``(path, reason)`` pairs).
-            A directory dropped above the large-scan threshold comes back as a
-            ``failed`` entry, not a special flag.
+            The terminal ``AddSourceResult``: ``added`` descriptors,
+            ``already_present`` / ``refreshed`` / ``removed`` source_ids, and
+            ``failed`` ``(path, reason)`` pairs. A directory dropped above the
+            large-scan threshold comes back as a ``failed`` entry, not a special
+            flag.
+
+            Re-adding a path that is already registered REBUILDS it against the
+            file as it is now -- that is what ``refreshed`` reports, and it is
+            how a source picks up an in-place edit, since both its descriptor
+            and the content_version that namespaces the chunk cache are sampled
+            when its adapter is built. ``refreshed`` is a subset of
+            ``already_present``, which keeps its original meaning. Registered
+            sources under the path whose files are gone are deregistered and
+            listed in ``removed``.
 
         Raises:
             flight.FlightServerError: whole-request failure (path not found /

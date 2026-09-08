@@ -24,8 +24,11 @@ from biopb_tensor_server.core.normalize import normalize_adapter
 logger = logging.getLogger(__name__)
 
 
-def _close_adapter(adapter: Optional[SourceAdapter]) -> None:
+def close_adapter(adapter: Optional[SourceAdapter]) -> None:
     """Best-effort release of an adapter's resources (e.g. open file handles).
+
+    Public because :meth:`SourceRegistry.swap` hands the displaced adapter back
+    unclosed, so whoever swapped needs this same never-raises close.
 
     ``SourceAdapter.close()`` is declared on the ABC with a no-op default, so
     this calls it rather than sniffing for it: a wrapper that forwards every
@@ -101,9 +104,30 @@ class SourceRegistry:
         """
         with self._lock:
             adapter = self._sources.pop(source_id, None)
-        _close_adapter(adapter)
+        close_adapter(adapter)
         logger.debug(f"Unregistered source: {source_id}")
         return adapter
+
+    def swap(
+        self, source_id: str, adapter: SourceAdapter
+    ) -> Tuple[SourceAdapter, Optional[SourceAdapter]]:
+        """Put *adapter* in place of ``source_id``'s current one, atomically.
+
+        Returns ``(registered, displaced)`` -- the adapter as registered (see
+        :meth:`register` on normalization) and the one it replaced, or None if
+        the id was free. The displaced adapter is **not** closed: a reader that
+        already resolved it through :meth:`get` is still decoding from it, so
+        closing is the caller's to do once it has drained (see
+        ``SourceAdapter.close``). Callers that skip that leak the handle -- which
+        is what a bare :meth:`register` over a live id does, and why a
+        replacement goes through here instead.
+        """
+        adapter = normalize_adapter(adapter)
+        with self._lock:
+            displaced = self._sources.get(source_id)
+            self._sources[source_id] = adapter
+        logger.debug(f"Swapped source adapter: {source_id}")
+        return adapter, displaced
 
     def get(self, source_id: str) -> Optional[SourceAdapter]:
         """Thread-safe source lookup."""
@@ -126,7 +150,7 @@ class SourceRegistry:
         with self._lock:
             adapters = list(self._sources.values())
         for adapter in adapters:
-            _close_adapter(adapter)
+            close_adapter(adapter)
 
     def replace(self, mapping: Dict[str, SourceAdapter]) -> None:
         """Atomically swap the whole map (used by tests to inject fixtures)."""

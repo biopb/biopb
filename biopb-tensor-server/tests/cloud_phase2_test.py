@@ -408,7 +408,7 @@ class TestUnresolvedProxy:
     def test_close_forwards_to_the_resolved_adapter(self):
         """The proxy must not swallow the inner adapter's close (biopb/biopb#71).
 
-        ``_close_adapter`` is duck-typed, so a proxy without ``close`` silently
+        ``close_adapter`` is duck-typed, so a proxy without ``close`` silently
         skips cleanup for exactly the resolved cloud OME-TIFF / QPTIFF sources
         whose ``close()`` is the one that matters.
         """

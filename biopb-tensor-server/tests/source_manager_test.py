@@ -95,6 +95,8 @@ class _FakeServer:
     def __init__(self):
         self.registered = []
         self.unregistered = []
+        self.swapped = []
+        self.sources = {}
         self._metadata_db = _FakeMetadataDb()
         # Progressive-discovery freshness signals, recorded for assertions.
         self.full_scan_in_progress = False
@@ -103,9 +105,17 @@ class _FakeServer:
 
     def register_source(self, source_id, adapter):
         self.registered.append(source_id)
+        self.sources[source_id] = adapter
+
+    def swap_source(self, source_id, adapter):
+        self.swapped.append(source_id)
+        displaced = self.sources.get(source_id)
+        self.sources[source_id] = adapter
+        return adapter, displaced
 
     def unregister_source(self, source_id):
         self.unregistered.append(source_id)
+        self.sources.pop(source_id, None)
 
     def set_full_scan_in_progress(self, in_progress):
         self.full_scan_in_progress = bool(in_progress)
@@ -1061,9 +1071,47 @@ class TestSourceManagerRegressions:
         assert claim.primary_path not in manager._reconciler._path_to_source_id
         assert claim.source_id not in state.claims
 
-    def test_reconcile_changed_source_removes_old_source_when_readd_fails(
-        self, tmp_path
-    ):
+    def test_reconcile_changed_source_rebuilds_it_in_place(self, tmp_path):
+        """A rewritten file is rebuilt on top of the live adapter, never removed
+        and re-added: the source stays in ListFlights and in the catalog for the
+        whole rebuild (biopb/biopb#944)."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+
+        server.registered.clear()
+        server.unregistered.clear()
+        server.swapped.clear()
+        server._metadata_db.added.clear()
+        server._metadata_db.removed.clear()
+
+        data_path.write_text("hello world")
+        manager._handle_rescan()
+
+        assert server.swapped == [source_id]
+        assert server.unregistered == []
+        assert server._metadata_db.removed == []
+        # sync_source_added is an upsert, so the row is replaced in place.
+        assert server._metadata_db.added == [source_id]
+        assert source_id in state.claims
+
+    def test_reconcile_changed_source_keeps_serving_when_rebuild_fails(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -1094,12 +1142,15 @@ class TestSourceManagerRegressions:
 
         manager._handle_rescan()
 
-        assert state.claims == {}
+        # The rebuild failed, and that must cost nothing: the previously
+        # registered adapter is still the one serving. Remove-then-add used to
+        # deregister the source here -- a *rescan request* losing a working
+        # source (biopb/biopb#944).
+        assert source_id in state.claims
         assert server.registered == []
-        assert server.unregistered == [source_id]
-        assert server._metadata_db.added == []
-        assert server._metadata_db.removed == [source_id]
-        assert source_id not in manager._reconciler._source_signatures
+        assert server.unregistered == []
+        assert server._metadata_db.removed == []
+        assert source_id in manager._reconciler._source_signatures
 
     def test_rollback_source_registration_survives_rollback_errors(self, tmp_path):
         monitored_dir = tmp_path / "monitored"

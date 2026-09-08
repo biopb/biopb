@@ -5,12 +5,12 @@ set (``DiscoveryState``), the server registration, the metadata-DB rows, and the
 derived indices (path->source_id, per-source signatures, cloud-source ids, and
 failed-source retry state). It is the single writer of that catalog, reached from
 the three desired-state sources, all of which reduce to the same
-add/remove/register primitives:
+add/refresh/remove/register primitives:
 
   * the periodic filesystem rescan  -> :meth:`_reconcile_discovered_state` /
     :meth:`_preserve_skipped_claims` (fed the walk's discovered claims);
-  * a runtime drag-drop / SDK add   -> :meth:`_commit_add_claim` (driven by
-    ``SourceManager.add_local_source``);
+  * a runtime drag-drop / SDK add   -> :meth:`_commit_add_claim` /
+    :meth:`_refresh_claim` (driven by ``SourceManager.add_local_source``);
   * a tensor-server upstream re-list -> :meth:`_reconcile_one_upstream`.
 
 ``SourceManager`` owns the *rescan machinery* (event loop, the filesystem walk
@@ -54,6 +54,7 @@ from biopb_tensor_server.core.discovery import (
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
+from biopb_tensor_server.core.source_registry import close_adapter
 from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
 
 if TYPE_CHECKING:
@@ -246,21 +247,36 @@ class Reconciler:
 
         removed_ids = [
             source_id
-            for source_id in sorted(current_ids - discovered_ids | changed_ids)
+            for source_id in sorted(current_ids - discovered_ids)
             if not self._claim_overlaps_unstable(
                 current_claims[source_id], unstable_paths
             )
         ]
         added_claims = [
             discovered_claims[source_id]
-            for source_id in sorted((discovered_ids - current_ids) | changed_ids)
+            for source_id in sorted(discovered_ids - current_ids)
             if self._should_retry_source(source_id)
+        ]
+        # A changed source is REBUILT in place rather than removed and re-added:
+        # the replacement adapter is registered on top of the live one, so the
+        # source is never absent from ListFlights or the catalog and a failed
+        # rebuild does not cost a working source. Still gated on stability --
+        # rebuilding mid-write reads a half-written file.
+        refreshed_ids = [
+            source_id
+            for source_id in sorted(changed_ids)
+            if not self._claim_overlaps_unstable(
+                current_claims[source_id], unstable_paths
+            )
+            and self._should_retry_source(source_id)
         ]
 
         for source_id in removed_ids:
             self._commit_remove_source(source_id)
         for claim in added_claims:
             self._commit_add_claim(claim)
+        for source_id in refreshed_ids:
+            self._refresh_claim(discovered_claims[source_id])
 
     def _is_monitored_claim(self, claim: SourceClaim) -> bool:
         """Check if a claim belongs to one of the monitored local roots."""
@@ -301,8 +317,16 @@ class Reconciler:
     def _build_claim_signatures(
         self,
         claim: SourceClaim,
+        use_cache: bool = True,
     ) -> Dict[str, Tuple[Any, ...]]:
-        """Collect cached member-path signatures for a claim."""
+        """Collect member-path signatures for a claim.
+
+        ``use_cache=False`` stats every member instead of reading the scan
+        cache. The cache is the right source on the periodic path -- the walk
+        that just populated it is where the signatures came from -- and the
+        wrong one for a refresh fired between passes, which would compare
+        against the previous pass's entry and see nothing.
+        """
         signatures: Dict[str, Tuple[Any, ...]] = {}
         # Cloud-root membership is a property of the *source*, not the individual
         # member: every member lives under ``claim.primary_path``, so they share
@@ -313,7 +337,7 @@ class Reconciler:
         # ``cloud`` flag).
         cloud = self._is_under_cloud_root(claim.primary_path)
         for member_path in sorted(claim.member_paths):
-            entry = self._entry_for(member_path)
+            entry = self._entry_for(member_path) if use_cache else None
             if entry is not None:
                 signatures[member_path] = entry.signature
                 continue
@@ -438,6 +462,80 @@ class Reconciler:
         # live-vs-startup gate (and the best-effort hook invocation) lives in the
         # injected SourceManager callback, which owns the startup/suppress state.
         self._notify_source_committed(claim.source_id)
+        return True
+
+    def _refresh_claim(
+        self, claim: SourceClaim, fresh_signatures: bool = False
+    ) -> bool:
+        """Re-register an already-confirmed source against its bytes as they are now.
+
+        The third commit primitive, beside add and remove. A source's descriptor
+        and its ``content_version`` are both sampled in the adapter's
+        ``__init__``, so the only way to notice that a file was rewritten in
+        place is to build a new adapter -- and the version is what namespaces the
+        chunk cache, so a refresh that skipped it would leave the old bytes being
+        served (biopb/biopb#944).
+
+        Registration goes through ``replace=True``, which swaps the new adapter
+        in over the old one and closes the old one only afterwards; see
+        :meth:`_register_source_claim`.
+
+        ``fresh_signatures`` re-stats the members rather than reading the scan
+        cache -- what a refresh fired outside the periodic pass needs, since the
+        cache still holds what the last pass saw.
+        """
+        with self._lock:
+            previous = self._state.claims.get(claim.source_id)
+        if previous is None:
+            return False
+
+        # The display url is the source's, not the rebuild's. Re-deriving it
+        # would either hand a dnd:// drop its native file:// url back -- losing
+        # its removability, since remove_source authorizes on that scheme -- or
+        # stamp the marker onto a monitored source, where it would falsely
+        # promise that nothing will re-add it.
+        live = self._server.sources.get(claim.source_id)
+        catalog_url = getattr(live, "_catalog_url", None) if live is not None else None
+        was = getattr(live, "content_version", None) if live is not None else None
+
+        if not self._register_source_claim(
+            claim, catalog_url=catalog_url, replace=True
+        ):
+            self._record_failed_source_attempt(claim.source_id)
+            return False
+
+        with self._lock:
+            # Membership moves under a source (a file added to a sequence dir),
+            # so the claim is replaced rather than left at what was discovered
+            # when it was first registered.
+            self._state.remove_claim(previous.primary_path, notify=False)
+            if not self._state.add_claim(claim, notify=False):
+                # A member is owned by another source. The rebuilt adapter is
+                # already serving, so keep the catalog consistent with it by
+                # restoring the membership we knew rather than leaving none.
+                self._state.add_claim(previous, notify=False)
+                logger.warning(
+                    "Refreshed source %s kept its previous membership: the "
+                    "rediscovered claim overlaps another source",
+                    claim.source_id,
+                )
+            self._source_signatures[claim.source_id] = self._build_claim_signatures(
+                claim, use_cache=not fresh_signatures
+            )
+            if self._is_under_cloud_root(claim.primary_path):
+                self._cloud_source_ids.add(claim.source_id)
+            self._clear_failed_source_attempt(claim.source_id)
+
+        logger.info(f"Refreshed source: {claim.source_id}")
+        # Precache only when the content_version moved. The rebuild is cheap and
+        # runs unconditionally, but a warm re-reads the whole source -- and an
+        # unmoved token means the cache namespace did not move either, so what
+        # is already warm is still what a read would look up.
+        now = getattr(
+            self._server.sources.get(claim.source_id), "content_version", None
+        )
+        if now != was:
+            self._notify_source_committed(claim.source_id)
         return True
 
     def _commit_remove_source(self, source_id: str) -> bool:
@@ -801,8 +899,16 @@ class Reconciler:
         claim: SourceClaim,
         catalog_seed: Optional[tuple] = None,
         catalog_url: Optional[str] = None,
+        replace: bool = False,
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
+
+        ``replace`` re-registers a source that is already live: the new adapter
+        is swapped in on top of the old one and the old one is closed only after
+        the swap and the catalog upsert have both succeeded. Ordering matters --
+        unregister-then-register would leave the source absent from ListFlights
+        and its catalog row deleted for the length of the rebuild, and gone for
+        good if the rebuild then failed.
 
         ``catalog_seed`` (biopb/biopb#266) is an optional
         ``(tensors, metadata, data_resident, source_url)`` tuple from a bulk upstream
@@ -891,6 +997,7 @@ class Reconciler:
             adapter._catalog_url = catalog_url
 
         registered = False
+        displaced: Optional[Any] = None
         try:
             # Normalize the axis order here rather than leaning on what
             # register_source hands back (biopb/biopb#596): the catalog row
@@ -898,16 +1005,25 @@ class Reconciler:
             # out, and the wrap is idempotent, so the registry re-applying it
             # is a no-op.
             adapter = normalize_adapter(adapter)
-            self._server.register_source(claim.source_id, adapter)
+            if replace:
+                adapter, displaced = self._server.swap_source(claim.source_id, adapter)
+            else:
+                self._server.register_source(claim.source_id, adapter)
             registered = True
 
             # Raises on failure -> the except below rolls back register_source,
             # so a catalog write error never leaves a source visible in
-            # ListFlights but absent from DuckDB.
+            # ListFlights but absent from DuckDB. sync_source_added is an upsert,
+            # so a replace overwrites the row rather than needing it deleted
+            # first -- which is what keeps the source continuously catalogued.
             if self._metadata_db is not None:
                 self._metadata_db.sync_source_added(claim.source_id, adapter)
 
             self._path_to_source_id[claim.primary_path] = claim.source_id
+            if displaced is not None and displaced is not adapter:
+                # Only now: a reader that resolved the old adapter before the
+                # swap is still decoding from it, and close() drains that.
+                close_adapter(displaced)
             logger.info(f"Registered source with server: {claim.source_id}")
             return True
         except Exception as e:
@@ -919,9 +1035,26 @@ class Reconciler:
                 e,
                 exc_info=True,
             )
-            if registered:
+            if registered and displaced is not None:
+                # A failed REBUILD must not cost the working source: put the
+                # adapter that was serving back, and its catalog row with it.
+                self._restore_displaced_source(claim.source_id, displaced)
+            elif registered:
                 self._rollback_source_registration(claim.source_id)
             return False
+
+    def _restore_displaced_source(self, source_id: str, displaced: Any) -> None:
+        """Put a swapped-out adapter back after a failed replace (best-effort)."""
+        try:
+            self._server.swap_source(source_id, displaced)
+            if self._metadata_db is not None:
+                self._metadata_db.sync_source_added(source_id, displaced)
+        except Exception:
+            logger.exception(
+                "Failed to restore the previous adapter for source %s; it is "
+                "no longer served",
+                source_id,
+            )
 
     def _teardown_source_bookkeeping(self, source_id: str) -> None:
         """Drop a source's catalog row and path-map entries (best-effort).

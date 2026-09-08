@@ -443,6 +443,17 @@ message AddSourceResult {
   // above the large-scan threshold is declined here too ("directory too large
   // to scan on drop -- drop a subfolder, or add it via the server config file").
   repeated AddSourceFailure failed = 3;
+
+  // source_ids whose adapter was rebuilt against the file as it is now -- the
+  // only thing that resamples the descriptor and the content_version that
+  // namespaces the chunk cache (biopb/biopb#944). A subset of `already_present`,
+  // which keeps its meaning so an older client still reads a re-drop as
+  // "already present".
+  repeated string refreshed = 4;
+
+  // source_ids deregistered because their files are gone from under the
+  // dropped path.
+  repeated string removed = 5;
 }
 
 // One message in the "add_source" action's result stream: zero or more

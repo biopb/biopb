@@ -450,6 +450,18 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return self.sources.register(source_id, adapter)
 
+    def swap_source(
+        self, source_id: str, adapter: SourceAdapter
+    ) -> Tuple[SourceAdapter, Optional[SourceAdapter]]:
+        """Replace a registered source's adapter in place (delegates to ``sources``).
+
+        Returns ``(registered, displaced)``. Upload state is deliberately NOT
+        forgotten: the source is not going away, only its adapter is being
+        rebuilt against the current bytes. The displaced adapter is left open
+        for the caller to close once in-flight reads have drained.
+        """
+        return self.sources.swap(source_id, adapter)
+
     def unregister_source(self, source_id: str) -> None:
         """Unregister a data source and drop any in-flight upload state."""
         self.sources.unregister(source_id)
@@ -1096,9 +1108,11 @@ class TensorFlightServer(flight.FlightServerBase):
                     )
                     yield AddSourceStreamMessage(progress=progress).SerializeToString()
                 else:  # "result"
-                    _, added, already_present, failed = event
+                    _, added, already_present, refreshed, removed, failed = event
                     result = AddSourceResult(
                         already_present=already_present,
+                        refreshed=refreshed,
+                        removed=removed,
                     )
                     result.added.extend(d for d in added if d is not None)
                     for path, reason in failed:

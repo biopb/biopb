@@ -1109,10 +1109,29 @@ class SourceManager:
         drag-drop. It yields event tuples the caller maps onto the wire:
 
         - ``("progress", added_count, current_path)`` -- one per source as it
-          registers (a running count + the path being scanned),
-        - ``("result", added, already_present, failed)`` -- exactly one terminal
-          tally (``added`` is a list of descriptors, ``already_present`` a list
-          of source_ids, ``failed`` a list of ``(path, reason)``).
+          registers or refreshes (the count is of NEW sources, so a pure re-drop
+          advances only the path),
+        - ``("result", added, already_present, refreshed, removed, failed)`` --
+          exactly one terminal tally (``added`` is a list of descriptors, the
+          next three are lists of source_ids, ``failed`` a list of
+          ``(path, reason)``).
+
+        A claim that is already registered is **rebuilt**, not skipped: its
+        adapter is reconstructed against the file as it is now, which is the
+        only thing that resamples the descriptor and the ``content_version``
+        that namespaces the chunk cache (biopb/biopb#944). Those source_ids come
+        back in ``refreshed`` as well as ``already_present`` -- the latter keeps
+        its meaning, "this id was already known", so an older client still reads
+        a re-drop as "already present" rather than "nothing happened".
+
+        The rebuild is unconditional rather than gated on a signature diff. A
+        directory source's stat signature is the directory's own, and a
+        directory's mtime does not move when a member is rewritten in place, so
+        for a zarr or a TIFF sequence there is no cheap signal to gate on -- the
+        drop itself is the signal.
+
+        Registered sources under the dropped path whose files are GONE are
+        deregistered and reported in ``removed``.
 
         The walk + commit run inline on the CALLING (Flight handler) thread, but
         under ``self._catalog_lock`` -- so they are mutually exclusive with the
@@ -1161,6 +1180,8 @@ class SourceManager:
 
         added: List[Any] = []
         already_present: List[str] = []
+        refreshed: List[str] = []
+        removed: List[str] = []
         failed: List[Tuple[str, str]] = []
 
         # Acquire the catalog lock, heart-beating while a rescan holds it so a
@@ -1175,7 +1196,7 @@ class SourceManager:
             owner = self._reconciler._find_containing_source(url)
             if owner is not None:
                 failed.append((url, f"already part of source '{owner}'"))
-                yield ("result", added, already_present, failed)
+                yield ("result", added, already_present, refreshed, removed, failed)
                 return
 
             # Is the dropped path itself a dataset (single claim), or a plain
@@ -1203,16 +1224,6 @@ class SourceManager:
             else:
                 claims = []
 
-            if not claims:
-                reason = (
-                    "no supported datasets found under directory"
-                    if is_dir
-                    else "not a recognized image format"
-                )
-                failed.append((url, reason))
-                yield ("result", added, already_present, failed)
-                return
-
             # Assign identity to every claim up front so the overlap check below
             # can see the whole drop before any of it is committed.
             for claim in claims:
@@ -1224,6 +1235,24 @@ class SourceManager:
                     claim.source_id = generate_source_id(
                         str(claim.primary_path), claim.source_type
                     )
+
+            # Removal half, before the empty-drop bail-out below: dropping a
+            # folder whose contents were deleted is exactly how a stale entry
+            # gets noticed, and there is nothing to add in that case.
+            removed = self._deregister_vanished_under(
+                url, {claim.source_id for claim in claims}
+            )
+
+            if not claims:
+                if not removed:
+                    reason = (
+                        "no supported datasets found under directory"
+                        if is_dir
+                        else "not a recognized image format"
+                    )
+                    failed.append((url, reason))
+                yield ("result", added, already_present, refreshed, removed, failed)
+                return
 
             # Re-root the drop into its own browser tree root only when it is
             # ENTIRELY NEW. If any claim is already registered, this drop is a
@@ -1240,6 +1269,20 @@ class SourceManager:
                 already = self._reconciler.has_claim(claim.source_id)
                 if already:
                     already_present.append(claim.source_id)
+                    # fresh_signatures: this drop is not the periodic pass, so
+                    # the scan cache holds what that pass last saw, not what is
+                    # on disk now.
+                    if self._reconciler._refresh_claim(claim, fresh_signatures=True):
+                        refreshed.append(claim.source_id)
+                        yield ("progress", len(added), str(claim.primary_path))
+                    else:
+                        failed.append(
+                            (
+                                str(claim.primary_path),
+                                "could not rebuild (see server log); the "
+                                "previously registered source is still served",
+                            )
+                        )
                 else:
                     # Re-rooting (own display root) and the ``dnd://`` origin
                     # marker are decoupled: a drop under a monitored root still
@@ -1274,9 +1317,44 @@ class SourceManager:
                 if should_cancel is not None and should_cancel():
                     break
 
-            yield ("result", added, already_present, failed)
+            yield ("result", added, already_present, refreshed, removed, failed)
         finally:
             self._catalog_lock.release()
+
+    def _deregister_vanished_under(
+        self, root: str, discovered_ids: Set[str]
+    ) -> List[str]:
+        """Deregister sources under ``root`` whose files are no longer there.
+
+        Scoped to the drop, deliberately: the periodic reconcile's diff is
+        whole-catalog (``current_ids - discovered_ids``), so running it against a
+        subtree walk would deregister every source outside the drop.
+
+        Absence from the walk is not on its own evidence of deletion -- an
+        adapter can decline a claim it once made (a sequence directory worn down
+        to a single file), and a drop has none of the stability gating the
+        periodic path removes under. So a source goes only when its primary path
+        is gone from the filesystem, which is the case #944 reports.
+        """
+        try:
+            root_path = Path(resolve_local_path(root)).resolve(strict=False)
+        except OSError:
+            return []
+
+        removed: List[str] = []
+        for source_id, claim in self._reconciler.claim_items():
+            if source_id in discovered_ids or is_remote_url(claim.primary_path):
+                continue
+            try:
+                primary = Path(claim.primary_path).resolve(strict=False)
+            except OSError:
+                continue
+            if not primary.is_relative_to(root_path) or primary.exists():
+                continue
+            if self._reconciler._commit_remove_source(source_id):
+                removed.append(source_id)
+                logger.info("Deregistered source %s: %s is gone", source_id, primary)
+        return removed
 
     def _descriptor_for(self, source_id: str):
         """Fetch the registered source's DataSourceDescriptor (None if missing)."""
