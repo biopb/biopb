@@ -197,6 +197,29 @@ bulk, and it would keep annotations visible on
 appear on. Safe because the derivation reads the adapter's fresh
 `get_metadata()` return, never the stored column.
 
+**The import cannot fail a registration.** It runs on a file nobody here wrote,
+and it sits inside `sync_source_added` — so an unguarded raise would cost a
+source its pixels over an annotation, which is backwards: an imported set is
+disposable (the next registration rebuilds it, and open clears it anyway) where
+a source that will not register is an outage.
+
+Three layers, because the raises are of three kinds. A malformed *shape* — a
+coordinate that is not a number, a `TheZ` outside uint32 — is dropped on its own
+and counted, so one bad shape cannot cost a file its other forty. A malformed
+*structure* (`union` that is not a mapping, `rois` that is not a list) is skipped
+the same way. And the whole read is wrapped, since reaching that handler means
+something the module does not model at all.
+
+The write is likewise after the source row commits, not inside its transaction,
+and swallows its own failures. `_prepare_roi` stays the single authority on what
+is storable — the importer skips rows it rejects rather than carrying a second
+copy of the rules.
+
+The one thing not dropped on a failure is `sources.metadata_json`'s `rois` key:
+it is stripped only when the read completed, so a wholesale failure leaves the
+last copy in place instead of losing it silently. Per-shape drops are counted in
+the log line.
+
 Imported rows are also outside `max_rois_per_tensor`. The cap exists to keep this
 an annotation store rather than a segmentation store; a user should not be pushed
 toward it by rows they did not author, and cloning an imported set — which is how

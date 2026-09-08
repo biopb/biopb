@@ -1164,22 +1164,35 @@ class MetadataDatabase:
         # own, only the same lifecycle as the row below. It is also free here:
         # get_metadata() has just been called, so this is a dict walk, not a
         # second parse.
-        imported, report = imported_annotations(
-            # `or {}`: get_metadata is typed -> dict, but an upload-backed
-            # source returns whatever OME metadata it was given, which may be
-            # None. The line below has always tolerated that; this one must too.
-            metadata or {},
-            [(t.array_id, list(t.dim_labels)) for t in source_desc.tensors],
-            # getattr, not attribute access: content_version is a SourceAdapter
-            # property, but this method only ever duck-types its argument (it
-            # calls four methods on it), and several adapters here and in the
-            # tests supply that surface without inheriting the base.
-            content_version=getattr(adapter, "content_version", None),
-            max_per_tensor=self._max_rois_per_tensor,
-        )
+        try:
+            imported, report = imported_annotations(
+                # `or {}`: get_metadata is typed -> dict, but an upload-backed
+                # source returns whatever OME metadata it was given, which may
+                # be None. The line below has always tolerated that, so does
+                # this one.
+                metadata or {},
+                [(t.array_id, list(t.dim_labels)) for t in source_desc.tensors],
+                # getattr, not attribute access: content_version is a
+                # SourceAdapter property, but this method only ever duck-types
+                # its argument (it calls four methods on it), and several
+                # adapters here and in the tests supply that surface without
+                # inheriting the base.
+                content_version=getattr(adapter, "content_version", None),
+                max_per_tensor=self._max_rois_per_tensor,
+            )
+        except Exception:
+            # The module drops malformed shapes one at a time, so reaching here
+            # means something it does not model at all. Registration still has
+            # to succeed: a source is its pixels first.
+            logger.exception("ome rois: could not read the set for %s", source_id)
+            imported, report = {}, None
+
         if report:
             logger.info("ome rois for %s: %s", source_id, report.summary())
-        if metadata and "rois" in metadata:
+        # Only when the read completed. A wholesale failure leaves `rois` in the
+        # column rather than dropping the one copy that is left -- partial drops
+        # are counted in the report above, but this would be silent loss.
+        if report is not None and metadata and "rois" in metadata:
             # The store owns them now. A second copy here would be duplicated
             # bulk and would keep them in GET /api/sources/{id}/metadata, which
             # is the surface the design says annotations do not appear on.
@@ -1191,44 +1204,34 @@ class MetadataDatabase:
         indexed_at = datetime.now()
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
-        # Insert or replace (upsert) - serialize writes with lock. One
-        # transaction so the source row and its imported ROIs land together:
-        # they are one fact about the file, and a half-applied registration
-        # would leave a set that only the next re-registration could correct.
+        # Insert or replace (upsert) - serialize writes with lock
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at,
-                     metadata_json, shape_summary, data_resident, tensors)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        source_id,
-                        source_desc.source_url,
-                        source_desc.source_type,
-                        dtype,
-                        indexed_at,
-                        metadata_json,
-                        shape_summary,
-                        source_desc.data_resident,
-                        tensors,
-                    ],
-                )
-                self._replace_imported_locked(
-                    conn, source_id, source_desc.source_url, imported, indexed_at
-                )
-                conn.execute("COMMIT")
-            except BaseException:
-                try:
-                    conn.execute("ROLLBACK")
-                except Exception:  # pragma: no cover - rollback of a dead conn
-                    logger.exception(
-                        "sync_source_added: ROLLBACK failed for %s", source_id
-                    )
-                raise
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sources
+                (source_id, source_url, source_type, dtype, indexed_at,
+                 metadata_json, shape_summary, data_resident, tensors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    source_id,
+                    source_desc.source_url,
+                    source_desc.source_type,
+                    dtype,
+                    indexed_at,
+                    metadata_json,
+                    shape_summary,
+                    source_desc.data_resident,
+                    tensors,
+                ],
+            )
+
+        # Deliberately AFTER the source row commits, and deliberately unable to
+        # raise. Registration failing here would cost a source its pixels over
+        # an annotation, which is the wrong way round: an imported set is
+        # disposable (the next registration rebuilds it, and open clears it
+        # anyway) where a source that will not register is an outage.
+        self._replace_imported(source_id, source_desc.source_url, imported, indexed_at)
 
         # The row is committed, so the catalog -- not the adapter -- now owns this
         # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
@@ -1244,9 +1247,8 @@ class MetadataDatabase:
 
         logger.debug(f"Synced source to metadata database: {source_id}")
 
-    def _replace_imported_locked(
+    def _replace_imported(
         self,
-        conn: duckdb.DuckDBPyConnection,
         source_id: str,
         source_url: str,
         imported: Dict[str, List[RoiAnnotation]],
@@ -1262,7 +1264,39 @@ class MetadataDatabase:
         not edited, they are re-derived -- there is no history to preserve, and
         pretending otherwise would put a monotonic rev on a value that only ever
         restates the file.
+
+        Never raises: its caller is source registration, and no annotation is
+        worth failing that (see the call site). One transaction all the same, so
+        a failure leaves the previous set rather than half of the new one.
         """
+        conn = self._get_connection()
+        try:
+            with self._write_lock:
+                conn.execute("BEGIN TRANSACTION")
+                try:
+                    self._replace_imported_locked(
+                        conn, source_id, source_url, imported, now
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+        except Exception:
+            logger.exception(
+                "ome rois: could not store the imported set for %s; the source "
+                "is registered and serving, and the next registration retries",
+                source_id,
+            )
+
+    def _replace_imported_locked(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        source_id: str,
+        source_url: str,
+        imported: Dict[str, List[RoiAnnotation]],
+        now: datetime,
+    ) -> None:
+        """The body of :meth:`_replace_imported`, inside the transaction."""
         conn.execute(
             "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
             [source_id, RESERVED_SET_PREFIX],
@@ -1282,7 +1316,17 @@ class MetadataDatabase:
                 # Still through _prepare_roi, so bbox and the canonical geometry
                 # JSON are derived exactly as they are for a hand-drawn row --
                 # the SQL surface cannot tell the two apart, which is the point.
-                prep = _prepare_roi(array_id, annotation, allow_reserved=True)
+                try:
+                    prep = _prepare_roi(array_id, annotation, allow_reserved=True)
+                except ValueError:
+                    # _prepare_roi stays the single authority on what is
+                    # storable -- an over-long id, say -- so the importer skips
+                    # what it refuses instead of carrying a second copy of the
+                    # rules. Python-side, so the transaction is still intact.
+                    logger.debug(
+                        "ome rois: %s rejected by the store", annotation.roi_id
+                    )
+                    continue
                 conn.execute(
                     insert_sql,
                     [prep.roi_id, array_id, source_id]

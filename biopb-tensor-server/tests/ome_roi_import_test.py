@@ -544,3 +544,120 @@ def _point():
     from biopb.image import ROI, Point
 
     return ROI(point=Point(x=1, y=1))
+
+
+class TestMalformedInput:
+    """A file we did not write must not be able to fail source registration.
+
+    Each of these raised before biopb/biopb#951 review: the import runs inside
+    `sync_source_added`, so an unguarded raise costs a source its pixels over an
+    annotation. They degrade per shape, so one bad shape cannot cost a file its
+    other forty.
+    """
+
+    GOOD = {"id": "S:good", "x": 1, "y": 1}
+
+    def _with(self, *shapes):
+        union = {"points": list(shapes)}
+        return {
+            "images": [{"id": "Image:0", "roi_refs": [{"id": "ROI:0"}]}],
+            "rois": [{"id": "ROI:0", "union": union}],
+        }
+
+    def test_a_coordinate_that_is_not_a_number(self):
+        out, report = imported_annotations(
+            self._with({"id": "S:0", "x": "left", "y": 1}, self.GOOD), TENSORS
+        )
+        assert [r.roi_id for r in out[ARRAY_0]] == ["S:good"]
+        assert report.malformed == 1
+
+    def test_a_plane_index_outside_uint32(self):
+        out, report = imported_annotations(
+            self._with({"id": "S:0", "x": 1, "y": 1, "the_z": 2**40}, self.GOOD),
+            TENSORS,
+        )
+        assert [r.roi_id for r in out[ARRAY_0]] == ["S:good"]
+        assert report.malformed == 1
+
+    def test_a_name_that_is_not_a_string_is_coerced(self):
+        metadata = self._with(self.GOOD)
+        metadata["rois"][0]["name"] = 7
+
+        annotation, _ = _one(metadata)
+        assert annotation.label == "7"
+
+    def test_an_infinite_coordinate_is_not_stored(self):
+        """Nothing downstream would catch it: proto, DuckDB and bbox all take it."""
+        out, report = imported_annotations(
+            self._with({"id": "S:0", "x": float("inf"), "y": 1}, self.GOOD), TENSORS
+        )
+        assert [r.roi_id for r in out[ARRAY_0]] == ["S:good"]
+        assert report.dropped_degenerate == 1
+
+    @pytest.mark.parametrize(
+        "union", [[], "polygons", {"points": {"id": "S:0"}}, {"points": ["nope"]}]
+    )
+    def test_a_union_that_is_not_shaped_like_one(self, union):
+        out, report = imported_annotations(
+            {
+                "images": [{"id": "Image:0", "roi_refs": [{"id": "ROI:0"}]}],
+                "rois": [{"id": "ROI:0", "union": union}],
+            },
+            TENSORS,
+        )
+        assert out == {}
+        assert report.malformed >= 1
+
+    @pytest.mark.parametrize("rois", [{"ROI:0": {}}, "ROI:0", ["ROI:0"]])
+    def test_a_rois_field_that_is_not_a_list_of_mappings(self, rois):
+        out, _ = imported_annotations({"images": [], "rois": rois}, TENSORS)
+        assert out == {}
+
+    @pytest.mark.parametrize("images", [{"Image:0": {}}, "Image:0", [None]])
+    def test_an_images_field_that_is_not_a_list_of_mappings(self, images):
+        out, _ = imported_annotations(
+            {"images": images, "rois": [{"id": "ROI:0", "union": {}}]}, TENSORS
+        )
+        assert out == {}
+
+
+class TestRegistrationSurvivesABadImport:
+    def test_a_row_the_store_refuses_does_not_fail_registration(self):
+        """An over-long roi_id: _prepare_roi rejects it, inside the write."""
+        db = MetadataDatabase()
+        db.sync_source_added(
+            SOURCE_ID,
+            _FakeAdapter(_meta(_shape("points", x=1, y=1, id="S:" + "x" * 400))),
+        )
+
+        assert db.get_metadata_json(SOURCE_ID) is not None
+        assert _reserved(db) == []
+
+    def test_an_unreadable_set_does_not_fail_registration(self, monkeypatch):
+        db = MetadataDatabase()
+        monkeypatch.setattr(
+            "biopb_tensor_server.core.metadata_db.imported_annotations",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+
+        assert _reserved(db) == []
+        # The one remaining copy is not dropped when nothing read it.
+        assert "rois" in db.get_metadata_json(SOURCE_ID)
+
+    def test_a_failed_write_leaves_the_previous_set(self, monkeypatch):
+        db = MetadataDatabase()
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+        assert _reserved(db) == ["Shape:0"]
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("write failed")
+
+        monkeypatch.setattr(MetadataDatabase, "_replace_imported_locked", boom)
+        db.sync_source_added(
+            SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=9, y=9, id="Shape:1")))
+        )
+
+        assert _reserved(db) == ["Shape:0"]  # rolled back, not half-applied
+        assert db.get_metadata_json(SOURCE_ID) is not None

@@ -64,6 +64,10 @@ class ImportReport:
     unreferenced: int = 0
     #: Per-tensor cap reached; the remainder of that tensor's ROIs was dropped.
     over_cap: int = 0
+    #: A shape this module could not read: a coordinate that is not a number, a
+    #: plane index outside uint32, a `union` that is not a mapping. Dropped one
+    #: at a time so one bad shape cannot cost a file its other forty.
+    malformed: int = 0
     tensors: List[str] = field(default_factory=list)
 
     def __bool__(self) -> bool:
@@ -74,6 +78,7 @@ class ImportReport:
             or self.unmatched_refs
             or self.unreferenced
             or self.over_cap
+            or self.malformed
         )
 
     def summary(self) -> str:
@@ -84,6 +89,7 @@ class ImportReport:
             ("ref(s) matched no tensor", self.unmatched_refs),
             ("ROI(s) referenced by no image", self.unreferenced),
             ("dropped over the per-tensor cap", self.over_cap),
+            ("unreadable shape(s) dropped", self.malformed),
         ):
             if n:
                 parts.append(f"{n} {label}")
@@ -179,6 +185,31 @@ def _points(spec: Any) -> List[Tuple[float, float]]:
 
 def _pt(xy: Tuple[float, float]) -> Point:
     return Point(x=xy[0], y=xy[1])
+
+
+def _coords(roi: ROI) -> Tuple[float, ...]:
+    kind = roi.WhichOneof("shape")
+    if kind == "point":
+        return (roi.point.x, roi.point.y)
+    if kind == "rectangle":
+        r = roi.rectangle
+        return (r.top_left.x, r.top_left.y, r.bottom_right.x, r.bottom_right.y)
+    if kind == "ellipse":
+        e = roi.ellipse
+        return (e.center.x, e.center.y, e.radius.x, e.radius.y, e.rotation)
+    points = roi.polygon.points if kind == "polygon" else roi.polyline.points
+    return tuple(v for p in points for v in (p.x, p.y))
+
+
+def _finite(roi: ROI) -> bool:
+    """Whether every coordinate is a real number.
+
+    Checked because nothing downstream would: proto floats accept NaN and inf,
+    DuckDB DOUBLE accepts them, and the derived bbox propagates them -- so an
+    overflowing affine or a garbage coordinate would land in the SQL surface
+    looking like data.
+    """
+    return all(math.isfinite(v) for v in _coords(roi))
 
 
 def _geometry(kind: str, shape: Mapping[str, Any]) -> Optional[ROI]:
@@ -307,6 +338,10 @@ def imported_annotations(
     """
     report = ImportReport()
     ome_rois = metadata.get("rois") or []
+    if not isinstance(ome_rois, (list, tuple)):
+        logger.warning("ome rois: `rois` is %s, not a list", type(ome_rois).__name__)
+        return {}, report
+    ome_rois = [r for r in ome_rois if isinstance(r, Mapping)]
     if not ome_rois:
         return {}, report
 
@@ -318,10 +353,15 @@ def imported_annotations(
     # shared by several images becomes a row on each -- the store anchors to one
     # array_id, and denormalising is the only way to say "on both".
     referenced_by: Dict[str, List[str]] = {}
-    for image in metadata.get("images") or []:
+    images = metadata.get("images") or []
+    for image in images if isinstance(images, (list, tuple)) else []:
+        if not isinstance(image, Mapping):
+            continue
         scene = image.get("id")
-        for ref in image.get("roi_refs") or []:
-            referenced_by.setdefault(str(ref.get("id")), []).append(str(scene))
+        refs = image.get("roi_refs") or []
+        for ref in refs if isinstance(refs, (list, tuple)) else []:
+            if isinstance(ref, Mapping):
+                referenced_by.setdefault(str(ref.get("id")), []).append(str(scene))
 
     out: Dict[str, List[RoiAnnotation]] = {}
     for ome_roi in ome_rois:
@@ -336,30 +376,36 @@ def imported_annotations(
                 continue
             array_id, axis_index = target
             rows = out.setdefault(array_id, [])
-            for kind, shapes in (ome_roi.get("union") or {}).items():
-                for shape in shapes or []:
+            for kind, shapes in _shape_lists(ome_roi, report):
+                for shape in shapes:
                     if kind == "masks":
                         report.dropped_masks += 1
-                        continue
-                    geometry = _geometry(kind, shape)
-                    if geometry is None:
-                        report.dropped_degenerate += 1
                         continue
                     if max_per_tensor is not None and len(rows) >= max_per_tensor:
                         report.over_cap += 1
                         continue
-                    ann = RoiAnnotation(
-                        roi_id=_roi_id(ome_roi, shape, len(rows)),
-                        array_id=array_id,
-                        set_name=OME_SET_NAME,
-                        label=ome_roi.get("name") or shape.get("text") or "",
-                        roi=geometry,
-                        props_json=_props(ome_roi, shape) or "",
-                        rev=1,
-                    )
-                    ann.plane.update(_plane(shape, axis_index))
-                    if content_version is not None:
-                        ann.drawn_against_version = content_version
+                    # One shape at a time, because this reads a file we did not
+                    # write. A coordinate that is not a number, a TheZ outside
+                    # uint32, a name that is not a string -- each raises, and
+                    # this import runs inside source registration, so an
+                    # unguarded one would cost the source its pixels over an
+                    # annotation. Drop the shape, keep the rest, count it.
+                    try:
+                        ann = _annotation(
+                            kind, ome_roi, shape, array_id, axis_index, content_version
+                        )
+                    except Exception:
+                        logger.debug(
+                            "ome rois: unreadable %s on %s",
+                            kind,
+                            array_id,
+                            exc_info=True,
+                        )
+                        report.malformed += 1
+                        continue
+                    if ann is None:
+                        report.dropped_degenerate += 1
+                        continue
                     rows.append(ann)
                     report.imported += 1
 
@@ -370,12 +416,66 @@ def imported_annotations(
     return out, report
 
 
-def _roi_id(ome_roi: Mapping[str, Any], shape: Mapping[str, Any], n: int) -> str:
+def _shape_lists(
+    ome_roi: Mapping[str, Any], report: ImportReport
+) -> List[Tuple[str, Sequence[Mapping[str, Any]]]]:
+    """``(kind, shapes)`` pairs from a ROI's union, skipping anything malformed.
+
+    Structure is checked rather than assumed: this walks a dict parsed from a
+    file, and `union` being a list or a shape list being a bare dict are both
+    things a hand-rolled writer produces.
+    """
+    union = ome_roi.get("union")
+    if not isinstance(union, Mapping):
+        report.malformed += 1
+        return []
+    pairs = []
+    for kind, shapes in union.items():
+        if not isinstance(shapes, (list, tuple)):
+            report.malformed += 1
+            continue
+        good = [s for s in shapes if isinstance(s, Mapping)]
+        report.malformed += len(shapes) - len(good)
+        if good:
+            pairs.append((str(kind), good))
+    return pairs
+
+
+def _annotation(
+    kind: str,
+    ome_roi: Mapping[str, Any],
+    shape: Mapping[str, Any],
+    array_id: str,
+    axis_index: Mapping[str, int],
+    content_version: Optional[bytes],
+) -> Optional[RoiAnnotation]:
+    """One shape as a stored annotation, or None when it has no geometry here."""
+    geometry = _geometry(kind, shape)
+    if geometry is None or not _finite(geometry):
+        return None
+    ann = RoiAnnotation(
+        roi_id=_roi_id(ome_roi, shape),
+        array_id=array_id,
+        set_name=OME_SET_NAME,
+        # str(): a name is text in the schema but this dict came from a file,
+        # and proto refuses a non-string outright.
+        label=str(ome_roi.get("name") or shape.get("text") or ""),
+        roi=geometry,
+        props_json=_props(ome_roi, shape) or "",
+        rev=1,
+    )
+    ann.plane.update(_plane(shape, axis_index))
+    if content_version is not None:
+        ann.drawn_against_version = content_version
+    return ann
+
+
+def _roi_id(ome_roi: Mapping[str, Any], shape: Mapping[str, Any]) -> str:
     """The OME shape id, which is unique within the document.
 
     Commas are replaced because the store refuses them: the sidecar deletes by a
     comma-separated `?ids=` list, so an id carrying one could be created and
     never addressed.
     """
-    raw = shape.get("id") or f"{ome_roi.get('id')}#{n}"
+    raw = shape.get("id") or ome_roi.get("id") or "shape"
     return str(raw).replace(",", "_")
