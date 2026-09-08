@@ -25,10 +25,11 @@ export interface McpNavItem {
 /**
  * Flat, ordered nav, grouped by concern in reading order: the data-plane knobs
  * the MCP kernel uses, the compute-plane knobs, then the MCP server runtime.
- * The `id` equals the config section key. The demo-widget sections
- * (`widget` / `detection` / `grid`, the experimental image_processing/ widgets)
- * are deliberately omitted from the nav — they stay in the config and remain
- * editable via the Raw JSON panel, just not surfaced as first-class settings.
+ * The `id` equals the config section key. The demo-widget sections (the
+ * experimental image_processing/ widgets) are deliberately omitted from the nav
+ * — they stay in the config and remain editable via the Raw JSON panel, just not
+ * surfaced as first-class settings. They are named in `MCP_HIDDEN_SECTIONS`
+ * below, so a forgotten section is distinguishable from a hidden one.
  *
  * There is no data-plane *endpoint* section: biopb-mcp asks the control where the
  * plane is at connect time rather than reading a configured URL (biopb#628), so
@@ -136,6 +137,19 @@ export const MCP_NAV: McpNavItem[] = [
     kind: "raw",
   },
 ];
+
+/**
+ * Sections deliberately absent from `MCP_NAV`: the experimental
+ * image_processing/ demo widgets. A drift guard (test_mcp_nav.py) asserts the
+ * schema's sections are exactly `MCP_NAV` plus this set, so a new section has to
+ * be either navigated or hidden on purpose — the state `chat` shipped in
+ * (biopb/biopb#853, #854) is no longer reachable.
+ */
+export const MCP_HIDDEN_SECTIONS: ReadonlySet<string> = new Set([
+  "widget",
+  "detection",
+  "grid",
+]);
 
 export const MCP_DEFAULT_NAV_ID = MCP_NAV[0]!.id;
 
