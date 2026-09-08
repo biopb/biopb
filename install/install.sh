@@ -1185,7 +1185,7 @@ install_biopb() {
 
     # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
     # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
-    # default `aics` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
+    # default `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
     # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
     # libCZI), which fails on a fresh machine without a C++ toolchain. If the
     # system Python is newer we fall back to a uv-managed 3.12 below.
@@ -1241,7 +1241,15 @@ install_biopb() {
     # source format here, and h5py is cleanly gated behind its own opt-in extra
     # (nothing else in this set pulls it), so a user who needs it installs
     # biopb-tensor-server[hdf5]. Kept out of the default to slim the install.
-    TENSOR_EXTRAS="web,aics,medical,ndtiff"
+    # [aics] (bioio + its plugins) is NOT in the default set: the native
+    # adapters own every local vendor format, so what bioio would still add is
+    # the Java bridge (its own [bioformats] opt-in) and remote vendor sources,
+    # which are reachable only from a hand-written config entry. [vendor] carries
+    # the readers those native adapters actually import. See biopb/biopb#799.
+    # [qptiff] (-> imagecodecs) is listed explicitly now: QPTIFF worked in the
+    # default install only because bioio-tifffile happened to pull imagecodecs,
+    # and that stops being true without [aics].
+    TENSOR_EXTRAS="web,vendor,qptiff,medical,ndtiff"
     if [ "$INSTALL_BIOFORMATS" = "1" ]; then
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"

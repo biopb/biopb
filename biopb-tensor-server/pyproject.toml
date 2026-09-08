@@ -43,6 +43,13 @@ dependencies = [
   # above, so tifffile must stay on the Zarr-2 line. See
   # docs/aicsimageio-to-bioio-migration.md.
   "tifffile >= 2024.8.10, < 2025.5.21",
+  # OmeTiffAdapter parses OME-XML with it (ome_tiff.py:310), and that adapter is
+  # always registered because tifffile is a core dep -- so this is a core
+  # dependency too. It went undeclared while bioio-ome-tiff / bioio-czi happened
+  # to supply it; dropping [aics] from the default install (biopb/biopb#799) is
+  # what makes the omission bite. The parse is wrapped in a bare except, so a
+  # missing ome-types costs OME metadata silently rather than raising.
+  "ome-types >= 0.4.0",
   "numpy",
   "scipy",
   "typer >= 0.12.0",
@@ -81,9 +88,26 @@ dependencies = [
     "biopb-tensor-server[web]",
     "biopb-tensor-server[tls]",
   ]
+  # Readers the native vendor adapters import directly (biopb/biopb#799). These
+  # used to arrive only transitively through [aics] -- bioio-lif pulls readlif,
+  # bioio-nd2 pulls nd2, bioio-dv pulls mrc -- which made the default install
+  # depend on bioio for packages bioio itself is not needed to use. Declared
+  # here so dropping [aics] does not silently remove local LIF/DV/ND2 support.
+  # .czi's pylibczirw stays in [czi]: it has no Intel-macOS wheel, so it cannot
+  # be part of a set every platform installs.
+  vendor = [
+    "readlif >= 0.6.4",  # Leica LIF (LifAdapter)
+    "mrc >= 0.2.0",      # DeltaVision DV (DeltaVisionAdapter)
+    # [legacy] (-> imagecodecs) is what bioio-nd2 asked for; without it nd2
+    # refuses JPEG-compressed legacy .nd2 files, which would be a silent
+    # capability loss rather than a slimmer install.
+    "nd2[legacy] >= 0.10.3",  # Nikon ND2 (Nd2Adapter)
+  ]
   # Vendor microscopy formats via bioio (successor to aicsimageio). Each reader
   # is its own plugin with modern, uncapped deps, so none re-imposes the
-  # numpy<2 / tifffile<2023.3.15 caps aicsimageio did. See
+  # numpy<2 / tifffile<2023.3.15 caps aicsimageio did. Not in the default
+  # install since biopb/biopb#799: the native adapters own every local vendor
+  # format, leaving bioio the Java bridge and remote sources. See
   # docs/aicsimageio-to-bioio-migration.md.
   aics = [
     "bioio >= 3.0",
@@ -125,6 +149,10 @@ dependencies = [
   # reader (ZVI, ...). A JDK is NOT a build/system dependency: scyjava + cjdk
   # download a small, user-cached JDK on first read.
   bioformats = [
+    # BioformatsAdapter reads through ``bioio.BioImage``; bioio-bioformats
+    # declares only bioio-base, so the umbrella has to be named here. It came
+    # in via [aics] until that left the default install (biopb/biopb#799).
+    "bioio >= 3.0",
     "bioio-bioformats",
     "scyjava >= 1.9.0",
     "cjdk >= 0.5.0",
