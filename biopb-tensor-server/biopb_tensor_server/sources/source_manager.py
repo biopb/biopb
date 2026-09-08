@@ -1239,8 +1239,22 @@ class SourceManager:
             # Removal half, before the empty-drop bail-out below: dropping a
             # folder whose contents were deleted is exactly how a stale entry
             # gets noticed, and there is nothing to add in that case.
-            removed = self._deregister_vanished_under(
-                url, {claim.source_id for claim in claims}
+            #
+            # Skip the O(catalog) scan for the common trivial re-drop: a single
+            # file that is already a registered claim cannot have anything
+            # "vanished" under it -- existence was just confirmed above (line
+            # ~1174), and a file has no descendants to have disappeared.
+            trivial_redrop = (
+                not is_dir
+                and len(claims) == 1
+                and self._reconciler.has_claim(claims[0].source_id)
+            )
+            removed = (
+                []
+                if trivial_redrop
+                else self._deregister_vanished_under(
+                    url, {claim.source_id for claim in claims}
+                )
             )
 
             if not claims:

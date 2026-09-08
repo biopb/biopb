@@ -125,6 +125,12 @@ class Reconciler:
     _retry_backoff_initial = 1.0
     _retry_backoff_max = 60.0
     _failure_log_interval = 30.0
+    # A rebuild that keeps failing this many times in a row (e.g. a member
+    # file of a monitored multi-file source was deleted) is presumed
+    # permanent, not transient like the metadata-DB hiccups #944 guards
+    # against -- give up and remove it rather than serving stale bytes
+    # forever on capped backoff.
+    _max_refresh_failures = 5
 
     def __init__(
         self,
@@ -501,6 +507,16 @@ class Reconciler:
             claim, catalog_url=catalog_url, replace=True
         ):
             self._record_failed_source_attempt(claim.source_id)
+            tracker = self._failed_sources.get(claim.source_id)
+            if tracker is not None and tracker.attempts >= self._max_refresh_failures:
+                logger.warning(
+                    "Giving up on source %s after %d consecutive failed "
+                    "rebuild attempts; removing it instead of continuing to "
+                    "serve its stale adapter",
+                    claim.source_id,
+                    tracker.attempts,
+                )
+                self._commit_remove_source(claim.source_id)
             return False
 
         with self._lock:
@@ -508,15 +524,21 @@ class Reconciler:
             # so the claim is replaced rather than left at what was discovered
             # when it was first registered.
             self._state.remove_claim(previous.primary_path, notify=False)
-            if not self._state.add_claim(claim, notify=False):
-                # A member is owned by another source. The rebuilt adapter is
-                # already serving, so keep the catalog consistent with it by
-                # restoring the membership we knew rather than leaving none.
-                self._state.add_claim(previous, notify=False)
-                logger.warning(
-                    "Refreshed source %s kept its previous membership: the "
-                    "rediscovered claim overlaps another source",
+            # The rebuilt adapter is already live (registration above already
+            # swapped it in and closed the old one), so the catalog must track
+            # the NEW membership even if it overlaps another source's claim --
+            # restoring the old membership here would describe an adapter that
+            # no longer exists. replace_claim keeps this source's entry (and
+            # any non-conflicting paths) in sync with what's actually served,
+            # rather than add_claim's reject-on-conflict semantics.
+            conflicting = self._state.replace_claim(claim, notify=False)
+            if conflicting:
+                logger.error(
+                    "Refreshed source %s now overlaps another source's claim "
+                    "on %s; the rebuilt adapter is serving but those paths "
+                    "remain attributed to the other source",
                     claim.source_id,
+                    sorted(conflicting),
                 )
             self._source_signatures[claim.source_id] = self._build_claim_signatures(
                 claim, use_cache=not fresh_signatures
