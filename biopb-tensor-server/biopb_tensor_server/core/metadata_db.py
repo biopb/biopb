@@ -70,7 +70,6 @@ from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from google.protobuf import json_format
 
 from biopb_tensor_server.core.errors import AnnotationStoreError
-from biopb_tensor_server.core.ome_rois import imported_annotations
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -1164,26 +1163,29 @@ class MetadataDatabase:
         # own, only the same lifecycle as the row below. It is also free here:
         # get_metadata() has just been called, so this is a dict walk, not a
         # second parse.
+        # The FORMAT decides whether its file carries annotations, because the
+        # server does not police what get_metadata() returns: a `rois` key in an
+        # EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
+        # format meant by it. getattr, because this method only duck-types its
+        # argument and several adapters supply that surface without inheriting
+        # the base -- which is also why they read as "carries nothing".
+        report = None
+        imported: Dict[str, List[RoiAnnotation]] = {}
+        get_embedded = getattr(adapter, "get_embedded_rois", None)
         try:
-            imported, report = imported_annotations(
-                # `or {}`: get_metadata is typed -> dict, but an upload-backed
-                # source returns whatever OME metadata it was given, which may
-                # be None. The line below has always tolerated that, so does
-                # this one.
-                metadata or {},
-                [(t.array_id, list(t.dim_labels)) for t in source_desc.tensors],
-                # getattr, not attribute access: content_version is a
-                # SourceAdapter property, but this method only ever duck-types
-                # its argument (it calls four methods on it), and several
-                # adapters here and in the tests supply that surface without
-                # inheriting the base.
-                content_version=getattr(adapter, "content_version", None),
-                max_per_tensor=self._max_rois_per_tensor,
-            )
+            if get_embedded is not None:
+                imported, report = get_embedded(
+                    # `or {}`: get_metadata is typed -> dict, but an
+                    # upload-backed source returns whatever OME metadata it was
+                    # given, which may be None. The line below has always
+                    # tolerated that, so does this one.
+                    metadata or {},
+                    [(t.array_id, list(t.dim_labels)) for t in source_desc.tensors],
+                    max_per_tensor=self._max_rois_per_tensor,
+                )
         except Exception:
-            # The module drops malformed shapes one at a time, so reaching here
-            # means something it does not model at all. Registration still has
-            # to succeed: a source is its pixels first.
+            # Documented as a bug in the adapter, and still not fatal here: a
+            # source is its pixels first, and the next registration retries.
             logger.exception("ome rois: could not read the set for %s", source_id)
             imported, report = {}, None
 

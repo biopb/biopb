@@ -48,6 +48,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.ome_rois import imported_annotations
 
 logger = logging.getLogger(__name__)
 
@@ -659,6 +660,15 @@ class OmeTiffAdapter(TensorAdapter):
             if fast is not None:
                 return fast
         return {}
+
+    def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
+        """The OME-XML ``<ROI>`` elements this file carries (see the base)."""
+        return imported_annotations(
+            metadata,
+            tensors,
+            content_version=self.content_version,
+            max_per_tensor=max_per_tensor,
+        )
 
     def _reduced_ome_xml_cached(self) -> Optional[str]:
         """The plane-stripped OME-XML, computed once and kept for the adapter's life.

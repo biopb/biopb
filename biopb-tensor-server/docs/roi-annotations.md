@@ -197,6 +197,23 @@ bulk, and it would keep annotations visible on
 appear on. Safe because the derivation reads the adapter's fresh
 `get_metadata()` return, never the stored column.
 
+**The format decides, through the adapter API.** `SourceAdapter.get_embedded_rois`
+returns `({}, None)` by default; `OmeTiffAdapter` and `_BioioAdapterBase` (hence
+every vendor subclass) implement it. The server does not police what
+`get_metadata()` returns, so a `rois` key means whatever that format meant by it
+— reading an EMD's `original_metadata` or an OME-Zarr's `.zattrs` as OME-XML
+would invent annotations.
+
+Not keyed on `source_type` either. That is a name, and it lies in both
+directions: `ome-zarr` carries NGFF rather than OME-XML, while `zeiss`,
+`leica`, `nikon` and the rest are ome-types dumps through bioio. A hook also
+generalises the way this design expects — ImageJ overlays or a GeoJSON sidecar
+are a method on their own adapter, not another branch here.
+
+The metadata dict and the tensor list are passed *in* rather than recomputed:
+the caller holds both, and `get_metadata` is a documented pure producer that
+would re-parse.
+
 **The import cannot fail a registration.** It runs on a file nobody here wrote,
 and it sits inside `sync_source_added` — so an unguarded raise would cost a
 source its pixels over an annotation, which is backwards: an imported set is

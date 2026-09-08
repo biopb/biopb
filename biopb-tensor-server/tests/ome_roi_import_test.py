@@ -14,6 +14,7 @@ import math
 import pytest
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.core.ome_rois import OME_SET_NAME, imported_annotations
 
@@ -390,6 +391,14 @@ class _FakeAdapter:
         self.content_version = version
         self.released = False
 
+    def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
+        return imported_annotations(
+            metadata,
+            tensors,
+            content_version=self.content_version,
+            max_per_tensor=max_per_tensor,
+        )
+
     def get_source_descriptor(self):
         return DataSourceDescriptor(
             source_id=SOURCE_ID,
@@ -633,14 +642,13 @@ class TestRegistrationSurvivesABadImport:
         assert db.get_metadata_json(SOURCE_ID) is not None
         assert _reserved(db) == []
 
-    def test_an_unreadable_set_does_not_fail_registration(self, monkeypatch):
+    def test_an_adapter_hook_that_raises_does_not_fail_registration(self):
+        """Documented as an adapter bug, and still not allowed to be fatal."""
         db = MetadataDatabase()
-        monkeypatch.setattr(
-            "biopb_tensor_server.core.metadata_db.imported_annotations",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
+        adapter = _FakeAdapter(_meta(_shape("points", x=1, y=1)))
+        adapter.get_embedded_rois = lambda *a, **k: 1 / 0
 
-        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
+        db.sync_source_added(SOURCE_ID, adapter)
 
         assert _reserved(db) == []
         # The one remaining copy is not dropped when nothing read it.
@@ -661,3 +669,68 @@ class TestRegistrationSurvivesABadImport:
 
         assert _reserved(db) == ["Shape:0"]  # rolled back, not half-applied
         assert db.get_metadata_json(SOURCE_ID) is not None
+
+
+class TestTheFormatDecides:
+    """`rois` in a metadata dict means whatever that format meant by it.
+
+    The server does not police get_metadata()'s contents, so reading one as
+    OME-XML is the adapter's call, made by implementing `get_embedded_rois`.
+    Not the key, and not `source_type` -- that is a name and it lies in both
+    directions: `ome-zarr` carries NGFF rather than OME-XML, while `zeiss` /
+    `leica` / `nikon` and the rest are ome-types dumps through bioio.
+    """
+
+    class _PlainAdapter(_FakeAdapter):
+        """A format that stores something else under `rois`."""
+
+        get_embedded_rois = SourceAdapter.get_embedded_rois
+
+    def test_a_format_that_carries_nothing_is_not_parsed(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            SOURCE_ID, self._PlainAdapter(_meta(_shape("points", x=1, y=1)))
+        )
+
+        assert _reserved(db) == []
+
+    def test_and_its_metadata_is_left_alone(self):
+        """Nothing read them, so dropping the key would be plain data loss."""
+        db = MetadataDatabase()
+        db.sync_source_added(
+            SOURCE_ID, self._PlainAdapter(_meta(_shape("points", x=1, y=1)))
+        )
+
+        assert "rois" in db.get_metadata_json(SOURCE_ID)
+
+    def test_an_adapter_that_does_not_answer_at_all_is_fine(self):
+        """Most test doubles, and anything predating the hook."""
+        db = MetadataDatabase()
+        adapter = _FakeAdapter(_meta(_shape("points", x=1, y=1)))
+        del type(adapter).get_embedded_rois
+        try:
+            db.sync_source_added(SOURCE_ID, adapter)
+            assert _reserved(db) == []
+        finally:
+            type(adapter).get_embedded_rois = _FakeAdapter.__dict__.get(
+                "get_embedded_rois", None
+            )
+
+    def test_the_base_carries_nothing(self):
+        assert SourceAdapter.get_embedded_rois(object(), {"rois": [1]}, []) == (
+            {},
+            None,
+        )
+
+    def test_which_real_adapters_implement_it(self):
+        from biopb_tensor_server.adapters.bioio import _BioioAdapterBase
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        declares = lambda cls: "get_embedded_rois" in vars(cls)  # noqa: E731
+        assert declares(OmeTiffAdapter)
+        assert declares(_BioioAdapterBase)  # and so every vendor subclass
+        # .zattrs is NGFF, not an ome-types dump -- the name is the trap.
+        assert not declares(OmeZarrAdapter)
+        assert not declares(ZarrAdapter)
