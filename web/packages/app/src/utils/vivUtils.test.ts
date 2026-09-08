@@ -7,7 +7,7 @@ import {
   clampGamma,
   contrastLimitsFrom,
   contrastSamples,
-  dtypeContrastLimits,
+  contrastTrack,
   gammaFromOctaves,
   octavesFromGamma,
   clampContrastLimits,
@@ -84,6 +84,13 @@ describe("contrastSamples", () => {
     expect(Array.from(contrastSamples(new Uint8Array([9, 1, 5]), 100))).toEqual([1, 5, 9]);
   });
 
+  it("drops NaN and the infinities instead of sorting them to the top", () => {
+    // A typed-array sort puts both at the end, so either one becomes what a
+    // percentile taken at 100 reads back as the plane's maximum.
+    const data = Float64Array.from([5, NaN, 1, Infinity, 3, -Infinity]);
+    expect(Array.from(contrastSamples(data, 100))).toEqual([1, 3, 5]);
+  });
+
   it("has a limit that keeps a full 512-edge tile's worth of sorting bounded", () => {
     expect(contrastSamples(new Uint16Array(512 * 512)).length).toBeLessThanOrEqual(
       CONTRAST_SAMPLE_LIMIT,
@@ -143,9 +150,16 @@ describe("percentileBounds", () => {
 
 describe("contrastStep", () => {
   it("is one grey level on an integer track and a thousandth on a float one", () => {
-    expect(contrastStep([0, 65535])).toBe(1);
-    expect(contrastStep([0, 255])).toBe(1);
-    expect(contrastStep([0, 1])).toBeCloseTo(0.001);
+    expect(contrastStep([0, 65535], "Uint16")).toBe(1);
+    expect(contrastStep([0, 255], "Uint8")).toBe(1);
+    expect(contrastStep([0, 1], "Float32")).toBeCloseTo(0.001);
+  });
+
+  it("stays a thousandth of the track on a float dtype however wide it is", () => {
+    // Keyed on the width instead, a float tensor whose values span 20 would get
+    // whole units: twenty positions on the whole bar, and an integer readout.
+    expect(contrastStep([0, 20], "Float32")).toBeCloseTo(0.02);
+    expect(contrastStep([0, 4000], "Float64")).toBeCloseTo(4);
   });
 });
 
@@ -172,15 +186,15 @@ describe("clampContrastLimits", () => {
   it("brings a window chosen on another dtype inside this one", () => {
     // A uint16 window carried onto a uint8 image: clamped, not applied as a
     // white frame.
-    expect(clampContrastLimits([300, 40000], [0, 255])).toEqual([254, 255]);
+    expect(clampContrastLimits([300, 40000], [0, 255], "Uint8")).toEqual([254, 255]);
   });
 
   it("leaves a window that already fits alone", () => {
-    expect(clampContrastLimits([10, 200], [0, 255])).toEqual([10, 200]);
+    expect(clampContrastLimits([10, 200], [0, 255], "Uint8")).toEqual([10, 200]);
   });
 
   it("never returns a zero-width window", () => {
-    const [lo, hi] = clampContrastLimits([255, 255], [0, 255]);
+    const [lo, hi] = clampContrastLimits([255, 255], [0, 255], "Uint8");
     expect(hi).toBeGreaterThan(lo);
   });
 });
@@ -235,13 +249,49 @@ describe("gamma", () => {
   });
 });
 
-describe("dtypeContrastLimits", () => {
+describe("contrastTrack", () => {
   it("covers the integer range so the first frame is not blank", () => {
-    expect(dtypeContrastLimits("Uint16")).toEqual([0, 65535]);
+    expect(contrastTrack("Uint16")).toEqual([0, 65535]);
+  });
+
+  it("ignores what a plane showed when the dtype names its own range", () => {
+    expect(contrastTrack("Uint16", [12, 400])).toEqual([0, 65535]);
+  });
+
+  it("puts a float tensor on the levels its data actually showed", () => {
+    // The bug this replaced: a float plane holding thousands was offered a
+    // 0-1 track, so a fixed window could only ever be the whole image.
+    expect(contrastTrack("Float32", [12.5, 4000])).toEqual([12.5, 4000]);
+  });
+
+  it("widens a float track to a window chosen on another plane", () => {
+    expect(contrastTrack("Float32", [12.5, 4000], [0, 6000])).toEqual([0, 6000]);
+  });
+
+  it("keeps 0-1 for a float tensor with nothing sampled yet", () => {
+    expect(contrastTrack("Float32", null, null)).toEqual([0, 1]);
+  });
+
+  it("skips a non-finite window rather than falling back off it", () => {
+    // Falling back would put the whole track on 0-1, which is the bug this
+    // function exists to remove -- and silently.
+    expect(contrastTrack("Float32", [12.5, Infinity], [12.5, 4000])).toEqual([12.5, 4000]);
+    expect(contrastTrack("Float32", [NaN, NaN], [12.5, 4000])).toEqual([12.5, 4000]);
+  });
+
+  it("unions every window it is given, so a dim plane cannot shrink the track", () => {
+    // The union from the bright planes already seen, then this dark plane.
+    expect(contrastTrack("Float32", [12.5, 4000], [0, 3])).toEqual([0, 4000]);
+  });
+
+  it("never hands back a zero-width track", () => {
+    // A uniform plane observes one value, and every fraction taken of the
+    // track divides by its width.
+    expect(contrastTrack("Float64", [3, 3])).toEqual([3, 4]);
   });
 
   it("falls back rather than throwing on an unknown dtype", () => {
-    expect(dtypeContrastLimits("Float16")).toEqual([0, 1]);
+    expect(contrastTrack("Float16")).toEqual([0, 1]);
   });
 });
 

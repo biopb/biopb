@@ -3,7 +3,7 @@
 import { sliderAxes, vivDtype, type SliderAxis } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { selectTileInfo, useAppStore } from "../store";
+import { selectObservedLimits, selectTileInfo, useAppStore } from "../store";
 import {
   PRESET_COLORS,
   type ColorValue,
@@ -25,7 +25,7 @@ import {
   clampContrastLimits,
   contrastLabel,
   contrastStep,
-  dtypeContrastLimits,
+  contrastTrack,
   gammaFromOctaves,
   octavesFromGamma,
   percentileLabel,
@@ -118,6 +118,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const setVolumeRenderMode = useAppStore((s) => s.setVolumeRenderMode);
   const appliedLimits = useAppStore((s) => s.appliedLimits);
   const planeLimits = useAppStore((s) => s.planeLimits);
+  const observedLimits = useAppStore(selectObservedLimits);
   const playAxis = useAppStore((s) => s.playAxis);
   const setPlayAxis = useAppStore((s) => s.setPlayAxis);
 
@@ -256,20 +257,33 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     [tileInfo],
   );
 
-  // The track a fixed window is chosen on: the dtype's whole range, so the
-  // window's position on the bar says what part of the possible signal is in
-  // view. `sliderGrid` supplies the dtype from the live grid or the catalog.
-  const dtypeRange = useMemo<[number, number]>(
-    () => (descriptor ? dtypeContrastLimits(vivDtype(descriptor.dtype)) : [0, 1]),
+  // One `vivDtype` for the panel: it is what decides whether the track below is
+  // the dtype's own range or the data's, and what the step is counted in.
+  const dtype = useMemo(
+    () => (descriptor ? vivDtype(descriptor.dtype) : null),
     [descriptor],
   );
-  const fixedStep = useMemo(() => contrastStep(dtypeRange), [dtypeRange]);
+  // The track a fixed window is chosen on: the dtype's whole range where it has
+  // one, so the window's position on the bar says what part of the possible
+  // signal is in view; for a float tensor, which has no such range, every level
+  // the data has shown -- not just this plane's, or a window chosen against a
+  // bright plane could not be widened from a dim one. `sliderGrid` supplies the
+  // dtype from the live grid or the catalog.
+  const track = useMemo<[number, number]>(
+    () => contrastTrack(dtype, observedLimits, planeLimits, slice.fixedLimits),
+    [dtype, observedLimits, planeLimits, slice.fixedLimits],
+  );
+  const fixedStep = useMemo(() => contrastStep(track, dtype), [track, dtype]);
   // Local first (a drag in progress), then the committed window, then whatever
-  // the viewer is applying -- which is the dtype range until one is chosen.
+  // the viewer is applying -- which is the whole track until one is chosen.
   const fixedWindow = useMemo<[number, number]>(
     () =>
-      clampContrastLimits(localFixed ?? slice.fixedLimits ?? appliedLimits ?? dtypeRange, dtypeRange),
-    [localFixed, slice.fixedLimits, appliedLimits, dtypeRange],
+      clampContrastLimits(
+        localFixed ?? slice.fixedLimits ?? appliedLimits ?? track,
+        track,
+        dtype,
+      ),
+    [localFixed, slice.fixedLimits, appliedLimits, track, dtype],
   );
 
   // Get channel name for current channel index
@@ -505,12 +519,12 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                   // not change the image -- it stops it from changing.
                   setSlice({
                     contrastMode: "fixed",
-                    fixedLimits: clampContrastLimits(appliedLimits ?? dtypeRange, dtypeRange),
+                    fixedLimits: clampContrastLimits(appliedLimits ?? track, track, dtype),
                   });
                   return;
                 }
                 // `fixedLimits` is kept: toggling back must return to the
-                // window the user chose, not to the dtype's whole range.
+                // window the user chose, not to the whole track.
                 setSlice({ contrastMode: "auto" });
               }}
               disabled={slice.contrastMode === mode.key}
@@ -536,7 +550,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               if (slice.contrastMode === "fixed") {
                 if (!planeLimits) return;
                 setLocalFixed(null);
-                setSlice({ fixedLimits: clampContrastLimits(planeLimits, dtypeRange) });
+                setSlice({ fixedLimits: clampContrastLimits(planeLimits, track, dtype) });
                 return;
               }
               setLocalPercentile(0);
@@ -584,24 +598,24 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               style={{ flex: 1 }}
             />
           ) : (
-            // Two grabs on one bar, and the bar is the dtype's whole range --
-            // so where the window sits says what part of the possible signal is
-            // being shown, which a self-scaled bar could not.
+            // Two grabs on one bar, and the bar is the whole track -- so where
+            // the window sits says what part of the available signal is being
+            // shown, which a self-scaled bar could not.
             <div className="dual-range" style={{ flex: 1 }}>
               <div className="dual-range-track" />
               <div
                 className="dual-range-fill"
                 style={{
-                  left: `${trackFraction(fixedWindow[0], dtypeRange)}%`,
-                  right: `${100 - trackFraction(fixedWindow[1], dtypeRange)}%`,
+                  left: `${trackFraction(fixedWindow[0], track)}%`,
+                  right: `${100 - trackFraction(fixedWindow[1], track)}%`,
                 }}
               />
               {(["lo", "hi"] as const).map((end) => (
                 <input
                   key={end}
                   type="range"
-                  min={dtypeRange[0]}
-                  max={dtypeRange[1]}
+                  min={track[0]}
+                  max={track[1]}
                   step={fixedStep}
                   value={end === "lo" ? fixedWindow[0] : fixedWindow[1]}
                   aria-label={end === "lo" ? "Black level" : "White level"}
@@ -612,14 +626,14 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                   // window is always the one the pointer finds.
                   style={{
                     zIndex:
-                      end === "lo" && trackFraction(fixedWindow[0], dtypeRange) > 50 ? 2 : 1,
+                      end === "lo" && trackFraction(fixedWindow[0], track) > 50 ? 2 : 1,
                   }}
                   onChange={(e) => {
                     const next = withContrastLimit(
                       fixedWindow,
                       end,
                       Number(e.target.value),
-                      dtypeRange,
+                      track,
                       fixedStep,
                     );
                     setLocalFixed(next);

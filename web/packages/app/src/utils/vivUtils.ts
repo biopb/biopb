@@ -43,6 +43,11 @@ export const CONTRAST_SAMPLE_LIMIT = 65_536;
  * Sorting once is what makes the contrast slider free: dragging it re-reads this
  * array instead of asking the server to re-render, which is the whole point of
  * moving contrast into the shader.
+ *
+ * NaN and the infinities are dropped rather than sorted. A typed-array sort puts
+ * both at the end, so a single one -- a masked-out region of a float plane is
+ * the usual source -- becomes what every percentile taken at 100 reads back as
+ * the plane's maximum.
  */
 export function contrastSamples(
   data: ArrayLike<number>,
@@ -51,9 +56,14 @@ export function contrastSamples(
   const stride = Math.max(1, Math.ceil(data.length / limit));
   const count = Math.ceil(data.length / stride);
   const out = new Float64Array(count);
-  for (let i = 0, j = 0; j < count; i += stride, j++) out[j] = data[i] ?? 0;
-  out.sort(); // TypedArray sorts numerically, unlike Array
-  return out;
+  let kept = 0;
+  for (let i = 0; kept < count && i < data.length; i += stride) {
+    const value = data[i] ?? NaN;
+    if (Number.isFinite(value)) out[kept++] = value;
+  }
+  const sampled = out.subarray(0, kept);
+  sampled.sort(); // TypedArray sorts numerically, unlike Array
+  return sampled;
 }
 
 /**
@@ -157,27 +167,61 @@ const RANGE_BY_DTYPE: Record<string, [number, number]> = {
   Int16: [-32768, 32767],
   Uint32: [0, 4294967295],
   Int32: [-2147483648, 2147483647],
-  Float32: [0, 1],
-  Float64: [0, 1],
 };
 
 /**
- * The dtype's whole range: full-range limits until the first sampled plane comes
- * back, and the track a fixed window is chosen on.
+ * The track when nothing names one: a float tensor with no plane sampled yet,
+ * and the case `vivDtype` would have thrown on before it ever reached here.
  */
-export function dtypeContrastLimits(vivDtype: string): [number, number] {
-  return RANGE_BY_DTYPE[vivDtype] ?? [0, 1];
+const FALLBACK_RANGE: [number, number] = [0, 1];
+
+/**
+ * The track a contrast window is chosen on: full-range limits until the first
+ * sampled plane comes back, and the bar a fixed window is dragged along.
+ *
+ * An integer dtype names its own track, so the window's position on the bar
+ * says what part of the possible signal is in view. A float one names nothing
+ * -- "<f4" is 0-1 normalised, raw counts in the thousands and calibrated units
+ * alike -- so the values actually seen stand in for it: `observed` is any
+ * number of windows the track has to contain, typically the sampled extremes
+ * of the plane in view and the window already set. Passing the set window in
+ * is what keeps a track derived from one plane from clipping a window chosen
+ * on another.
+ */
+export function contrastTrack(
+  vivDtype: string | null,
+  ...observed: readonly ([number, number] | null | undefined)[]
+): [number, number] {
+  const intrinsic = vivDtype ? RANGE_BY_DTYPE[vivDtype] : undefined;
+  if (intrinsic) return intrinsic;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const window of observed) {
+    if (!window) continue;
+    // A non-finite end is skipped, not taken: taken, it would put the track
+    // back on the 0-1 fallback below, which is the bug this function removes.
+    if (!Number.isFinite(window[0]) || !Number.isFinite(window[1])) continue;
+    lo = Math.min(lo, window[0]);
+    hi = Math.max(hi, window[1]);
+  }
+  if (lo === Infinity) return FALLBACK_RANGE;
+  // A uniform plane observes a single value, and a zero-width track divides by
+  // zero in every fraction taken of it.
+  return hi > lo ? [lo, hi] : [lo, lo + 1];
 }
 
 /**
  * The step a fixed window moves in on a track spanning `range`.
  *
- * One grey level for the integer dtypes, where a fraction of a level names
- * nothing; a thousandth of the track for the float ones, whose range is 0-1.
+ * One grey level on an integer dtype, where a fraction of a level names
+ * nothing; a thousandth of the track on a float one. Keyed on the dtype rather
+ * than on the width, because a float track comes from the data: at whole units
+ * a tensor whose values span 20 would offer twenty positions on the whole bar,
+ * and `contrastLabel` would round the readout past what was chosen.
  */
-export function contrastStep(range: [number, number]): number {
-  const span = range[1] - range[0];
-  return span > 8 ? 1 : span / 1000;
+export function contrastStep(range: [number, number], vivDtype: string | null): number {
+  if (vivDtype && RANGE_BY_DTYPE[vivDtype]) return 1;
+  return (range[1] - range[0]) / 1000;
 }
 
 /**
@@ -205,14 +249,15 @@ export function withContrastLimit(
 export function clampContrastLimits(
   limits: [number, number],
   range: [number, number],
+  vivDtype: string | null,
 ): [number, number] {
-  const step = contrastStep(range);
+  const step = contrastStep(range, vivDtype);
   const lo = Math.min(Math.max(limits[0], range[0]), range[1] - step);
   const hi = Math.min(Math.max(limits[1], lo + step), range[1]);
   return [lo, hi];
 }
 
-/** A fixed window as the panel prints it: whole grey levels, or 0-1 to two dp. */
+/** A fixed window as the panel prints it: whole grey levels, or two dp. */
 export function contrastLabel(limits: [number, number], step: number): string {
   const fmt = (v: number) => (step >= 1 ? String(Math.round(v)) : v.toFixed(2));
   return `${fmt(limits[0])}-${fmt(limits[1])}`;

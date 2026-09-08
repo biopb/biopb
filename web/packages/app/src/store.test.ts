@@ -14,6 +14,7 @@ import {
   selectRoisTruncated,
   selectDraft,
   selectSelectedRoi,
+  selectObservedLimits,
   selectTileInfo,
   useAppStore,
 } from "./store";
@@ -155,6 +156,59 @@ describe("viewer URL state", () => {
     expect(useAppStore.getState().applyViewerState(new URLSearchParams("id=second&t=9&v=1"))).toBe(true);
     expect(useAppStore.getState().slice.t).toBe(9);
     expect(useAppStore.getState().render3d).toBe(true);
+  });
+});
+
+describe("the levels the data has shown", () => {
+  const at = (channel: number) =>
+    useAppStore.setState({ slice: { ...BASE_SLICE, c: channel } });
+
+  it("widens to cover every plane sampled, not just the last one", () => {
+    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
+    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
+    useAppStore.getState().noteObservedLimits([0, 3], "first", 0);
+    at(0);
+
+    // Without the union a fixed window chosen on the bright plane could not be
+    // widened again while the dark one is in view.
+    expect(selectObservedLimits(useAppStore.getState())).toEqual([0, 4000]);
+  });
+
+  it("keeps each channel on its own scale", () => {
+    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
+    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
+    useAppStore.getState().noteObservedLimits([0, 1], "first", 1);
+    at(1);
+
+    expect(selectObservedLimits(useAppStore.getState())).toEqual([0, 1]);
+  });
+
+  it("starts over on another tensor rather than widening across two", () => {
+    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
+    useAppStore.getState().noteObservedLimits([0, 1], "second", 0);
+    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+    at(0);
+
+    expect(selectObservedLimits(useAppStore.getState())).toEqual([0, 1]);
+  });
+
+  it("hides a union sampled from another tensor", () => {
+    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
+    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+    at(0);
+
+    expect(selectObservedLimits(useAppStore.getState())).toBeNull();
+  });
+
+  it("does not write when the plane adds nothing", () => {
+    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
+    useAppStore.getState().noteObservedLimits([0, 4000], "first", 0);
+    const before = useAppStore.getState().observedLimits;
+    useAppStore.getState().noteObservedLimits([10, 900], "first", 0);
+
+    // The viewers publish this from a memo on every render; a fresh identity
+    // each time would loop through the effect that writes it.
+    expect(useAppStore.getState().observedLimits).toBe(before);
   });
 });
 
