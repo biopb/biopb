@@ -275,10 +275,16 @@ class LifAdapter(TensorAdapter):
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
-        """One whole plane: readlif has no ROI, ``get_frame`` reads it whole."""
+        """One whole plane: readlif has no ROI, ``get_frame`` reads it whole.
+
+        Full rank, matching the ``native=`` seed in :meth:`_descriptor_for` --
+        :func:`~.stream_reduce.streaming_unit` zips this positionally against
+        the transfer grid, so a Y/X-only tuple would floor the wrong axes.
+        """
         if self.image_position is None:
             return None
-        return tuple(_native_shape(self._layout.image_list[self.image_position])[-2:])
+        shape = _native_shape(self._layout.image_list[self.image_position])
+        return tuple([1] * (len(shape) - 2)) + tuple(shape[-2:])
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         return self._read(bounds, step=None)

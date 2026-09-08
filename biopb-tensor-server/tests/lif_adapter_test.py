@@ -104,6 +104,21 @@ def test_eight_bit_image_reads_as_uint8(tmp_path):
     np.testing.assert_array_equal(whole, expected)
 
 
+def test_read_block_shape_is_full_rank_and_floors_at_one_plane(tmp_path):
+    """``streaming_unit`` zips ``read_block_shape`` positionally against the
+    transfer grid (``core/stream_reduce.py``), so a Y/X-only tuple would floor
+    the wrong axes instead of flooring nothing on the real spatial ones --
+    silently defeating the whole-plane floor for a scaled/streamed read."""
+    path, _ = create_leica_lif(str(tmp_path), n_t=2, n_c=2, n_z=5, image_shape=(24, 32))
+    source = _native(path)
+    image = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+
+    shape = image.get_tensor_descriptor().shape
+    block = image.read_block_shape
+    assert len(block) == len(shape)
+    assert tuple(block) == (1, 1, 1, 24, 32)
+
+
 def test_physical_scale_reports_readlif_pixel_size(tmp_path):
     path, _ = create_leica_lif(str(tmp_path), n_z=3, image_shape=(16, 16))
     source = _native(path)
