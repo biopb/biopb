@@ -25,6 +25,21 @@ from biopb_tensor_server.adapters.tiff import (
 from biopb_tensor_server.adapters.tifffile_adapter import LsmAdapter, TiffAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
+# Native phase-3 vendor adapters (biopb/biopb#799): each optional on its own
+# package (readlif / mrc / nd2), independent of the bioio extra below.
+try:
+    from biopb_tensor_server.adapters.dv import DeltaVisionAdapter
+except ImportError:
+    DeltaVisionAdapter = None  # type: ignore
+try:
+    from biopb_tensor_server.adapters.lif import LifAdapter
+except ImportError:
+    LifAdapter = None  # type: ignore
+try:
+    from biopb_tensor_server.adapters.nd2 import Nd2Adapter
+except ImportError:
+    Nd2Adapter = None  # type: ignore
+
 # Optional bioio vendor-format adapters (installed via the [aics] extra)
 try:
     from biopb_tensor_server.adapters.bioio import (
@@ -90,6 +105,9 @@ __all__ = [
     "TiffAdapter",
     "LsmAdapter",
     "OmeTiffAdapter",
+    "LifAdapter",
+    "DeltaVisionAdapter",
+    "Nd2Adapter",
     "ZeissAdapter",
     "LeicaAdapter",
     "NikonAdapter",

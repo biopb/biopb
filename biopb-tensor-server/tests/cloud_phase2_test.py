@@ -153,9 +153,9 @@ class TestContentFreeClaimsDoNotRead:
             ("img.lsm", "lsm"),
             ("scan.nii.gz", "nifti"),
             ("img.czi", "czi"),
-            ("img.lif", "leica"),
-            ("img.nd2", "nikon"),
-            ("img.dv", "dv"),
+            ("img.lif", "lif"),
+            ("img.nd2", "nd2"),
+            ("img.dv", "deltavision"),
             ("img.oif", "olympus"),
         ],
     )
@@ -175,7 +175,14 @@ class TestContentFreeClaimsDoNotRead:
 
     @pytest.mark.parametrize(
         "filename, source_type",
-        [("img.tif", "tiff"), ("img.lsm", "lsm"), ("img.czi", "czi")],
+        [
+            ("img.tif", "tiff"),
+            ("img.lsm", "lsm"),
+            ("img.czi", "czi"),
+            ("img.lif", "lif"),
+            ("img.dv", "deltavision"),
+            ("img.nd2", "nd2"),
+        ],
     )
     def test_native_adapters_claim_a_dehydrated_placeholder(
         self, tmp_path, force_nonresident, filename, source_type

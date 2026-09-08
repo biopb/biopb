@@ -1,10 +1,11 @@
-"""Read-path coverage for vendor formats, including the Phase 1 native TIFF/LSM path.
+"""Read-path coverage for vendor formats, including the native adapter paths.
 
 LSM, LIF, CZI and DV have no checked-in sample data, so each is synthesized
 (biopb_tensor_server.fixtures) and driven through the real adapter: claim,
-descriptor, pixels. The LSM case exercises the native persistent tifffile path;
-the remaining vendor cases still cover BioIO's dask path documented in
-docs/dask-bypass-benchmarks.md.
+descriptor, pixels. All four now name their native adapters (biopb/biopb#799
+phases 1-3) -- LIF and DV are covered again, more thoroughly, in
+tests/lif_adapter_test.py and tests/dv_adapter_test.py; the rows here stay for
+the shared claim/read/crop sweep every format in this file gets.
 """
 
 from pathlib import Path
@@ -22,15 +23,16 @@ from biopb_tensor_server.fixtures import (
     create_zeiss_lsm,
 )
 
-# (fixture factory, optional plugin module, expected source_type, scene count).
-# LSM's reduced thumbnail series is deliberately dropped by the native adapter.
-# The full-resolution image is the only exposed scene. `.lsm`, `.tif` and `.czi`
-# now name their native adapters; the remaining rows still read through BioIO.
+# (fixture factory, optional dependency module, expected source_type, scene
+# count). LSM's reduced thumbnail series is deliberately dropped by the native
+# adapter. The full-resolution image is the only exposed scene. The dependency
+# column gates on what the native reader itself needs (readlif / mrc), not a
+# bioio plugin -- none of these four rows reads through BioIO any more.
 FORMATS = [
     pytest.param(create_zeiss_lsm, None, "lsm", 1, id="lsm"),
-    pytest.param(create_leica_lif, "bioio_lif", "leica", 1, id="lif"),
-    pytest.param(create_zeiss_czi, "bioio_czi", "czi", 1, id="czi"),
-    pytest.param(create_deltavision_dv, "bioio_dv", "dv", 1, id="dv"),
+    pytest.param(create_leica_lif, "readlif", "lif", 1, id="lif"),
+    pytest.param(create_zeiss_czi, "pylibCZIrw", "czi", 1, id="czi"),
+    pytest.param(create_deltavision_dv, "mrc", "deltavision", 1, id="dv"),
 ]
 
 
