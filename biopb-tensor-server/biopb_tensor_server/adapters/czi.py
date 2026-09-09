@@ -465,6 +465,7 @@ class CziAdapter(TensorAdapter):
         bounds: ChunkBounds,
         scale_hint: Tuple[int, ...],
         reduction_method: str,
+        cache_manager=None,
     ) -> np.ndarray:
         """Serve ``nearest`` from libCZI's own ``zoom=``, where it is exact.
 
@@ -496,7 +497,9 @@ class CziAdapter(TensorAdapter):
                 # pixels at the default's cost beats failing the read, but it
                 # should be loud enough to find.
                 logger.warning("CZI zoom read declined for %s: %s", self.array_id, exc)
-        return super().get_scaled_data(bounds, scale_hint, reduction_method)
+        return super().get_scaled_data(
+            bounds, scale_hint, reduction_method, cache_manager
+        )
 
     def _zoom_factor(
         self,

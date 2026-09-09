@@ -12,7 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
 
@@ -186,6 +186,24 @@ class MemoryCacheBackend(CacheBackend):
         with self._lock:
             entry.acquire()
             if entry.state == EntryState.READY:
+                self._move_to_end(key)
+            return entry
+
+    def contains(self, key: bytes) -> bool:
+        with self._lock:
+            entry = self._entries.get(key)
+            return entry is not None and entry.state == EntryState.READY
+
+    def try_acquire(self, key: bytes, touch: bool = True) -> Optional[CacheEntry]:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.state != EntryState.READY:
+                return None
+            entry.acquire()
+            # LRU position is the whole of this backend's policy, so `touch` is
+            # exactly its recency bump; the hit/miss counters are left alone
+            # either way (see CacheBackend.try_acquire).
+            if touch:
                 self._move_to_end(key)
             return entry
 

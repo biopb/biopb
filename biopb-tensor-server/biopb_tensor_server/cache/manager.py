@@ -47,6 +47,9 @@ class CacheManager:
 
     def __init__(self, config: CacheConfig):
         """Initialize with CacheConfig, selecting backend based on config.backend."""
+        # Read by the scaled read (adapter_base._cache_sourced_units), which
+        # holds the manager and nothing else of the config.
+        self.source_scaled_reads = bool(config.source_scaled_reads)
         if config.backend == "memory":
             self._backend = MemoryCacheBackend(
                 MemoryCacheConfig(
@@ -118,6 +121,22 @@ class CacheManager:
             CacheEntry with state READY, ref_count >= 1
         """
         return self._backend.get_or_acquire(key, compute_fn)
+
+    def contains(self, key: bytes) -> bool:
+        """Whether *key* is cached and servable without computing it.
+
+        See :meth:`CacheBackend.contains`: a peek, not a promise.
+        """
+        return self._backend.contains(key)
+
+    def try_acquire(self, key: bytes, touch: bool = True) -> Optional[CacheEntry]:
+        """The acquired entry for *key*, or None when it is not already cached.
+
+        See :meth:`CacheBackend.try_acquire`. Release it as you would an entry
+        from :meth:`get_or_acquire`; ``touch=False`` keeps the read out of the
+        eviction policy.
+        """
+        return self._backend.try_acquire(key, touch=touch)
 
     def put(
         self,

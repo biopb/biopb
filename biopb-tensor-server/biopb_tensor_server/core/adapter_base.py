@@ -23,7 +23,17 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import pyarrow as pa
@@ -64,6 +74,7 @@ from biopb_tensor_server.core.errors import (
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.stream_reduce import (
+    covering_units,
     stream_reduce,
     streaming_unit,
 )
@@ -122,6 +133,22 @@ def pack_chunk_batch(arr: np.ndarray) -> pa.RecordBatch:
     )
 
 
+def unpack_chunk_view(batch: pa.RecordBatch) -> np.ndarray:
+    """A view of a chunk batch's array -- :func:`unpack_chunk_array`, uncopied.
+
+    Valid only while *batch* is alive, and for a cached entry only while that
+    entry is acquired, so this is for a caller that copies out immediately:
+    :meth:`TensorAdapter._assemble_from_cache` writes it straight into its own
+    unit buffer, where the copy below would be a second one. Anything that
+    outlives the entry wants :func:`unpack_chunk_array`.
+    """
+    dtype = np.dtype(batch.column("dtype")[0].as_py())
+    shape = tuple(batch.column("shape").to_pylist()[0])
+    count = int(np.prod(shape)) if shape else 0
+    data_buf = batch.column("data").buffers()[2]
+    return np.frombuffer(data_buf, dtype=dtype, count=count).reshape(shape)
+
+
 def unpack_chunk_array(batch: pa.RecordBatch) -> np.ndarray:
     """Reconstruct a chunk's numpy array from a unified binary RecordBatch.
 
@@ -132,12 +159,7 @@ def unpack_chunk_array(batch: pa.RecordBatch) -> np.ndarray:
     logic, ``_array_from_unified_batch``, since the core ``biopb`` package cannot
     import server code.)
     """
-    dtype = np.dtype(batch.column("dtype")[0].as_py())
-    shape = tuple(batch.column("shape").to_pylist()[0])
-    count = int(np.prod(shape)) if shape else 0
-    data_buf = batch.column("data").buffers()[2]
-    arr = np.frombuffer(data_buf, dtype=dtype, count=count)
-    return arr.reshape(shape).copy()
+    return unpack_chunk_view(batch).copy()
 
 
 # A real URL scheme is 2+ chars followed by "://" (so a bare Windows drive
@@ -913,6 +935,7 @@ class TensorAdapter(SourceAdapter):
         bounds: ChunkBounds,
         scale_hint: Tuple[int, ...],
         reduction_method: str,
+        cache_manager: Optional[CacheManager] = None,
     ) -> np.ndarray:
         """Read ``bounds`` and reduce it by ``scale_hint`` in one step.
 
@@ -922,6 +945,12 @@ class TensorAdapter(SourceAdapter):
         :mod:`~.stream_reduce`). An extent that is already one tile is read and
         reduced whole, which is what every unscaled read and most small scaled
         ones do.
+
+        ``cache_manager`` lets the default source its units from the
+        full-resolution chunks the cache already holds rather than decode them
+        from the source again -- see :meth:`_cache_sourced_units`. ``None`` (the
+        default, and what a caller with no cache passes) is exactly the
+        behaviour that was here before it.
 
         ``nearest`` takes a shorter route where the backend offers one: it is a
         pick, so :meth:`get_decimated_data` expresses it whole, and an adapter
@@ -952,12 +981,15 @@ class TensorAdapter(SourceAdapter):
            base array already owned and already off the reader. The streamed
            path materialises by construction, writing picks into its own output.
         5. **Fallback** -- anything the fused path cannot express bit-identically
-           calls ``super().get_scaled_data(...)`` rather than approximating.
+           calls ``super().get_scaled_data(...)`` rather than approximating, and
+           forwards ``cache_manager`` when it does, or the fallback silently
+           loses the cache-sourced path.
 
         Args:
             bounds: Chunk bounds, in this adapter's own axis order.
             scale_hint: Per-axis reduction factor, same order as ``bounds``.
             reduction_method: Normalized method, decoded from the chunk_id.
+            cache_manager: The chunk cache, when the caller has one.
         Returns:
             The reduced array.
         """
@@ -976,17 +1008,24 @@ class TensorAdapter(SourceAdapter):
         start = tuple(int(value) for value in bounds.start)
         stop = tuple(int(value) for value in bounds.stop)
         extent = tuple(hi - lo for lo, hi in zip(start, stop, strict=True))
-        unit = streaming_unit(
-            extent, self.get_transfer_chunk_size(), self.read_block_shape, scale_hint
-        )
 
-        if all(hi - lo <= size for lo, hi, size in zip(start, stop, unit, strict=True)):
-            return downsample_block(self.get_data(bounds), scale_hint, reduction_method)
-
-        def fetch(unit_start, unit_stop):
+        def read(unit_start, unit_stop):
             return self.get_data(
                 ChunkBounds(start=list(unit_start), stop=list(unit_stop))
             )
+
+        unit = streaming_unit(
+            extent, self.get_transfer_chunk_size(), self.read_block_shape, scale_hint
+        )
+        fetch = read
+        sourced = self._cache_sourced_units(
+            cache_manager, descriptor, start, stop, unit, scale_hint, reduction_method
+        )
+        if sourced is not None:
+            unit, fetch = sourced
+
+        if all(hi - lo <= size for lo, hi, size in zip(start, stop, unit, strict=True)):
+            return downsample_block(fetch(start, stop), scale_hint, reduction_method)
 
         return stream_reduce(
             fetch,
@@ -998,6 +1037,236 @@ class TensorAdapter(SourceAdapter):
             reduction_method,
             descriptor.dtype,
         )
+
+    def _cache_sourced_units(
+        self,
+        cache_manager: Optional[CacheManager],
+        descriptor: TensorDescriptor,
+        start: Tuple[int, ...],
+        stop: Tuple[int, ...],
+        unit: Tuple[int, ...],
+        scale_hint: Tuple[int, ...],
+        reduction_method: str,
+    ) -> Optional[Tuple[Tuple[int, ...], Callable[..., np.ndarray]]]:
+        """``(unit, fetch)`` for serving this extent out of the cache, or None.
+
+        The full-resolution chunks under a scaled read are ordinary cache
+        entries: a scaled chunk's bounds snap to ``transfer x scale``
+        (:func:`~.chunk.scaled_virtual_chunk_size`), so its extent tiles exactly
+        into the absolute transfer grid the unscaled read plan mints chunk_ids
+        on, and a unit is a whole number of those chunks. Where every one of them
+        is already there -- warmed by full-resolution reads, or by an earlier
+        pass -- units are assembled from them instead of decoded from the source
+        a second time.
+
+        **What that trades is two read paths, and the codec is not the
+        difference.** A segment is mmap'd, so a cached chunk is a view and the
+        only cost is one copy at memcpy speed; a store hands its bytes back
+        through a file read that is then materialised and copied into the output.
+        Measured on an 8192^2 uint16 zarr chunked at 4096, one scale-16 virtual
+        chunk, page cache warm, medians of 3 (and at the grid the adapter itself
+        chooses -- forcing a 4x finer one inflates the per-entry cost here 16x
+        and inverts some of these):
+
+        ==================  =========  ========  ========
+        store               method     source    cache
+        ==================  =========  ========  ========
+        blosc, random       nearest    98.8 ms    9.1 ms
+        blosc, random       area      141.2 ms   56.0 ms
+        blosc, 116x pattern nearest    16.8 ms    9.1 ms
+        blosc, 116x pattern area       67.5 ms   56.2 ms
+        uncompressed        nearest    91.8 ms    8.7 ms
+        uncompressed        area      133.1 ms   55.2 ms
+        ==================  =========  ========  ========
+
+        ``zarr[whole chunk]`` costs the same 24 ms compressed or not (1.30
+        GiB/s), of which 12.6 ms is the file read alone, against a 16 GiB/s
+        memcpy floor -- so what this path removes is that read path, not a
+        decode. An adapter whose ``get_data`` is *already* an mmap crop would
+        have nothing to gain, and those are precisely the ones that report no
+        :attr:`read_block_shape` and implement :meth:`get_decimated_data`, so
+        they return before the unit loop and never arrive here.
+
+        **The unit follows the reduction's cost model.** A pick needs none of
+        what it skips, so the smallest unit that still tiles into whole chunks
+        wins -- each chunk is copied contiguously into its own unit rather than
+        pasted into a slice of a wide one (35 ms against 40). An averaging
+        reduction runs ``prod(scale)`` strided adds per unit *whatever the unit's
+        size*, so more units is the same bytes over more, smaller numpy calls --
+        195 ms against 80 -- and it keeps the caller's unit, which is also the one
+        a source read would have held, so residency cannot regress. Both are the
+        same fact about the kernels that gives ``nearest`` a fused
+        :meth:`get_decimated_data` and ``area`` none.
+
+        **On by default** (``cache.source_scaled_reads``), and the timings above
+        are the smaller half of why. A scaled read is usually a pretext for work
+        on real pixels -- a viewer that just fit a plane to its window is about
+        to zoom into it, an analysis that sized a volume is about to read it --
+        so sourcing the coarse read from the full-resolution chunks leaves those
+        chunks' segment pages resident, and the full-res read that follows is a
+        warm mmap read instead of a cold source decode. That is worth paying for
+        even where the coarse read itself gains little, which is why this does
+        not wait for a per-store measurement to be enabled.
+
+        Declines, leaving the streamed source read exactly as it was, when there
+        is no cache, when the extent or the unit does not sit on the chunk grid
+        (a non-dyadic ``scale_hint`` rounds a 512 unit up to 513), or when any
+        chunk is missing -- short-circuiting on the first, so a cold extent pays
+        one index lookup rather than one per chunk.
+
+        A probe is a decision, never a promise: an entry can be evicted between
+        it and the read, so the fetch falls back to the source per unit.
+        """
+        if cache_manager is None or not getattr(
+            cache_manager, "source_scaled_reads", False
+        ):
+            return None
+
+        transfer = tuple(max(1, int(size)) for size in self.get_transfer_chunk_size())
+        shape = tuple(int(dim) for dim in descriptor.shape)
+        extent = tuple(hi - lo for lo, hi in zip(start, stop, strict=True))
+        if reduction_method == "nearest":
+            # No read block: that floor speaks for a source read this path does
+            # not make. The rounding to whole reduction blocks stays, so a chunk
+            # below one block still yields a unit that does not split one.
+            unit = streaming_unit(extent, transfer, None, scale_hint)
+        # The extent has to sit on the chunk grid at both ends, or the bounds
+        # derived here name a chunk the plan never minted -- a partial chunk
+        # ending mid-grid keys differently from the whole one that is cached, so
+        # the probe would miss on every entry rather than crop. A plan-minted
+        # scaled chunk always qualifies (it snaps to transfer x scale, and its
+        # last chunk on an axis ends at the tensor), so this only declines an
+        # extent no read plan asks for.
+        if any(lo % size for lo, size in zip(start, transfer, strict=True)):
+            return None
+        if any(
+            hi % size and hi != dim
+            for hi, size, dim in zip(stop, transfer, shape, strict=True)
+        ):
+            return None
+        if any(
+            span % size and span != whole
+            for span, size, whole in zip(unit, transfer, extent, strict=True)
+        ):
+            return None
+        for _chunk_bounds, key in self._chunk_cache_keys(
+            descriptor, start, stop, transfer
+        ):
+            if not cache_manager.contains(key):
+                return None
+
+        # One buffer for every unit of this read, not one per unit. A fresh
+        # 32 MiB destination measured 31.7 ms against 8.3 ms for a reused one on
+        # the unit below -- copying out of the segment mapping into pages that
+        # have never been touched faults them interleaved with the read. The
+        # first unit is the largest (``covering_units`` clamps only the last one
+        # on an axis), so it sizes the buffer and the rest take a slice of it.
+        #
+        # Safe to reuse because the only consumer is one iteration of
+        # :func:`~.stream_reduce.stream_reduce`, which reduces the unit and
+        # writes the result into its own output before asking for the next one
+        # -- and the single-unit shortcut asks exactly once per closure.
+        buffer: Optional[np.ndarray] = None
+        dtype = np.dtype(descriptor.dtype)
+
+        def fetch(unit_start, unit_stop):
+            nonlocal buffer
+            span = tuple(
+                int(hi) - int(lo) for lo, hi in zip(unit_start, unit_stop, strict=True)
+            )
+            if buffer is None or any(
+                size > held for size, held in zip(span, buffer.shape, strict=True)
+            ):
+                buffer = np.empty(span, dtype=dtype)
+            out = buffer[tuple(slice(0, size) for size in span)]
+            if self._assemble_from_cache(
+                cache_manager, descriptor, unit_start, unit_stop, transfer, out
+            ):
+                return out
+            # Evicted since the probe. One source read of the unit, which is what
+            # this extent would have cost all along.
+            return self.get_data(
+                ChunkBounds(start=list(unit_start), stop=list(unit_stop))
+            )
+
+        return unit, fetch
+
+    def _chunk_cache_keys(
+        self,
+        descriptor: TensorDescriptor,
+        start: Sequence[int],
+        stop: Sequence[int],
+        transfer: Sequence[int],
+    ) -> Any:
+        """``((chunk_start, chunk_stop), cache_key)`` for the full-resolution
+        chunks tiling ``[start, stop)``.
+
+        Minted exactly as ``_get_read_plan`` mints an unscaled endpoint -- same
+        absolute grid, same ``array_id``, same ``content_version`` header --
+        because a key that differs by one byte is a probe that never hits.
+        """
+        version_header = (
+            _version_header(self.content_version)
+            if self.content_version is not None
+            else b""
+        )
+        shape = tuple(int(dim) for dim in descriptor.shape)
+        for chunk_start, chunk_stop in covering_units(start, stop, transfer, shape):
+            chunk_id = version_header + encode_chunk_id(
+                descriptor.array_id,
+                ChunkBounds(start=list(chunk_start), stop=list(chunk_stop)),
+            )
+            yield (chunk_start, chunk_stop), cache_key_for_chunk_id(chunk_id)
+
+    def _assemble_from_cache(
+        self,
+        cache_manager: CacheManager,
+        descriptor: TensorDescriptor,
+        start: Sequence[int],
+        stop: Sequence[int],
+        transfer: Sequence[int],
+        out: np.ndarray,
+    ) -> bool:
+        """Fill *out* with ``[start, stop)`` from the cache, chunk by chunk.
+
+        False means "not all of it is here": an eviction since the probe, or an
+        entry whose stored shape or dtype is not the one this extent expects,
+        which is a stale key collision and not something to paste in blind. The
+        caller reads the unit from the source instead -- *out* may have been
+        partly written by then, and is overwritten wholesale by that read.
+
+        One copy per chunk, straight into *out*, and the entry is held for
+        exactly that copy: ``unpack_chunk_view`` is a view onto the segment's
+        mapping, so the copy reads file-backed pages and must not outlive its
+        reference.
+        """
+        for (chunk_start, chunk_stop), key in self._chunk_cache_keys(
+            descriptor, start, stop, transfer
+        ):
+            # touch=False: this read stands in for one this adapter could do
+            # itself, and one coarse extent covers every chunk of the source --
+            # crediting them all would let a zoomed-out read decide what stays
+            # cached (CacheBackend.try_acquire).
+            entry = cache_manager.try_acquire(key, touch=False)
+            if entry is None:
+                return False
+            try:
+                if entry.data is None:
+                    return False
+                block = unpack_chunk_view(entry.data)
+                where = tuple(
+                    slice(int(lo) - int(origin), int(hi) - int(origin))
+                    for lo, hi, origin in zip(
+                        chunk_start, chunk_stop, start, strict=True
+                    )
+                )
+                target = out[where]
+                if block.shape != target.shape or block.dtype != out.dtype:
+                    return False
+                target[...] = block
+            finally:
+                cache_manager.release(key)
+        return True
 
     @staticmethod
     def _bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
@@ -1133,6 +1402,7 @@ class TensorAdapter(SourceAdapter):
                     bounds,
                     decode_scale_info(chunk_id),
                     decode_reduction_method(chunk_id),
+                    cache_manager,
                 )
             else:
                 result_arr = self.get_data(bounds)
