@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorReadOption
 
-    from biopb_tensor_server.cache import CacheManager
+    from biopb_tensor_server.cache import CacheManager, RetentionClass
     from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
     from biopb_tensor_server.core.discovery import (
         ClaimContext,
@@ -1361,12 +1361,20 @@ class TensorAdapter(SourceAdapter):
         self,
         chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
+        retention: Optional[RetentionClass] = None,
     ) -> pa.RecordBatch:
         """Resolve chunk data, handling scaled chunks and backend caching.
 
         The default implementation reads raw chunk data with ``self.get_data()``.
         Scaled chunks are always cacheable when a CacheManager is available.
         With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
+
+        ``retention`` declares what a miss for this chunk would cost; None (every
+        caller but the precache) takes the default below. Declared rather than
+        measured because a scaled build's cost is not a property of the chunk --
+        it is a full-resolution read plus a reduction, over an extent the cache
+        may or may not already hold, so timing it would measure the cache's own
+        state and then use that to decide what the cache keeps.
 
         Raises:
             StaleChunkError: chunk_id carries a content_version that no longer
@@ -1382,6 +1390,14 @@ class TensorAdapter(SourceAdapter):
 
         # Check if scaled chunk (has extra bytes after bounds encoding)
         is_scaled_chunk_flag = is_scaled_chunk(chunk_id)
+
+        if retention is None:
+            # A scaled chunk is derived: the full-resolution chunks under its
+            # extent regenerate it and it cannot regenerate them, so it is what
+            # to reclaim first. The precache overrides -- what it warms is a
+            # coarse level for a first render, the one scaled chunk worth
+            # keeping ahead of the demand reads around it.
+            retention = "cheap" if is_scaled_chunk_flag else "normal"
 
         should_cache = cache_manager is not None and (
             is_scaled_chunk_flag or isinstance(cache_manager.backend, ArrowFileBackend)
@@ -1420,7 +1436,7 @@ class TensorAdapter(SourceAdapter):
             # it, so a nearest read cannot be served an area chunk (this
             # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(cache_key, compute_fn)
+            entry = cache_manager.get_or_acquire(cache_key, compute_fn, retention)
             data = entry.data
             cache_manager.release(cache_key)
         else:

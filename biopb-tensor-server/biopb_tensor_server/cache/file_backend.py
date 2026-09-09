@@ -17,17 +17,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
-from typing import Callable, Dict, Literal, Optional, Tuple
+from typing import Callable, Dict, Literal, Optional, Tuple, get_args
 
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
+    RETENTION_EVICTION_ORDER,
     CacheBackend,
     CacheEntry,
     CacheStats,
     ChunkLocation,
     EntryState,
     PoolStats,
+    RetentionClass,
     estimate_batch_bytes,
 )
 from biopb_tensor_server.cache.recovery import (
@@ -51,24 +53,29 @@ COLD_FREQUENCY_THRESHOLD = 0  # frequency == 0
 MMAP_LIFECYCLE_THRESHOLD = 100  # Only manage mmaps when segments > 100
 
 
-# Size class thresholds for pooling (fixed values, not derived from MAX_ARROW_BATCH_BYTES)
-# With 64MB max chunk size, we want reasonable pooling buckets
+# Size class thresholds for pooling. A segment holds one class, so what this
+# buys is a uniform eviction granularity: a "large" segment loses one entry when
+# it goes, a "tiny" one loses ~180. Outliers vs bulk, three buckets and not four,
+# because the old 8 MB small/medium boundary was byte-identical to
+# PREFERRED_ARROW_BATCH_BYTES -- the size the transfer grid targets -- so it cut
+# the population at its own mode (measured on a 25 GB cache: median entry
+# 7.99 MB, 52% either side). Splitting the bulk buys nothing and costs a pool,
+# and every pool holds one open unsealed segment of up to max_segment_bytes.
 SIZE_CLASS_TINY_THRESHOLD = 1 * 1024 * 1024  # <1MB
-SIZE_CLASS_SMALL_THRESHOLD = 8 * 1024 * 1024  # 1-8MB
-SIZE_CLASS_MEDIUM_THRESHOLD = 32 * 1024 * 1024  # 8-32MB
+SIZE_CLASS_BULK_THRESHOLD = 32 * 1024 * 1024  # 1-32MB: the transfer grid's range
 # large: >=32MB (still cached, just pooled separately)
 
-SizeClass = Literal["tiny", "small", "medium", "large"]
+SizeClass = Literal["tiny", "bulk", "large"]
+
+_KNOWN_RETENTIONS = frozenset(get_args(RetentionClass))
 
 
 def _get_size_class(size_bytes: int) -> SizeClass:
     """Classify chunk size for pooling."""
     if size_bytes < SIZE_CLASS_TINY_THRESHOLD:
         return "tiny"
-    elif size_bytes < SIZE_CLASS_SMALL_THRESHOLD:
-        return "small"
-    elif size_bytes < SIZE_CLASS_MEDIUM_THRESHOLD:
-        return "medium"
+    elif size_bytes < SIZE_CLASS_BULK_THRESHOLD:
+        return "bulk"
     else:
         return "large"
 
@@ -113,9 +120,17 @@ FORMAT_VERSION_MARKER = "format_version"
 # back to the body walk). Purely additive -- an older server ignores ``.idx``
 # (it globs ``.arrow``); a newer server on an old cache walks and backfills. The
 # tiny ``.idx`` bytes are deliberately NOT counted toward ``max_total_bytes``.
+# The retention class rides in the sidecar's schema metadata, not in the segment
+# body: the body layout is the cross-process contract the localhost client parses
+# (CACHE_FILE_FORMAT_VERSION), and this is server-side policy. Additive in both
+# directions, so neither version needs a bump -- an older server ignores the key,
+# and a newer one reading an older sidecar (or walking a body) defaults to
+# "normal". Bumping SIDECAR_FORMAT_VERSION for it would be the expensive
+# mistake: every existing .idx would be rejected for the body walk #300 removed.
 SIDECAR_FORMAT_VERSION = 1
 _SIDECAR_VERSION_KEY = b"biopb_sidecar_version"
 _SIDECAR_SEGMENT_SIZE_KEY = b"biopb_segment_size"
+_SIDECAR_RETENTION_KEY = b"biopb_retention"
 _SIDECAR_VERSION_BYTES = str(SIDECAR_FORMAT_VERSION).encode()
 # The key travels as a real column (not schema-only): a sidecar is an Arrow IPC
 # FILE, so this is belt-and-suspenders, but it keeps the record self-describing.
@@ -249,7 +264,7 @@ class ArrowFileBackend(CacheBackend):
         self._segment_keys: Dict[int, set] = {}
 
         # Sieve-K: Per-pool queues with frequency counters
-        self._pool_queues: Dict[Tuple[str, SizeClass], PoolQueueInfo] = {}
+        self._pool_queues: Dict[Tuple[RetentionClass, SizeClass], PoolQueueInfo] = {}
 
         # Mmap handles for fast reads, and each mapped segment's IPC schema.
         # The schema is what lets a read decode the single message at an entry's
@@ -272,7 +287,7 @@ class ArrowFileBackend(CacheBackend):
         self._pool_paths: Dict[int, Path] = {}
 
         # Pool tracking: (schema_key, size_class) -> segment_id for open segments
-        self._open_pools: Dict[Tuple[str, SizeClass], int] = {}
+        self._open_pools: Dict[Tuple[RetentionClass, SizeClass], int] = {}
 
         # Statistics
         self._hits: int = 0
@@ -731,13 +746,21 @@ class ArrowFileBackend(CacheBackend):
             mm.close()
 
     def _install_segment_records(
-        self, segment_id: int, seg_file: Path, records: list
+        self,
+        segment_id: int,
+        seg_file: Path,
+        records: list,
+        retention: RetentionClass = "normal",
     ) -> None:
         """Populate ``_metadata`` + pool queues for one segment from its index
         records. Shared by the sidecar fast path and the body-walk fallback so
         both produce an identical index. Entries in a segment share a size class
         (the pool key), so the last one's class keys the segment's pool -- same as
         the pre-#300 walk. Caller has already rejected an empty record list.
+
+        ``retention`` comes from the sidecar where there is one. A body walk has
+        no record of it and takes the default, which costs that segment only its
+        place in the reclamation order, until it turns over.
         """
         st = seg_file.stat()
         segment_created = st.st_mtime  # file mtime, matching the pre-#300 walk
@@ -755,7 +778,7 @@ class ArrowFileBackend(CacheBackend):
                 ),
             )
 
-        pool_key = ("unified", _get_size_class(records[-1][3]))
+        pool_key = (retention, _get_size_class(records[-1][3]))
         pool_queue = self._get_or_create_pool_queue(pool_key)
         # Oldest at the tail: a rebuilt segment predates this session's writes.
         pool_queue.queue.append(segment_id)
@@ -806,8 +829,12 @@ class ArrowFileBackend(CacheBackend):
         )
         if not records:
             return False  # nothing to install; let the body walk decide
+        raw = meta.get(_SIDECAR_RETENTION_KEY)
+        retention = raw.decode() if raw else "normal"
+        if retention not in _KNOWN_RETENTIONS:
+            retention = "normal"
         self._open_segment_mmap(segment_id, seg_file)
-        self._install_segment_records(segment_id, seg_file, records)
+        self._install_segment_records(segment_id, seg_file, records, retention)
         return True
 
     def _write_segment_sidecar(
@@ -848,10 +875,13 @@ class ArrowFileBackend(CacheBackend):
         except OSError:
             return
 
+        pool_key = self._get_pool_key_for_segment(segment_id)
+        retention: RetentionClass = pool_key[0] if pool_key else "normal"
         schema = _SIDECAR_SCHEMA.with_metadata(
             {
                 _SIDECAR_VERSION_KEY: _SIDECAR_VERSION_BYTES,
                 _SIDECAR_SEGMENT_SIZE_KEY: str(st.st_size).encode(),
+                _SIDECAR_RETENTION_KEY: retention.encode(),
             }
         )
         table = pa.Table.from_arrays(
@@ -881,7 +911,7 @@ class ArrowFileBackend(CacheBackend):
 
     def _create_segment_for_pool(
         self,
-        pool_key: Tuple[str, SizeClass],
+        pool_key: Tuple[RetentionClass, SizeClass],
         schema: pa.Schema,
     ) -> int:
         """Create a new segment for a specific pool and return its ID."""
@@ -930,7 +960,7 @@ class ArrowFileBackend(CacheBackend):
         return segment_id
 
     def _get_or_create_pool_queue(
-        self, pool_key: Tuple[str, SizeClass]
+        self, pool_key: Tuple[RetentionClass, SizeClass]
     ) -> PoolQueueInfo:
         """Return the pool's queue, creating it on first use."""
         pool_queue = self._pool_queues.get(pool_key)
@@ -1035,7 +1065,7 @@ class ArrowFileBackend(CacheBackend):
 
     def _get_pool_key_for_segment(
         self, segment_id: int
-    ) -> Optional[Tuple[str, SizeClass]]:
+    ) -> Optional[Tuple[RetentionClass, SizeClass]]:
         """Get the pool key for a given segment ID."""
         for pool_key, pool in self._pool_queues.items():
             if segment_id in pool.segments:
@@ -1071,23 +1101,30 @@ class ArrowFileBackend(CacheBackend):
 
         self._evictions += 1
 
-    def _select_pool_for_eviction(self) -> Optional[Tuple[str, SizeClass]]:
-        """Select pool with lowest aggregate hit rate."""
+    def _select_pool_for_eviction(self) -> Optional[Tuple[RetentionClass, SizeClass]]:
+        """Select the pool to reclaim from: cheapest retention class first, then
+        lowest aggregate hit rate within the class.
+
+        The class outranks the hit rate deliberately -- a cheap chunk is one that
+        costs least to produce again, so it is reclaimed before a normal one
+        however well it is being hit. A ``pinned`` pool is never selected;
+        nothing declares that class today.
+        """
         if not self._pool_queues:
             return None
 
-        # Calculate hit rates
+        # Class rank, then hit rate, then most segments
         pool_rates = []
         for pool_key, pool in self._pool_queues.items():
+            if pool_key[0] not in RETENTION_EVICTION_ORDER:
+                continue  # pinned: never a victim
             total = pool.hits + pool.misses
             hit_rate = pool.hits / total if total > 0 else 0.0
-            pool_rates.append((pool_key, hit_rate, pool.queue))
+            rank = RETENTION_EVICTION_ORDER.index(pool_key[0])
+            pool_rates.append((rank, hit_rate, -len(pool.queue), pool_key, pool.queue))
 
-        # Select lowest hit rate pool with segments
-        pool_rates.sort(
-            key=lambda x: (x[1], -len(x[2]))
-        )  # Lowest rate, then most segments
-        for pool_key, _rate, queue in pool_rates:
+        pool_rates.sort(key=lambda x: x[:3])
+        for *_rank, pool_key, queue in pool_rates:
             if queue:
                 return pool_key
         return None
@@ -1362,6 +1399,7 @@ class ArrowFileBackend(CacheBackend):
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
+        retention: RetentionClass = "normal",
     ) -> CacheEntry:
         """Get existing entry or create pending and compute."""
         is_owner = False
@@ -1393,6 +1431,7 @@ class ArrowFileBackend(CacheBackend):
                 entry = CacheEntry(
                     state=EntryState.PENDING,
                     created_at=time.time(),
+                    retention=retention,
                 )
                 self._entries[key] = entry
                 self._misses += 1
@@ -1456,11 +1495,15 @@ class ArrowFileBackend(CacheBackend):
         batch = self._read_batch_from_segment(key, touch=touch)
         if batch is None:
             return None
+        # Take the class back off the segment the entry came from, so a
+        # re-hydrated entry cannot report a class its bytes are not stored under.
+        pool_key = self._get_pool_key_for_segment(self._metadata[key].segment_id)
         entry = CacheEntry(
             data=batch,
             state=EntryState.READY,
             created_at=time.time(),
             size_bytes=estimate_batch_bytes(batch),
+            retention=pool_key[0] if pool_key else "normal",
         )
         entry.acquire()
         self._entries[key] = entry
@@ -1478,7 +1521,9 @@ class ArrowFileBackend(CacheBackend):
         seg_info.last_access_time = time.time()
         pool_queue.hits += 1
 
-    def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
+    def start_compute(
+        self, key: bytes, retention: RetentionClass = "normal"
+    ) -> Tuple[CacheEntry, bool]:
         """Start compute phase - returns (entry, is_owner)."""
         with self._lock:
             entry = self._entries.get(key)
@@ -1508,6 +1553,7 @@ class ArrowFileBackend(CacheBackend):
             entry = CacheEntry(
                 state=EntryState.PENDING,
                 created_at=time.time(),
+                retention=retention,
             )
             entry.acquire()
             self._entries[key] = entry
@@ -1586,7 +1632,9 @@ class ArrowFileBackend(CacheBackend):
                     names=list(unified_batch.schema.names) + [CACHE_KEY_FIELD],
                 )
 
-                pool_key = ("unified", size_class)
+                # The class is the entry's, not this call's: a deferred write is
+                # persisted by the writer thread, which has only the key.
+                pool_key = (entry.retention, size_class)
                 pool_queue = self._get_or_create_pool_queue(pool_key)
                 pool_queue.misses += 1
 

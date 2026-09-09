@@ -501,7 +501,12 @@ class PrecacheWorker:
             if not self._wait_until_idle():
                 return False
             try:
-                tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
+                # "normal", not the scaled default: this level exists to make
+                # the first render of a newly-added source instant, so it should
+                # outlive the coarse chunks a client asks for in passing.
+                tensor_adapter.resolve_chunk_data(
+                    ce.chunk_id, cache_manager, retention="normal"
+                )
                 warmed += 1
             except Exception as e:
                 # One bad chunk shouldn't abort the whole tensor.
