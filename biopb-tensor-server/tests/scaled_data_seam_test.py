@@ -845,6 +845,47 @@ class TestBorrowedUnits:
         cache.clear()
         assert np.array_equal(out, expected)
 
+    def test_a_buffered_pick_is_not_copied_on_the_way_out(
+        self, counted, monkeypatch, cache
+    ):
+        """The copy is owed by the *unit*, not by the read's mode.
+
+        A grid below the reduction block rounds the pick's unit up past one
+        chunk, so it is buffered rather than borrowed -- and that buffer is the
+        closure's own, which outlives the read. Materialising here would copy a
+        pick that was already safe to return, which is what asking
+        ``source_scaled_reads`` instead of the unit would do.
+
+        The grid is narrow on one axis and wide on the other so the pick is
+        genuinely strided: a unit of one reduction block reduces to a single
+        element, which numpy calls contiguous, and nothing would be copied
+        either way.
+        """
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (2, 16))
+        bounds = _bounds((0, 0), (4, 16))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "nearest")
+        self._warm_level_zero(adapter, cache)
+        attempts = []
+        borrow = adapter._borrow_cached_unit
+
+        def spy(*args):
+            lent = borrow(*args)
+            attempts.append(lent)
+            return lent
+
+        monkeypatch.setattr(adapter, "_borrow_cached_unit", spy)
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "nearest", cache)
+
+        assert attempts and all(lent is None for lent in attempts), (
+            "a unit of several chunks must decline the borrow"
+        )
+        assert reads == [], "expected the cache-sourced path"
+        assert out.base is not None, "a buffered pick must not be copied"
+        assert np.array_equal(out, expected)
+
     @pytest.mark.parametrize("grid", [(16, 16), (64, 64)])
     def test_every_borrowed_entry_is_released(self, counted, monkeypatch, cache, grid):
         """Streamed and single-unit alike: an entry held past the reduction
