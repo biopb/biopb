@@ -400,15 +400,21 @@ class TestCacheSourcedUnits:
 
     @staticmethod
     def _units(adapter, monkeypatch):
-        """Record the extent each cache-sourced unit covers."""
+        """Record the extent each cache-sourced unit covers, by either route."""
         seen = []
-        original = adapter._assemble_from_cache
+        assemble = adapter._assemble_from_cache
+        borrow = adapter._borrow_cached_unit
 
-        def spy(cache_manager, descriptor, start, stop, transfer, out):
+        def assemble_spy(cache_manager, descriptor, start, stop, transfer, out):
             seen.append((tuple(start), tuple(stop)))
-            return original(cache_manager, descriptor, start, stop, transfer, out)
+            return assemble(cache_manager, descriptor, start, stop, transfer, out)
 
-        monkeypatch.setattr(adapter, "_assemble_from_cache", spy)
+        def borrow_spy(cache_manager, descriptor, start, stop, transfer, dtype):
+            seen.append((tuple(start), tuple(stop)))
+            return borrow(cache_manager, descriptor, start, stop, transfer, dtype)
+
+        monkeypatch.setattr(adapter, "_assemble_from_cache", assemble_spy)
+        monkeypatch.setattr(adapter, "_borrow_cached_unit", borrow_spy)
         return seen
 
     def test_a_warm_extent_never_touches_the_source(self, counted, monkeypatch, cache):
@@ -495,10 +501,10 @@ class TestCacheSourcedUnits:
 
     def test_a_pick_drops_the_unit_to_the_chunk_grid(self, counted, monkeypatch, cache):
         """`nearest` needs none of what it skips, so the smallest unit that
-        tiles into whole chunks wins: each chunk is copied contiguously into its
-        own unit rather than landing as strided rows in a wide buffer (35 ms
-        against 48). The read_block floor does not apply -- it speaks for a
-        source read this path does not make."""
+        tiles into whole chunks wins: a unit that is one chunk is one mapping
+        the pick reads straight out of (``TestBorrowedUnits``), where a wide one
+        would land as strided rows in a buffer. The read_block floor does not
+        apply -- it speaks for a source read this path does not make."""
         adapter, reads = counted
         _set_grid(monkeypatch, adapter, (16, 16), block=(64, 64))
         bounds = _bounds((0, 0), (64, 64))
@@ -732,3 +738,199 @@ class TestCacheSourcedUnits:
             assert len(reads) > 1
         finally:
             manager.close()
+
+
+class TestBorrowedUnits:
+    """A pick reduces out of the segment mapping instead of a copy of it.
+
+    ``nearest`` sizes its unit at one chunk, so the unit *is* one cache entry:
+    copying it into a buffer moves prod(scale) times the bytes the pick then
+    reads. Borrowing skips that -- at the price of a view whose validity ends
+    with the entry, which is what most of this class is about.
+    """
+
+    @pytest.fixture
+    def cache(self, tmp_path):
+        manager = CacheManager(
+            CacheConfig(
+                backend="file",
+                file_cache_dir=tmp_path / "cache",
+                source_scaled_reads=True,
+            )
+        )
+        try:
+            yield manager
+        finally:
+            manager.close()
+
+    _warm_level_zero = staticmethod(TestCacheSourcedUnits._warm_level_zero)
+
+    @staticmethod
+    def _refcounts(cache, monkeypatch):
+        """(acquires, releases) the read makes through the manager."""
+        acquired, released = [], []
+        acquire, release = cache.try_acquire, cache.release
+
+        def acquire_spy(key, touch=True):
+            entry = acquire(key, touch)
+            if entry is not None:
+                acquired.append(key)
+            return entry
+
+        def release_spy(key):
+            released.append(key)
+            return release(key)
+
+        monkeypatch.setattr(cache, "try_acquire", acquire_spy)
+        monkeypatch.setattr(cache, "release", release_spy)
+        return acquired, released
+
+    def test_a_pick_never_copies_the_unit(self, counted, monkeypatch, cache):
+        """The optimization itself: sixteen units, sixteen borrows, no buffer.
+
+        Scale 2 so the shapes separate -- a unit is 16x16 full-resolution and
+        the output is 32x32, so the only 16x16 allocation there could be is the
+        unit copy this removes.
+        """
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (2, 2), "nearest")
+        self._warm_level_zero(adapter, cache)
+        borrowed, assembled = [], []
+        borrow = adapter._borrow_cached_unit
+        monkeypatch.setattr(
+            adapter,
+            "_borrow_cached_unit",
+            lambda *a: (borrowed.append(a[2]), borrow(*a))[1],
+        )
+        monkeypatch.setattr(
+            adapter, "_assemble_from_cache", lambda *a: assembled.append(a[2])
+        )
+        allocated = []
+        empty = np.empty
+        monkeypatch.setattr(
+            np,
+            "empty",
+            lambda shape, *a, **k: (allocated.append(shape), empty(shape, *a, **k))[1],
+        )
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (2, 2), "nearest", cache)
+
+        assert len(borrowed) == 16
+        assert assembled == []
+        assert (16, 16) not in allocated, "a borrowed unit needs no buffer"
+        assert reads == []
+        assert np.array_equal(out, expected)
+
+    def test_the_reduced_array_outlives_the_entry(self, counted, monkeypatch, cache):
+        """Contract 4, and the one that would hand back freed pages.
+
+        The single-unit shortcut returns the reduction itself, and a pick is a
+        strided *view* of what it reduced -- of the segment mapping, here. It
+        has to be materialised before the entry is released.
+        """
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (64, 64))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "nearest")
+        self._warm_level_zero(adapter, cache)
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "nearest", cache)
+
+        assert reads == [], "expected the borrowed path"
+        assert out.base is None and out.flags.owndata, "a view onto a released entry"
+        cache.clear()
+        assert np.array_equal(out, expected)
+
+    @pytest.mark.parametrize("grid", [(16, 16), (64, 64)])
+    def test_every_borrowed_entry_is_released(self, counted, monkeypatch, cache, grid):
+        """Streamed and single-unit alike: an entry held past the reduction
+        would pin its segment against eviction for the life of the server."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, grid)
+        self._warm_level_zero(adapter, cache)
+        acquired, released = self._refcounts(cache, monkeypatch)
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "nearest", cache)
+
+        assert reads == [], "expected the borrowed path"
+        assert acquired and released == acquired
+
+    def test_a_failed_reduction_releases_too(self, counted, monkeypatch, cache):
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (64, 64))
+        self._warm_level_zero(adapter, cache)
+        acquired, released = self._refcounts(cache, monkeypatch)
+        monkeypatch.setattr(
+            "biopb_tensor_server.core.adapter_base.downsample_block",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        with pytest.raises(RuntimeError):
+            adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "nearest", cache)
+
+        assert acquired and released == acquired
+
+    def test_a_unit_of_several_chunks_is_assembled_as_before(
+        self, counted, monkeypatch, cache
+    ):
+        """Borrowing needs the unit to *be* one entry. A grid below the
+        reduction block rounds the unit up past it, and that unit is pasted
+        together exactly as an averaging one is."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (2, 2))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "nearest")
+        self._warm_level_zero(adapter, cache)
+        assembled = []
+        assemble = adapter._assemble_from_cache
+        monkeypatch.setattr(
+            adapter,
+            "_assemble_from_cache",
+            lambda *a: (assembled.append(a[2]), assemble(*a))[1],
+        )
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "nearest", cache)
+
+        assert len(assembled) == 16 * 16, "a 4x4 unit over a 2x2 grid"
+        assert reads == []
+        assert np.array_equal(out, expected)
+
+    def test_an_eviction_between_the_probe_and_the_borrow_reads_the_source(
+        self, counted, monkeypatch, cache
+    ):
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "nearest")
+        self._warm_level_zero(adapter, cache)
+        reads.clear()
+        monkeypatch.setattr(cache, "try_acquire", lambda key, touch=True: None)
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "nearest", cache)
+
+        assert reads, "the fallback must reach the source"
+        assert np.array_equal(out, expected)
+
+    def test_an_averaging_reduction_does_not_borrow(self, counted, monkeypatch, cache):
+        """`area` reads every byte anyway, and its edge units go through the
+        padding and strided-add kernels -- not worth handing those a read-only
+        view of a cached chunk for one memcpy of the ~4% it costs."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        self._warm_level_zero(adapter, cache)
+        borrowed = []
+        monkeypatch.setattr(
+            adapter, "_borrow_cached_unit", lambda *a: borrowed.append(a[2])
+        )
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area", cache)
+
+        assert borrowed == []
+        assert reads == []
