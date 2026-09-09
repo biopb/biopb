@@ -115,6 +115,31 @@ CHUNK_WIRE_SCHEMA = pa.schema(
 )
 
 
+class _BorrowedUnit:
+    """The cache entry the unit last fetched is a view of, if it is one.
+
+    A cache-sourced ``fetch`` hands back either a view onto a segment mapping or
+    a copy in its own buffer (:meth:`TensorAdapter._cache_sourced_units`), and
+    only the view constrains what the caller may do with the reduction of it.
+    This is what says which, and what frees the entry once the unit has been
+    reduced.
+    """
+
+    __slots__ = ("_cache", "key")
+
+    def __init__(self, cache_manager: CacheManager) -> None:
+        self._cache = cache_manager
+        self.key: Optional[bytes] = None
+
+    def hold(self, key: bytes) -> None:
+        self.key = key
+
+    def release(self) -> None:
+        if self.key is not None:
+            self._cache.release(self.key)
+            self.key = None
+
+
 def pack_chunk_batch(arr: np.ndarray) -> pa.RecordBatch:
     """Pack a chunk's numpy array into the unified binary RecordBatch (one row).
 
@@ -137,10 +162,11 @@ def unpack_chunk_view(batch: pa.RecordBatch) -> np.ndarray:
     """A view of a chunk batch's array -- :func:`unpack_chunk_array`, uncopied.
 
     Valid only while *batch* is alive, and for a cached entry only while that
-    entry is acquired, so this is for a caller that copies out immediately:
-    :meth:`TensorAdapter._assemble_from_cache` writes it straight into its own
-    unit buffer, where the copy below would be a second one. Anything that
-    outlives the entry wants :func:`unpack_chunk_array`.
+    entry is acquired, so this is for a caller that consumes it under that
+    reference: :meth:`TensorAdapter._assemble_from_cache` writes it straight into
+    its own unit buffer, where the copy below would be a second one, and
+    :meth:`TensorAdapter._borrow_cached_unit` reduces out of it without copying
+    at all. Anything that outlives the entry wants :func:`unpack_chunk_array`.
     """
     dtype = np.dtype(batch.column("dtype")[0].as_py())
     shape = tuple(batch.column("shape").to_pylist()[0])
@@ -978,7 +1004,8 @@ class TensorAdapter(SourceAdapter):
         4. **Ownership** -- an owned array. In particular a fused ``nearest``
            must materialise: only the default's single-unit path may return the
            strided view ``TestZeroCopyContract`` pins, because only there is the
-           base array already owned and already off the reader. The streamed
+           base array already owned and already off the reader -- and where that
+           base is instead borrowed from the cache, that path materialises too. The streamed
            path materialises by construction, writing picks into its own output.
         5. **Fallback** -- anything the fused path cannot express bit-identically
            calls ``super().get_scaled_data(...)`` rather than approximating, and
@@ -1018,25 +1045,45 @@ class TensorAdapter(SourceAdapter):
             extent, self.get_transfer_chunk_size(), self.read_block_shape, scale_hint
         )
         fetch = read
+        borrowed = None
         sourced = self._cache_sourced_units(
             cache_manager, descriptor, start, stop, unit, scale_hint, reduction_method
         )
         if sourced is not None:
-            unit, fetch = sourced
+            unit, fetch, borrowed = sourced
 
-        if all(hi - lo <= size for lo, hi, size in zip(start, stop, unit, strict=True)):
-            return downsample_block(fetch(start, stop), scale_hint, reduction_method)
+        try:
+            if all(
+                hi - lo <= size for lo, hi, size in zip(start, stop, unit, strict=True)
+            ):
+                reduced = downsample_block(
+                    fetch(start, stop), scale_hint, reduction_method
+                )
+                # Only if *this* unit was borrowed: it is a view onto the segment
+                # mapping and ``nearest`` picks a view of that, which cannot
+                # outlive the entry it is returned past. Materialising the
+                # reduced array costs prod(scale) less than the unit copy it
+                # replaces. A buffered unit needs none of this -- its buffer is
+                # the closure's own and outlives the read -- and asking the mode
+                # rather than the unit would copy a buffered pick for nothing,
+                # since ``ascontiguousarray`` copies any strided input.
+                if borrowed is not None and borrowed.key is not None:
+                    return np.ascontiguousarray(reduced)
+                return reduced
 
-        return stream_reduce(
-            fetch,
-            start,
-            stop,
-            tensor_shape,
-            unit,
-            scale_hint,
-            reduction_method,
-            descriptor.dtype,
-        )
+            return stream_reduce(
+                fetch,
+                start,
+                stop,
+                tensor_shape,
+                unit,
+                scale_hint,
+                reduction_method,
+                descriptor.dtype,
+            )
+        finally:
+            if borrowed is not None:
+                borrowed.release()
 
     def _cache_sourced_units(
         self,
@@ -1047,8 +1094,13 @@ class TensorAdapter(SourceAdapter):
         unit: Tuple[int, ...],
         scale_hint: Tuple[int, ...],
         reduction_method: str,
-    ) -> Optional[Tuple[Tuple[int, ...], Callable[..., np.ndarray]]]:
-        """``(unit, fetch)`` for serving this extent out of the cache, or None.
+    ) -> Optional[Tuple[Tuple[int, ...], Callable[..., np.ndarray], _BorrowedUnit]]:
+        """``(unit, fetch, borrowed)`` for serving this extent out of the cache.
+
+        ``fetch`` may hand back a view onto a cache segment rather than a copy,
+        and ``borrowed`` is both how the caller tells (``.key``, per unit) and
+        how it frees the last one (``.release()``, once the reduction is done).
+        None (rather than the triple) declines the whole path.
 
         The full-resolution chunks under a scaled read are ordinary cache
         entries: a scaled chunk's bounds snap to ``transfer x scale``
@@ -1089,8 +1141,9 @@ class TensorAdapter(SourceAdapter):
 
         **The unit follows the reduction's cost model.** A pick needs none of
         what it skips, so the smallest unit that still tiles into whole chunks
-        wins -- each chunk is copied contiguously into its own unit rather than
-        pasted into a slice of a wide one (35 ms against 40). An averaging
+        wins -- which is also what lets the unit be *borrowed* rather than copied
+        (:meth:`_borrow_cached_unit`), since a unit that is one chunk is one
+        mapping the pick can read straight out of. An averaging
         reduction runs ``prod(scale)`` strided adds per unit *whatever the unit's
         size*, so more units is the same bytes over more, smaller numpy calls --
         195 ms against 80 -- and it keeps the caller's unit, which is also the one
@@ -1168,12 +1221,31 @@ class TensorAdapter(SourceAdapter):
         # -- and the single-unit shortcut asks exactly once per closure.
         buffer: Optional[np.ndarray] = None
         dtype = np.dtype(descriptor.dtype)
+        # ``nearest`` sized its unit at one chunk above, so the copy that unit
+        # would take moves prod(scale) times the bytes the pick then reads.
+        # Borrowing the entry's own mapping instead skips it; see
+        # :meth:`_borrow_cached_unit`. ``area`` reads every byte anyway, its unit
+        # is normally several chunks, and its edge units go through the padding
+        # and strided-add kernels -- so it keeps the buffer.
+        borrows = reduction_method == "nearest"
+        borrowed = _BorrowedUnit(cache_manager)
 
         def fetch(unit_start, unit_stop):
             nonlocal buffer
+            # The previous unit has been reduced and written out by now -- the
+            # same fact that makes the buffer reusable makes its entry free.
+            borrowed.release()
             span = tuple(
                 int(hi) - int(lo) for lo, hi in zip(unit_start, unit_stop, strict=True)
             )
+            if borrows:
+                lent = self._borrow_cached_unit(
+                    cache_manager, descriptor, unit_start, unit_stop, transfer, dtype
+                )
+                if lent is not None:
+                    key, block = lent
+                    borrowed.hold(key)
+                    return block
             if buffer is None or any(
                 size > held for size, held in zip(span, buffer.shape, strict=True)
             ):
@@ -1189,7 +1261,7 @@ class TensorAdapter(SourceAdapter):
                 ChunkBounds(start=list(unit_start), stop=list(unit_stop))
             )
 
-        return unit, fetch
+        return unit, fetch, borrowed
 
     def _chunk_cache_keys(
         self,
@@ -1217,6 +1289,45 @@ class TensorAdapter(SourceAdapter):
                 ChunkBounds(start=list(chunk_start), stop=list(chunk_stop)),
             )
             yield (chunk_start, chunk_stop), cache_key_for_chunk_id(chunk_id)
+
+    def _borrow_cached_unit(
+        self,
+        cache_manager: CacheManager,
+        descriptor: TensorDescriptor,
+        start: Sequence[int],
+        stop: Sequence[int],
+        transfer: Sequence[int],
+        dtype: np.dtype,
+    ) -> Optional[Tuple[bytes, np.ndarray]]:
+        """``(key, view)`` where one cached chunk *is* this unit, else None.
+
+        The unit is then not copied at all: the reduction reads the segment's
+        mapping directly, which for ``nearest`` is the whole point -- the pick
+        touches one byte in ``prod(scale)`` of what the copy would have moved.
+
+        The entry is returned still acquired, because the view is only valid
+        while it is: the caller releases it once the reduction has consumed the
+        unit, and never lets a view of it escape (see :meth:`get_scaled_data`,
+        contract 4).
+
+        None where the unit is more than one chunk, where the entry went between
+        the probe and here, or where its stored shape or dtype is not the one
+        this extent expects -- a stale key collision, not something to reduce
+        blind. The caller falls back to :meth:`_assemble_from_cache`.
+        """
+        keys = list(self._chunk_cache_keys(descriptor, start, stop, transfer))
+        if len(keys) != 1:
+            return None
+        key = keys[0][1]
+        entry = cache_manager.try_acquire(key, touch=False)
+        if entry is None:
+            return None
+        span = tuple(int(hi) - int(lo) for lo, hi in zip(start, stop, strict=True))
+        block = unpack_chunk_view(entry.data) if entry.data is not None else None
+        if block is None or block.shape != span or block.dtype != dtype:
+            cache_manager.release(key)
+            return None
+        return key, block
 
     def _assemble_from_cache(
         self,
