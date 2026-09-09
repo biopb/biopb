@@ -405,12 +405,27 @@ class TestProbeWithoutComputing:
         second = ArrowFileBackend(config)
         try:
             assert second.contains(b"ondisk") is True
+            before = second.stats()
             entry = second.try_acquire(b"ondisk")
             assert entry is not None
             assert entry.data.column(0).to_pylist() == [[4, 5, 6]]
             second.release(b"ondisk")
+            # Hydrating from the segment is still a probe: the ratio counts
+            # chunks served, and which copy answered is not the caller's doing.
+            after = second.stats()
+            assert (after.hits, after.misses) == (before.hits, before.misses)
         finally:
             second.close()
+
+        # ... while a real read that hydrates the same key does count.
+        third = ArrowFileBackend(config)
+        try:
+            assert third.stats().hits == 0
+            third.start_compute(b"ondisk")
+            third.release(b"ondisk")
+            assert third.stats().hits == 1
+        finally:
+            third.close()
 
     def test_a_probe_leaves_the_eviction_policy_alone(self, tmp_path):
         """`touch=False` reads the bytes and credits nothing.

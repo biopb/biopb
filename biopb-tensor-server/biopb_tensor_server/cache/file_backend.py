@@ -1386,6 +1386,7 @@ class ArrowFileBackend(CacheBackend):
             else:
                 hydrated = self._hydrate_from_segment(key)
                 if hydrated is not None:
+                    self._hits += 1
                     return hydrated
 
                 # No entry - create pending, we own the computation
@@ -1446,7 +1447,9 @@ class ArrowFileBackend(CacheBackend):
 
         The path taken when a key is on disk but has no live in-memory entry --
         either it was never in this session or ``release`` dropped the redundant
-        mirror. Caller holds ``_lock``.
+        mirror. Caller holds ``_lock``, and counts the hit if its call was a
+        chunk request: a ``try_acquire`` probe is not one, and reaching the
+        segment rather than the mirror must not change that.
         """
         if key not in self._metadata:
             return None
@@ -1461,7 +1464,6 @@ class ArrowFileBackend(CacheBackend):
         )
         entry.acquire()
         self._entries[key] = entry
-        self._hits += 1
         return entry
 
     def _update_segment_frequency(self, segment_id: int) -> None:
@@ -1499,6 +1501,7 @@ class ArrowFileBackend(CacheBackend):
 
             hydrated = self._hydrate_from_segment(key)
             if hydrated is not None:
+                self._hits += 1
                 return hydrated, False
 
             # No entry - create pending, we own computation
