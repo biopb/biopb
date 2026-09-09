@@ -1171,7 +1171,9 @@ class ArrowFileBackend(CacheBackend):
                     self._forget_segment_mmap(seg_id)
                     seg_info.mmap_released = True
 
-    def _read_batch_from_segment(self, key: bytes) -> Optional[pa.RecordBatch]:
+    def _read_batch_from_segment(
+        self, key: bytes, touch: bool = True
+    ) -> Optional[pa.RecordBatch]:
         """Read one cached chunk back out of its segment file.
 
         Seeks straight to the entry's recorded byte range rather than walking
@@ -1190,7 +1192,10 @@ class ArrowFileBackend(CacheBackend):
         seg_info = self._segment_info(segment_id)
         if seg_info is not None and seg_info.mmap_released:
             self._reopen_segment_mmap(segment_id, seg_info)
-        self._update_segment_frequency(segment_id)
+        # A probe reads the bytes without crediting the segment; see
+        # CacheBackend.try_acquire for why.
+        if touch:
+            self._update_segment_frequency(segment_id)
 
         mmap = self._segment_mmaps.get(segment_id)
         if mmap is None:
@@ -1381,6 +1386,7 @@ class ArrowFileBackend(CacheBackend):
             else:
                 hydrated = self._hydrate_from_segment(key)
                 if hydrated is not None:
+                    self._hits += 1
                     return hydrated
 
                 # No entry - create pending, we own the computation
@@ -1412,16 +1418,42 @@ class ArrowFileBackend(CacheBackend):
             entry.acquire()
             return entry
 
-    def _hydrate_from_segment(self, key: bytes) -> Optional[CacheEntry]:
+    def contains(self, key: bytes) -> bool:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None:
+                return entry.state == EntryState.READY
+            # No live entry, but the segment index still knows it: that is a
+            # hit this backend can serve, by hydrating in try_acquire.
+            return key in self._metadata
+
+    def try_acquire(self, key: bytes, touch: bool = True) -> Optional[CacheEntry]:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return self._hydrate_from_segment(key, touch=touch)
+            if entry.state != EntryState.READY:
+                return None
+            entry.acquire()
+            entry_info = self._metadata.get(key)
+            if entry_info and touch:
+                self._update_segment_frequency(entry_info.segment_id)
+            return entry
+
+    def _hydrate_from_segment(
+        self, key: bytes, touch: bool = True
+    ) -> Optional[CacheEntry]:
         """Rebuild an acquired READY entry from its persisted segment, or None.
 
         The path taken when a key is on disk but has no live in-memory entry --
         either it was never in this session or ``release`` dropped the redundant
-        mirror. Caller holds ``_lock``.
+        mirror. Caller holds ``_lock``, and counts the hit if its call was a
+        chunk request: a ``try_acquire`` probe is not one, and reaching the
+        segment rather than the mirror must not change that.
         """
         if key not in self._metadata:
             return None
-        batch = self._read_batch_from_segment(key)
+        batch = self._read_batch_from_segment(key, touch=touch)
         if batch is None:
             return None
         entry = CacheEntry(
@@ -1432,7 +1464,6 @@ class ArrowFileBackend(CacheBackend):
         )
         entry.acquire()
         self._entries[key] = entry
-        self._hits += 1
         return entry
 
     def _update_segment_frequency(self, segment_id: int) -> None:
@@ -1470,6 +1501,7 @@ class ArrowFileBackend(CacheBackend):
 
             hydrated = self._hydrate_from_segment(key)
             if hydrated is not None:
+                self._hits += 1
                 return hydrated, False
 
             # No entry - create pending, we own computation

@@ -12,15 +12,21 @@ import tempfile
 import numpy as np
 import pytest
 import zarr
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import ZarrAdapter
+from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core import downsample as _ds
 from biopb_tensor_server.core.adapter_base import (
     _TENSOR_SCOPED_API,
     TensorAdapter,
     unpack_chunk_array,
 )
-from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
+from biopb_tensor_server.core.chunk import (
+    cache_key_for_chunk_id,
+    encode_chunk_id_with_scale,
+)
+from biopb_tensor_server.core.config import CacheConfig
 
 
 def _bounds(start, stop):
@@ -36,6 +42,32 @@ def adapter():
         )
         arr[:] = src
         yield ZarrAdapter(zarr.open_array(f"{tmp}/a.zarr", mode="r"), "src", ["y", "x"])
+
+
+@pytest.fixture
+def counted(adapter, monkeypatch):
+    """`adapter`, counting the reads its scaled path issues."""
+    reads = []
+    original = adapter.get_data
+
+    def counting(bounds):
+        reads.append((tuple(bounds.start), tuple(bounds.stop)))
+        return original(bounds)
+
+    monkeypatch.setattr(adapter, "get_data", counting)
+    return adapter, reads
+
+
+def _set_grid(monkeypatch, adapter, grid, block=None):
+    """Set the transfer grid, and what the backend is quantized to.
+
+    ``block=None`` drives the unquantized path, where the tile is the grid. The
+    fixture is a real ``ZarrAdapter`` whose store would otherwise floor the tile
+    at its own 16x16 chunk -- correct behaviour, but it would mask the grid these
+    cases are choosing.
+    """
+    monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
+    monkeypatch.setattr(type(adapter), "read_block_shape", property(lambda self: block))
 
 
 class TestDefaultIsTodaysBehaviour:
@@ -79,9 +111,9 @@ class TestResolveChunkDataGoesThroughTheSeam:
         seen = {}
         original = adapter.get_scaled_data
 
-        def spy(bounds, scale_hint, reduction_method):
+        def spy(bounds, scale_hint, reduction_method, cache_manager=None):
             seen["args"] = (tuple(scale_hint), reduction_method)
-            return original(bounds, scale_hint, reduction_method)
+            return original(bounds, scale_hint, reduction_method, cache_manager)
 
         monkeypatch.setattr(adapter, "get_scaled_data", spy)
         chunk_id = encode_chunk_id_with_scale(
@@ -148,33 +180,6 @@ class TestStreamingDefault:
     phase-2 adapter override, not a branch here.
     """
 
-    @pytest.fixture
-    def counted(self, adapter, monkeypatch):
-        """`adapter`, counting the reads its scaled path issues."""
-        reads = []
-        original = adapter.get_data
-
-        def counting(bounds):
-            reads.append((tuple(bounds.start), tuple(bounds.stop)))
-            return original(bounds)
-
-        monkeypatch.setattr(adapter, "get_data", counting)
-        return adapter, reads
-
-    @staticmethod
-    def _grid(monkeypatch, adapter, grid, block=None):
-        """Set the transfer grid, and what the backend is quantized to.
-
-        ``block=None`` drives the unquantized path, where the tile is the grid.
-        The fixture is a real ``ZarrAdapter`` whose store would otherwise floor
-        the tile at its own 16x16 chunk -- correct behaviour, but it would mask
-        the grid these cases are choosing.
-        """
-        monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
-        monkeypatch.setattr(
-            type(adapter), "read_block_shape", property(lambda self: block)
-        )
-
     @pytest.mark.parametrize("method", ["area", "nearest"])
     @pytest.mark.parametrize(
         "scale,stop",
@@ -201,7 +206,7 @@ class TestStreamingDefault:
         expected = _ds.downsample_block(adapter.get_data(bounds), scale, method)
         reads.clear()
 
-        self._grid(monkeypatch, adapter, (12, 12))
+        _set_grid(monkeypatch, adapter, (12, 12))
         actual = adapter.get_scaled_data(bounds, scale, method)
 
         assert len(reads) > 1, "grid should have forced more than one unit"
@@ -216,7 +221,7 @@ class TestStreamingDefault:
         for ``nearest``, and for ``area`` would double-count silently.
         """
         adapter, reads = counted
-        self._grid(monkeypatch, adapter, (16, 16))
+        _set_grid(monkeypatch, adapter, (16, 16))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
@@ -233,7 +238,7 @@ class TestStreamingDefault:
         tile rounds up to the block rather than the grid being taken literally.
         """
         adapter, reads = counted
-        self._grid(monkeypatch, adapter, (4, 4))
+        _set_grid(monkeypatch, adapter, (4, 4))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
@@ -250,7 +255,7 @@ class TestStreamingDefault:
         OME-Zarr, which is the whole reason the floor exists.
         """
         adapter, reads = counted
-        self._grid(monkeypatch, adapter, (16, 16), block=(32, 32))
+        _set_grid(monkeypatch, adapter, (16, 16), block=(32, 32))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
@@ -263,7 +268,7 @@ class TestStreamingDefault:
     def test_a_block_below_the_grid_is_the_identity(self, counted, monkeypatch):
         """The coalescing case: the grid is already a whole multiple of it."""
         adapter, reads = counted
-        self._grid(monkeypatch, adapter, (16, 16), block=(8, 8))
+        _set_grid(monkeypatch, adapter, (16, 16), block=(8, 8))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (8, 8), "area")
@@ -281,7 +286,7 @@ class TestStreamingDefault:
         is the memory streaming exists to bound.
         """
         adapter, _ = counted
-        self._grid(monkeypatch, adapter, (16, 16))
+        _set_grid(monkeypatch, adapter, (16, 16))
 
         out = adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "nearest")
 
@@ -290,7 +295,7 @@ class TestStreamingDefault:
     def test_extent_inside_one_unit_reads_once(self, counted, monkeypatch):
         """Streaming an extent that already fits is pure overhead."""
         adapter, reads = counted
-        self._grid(monkeypatch, adapter, (64, 64))
+        _set_grid(monkeypatch, adapter, (64, 64))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
@@ -300,7 +305,7 @@ class TestStreamingDefault:
     def test_streaming_needs_no_opt_in(self, counted, monkeypatch):
         """It is the default: no flag, and nothing for an adapter to set."""
         adapter, reads = counted
-        self._grid(monkeypatch, adapter, (16, 16))
+        _set_grid(monkeypatch, adapter, (16, 16))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area")
@@ -329,7 +334,7 @@ class TestStreamingDefault:
             adapter = ZarrAdapter(
                 zarr.open_array(f"{tmp}/f.zarr", mode="r"), "src", ["y", "x"]
             )
-            self._grid(monkeypatch, adapter, (16, 16))
+            _set_grid(monkeypatch, adapter, (16, 16))
             reads = []
             original = adapter.get_data
             adapter.get_data = lambda b: (
@@ -343,3 +348,387 @@ class TestStreamingDefault:
             assert len(reads) > 1, "a float area must stream, not read whole"
             assert out.dtype == np.dtype("float32")
             assert np.array_equal(out, _ds.downsample_block(src, (4, 4), "area"))
+
+
+class TestCacheSourcedUnits:
+    """A scaled read may source its extent from the cache (biopb/biopb#640).
+
+    The full-resolution chunks under a scaled read are ordinary cache entries:
+    the extent snaps to ``transfer x scale``, so it tiles exactly into the
+    absolute transfer grid the unscaled plan mints chunk_ids on. Where they are
+    all warm, decoding the source again is work already done -- and the
+    ``read_block_shape`` floor, which speaks for the backend, stops applying.
+
+    Read-only by design: a miss reads the source and stores nothing, so a
+    scaled read cannot evict the warm set to deliver one coarse chunk. What it
+    trades is two per-byte rates -- the cache holds decoded bytes, the store
+    holds what it holds -- which is why it is opted into per deployment.
+    """
+
+    @pytest.fixture
+    def cache(self, tmp_path):
+        """A file-backed cache with the knob on.
+
+        The backend matters: `resolve_chunk_data` caches *unscaled* chunks only
+        on the file backend, so it is the one where a full-resolution read
+        leaves anything for a probe to find.
+        """
+        manager = CacheManager(
+            CacheConfig(
+                backend="file",
+                file_cache_dir=tmp_path / "cache",
+                source_scaled_reads=True,
+            )
+        )
+        try:
+            yield manager
+        finally:
+            manager.close()
+
+    @staticmethod
+    def _warm_level_zero(adapter, cache):
+        """Warm every full-resolution chunk exactly as an unscaled read does.
+
+        Through ``get_read_plan`` rather than by minting ids here: the probe has
+        to find the keys the *plan* stored under, and a test that minted its own
+        would pass just as happily against a key scheme the server never writes.
+        """
+        plan = adapter.get_read_plan(TensorDescriptor())
+        for endpoint in plan.chunk_endpoints:
+            adapter.resolve_chunk_data(endpoint.chunk_id, cache)
+        return [endpoint.chunk_id for endpoint in plan.chunk_endpoints]
+
+    @staticmethod
+    def _units(adapter, monkeypatch):
+        """Record the extent each cache-sourced unit covers."""
+        seen = []
+        original = adapter._assemble_from_cache
+
+        def spy(cache_manager, descriptor, start, stop, transfer, out):
+            seen.append((tuple(start), tuple(stop)))
+            return original(cache_manager, descriptor, start, stop, transfer, out)
+
+        monkeypatch.setattr(adapter, "_assemble_from_cache", spy)
+        return seen
+
+    def test_a_warm_extent_never_touches_the_source(self, counted, monkeypatch, cache):
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
+        self._warm_level_zero(adapter, cache)
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "area", cache)
+
+        assert reads == [], "a warm extent must not re-read the source"
+        assert out.dtype == expected.dtype
+        assert np.array_equal(out, expected)
+
+    @pytest.mark.parametrize("method", ["area", "nearest"])
+    @pytest.mark.parametrize(
+        "grid,scale",
+        [
+            ((16, 16), (4, 4)),  # a chunk is a whole number of blocks
+            ((24, 24), (4, 4)),  # chunks ragged against the tensor's own end
+            ((16, 16), (32, 32)),  # a block spans two chunks, so the unit does
+        ],
+    )
+    def test_assembled_is_bit_identical(
+        self, counted, monkeypatch, cache, method, grid, scale
+    ):
+        """Sourcing is not a decision about what the data is.
+
+        The ragged grid matters: its last chunk on each axis is short, and the
+        cached entry is short in exactly the same way -- which is what makes the
+        bounds derived here the plan's own.
+        """
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, grid)
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), scale, method)
+        self._warm_level_zero(adapter, cache)
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, scale, method, cache)
+
+        assert reads == []
+        assert np.array_equal(out, expected)
+
+    def test_an_extent_that_ends_mid_chunk_declines(self, counted, monkeypatch, cache):
+        """A partial chunk keys differently from the whole one that is cached.
+
+        No read plan asks for such an extent -- a scaled chunk's bounds snap to
+        ``transfer x scale`` -- so this is a guard, not a case to support: the
+        alternative is a probe that misses on every entry.
+        """
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        self._warm_level_zero(adapter, cache)
+        bounds = _bounds((0, 0), (30, 30))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "area", cache)
+
+        assert reads, "an extent off the chunk grid must go to the source"
+        assert np.array_equal(out, expected)
+
+    def test_an_averaging_reduction_keeps_the_callers_unit(
+        self, counted, monkeypatch, cache
+    ):
+        """`area` runs prod(scale) strided adds per unit whatever its size, so
+        more units is the same bytes over more, smaller numpy calls -- measured
+        197 ms against 82. A 64x64 read block quantizes this extent into ONE
+        unit, and the cache path assembles that unit from its 16 chunks."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16), block=(64, 64))
+        bounds = _bounds((0, 0), (64, 64))
+        self._warm_level_zero(adapter, cache)
+        units = self._units(adapter, monkeypatch)
+        reads.clear()
+
+        adapter.get_scaled_data(bounds, (4, 4), "area", cache)
+
+        assert units == [((0, 0), (64, 64))]
+        assert reads == []
+
+    def test_a_pick_drops_the_unit_to_the_chunk_grid(self, counted, monkeypatch, cache):
+        """`nearest` needs none of what it skips, so the smallest unit that
+        tiles into whole chunks wins: each chunk is copied contiguously into its
+        own unit rather than landing as strided rows in a wide buffer (35 ms
+        against 48). The read_block floor does not apply -- it speaks for a
+        source read this path does not make."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16), block=(64, 64))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "nearest")
+        self._warm_level_zero(adapter, cache)
+        units = self._units(adapter, monkeypatch)
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "nearest", cache)
+
+        assert len(units) == 16
+        assert {(hi[0] - lo[0], hi[1] - lo[1]) for lo, hi in units} == {(16, 16)}
+        assert reads == []
+        assert np.array_equal(out, expected)
+
+    def test_a_unit_spanning_several_chunks_is_assembled_from_all_of_them(
+        self, counted, monkeypatch, cache
+    ):
+        """The k x k case: one unit, sixteen entries, bit-identical."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16), block=(64, 64))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
+        self._warm_level_zero(adapter, cache)
+        acquired = []
+        original = cache.try_acquire
+        monkeypatch.setattr(
+            cache,
+            "try_acquire",
+            lambda key, touch=True: (acquired.append(key), original(key, touch))[1],
+        )
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "area", cache)
+
+        assert len(acquired) == 16
+        assert reads == []
+        assert np.array_equal(out, expected)
+
+    def test_a_cold_extent_reads_the_source_and_stores_nothing(
+        self, counted, monkeypatch, cache
+    ):
+        """The probe is read-only: a scaled read must not populate the
+        full-resolution grid it looked for."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        plan = adapter.get_read_plan(TensorDescriptor())
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area", cache)
+
+        assert len(reads) > 1, "a cold extent still streams from the source"
+        assert not any(
+            cache.contains(cache_key_for_chunk_id(endpoint.chunk_id))
+            for endpoint in plan.chunk_endpoints
+        )
+
+    def test_one_missing_chunk_declines_the_whole_extent(
+        self, counted, monkeypatch, cache
+    ):
+        """All-or-nothing per extent. A partial mix would read the misses one
+        chunk at a time, which is exactly what the read_block floor prevents."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        chunk_ids = self._warm_level_zero(adapter, cache)
+        cache.remove(cache_key_for_chunk_id(chunk_ids[-1]))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "area", cache)
+
+        assert reads, "one cold chunk must send the whole extent to the source"
+        assert np.array_equal(out, expected)
+
+    def test_an_eviction_after_the_probe_falls_back_per_unit(
+        self, counted, monkeypatch, cache
+    ):
+        """A probe is a decision, not a promise."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
+        self._warm_level_zero(adapter, cache)
+        reads.clear()
+        # Everything is present to `contains` and gone by the time it is read.
+        monkeypatch.setattr(cache, "try_acquire", lambda key, touch=True: None)
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "area", cache)
+
+        assert reads, "the fallback must reach the source"
+        assert np.array_equal(out, expected)
+
+    def test_a_scale_that_rounds_off_the_grid_declines(
+        self, counted, monkeypatch, cache
+    ):
+        """A non-dyadic scale_hint raises the unit to a whole reduction block --
+        16 -> 18 -- which no longer tiles into chunks. Left to the source."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        self._warm_level_zero(adapter, cache)
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (3, 3), "area")
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (3, 3), "area", cache)
+
+        assert reads, "an undecomposable unit must not be sourced from the cache"
+        assert np.array_equal(out, expected)
+
+    def test_resolve_chunk_data_hands_the_cache_down(self, counted, monkeypatch, cache):
+        """The wiring, through the real caller.
+
+        `resolve_chunk_data` is the only production caller, so a handle it does
+        not forward makes every test above a test of an unreachable path.
+        """
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        self._warm_level_zero(adapter, cache)
+        chunk_id = encode_chunk_id_with_scale(
+            "src", _bounds((0, 0), (64, 64)), (4, 4), "area"
+        )
+        reads.clear()
+
+        served = unpack_chunk_array(adapter.resolve_chunk_data(chunk_id, cache))
+
+        assert reads == [], "a warm extent must not re-read the source"
+        expected = _ds.downsample_block(
+            adapter.get_data(_bounds((0, 0), (64, 64))), (4, 4), "area"
+        )
+        assert np.array_equal(served.reshape(expected.shape), expected)
+
+    def test_sourcing_does_not_credit_the_chunks_it_read(
+        self, counted, monkeypatch, cache
+    ):
+        """The unintended half of on-by-default, closed.
+
+        Warming the OS page cache for the full-resolution chunks is the point;
+        making them look hot to the eviction policy is not. One coarse read
+        covers every chunk of the source, so a scaled read must not be able to
+        decide what stays cached.
+        """
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        self._warm_level_zero(adapter, cache)
+        touched = []
+        original = cache.try_acquire
+        monkeypatch.setattr(
+            cache,
+            "try_acquire",
+            lambda key, touch=True: (touched.append(touch), original(key, touch))[1],
+        )
+        reads.clear()
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area", cache)
+
+        assert reads == [], "expected the cache-sourced path"
+        assert touched and not any(touched), "every probe read must be untouched"
+
+    def test_it_is_on_by_default(self, counted, monkeypatch, tmp_path):
+        """Inherited rather than opted into: a coarse read is usually a pretext
+        for full-resolution work, and sourcing it this way leaves that work's
+        pages resident."""
+        adapter, reads = counted
+        manager = CacheManager(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        try:
+            assert manager.source_scaled_reads is True
+            _set_grid(monkeypatch, adapter, (16, 16))
+            self._warm_level_zero(adapter, manager)
+            reads.clear()
+
+            adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area", manager)
+
+            assert reads == []
+        finally:
+            manager.close()
+
+    def test_it_can_be_turned_off(self, counted, monkeypatch, tmp_path):
+        """The escape hatch still reads the source, warm cache or not."""
+        adapter, reads = counted
+        manager = CacheManager(
+            CacheConfig(
+                backend="file",
+                file_cache_dir=tmp_path / "cache",
+                source_scaled_reads=False,
+            )
+        )
+        try:
+            _set_grid(monkeypatch, adapter, (16, 16))
+            self._warm_level_zero(adapter, manager)
+            bounds = _bounds((0, 0), (64, 64))
+            expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
+            reads.clear()
+
+            out = adapter.get_scaled_data(bounds, (4, 4), "area", manager)
+
+            assert len(reads) > 1
+            assert np.array_equal(out, expected)
+        finally:
+            manager.close()
+
+    def test_no_cache_is_the_path_it_always_was(self, counted, monkeypatch):
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), "area")
+
+        assert len(reads) > 1
+        assert np.array_equal(out, expected)
+
+    def test_the_memory_backend_leaves_nothing_to_source_from(
+        self, counted, monkeypatch, tmp_path
+    ):
+        """Documented, not incidental: `resolve_chunk_data` caches unscaled
+        chunks only on the file backend, so a level-0 read against the memory
+        backend stores nothing and the probe costs one index lookup."""
+        adapter, reads = counted
+        manager = CacheManager(CacheConfig(backend="memory", source_scaled_reads=True))
+        try:
+            _set_grid(monkeypatch, adapter, (16, 16))
+            self._warm_level_zero(adapter, manager)
+            reads.clear()
+
+            adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area", manager)
+
+            assert len(reads) > 1
+        finally:
+            manager.close()

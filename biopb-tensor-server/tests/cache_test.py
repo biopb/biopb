@@ -310,6 +310,203 @@ class TestMemoryCacheBackend:
         backend.close()
 
 
+class TestProbeWithoutComputing:
+    """`contains` / `try_acquire`: the read half of the promise, on its own.
+
+    The scaled read asks whether the full-resolution chunks under an extent are
+    already here before deciding to assemble it from them rather than decode the
+    source again (``adapter_base._cache_sourced_units``). That question must not
+    compute anything, must not join a computation in flight, and must not move
+    the hit/miss ratio, which measures chunk serving and not probing.
+    """
+
+    @staticmethod
+    def _data(values) -> pa.RecordBatch:
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
+        )
+
+    @pytest.fixture(params=["memory", "file"])
+    def backend(self, request, tmp_path):
+        """Both backends: the probe is driven on whichever one is configured."""
+        if request.param == "memory":
+            be = MemoryCacheBackend(MemoryCacheConfig(max_entries=10))
+        else:
+            be = ArrowFileBackend(
+                ArrowFileConfig(
+                    cache_dir=tmp_path / "cache",
+                    max_segment_bytes=1024 * 1024,
+                    max_total_bytes=10 * 1024 * 1024,
+                )
+            )
+        try:
+            yield be
+        finally:
+            be.close()
+
+    def test_a_missing_key_is_absent_and_unacquirable(self, backend):
+        assert backend.contains(b"nope") is False
+        assert backend.try_acquire(b"nope") is None
+
+    def test_probing_computes_nothing(self, backend):
+        """The whole point: no compute_fn, so nothing is read or stored."""
+        backend.try_acquire(b"cold")
+        assert backend.contains(b"cold") is False
+        assert backend.stats().total_entries == 0
+
+    def test_a_ready_key_is_acquired_and_released(self, backend):
+        backend.start_compute(b"warm")
+        backend.complete_entry(b"warm", self._data([1, 2, 3]), 24)
+        backend.release(b"warm")
+
+        assert backend.contains(b"warm") is True
+        entry = backend.try_acquire(b"warm")
+        assert entry is not None
+        assert entry.data.column(0).to_pylist() == [[1, 2, 3]]
+        assert entry.ref_count >= 1
+        assert backend.release(b"warm") >= 0
+
+    def test_a_computation_in_flight_is_a_miss_not_a_wait(self, backend):
+        """A prober can produce the bytes itself; blocking on another reader's
+        decode would trade a bounded read for an unbounded wait."""
+        backend.start_compute(b"pending")
+
+        assert backend.contains(b"pending") is False
+        assert backend.try_acquire(b"pending") is None
+
+    def test_a_probe_does_not_move_the_ratio(self, backend):
+        backend.start_compute(b"warm")
+        backend.complete_entry(b"warm", self._data([1, 2, 3]), 24)
+        backend.release(b"warm")
+        before = backend.stats()
+
+        backend.try_acquire(b"warm")
+        backend.release(b"warm")
+        backend.try_acquire(b"cold")
+
+        after = backend.stats()
+        assert (after.hits, after.misses) == (before.hits, before.misses)
+
+    def test_the_file_backend_hydrates_a_key_it_only_has_on_disk(self, tmp_path):
+        """The in-memory mirror is dropped on release; the segment still has it,
+        and a probe that ignored that would send a warm extent to the source."""
+        config = ArrowFileConfig(
+            cache_dir=tmp_path / "cache",
+            max_segment_bytes=1024 * 1024,
+            max_total_bytes=10 * 1024 * 1024,
+        )
+        first = ArrowFileBackend(config)
+        first.start_compute(b"ondisk")
+        first.complete_entry(b"ondisk", self._data([4, 5, 6]), 24)
+        first.release(b"ondisk")
+        first.close()
+
+        second = ArrowFileBackend(config)
+        try:
+            assert second.contains(b"ondisk") is True
+            before = second.stats()
+            entry = second.try_acquire(b"ondisk")
+            assert entry is not None
+            assert entry.data.column(0).to_pylist() == [[4, 5, 6]]
+            second.release(b"ondisk")
+            # Hydrating from the segment is still a probe: the ratio counts
+            # chunks served, and which copy answered is not the caller's doing.
+            after = second.stats()
+            assert (after.hits, after.misses) == (before.hits, before.misses)
+        finally:
+            second.close()
+
+        # ... while a real read that hydrates the same key does count.
+        third = ArrowFileBackend(config)
+        try:
+            assert third.stats().hits == 0
+            third.start_compute(b"ondisk")
+            third.release(b"ondisk")
+            assert third.stats().hits == 1
+        finally:
+            third.close()
+
+    def test_a_probe_leaves_the_eviction_policy_alone(self, tmp_path):
+        """`touch=False` reads the bytes and credits nothing.
+
+        One coarse scaled read covers every full-resolution chunk under its
+        extent, so crediting them would flatten the Sieve-K frequency signal and
+        let a zoomed-out read decide what stays cached.
+        """
+        backend = ArrowFileBackend(
+            ArrowFileConfig(
+                cache_dir=tmp_path / "cache",
+                max_segment_bytes=1024 * 1024,
+                max_total_bytes=10 * 1024 * 1024,
+            )
+        )
+        try:
+            backend.start_compute(b"k")
+            backend.complete_entry(b"k", self._data([1, 2, 3]), 24)
+            backend.release(b"k")
+            pool_queue = backend._pool_queues.get(("unified", "tiny"))
+            assert pool_queue is not None, "expected the entry to land in a pool"
+            seg_info = pool_queue.segments[backend._metadata[b"k"].segment_id]
+
+            def credit():
+                return (
+                    seg_info.frequency,
+                    seg_info.last_access_time,
+                    pool_queue.hits,
+                )
+
+            before = credit()
+
+            for _ in range(5):
+                assert backend.try_acquire(b"k", touch=False) is not None
+                backend.release(b"k")
+
+            assert credit() == before
+
+            # ... and the default still promotes, so a real read is unaffected.
+            assert backend.try_acquire(b"k") is not None
+            backend.release(b"k")
+            assert seg_info.frequency > before[0]
+        finally:
+            backend.close()
+
+    def test_an_untouched_probe_does_not_refresh_lru(self):
+        """Same on the memory backend, where LRU position *is* the policy."""
+        backend = MemoryCacheBackend(MemoryCacheConfig(max_entries=10))
+        try:
+            for key in (b"a", b"b"):
+                backend.start_compute(key)
+                backend.complete_entry(key, self._data([1]), 8)
+                backend.release(key)
+            oldest = next(iter(backend._entries))
+
+            backend.try_acquire(oldest, touch=False)
+            backend.release(oldest)
+            assert next(iter(backend._entries)) == oldest, "probe must not promote"
+
+            backend.try_acquire(oldest)
+            backend.release(oldest)
+            assert next(iter(backend._entries)) != oldest, "a real read promotes"
+        finally:
+            backend.close()
+
+    def test_the_manager_drives_both(self, tmp_path):
+        manager = CacheManager(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        try:
+            assert manager.contains(b"nope") is False
+            assert manager.try_acquire(b"nope") is None
+            manager.put(b"warm", self._data([7, 8]), 16)
+            assert manager.contains(b"warm") is True
+            entry = manager.try_acquire(b"warm")
+            assert entry is not None
+            manager.release(b"warm")
+        finally:
+            manager.close()
+
+
 class TestCacheManager:
     """Tests for CacheManager singleton."""
 
