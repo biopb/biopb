@@ -17,15 +17,15 @@ import zarr
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import ZarrAdapter
-from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core import (
     adapter_base as _ab,
     cache_source as _cs,
     downsample as _ds,
 )
 from biopb_tensor_server.core.chunk import cache_key_for_chunk_id
-from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.normalize import NormalizingAdapter, normalize_adapter
+
+from tests.scaled_data_seam_test import _set_grid
 
 GRID = (16, 16)
 
@@ -42,32 +42,6 @@ def _zarr(tmp, shape, labels):
 def adapter():
     with tempfile.TemporaryDirectory() as tmp:
         yield _zarr(tmp, (64, 64), ("y", "x"))
-
-
-@pytest.fixture
-def cache(tmp_path):
-    manager = CacheManager(
-        CacheConfig(
-            backend="file",
-            file_cache_dir=tmp_path / "cache",
-            source_scaled_reads=True,
-        )
-    )
-    try:
-        yield manager
-    finally:
-        manager.close()
-
-
-def _on_grid(monkeypatch, adapter, grid=GRID):
-    """Plan and probe on the same transfer grid, unquantized.
-
-    The fixture's store would otherwise floor the streaming tile at its own
-    chunk, and the grid is what both the plan's chunk_ids and the probe's keys
-    are minted on -- a test that let them differ would be testing the mismatch.
-    """
-    monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
-    monkeypatch.setattr(type(adapter), "read_block_shape", property(lambda self: None))
 
 
 def _plan_keys(adapter):
@@ -94,7 +68,7 @@ class TestTheProbeKeysAreThePlansKeys:
         self, adapter, monkeypatch, content_version
     ):
         monkeypatch.setattr(adapter, "_content_version", content_version)
-        _on_grid(monkeypatch, adapter)
+        _set_grid(monkeypatch, adapter, GRID)
 
         assert _probe_keys(adapter, (0, 0), (64, 64)) == _plan_keys(adapter)
 
@@ -104,7 +78,7 @@ class TestTheProbeKeysAreThePlansKeys:
         that forgets it still mints keys, just never onto anything the plan
         wrote."""
         monkeypatch.setattr(adapter, "_content_version", b"v2")
-        _on_grid(monkeypatch, adapter)
+        _set_grid(monkeypatch, adapter, GRID)
         descriptor = adapter.get_tensor_descriptor()
 
         versioned = _probe_keys(adapter, (0, 0), (64, 64))
@@ -119,7 +93,7 @@ class TestTheProbeKeysAreThePlansKeys:
     def test_the_extent_is_keyed_chunk_by_chunk(self, adapter, monkeypatch):
         """A sub-extent probes only the chunks under it, on the absolute grid --
         not a grid rebased on the extent, which would key nothing that exists."""
-        _on_grid(monkeypatch, adapter)
+        _set_grid(monkeypatch, adapter, GRID)
 
         assert _probe_keys(adapter, (32, 32), (64, 64)) < _plan_keys(adapter)
         assert len(_probe_keys(adapter, (32, 32), (64, 64))) == 4

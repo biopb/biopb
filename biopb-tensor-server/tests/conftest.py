@@ -6,6 +6,8 @@ Imports fixture factory functions from fixtures module and wraps them as pytest 
 import tempfile
 
 import pytest
+from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.fixtures import (
     create_5d_6d_micromanager_dataset,
     create_companion_ome_dataset,
@@ -135,3 +137,24 @@ def transfer_target(monkeypatch):
         return int(nbytes)
 
     return _set
+
+
+@pytest.fixture
+def cache(tmp_path):
+    """A file-backed cache with the scaled-read knob on.
+
+    The backend matters: `resolve_chunk_data` caches *unscaled* chunks only on
+    the file backend, so it is the one where a full-resolution read leaves
+    anything for a probe to find.
+    """
+    manager = CacheManager(
+        CacheConfig(
+            backend="file",
+            file_cache_dir=tmp_path / "cache",
+            source_scaled_reads=True,
+        )
+    )
+    try:
+        yield manager
+    finally:
+        manager.close()

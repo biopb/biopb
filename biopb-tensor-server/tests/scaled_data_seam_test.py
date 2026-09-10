@@ -347,27 +347,6 @@ class TestStreamingDefault:
             assert np.array_equal(out, _ds.downsample_block(src, (4, 4), "area"))
 
 
-@pytest.fixture
-def cache(tmp_path):
-    """A file-backed cache with the scaled-read knob on.
-
-    The backend matters: `resolve_chunk_data` caches *unscaled* chunks only on
-    the file backend, so it is the one where a full-resolution read leaves
-    anything for a probe to find.
-    """
-    manager = CacheManager(
-        CacheConfig(
-            backend="file",
-            file_cache_dir=tmp_path / "cache",
-            source_scaled_reads=True,
-        )
-    )
-    try:
-        yield manager
-    finally:
-        manager.close()
-
-
 class TestCacheSourcedUnits:
     """A scaled read may source its extent from the cache (biopb/biopb#640).
 
