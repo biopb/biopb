@@ -891,9 +891,10 @@ plan asserting it forever.
 
 **Shipped in #965**, from the cache side rather than the source side: where every
 full-resolution chunk under a scaled extent is already cached,
-`_cache_sourced_units` sources the units from those entries. What it trades is
-two read paths, not a decode -- a segment is mmap'd, so a cached chunk is a view
-plus one memcpy, where a store read is materialised and copied into the output.
+`cache_sourced_units` (`core/cache_source.py`) sources the units from those
+entries. What it trades is two read paths, not a decode -- a segment is mmap'd,
+so a cached chunk is a view plus one memcpy, where a store read is materialised
+and copied into the output.
 On an 8192^2 uint16 zarr chunked at 4096, one scale-16 virtual chunk, page cache
 warm, medians of 3, at the grid the adapter itself chooses:
 

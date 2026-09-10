@@ -593,7 +593,7 @@ class TestChunkEndpoint:
 
         # Mock do_get to return a table
         import pyarrow as pa
-        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+        from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -615,7 +615,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow as pa
-        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+        from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -638,7 +638,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow as pa
-        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+        from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))

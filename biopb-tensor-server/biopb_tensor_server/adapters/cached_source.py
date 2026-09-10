@@ -28,12 +28,9 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import (
-    CHUNK_WIRE_SCHEMA,
-    TensorAdapter,
-    catalog_entry,
-)
+from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
 from biopb_tensor_server.core.chunk import encode_chunk_id, wrap_content_version
+from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig

@@ -18,7 +18,7 @@ import pytest
 from biopb_tensor_server.cache import ArrowFileBackend
 from biopb_tensor_server.cache.base import EntryState
 from biopb_tensor_server.cache.file_backend import ArrowFileConfig
-from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
 
 def _batch(seed: int, elements: int = 4096):

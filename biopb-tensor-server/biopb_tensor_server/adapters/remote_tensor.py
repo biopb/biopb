@@ -51,7 +51,6 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorReadPlan,
     catalog_entry,
-    unpack_chunk_array,
 )
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import (
@@ -64,6 +63,7 @@ from biopb_tensor_server.core.chunk import (
     is_scaled_chunk,
     peel_proxy_envelope,
 )
+from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
 
 if TYPE_CHECKING:
