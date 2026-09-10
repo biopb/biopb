@@ -4,6 +4,7 @@ import struct
 import tempfile
 import threading
 import time
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
@@ -176,7 +177,7 @@ class TestMrcAdapter:
             assert self._mapped() is False
 
     def test_reaper_releases_an_idle_mapping_and_the_next_read_remaps(self):
-        from biopb_tensor_server.adapters import mrc as mrc_module
+        mrc_module = import_module("biopb_tensor_server.adapters.mrc")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter, data = self._adapter(tmpdir, shape=(4, 8, 8))
@@ -197,7 +198,7 @@ class TestMrcAdapter:
     def test_a_read_in_flight_blocks_the_reap(self):
         """Reads copy OUTSIDE _io_lock so they stay parallel, which is exactly
         why the count is needed: unmapping under a copy would fault, not raise."""
-        from biopb_tensor_server.adapters import mrc as mrc_module
+        mrc_module = import_module("biopb_tensor_server.adapters.mrc")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
