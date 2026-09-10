@@ -414,12 +414,7 @@ class PrecacheWorker:
         # is both the costliest warm and the one warming cannot help.
         cfg = self._pyramid_cfg
         targets = compute_warm_targets(
-            list(base_desc.shape),
-            list(base_desc.dim_labels),
-            threshold=cfg.threshold,
-            downscale_factor=cfg.downscale_factor,
-            pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-            plane_max_pixels=cfg.plane_max_pixels,
+            list(base_desc.shape), list(base_desc.dim_labels), **cfg.level_kwargs()
         )
 
         if not targets:

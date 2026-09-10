@@ -22,7 +22,7 @@ from typing import Callable, Dict, Literal, Optional, Tuple, get_args
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
-    RETENTION_EVICTION_ORDER,
+    EVICTION_RANK,
     CacheBackend,
     CacheEntry,
     CacheStats,
@@ -55,12 +55,11 @@ MMAP_LIFECYCLE_THRESHOLD = 100  # Only manage mmaps when segments > 100
 
 # Size class thresholds for pooling. A segment holds one class, so what this
 # buys is a uniform eviction granularity: a "large" segment loses one entry when
-# it goes, a "tiny" one loses ~180. Outliers vs bulk, three buckets and not four,
-# because the old 8 MB small/medium boundary was byte-identical to
-# PREFERRED_ARROW_BATCH_BYTES -- the size the transfer grid targets -- so it cut
-# the population at its own mode (measured on a 25 GB cache: median entry
-# 7.99 MB, 52% either side). Splitting the bulk buys nothing and costs a pool,
-# and every pool holds one open unsealed segment of up to max_segment_bytes.
+# it goes, a "tiny" one loses ~180. Outliers vs bulk, not four buckets: the old
+# 8 MB boundary was byte-identical to PREFERRED_ARROW_BATCH_BYTES, the size the
+# transfer grid targets, so it cut the population at its own mode (measured on a
+# 25 GB cache: median entry 7.99 MB, 52% either side). Splitting the bulk buys
+# nothing and costs a pool, and every pool holds one open unsealed segment.
 SIZE_CLASS_TINY_THRESHOLD = 1 * 1024 * 1024  # <1MB
 SIZE_CLASS_BULK_THRESHOLD = 32 * 1024 * 1024  # 1-32MB: the transfer grid's range
 # large: >=32MB (still cached, just pooled separately)
@@ -121,12 +120,10 @@ FORMAT_VERSION_MARKER = "format_version"
 # (it globs ``.arrow``); a newer server on an old cache walks and backfills. The
 # tiny ``.idx`` bytes are deliberately NOT counted toward ``max_total_bytes``.
 # The retention class rides in the sidecar's schema metadata, not in the segment
-# body: the body layout is the cross-process contract the localhost client parses
-# (CACHE_FILE_FORMAT_VERSION), and this is server-side policy. Additive in both
-# directions, so neither version needs a bump -- an older server ignores the key,
-# and a newer one reading an older sidecar (or walking a body) defaults to
-# "normal". Bumping SIDECAR_FORMAT_VERSION for it would be the expensive
-# mistake: every existing .idx would be rejected for the body walk #300 removed.
+# body: the body layout is the contract the localhost client parses, and this is
+# server-side policy. Additive both ways, so neither version is bumped -- an old
+# server ignores the key, a new one defaults to "normal" on an old sidecar. A
+# SIDECAR_FORMAT_VERSION bump would reject every .idx for the walk #300 removed.
 SIDECAR_FORMAT_VERSION = 1
 _SIDECAR_VERSION_KEY = b"biopb_sidecar_version"
 _SIDECAR_SEGMENT_SIZE_KEY = b"biopb_segment_size"
@@ -1110,24 +1107,23 @@ class ArrowFileBackend(CacheBackend):
         however well it is being hit. A ``pinned`` pool is never selected;
         nothing declares that class today.
         """
-        if not self._pool_queues:
-            return None
 
-        # Class rank, then hit rate, then most segments
-        pool_rates = []
-        for pool_key, pool in self._pool_queues.items():
-            if pool_key[0] not in RETENTION_EVICTION_ORDER:
-                continue  # pinned: never a victim
+        def order(pool_key: Tuple[RetentionClass, SizeClass]):
+            pool = self._pool_queues[pool_key]
             total = pool.hits + pool.misses
-            hit_rate = pool.hits / total if total > 0 else 0.0
-            rank = RETENTION_EVICTION_ORDER.index(pool_key[0])
-            pool_rates.append((rank, hit_rate, -len(pool.queue), pool_key, pool.queue))
+            return (
+                EVICTION_RANK[pool_key[0]],
+                pool.hits / total if total > 0 else 0.0,
+                -len(pool.queue),
+            )
 
-        pool_rates.sort(key=lambda x: x[:3])
-        for *_rank, pool_key, queue in pool_rates:
-            if queue:
-                return pool_key
-        return None
+        # A class absent from EVICTION_RANK (pinned) is never a victim.
+        candidates = [
+            pool_key
+            for pool_key, pool in self._pool_queues.items()
+            if pool.queue and pool_key[0] in EVICTION_RANK
+        ]
+        return min(candidates, key=order, default=None)
 
     def _evict_segment_sieve_k(self) -> bool:
         """Per-pool Sieve-K sweep following reference algorithm.
@@ -1495,15 +1491,11 @@ class ArrowFileBackend(CacheBackend):
         batch = self._read_batch_from_segment(key, touch=touch)
         if batch is None:
             return None
-        # Take the class back off the segment the entry came from, so a
-        # re-hydrated entry cannot report a class its bytes are not stored under.
-        pool_key = self._get_pool_key_for_segment(self._metadata[key].segment_id)
         entry = CacheEntry(
             data=batch,
             state=EntryState.READY,
             created_at=time.time(),
             size_bytes=estimate_batch_bytes(batch),
-            retention=pool_key[0] if pool_key else "normal",
         )
         entry.acquire()
         self._entries[key] = entry

@@ -75,7 +75,7 @@ from biopb_tensor_server.core.errors import (
 )
 from biopb_tensor_server.core.retention import (
     computed_ladder,
-    retention_for_chunk,
+    retention_for_scale,
 )
 from biopb_tensor_server.core.stream_reduce import (
     covering_units,
@@ -1366,19 +1366,21 @@ class TensorAdapter(SourceAdapter):
 
         A property of the chunk, not of the caller that stored it: the class is
         written into a cache segment, so a first writer would otherwise fix it
-        for good. The decision itself lives in ``core.retention``, which also
-        owns the ladder config -- see there for why it is not an argument.
+        for good. ``core.retention`` owns the decision and the ladder config.
 
-        The ladder is memoized because this runs per chunk and a miss builds a
-        descriptor. Unkeyed: a tensor's shape cannot change under one adapter,
-        and the config is installed once at server start.
+        Unscaled returns before the ladder is built, so a source nobody reads a
+        scaled chunk from never pays for one. The ladder is memoized because
+        this runs per chunk and a miss builds a descriptor; unkeyed, because a
+        tensor's shape cannot change under one adapter and the config is
+        installed once at server start.
         """
+        if not is_scaled_chunk(chunk_id):
+            return "normal"  # full resolution, or a native level's own store
         ladder = getattr(self, "_ladder_cache", None)
         if ladder is None:
             desc = self.get_tensor_descriptor()
-            ladder = computed_ladder(desc.shape, desc.dim_labels)
-            self._ladder_cache = ladder
-        return retention_for_chunk(chunk_id, ladder)
+            ladder = self._ladder_cache = computed_ladder(desc.shape, desc.dim_labels)
+        return retention_for_scale(decode_scale_info(chunk_id), ladder)
 
     def resolve_chunk_data(
         self,
@@ -1387,23 +1389,22 @@ class TensorAdapter(SourceAdapter):
     ) -> pa.RecordBatch:
         """Resolve chunk data, handling scaled chunks and backend caching.
 
-                The default implementation reads raw chunk data with ``self.get_data()``.
-                Scaled chunks are always cacheable when a CacheManager is available.
-                With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
+        The default implementation reads raw chunk data with ``self.get_data()``.
+        Scaled chunks are always cacheable when a CacheManager is available.
+        With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
 
-        The retention class a stored chunk gets is declared from the chunk
-                (:meth:`_retention_for_chunk`) rather than measured: a scaled build's cost
-                is not a property of the chunk -- it is a full-resolution read plus a
-                reduction, over an extent the cache may or may not already hold -- so
-                timing it would measure the cache's own state and then use that to
-                decide what the cache keeps.
+        What a stored chunk costs to produce again is declared from the chunk
+        (:meth:`_retention_for_chunk`) rather than measured: a scaled build's
+        cost is a full-resolution read plus a reduction, over an extent the
+        cache may or may not already hold, so timing it would measure the
+        cache's own state and then decide what the cache keeps by it.
 
-                Raises:
-                    StaleChunkError: chunk_id carries a content_version that no longer
-                        matches this source's current one -- it was minted against an
-                        earlier registration (biopb/biopb#178). See
-                        :meth:`check_chunk_version`, called first, before any bytes
-                        are read.
+        Raises:
+            StaleChunkError: chunk_id carries a content_version that no longer
+                matches this source's current one -- it was minted against an
+                earlier registration (biopb/biopb#178). See
+                :meth:`check_chunk_version`, called first, before any bytes
+                are read.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
@@ -1412,8 +1413,6 @@ class TensorAdapter(SourceAdapter):
 
         # Check if scaled chunk (has extra bytes after bounds encoding)
         is_scaled_chunk_flag = is_scaled_chunk(chunk_id)
-
-        retention = self._retention_for_chunk(chunk_id)
 
         should_cache = cache_manager is not None and (
             is_scaled_chunk_flag or isinstance(cache_manager.backend, ArrowFileBackend)
@@ -1452,7 +1451,9 @@ class TensorAdapter(SourceAdapter):
             # it, so a nearest read cannot be served an area chunk (this
             # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(cache_key, compute_fn, retention)
+            entry = cache_manager.get_or_acquire(
+                cache_key, compute_fn, self._retention_for_chunk(chunk_id)
+            )
             data = entry.data
             cache_manager.release(cache_key)
         else:
@@ -1722,10 +1723,7 @@ class TensorAdapter(SourceAdapter):
                 list(base_desc.shape),
                 list(base_desc.dim_labels),
                 reduction_method=cfg.reduction_method,
-                threshold=cfg.threshold,
-                downscale_factor=cfg.downscale_factor,
-                pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-                plane_max_pixels=cfg.plane_max_pixels,
+                **cfg.level_kwargs(),
             )
         return levels
 

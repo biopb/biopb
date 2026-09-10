@@ -181,10 +181,9 @@ class CacheManager:
             key: Cache key bytes
             data: The batch to store
             size_bytes: Size of data in bytes
-            retention: What a miss for this chunk costs. An upload defaults to
-                "normal" like anything else: its bytes have no source to re-read,
-                but nothing reclaims a "pinned" entry, no path deletes one yet,
-                and an upload is meant to be temporary.
+            retention: What a miss for this chunk costs. An upload takes the
+                default: nothing deletes a "pinned" entry, and an upload is
+                meant to be temporary.
         """
         _entry, is_owner = self._backend.start_compute(key, retention)
         try:

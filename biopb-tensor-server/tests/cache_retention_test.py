@@ -1,4 +1,4 @@
-"""Retention classes: what a cache miss costs, declared at admission.
+"""Retention classes: what a cache miss costs, decided from the chunk.
 
 Eviction on the file backend is whole-segment, so the class cannot be consulted
 when a victim is chosen -- it has to pick the segment a chunk is written into.
@@ -6,12 +6,7 @@ These tests pin that down at both ends: the pool a chunk lands in, and the order
 the pools are reclaimed in.
 """
 
-import shutil
-import tempfile
-from pathlib import Path
-
 import numpy as np
-import pyarrow as pa
 import pytest
 import zarr
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -23,39 +18,23 @@ from biopb_tensor_server.cache import (
     MemoryCacheBackend,
     MemoryCacheConfig,
 )
-from biopb_tensor_server.core.chunk import (
-    encode_chunk_id,
-    encode_chunk_id_with_scale,
-)
+from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
 from biopb_tensor_server.core.config import CacheConfig, PyramidConfig
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 
 
-def _batch(values):
-    """A batch in the unified binary schema the cache stores."""
-    arr = np.asarray(values, dtype=np.uint8)
-    return pa.RecordBatch.from_arrays(
-        [
-            pa.array([arr.tobytes()], type=pa.binary()),
-            pa.array([list(arr.shape)], type=pa.list_(pa.int64())),
-            pa.array([str(arr.dtype)], type=pa.string()),
-        ],
-        names=["data", "shape", "dtype"],
-    )
-
-
 def _store(backend, key, values, retention="normal", size_bytes=None):
-    batch = _batch(values)
+    """Store one chunk in the same wire schema the server writes."""
+    batch = pack_chunk_batch(np.asarray(values, dtype=np.uint8))
     backend.start_compute(key, retention)
     backend.complete_entry(key, batch, size_bytes or len(values))
     backend.release(key)
 
 
 @pytest.fixture
-def cache_dir():
-    path = Path(tempfile.mkdtemp(prefix="biopb-retention-test-"))
-    yield path
-    shutil.rmtree(path, ignore_errors=True)
+def cache_dir(tmp_path):
+    return tmp_path / "cache"
 
 
 class TestPoolAssignment:
@@ -73,10 +52,7 @@ class TestPoolAssignment:
 
     def test_default_is_normal(self, cache_dir):
         backend = ArrowFileBackend(ArrowFileConfig(cache_dir=cache_dir))
-        batch = _batch([1] * 32)
-        backend.start_compute(b"k")
-        backend.complete_entry(b"k", batch, 32)
-        backend.release(b"k")
+        _store(backend, b"k", [1] * 32)
 
         assert set(backend._pool_queues) == {("normal", "tiny")}
         backend.close()
@@ -207,19 +183,13 @@ class TestDeclarationAtTheReadSeam:
         set_active_pyramid_config(None)
 
     @pytest.fixture
-    def adapter(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            arr = zarr.open_array(
-                f"{tmp}/a.zarr",
-                mode="w",
-                shape=(64, 64),
-                chunks=(32, 32),
-                dtype="uint16",
-            )
-            arr[:] = (np.arange(64 * 64, dtype=np.uint16) % 4093).reshape(64, 64)
-            yield ZarrAdapter(
-                zarr.open_array(f"{tmp}/a.zarr", mode="r"), "src", ["y", "x"]
-            )
+    def adapter(self, tmp_path):
+        path = tmp_path / "a.zarr"
+        arr = zarr.open_array(
+            str(path), mode="w", shape=(64, 64), chunks=(32, 32), dtype="uint16"
+        )
+        arr[:] = (np.arange(64 * 64, dtype=np.uint16) % 4093).reshape(64, 64)
+        return ZarrAdapter(zarr.open_array(str(path), mode="r"), "src", ["y", "x"])
 
     @pytest.fixture
     def manager(self, cache_dir):
@@ -227,61 +197,63 @@ class TestDeclarationAtTheReadSeam:
         yield mgr
         mgr.close()
 
-    def _scaled(self, scale):
-        return encode_chunk_id_with_scale(
-            "src", ChunkBounds(start=[0, 0], stop=[64, 64]), scale, "area"
-        )
+    def _chunk_id(self, kind, scale=None):
+        bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
+        if kind == "scaled":
+            return encode_chunk_id_with_scale("src", bounds, scale, "area")
+        array_id = "src/1" if kind == "native" else "src"
+        return encode_chunk_id(array_id, ChunkBounds(start=[0, 0], stop=[32, 32]))
 
     def _classes(self, manager):
         return {key[0] for key in manager.backend._pool_queues}
 
-    def test_a_ladder_scale_is_normal(self, adapter, manager, ladder):
-        """A rung the client comes back to on every open, and what precache warms."""
-        adapter.resolve_chunk_data(self._scaled((4, 4)), manager)
+    @pytest.mark.parametrize(
+        "chunk,expected",
+        [
+            # A rung of the ladder: what a client returns to on every open, and
+            # what the precache warms.
+            (("scaled", (4, 4)), "normal"),
+            # A one-off scale, regenerable from the chunks under it.
+            (("scaled", (2, 2)), "cheap"),
+            (("full", None), "normal"),
+            # A native level: minted against the level's own store, so it
+            # arrives unscaled and is a level-0 read here.
+            (("native", None), "normal"),
+        ],
+    )
+    def test_the_chunk_decides_its_class(
+        self, adapter, manager, ladder, chunk, expected
+    ):
+        adapter.resolve_chunk_data(self._chunk_id(*chunk), manager)
 
-        assert self._classes(manager) == {"normal"}
-
-    def test_an_off_ladder_scale_is_cheap(self, adapter, manager, ladder):
-        """A one-off scale, regenerable from the full-resolution chunks under it."""
-        adapter.resolve_chunk_data(self._scaled((2, 2)), manager)
-
-        assert self._classes(manager) == {"cheap"}
-
-    def test_an_unscaled_chunk_is_normal(self, adapter, manager, ladder):
-        chunk_id = encode_chunk_id("src", ChunkBounds(start=[0, 0], stop=[32, 32]))
-        adapter.resolve_chunk_data(chunk_id, manager)
-
-        assert self._classes(manager) == {"normal"}
-
-    def test_the_class_does_not_depend_on_who_asked_first(self, adapter, ladder):
-        """The race the predicate exists to close.
-
-        A client asking for a level before the precache reached it used to mark
-        that chunk cheap for the life of its segment, because the class came
-        from the code branch that stored it rather than from the chunk.
-        """
-        assert adapter._retention_for_chunk(self._scaled((4, 4))) == "normal"
-        assert adapter._retention_for_chunk(self._scaled((2, 2))) == "cheap"
-
-    def test_a_native_level_read_is_normal(self, adapter, ladder):
-        """Native levels never reach here scaled -- _plan_from_precomputed mints
-        their chunk_ids against the level's own store -- so they are level-0
-        reads as far as the class is concerned."""
-        native_like = encode_chunk_id("src/1", ChunkBounds(start=[0, 0], stop=[32, 32]))
-
-        assert adapter._retention_for_chunk(native_like) == "normal"
+        assert self._classes(manager) == {expected}
 
     def test_the_ladder_is_the_installed_config_not_a_default(self, adapter):
         """Under the shipped knobs a 64x64 plane has no computed levels at all,
-        so the chunk_id that is a rung under the fixture's config is a one-off."""
-        assert adapter._retention_for_chunk(self._scaled((4, 4))) == "cheap"
+        so the chunk_id that is a rung under the fixture's config is a one-off.
+
+        This is also why the class cannot come from the caller: the same
+        chunk_id has to classify the same whether the precache or a client got
+        there first, and only the chunk and the installed ladder decide it.
+        """
+        assert adapter._retention_for_chunk(self._chunk_id("scaled", (4, 4))) == "cheap"
+
+    def test_an_unscaled_chunk_never_builds_a_ladder(self, adapter, ladder):
+        """Full resolution is normal by inspection, so a source nobody reads a
+        scaled chunk from pays nothing for the classification."""
+
+        def explode():
+            raise AssertionError("ladder built for an unscaled chunk")
+
+        adapter.get_tensor_descriptor = explode
+        assert adapter._retention_for_chunk(self._chunk_id("full")) == "normal"
 
     def test_the_ladder_is_memoized(self, adapter, ladder, monkeypatch):
         """The hot path must not build a descriptor per chunk."""
-        adapter._retention_for_chunk(self._scaled((4, 4)))
+        adapter._retention_for_chunk(self._chunk_id("scaled", (4, 4)))
 
         def explode():
             raise AssertionError("descriptor rebuilt on a memoized lookup")
 
         monkeypatch.setattr(adapter, "get_tensor_descriptor", explode)
-        assert adapter._retention_for_chunk(self._scaled((2, 2))) == "cheap"
+        assert adapter._retention_for_chunk(self._chunk_id("scaled", (2, 2))) == "cheap"

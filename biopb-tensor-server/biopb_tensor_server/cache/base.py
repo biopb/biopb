@@ -25,23 +25,21 @@ logger = logging.getLogger(__name__)
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 
-# What a miss costs, declared by whoever stores the chunk. Eviction on the file
-# backend is whole-segment, so the class cannot be consulted at eviction time --
-# it picks the segment a chunk is written into, and reclamation then prefers the
-# cheap segments.
+# What a miss costs. Eviction on the file backend is whole-segment, so this
+# cannot be consulted when a victim is chosen -- it picks the segment a chunk is
+# written into, and reclamation prefers the cheap ones.
 #
-#   cheap  -- derived data. A scaled chunk is a reduction over full-resolution
-#             chunks, so keeping its inputs is worth more than keeping it.
+#   cheap  -- derived data: a scaled chunk reduced from full-resolution chunks
+#             that regenerate it, and that it cannot regenerate.
 #   normal -- the default: a source read and a decode.
-#   pinned -- never evicted. No customer yet. An upload is the only data whose
-#             rebuild cost is infinite, but pinning one without a deletion path
-#             would leave the cache no way back under its budget, and uploads
-#             are meant to be temporary anyway.
+#   pinned -- never evicted. No producer yet: an upload is the only data with no
+#             source to re-read, but nothing deletes a cache entry, so pinning
+#             one would leave the cache no way back under its budget.
 RetentionClass = Literal["cheap", "normal", "pinned"]
 
-# Reclamation order: earlier classes are evicted first. "pinned" is absent by
-# design -- a pool of that class is never selected for eviction at all.
-RETENTION_EVICTION_ORDER: Tuple[RetentionClass, ...] = ("cheap", "normal")
+# Reclamation order, lowest first. A class absent from this map is never
+# selected for eviction, which is what makes "pinned" pinned.
+EVICTION_RANK: Dict[RetentionClass, int] = {"cheap": 0, "normal": 1}
 
 
 def estimate_batch_bytes(batch: pa.RecordBatch) -> int:
