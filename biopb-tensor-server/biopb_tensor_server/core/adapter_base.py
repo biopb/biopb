@@ -48,7 +48,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
-    _version_header,
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
@@ -56,9 +55,8 @@ from biopb_tensor_server.core.chunk import (
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
-    encode_chunk_id,
-    encode_chunk_id_with_scale,
     is_scaled_chunk,
+    mint_chunk_id,
     normalized_scale_hint,
     normalized_slice_bounds,
     scaled_virtual_chunk_size,
@@ -1288,16 +1286,12 @@ class TensorAdapter(SourceAdapter):
         absolute grid, same ``array_id``, same ``content_version`` header --
         because a key that differs by one byte is a probe that never hits.
         """
-        version_header = (
-            _version_header(self.content_version)
-            if self.content_version is not None
-            else b""
-        )
         shape = tuple(int(dim) for dim in descriptor.shape)
         for chunk_start, chunk_stop in covering_units(start, stop, transfer, shape):
-            chunk_id = version_header + encode_chunk_id(
+            chunk_id = mint_chunk_id(
                 descriptor.array_id,
                 ChunkBounds(start=list(chunk_start), stop=list(chunk_stop)),
+                content_version=self.content_version,
             )
             yield chunk_start, cache_key_for_chunk_id(chunk_id)
 
@@ -2090,13 +2084,6 @@ def _get_read_plan(
     # still clears the Arrow ceiling (scaled_virtual_chunk_size).
     logical_endpoints: List[ChunkEndpoint] = []
 
-    # content_version is constant across the grid, so build its wrapper header
-    # once (biopb/biopb#178) and prepend to each chunk_id -- one concat per chunk,
-    # not a re-encode. None -> unversioned -> chunk_ids are byte-identical to pre-#178.
-    version_header = (
-        _version_header(content_version) if content_version is not None else b""
-    )
-
     # Compute number of chunks along each axis
     n_chunks_per_axis = tuple(
         ceil_div(realized_stop[ax] - realized_start[ax], virtual_chunk_size[ax])
@@ -2136,17 +2123,17 @@ def _get_read_plan(
         logical_bounds = ChunkBounds(start=list(logical_start), stop=list(logical_stop))
 
         # Encode: array_id + virtual_bounds + optional scale_hint + the requested
-        # reduction_method, so do_get downsamples with the method the client asked
-        # for (biopb/biopb#578). "area"/default adds no byte (identity-stable).
-        if scale_hint is not None:
-            chunk_id = encode_chunk_id_with_scale(
-                base_desc.array_id, virtual_bounds, scale_hint, reduction_method
-            )
-        else:
-            chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)
+        # reduction_method, then apply the content-version namespace.
+        chunk_id = mint_chunk_id(
+            base_desc.array_id,
+            virtual_bounds,
+            scale_hint,
+            reduction_method,
+            content_version,
+        )
 
         logical_endpoints.append(
-            ChunkEndpoint(chunk_id=version_header + chunk_id, bounds=logical_bounds)
+            ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds)
         )
 
     # Build descriptor

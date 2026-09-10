@@ -399,6 +399,24 @@ class TestCacheSourcedUnits:
             adapter.resolve_chunk_data(endpoint.chunk_id, cache)
         return [endpoint.chunk_id for endpoint in plan.chunk_endpoints]
 
+    @pytest.mark.parametrize("content_version", [None, b"v1"])
+    def test_cache_probe_keys_match_the_read_plan(
+        self, adapter, monkeypatch, content_version
+    ):
+        """The probe and unscaled plan must address identical cache entries."""
+        _set_grid(monkeypatch, adapter, (16, 16))
+        monkeypatch.setattr(adapter, "_content_version", content_version)
+        base_desc = adapter.get_tensor_descriptor()
+        plan = adapter.get_read_plan(TensorDescriptor())
+
+        expected = {
+            tuple(endpoint.bounds.start): cache_key_for_chunk_id(endpoint.chunk_id)
+            for endpoint in plan.chunk_endpoints
+        }
+        actual = dict(adapter._chunk_cache_keys(base_desc, (0, 0), (64, 64), (16, 16)))
+
+        assert actual == expected
+
     @staticmethod
     def _units(adapter, monkeypatch):
         """Record the extent each cache-sourced unit covers, by either route."""
