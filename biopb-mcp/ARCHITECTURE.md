@@ -112,15 +112,16 @@ the real `napari.Viewer`, because an off-main napari mutation can segfault the k
 
 ### dask cluster
 
-**There is no cluster unless someone asks for one.** The kernel computes on the
-in-process scheduler the napari viewer already reads through, and the agent moves
-it onto a cluster with `attach_cluster` (or a config that auto-attaches at kernel
-launch). That is a reliability choice, not a cost one: a long-lived cluster nobody
-opted into is one nobody watches, and a suspended host left every `.compute()`
-blocked on a scheduler whose workers were gone (**#970**). The trade is that a
-`.compute()` is cancellable mid-flight only while attached.
+By default, the kernel's dask computes run on the in-process scheduler, shared with
+the napari viewer. If needed, the agent can ask the session child to spin up
+a local cluster (`attach_cluster`) for parallel multi-process computation. The default
+can also be overridden by the user via config. Defaulting to in-process is a
+reliability choice, not a cost one: a long-lived cluster nobody opted into is one
+nobody watches, and a suspended host left every `.compute()` blocked on a scheduler
+whose workers were gone (**#970**). The trade is that a `.compute()` is cancellable
+mid-flight only while attached.
 
-When one exists the **mcp server** — not the kernel — owns it, so it survives
+The dask cluster is owned by the **session child** — not the kernel — so it survives
 kernel restart/respawn/window-close with no cold worker re-spawn (the dominant
 restart cost on Windows). The kernel attaches by scheduler address; worker/memory
 changes therefore need a *session* restart, not just a kernel restart. An idle
