@@ -55,8 +55,8 @@ Four mechanisms, all of them answering "which of these rows was the rehearsal?"
 
 ## The model
 
-One scratch kernel, spawned on demand, holding its own namespace, attached to
-the session's already-warm dask cluster, and **headless**. A verification is
+One scratch kernel, spawned on demand, holding its own namespace, on the same
+dask arrangement any fresh kernel gets, and **headless**. A verification is
 then:
 
     run the cells → verdict → if it passed, write the notebook → discard the kernel
@@ -201,10 +201,10 @@ Measured on the dev box (Ryzen 5 5600X, `.venv`, page cache warm):
 | full bootstrap, real display `:1` | 7.63 s | 584 MiB | — | ~358 MiB |
 
 **1.5 s and ~154 MiB private**, against a 60 s `startup_timeout`. Neither `qtpy`
-nor `napari` is imported at all. Dask adds nothing: `DaskClusterHost` is already
-decoupled from the kernel and `_launch` injects the scheduler address
-(`BIOPB_DASK_ADDRESS`), so a second kernel attaches to the warm cluster rather
-than spinning one.
+nor `napari` is imported at all. Dask adds nothing: no kernel ever spins a
+cluster — since biopb/biopb#970 there is usually none at all, and under a config
+that auto-attaches `_launch` passes the session cluster's address
+(`BIOPB_DASK_ADDRESS`) so a second kernel attaches to the warm one.
 
 Where the memory goes, cumulative through a *full* bootstrap — the two rows the
 headless kernel does not pay are marked:
@@ -359,16 +359,24 @@ falls out for free: the child issued the id, so it knows which kernel owns it.
 Most of the kernel-side claim machinery (`_owner`, `_owner_label`, the busy
 scan) can then shrink, since admission is decided above it.
 
-**The cluster is shared, and the slot is why.** Two clients on one
-`LocalCluster` sounds like contention, but under a global slot there is no
-second computation to contend with: while a verification runs, the session
-kernel is by construction not running a job. The other thing that could plausibly
-be computing there — the viewer's own slice reads — is deliberately kept off the
+**A scratch kernel gets the default scheduler, like every other fresh kernel.**
+Since biopb/biopb#970 that default is in-process, and an `attach_cluster` the
+session's agent made does not travel: the attach belongs to the kernel that asked
+for it. That is the same rule as the headless one — the reader of a saved
+workflow gets a bare kernel, so the run that verifies it gets one too. A workflow
+that needs a cluster says so in a cell, and then the verification proves that
+cell.
+
+**When a cluster *is* in play, the slot is what makes sharing safe.** Under a
+config that auto-attaches, both kernels attach to the session child's one
+`LocalCluster`. That sounds like contention, but under a global slot there is no
+second computation to contend with: while a verification runs, the session kernel
+is by construction not running a job. The other thing that could plausibly be
+computing there — the viewer's own slice reads — is deliberately kept off the
 cluster, `ViewerConfig.compute_scheduler` defaulting to `"threads"` so plane
 reads use "the one shared client cache (~100% hit on revisit, no worker scatter;
 biopb/biopb#8)". Nothing else schedules work on it: outside a job, `_dask_client`
-appears only in `server_status`'s `scheduler_info()` and the graceful-close
-snippet.
+appears only in `server_status` and the graceful-close snippet.
 
 Sharing then pays twice over, because the workers' per-worker chunk caches (the
 budget `_make_cache_plugin` divides) are already warm from the session's own

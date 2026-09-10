@@ -1,4 +1,4 @@
-"""The kernel round trip: calling into the in-kernel job runner, and reading back.
+"""The kernel round trip: calling into the kernel's handles, and reading back.
 
 Runs **in the MCP server process**. Every tool call and every observe/chat poll
 crosses this seam, and it is the same crossing each time: build a call
@@ -54,24 +54,24 @@ def _call_expr(name: str, *args, **kwargs) -> str:
     return f"{name}({', '.join(parts)})"
 
 
-def _job_snippet(call: str) -> str:
-    """Build a snippet that prints ``_jobs.<call>``'s result as delimited JSON.
+def _payload_snippet(expr: str) -> str:
+    """Build a snippet that prints *expr*'s value as delimited JSON.
 
-    ``call`` is a fully-formed call expression, normally from :func:`_call_expr`
-    (agent code is RCE by design, but embedding via ``repr`` keeps the payload a
-    valid literal regardless of its contents).
+    ``expr`` is a fully-formed expression, normally a call from
+    :func:`_call_expr` (agent code is RCE by design, but embedding via ``repr``
+    keeps the payload a valid literal regardless of its contents).
 
-    The payload is ``{"r": <call result>, "w": <viewer window alive?>}`` so the
-    same round-trip also reports whether the viewer window is still open (a
+    The payload is ``{"r": <value>, "w": <viewer window alive?>}`` so the same
+    round-trip also reports whether the viewer window is still open (a
     user-closed window turns viewer mutations into silent no-ops). The liveness
     probe is auxiliary, so a kernel that never bound ``_viewer_window_alive``
     (e.g. a partial/test bootstrap) reports ``w: null`` rather than breaking the
-    job round-trip.
+    round-trip.
     """
     return (
         "import json as _json\n"
         "print('" + _JOB_DELIM + "' + _json.dumps("
-        "{'r': _jobs." + call + ", "
+        "{'r': " + expr + ", "
         "'w': globals().get('_viewer_window_alive', lambda: None)()}))\n"
     )
 
@@ -114,22 +114,37 @@ def _extract_json(text: str):
         return None
 
 
-def _run_job_call(host, name: str, *args, **kwargs):
-    """Call ``_jobs.<name>(*args, **kwargs)`` in the kernel.
+def _run_ns_call(host, name: str, *args, **kwargs):
+    """Call ``<name>(*args, **kwargs)`` on a handle in the kernel namespace.
 
-    Arguments are passed as values, not as pre-built source: :func:`_call_expr`
-    reprs them. Returns ``(result, raw_result, window_alive)`` where ``result``
-    is the parsed return value (None if the snippet failed) and ``window_alive``
-    is the viewer-window liveness flag carried in the same payload (None when
-    unknown, e.g. the snippet did not run cleanly).
+    The general form of the hop; :func:`_run_job_call` is the job runner's
+    named specialization of it. Arguments are embedded by :func:`_call_expr`,
+    so the repr rule stays in one place. Returns ``(result, raw_result,
+    window_alive)`` where ``result`` is the parsed return value (None if the
+    snippet failed) and ``window_alive`` is the viewer-window liveness flag
+    carried in the same payload (None when unknown).
     """
-    res = host.execute(_job_snippet(_call_expr(name, *args, **kwargs)))
+    res = host.execute(_payload_snippet(_call_expr(name, *args, **kwargs)))
     if res.get("status") != "ok":
         return None, res, None
     payload = _extract_json(res.get("stdout", ""))
     if payload is None:
         return None, res, None
     return payload.get("r"), res, payload.get("w")
+
+
+async def _ns_call(host, name: str, *args, **kwargs):
+    """:func:`_run_ns_call` off the event loop (see :func:`_job_call`)."""
+    return await asyncio.to_thread(_run_ns_call, host, name, *args, **kwargs)
+
+
+def _run_job_call(host, name: str, *args, **kwargs):
+    """Call ``_jobs.<name>(*args, **kwargs)`` in the kernel.
+
+    The job runner's :func:`_run_ns_call` -- the hop every tool and poll makes,
+    named for it.
+    """
+    return _run_ns_call(host, "_jobs." + name, *args, **kwargs)
 
 
 async def _job_call(host, name: str, *args, **kwargs):

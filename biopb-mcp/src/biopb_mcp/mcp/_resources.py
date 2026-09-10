@@ -80,13 +80,14 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `in
   calling it back-to-back asks the same question sooner and costs you a round trip
   for nothing. Raise `wait` if you have nothing to do until the job finishes; pass
   `wait=0` only for a snapshot you are not about to ask for again.
-* **A blocking `.compute()` is interruptible** — `interrupt_kernel` cancels the in-flight
-  dask tasks, so the `.compute()` raises and the job ends. No special pattern needed.
+* **A blocking `.compute()` is interruptible** — while a cluster is attached
+  `interrupt_kernel` cancels the in-flight dask tasks, so the `.compute()` raises and
+  the job ends. On the in-process default (see below) the stop is best-effort.
 * **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
   raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
 * **Progress on a big graph:** submit with the distributed client
-  (`_dask_client`, present only under the distributed scheduler) and consume results as
-  they land — this gives a live processed count via `poll_job`:
+  (`_dask_client`, present only while a cluster is attached — see below) and consume
+  results as they land — this gives a live processed count via `poll_job`:
   ```python
   from dask.distributed import as_completed
   futs = _dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
@@ -95,6 +96,26 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `in
       done.append(fut.result())
       print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
   ```
+
+## Where your computes run
+
+The kernel starts on the **in-process scheduler**, the same one the napari viewer
+reads through. That is the right default for this workload: a chunk read over
+loopback is IO-bound and comes back as an mmap view, so routing it through worker
+processes adds hops rather than speed — and a cluster nobody asked for is one
+that quietly dies with the laptop lid and hangs every later `.compute()` (#970).
+
+`attach_cluster()` moves your computes onto a distributed cluster; it spins (or
+reuses, and health-checks) the session's own LocalCluster, or takes an
+`address` for an external scheduler. `detach_cluster()` goes back. Reach for it
+when the work is CPU-heavy and parallel — a per-tile filter over a big stack, a
+segmentation sweep — not for reads. `server_status`'s `## Dask` section always
+says which mode is in effect, and `restart_kernel` starts in-process again.
+
+One real difference: **a `.compute()` is fully cancellable only while attached**
+— `interrupt_kernel` cancels the in-flight futures. In-process the stop is
+best-effort: a `KeyboardInterrupt` at the next bytecode, so a fetch inside a C
+call ends only when it returns. Your own Python loops are stoppable either way.
 
 ## You are not the only writer of this namespace
 The user can run their own code in this kernel, from the observe web page. It is the

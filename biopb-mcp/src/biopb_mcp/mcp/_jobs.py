@@ -145,6 +145,7 @@ KERNEL_HANDLE_NAMES = frozenset(
         "_jobs",
         "_dask_client",
         "_dask_attach_done",
+        "_dask_ctl",
         "_viewer_window_alive",
         "_resync_view",
     }
@@ -614,10 +615,32 @@ def _exec_cells(job, verification):
                 cell.status = "skipped"
 
 
+def _dask_backstop():
+    """Why nothing this job computes could finish, or ``None``.
+
+    biopb/biopb#970's backstop: an attached scheduler whose workers have all gone
+    (a host suspend outliving their TTL) still *accepts* work and never runs it,
+    turning a 0.2 s read into a cell that hangs until someone interrupts it. A
+    worker count off the client makes that an error naming the fix instead. Only
+    fires while attached, which is opt-in (``attach_cluster``).
+    """
+    ctl = _ip.user_ns.get("_dask_ctl") if _ip is not None else None
+    if ctl is None:
+        return None
+    try:
+        return ctl.dead_message()
+    except Exception:  # noqa: BLE001 - a backstop must not become the failure
+        logger.debug("dask liveness probe failed", exc_info=True)
+        return None
+
+
 def _run(job, code):
     _jobs_by_thread[threading.get_ident()] = job
     exc = None
     try:
+        _dead = _dask_backstop()
+        if _dead:
+            raise RuntimeError(_dead)
         if job.verify is not None:
             _exec_cells(job, job.verify)
         else:
@@ -853,6 +876,21 @@ def _cancel_dask_futures(job, reason=None):
                 dc.cancel([Future(k, dc) for k in keys], force=True)
         except Exception:  # noqa: BLE001 - cancel is best-effort
             logger.debug("distributed cancel failed", exc_info=True)
+
+
+def check_writer(writer):
+    """Refuse *writer* if it does not hold this kernel's one-agent claim.
+
+    The claim itself is :func:`submit`'s (first non-user submitter takes it);
+    this is the same test for a state change that is not a submit -- moving the
+    namespace's dask scheduler (``_dask_ctl``). ``None`` when the caller may
+    proceed, otherwise the same ``{"refused": "not_owner", ...}`` shape
+    :func:`interrupt_current` returns, so one refusal is rendered one way.
+    """
+    with _lock:
+        if writer is None or _owner in (None, writer):
+            return None
+        return {"refused": "not_owner", "owner": _owner_label, "owner_id": _owner}
 
 
 def _running_job():

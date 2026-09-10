@@ -1,12 +1,18 @@
 """Pin the napari viewer's lazy layer arrays to a single-process scheduler.
 
-The MCP bootstrap registers a distributed ``LocalCluster`` as dask's *default*
-scheduler so the agent's heavy ``da`` computes run in parallel. The viewer,
-however, scrubs planes **one at a time** (serial ``np.asarray(data[slices])``),
-so computing those slices on the cluster buys zero parallelism while scattering
-each single-chunk fetch across a rotating worker — the per-worker chunk cache is
-an opaque side-effect dask's locality scheduler can't see, so same-chunk reads
-miss and replicate (issue #8).
+The agent can put a distributed cluster behind dask's *default* scheduler
+(``attach_cluster``, or ``dask.scheduler = "distributed"``) so its heavy ``da``
+computes run in parallel. The viewer, however, scrubs planes **one at a time**
+(serial ``np.asarray(data[slices])``), so computing those slices on the cluster
+buys zero parallelism while scattering each single-chunk fetch across a rotating
+worker — the per-worker chunk cache is an opaque side-effect dask's locality
+scheduler can't see, so same-chunk reads miss (issue #8). They no longer
+*replicate*, though: on localhost a chunk under the pinned-segment budget comes
+back as a zero-copy mmap view of the server's own segment file (#571), which N
+workers share through the page cache rather than each holding a copy.
+
+Since #970 the kernel's default is in-process, so this pin is belt-and-braces on
+the default path — load-bearing once something has attached a cluster.
 
 ``wrap_levels`` wraps each layer array in a :class:`_ViewerArray` proxy that
 forces the *implicit* materialization napari performs (``np.asarray`` ->
@@ -16,13 +22,13 @@ slice reads run in the kernel main process against the one shared
 
 Only ``__array__`` (implicit ``np.asarray`` coercion) and ``__getitem__`` (the
 slice it coerces) are pinned to the single-process scheduler. Everything else
-delegates to the underlying dask array and stays lazy on the default
-(distributed) scheduler: attribute/method access (``.compute()``, ``.mean()``,
+delegates to the underlying dask array and stays lazy on whatever the default
+scheduler is: attribute/method access (``.compute()``, ``.mean()``,
 ``.rechunk()``) via ``__getattr__``, and operators / comparisons / NumPy ufuncs
 (``data + 1``, ``data > 0``, ``np.add(data, 1)``) via ``__array_ufunc__``, which
 returns a plain dask array. So the agent's explicit computes on a layer's
-``.data`` still use the cluster. The viewer being serial is exactly why pinning
-its reads is free.
+``.data`` still go to the cluster when one is attached. The viewer being serial
+is exactly why pinning its reads is free.
 """
 
 import numpy as np
@@ -56,8 +62,8 @@ class _ViewerArray(NDArrayOperatorsMixin):
         # Forward operators/comparisons/ufuncs (data + 1, data > 0, np.add(...))
         # to the underlying dask array: unwrap any _ViewerArray operand, then let
         # NumPy dispatch to dask's own __array_ufunc__. The result is a plain
-        # lazy dask array on the default (distributed) scheduler -- not re-wrapped
-        # -- so derived agent expressions are not pinned to the viewer scheduler.
+        # lazy dask array on the default scheduler -- not re-wrapped -- so
+        # derived agent expressions are not pinned to the viewer scheduler.
         inputs = tuple(x._arr if isinstance(x, _ViewerArray) else x for x in inputs)
         out = kwargs.get("out")
         if out is not None:

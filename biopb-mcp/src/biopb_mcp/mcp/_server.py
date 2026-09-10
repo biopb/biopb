@@ -116,22 +116,26 @@ except Exception as _e:
 
 print("")
 print("## Dask")
+# Which scheduler this kernel's computes run on -- the arrangement, not just a
+# worker count, because "attached to a cluster that has lost its workers" is the
+# state that used to be invisible until a .compute() hung forever (#970).
 try:
-    import dask as _dask
-    print("  scheduler: " + str(_dask.config.get("scheduler", default="unknown")))
+    _dst = _dask_ctl.status()
+    if _dst["mode"] == "attached":
+        print("  mode: attached to " + str(_dst["address"]))
+        print("  workers: " + str(_dst["workers"]))
+        print("  dashboard: " + str(_dst["dashboard"]))
+        if _dst["cache_budget_per_worker"] is not None:
+            print("  chunk_cache: " + str(_dst["cache_budget_per_worker"]) + " B/worker")
+        if _dst["warning"]:
+            print("  WARNING: " + _dst["warning"])
+    elif _dst["mode"] == "attaching":
+        print("  mode: attaching (still connecting to a cluster)")
+    else:
+        print("  mode: in-process (" + str(_dst["scheduler"]) + "), shared with the viewer")
+        print("    attach_cluster() for multi-process parallelism / a cancellable compute")
 except Exception as _e:
     print("  error: " + str(_e))
-try:
-    if _dask_client is not None:
-        _info = _dask_client.scheduler_info()
-        print("  distributed_workers: " + str(len(_info.get("workers", {}))))
-        print("  dashboard: " + str(_dask_client.dashboard_link))
-    elif not globals().get("_dask_attach_done", True):
-        print("  distributed: starting (attaching to cluster)")
-    else:
-        print("  distributed: not active")
-except Exception:
-    print("  distributed: not active")
 
 print("")
 print("## Tensor Server")
@@ -1029,13 +1033,14 @@ async def inspect_object(object_path: str) -> str:
 async def interrupt_kernel() -> str:
     """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
-    Also cancels the job's in-flight dask futures. The job runs in a background
-    worker thread, so a SIGINT (which Python delivers only to the kernel main
-    thread) can't reach it — this raises the exception directly into the worker.
-    Best-effort: it lands at the next bytecode, so a
-    blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
-    it returns to Python; if YOUR job stays stuck, use restart_kernel — the
-    guaranteed stop.
+    Also cancels the job's in-flight dask futures, which is what actually stops a
+    blocking `.compute()` — but only while a cluster is attached (attach_cluster);
+    on the in-process default there are no futures to cancel. The job runs in a
+    background worker thread, so a SIGINT (which Python delivers only to the
+    kernel main thread) can't reach it — this raises the exception directly into
+    the worker. Best-effort: it lands at the next bytecode, so a blocking C-level
+    call (gRPC tensor fetch, native dask compute) stops only when it returns to
+    Python; if YOUR job stays stuck, use restart_kernel — the guaranteed stop.
 
     Stops YOUR job only. A cell the user ran from the observe page shares this
     kernel and this one-job-at-a-time runner, but is not yours to stop: this
@@ -1217,6 +1222,136 @@ async def restart_kernel() -> str:
         return refusal
     note = f" Verification {discarded} was discarded with it." if discarded else ""
     return "Kernel restarted. Viewer rebuilt; previous variables are gone." + note
+
+
+def _format_cluster(status: dict) -> str:
+    """Render :meth:`_dask_ctl.DaskAttachment.status` for a tool reply.
+
+    ``warning`` is the kernel's own wording of the #970 advice (also what the
+    job runner raises and ``server_status`` prints), passed through rather than
+    re-said here.
+    """
+    if status.get("mode") != "attached":
+        return (
+            "Detached. Computes now run on this kernel's in-process "
+            f"{status.get('scheduler')} scheduler, the one the napari viewer "
+            "uses. Any session-owned cluster is left up for now; its idle reaper "
+            "takes it down once no kernel has been attached for dask.idle_ttl."
+        )
+    lines = [
+        f"Attached to {status.get('address')} — {status.get('workers')} worker(s).",
+        f"  dashboard: {status.get('dashboard')}",
+    ]
+    budget = status.get("cache_budget_per_worker")
+    if budget is not None:
+        lines.append(f"  chunk-cache budget: {budget / (1024**2):.0f} MB per worker")
+    lines.append(
+        "`.compute()` now runs there, and interrupt_kernel can cancel it "
+        "mid-flight. The napari viewer keeps reading in-process (#8)."
+    )
+    if status.get("warning"):
+        lines.append("WARNING: " + status["warning"])
+    return "\n".join(lines)
+
+
+async def _dask_ctl_call(host, action: str, *args):
+    """Run ``_dask_ctl.<action>`` in the kernel; return ``(reply, done)``.
+
+    The whole tool contract for the pair below — identity, the kernel's refusals
+    (it answers both the one-agent claim and "a job is running"), a failed hop,
+    and the rendering — so ``attach_cluster`` is left holding only the part that
+    is its own: resolving an address. *done* is False for every refusal, which is
+    what tells a caller its follow-up (``note_detached``) must not run.
+    """
+    writer, _label = _writers._client_identity()
+    data, res, _w = await _kernel_rpc._ns_call(
+        host, f"_dask_ctl.{action}", *args, writer=writer
+    )
+    if data is None:
+        return _kernel_rpc._format_execute_result(res), False
+    if data.get("refused") == "not_owner":
+        # The kernel named the holder; correct this process's mirror with it.
+        _writers._note_claim(data.get("owner_id"))
+        held_by = data.get("owner") or ""
+        return _writers._NOT_OWNER_MSG.format(
+            held_by=f" ({held_by})" if held_by else ""
+        ), False
+    if data.get("error"):
+        return f"Could not {action} the cluster: {data['error']}", False
+    return _format_cluster(data), True
+
+
+@mcp.tool()
+async def attach_cluster(address: str | None = None) -> str:
+    """Run this kernel's computes on a distributed dask cluster.
+
+    The kernel starts on the **in-process scheduler** it shares with the napari
+    viewer, which is the right default: a chunk read over loopback is IO-bound
+    and already hands back an mmap view, so shipping it through worker processes
+    only adds hops. Attach when the work is genuinely CPU-heavy and parallel — a
+    segmentation sweep, a per-tile filter over a big stack — or when you want a
+    `.compute()` that `interrupt_kernel` can cancel mid-flight (in-process, a
+    stop lands only when the current C call returns).
+
+    With no *address*, the session spins (or reuses) its own LocalCluster on this
+    machine; a stale one is health-checked and re-spun here rather than left to
+    hang your next compute. Pass an *address* (`tcp://host:8786`) for an external
+    scheduler — but note its workers must be able to reach the data plane
+    themselves, and off-loopback they lose the mmap fast path, so a read-heavy
+    graph can end up slower than in-process.
+
+    Attaching is remembered by the kernel, not the session: `restart_kernel`
+    starts in-process again. Refused while a job is running — changing the
+    scheduler under one would strand its work.
+    """
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
+
+    target = address
+    if not target:
+        if _app._cluster_host is None:
+            return (
+                "This session owns no dask cluster host, so there is nothing to "
+                "spin. Pass an external scheduler address to attach to one."
+            )
+        # on_demand: the config default no longer asks for a cluster, and this
+        # call is the ask. Blocking (a cold spin is seconds, N spawns on
+        # Windows), so it goes to a thread like every other slow step here.
+        target = await asyncio.to_thread(_app._cluster_host.ensure, True)
+        if not target:
+            return (
+                "Failed to start a local dask cluster (see the session log). The "
+                "kernel is unchanged and still computes in-process."
+            )
+    reply, _done = await _dask_ctl_call(host, "attach", target)
+    return reply
+
+
+@mcp.tool()
+async def detach_cluster() -> str:
+    """Go back to the in-process scheduler shared with the napari viewer.
+
+    Undoes `attach_cluster`: closes this kernel's client, so `.compute()` runs in
+    the kernel process again. The cluster itself is left alone — the session's
+    own is torn down by its idle reaper once no kernel is attached, and an
+    external one was never ours.
+
+    Worth doing when the parallel phase of a job is over: an attached cluster
+    that goes stale (a laptop suspend outliving the workers' TTL) is how a
+    routine read turns into a cell that hangs forever. Refused while a job is
+    running.
+    """
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return err
+    reply, done = await _dask_ctl_call(host, "detach")
+    # The kernel let go, so the session's cluster is now held by nobody and its
+    # idle reaper should start counting -- a live kernel is no longer proof that
+    # anyone is attached. Not on a refusal: nothing detached.
+    if done and _app._cluster_host is not None:
+        _app._cluster_host.note_detached()
+    return reply
 
 
 @mcp.tool()

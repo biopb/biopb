@@ -38,9 +38,15 @@ class _FakeCluster:
 
 
 def _cfg(**over):
+    """A config that *asks* for a cluster (auto-attach at kernel launch)."""
     dask = {"scheduler": "distributed", "address": ""}
     dask.update(over)
     return {"dask": dask}
+
+
+def _default_cfg(**over):
+    """The shipped default: no cluster unless someone calls attach_cluster."""
+    return _cfg(scheduler="threads", **over)
 
 
 @pytest.fixture
@@ -61,7 +67,7 @@ def fake_local_cluster(monkeypatch):
 
 class TestShouldOwn:
     def test_none_when_not_distributed(self, fake_local_cluster):
-        host = DaskClusterHost(_cfg(scheduler="threads"))
+        host = DaskClusterHost(_default_cfg())
         assert host.ensure() is None
         assert fake_local_cluster == []
 
@@ -71,6 +77,40 @@ class TestShouldOwn:
         host = DaskClusterHost(_cfg(address="tcp://1.2.3.4:8786"))
         assert host.ensure() is None
         assert fake_local_cluster == []
+
+
+class TestOnDemand:
+    """attach_cluster's path: spin even though the config never asked (#970)."""
+
+    def test_spins_under_the_default_config(self, fake_local_cluster):
+        host = DaskClusterHost(_default_cfg())
+        assert host.ensure(on_demand=True) == "tcp://127.0.0.1:9999"
+        assert len(fake_local_cluster) == 1
+
+    def test_spins_even_with_an_external_address_configured(self, fake_local_cluster):
+        # attach_cluster() with no address means "the session's own cluster";
+        # an external one is reached by passing its address explicitly.
+        host = DaskClusterHost(_default_cfg(address="tcp://elsewhere:8786"))
+        assert host.ensure(on_demand=True) == "tcp://127.0.0.1:9999"
+
+    def test_health_checks_and_respins_a_dead_cluster(self, fake_local_cluster):
+        """The #970 check, at the moment someone asks for a working cluster."""
+        host = DaskClusterHost(_default_cfg())
+        host.ensure(on_demand=True)
+        host.ensure(on_demand=True)  # observes the workers
+        fake_local_cluster[0].scheduler = _FakeScheduler(0)  # suspend killed them
+        host.ensure(on_demand=True)
+        assert len(fake_local_cluster) == 2
+        assert fake_local_cluster[0].closed is True
+
+    def test_a_later_kernel_launch_is_not_auto_attached(self, fake_local_cluster):
+        # An attach belongs to the kernel that asked for it: a fresh kernel
+        # (restart, watchdog respawn) starts in-process again, and the cluster
+        # left behind falls to the idle reaper. Re-attaching is a tool call.
+        host = DaskClusterHost(_default_cfg())
+        host.ensure(on_demand=True)
+        assert host.ensure() is None
+        assert len(fake_local_cluster) == 1
 
 
 class TestEnsure:
@@ -218,12 +258,62 @@ class TestIdleReaper:
         time.sleep(0.2)
         assert fake_local_cluster[0].closed is False
 
-    def test_not_started_for_external_scheduler(self, fake_local_cluster):
-        # We don't own an external cluster, so we must not reap it.
-        host = DaskClusterHost(_cfg(idle_ttl=0.05, address="tcp://elsewhere:8786"))
+    def test_runs_but_reaps_nothing_when_no_cluster_was_spun(self, fake_local_cluster):
+        # Started unconditionally now (the default config spins nothing, yet an
+        # attach_cluster cluster still needs bounding). With none spun the loop
+        # has nothing to close -- including an external scheduler, which this
+        # host never owns.
+        host = DaskClusterHost(_default_cfg(idle_ttl=0.05, address="tcp://ext:8786"))
         host.set_kernel_alive(lambda: False)
         host.start_reaper()
-        assert host._reap_thread is None
+        try:
+            assert host._reap_thread is not None
+            time.sleep(0.2)
+            assert fake_local_cluster == []
+        finally:
+            host.close()
+
+    def test_reaps_after_a_detach_although_the_kernel_lives_on(
+        self, fake_local_cluster
+    ):
+        # Kernel liveness stopped being proof that anyone is attached when the
+        # attach became explicit (#970): a detached kernel is alive and holds
+        # nothing, and waiting for it to die would keep N workers for the
+        # session's whole life.
+        host = DaskClusterHost(_default_cfg(idle_ttl=0.05))
+        host.set_kernel_alive(lambda: True)
+        host.ensure(on_demand=True)
+        host.start_reaper()
+        try:
+            time.sleep(0.2)
+            assert fake_local_cluster[0].closed is False  # still attached
+            host.note_detached()
+            time.sleep(0.3)
+            assert fake_local_cluster[0].closed is True
+        finally:
+            host.close()
+
+    def test_a_live_attached_kernel_keeps_the_cluster(self, fake_local_cluster):
+        host = DaskClusterHost(_default_cfg(idle_ttl=0.05))
+        host.set_kernel_alive(lambda: True)
+        host.ensure(on_demand=True)
+        host.start_reaper()
+        try:
+            time.sleep(0.3)
+            assert fake_local_cluster[0].closed is False
+        finally:
+            host.close()
+
+    def test_reaps_an_on_demand_cluster(self, fake_local_cluster):
+        host = DaskClusterHost(_default_cfg(idle_ttl=0.05))
+        host.set_kernel_alive(lambda: False)
+        host.ensure(on_demand=True)
+        host.start_reaper()
+        try:
+            time.sleep(0.3)
+            assert fake_local_cluster[0].closed is True
+        finally:
+            host.close()
 
     def test_start_reaper_is_idempotent(self, fake_local_cluster):
         host = DaskClusterHost(_cfg(idle_ttl=0.05))

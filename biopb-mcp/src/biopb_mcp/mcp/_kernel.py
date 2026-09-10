@@ -227,10 +227,11 @@ class KernelHost:
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
 
-        # Session-child-owned dask cluster (or None). _launch calls ensure() and
-        # injects the scheduler address so the kernel attaches to it instead of
-        # spinning its own; the session child owns its lifetime, so a kernel
-        # restart/reap here leaves the cluster (and its warm workers) untouched.
+        # Session-child-owned dask cluster host (or None). It spins nothing
+        # unless asked: _launch calls ensure(), which answers with an address
+        # only under a config that wants auto-attach, and attach_cluster asks it
+        # directly. The session child owns the cluster's lifetime, so a kernel
+        # restart/reap here leaves it (and its warm workers) untouched.
         # See _cluster.py.
         self._cluster_host = cluster_host
 
@@ -302,19 +303,26 @@ class KernelHost:
         extra_args = list(self._extra_arguments)
         popen_kwargs = {}
 
-        # Attach this kernel to the session-child-owned dask cluster. ensure()
-        # spins it on the first launch (returning as soon as the scheduler is
-        # bound, so workers register while the kernel imports napari) and returns
-        # the cached address on later launches. None -> the session child owns no
-        # cluster (a non-distributed scheduler, an external address, or a spin
-        # failure); the kernel then resolves dask from its own config.
+        # Auto-attach this kernel to a session-child-owned dask cluster, if the
+        # config asks for one (dask.scheduler = "distributed"). ensure() spins it
+        # on the first such launch (returning as soon as the scheduler is bound,
+        # so workers register while the kernel imports napari) and returns the
+        # cached address on later ones. None -- the default since #970 -- means
+        # no cluster to attach at launch; the kernel starts on its in-process
+        # scheduler and attach_cluster is how one arrives later.
         if self._cluster_host is not None:
-            from ._cluster import DASK_ADDRESS_ENV
+            from ._dask_ctl import DASK_ADDRESS_ENV
 
             address = self._cluster_host.ensure()
             if address:
                 env = dict(env)
                 env[DASK_ADDRESS_ENV] = address
+            else:
+                # This kernel starts unattached, so a cluster left over from the
+                # previous one (an attach_cluster the restart discarded) is now
+                # held by nobody -- tell the host, or its reaper would count a
+                # live-but-unattached kernel as a reason to keep the workers.
+                self._cluster_host.note_detached()
 
         # Redirect the kernel subprocess' native stdout/stderr fds. None ->
         # inherit the launcher's fds (http mode). In stdio mode the launcher

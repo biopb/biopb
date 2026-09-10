@@ -288,20 +288,22 @@ class DaskConfig:
     """Dask scheduler / cluster for the kernel's compute."""
 
     scheduler: str = _h(
-        "distributed",
-        'Dask scheduler: "distributed" (a LocalCluster; enables mid-compute '
-        'cancel and real CPU parallelism), "threads"/"synchronous" (low-overhead '
-        "in-process, no mid-compute cancel).",
+        "threads",
+        'Scheduler the kernel starts on: "threads"/"synchronous" (in-process, '
+        "shared with the napari viewer; attach_cluster() attaches a cluster when "
+        'one is wanted), "distributed" (attach at startup to a session-owned '
+        "LocalCluster, as before #970).",
     )
     num_workers: int = _h(
         _DEFAULT_DASK_NUM_WORKERS,
-        "n_workers for the auto-spun LocalCluster (0 -> dask picks ~n_cores). 0 on "
-        "POSIX (fork is cheap); capped at 4 on Windows (each worker is a cold spawn).",
+        "n_workers for the LocalCluster, and the in-process scheduler's thread "
+        "count (0 -> dask picks ~n_cores). 0 on POSIX (fork is cheap); capped at "
+        "4 on Windows (each worker is a cold spawn).",
     )
     address: str = _h(
         "",
-        "Non-empty -> connect to this external scheduler address; empty -> the "
-        "session child spins/owns a LocalCluster.",
+        "Non-empty -> the kernel attaches to this external scheduler at startup "
+        "(wins over `scheduler`); empty -> no external cluster.",
     )
     threads_per_worker: int = _h(
         1, "LocalCluster threads per worker (local cluster only)."
@@ -323,10 +325,11 @@ class DaskConfig:
     idle_ttl: float = _h(
         900.0,
         "Seconds with no kernel attached after which the session child's own "
-        "LocalCluster is torn down, freeing its workers; the next start_kernel "
-        "re-spins it. Only counts while no kernel is alive, so a live viewer or "
-        "a restart never loses the warm cluster. 0 disables. An external "
-        "dask.address is never reaped (we do not own it).",
+        "LocalCluster is torn down, freeing its workers; the next attach_cluster "
+        "(or kernel launch, under scheduler=distributed) re-spins it. Only counts "
+        "while no kernel is alive, so a live viewer or a restart never loses the "
+        "warm cluster. 0 disables. An external dask.address is never reaped (we "
+        "do not own it).",
     )
 
 

@@ -410,13 +410,15 @@ def _serve_http(config, port, view=False):
     # the explicit calls on the os._exit paths harmless if they both run.
     atexit.register(_cleanup_dask_dir)
 
-    # Session-child-owned dask cluster: spun lazily on the first kernel launch
-    # (from KernelHost._launch, which injects its address), kept warm across
-    # kernel restarts, and closed only on real process exit (the _shutdown
-    # chokepoint + atexit backstop). Detaching the cluster from the kernel avoids
-    # re-spinning N cold workers on every restart_kernel — the dominant restart
-    # cost on Windows (no fork). Construction is cheap (no dask import until
-    # ensure()); atexit is a backstop for exits that skip _shutdown.
+    # Session-child-owned dask cluster: spun lazily, and only when something asks
+    # for one — the attach_cluster tool, or a kernel launch under
+    # `dask.scheduler = "distributed"`. Nothing asks by default (#970), so an
+    # ordinary session spawns no workers at all. Once spun it is kept warm across
+    # kernel restarts and closed only on real process exit (the _shutdown
+    # chokepoint + atexit backstop): owning it here rather than in the kernel
+    # avoids re-spinning N cold workers on every restart_kernel — the dominant
+    # restart cost on Windows (no fork). Construction is cheap (no dask import
+    # until ensure()); atexit is a backstop for exits that skip _shutdown.
     cluster_host = DaskClusterHost(config, local_dir=dask_local_dir)
     atexit.register(cluster_host.close)
 
@@ -431,8 +433,9 @@ def _serve_http(config, port, view=False):
         watchdog_max_respawns=get_setting(config, "kernel.watchdog_max_respawns"),
         watchdog_respawn_window=get_setting(config, "kernel.watchdog_respawn_window"),
         parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
-        # Session-child-owned dask cluster; _launch calls ensure() and injects
-        # its scheduler address so the kernel attaches instead of spinning its own.
+        # Session-child-owned dask cluster; _launch calls ensure(), which hands
+        # back an address only under a config that wants auto-attach, and
+        # attach_cluster asks it directly. The kernel never spins its own.
         cluster_host=cluster_host,
     )
 
@@ -468,9 +471,13 @@ def _serve_http(config, port, view=False):
 
     # Now that the kernel host exists, let the cluster's idle reaper ask it
     # whether a kernel is attached — the one thing that makes a teardown safe.
+    # Started unconditionally: with no cluster it polls in-process state and does
+    # nothing, and it is what bounds a cluster attach_cluster spun later.
     cluster_host.set_kernel_alive(host.is_alive)
     cluster_host.start_reaper()
     _app.set_kernel_host(host)
+    # attach_cluster spins/reuses this; it is the session's, not the kernel's.
+    _app.set_cluster_host(cluster_host)
     _app.set_promote_after(get_setting(config, "kernel.promote_after"))
     # Advertise the curated-skills catalog only when it is enabled (off by
     # default) — mirrors what list_skills / the skill:// resource actually serve.
