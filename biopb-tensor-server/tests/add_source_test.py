@@ -67,7 +67,8 @@ def _drain_all(gen):
     result = ([], [], [], [], [])
     for event in gen:
         if event[0] == "result":
-            result = event[1:]
+            t = event[1]
+            result = (t.added, t.already_present, t.refreshed, t.removed, t.failed)
     return result
 
 
@@ -351,12 +352,12 @@ class TestAddLocalSource:
             return state["n"] >= 1
 
         gen = manager.add_local_source(str(tmp_path), should_cancel=should_cancel)
-        added, already, failed = [], [], []
+        added = []
         for event in gen:
             if event[0] == "progress":
                 state["n"] += 1
             else:
-                _, added, already, _refreshed, _removed, failed = event
+                added = event[1].added
 
         assert 1 <= len(added) < 3  # stopped early, kept what was registered
         for desc in added:

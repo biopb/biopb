@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
@@ -106,6 +107,21 @@ def _drop_catalog_url(
     base = os.path.basename(dropped_root) or dropped_root
     rerooted = _reroot_catalog_url(base, dropped_root, primary_path)
     return DND_URL_PREFIX + rerooted if mark_dnd else rerooted
+
+
+@dataclass
+class AddSourceTally:
+    """The terminal outcome of one ``add_local_source`` drop.
+
+    A record rather than a positional tuple: the categories are all lists of
+    ids, so a mis-ordered unpack at one of the yield sites would be silent.
+    """
+
+    added: List[Any] = field(default_factory=list)
+    already_present: List[str] = field(default_factory=list)
+    refreshed: List[str] = field(default_factory=list)
+    removed: List[str] = field(default_factory=list)
+    failed: List[Tuple[str, str]] = field(default_factory=list)
 
 
 class SourceManager:
@@ -1111,10 +1127,8 @@ class SourceManager:
         - ``("progress", added_count, current_path)`` -- one per source as it
           registers or refreshes (the count is of NEW sources, so a pure re-drop
           advances only the path),
-        - ``("result", added, already_present, refreshed, removed, failed)`` --
-          exactly one terminal tally (``added`` is a list of descriptors, the
-          next three are lists of source_ids, ``failed`` a list of
-          ``(path, reason)``).
+        - ``("result", tally)`` -- exactly one terminal
+          :class:`AddSourceTally`.
 
         A claim that is already registered is **rebuilt**, not skipped: its
         adapter is reconstructed against the file as it is now, which is the
@@ -1124,11 +1138,9 @@ class SourceManager:
         its meaning, "this id was already known", so an older client still reads
         a re-drop as "already present" rather than "nothing happened".
 
-        The rebuild is unconditional rather than gated on a signature diff. A
-        directory source's stat signature is the directory's own, and a
-        directory's mtime does not move when a member is rewritten in place, so
-        for a zarr or a TIFF sequence there is no cheap signal to gate on -- the
-        drop itself is the signal.
+        The rebuild is unconditional: a directory source's signature is the
+        directory's own, and that mtime does not move when a member is rewritten
+        in place, so for a zarr or TIFF sequence the drop is the only signal.
 
         Registered sources under the dropped path whose files are GONE are
         deregistered and reported in ``removed``.
@@ -1178,11 +1190,7 @@ class SourceManager:
         url = real
         is_dir = os.path.isdir(url)
 
-        added: List[Any] = []
-        already_present: List[str] = []
-        refreshed: List[str] = []
-        removed: List[str] = []
-        failed: List[Tuple[str, str]] = []
+        tally = AddSourceTally()
 
         # Acquire the catalog lock, heart-beating while a rescan holds it so a
         # long wait does not sit silent long enough to trip a proxy timeout.
@@ -1195,8 +1203,8 @@ class SourceManager:
             # this (dir sources record only the dir as a member), so reject here.
             owner = self._reconciler._find_containing_source(url)
             if owner is not None:
-                failed.append((url, f"already part of source '{owner}'"))
-                yield ("result", added, already_present, refreshed, removed, failed)
+                tally.failed.append((url, f"already part of source '{owner}'"))
+                yield ("result", tally)
                 return
 
             # Is the dropped path itself a dataset (single claim), or a plain
@@ -1236,36 +1244,34 @@ class SourceManager:
                         str(claim.primary_path), claim.source_type
                     )
 
+            already_ids = {
+                claim.source_id
+                for claim in claims
+                if self._reconciler.has_claim(claim.source_id)
+            }
+
             # Removal half, before the empty-drop bail-out below: dropping a
             # folder whose contents were deleted is exactly how a stale entry
-            # gets noticed, and there is nothing to add in that case.
-            #
-            # Skip the O(catalog) scan for the common trivial re-drop: a single
-            # file that is already a registered claim cannot have anything
-            # "vanished" under it -- existence was just confirmed above (line
-            # ~1174), and a file has no descendants to have disappeared.
-            trivial_redrop = (
-                not is_dir
-                and len(claims) == 1
-                and self._reconciler.has_claim(claims[0].source_id)
-            )
-            removed = (
-                []
-                if trivial_redrop
-                else self._deregister_vanished_under(
+            # gets noticed, and there is nothing to add in that case. A dropped
+            # *file* skips the O(catalog) scan -- its own existence was checked
+            # above, and it has no descendants that could have vanished.
+            tally.removed = (
+                self._deregister_vanished_under(
                     url, {claim.source_id for claim in claims}
                 )
+                if is_dir
+                else []
             )
 
             if not claims:
-                if not removed:
+                if not tally.removed:
                     reason = (
                         "no supported datasets found under directory"
                         if is_dir
                         else "not a recognized image format"
                     )
-                    failed.append((url, reason))
-                yield ("result", added, already_present, refreshed, removed, failed)
+                    tally.failed.append((url, reason))
+                yield ("result", tally)
                 return
 
             # Re-root the drop into its own browser tree root only when it is
@@ -1275,22 +1281,19 @@ class SourceManager:
             # native source_url on the new siblings. Re-rooting them instead would
             # split that one dir's old and new contents across two roots with
             # nothing to reconcile them (a monitor=false dir never rescans).
-            reroot = not any(
-                self._reconciler.has_claim(claim.source_id) for claim in claims
-            )
+            reroot = not already_ids
 
             for claim in claims:
-                already = self._reconciler.has_claim(claim.source_id)
-                if already:
-                    already_present.append(claim.source_id)
+                if claim.source_id in already_ids:
+                    tally.already_present.append(claim.source_id)
                     # fresh_signatures: this drop is not the periodic pass, so
                     # the scan cache holds what that pass last saw, not what is
                     # on disk now.
                     if self._reconciler._refresh_claim(claim, fresh_signatures=True):
-                        refreshed.append(claim.source_id)
-                        yield ("progress", len(added), str(claim.primary_path))
+                        tally.refreshed.append(claim.source_id)
+                        yield ("progress", len(tally.added), str(claim.primary_path))
                     else:
-                        failed.append(
+                        tally.failed.append(
                             (
                                 str(claim.primary_path),
                                 "could not rebuild (see server log); the "
@@ -1318,10 +1321,10 @@ class SourceManager:
                         claim, catalog_url=catalog_url
                     ):
                         desc = self._descriptor_for(claim.source_id)
-                        added.append(desc)
-                        yield ("progress", len(added), str(claim.primary_path))
+                        tally.added.append(desc)
+                        yield ("progress", len(tally.added), str(claim.primary_path))
                     else:
-                        failed.append(
+                        tally.failed.append(
                             (
                                 str(claim.primary_path),
                                 "could not open or register (see server log)",
@@ -1331,7 +1334,7 @@ class SourceManager:
                 if should_cancel is not None and should_cancel():
                     break
 
-            yield ("result", added, already_present, refreshed, removed, failed)
+            yield ("result", tally)
         finally:
             self._catalog_lock.release()
 
@@ -1350,20 +1353,23 @@ class SourceManager:
         periodic path removes under. So a source goes only when its primary path
         is gone from the filesystem, which is the case #944 reports.
         """
-        try:
-            root_path = Path(resolve_local_path(root)).resolve(strict=False)
-        except OSError:
-            return []
+        # `root` is what resolve_local_path returned in add_local_source; a
+        # second, differently-spelled canonicalization here is what drifts (#947).
+        root_path = Path(root)
 
         removed: List[str] = []
         for source_id, claim in self._reconciler.claim_items():
             if source_id in discovered_ids or is_remote_url(claim.primary_path):
                 continue
+            # Existence first: it is one stat and rejects nearly every source in
+            # the catalog, where resolve() is an lstat per path component.
+            if os.path.exists(claim.primary_path):
+                continue
             try:
                 primary = Path(claim.primary_path).resolve(strict=False)
             except OSError:
                 continue
-            if not primary.is_relative_to(root_path) or primary.exists():
+            if not primary.is_relative_to(root_path):
                 continue
             if self._reconciler._commit_remove_source(source_id):
                 removed.append(source_id)

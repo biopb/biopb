@@ -118,16 +118,14 @@ class SourceRegistry:
         the id was free. The displaced adapter is **not** closed: a reader that
         already resolved it through :meth:`get` is still decoding from it, so
         closing is the caller's to do once it has drained (see
-        ``SourceAdapter.close``). Callers that skip that leak the handle -- which
-        is what a bare :meth:`register` over a live id does, and why a
-        replacement goes through here instead.
+        ``SourceAdapter.close``). That handback is this method's whole content --
+        a bare :meth:`register` over a live id leaks what it overwrote.
         """
-        adapter = normalize_adapter(adapter)
         with self._lock:
             displaced = self._sources.get(source_id)
-            self._sources[source_id] = adapter
+            registered = self.register(source_id, adapter)
         logger.debug(f"Swapped source adapter: {source_id}")
-        return adapter, displaced
+        return registered, displaced
 
     def get(self, source_id: str) -> Optional[SourceAdapter]:
         """Thread-safe source lookup."""

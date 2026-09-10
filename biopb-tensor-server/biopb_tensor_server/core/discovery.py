@@ -962,14 +962,7 @@ class DiscoveryState:
 
         # Update claim's source_id (important for callbacks)
         claim.source_id = source_id
-        claim.member_paths = member_paths
-
-        # Store claim
-        self.claims[source_id] = claim
-        self.source_to_paths[source_id] = member_paths
-        for path in member_paths:
-            self.path_to_source[path] = source_id
-            self.consumed_paths.add(path)
+        self._store_claim(claim, member_paths)
 
         # Callback
         if notify and self.on_source_added:
@@ -977,7 +970,26 @@ class DiscoveryState:
 
         return True
 
-    def replace_claim(self, claim: SourceClaim, notify: bool = True) -> Set[str]:
+    def _store_claim(
+        self,
+        claim: SourceClaim,
+        member_paths: Set[str],
+        skip: Set[str] = frozenset(),
+    ) -> None:
+        """Write *claim* into the four indices, superseding any entry for its id.
+
+        The conflict policy is the caller's: *skip* names member paths to leave
+        attributed to their current owner. Shared so the ownership maps cannot
+        end up maintained by one storing path and not the other.
+        """
+        claim.member_paths = member_paths
+        self.claims[claim.source_id] = claim
+        self.source_to_paths[claim.source_id] = member_paths
+        for path in member_paths - skip:
+            self.path_to_source[path] = claim.source_id
+            self.consumed_paths.add(path)
+
+    def replace_claim(self, claim: SourceClaim) -> Set[str]:
         """Force a claim into state even where its membership overlaps another.
 
         Used by a rebuild whose adapter is already live under this source_id
@@ -993,7 +1005,6 @@ class DiscoveryState:
         Args:
             claim: SourceClaim to store, superseding any existing entry for
                 its source_id.
-            notify: Whether to invoke on_source_added after storing the claim
 
         Returns:
             The subset of claim.member_paths still owned by another source_id.
@@ -1007,16 +1018,7 @@ class DiscoveryState:
             if self.path_to_source.get(path) not in (None, source_id)
         }
 
-        claim.member_paths = member_paths
-        self.claims[source_id] = claim
-        self.source_to_paths[source_id] = member_paths
-        for path in member_paths - conflicting:
-            self.path_to_source[path] = source_id
-            self.consumed_paths.add(path)
-
-        if notify and self.on_source_added:
-            self.on_source_added(claim)
-
+        self._store_claim(claim, member_paths, skip=conflicting)
         return conflicting
 
     def remove_claim(self, path: str, notify: bool = True) -> Optional[str]:

@@ -1113,14 +1113,14 @@ class TensorFlightServer(flight.FlightServerBase):
                     )
                     yield AddSourceStreamMessage(progress=progress).SerializeToString()
                 else:  # "result"
-                    _, added, already_present, refreshed, removed, failed = event
+                    _, tally = event
                     result = AddSourceResult(
-                        already_present=already_present,
-                        refreshed=refreshed,
-                        removed=removed,
+                        already_present=tally.already_present,
+                        refreshed=tally.refreshed,
+                        removed=tally.removed,
                     )
-                    result.added.extend(d for d in added if d is not None)
-                    for path, reason in failed:
+                    result.added.extend(d for d in tally.added if d is not None)
+                    for path, reason in tally.failed:
                         result.failed.add(path=path, reason=reason)
                     yield AddSourceStreamMessage(result=result).SerializeToString()
         except (FileNotFoundError, PermissionError, ValueError) as exc:
