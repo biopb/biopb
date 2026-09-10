@@ -36,6 +36,7 @@ taken by the commit primitives) lives here.
 from __future__ import annotations
 
 import logging
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -125,11 +126,9 @@ class Reconciler:
     _retry_backoff_initial = 1.0
     _retry_backoff_max = 60.0
     _failure_log_interval = 30.0
-    # A rebuild that keeps failing this many times in a row (e.g. a member
-    # file of a monitored multi-file source was deleted) is presumed
-    # permanent, not transient like the metadata-DB hiccups #944 guards
-    # against -- give up and remove it rather than serving stale bytes
-    # forever on capped backoff.
+    # A rebuild failing this many times running is presumed permanent (a member
+    # file deleted), not a transient DB hiccup -- remove the source rather than
+    # serve stale bytes forever on capped backoff.
     _max_refresh_failures = 5
 
     def __init__(
@@ -349,8 +348,10 @@ class Reconciler:
                 continue
 
             try:
-                resolved_path = Path(member_path).resolve(strict=False)
-                stat_result = resolved_path.stat()
+                # `stat` follows symlinks, so it lands where an explicit
+                # `resolve()` would -- and the mode it returns answers is_dir
+                # without a second trip.
+                stat_result = Path(member_path).stat()
             except OSError:
                 continue
 
@@ -359,7 +360,7 @@ class Reconciler:
             # per-claim flag so hydration/eviction does not flap a resolved source.
             signatures[member_path] = build_entry_signature(
                 stat_result,
-                resolved_path.is_dir(),
+                stat.S_ISDIR(stat_result.st_mode),
                 cloud=cloud,
             )
         return signatures
@@ -449,20 +450,14 @@ class Reconciler:
             self._record_failed_source_attempt(claim.source_id)
             return False
 
+        signatures = self._build_claim_signatures(claim)
         with self._lock:
             added = self._state.add_claim(claim, notify=False)
             if not added:
                 self._rollback_source_registration(claim.source_id)
                 self._record_failed_source_attempt(claim.source_id)
                 return False
-            self._source_signatures[claim.source_id] = self._build_claim_signatures(
-                claim
-            )
-            # Track cloud-root sources so the incremental reconcile can preserve
-            # them by a hash-set check (see _reconcile_discovered_state).
-            if self._is_under_cloud_root(claim.primary_path):
-                self._cloud_source_ids.add(claim.source_id)
-            self._clear_failed_source_attempt(claim.source_id)
+            self._commit_claim_bookkeeping(claim, signatures)
 
         # Route the freshly committed source to the precache worker. The
         # live-vs-startup gate (and the best-effort hook invocation) lives in the
@@ -470,17 +465,31 @@ class Reconciler:
         self._notify_source_committed(claim.source_id)
         return True
 
+    def _commit_claim_bookkeeping(
+        self, claim: SourceClaim, signatures: Dict[str, Tuple[Any, ...]]
+    ) -> None:
+        """Index a claim that has just been committed. Caller holds ``self._lock``.
+
+        Every index a commit must leave consistent, in one place: the add and
+        refresh paths share it so a new one cannot be added to only one of them.
+        ``_cloud_source_ids`` is what lets the incremental reconcile preserve a
+        cloud-root source by a hash-set check (see _reconcile_discovered_state).
+        """
+        self._source_signatures[claim.source_id] = signatures
+        if self._is_under_cloud_root(claim.primary_path):
+            self._cloud_source_ids.add(claim.source_id)
+        self._clear_failed_source_attempt(claim.source_id)
+
     def _refresh_claim(
         self, claim: SourceClaim, fresh_signatures: bool = False
     ) -> bool:
         """Re-register an already-confirmed source against its bytes as they are now.
 
-        The third commit primitive, beside add and remove. A source's descriptor
-        and its ``content_version`` are both sampled in the adapter's
-        ``__init__``, so the only way to notice that a file was rewritten in
-        place is to build a new adapter -- and the version is what namespaces the
-        chunk cache, so a refresh that skipped it would leave the old bytes being
-        served (biopb/biopb#944).
+        A source's descriptor and its ``content_version`` are both sampled in the
+        adapter's ``__init__``, so building a new adapter is the only way to
+        notice that a file was rewritten in place -- and the version is what
+        namespaces the chunk cache, so a refresh that skipped it would go on
+        serving the pre-edit bytes (biopb/biopb#944).
 
         Registration goes through ``replace=True``, which swaps the new adapter
         in over the old one and closes the old one only afterwards; see
@@ -519,19 +528,20 @@ class Reconciler:
                 self._commit_remove_source(claim.source_id)
             return False
 
+        # Outside the lock: with fresh_signatures this stats every member, and
+        # the lock it would otherwise hold also serializes the rescan's reconcile.
+        signatures = self._build_claim_signatures(claim, use_cache=not fresh_signatures)
+
         with self._lock:
             # Membership moves under a source (a file added to a sequence dir),
             # so the claim is replaced rather than left at what was discovered
             # when it was first registered.
             self._state.remove_claim(previous.primary_path, notify=False)
-            # The rebuilt adapter is already live (registration above already
-            # swapped it in and closed the old one), so the catalog must track
-            # the NEW membership even if it overlaps another source's claim --
-            # restoring the old membership here would describe an adapter that
-            # no longer exists. replace_claim keeps this source's entry (and
-            # any non-conflicting paths) in sync with what's actually served,
-            # rather than add_claim's reject-on-conflict semantics.
-            conflicting = self._state.replace_claim(claim, notify=False)
+            # The rebuilt adapter is already live, so state must track the NEW
+            # membership even where it overlaps another source's claim; the old
+            # membership would describe an adapter that no longer exists. Hence
+            # replace_claim rather than add_claim's reject-on-conflict.
+            conflicting = self._state.replace_claim(claim)
             if conflicting:
                 logger.error(
                     "Refreshed source %s now overlaps another source's claim "
@@ -540,20 +550,13 @@ class Reconciler:
                     claim.source_id,
                     sorted(conflicting),
                 )
-            self._source_signatures[claim.source_id] = self._build_claim_signatures(
-                claim, use_cache=not fresh_signatures
-            )
-            if self._is_under_cloud_root(claim.primary_path):
-                self._cloud_source_ids.add(claim.source_id)
-            self._clear_failed_source_attempt(claim.source_id)
+            self._commit_claim_bookkeeping(claim, signatures)
 
         logger.info(f"Refreshed source: {claim.source_id}")
-        # Warm unconditionally, exactly as a fresh add does -- not only when the
-        # content_version moved. A drop is the user saying they care about this
-        # data, and the cache evicts under LRU, so an unchanged source can still
-        # have holes a warm would refill. Costs little when there are none: an
-        # unmoved token leaves every chunk_id, and so every cache key, identical,
-        # and resolve_chunk_data calls compute_fn only on a miss.
+        # Warm as a fresh add does, not only when the content_version moved: the
+        # cache evicts under LRU, so an unchanged source can still have holes.
+        # Cheap when it has none -- an unmoved token leaves every cache key
+        # identical, and resolve_chunk_data calls compute_fn only on a miss.
         self._notify_source_committed(claim.source_id)
         return True
 
@@ -1039,7 +1042,7 @@ class Reconciler:
                 self._metadata_db.sync_source_added(claim.source_id, adapter)
 
             self._path_to_source_id[claim.primary_path] = claim.source_id
-            if displaced is not None and displaced is not adapter:
+            if displaced is not None:
                 # Only now: a reader that resolved the old adapter before the
                 # swap is still decoding from it, and close() drains that.
                 close_adapter(displaced)
