@@ -20,9 +20,11 @@ Caching behavior depends on the configured CacheManager backend:
 from __future__ import annotations
 
 import logging
+import math
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from itertools import islice
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -131,7 +133,7 @@ class _BorrowedUnit:
 
     __slots__ = ("_cache", "key")
 
-    def __init__(self, cache_manager: CacheManager) -> None:
+    def __init__(self, cache_manager: Optional[CacheManager]) -> None:
         self._cache = cache_manager
         self.key: Optional[bytes] = None
 
@@ -174,9 +176,37 @@ def unpack_chunk_view(batch: pa.RecordBatch) -> np.ndarray:
     """
     dtype = np.dtype(batch.column("dtype")[0].as_py())
     shape = tuple(batch.column("shape").to_pylist()[0])
-    count = int(np.prod(shape)) if shape else 0
+    count = math.prod(shape) if shape else 0
     data_buf = batch.column("data").buffers()[2]
     return np.frombuffer(data_buf, dtype=dtype, count=count).reshape(shape)
+
+
+def _acquired_chunk_view(
+    cache_manager: CacheManager,
+    key: bytes,
+    expected_shape: Tuple[int, ...],
+    dtype: np.dtype,
+) -> Optional[np.ndarray]:
+    """A view of the cached chunk at *key*, still acquired, or None.
+
+    ``touch=False``: these reads stand in for one the adapter could do itself,
+    and one coarse extent covers every chunk of the source -- crediting them all
+    would let a zoomed-out read decide what stays cached
+    (:meth:`CacheBackend.try_acquire`).
+
+    None where the entry went between the probe and here, or where its stored
+    shape or dtype is not the one this extent expects -- a stale key collision,
+    not something to read blind. The entry is released before returning None, so
+    only a view hands back a held reference.
+    """
+    entry = cache_manager.try_acquire(key, touch=False)
+    if entry is None:
+        return None
+    block = unpack_chunk_view(entry.data) if entry.data is not None else None
+    if block is None or block.shape != expected_shape or block.dtype != dtype:
+        cache_manager.release(key)
+        return None
+    return block
 
 
 def unpack_chunk_array(batch: pa.RecordBatch) -> np.ndarray:
@@ -978,9 +1008,8 @@ class TensorAdapter(SourceAdapter):
 
         ``cache_manager`` lets the default source its units from the
         full-resolution chunks the cache already holds rather than decode them
-        from the source again -- see :meth:`_cache_sourced_units`. ``None`` (the
-        default, and what a caller with no cache passes) is exactly the
-        behaviour that was here before it.
+        from the source again -- see :meth:`_cache_sourced_units`. ``None``
+        streams from the source throughout.
 
         ``nearest`` takes a shorter route where the backend offers one: it is a
         pick, so :meth:`get_decimated_data` expresses it whole, and an adapter
@@ -1045,16 +1074,19 @@ class TensorAdapter(SourceAdapter):
                 ChunkBounds(start=list(unit_start), stop=list(unit_stop))
             )
 
-        unit = streaming_unit(
-            extent, self.get_transfer_chunk_size(), self.read_block_shape, scale_hint
+        transfer = tuple(max(1, int(size)) for size in self.get_transfer_chunk_size())
+        unit = streaming_unit(extent, transfer, self.read_block_shape, scale_hint)
+        unit, fetch, borrowed = self._cache_sourced_units(
+            cache_manager,
+            descriptor,
+            start,
+            stop,
+            unit,
+            scale_hint,
+            reduction_method,
+            read,
+            transfer,
         )
-        fetch = read
-        borrowed = None
-        sourced = self._cache_sourced_units(
-            cache_manager, descriptor, start, stop, unit, scale_hint, reduction_method
-        )
-        if sourced is not None:
-            unit, fetch, borrowed = sourced
 
         try:
             if all(
@@ -1067,11 +1099,8 @@ class TensorAdapter(SourceAdapter):
                 # mapping and ``nearest`` picks a view of that, which cannot
                 # outlive the entry it is returned past. Materialising the
                 # reduced array costs prod(scale) less than the unit copy it
-                # replaces. A buffered unit needs none of this -- its buffer is
-                # the closure's own and outlives the read -- and asking the mode
-                # rather than the unit would copy a buffered pick for nothing,
-                # since ``ascontiguousarray`` copies any strided input.
-                if borrowed is not None and borrowed.key is not None:
+                # replaces; a buffered unit owns its bytes already.
+                if borrowed.key is not None:
                     return np.ascontiguousarray(reduced)
                 return reduced
 
@@ -1086,8 +1115,7 @@ class TensorAdapter(SourceAdapter):
                 descriptor.dtype,
             )
         finally:
-            if borrowed is not None:
-                borrowed.release()
+            borrowed.release()
 
     def _cache_sourced_units(
         self,
@@ -1098,13 +1126,16 @@ class TensorAdapter(SourceAdapter):
         unit: Tuple[int, ...],
         scale_hint: Tuple[int, ...],
         reduction_method: str,
-    ) -> Optional[Tuple[Tuple[int, ...], Callable[..., np.ndarray], _BorrowedUnit]]:
+        read: Callable[..., np.ndarray],
+        transfer: Tuple[int, ...],
+    ) -> Tuple[Tuple[int, ...], Callable[..., np.ndarray], _BorrowedUnit]:
         """``(unit, fetch, borrowed)`` for serving this extent out of the cache.
 
         ``fetch`` may hand back a view onto a cache segment rather than a copy,
         and ``borrowed`` is both how the caller tells (``.key``, per unit) and
         how it frees the last one (``.release()``, once the reduction is done).
-        None (rather than the triple) declines the whole path.
+        Declining hands back the caller's own ``unit`` and ``read`` with nothing
+        held, so the caller has one shape to drive either way.
 
         The full-resolution chunks under a scaled read are ordinary cache
         entries: a scaled chunk's bounds snap to ``transfer x scale``
@@ -1115,45 +1146,25 @@ class TensorAdapter(SourceAdapter):
         pass -- units are assembled from them instead of decoded from the source
         a second time.
 
-        **What that trades is two read paths, and the codec is not the
-        difference.** A segment is mmap'd, so a cached chunk is a view and the
-        only cost is one copy at memcpy speed; a store hands its bytes back
-        through a file read that is then materialised and copied into the output.
-        Measured on an 8192^2 uint16 zarr chunked at 4096, one scale-16 virtual
-        chunk, page cache warm, medians of 3 (and at the grid the adapter itself
-        chooses -- forcing a 4x finer one inflates the per-entry cost here 16x
-        and inverts some of these):
-
-        ==================  =========  ========  ========
-        store               method     source    cache
-        ==================  =========  ========  ========
-        blosc, random       nearest    98.8 ms    9.1 ms
-        blosc, random       area      141.2 ms   56.0 ms
-        blosc, 116x pattern nearest    16.8 ms    9.1 ms
-        blosc, 116x pattern area       67.5 ms   56.2 ms
-        uncompressed        nearest    91.8 ms    8.7 ms
-        uncompressed        area      133.1 ms   55.2 ms
-        ==================  =========  ========  ========
-
-        ``zarr[whole chunk]`` costs the same 24 ms compressed or not (1.30
-        GiB/s), of which 12.6 ms is the file read alone, against a 16 GiB/s
-        memcpy floor -- so what this path removes is that read path, not a
-        decode. An adapter whose ``get_data`` is *already* an mmap crop would
-        have nothing to gain, and those are precisely the ones that report no
-        :attr:`read_block_shape` and implement :meth:`get_decimated_data`, so
-        they return before the unit loop and never arrive here.
+        What it trades is two read paths, not a decode: a segment is mmap'd, so
+        a cached chunk is a view and the only cost is one memcpy, where a store
+        hands its bytes back through a file read that is then materialised. On
+        an 8192^2 uint16 zarr chunked at 4096, one scale-16 virtual chunk, page
+        cache warm: 99 -> 9 ms for ``nearest``, 141 -> 56 ms for ``area``, and
+        the codec barely moves either (docs/fused-scaling-path.md, sec 9). An
+        adapter whose ``get_data`` is *already* an mmap crop has nothing to gain,
+        and those are the ones that report no :attr:`read_block_shape` and
+        implement :meth:`get_decimated_data`, so they never arrive here.
 
         **The unit follows the reduction's cost model.** A pick needs none of
         what it skips, so the smallest unit that still tiles into whole chunks
-        wins -- which is also what lets the unit be *borrowed* rather than copied
-        (:meth:`_borrow_cached_unit`), since a unit that is one chunk is one
-        mapping the pick can read straight out of. An averaging
-        reduction runs ``prod(scale)`` strided adds per unit *whatever the unit's
-        size*, so more units is the same bytes over more, smaller numpy calls --
-        195 ms against 80 -- and it keeps the caller's unit, which is also the one
-        a source read would have held, so residency cannot regress. Both are the
-        same fact about the kernels that gives ``nearest`` a fused
-        :meth:`get_decimated_data` and ``area`` none.
+        wins -- which is also what lets it be *borrowed* rather than copied
+        (:meth:`_borrow_cached_unit`): a unit that is one chunk is one mapping
+        the pick reads straight out of. An averaging reduction runs
+        ``prod(scale)`` strided adds per unit whatever its size, so more units is
+        the same bytes over more, smaller numpy calls (195 ms against 80); it
+        keeps the caller's unit, which a source read would have held anyway, so
+        residency cannot regress.
 
         **On by default** (``cache.source_scaled_reads``), and the timings above
         are the smaller half of why. A scaled read is usually a pretext for work
@@ -1174,15 +1185,19 @@ class TensorAdapter(SourceAdapter):
         A probe is a decision, never a promise: an entry can be evicted between
         it and the read, so the fetch falls back to the source per unit.
         """
-        if cache_manager is None or not getattr(
-            cache_manager, "source_scaled_reads", False
-        ):
-            return None
+        declined = (unit, read, _BorrowedUnit(None))
+        if cache_manager is None or not cache_manager.source_scaled_reads:
+            return declined
 
-        transfer = tuple(max(1, int(size)) for size in self.get_transfer_chunk_size())
         shape = tuple(int(dim) for dim in descriptor.shape)
         extent = tuple(hi - lo for lo, hi in zip(start, stop, strict=True))
-        if reduction_method == "nearest":
+        # ``nearest`` sizes its unit at one chunk, so the copy that unit would
+        # take moves prod(scale) times the bytes the pick then reads -- borrow
+        # the entry's own mapping instead (:meth:`_borrow_cached_unit`). ``area``
+        # reads every byte anyway and its edge units go through the padding and
+        # strided-add kernels, so it keeps the buffer.
+        borrows = reduction_method == "nearest"
+        if borrows:
             # No read block: that floor speaks for a source read this path does
             # not make. The rounding to whole reduction blocks stays, so a chunk
             # below one block still yields a unit that does not split one.
@@ -1195,43 +1210,37 @@ class TensorAdapter(SourceAdapter):
         # last chunk on an axis ends at the tensor), so this only declines an
         # extent no read plan asks for.
         if any(lo % size for lo, size in zip(start, transfer, strict=True)):
-            return None
+            return declined
         if any(
             hi % size and hi != dim
             for hi, size, dim in zip(stop, transfer, shape, strict=True)
         ):
-            return None
+            return declined
         if any(
             span % size and span != whole
             for span, size, whole in zip(unit, transfer, extent, strict=True)
         ):
-            return None
-        for _chunk_bounds, key in self._chunk_cache_keys(
+            return declined
+        # Keyed by chunk origin and kept: the fetch below needs the same keys per
+        # unit, and minting one is ~4.6 us against the ~45 us the chunk's memcpy
+        # costs -- at prod(scale) chunks per scaled read, re-minting them was a
+        # tenth of this path.
+        keys: Dict[Tuple[int, ...], bytes] = {}
+        for chunk_start, key in self._chunk_cache_keys(
             descriptor, start, stop, transfer
         ):
             if not cache_manager.contains(key):
-                return None
+                return declined
+            keys[chunk_start] = key
 
-        # One buffer for every unit of this read, not one per unit. A fresh
-        # 32 MiB destination measured 31.7 ms against 8.3 ms for a reused one on
-        # the unit below -- copying out of the segment mapping into pages that
-        # have never been touched faults them interleaved with the read. The
-        # first unit is the largest (``covering_units`` clamps only the last one
-        # on an axis), so it sizes the buffer and the rest take a slice of it.
-        #
-        # Safe to reuse because the only consumer is one iteration of
-        # :func:`~.stream_reduce.stream_reduce`, which reduces the unit and
-        # writes the result into its own output before asking for the next one
-        # -- and the single-unit shortcut asks exactly once per closure.
+        # One buffer for every unit, not one per unit: a fresh 32 MiB
+        # destination measured 31.7 ms against 8.3 ms reused, because untouched
+        # pages fault interleaved with the copy out of the mapping. The first
+        # unit is the largest (``covering_units`` clamps only the last on an
+        # axis), so it sizes the buffer and the rest slice it. Safe because
+        # ``stream_reduce`` writes each unit out before asking for the next.
         buffer: Optional[np.ndarray] = None
         dtype = np.dtype(descriptor.dtype)
-        # ``nearest`` sized its unit at one chunk above, so the copy that unit
-        # would take moves prod(scale) times the bytes the pick then reads.
-        # Borrowing the entry's own mapping instead skips it; see
-        # :meth:`_borrow_cached_unit`. ``area`` reads every byte anyway, its unit
-        # is normally several chunks, and its edge units go through the padding
-        # and strided-add kernels -- so it keeps the buffer.
-        borrows = reduction_method == "nearest"
         borrowed = _BorrowedUnit(cache_manager)
 
         def fetch(unit_start, unit_stop):
@@ -1244,7 +1253,7 @@ class TensorAdapter(SourceAdapter):
             )
             if borrows:
                 lent = self._borrow_cached_unit(
-                    cache_manager, descriptor, unit_start, unit_stop, transfer, dtype
+                    cache_manager, keys, unit_start, unit_stop, transfer, shape, dtype
                 )
                 if lent is not None:
                     key, block = lent
@@ -1256,14 +1265,12 @@ class TensorAdapter(SourceAdapter):
                 buffer = np.empty(span, dtype=dtype)
             out = buffer[tuple(slice(0, size) for size in span)]
             if self._assemble_from_cache(
-                cache_manager, descriptor, unit_start, unit_stop, transfer, out
+                cache_manager, keys, unit_start, unit_stop, transfer, shape, out
             ):
                 return out
             # Evicted since the probe. One source read of the unit, which is what
             # this extent would have cost all along.
-            return self.get_data(
-                ChunkBounds(start=list(unit_start), stop=list(unit_stop))
-            )
+            return read(unit_start, unit_stop)
 
         return unit, fetch, borrowed
 
@@ -1274,8 +1281,8 @@ class TensorAdapter(SourceAdapter):
         stop: Sequence[int],
         transfer: Sequence[int],
     ) -> Any:
-        """``((chunk_start, chunk_stop), cache_key)`` for the full-resolution
-        chunks tiling ``[start, stop)``.
+        """``(chunk_start, cache_key)`` for the full-resolution chunks tiling
+        ``[start, stop)``.
 
         Minted exactly as ``_get_read_plan`` mints an unscaled endpoint -- same
         absolute grid, same ``array_id``, same ``content_version`` header --
@@ -1292,15 +1299,16 @@ class TensorAdapter(SourceAdapter):
                 descriptor.array_id,
                 ChunkBounds(start=list(chunk_start), stop=list(chunk_stop)),
             )
-            yield (chunk_start, chunk_stop), cache_key_for_chunk_id(chunk_id)
+            yield chunk_start, cache_key_for_chunk_id(chunk_id)
 
     def _borrow_cached_unit(
         self,
         cache_manager: CacheManager,
-        descriptor: TensorDescriptor,
+        keys: Dict[Tuple[int, ...], bytes],
         start: Sequence[int],
         stop: Sequence[int],
         transfer: Sequence[int],
+        shape: Sequence[int],
         dtype: np.dtype,
     ) -> Optional[Tuple[bytes, np.ndarray]]:
         """``(key, view)`` where one cached chunk *is* this unit, else None.
@@ -1314,70 +1322,56 @@ class TensorAdapter(SourceAdapter):
         unit, and never lets a view of it escape (see :meth:`get_scaled_data`,
         contract 4).
 
-        None where the unit is more than one chunk, where the entry went between
-        the probe and here, or where its stored shape or dtype is not the one
-        this extent expects -- a stale key collision, not something to reduce
-        blind. The caller falls back to :meth:`_assemble_from_cache`.
+        None where the unit is more than one chunk, or where
+        :func:`_acquired_chunk_view` declines the entry. The caller falls back to
+        :meth:`_assemble_from_cache`.
         """
-        keys = list(self._chunk_cache_keys(descriptor, start, stop, transfer))
-        if len(keys) != 1:
+        chunks = list(islice(covering_units(start, stop, transfer, shape), 2))
+        if len(chunks) != 1:
             return None
-        key = keys[0][1]
-        entry = cache_manager.try_acquire(key, touch=False)
-        if entry is None:
+        key = keys.get(chunks[0][0])
+        if key is None:
             return None
         span = tuple(int(hi) - int(lo) for lo, hi in zip(start, stop, strict=True))
-        block = unpack_chunk_view(entry.data) if entry.data is not None else None
-        if block is None or block.shape != span or block.dtype != dtype:
-            cache_manager.release(key)
+        block = _acquired_chunk_view(cache_manager, key, span, dtype)
+        if block is None:
             return None
         return key, block
 
     def _assemble_from_cache(
         self,
         cache_manager: CacheManager,
-        descriptor: TensorDescriptor,
+        keys: Dict[Tuple[int, ...], bytes],
         start: Sequence[int],
         stop: Sequence[int],
         transfer: Sequence[int],
+        shape: Sequence[int],
         out: np.ndarray,
     ) -> bool:
         """Fill *out* with ``[start, stop)`` from the cache, chunk by chunk.
 
         False means "not all of it is here": an eviction since the probe, or an
-        entry whose stored shape or dtype is not the one this extent expects,
-        which is a stale key collision and not something to paste in blind. The
-        caller reads the unit from the source instead -- *out* may have been
-        partly written by then, and is overwritten wholesale by that read.
+        entry :func:`_acquired_chunk_view` declines. The caller reads the unit
+        from the source instead -- *out* may have been partly written by then,
+        and is overwritten wholesale by that read.
 
         One copy per chunk, straight into *out*, and the entry is held for
-        exactly that copy: ``unpack_chunk_view`` is a view onto the segment's
-        mapping, so the copy reads file-backed pages and must not outlive its
-        reference.
+        exactly that copy: the view is onto the segment's mapping, so the copy
+        reads file-backed pages and must not outlive its reference.
         """
-        for (chunk_start, chunk_stop), key in self._chunk_cache_keys(
-            descriptor, start, stop, transfer
-        ):
-            # touch=False: this read stands in for one this adapter could do
-            # itself, and one coarse extent covers every chunk of the source --
-            # crediting them all would let a zoomed-out read decide what stays
-            # cached (CacheBackend.try_acquire).
-            entry = cache_manager.try_acquire(key, touch=False)
-            if entry is None:
+        for chunk_start, chunk_stop in covering_units(start, stop, transfer, shape):
+            key = keys.get(chunk_start)
+            if key is None:
+                return False
+            where = tuple(
+                slice(int(lo) - int(origin), int(hi) - int(origin))
+                for lo, hi, origin in zip(chunk_start, chunk_stop, start, strict=True)
+            )
+            target = out[where]
+            block = _acquired_chunk_view(cache_manager, key, target.shape, out.dtype)
+            if block is None:
                 return False
             try:
-                if entry.data is None:
-                    return False
-                block = unpack_chunk_view(entry.data)
-                where = tuple(
-                    slice(int(lo) - int(origin), int(hi) - int(origin))
-                    for lo, hi, origin in zip(
-                        chunk_start, chunk_stop, start, strict=True
-                    )
-                )
-                target = out[where]
-                if block.shape != target.shape or block.dtype != out.dtype:
-                    return False
                 target[...] = block
             finally:
                 cache_manager.release(key)

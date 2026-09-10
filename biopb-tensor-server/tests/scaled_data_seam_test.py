@@ -350,6 +350,27 @@ class TestStreamingDefault:
             assert np.array_equal(out, _ds.downsample_block(src, (4, 4), "area"))
 
 
+@pytest.fixture
+def cache(tmp_path):
+    """A file-backed cache with the scaled-read knob on.
+
+    The backend matters: `resolve_chunk_data` caches *unscaled* chunks only on
+    the file backend, so it is the one where a full-resolution read leaves
+    anything for a probe to find.
+    """
+    manager = CacheManager(
+        CacheConfig(
+            backend="file",
+            file_cache_dir=tmp_path / "cache",
+            source_scaled_reads=True,
+        )
+    )
+    try:
+        yield manager
+    finally:
+        manager.close()
+
+
 class TestCacheSourcedUnits:
     """A scaled read may source its extent from the cache (biopb/biopb#640).
 
@@ -364,26 +385,6 @@ class TestCacheSourcedUnits:
     trades is two per-byte rates -- the cache holds decoded bytes, the store
     holds what it holds -- which is why it is opted into per deployment.
     """
-
-    @pytest.fixture
-    def cache(self, tmp_path):
-        """A file-backed cache with the knob on.
-
-        The backend matters: `resolve_chunk_data` caches *unscaled* chunks only
-        on the file backend, so it is the one where a full-resolution read
-        leaves anything for a probe to find.
-        """
-        manager = CacheManager(
-            CacheConfig(
-                backend="file",
-                file_cache_dir=tmp_path / "cache",
-                source_scaled_reads=True,
-            )
-        )
-        try:
-            yield manager
-        finally:
-            manager.close()
 
     @staticmethod
     def _warm_level_zero(adapter, cache):
@@ -405,13 +406,13 @@ class TestCacheSourcedUnits:
         assemble = adapter._assemble_from_cache
         borrow = adapter._borrow_cached_unit
 
-        def assemble_spy(cache_manager, descriptor, start, stop, transfer, out):
+        def assemble_spy(cache_manager, keys, start, stop, *rest):
             seen.append((tuple(start), tuple(stop)))
-            return assemble(cache_manager, descriptor, start, stop, transfer, out)
+            return assemble(cache_manager, keys, start, stop, *rest)
 
-        def borrow_spy(cache_manager, descriptor, start, stop, transfer, dtype):
+        def borrow_spy(cache_manager, keys, start, stop, *rest):
             seen.append((tuple(start), tuple(stop)))
-            return borrow(cache_manager, descriptor, start, stop, transfer, dtype)
+            return borrow(cache_manager, keys, start, stop, *rest)
 
         monkeypatch.setattr(adapter, "_assemble_from_cache", assemble_spy)
         monkeypatch.setattr(adapter, "_borrow_cached_unit", borrow_spy)
@@ -748,20 +749,6 @@ class TestBorrowedUnits:
     reads. Borrowing skips that -- at the price of a view whose validity ends
     with the entry, which is what most of this class is about.
     """
-
-    @pytest.fixture
-    def cache(self, tmp_path):
-        manager = CacheManager(
-            CacheConfig(
-                backend="file",
-                file_cache_dir=tmp_path / "cache",
-                source_scaled_reads=True,
-            )
-        )
-        try:
-            yield manager
-        finally:
-            manager.close()
 
     _warm_level_zero = staticmethod(TestCacheSourcedUnits._warm_level_zero)
 
