@@ -66,8 +66,9 @@ class DaskClusterHost:
         # Is anyone actually attached to our cluster? Kernel liveness alone
         # stopped answering that when attaching became explicit (#970): a kernel
         # that detached, or one launched without an address, is alive and holds
-        # nothing. Set when ensure() hands the address out, cleared by
-        # note_detached().
+        # nothing. Set by note_attached() once an attach has landed -- not when
+        # ensure() hands the address out, which the kernel can still refuse --
+        # and cleared by note_detached().
         self._attached = False
         # Monotonic timestamp from which the current no-kernel stretch is
         # measured; None while the cluster is held.
@@ -119,13 +120,12 @@ class DaskClusterHost:
             if self._cluster is not None and not self._is_alive(self._cluster):
                 logger.warning("Daemon dask cluster is not healthy; re-spinning.")
                 self._close_locked()
-            address = (
-                self._address if self._cluster is not None else self._spin_locked()
-            )
-            # Handing the address out *is* the attach: whoever asked is about to
-            # hold it, so the no-holder stretch ends here.
-            self._attached = address is not None
-            return address
+            # Handing the address out is not the attach -- the caller still has
+            # to reach the kernel, which can refuse (a job is running) or fail
+            # to connect. The ledger is updated by note_attached() once that has
+            # actually happened, so a failed attach leaves the fresh cluster on
+            # the reaper's clock instead of held by nobody's client.
+            return self._address if self._cluster is not None else self._spin_locked()
 
     def _spin_locked(self):
         from .._config import get_setting
@@ -192,6 +192,19 @@ class DaskClusterHost:
             self._saw_workers = True
             return True
         return not self._saw_workers
+
+    def note_attached(self, address):
+        """Record the attach a kernel has just *completed*, to *address*.
+
+        Only our own address counts: a kernel that attached to an external
+        scheduler is not holding this cluster, so the same call that records one
+        attach releases the other. Called after the kernel confirms
+        (``attach_cluster``), and at launch for the config-driven attach, which
+        has no confirmation channel -- the kernel attaches during its own
+        bootstrap.
+        """
+        with self._lock:
+            self._attached = address is not None and address == self._address
 
     def note_detached(self):
         """Nobody holds our cluster any more; start the reaper's idle clock.

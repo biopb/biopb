@@ -32,11 +32,15 @@ class TestClusterAddressInjection:
         def __init__(self, address):
             self._address = address
             self.calls = 0
+            self.attached = []
             self.detached = 0
 
         def ensure(self):
             self.calls += 1
             return self._address
+
+        def note_attached(self, address):
+            self.attached.append(address)
 
         def note_detached(self):
             self.detached += 1
@@ -51,6 +55,9 @@ class TestClusterAddressInjection:
             res = host.execute("import os; print(os.environ.get('BIOPB_DASK_ADDRESS'))")
             assert "tcp://127.0.0.1:12345" in res["stdout"]
             assert fake.calls >= 1
+            # The config-driven attach happens inside the kernel's bootstrap and
+            # reports nothing back, so the launch is what records the holder.
+            assert fake.attached == ["tcp://127.0.0.1:12345"]
         finally:
             host.shutdown()
 

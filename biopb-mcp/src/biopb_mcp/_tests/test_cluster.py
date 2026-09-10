@@ -215,9 +215,10 @@ class TestIdleReaper:
         assert fake_local_cluster[0].closed is True
 
     def test_live_kernel_is_never_reaped(self, fake_local_cluster):
+        # The config-driven attach: _launch injects the address and records it.
         host = DaskClusterHost(_cfg(idle_ttl=0.05))
         host.set_kernel_alive(lambda: True)
-        host.ensure()
+        host.note_attached(host.ensure())
         host.start_reaper()
         time.sleep(0.3)  # >> ttl: a reaping bug has ample room to fire
         try:
@@ -241,7 +242,7 @@ class TestIdleReaper:
     def test_no_kernel_predicate_never_reaps(self, fake_local_cluster):
         # An unknown answer must not be read as "safe to close".
         host = DaskClusterHost(_cfg(idle_ttl=0.05))
-        host.ensure()
+        host.note_attached(host.ensure())
         host.start_reaper()
         time.sleep(0.3)
         try:
@@ -282,7 +283,7 @@ class TestIdleReaper:
         # session's whole life.
         host = DaskClusterHost(_default_cfg(idle_ttl=0.05))
         host.set_kernel_alive(lambda: True)
-        host.ensure(on_demand=True)
+        host.note_attached(host.ensure(on_demand=True))
         host.start_reaper()
         try:
             time.sleep(0.2)
@@ -296,11 +297,39 @@ class TestIdleReaper:
     def test_a_live_attached_kernel_keeps_the_cluster(self, fake_local_cluster):
         host = DaskClusterHost(_default_cfg(idle_ttl=0.05))
         host.set_kernel_alive(lambda: True)
-        host.ensure(on_demand=True)
+        host.note_attached(host.ensure(on_demand=True))
         host.start_reaper()
         try:
             time.sleep(0.3)
             assert fake_local_cluster[0].closed is False
+        finally:
+            host.close()
+
+    def test_a_spin_whose_attach_never_landed_is_reaped(self, fake_local_cluster):
+        # ensure() spins, then the kernel refuses (a job is running) or cannot
+        # connect: nobody holds the cluster, so it must not read as attached
+        # just because the address was handed out.
+        host = DaskClusterHost(_default_cfg(idle_ttl=0.05))
+        host.set_kernel_alive(lambda: True)
+        host.ensure(on_demand=True)
+        host.start_reaper()
+        try:
+            time.sleep(0.3)
+            assert fake_local_cluster[0].closed is True
+        finally:
+            host.close()
+
+    def test_attaching_elsewhere_releases_our_cluster(self, fake_local_cluster):
+        # An external scheduler is not ours to hold: the kernel that took it is
+        # no longer on this cluster.
+        host = DaskClusterHost(_default_cfg(idle_ttl=0.05))
+        host.set_kernel_alive(lambda: True)
+        host.note_attached(host.ensure(on_demand=True))
+        host.note_attached("tcp://elsewhere:8786")
+        host.start_reaper()
+        try:
+            time.sleep(0.3)
+            assert fake_local_cluster[0].closed is True
         finally:
             host.close()
 

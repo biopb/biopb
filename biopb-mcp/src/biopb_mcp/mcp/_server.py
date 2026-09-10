@@ -1324,7 +1324,12 @@ async def attach_cluster(address: str | None = None) -> str:
                 "Failed to start a local dask cluster (see the session log). The "
                 "kernel is unchanged and still computes in-process."
             )
-    reply, _done = await _dask_ctl_call(host, "attach", target)
+    reply, done = await _dask_ctl_call(host, "attach", target)
+    # Only now is the cluster actually held -- the kernel could have refused (a
+    # job is running) or failed to connect. note_attached also releases our own
+    # cluster when the kernel attached to an external scheduler instead.
+    if done and _app._cluster_host is not None:
+        _app._cluster_host.note_attached(target)
     return reply
 
 

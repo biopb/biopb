@@ -317,6 +317,10 @@ class KernelHost:
             if address:
                 env = dict(env)
                 env[DASK_ADDRESS_ENV] = address
+                # The config-driven attach happens inside the kernel's own
+                # bootstrap, with nothing to report back, so the launch is the
+                # only signal there is that this cluster is about to be held.
+                self._cluster_host.note_attached(address)
             else:
                 # This kernel starts unattached, so a cluster left over from the
                 # previous one (an attach_cluster the restart discarded) is now

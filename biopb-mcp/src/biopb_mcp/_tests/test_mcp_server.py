@@ -1688,6 +1688,8 @@ class TestAttachDetachCluster:
         result = _tool(_server.attach_cluster)
         # on_demand=True: the config default asks for no cluster, this call does.
         assert cluster_host.ensure.call_args[0] == (True,)
+        # The ledger records the attach the kernel confirmed, not the spin.
+        cluster_host.note_attached.assert_called_once_with("tcp://127.0.0.1:8786")
         snippet = [
             c[0][0]
             for c in server_with_host.execute.call_args_list
@@ -1728,6 +1730,17 @@ class TestAttachDetachCluster:
             returns=_job_reply(error="job job-1 is running in this kernel", busy=True),
         )
         assert "job-1" in _tool(_server.attach_cluster)
+        # Spun but never attached: the ledger must not claim a holder, or the
+        # reaper would keep those workers for the life of the session.
+        cluster_host.note_attached.assert_not_called()
+
+    def test_attaching_elsewhere_releases_the_session_cluster(
+        self, server_with_host, cluster_host
+    ):
+        _install_replies(server_with_host, returns=self._attached())
+        _tool(_server.attach_cluster, address="tcp://elsewhere:8786")
+        # note_attached with someone else's address clears our own ledger.
+        cluster_host.note_attached.assert_called_once_with("tcp://elsewhere:8786")
 
     def test_detach_returns_to_the_in_process_scheduler(
         self, server_with_host, cluster_host
