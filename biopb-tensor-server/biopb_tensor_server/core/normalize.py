@@ -548,7 +548,11 @@ class NormalizingAdapter(TensorAdapter):
 
         if should_cache:
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(cache_key, compute_fn)
+            # The delegate minted this chunk_id (``_permute_plan`` carries it
+            # verbatim) and owns the ladder it has to be classified against.
+            entry = cache_manager.get_or_acquire(
+                cache_key, compute_fn, self._inner._retention_for_chunk(chunk_id)
+            )
             data = entry.data
             cache_manager.release(cache_key)
             return data

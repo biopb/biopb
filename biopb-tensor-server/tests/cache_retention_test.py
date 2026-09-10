@@ -27,7 +27,8 @@ from biopb_tensor_server.core.chunk import (
     encode_chunk_id,
     encode_chunk_id_with_scale,
 )
-from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.config import CacheConfig, PyramidConfig
+from biopb_tensor_server.core.retention import set_active_pyramid_config
 
 
 def _batch(values):
@@ -188,7 +189,22 @@ class TestMemoryBackend:
 
 
 class TestDeclarationAtTheReadSeam:
-    """Who declares what, at the one call every cached chunk goes through."""
+    """Who decides the class, at the one call every cached chunk goes through.
+
+    The chunk decides, not the caller: the precache and a client can ask for the
+    same coarse chunk_id, and whichever gets there first must not fix the class
+    for good.
+    """
+
+    # Knobs that give a 64x64 tensor a one-rung computed ladder at scale (4, 4).
+    LADDER_CFG = PyramidConfig(threshold=16, plane_max_pixels=1024)
+
+    @pytest.fixture
+    def ladder(self):
+        """Install the server's ladder the way TensorFlightServer.__init__ does."""
+        set_active_pyramid_config(self.LADDER_CFG)
+        yield
+        set_active_pyramid_config(None)
 
     @pytest.fixture
     def adapter(self):
@@ -211,30 +227,61 @@ class TestDeclarationAtTheReadSeam:
         yield mgr
         mgr.close()
 
+    def _scaled(self, scale):
+        return encode_chunk_id_with_scale(
+            "src", ChunkBounds(start=[0, 0], stop=[64, 64]), scale, "area"
+        )
+
     def _classes(self, manager):
         return {key[0] for key in manager.backend._pool_queues}
 
-    def test_a_scaled_chunk_is_cheap(self, adapter, manager):
-        chunk_id = encode_chunk_id_with_scale(
-            "src", ChunkBounds(start=[0, 0], stop=[64, 64]), (4, 4), "area"
-        )
-        adapter.resolve_chunk_data(chunk_id, manager)
+    def test_a_ladder_scale_is_normal(self, adapter, manager, ladder):
+        """A rung the client comes back to on every open, and what precache warms."""
+        adapter.resolve_chunk_data(self._scaled((4, 4)), manager)
+
+        assert self._classes(manager) == {"normal"}
+
+    def test_an_off_ladder_scale_is_cheap(self, adapter, manager, ladder):
+        """A one-off scale, regenerable from the full-resolution chunks under it."""
+        adapter.resolve_chunk_data(self._scaled((2, 2)), manager)
 
         assert self._classes(manager) == {"cheap"}
 
-    def test_an_unscaled_chunk_is_normal(self, adapter, manager):
+    def test_an_unscaled_chunk_is_normal(self, adapter, manager, ladder):
         chunk_id = encode_chunk_id("src", ChunkBounds(start=[0, 0], stop=[32, 32]))
         adapter.resolve_chunk_data(chunk_id, manager)
 
         assert self._classes(manager) == {"normal"}
 
-    def test_the_precache_overrides_the_scaled_default(self, adapter, manager):
-        """What the precache warms is a coarse level for a first render, so it
-        outranks the coarse chunks a client asks for in passing -- the one place
-        the same chunk_id means two different things to the cache."""
-        chunk_id = encode_chunk_id_with_scale(
-            "src", ChunkBounds(start=[0, 0], stop=[64, 64]), (4, 4), "area"
-        )
-        adapter.resolve_chunk_data(chunk_id, manager, retention="normal")
+    def test_the_class_does_not_depend_on_who_asked_first(self, adapter, ladder):
+        """The race the predicate exists to close.
 
-        assert self._classes(manager) == {"normal"}
+        A client asking for a level before the precache reached it used to mark
+        that chunk cheap for the life of its segment, because the class came
+        from the code branch that stored it rather than from the chunk.
+        """
+        assert adapter._retention_for_chunk(self._scaled((4, 4))) == "normal"
+        assert adapter._retention_for_chunk(self._scaled((2, 2))) == "cheap"
+
+    def test_a_native_level_read_is_normal(self, adapter, ladder):
+        """Native levels never reach here scaled -- _plan_from_precomputed mints
+        their chunk_ids against the level's own store -- so they are level-0
+        reads as far as the class is concerned."""
+        native_like = encode_chunk_id("src/1", ChunkBounds(start=[0, 0], stop=[32, 32]))
+
+        assert adapter._retention_for_chunk(native_like) == "normal"
+
+    def test_the_ladder_is_the_installed_config_not_a_default(self, adapter):
+        """Under the shipped knobs a 64x64 plane has no computed levels at all,
+        so the chunk_id that is a rung under the fixture's config is a one-off."""
+        assert adapter._retention_for_chunk(self._scaled((4, 4))) == "cheap"
+
+    def test_the_ladder_is_memoized(self, adapter, ladder, monkeypatch):
+        """The hot path must not build a descriptor per chunk."""
+        adapter._retention_for_chunk(self._scaled((4, 4)))
+
+        def explode():
+            raise AssertionError("descriptor rebuilt on a memoized lookup")
+
+        monkeypatch.setattr(adapter, "get_tensor_descriptor", explode)
+        assert adapter._retention_for_chunk(self._scaled((2, 2))) == "cheap"

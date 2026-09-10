@@ -656,7 +656,9 @@ class TestChunkLocateAction:
                 def check_chunk_version(self, chunk_id):
                     pass
 
-                def resolve_chunk_data(self, chunk_id, cache_manager):
+                def resolve_chunk_data(
+                    self, chunk_id, cache_manager, pyramid_config=None
+                ):
                     # Called on a cold miss -- the heaviest work in the handler.
                     observed.append(server.flight_idle_for(0.0))
                     raise ValueError("no data")
@@ -699,7 +701,9 @@ class TestChunkLocateAction:
                         "stale content_version", reason="stale_content_version"
                     )
 
-                def resolve_chunk_data(self, chunk_id, cache_manager):
+                def resolve_chunk_data(
+                    self, chunk_id, cache_manager, pyramid_config=None
+                ):
                     pytest.fail("must not read once the version check rejects it")
 
             chunk_id = encode_chunk_id("z", ChunkBounds(start=[0, 0], stop=[8, 8]))
