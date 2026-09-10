@@ -889,6 +889,33 @@ plan asserting it forever.
 
 ### #816 (compose a scaled chunk from cached full-resolution chunks)
 
+**Shipped in #965**, from the cache side rather than the source side: where every
+full-resolution chunk under a scaled extent is already cached,
+`_cache_sourced_units` sources the units from those entries. What it trades is
+two read paths, not a decode -- a segment is mmap'd, so a cached chunk is a view
+plus one memcpy, where a store read is materialised and copied into the output.
+On an 8192^2 uint16 zarr chunked at 4096, one scale-16 virtual chunk, page cache
+warm, medians of 3, at the grid the adapter itself chooses:
+
+| store | method | source | cache |
+| --- | --- | ---: | ---: |
+| blosc, random | nearest | 98.8 ms | 9.1 ms |
+| blosc, random | area | 141.2 ms | 56.0 ms |
+| blosc, 116x pattern | nearest | 16.8 ms | 9.1 ms |
+| blosc, 116x pattern | area | 67.5 ms | 56.2 ms |
+| uncompressed | nearest | 91.8 ms | 8.7 ms |
+| uncompressed | area | 133.1 ms | 55.2 ms |
+
+`zarr[whole chunk]` costs the same 24 ms compressed or not (1.30 GiB/s), of which
+12.6 ms is the file read alone, against a 16 GiB/s memcpy floor. Forcing a 4x
+finer grid inflates the per-entry cost 16x and inverts some of these. `nearest`
+borrows the entry's mapping and reduces out of it (#966); `area` keeps a reused
+unit buffer, since more units is the same bytes over more, smaller numpy calls
+(195 ms against 80).
+
+The rest of this section is the pre-#965 analysis, kept for the read-amplification
+argument it makes.
+
 They nest rather than compete: compose sits *above* this seam (it decides not to
 read the source at all), and where it declines, `get_scaled_data` runs. They
 must share one streaming reducer (§4), and #816's fold should adopt the

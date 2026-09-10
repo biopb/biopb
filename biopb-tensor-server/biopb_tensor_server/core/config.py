@@ -570,16 +570,9 @@ class CacheConfig:
         metadata={
             "help": "Serve a scaled (downsampled) chunk from the "
             "full-resolution chunks already in the cache instead of reading the "
-            "source again, where all of them are present. Two reasons, and the "
-            "second is the one that decides it. It is faster: a cache segment is "
-            "mmap'd, so a chunk is a view plus one copy at memcpy speed, where a "
-            "store read is materialised and copied into the output -- on an "
-            "8192^2 uint16 zarr chunked at 4096, one scale-16 chunk with the "
-            "page cache warm, 99 -> 9 ms (nearest) and 141 -> 56 ms (area). And "
-            "it warms the right pages: a coarse read is usually a pretext for "
-            "work on real pixels, so pulling the full-resolution chunks through "
-            "leaves their segment pages resident for the full-res read that "
-            "follows. Set false to always read the source."
+            "source again, where all of them are present. Faster, and it leaves "
+            "those chunks' pages resident for the full-resolution read a coarse "
+            "one usually precedes. Set false to always read the source."
         },
     )
     file_deferred_write_mb: int = field(

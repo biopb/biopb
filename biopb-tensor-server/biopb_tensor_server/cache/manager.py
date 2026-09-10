@@ -48,8 +48,8 @@ class CacheManager:
 
     def __init__(self, config: CacheConfig):
         """Initialize with CacheConfig, selecting backend based on config.backend."""
-        # Read by the scaled read (adapter_base._cache_sourced_units), which
-        # holds the manager and nothing else of the config.
+        # On the manager rather than the backend: the scaled read holds the
+        # manager and nothing else of the config.
         self.source_scaled_reads = bool(config.source_scaled_reads)
         if config.backend == "memory":
             self._backend = MemoryCacheBackend(

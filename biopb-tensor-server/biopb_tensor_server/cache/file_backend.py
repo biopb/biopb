@@ -1226,7 +1226,10 @@ class ArrowFileBackend(CacheBackend):
         if seg_info is not None and seg_info.mmap_released:
             self._reopen_segment_mmap(segment_id, seg_info)
         # A probe reads the bytes without crediting the segment; see
-        # CacheBackend.try_acquire for why.
+        # CacheBackend.try_acquire for why. The cold-mmap sweep is driven off the
+        # same accounting: a read that declines to be credited must not schedule
+        # it either, or a scaled read over a cache warmed minutes ago would walk
+        # its own working set and munmap the segments the next unit reads.
         if touch:
             self._update_segment_frequency(segment_id)
 
@@ -1234,10 +1237,10 @@ class ArrowFileBackend(CacheBackend):
         if mmap is None:
             return None
 
-        # Periodic mmap cleanup check
-        self._access_counter += 1
-        if self._access_counter % 100 == 0:
-            self._maybe_release_cold_mmaps()
+        if touch:
+            self._access_counter += 1
+            if self._access_counter % 100 == 0:
+                self._maybe_release_cold_mmaps()
 
         batch = self._read_batch_at(segment_id, mmap, entry_info)
         if batch is None:

@@ -309,21 +309,18 @@ class CacheBackend(ABC):
         (memory) inherit this no-op default; the file backend overrides it.
         """
 
+    @abstractmethod
     def contains(self, key: bytes) -> bool:
         """Whether *key* is cached and servable without computing it.
 
         A peek: takes no reference and reads no data, so it is a decision input
         and never a promise -- an entry may be evicted between this and the
         :meth:`try_acquire` that acts on it, and a caller must handle that miss.
-        Cheap by contract (an index lookup), because the scaled read probes
-        every full-resolution chunk under an extent before deciding how to
-        source it (``adapter_base.get_scaled_data``).
-
-        The default is False -- "this backend cannot say" -- for the same reason
-        :meth:`locate_entry` defaults to None.
+        Cheap by contract (an index lookup), because the scaled read probes every
+        full-resolution chunk under an extent before deciding how to source it.
         """
-        return False
 
+    @abstractmethod
     def try_acquire(self, key: bytes, touch: bool = True) -> Optional[CacheEntry]:
         """The acquired entry for *key* if it is already cached, else None.
 
@@ -335,21 +332,14 @@ class CacheBackend(ABC):
         A PENDING entry is a miss, not a wait: the caller can compute it itself,
         and joining another reader's decode would trade a bounded read for an
         unbounded block. Nothing is counted as a hit or a miss either -- a probe
-        is not a chunk request, and folding it into the ratio would make the
-        hit rate mean something else.
+        is not a chunk request.
 
-        ``touch=False`` reads without telling the eviction policy: no recency
-        bump, no frequency credit, no pool hit. For a read that stands in for one
-        the caller could do itself, that is the honest accounting -- and it
-        matters at scale, because one coarse scaled read covers every
-        full-resolution chunk under its extent
-        (``adapter_base._cache_sourced_units``), which is every segment of the
-        source. Crediting all of them would flatten the frequency signal the
-        policy runs on and let one zoomed-out read decide what stays cached. The
-        pages such a read warms in the OS page cache are not ours to account for
-        and are unaffected either way.
+        ``touch=False`` reads without telling the eviction policy anything: no
+        recency bump, no frequency credit, no pool hit, and no accounting-driven
+        maintenance. One coarse scaled read covers every full-resolution chunk
+        under its extent, so crediting them all would let a zoomed-out read
+        decide what stays cached.
         """
-        return None
 
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk location of a cached chunk, or None.

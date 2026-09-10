@@ -60,6 +60,7 @@ from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
 if TYPE_CHECKING:
+    from biopb_tensor_server.cache.manager import CacheManager
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
@@ -465,7 +466,7 @@ class CziAdapter(TensorAdapter):
         bounds: ChunkBounds,
         scale_hint: Tuple[int, ...],
         reduction_method: str,
-        cache_manager=None,
+        cache_manager: Optional["CacheManager"] = None,
     ) -> np.ndarray:
         """Serve ``nearest`` from libCZI's own ``zoom=``, where it is exact.
 
