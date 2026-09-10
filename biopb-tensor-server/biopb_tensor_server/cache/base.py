@@ -14,7 +14,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Literal, Optional, Tuple
 
 import pyarrow as pa
 
@@ -23,6 +23,23 @@ logger = logging.getLogger(__name__)
 # Chunk splitting threshold - 64MB for parallel Flight transfers
 # (Arrow IPC can handle larger, but we split for throughput optimization)
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
+
+
+# What a miss costs. Eviction on the file backend is whole-segment, so this
+# cannot be consulted when a victim is chosen -- it picks the segment a chunk is
+# written into, and reclamation prefers the cheap ones.
+#
+#   cheap  -- derived data: a scaled chunk reduced from full-resolution chunks
+#             that regenerate it, and that it cannot regenerate.
+#   normal -- the default: a source read and a decode.
+#   pinned -- never evicted. No producer yet: an upload is the only data with no
+#             source to re-read, but nothing deletes a cache entry, so pinning
+#             one would leave the cache no way back under its budget.
+RetentionClass = Literal["cheap", "normal", "pinned"]
+
+# Reclamation order, lowest first. A class absent from this map is never
+# selected for eviction, which is what makes "pinned" pinned.
+EVICTION_RANK: Dict[RetentionClass, int] = {"cheap": 0, "normal": 1}
 
 
 def estimate_batch_bytes(batch: pa.RecordBatch) -> int:
@@ -72,6 +89,7 @@ class CacheEntry:
         ref_count: Number of active references (prevents eviction)
         created_at: Creation timestamp
         size_bytes: Data size in bytes
+        retention: What a miss for this entry would cost (see RetentionClass)
     """
 
     data: Optional[pa.RecordBatch] = None
@@ -81,6 +99,7 @@ class CacheEntry:
     ref_count: int = 0
     created_at: float = 0.0
     size_bytes: int = 0
+    retention: RetentionClass = "normal"
 
     def acquire(self) -> None:
         """Increment reference count to prevent eviction."""
@@ -124,7 +143,7 @@ class CacheEntry:
 class PoolStats:
     """Per-pool cache statistics."""
 
-    pool_key: str  # e.g., "unified-tiny"
+    pool_key: str  # e.g., "cheap-bulk" (retention class + size class)
     hits: int = 0
     misses: int = 0
     segments: int = 0
@@ -178,6 +197,7 @@ class CacheBackend(ABC):
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
+        retention: RetentionClass = "normal",
     ) -> CacheEntry:
         """Get existing entry or create pending entry for computation.
 
@@ -192,13 +212,18 @@ class CacheBackend(ABC):
         Args:
             key: Cache key bytes
             compute_fn: Function to compute data, returns (RecordBatch, size_bytes)
+            retention: What a miss for this chunk costs. Read only when this
+                call is the one that creates the entry; a hit keeps the class
+                the first writer declared.
 
         Returns:
             CacheEntry with ref_count >= 1, state READY
         """
 
     @abstractmethod
-    def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
+    def start_compute(
+        self, key: bytes, retention: RetentionClass = "normal"
+    ) -> Tuple[CacheEntry, bool]:
         """Reserve the key without computing: returns (entry, is_owner).
 
         The check-cache half of get_or_acquire, split out for a caller that
@@ -208,6 +233,7 @@ class CacheBackend(ABC):
 
         Args:
             key: Cache key bytes
+            retention: What a miss for this chunk costs, as in get_or_acquire.
 
         Returns:
             (CacheEntry with ref_count >= 1, is_owner)

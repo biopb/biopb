@@ -11,6 +11,7 @@ Exports:
     - CacheStats: Cache statistics for monitoring
     - ChunkLocation: On-disk byte range of a cached chunk (localhost handoff)
     - EntryState: PENDING, READY, or ERROR states
+    - RetentionClass: what a miss costs ("cheap" | "normal" | "pinned")
     - MemoryCacheBackend: In-memory LRU cache backend
     - MemoryCacheConfig: Configuration for memory backend
     - ArrowFileBackend: Persistent Arrow file cache backend
@@ -27,6 +28,7 @@ from biopb_tensor_server.cache.base import (
     ChunkLocation,
     EntryState,
     PoolStats,
+    RetentionClass,
 )
 from biopb_tensor_server.cache.file_backend import (
     CACHE_FILE_FORMAT_VERSION,
@@ -55,4 +57,5 @@ __all__ = [
     "RecoveryStatus",
     "MAX_ARROW_BATCH_BYTES",
     "PoolStats",
+    "RetentionClass",
 ]

@@ -69,7 +69,7 @@ class PoolQueueInfo:
     - segments: dict for metadata lookup (segment_id -> SieveKSegmentInfo)
 
     Attributes:
-        pool_key: Tuple of (schema_key, size_class)
+        pool_key: Tuple of (retention_class, size_class)
         hand: Current hand offset from tail (0 = tail position)
         queue: deque of segment_ids ordered (newest at left)
         segments: dict mapping segment_id to SieveKSegmentInfo
@@ -77,7 +77,7 @@ class PoolQueueInfo:
         misses: Number of cache misses in this pool
     """
 
-    pool_key: Tuple[str, str]  # (schema_key, size_class)
+    pool_key: Tuple[str, str]  # (retention_class, size_class)
     hand: int = 0  # Current hand offset from tail (0 = tail position)
     queue: deque = field(default_factory=deque)  # segment_ids ordered (newest at left)
     segments: Dict[int, SieveKSegmentInfo] = field(

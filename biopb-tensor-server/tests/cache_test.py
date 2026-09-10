@@ -22,8 +22,7 @@ from biopb_tensor_server.cache import (
 from biopb_tensor_server.cache.file_backend import (
     CACHE_KEY_FIELD,
     SIDECAR_FORMAT_VERSION,
-    SIZE_CLASS_MEDIUM_THRESHOLD,
-    SIZE_CLASS_SMALL_THRESHOLD,
+    SIZE_CLASS_BULK_THRESHOLD,
     SIZE_CLASS_TINY_THRESHOLD,
     ArrowFileBackend,
     ArrowFileConfig,
@@ -445,7 +444,7 @@ class TestProbeWithoutComputing:
             backend.start_compute(b"k")
             backend.complete_entry(b"k", self._data([1, 2, 3]), 24)
             backend.release(b"k")
-            pool_queue = backend._pool_queues.get(("unified", "tiny"))
+            pool_queue = backend._pool_queues.get(("normal", "tiny"))
             assert pool_queue is not None, "expected the entry to land in a pool"
             seg_info = pool_queue.segments[backend._metadata[b"k"].segment_id]
 
@@ -1488,19 +1487,19 @@ class TestSizeClassClassification:
         assert _get_size_class(1) == "tiny"
         assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD - 1) == "tiny"
 
-    def test_small_size_class(self):
-        """Chunks between TINY and SMALL thresholds are small."""
-        assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD) == "small"
-        assert _get_size_class(SIZE_CLASS_SMALL_THRESHOLD - 1) == "small"
+    def test_bulk_size_class(self):
+        """Everything between the two thresholds is one bulk class.
 
-    def test_medium_size_class(self):
-        """Chunks between SMALL and MEDIUM thresholds are medium."""
-        assert _get_size_class(SIZE_CLASS_SMALL_THRESHOLD) == "medium"
-        assert _get_size_class(SIZE_CLASS_MEDIUM_THRESHOLD - 1) == "medium"
+        Deliberately spans the 8 MB transfer target: splitting there cut the
+        population at its own mode.
+        """
+        assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD) == "bulk"
+        assert _get_size_class(8 * 1024 * 1024) == "bulk"
+        assert _get_size_class(SIZE_CLASS_BULK_THRESHOLD - 1) == "bulk"
 
     def test_large_size_class(self):
-        """Chunks over MEDIUM_THRESHOLD are large."""
-        assert _get_size_class(SIZE_CLASS_MEDIUM_THRESHOLD) == "large"
+        """Chunks over BULK_THRESHOLD are large."""
+        assert _get_size_class(SIZE_CLASS_BULK_THRESHOLD) == "large"
         assert _get_size_class(MAX_ARROW_BATCH_BYTES) == "large"
 
 
@@ -1726,7 +1725,7 @@ class TestSieveKEviction:
         backend.release(key)
 
         # Get pool queue for this segment
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue:
@@ -1767,7 +1766,7 @@ class TestSieveKEviction:
             backend.complete_entry(key, data, 400)
             backend.release(key)
 
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue and len(pool_queue.queue) > 2:
@@ -1833,11 +1832,11 @@ class TestSieveKEviction:
         assert stats.evictions >= 1
 
         # Tiny pool should have lower hit rate
-        if "unified-tiny" in stats.pool_stats and "unified-small" in stats.pool_stats:
-            tiny_rate = stats.pool_stats["unified-tiny"].hit_rate
-            small_rate = stats.pool_stats["unified-small"].hit_rate
-            # Small pool was accessed more, should have higher hit rate
-            assert small_rate >= tiny_rate
+        if "normal-tiny" in stats.pool_stats and "normal-bulk" in stats.pool_stats:
+            tiny_rate = stats.pool_stats["normal-tiny"].hit_rate
+            bulk_rate = stats.pool_stats["normal-bulk"].hit_rate
+            # Bulk pool was accessed more, should have higher hit rate
+            assert bulk_rate >= tiny_rate
 
         backend.close()
         shutil.rmtree(cache_dir)
@@ -1863,9 +1862,9 @@ class TestSieveKEviction:
             backend.release(key)
 
         stats = backend.stats()
-        assert "unified-tiny" in stats.pool_stats
+        assert "normal-tiny" in stats.pool_stats
 
-        pool_stat = stats.pool_stats["unified-tiny"]
+        pool_stat = stats.pool_stats["normal-tiny"]
         assert pool_stat.hits >= 3  # 3 hits
         assert pool_stat.misses >= 5  # 5 misses (initial writes)
         assert pool_stat.segments >= 1
@@ -1886,7 +1885,7 @@ class TestSieveKEviction:
         backend.complete_entry(key, data, 24)
         backend.release(key)
 
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue and pool_queue.queue:
@@ -1916,7 +1915,7 @@ class TestSieveKEviction:
             backend.complete_entry(key, data, 400)
             backend.release(key)
 
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue and len(pool_queue.queue) >= 3:

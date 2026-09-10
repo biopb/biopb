@@ -73,6 +73,10 @@ from biopb_tensor_server.core.errors import (
     TensorNotFound,
     WriteNotSupportedError,
 )
+from biopb_tensor_server.core.retention import (
+    computed_ladder,
+    retention_for_scale,
+)
 from biopb_tensor_server.core.stream_reduce import (
     covering_units,
     stream_reduce,
@@ -84,7 +88,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorReadOption
 
-    from biopb_tensor_server.cache import CacheManager
+    from biopb_tensor_server.cache import CacheManager, RetentionClass
     from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
     from biopb_tensor_server.core.discovery import (
         ClaimContext,
@@ -1468,6 +1472,27 @@ class TensorAdapter(SourceAdapter):
 
         return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
 
+    def _retention_for_chunk(self, chunk_id: bytes) -> RetentionClass:
+        """What a miss for this chunk would cost (see ``cache.RetentionClass``).
+
+        A property of the chunk, not of the caller that stored it: the class is
+        written into a cache segment, so a first writer would otherwise fix it
+        for good. ``core.retention`` owns the decision and the ladder config.
+
+        Unscaled returns before the ladder is built, so a source nobody reads a
+        scaled chunk from never pays for one. The ladder is memoized because
+        this runs per chunk and a miss builds a descriptor; unkeyed, because a
+        tensor's shape cannot change under one adapter and the config is
+        installed once at server start.
+        """
+        if not is_scaled_chunk(chunk_id):
+            return "normal"  # full resolution, or a native level's own store
+        ladder = getattr(self, "_ladder_cache", None)
+        if ladder is None:
+            desc = self.get_tensor_descriptor()
+            ladder = self._ladder_cache = computed_ladder(desc.shape, desc.dim_labels)
+        return retention_for_scale(decode_scale_info(chunk_id), ladder)
+
     def resolve_chunk_data(
         self,
         chunk_id: bytes,
@@ -1478,6 +1503,12 @@ class TensorAdapter(SourceAdapter):
         The default implementation reads raw chunk data with ``self.get_data()``.
         Scaled chunks are always cacheable when a CacheManager is available.
         With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
+
+        What a stored chunk costs to produce again is declared from the chunk
+        (:meth:`_retention_for_chunk`) rather than measured: a scaled build's
+        cost is a full-resolution read plus a reduction, over an extent the
+        cache may or may not already hold, so timing it would measure the
+        cache's own state and then decide what the cache keeps by it.
 
         Raises:
             StaleChunkError: chunk_id carries a content_version that no longer
@@ -1531,7 +1562,9 @@ class TensorAdapter(SourceAdapter):
             # it, so a nearest read cannot be served an area chunk (this
             # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(cache_key, compute_fn)
+            entry = cache_manager.get_or_acquire(
+                cache_key, compute_fn, self._retention_for_chunk(chunk_id)
+            )
             data = entry.data
             cache_manager.release(cache_key)
         else:
@@ -1801,10 +1834,7 @@ class TensorAdapter(SourceAdapter):
                 list(base_desc.shape),
                 list(base_desc.dim_labels),
                 reduction_method=cfg.reduction_method,
-                threshold=cfg.threshold,
-                downscale_factor=cfg.downscale_factor,
-                pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-                plane_max_pixels=cfg.plane_max_pixels,
+                **cfg.level_kwargs(),
             )
         return levels
 

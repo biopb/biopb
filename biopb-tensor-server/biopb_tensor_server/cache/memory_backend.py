@@ -21,6 +21,7 @@ from biopb_tensor_server.cache.base import (
     CacheEntry,
     CacheStats,
     EntryState,
+    RetentionClass,
     estimate_batch_bytes,
 )
 
@@ -96,7 +97,7 @@ class MemoryCacheBackend(CacheBackend):
         if half_size == 0:
             # Very small cache - check if first entry is evictable
             first_key = next(iter(self._entries))
-            if self._entries[first_key].is_evictable():
+            if self._is_reclaimable(first_key):
                 self._do_evict(first_key)
                 return True
             self._ref_held_skips += 1
@@ -109,7 +110,7 @@ class MemoryCacheBackend(CacheBackend):
         evictable = [
             (k, self._entries[k].size_bytes)
             for k in lru_keys
-            if self._entries[k].is_evictable()
+            if self._is_reclaimable(k)
         ]
 
         if not evictable:
@@ -121,6 +122,18 @@ class MemoryCacheBackend(CacheBackend):
         self._do_evict(smallest_key)
         return True
 
+    def _is_reclaimable(self, key: bytes) -> bool:
+        """Whether this entry may be evicted: unreferenced and not pinned.
+
+        The class is otherwise inert here. Eviction is per-entry rather than
+        per-segment, so there is no pooling to do, and the only population this
+        backend caches under demand is scaled chunks (``resolve_chunk_data``
+        caches an unscaled chunk only on the file backend), which are uniformly
+        "cheap" -- an ordering over one class is no ordering.
+        """
+        entry = self._entries[key]
+        return entry.is_evictable() and entry.retention != "pinned"
+
     def _do_evict(self, key: bytes) -> None:
         """Actually evict an entry."""
         entry = self._entries.pop(key)
@@ -131,6 +144,7 @@ class MemoryCacheBackend(CacheBackend):
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
+        retention: RetentionClass = "normal",
     ) -> CacheEntry:
         """Get existing entry or create pending and compute.
 
@@ -162,6 +176,7 @@ class MemoryCacheBackend(CacheBackend):
                 entry = CacheEntry(
                     state=EntryState.PENDING,
                     created_at=time.time(),
+                    retention=retention,
                 )
                 self._entries[key] = entry
                 self._misses += 1
@@ -207,7 +222,9 @@ class MemoryCacheBackend(CacheBackend):
                 self._move_to_end(key)
             return entry
 
-    def start_compute(self, key: bytes) -> Tuple[CacheEntry, bool]:
+    def start_compute(
+        self, key: bytes, retention: RetentionClass = "normal"
+    ) -> Tuple[CacheEntry, bool]:
         """Start compute phase - returns (entry, is_owner).
 
         is_owner=True means this thread should compute and call complete_entry.
@@ -241,6 +258,7 @@ class MemoryCacheBackend(CacheBackend):
             entry = CacheEntry(
                 state=EntryState.PENDING,
                 created_at=time.time(),
+                retention=retention,
             )
             entry.acquire()  # Acquire for compute owner
             self._entries[key] = entry

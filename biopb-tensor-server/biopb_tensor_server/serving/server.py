@@ -62,6 +62,7 @@ from biopb_tensor_server.core.errors import (
     UnknownResolutionError,
 )
 from biopb_tensor_server.core.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.upload_manager import UploadManager
 
@@ -332,6 +333,10 @@ class TensorFlightServer(flight.FlightServerBase):
         # with the precache worker so the warmed scales can't drift from the
         # advertised ones.
         self._pyramid_config = pyramid_config or PyramidConfig()
+        # The read path classifies each chunk's retention against this ladder.
+        # Installed once here rather than threaded through resolve_chunk_data
+        # and every override of it (see core.retention).
+        set_active_pyramid_config(self._pyramid_config)
         self._start_time: float = time.time()
         # DoPut upload path: source creation, chunk writes, and per-source upload
         # progress. Registers created sources through the shared registry.

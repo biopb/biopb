@@ -649,6 +649,21 @@ class PyramidConfig:
         },
     )
 
+    def level_kwargs(self) -> Dict[str, int]:
+        """The knobs that shape the ladder, as ``chunk.py`` takes them.
+
+        Every caller of ``_pyramid_levels`` and its wrappers needs exactly these
+        four, and the point of this class is that they cannot drift between the
+        levels the server advertises and the ones the precache warms -- so they
+        are unpacked once here rather than at each call.
+        """
+        return {
+            "threshold": self.threshold,
+            "downscale_factor": self.downscale_factor,
+            "pixel_budget_cubic_root": self.pixel_budget_cubic_root,
+            "plane_max_pixels": self.plane_max_pixels,
+        }
+
 
 @dataclass
 class PrecacheConfig:

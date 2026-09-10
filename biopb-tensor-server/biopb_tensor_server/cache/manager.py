@@ -17,6 +17,7 @@ from biopb_tensor_server.cache.base import (
     CacheEntry,
     CacheStats,
     ChunkLocation,
+    RetentionClass,
 )
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
 from biopb_tensor_server.cache.memory_backend import (
@@ -107,6 +108,7 @@ class CacheManager:
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
+        retention: RetentionClass = "normal",
     ) -> CacheEntry:
         """Get or compute entry with future/promise pattern.
 
@@ -116,11 +118,14 @@ class CacheManager:
         Args:
             key: Cache key bytes
             compute_fn: Returns (RecordBatch, size_bytes)
+            retention: What a miss for this chunk costs, declared by the caller
+                that knows how it was produced. Only the call that creates the
+                entry sets it.
 
         Returns:
             CacheEntry with state READY, ref_count >= 1
         """
-        return self._backend.get_or_acquire(key, compute_fn)
+        return self._backend.get_or_acquire(key, compute_fn, retention)
 
     def contains(self, key: bytes) -> bool:
         """Whether *key* is cached and servable without computing it.
@@ -143,6 +148,7 @@ class CacheManager:
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
+        retention: RetentionClass = "normal",
     ) -> bool:
         """Store an already-computed batch. Returns True if this call stored it.
 
@@ -175,8 +181,11 @@ class CacheManager:
             key: Cache key bytes
             data: The batch to store
             size_bytes: Size of data in bytes
+            retention: What a miss for this chunk costs. An upload takes the
+                default: nothing deletes a "pinned" entry, and an upload is
+                meant to be temporary.
         """
-        _entry, is_owner = self._backend.start_compute(key)
+        _entry, is_owner = self._backend.start_compute(key, retention)
         try:
             if is_owner:
                 if self._backend.SUPPORTS_DEFERRED_WRITES:
