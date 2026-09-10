@@ -371,7 +371,7 @@ class TestNormalizedDescriptorAndData:
             )
             out = np.zeros(tuple(plan.descriptor.shape), dtype=np.uint16)
             for ce in plan.chunk_endpoints:
-                from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+                from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
                 arr = unpack_chunk_array(adapter.resolve_chunk_data(ce.chunk_id))
                 sl = tuple(
@@ -403,7 +403,7 @@ class TestNormalizedDescriptorAndData:
         """A downsampled read is the subtlest path: the client's ``scale_hint``
         is canonical, the delegate downsamples in native order inside the
         chunk_id, and the result comes back transposed. All three have to agree."""
-        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+        from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
         with tempfile.TemporaryDirectory() as tmp:
             src = (np.arange(4 * 32 * 64, dtype=np.uint16) % 251).reshape(4, 32, 64)

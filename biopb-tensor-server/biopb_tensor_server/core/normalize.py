@@ -83,18 +83,14 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.adapter_base import (
-    SourceAdapter,
-    TensorAdapter,
-    pack_chunk_batch,
-    unpack_chunk_array,
-)
+from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.axes import canonical_permutation
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
     cache_key_for_chunk_id,
     is_scaled_chunk,
 )
+from biopb_tensor_server.core.chunk_batch import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 
 if TYPE_CHECKING:

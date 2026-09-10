@@ -18,8 +18,8 @@ from biopb_tensor_server.cache import (
     MemoryCacheBackend,
     MemoryCacheConfig,
 )
-from biopb_tensor_server.core.adapter_base import pack_chunk_batch
 from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
+from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 from biopb_tensor_server.core.config import CacheConfig, PyramidConfig
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 

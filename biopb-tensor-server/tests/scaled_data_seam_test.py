@@ -16,16 +16,13 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import ZarrAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core import downsample as _ds
-from biopb_tensor_server.core.adapter_base import (
-    _TENSOR_SCOPED_API,
-    TensorAdapter,
-    unpack_chunk_array,
-)
+from biopb_tensor_server.core import cache_source as _cs, downsample as _ds
+from biopb_tensor_server.core.adapter_base import _TENSOR_SCOPED_API, TensorAdapter
 from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
     encode_chunk_id_with_scale,
 )
+from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.config import CacheConfig
 
 
@@ -350,27 +347,6 @@ class TestStreamingDefault:
             assert np.array_equal(out, _ds.downsample_block(src, (4, 4), "area"))
 
 
-@pytest.fixture
-def cache(tmp_path):
-    """A file-backed cache with the scaled-read knob on.
-
-    The backend matters: `resolve_chunk_data` caches *unscaled* chunks only on
-    the file backend, so it is the one where a full-resolution read leaves
-    anything for a probe to find.
-    """
-    manager = CacheManager(
-        CacheConfig(
-            backend="file",
-            file_cache_dir=tmp_path / "cache",
-            source_scaled_reads=True,
-        )
-    )
-    try:
-        yield manager
-    finally:
-        manager.close()
-
-
 class TestCacheSourcedUnits:
     """A scaled read may source its extent from the cache (biopb/biopb#640).
 
@@ -413,7 +389,11 @@ class TestCacheSourcedUnits:
             tuple(endpoint.bounds.start): cache_key_for_chunk_id(endpoint.chunk_id)
             for endpoint in plan.chunk_endpoints
         }
-        actual = dict(adapter._chunk_cache_keys(base_desc, (0, 0), (64, 64), (16, 16)))
+        actual = dict(
+            _cs.chunk_cache_keys(
+                base_desc, adapter.content_version, (0, 0), (64, 64), (16, 16)
+            )
+        )
 
         assert actual == expected
 
@@ -421,8 +401,8 @@ class TestCacheSourcedUnits:
     def _units(adapter, monkeypatch):
         """Record the extent each cache-sourced unit covers, by either route."""
         seen = []
-        assemble = adapter._assemble_from_cache
-        borrow = adapter._borrow_cached_unit
+        assemble = _cs.assemble_from_cache
+        borrow = _cs.borrow_cached_unit
 
         def assemble_spy(cache_manager, keys, start, stop, *rest):
             seen.append((tuple(start), tuple(stop)))
@@ -432,8 +412,8 @@ class TestCacheSourcedUnits:
             seen.append((tuple(start), tuple(stop)))
             return borrow(cache_manager, keys, start, stop, *rest)
 
-        monkeypatch.setattr(adapter, "_assemble_from_cache", assemble_spy)
-        monkeypatch.setattr(adapter, "_borrow_cached_unit", borrow_spy)
+        monkeypatch.setattr(_cs, "assemble_from_cache", assemble_spy)
+        monkeypatch.setattr(_cs, "borrow_cached_unit", borrow_spy)
         return seen
 
     def test_a_warm_extent_never_touches_the_source(self, counted, monkeypatch, cache):
@@ -803,14 +783,14 @@ class TestBorrowedUnits:
         expected = _ds.downsample_block(adapter.get_data(bounds), (2, 2), "nearest")
         self._warm_level_zero(adapter, cache)
         borrowed, assembled = [], []
-        borrow = adapter._borrow_cached_unit
+        borrow = _cs.borrow_cached_unit
         monkeypatch.setattr(
-            adapter,
-            "_borrow_cached_unit",
+            _cs,
+            "borrow_cached_unit",
             lambda *a: (borrowed.append(a[2]), borrow(*a))[1],
         )
         monkeypatch.setattr(
-            adapter, "_assemble_from_cache", lambda *a: assembled.append(a[2])
+            _cs, "assemble_from_cache", lambda *a: assembled.append(a[2])
         )
         allocated = []
         empty = np.empty
@@ -872,14 +852,14 @@ class TestBorrowedUnits:
         expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "nearest")
         self._warm_level_zero(adapter, cache)
         attempts = []
-        borrow = adapter._borrow_cached_unit
+        borrow = _cs.borrow_cached_unit
 
         def spy(*args):
             lent = borrow(*args)
             attempts.append(lent)
             return lent
 
-        monkeypatch.setattr(adapter, "_borrow_cached_unit", spy)
+        monkeypatch.setattr(_cs, "borrow_cached_unit", spy)
         reads.clear()
 
         out = adapter.get_scaled_data(bounds, (4, 4), "nearest", cache)
@@ -933,10 +913,10 @@ class TestBorrowedUnits:
         expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "nearest")
         self._warm_level_zero(adapter, cache)
         assembled = []
-        assemble = adapter._assemble_from_cache
+        assemble = _cs.assemble_from_cache
         monkeypatch.setattr(
-            adapter,
-            "_assemble_from_cache",
+            _cs,
+            "assemble_from_cache",
             lambda *a: (assembled.append(a[2]), assemble(*a))[1],
         )
         reads.clear()
@@ -971,9 +951,7 @@ class TestBorrowedUnits:
         _set_grid(monkeypatch, adapter, (16, 16))
         self._warm_level_zero(adapter, cache)
         borrowed = []
-        monkeypatch.setattr(
-            adapter, "_borrow_cached_unit", lambda *a: borrowed.append(a[2])
-        )
+        monkeypatch.setattr(_cs, "borrow_cached_unit", lambda *a: borrowed.append(a[2]))
         reads.clear()
 
         adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area", cache)

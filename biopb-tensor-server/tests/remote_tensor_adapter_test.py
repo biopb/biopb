@@ -2140,12 +2140,12 @@ def test_resolve_forwards_inner_verbatim():
     import numpy as np
     from biopb.tensor.ticket_pb2 import ChunkBounds
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
-    from biopb_tensor_server.core.adapter_base import pack_chunk_batch
     from biopb_tensor_server.core.chunk import (
         encode_chunk_id,
         encode_proxy_envelope,
         wrap_content_version,
     )
+    from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
     adapter = RemoteTensorAdapter(
         source_id="lab__img",

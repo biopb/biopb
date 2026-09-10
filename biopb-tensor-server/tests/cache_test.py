@@ -314,7 +314,7 @@ class TestProbeWithoutComputing:
 
     The scaled read asks whether the full-resolution chunks under an extent are
     already here before deciding to assemble it from them rather than decode the
-    source again (``adapter_base._cache_sourced_units``). That question must not
+    source again (``cache_source.cache_sourced_units``). That question must not
     compute anything, must not join a computation in flight, and must not move
     the hit/miss ratio, which measures chunk serving and not probing.
     """
@@ -1525,7 +1525,7 @@ class TestSchemaPooling:
 
         # Different dtypes now all serialize to the ONE unified binary chunk
         # schema (raw bytes + dtype string), so they share a pool.
-        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+        from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
         int_data = pack_chunk_batch(np.array([1, 2, 3], dtype=np.int32))
         float_data = pack_chunk_batch(np.array([1.0, 2.0, 3.0], dtype=np.float32))

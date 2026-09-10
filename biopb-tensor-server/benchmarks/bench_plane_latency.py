@@ -54,7 +54,7 @@ from pathlib import Path
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.config import CacheConfig
 
 
