@@ -38,6 +38,7 @@ from biopb_tensor_server.core.chunk import (
     get_bounds_from_chunk_id,
     is_proxy_envelope,
     is_scaled_chunk,
+    mint_chunk_id,
     peel_proxy_envelope,
     routing_array_id,
     wrap_content_version,
@@ -319,6 +320,22 @@ def _base_desc():
 
 
 class TestReadPlanWiring:
+    @pytest.mark.parametrize("content_version", [None, CV])
+    def test_mint_chunk_id_matches_an_unscaled_read_plan(self, content_version):
+        request = TensorDescriptor()
+        bounds = ChunkBounds(start=[0, 0], stop=[5, 5])
+        expected = mint_chunk_id(
+            "src/t",
+            bounds,
+            content_version=content_version,
+        )
+        plan = _get_read_plan(
+            _base_desc(), request, (5, 5), content_version=content_version
+        )
+
+        assert plan.chunk_endpoints
+        assert plan.chunk_endpoints[0].chunk_id == expected
+
     def test_unspecified_method_mints_the_request_default(self):
         """An unspecified reduction_method resolves at plan time and is minted.
 

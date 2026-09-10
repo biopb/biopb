@@ -339,6 +339,30 @@ def encode_chunk_id_with_scale(
     return base + scale_payload + method_suffix
 
 
+def mint_chunk_id(
+    array_id: str,
+    bounds: ChunkBounds,
+    scale_hint: Optional[Tuple[int, ...]] = None,
+    reduction_method: str = CHUNK_ID_IMPLICIT_REDUCTION_METHOD,
+    content_version: Optional[bytes] = None,
+) -> bytes:
+    """Mint the canonical chunk_id for a read-plan endpoint.
+
+    This is the single composition point for regular or scaled encoding and the
+    optional content-version wrapper. Keeping those choices together ensures
+    cache probes mint the same bytes as read plans.
+    """
+    if scale_hint is None:
+        inner = encode_chunk_id(array_id, bounds)
+    else:
+        inner = encode_chunk_id_with_scale(
+            array_id, bounds, scale_hint, reduction_method
+        )
+    if content_version is not None:
+        return wrap_content_version(inner, content_version)
+    return inner
+
+
 def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
     """``(ndim, bounds_end)`` for an INNER (legacy, version-stripped) chunk_id.
 
