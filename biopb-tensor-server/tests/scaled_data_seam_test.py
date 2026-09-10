@@ -389,7 +389,11 @@ class TestCacheSourcedUnits:
             tuple(endpoint.bounds.start): cache_key_for_chunk_id(endpoint.chunk_id)
             for endpoint in plan.chunk_endpoints
         }
-        actual = dict(adapter._chunk_cache_keys(base_desc, (0, 0), (64, 64), (16, 16)))
+        actual = dict(
+            _cs.chunk_cache_keys(
+                base_desc, adapter.content_version, (0, 0), (64, 64), (16, 16)
+            )
+        )
 
         assert actual == expected
 
