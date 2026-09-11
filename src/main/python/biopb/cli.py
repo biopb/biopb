@@ -144,10 +144,16 @@ def _read_release_version() -> str:
 def _package_version(dist_name: str) -> str:
     """Installed version of distribution `dist_name`, or 'not installed'.
 
-    Reads distribution metadata (like biopb.__init__ does for its own version)
-    instead of importing the package, so `biopb version` never drags in the
-    packages' heavy optional stacks just to print a number, and still reports a
-    version when a package is installed but its runtime imports are broken.
+    Reads distribution metadata rather than importing the package, and that is
+    deliberate: this command reports what is *installed* here -- the same
+    question its release-marker line answers. A package's own ``__version__``
+    answers a different one, what is *running*, and resolves the build-time file
+    first (biopb/biopb#910), so in an editable checkout the two legitimately
+    differ until the next install.
+
+    Not importing also keeps `biopb version` from dragging in the packages'
+    heavy optional stacks just to print a number, and still reports a version
+    when a package is installed but its runtime imports are broken.
     """
     from importlib.metadata import PackageNotFoundError, version as _dist_version
 

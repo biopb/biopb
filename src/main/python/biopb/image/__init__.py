@@ -1,10 +1,9 @@
-try:
-    import importlib.metadata
-
-    __version__ = importlib.metadata.version("biopb")
-except Exception:
-    pass
-
+# One resolution for the SDK, in the parent package: `biopb.image` is not a
+# distribution of its own, and looking the version up again here left
+# `__version__` *undefined* whenever the lookup failed -- importing from a
+# source tree that was never installed made `biopb.image.__version__` raise
+# AttributeError instead of reporting anything.
+from biopb import __version__
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiConflict,
