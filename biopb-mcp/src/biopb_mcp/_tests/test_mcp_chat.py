@@ -1061,6 +1061,78 @@ class TestCancel:
         assert "job-1" in last["content"]
 
 
+class TestProviderEcho:
+    """What the provider puts on an assistant turn and demands back with it.
+
+    A thinking model rejects the whole request when the ``reasoning_content``
+    it produced does not come back on that same message, and the projection
+    rebuilds every assistant turn from scratch -- so a dropped field fails a
+    turn later than its cause, and keeps failing, because the thread is
+    re-projected whole on every turn after it (biopb/biopb#975).
+    """
+
+    def _assistant(self, model, turn=-1):
+        return [m for m in model.seen[turn]["messages"] if m["role"] == "assistant"]
+
+    def test_a_reasoning_turn_is_echoed_on_the_next_request(self, chat_host):
+        model = _scripted(
+            {"content": "thought about it", "reasoning_content": "weighing options"},
+            {"content": "and again"},
+        )
+        asyncio.run(_chat.run_turn("first", model))
+        asyncio.run(_chat.run_turn("second", model))
+        assert self._assistant(model) == [
+            {
+                "role": "assistant",
+                "content": "thought about it",
+                "reasoning_content": "weighing options",
+            }
+        ]
+
+    def test_the_echo_rides_an_assistant_turn_that_called_a_tool(self, chat_host):
+        # The branch that rebuilds the turn around its tool_calls is the one the
+        # bug was reported against; a reasoning model calls tools like any other.
+        model = _scripted(
+            {
+                "content": "",
+                "tool_calls": [_call(_chat.RESOURCE_TOOL, uri="guide://data")],
+                "reasoning_content": "which guide",
+            },
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("what ops exist?", model))
+        called = self._assistant(model)[0]
+        assert called["reasoning_content"] == "which guide"
+        assert called["tool_calls"]
+
+    def test_the_providers_own_spelling_is_kept(self, chat_host):
+        # Carried under the name it arrived with: a provider spelling it
+        # `reasoning` will not accept `reasoning_content`.
+        model = _scripted({"content": "hm", "reasoning": "r"}, {"content": "ok"})
+        asyncio.run(_chat.run_turn("first", model))
+        asyncio.run(_chat.run_turn("second", model))
+        assert self._assistant(model)[0] == {
+            "role": "assistant",
+            "content": "hm",
+            "reasoning": "r",
+        }
+
+    def test_a_reply_without_one_sends_no_extra_keys(self, chat_host):
+        model = _scripted({"content": "hi"}, {"content": "ok"})
+        asyncio.run(_chat.run_turn("first", model))
+        asyncio.run(_chat.run_turn("second", model))
+        assert self._assistant(model) == [{"role": "assistant", "content": "hi"}]
+
+    def test_the_pane_is_not_shown_the_reasoning(self, chat_host):
+        # `history()` hands its dicts to the views unfiltered, so this is what
+        # keeps a reasoning turn's reasoning out of every browser poll.
+        model = _scripted({"content": "hi", "reasoning_content": "private"})
+        asyncio.run(_chat.run_turn("first", model))
+        assert all("reasoning_content" not in m for m in _chat.history())
+        # ...and the record still has it, or the next turn could not echo it.
+        assert _chat._messages[-1]["reasoning_content"] == "private"
+
+
 @pytest.mark.parametrize("text", ["", "   "])
 def test_an_empty_turn_is_still_recorded(chat_host, text):
     # The loop does not police the input; whatever the transport accepted is
