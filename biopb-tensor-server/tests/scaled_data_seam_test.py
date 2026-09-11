@@ -958,3 +958,95 @@ class TestBorrowedUnits:
 
         assert borrowed == []
         assert reads == []
+
+
+class TestAStaleEntryIsDeclined:
+    """An entry that hits but does not hold this chunk (biopb/biopb#983).
+
+    The probe addresses cache entries by key alone, and the key is a digest --
+    so a hit is evidence, not proof. Where one unpacks to a block whose shape or
+    dtype is not the one this extent expects, the bytes under it are some other
+    chunk's, and reading them would serve one source's pixels under another's
+    name. ``_acquired_chunk_view`` declines instead, and the unit falls back to
+    the source read it would have cost all along.
+
+    It declines *after* acquiring, which is why the release matters as much as
+    the decline: an entry left held pins its segment against eviction for the
+    life of the server, and the sweep that would have freed it never sees a
+    reference it can drop.
+    """
+
+    _warm_level_zero = staticmethod(TestCacheSourcedUnits._warm_level_zero)
+    _refcounts = staticmethod(TestBorrowedUnits._refcounts)
+
+    @staticmethod
+    def _mangle(monkeypatch, damage):
+        """Make every cached chunk unpack to something this extent will reject.
+
+        Patched at the unpack rather than by forging a cache entry: the guard is
+        stated in terms of the block it gets back, and a hand-built payload would
+        pin this test to the packing format instead of to the rule.
+        """
+        real = _cs.unpack_chunk_view
+
+        def mangled(data):
+            block = real(data)
+            return None if block is None else damage(block)
+
+        monkeypatch.setattr(_cs, "unpack_chunk_view", mangled)
+
+    # Both routes into the guard: a pick whose unit is one chunk borrows the
+    # entry (``borrow_cached_unit``), anything else copies out of it
+    # (``assemble_from_cache``). The rule has to hold on each.
+    _ROUTES = [("nearest", "the borrowed route"), ("area", "the assembled route")]
+
+    @pytest.mark.parametrize("method,route", _ROUTES)
+    @pytest.mark.parametrize(
+        "damage,flaw",
+        [
+            (lambda block: block[:-1], "a shorter block"),
+            (lambda block: block.astype(np.int32), "another dtype"),
+            (lambda block: None, "nothing readable"),
+        ],
+    )
+    def test_it_reads_the_source_instead(
+        self, counted, monkeypatch, cache, method, route, damage, flaw
+    ):
+        """Declining is not a decision about what the data is: the extent still
+        comes back bit-identical, off the source."""
+        adapter, reads = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        bounds = _bounds((0, 0), (64, 64))
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), method)
+        self._warm_level_zero(adapter, cache)
+        self._mangle(monkeypatch, damage)
+        reads.clear()
+
+        out = adapter.get_scaled_data(bounds, (4, 4), method, cache)
+
+        assert reads, f"{flaw} must fall back to the source on {route}"
+        assert out.dtype == expected.dtype
+        assert np.array_equal(out, expected)
+
+    @pytest.mark.parametrize("method,route", _ROUTES)
+    @pytest.mark.parametrize(
+        "damage,flaw",
+        [
+            (lambda block: block[:-1], "a shorter block"),
+            (lambda block: block.astype(np.int32), "another dtype"),
+            (lambda block: None, "nothing readable"),
+        ],
+    )
+    def test_it_is_released_before_it_is_declined(
+        self, counted, monkeypatch, cache, method, route, damage, flaw
+    ):
+        adapter, _ = counted
+        _set_grid(monkeypatch, adapter, (16, 16))
+        self._warm_level_zero(adapter, cache)
+        acquired, released = self._refcounts(cache, monkeypatch)
+        self._mangle(monkeypatch, damage)
+
+        adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), method, cache)
+
+        assert acquired, f"{flaw} on {route} never reached the guard"
+        assert released == acquired
