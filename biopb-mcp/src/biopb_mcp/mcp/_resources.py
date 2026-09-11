@@ -218,13 +218,17 @@ breaks because these arrays come off a tensor server, lazily, in a pyramid.
 | **Kernel** | your own variables | Exactly what you made, carrying no physical scale unless you carried it |
 
 `viewer.add_tensor()` is a *conversion between the first two*, not a window onto
-the first. The traps follow from that. The conversion is reversible: a layer it
-loaded records its origin as `layer.metadata['array_id']` — the same id
-`client.get_tensor()` takes — and **`viewer.tensor(layer)` walks that back for
-you**, returning the full-resolution source-order dask array from either kind of
-layer. (The layer *name* is not a reliable origin; it is a display stem the user
-may rename. A layer the agent built with `add_image`/`add_labels` has no
-`array_id` entry, and `viewer.tensor` hands its own array back instead.)
+the first. The traps follow from that. **`viewer.tensor(layer)` undoes the
+packaging** — it hands back the layer's own full-resolution array, unwrapped,
+from either kind of layer, without going near the network.
+
+Going back to the *server* is a different question, and a layer it loaded can
+answer it: `layer.metadata['array_id']` is the same id `client.get_tensor()`
+takes. Ask for that only when you want a **fresh** read — a source re-indexed
+since the layer loaded — because it costs a read plan the layer does not need.
+(The layer *name* is not a reliable origin; it is a display stem the user may
+rename. A layer the agent built with `add_image`/`add_labels` has no `array_id`
+entry at all.)
 
 ## The traps
 
@@ -234,10 +238,12 @@ may rename. A layer the agent built with `add_image`/`add_labels` has no
 arr = viewer.tensor(layer)   # or viewer.tensor("layer name")
 ```
 
-A plain, lazy, full-resolution `da.Array` in canonical `[..., Z, Y, X]` order,
-on either kind of layer. For a layer `add_tensor` loaded it re-reads the tensor
-from the server (via `layer.metadata['array_id']`); for one you built with
-`add_image`/`add_labels` it hands back exactly the array you gave it.
+A plain, lazy `da.Array` at the layer's full resolution — the shape
+`layer.data.shape` reports — in canonical `[..., Z, Y, X]` order, on either kind
+of layer. It is the array already in hand, unwrapped: level 0 of the pyramid for
+a layer `add_tensor` loaded, and exactly what you passed for one you built with
+`add_image`/`add_labels`. No server round trip, so it works with the server
+disconnected. For a *fresh* read instead, `client.get_tensor(array_id)`.
 
 `layer.data` is what napari is *displaying*, and it is packaged for the
 renderer, not for you:
@@ -330,6 +336,7 @@ array_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 # 4. Back onto the viewer for the user to check. It arrives pyramid-shaped, so
 #    read it back with viewer.tensor(), not .data (trap 1).
 layer_name = viewer.add_tensor(array_id)
+check = viewer.tensor(layer_name)   # the layer's pixels, as a plain dask array
 ```
 
 Uploading is also what makes a result *shareable* — an array in the kernel is

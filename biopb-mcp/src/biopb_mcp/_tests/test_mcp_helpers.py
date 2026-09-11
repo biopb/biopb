@@ -499,69 +499,63 @@ class TestViewerTensor:
             da.zeros((4, 128, 128), dtype="uint8"),
         ]
 
-    def test_a_loaded_layer_is_read_from_the_server(self, viewer, connection):
+    def test_a_loaded_layer_unwraps_to_its_own_level_0(self, viewer, connection):
         import dask.array as da
 
-        full = da.zeros((4, 512, 512), dtype="uint8")
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+        levels = self._pyramid()
+
+        arr = viewer.tensor(self._loaded_layer(levels, array_id="src/t1"))
+
+        assert arr is levels[0]
+        assert isinstance(arr, da.Array), "the proxy was handed back unwrapped"
+
+    def test_it_never_goes_back_to_the_server(self, viewer, connection):
+        """The array is already here, so re-reading it would buy nothing and
+        cost three things: a GetFlightInfo that returns one endpoint *per
+        chunk* (the O(chunks) read plan ``_advertised_pyramid_levels`` exists
+        to avoid), a different chunk-key space from the scale_hint=[1, 1, ...]
+        ids the layer's level 0 was loaded with and the server pre-warmed, and
+        the wrong answer if the source was re-indexed since the layer loaded.
+        """
         client = MagicMock()
-        client.get_tensor.return_value = full
         connection.client = client
         patch_viewer_tensor_methods(viewer, connection)
 
-        layer = self._loaded_layer(self._pyramid(), array_id="src/t1")
+        viewer.tensor(self._loaded_layer(self._pyramid(), array_id="src/t1"))
 
-        assert viewer.tensor(layer) is full
-        client.get_tensor.assert_called_once_with("src/t1")
+        client.get_tensor.assert_not_called()
+        client.get_descriptor.assert_not_called()
 
     def test_a_name_resolves_against_the_viewer(self, viewer, connection):
         import dask.array as da
 
-        client = MagicMock()
-        client.get_tensor.return_value = da.zeros((2, 2), dtype="uint8")
-        connection.client = client
-        layer = self._loaded_layer(self._pyramid())
-        viewer.layers = {"big": layer}
-        patch_viewer_tensor_methods(viewer, connection)
-
-        viewer.tensor("big")
-
-        client.get_tensor.assert_called_once_with("t1")
-
-    def test_it_is_not_level_0_of_the_advertised_pyramid(self, viewer, connection):
-        """The reason this goes to the server rather than unwrapping: level 0 is
-        whatever the server *advertised*, which is full resolution by
-        convention and not by contract (a native OME-Zarr pyramid whose first
-        dataset carries no integer scale is skipped when the levels are built).
-        ``get_tensor`` is full resolution by definition."""
-        import dask.array as da
-
+        connection.client = MagicMock()
         levels = self._pyramid()
-        full = da.zeros((4, 1024, 1024), dtype="uint8")  # what the tensor really is
-        client = MagicMock()
-        client.get_tensor.return_value = full
-        connection.client = client
+        viewer.layers = {"big": self._loaded_layer(levels)}
         patch_viewer_tensor_methods(viewer, connection)
 
-        arr = viewer.tensor(self._loaded_layer(levels))
+        arr = viewer.tensor("big")
 
-        assert arr.shape == (4, 1024, 1024)
-        assert arr is not levels[0]
+        assert arr is levels[0]
+        assert isinstance(arr, da.Array)
 
-    def test_a_layer_the_agent_built_is_unwrapped_not_fetched(self, viewer, connection):
+    def test_a_layer_the_agent_built_unwraps_the_same_way(self, viewer, connection):
+        """Same path, no ``array_id`` needed: what makes the return type one
+        thing is that both kinds of layer end at the array ``add_image`` was
+        given."""
         import dask.array as da
 
-        client = MagicMock()
-        connection.client = client
+        connection.client = MagicMock()
         patch_viewer_tensor_methods(viewer, connection)
 
         own = da.zeros((4, 64, 64), dtype="uint8")
-        layer = self._loaded_layer([own], array_id=None)
 
-        arr = viewer.tensor(layer)
+        arr = viewer.tensor(self._loaded_layer([own], array_id=None))
 
         assert arr is own
-        assert isinstance(arr, da.Array), "the proxy was handed back unwrapped"
-        client.get_tensor.assert_not_called()
+        assert isinstance(arr, da.Array)
 
     def test_an_unattributed_pyramid_unwraps_level_0(self, viewer, connection):
         """No ``array_id`` and multiscale: ``data[0]`` is the level, and the
@@ -577,6 +571,17 @@ class TestViewerTensor:
         assert arr is levels[0]
         assert isinstance(arr, da.Array)
 
+    def test_level_0_is_the_full_resolution_shape_reports(self, viewer, connection):
+        """``.shape`` on a MultiScaleData reports level 0, so what this returns
+        is the array the layer already describes -- no separate claim about
+        what the server holds, which is what makes the accessor answerable
+        without a round trip."""
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+        layer = self._loaded_layer(self._pyramid())
+
+        assert viewer.tensor(layer).shape == layer.data.shape
+
     def test_a_numpy_layer_comes_back_as_it_went_in(self, viewer, connection):
         import napari
         import numpy as np
@@ -589,23 +594,9 @@ class TestViewerTensor:
 
         assert arr is own
 
-    def test_a_failed_server_read_falls_back_to_the_layer(self, viewer, connection):
-        """The pixels on screen are still readable; raising here would fail a
-        read the layer can satisfy on its own."""
-        import dask.array as da
-
-        client = MagicMock()
-        client.get_tensor.side_effect = RuntimeError("source is gone")
-        connection.client = client
-        patch_viewer_tensor_methods(viewer, connection)
-        levels = self._pyramid()
-
-        arr = viewer.tensor(self._loaded_layer(levels))
-
-        assert arr is levels[0]
-        assert isinstance(arr, da.Array)
-
-    def test_no_server_still_reads_the_layer(self, viewer, connection):
+    def test_a_disconnected_server_changes_nothing(self, viewer, connection):
+        """Nothing here needs the client, so a session whose server went away
+        still reads every layer on the viewer."""
         import dask.array as da
 
         connection.client = None
@@ -627,16 +618,11 @@ class TestViewerTensor:
         ``layer.data`` to numpy or scikit-image silently computes on the bottom
         of the pyramid -- no error, no signal, wrong resolution
         (biopb/biopb#973)."""
-        import dask.array as da
         import numpy as np
 
-        levels = self._pyramid()
-        full = da.zeros((4, 512, 512), dtype="uint8")
-        client = MagicMock()
-        client.get_tensor.return_value = full
-        connection.client = client
+        connection.client = MagicMock()
         patch_viewer_tensor_methods(viewer, connection)
-        layer = self._loaded_layer(levels)
+        layer = self._loaded_layer(self._pyramid())
 
         assert np.asarray(layer.data).shape == (4, 128, 128)  # the trap
         assert viewer.tensor(layer).shape == (4, 512, 512)  # the way out
@@ -666,12 +652,11 @@ class TestViewerTensor:
             name="big",
             metadata={"array_id": "src/t1"},
         )
-        full = da.zeros((4, 512, 512), dtype="uint8")
         connection.client = MagicMock()
-        connection.client.get_tensor.return_value = full
         patch_viewer_tensor_methods(real, connection)
 
         proxy = make_viewer_proxy(real)
 
-        assert proxy.tensor(proxy.layers["big"]) is full
-        assert proxy.tensor("big") is full
+        assert proxy.tensor(proxy.layers["big"]) is levels[0]
+        assert isinstance(levels[0], da.Array)
+        assert proxy.tensor("big") is levels[0]

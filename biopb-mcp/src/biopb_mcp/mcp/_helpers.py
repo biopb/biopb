@@ -150,7 +150,10 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
     client/sources from the live ``TensorConnection`` *connection*.
 
     The pair is the round trip: ``add_tensor`` puts a tensor on the viewer,
-    ``tensor`` reads one back off it as a plain array (biopb/biopb#974).
+    ``tensor`` reads one back off it as a plain array (biopb/biopb#974). Only
+    the loader needs *connection* -- ``tensor`` reads the layer and nothing
+    else -- but both are installed here because both are named on the viewer,
+    and a reader that lives somewhere else is a reader the agent will not find.
 
     *compute_scheduler*, when set, pins the loaded layer's slice reads to a
     single-process dask scheduler (see ``_viewer_compute.wrap_levels``) so the
@@ -269,20 +272,26 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
             layer: A napari layer, or the name of one on this viewer.
 
         Returns:
-            The layer's array. For a layer ``add_tensor`` loaded, this is
-            ``client.get_tensor(layer.metadata['array_id'])``: full resolution,
-            canonical ``[..., Z, Y, X]`` order, a genuine ``dask.array.Array``
-            -- not level 0 of whatever pyramid the server happened to
-            advertise, and not affected by the viewer's display state. For a
-            layer the agent built with ``add_image``/``add_labels``, this is
-            exactly the array it was given.
+            The layer's own array, unwrapped: level 0 of its pyramid, which is
+            the full resolution ``layer.data.shape`` reports, in the canonical
+            ``[..., Z, Y, X]`` order the data plane guarantees
+            (``build_pyramid_levels`` transposes nothing). A genuine
+            ``dask.array.Array`` wherever the layer is backed by one.
 
-        Reads from the *server*, so a layer whose ``.data`` was replaced in
-        place is not what comes back -- ``metadata['array_id']`` still names
-        the tensor it was loaded from. If that read fails (the source was
-        removed, say) this falls back to the layer's own array rather than
-        raising: the pixels on screen are still readable, and for a
-        single-scale layer the fallback is the same array.
+        **This does not go back to the server**, though
+        ``metadata['array_id']`` would let it. Three reasons, and the first is
+        the one that matters: the array is already here. Re-reading it would
+        cost a ``GetFlightInfo`` that returns one endpoint **per chunk** --
+        the O(chunks) read plan ``_advertised_pyramid_levels`` already goes out
+        of its way not to build. It would also mint *unscaled* chunk_ids, a
+        different key space from the ``scale_hint=[1, 1, ...]`` ids the layer's
+        level 0 was loaded with and the server pre-warmed, so the same pixels
+        could come back as a cold read. And it would answer the wrong question:
+        a source re-indexed since the layer loaded would hand back pixels the
+        viewer is not displaying.
+
+        For a *fresh* server read -- deliberately, when the source may have
+        changed -- ask for it: ``client.get_tensor(layer.metadata['array_id'])``.
         """
         if isinstance(layer, str):
             layer = viewer.layers[layer]
@@ -290,19 +299,6 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
             raise TypeError(
                 f"tensor() takes a layer or a layer name, got {type(layer).__name__}"
             )
-
-        array_id = (getattr(layer, "metadata", None) or {}).get("array_id")
-        client = connection.client
-        if array_id and client is not None:
-            try:
-                return client.get_tensor(array_id)
-            except Exception:  # noqa: BLE001 - the layer still holds the pixels
-                logger.debug(
-                    "tensor(): server read of %s failed; falling back to the "
-                    "layer's own array",
-                    array_id,
-                    exc_info=True,
-                )
         return _layer_own_array(layer)
 
     # napari.Viewer is a pydantic evented model with validate_assignment, so a
