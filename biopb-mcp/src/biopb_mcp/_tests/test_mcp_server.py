@@ -1650,11 +1650,25 @@ class TestDataGuide:
         assert "layer.scale" in guide
 
     def test_viewer_guide_reads_layer_data_the_safe_way(self):
-        # The layer-listing example is the snippet most likely to be copied;
-        # a bare `layer.data.shape` breaks on every multiscale layer.
+        # The layer-listing example is the snippet most likely to be copied, so
+        # it must teach the accessor rather than the branch idiom
+        # (biopb/biopb#974). `layer.data.shape` is fine and stays -- it reports
+        # level 0 on either branch; what breaks is *indexing* `.data`, which is
+        # what the old form of this test got backwards (biopb/biopb#973).
         viewer_guide = _server._resources.VIEWER
-        assert "layer.data.shape" not in viewer_guide
-        assert "layer.multiscale" in viewer_guide
+        assert "viewer.tensor(" in viewer_guide
+        assert "layer.data[0] if layer.multiscale" not in viewer_guide
+
+    def test_data_guide_states_the_real_multiscale_failure(self):
+        # biopb/biopb#973: the trap used to be "layer.data.shape raises", which
+        # it does not. The failures that are real are silent ones -- np.asarray
+        # of a MultiScaleData returns the *lowest* level -- and a guide that
+        # names the wrong one sends the agent looking for an exception that
+        # never comes.
+        guide = _server._resources.DATA
+        assert "viewer.tensor(" in guide
+        assert "lowest" in guide
+        assert "layer.data.shape` raises" not in guide
 
 
 class TestToolReturnShape:

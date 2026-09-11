@@ -1,7 +1,8 @@
 """Helper functions injected into the execute_code namespace.
 
-``add_tensor`` is monkey-patched onto the viewer instance so the agent
-calls ``viewer.add_tensor("array_id")``.
+``add_tensor`` and ``tensor`` are monkey-patched onto the viewer instance so
+the agent calls ``viewer.add_tensor("array_id")`` to put a tensor on the viewer
+and ``viewer.tensor(layer)`` to read one back off it.
 """
 
 import logging
@@ -126,9 +127,30 @@ def resync_view_for_capture(viewer, timeout: float = 30.0) -> None:
         logger.debug("resync_view_for_capture failed", exc_info=True)
 
 
-def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
-    """Monkey-patch ``add_tensor`` onto *viewer*, reading client/sources from
-    the live ``TensorConnection`` *connection*.
+def _layer_own_array(layer):
+    """A layer's own pixels as one array, with the viewer's packaging removed.
+
+    Resolves the multiscale branch (level 0) and unwraps the ``_ViewerArray``
+    proxy, so what comes back is the array that was handed to ``add_image`` --
+    a dask array wherever the layer is backed by one.
+
+    Duck-typed rather than isinstance-checked on purpose: this also runs on a
+    layer the agent built from a plain numpy array, where there is no proxy and
+    nothing to unwrap.
+    """
+    data = layer.data
+    if getattr(layer, "multiscale", False):
+        data = data[0]  # MultiScaleData: level 0, not plane 0 (biopb/biopb#973)
+    unwrap = getattr(data, "unwrap", None)
+    return unwrap() if callable(unwrap) else data
+
+
+def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
+    """Monkey-patch ``add_tensor`` and ``tensor`` onto *viewer*, reading
+    client/sources from the live ``TensorConnection`` *connection*.
+
+    The pair is the round trip: ``add_tensor`` puts a tensor on the viewer,
+    ``tensor`` reads one back off it as a plain array (biopb/biopb#974).
 
     *compute_scheduler*, when set, pins the loaded layer's slice reads to a
     single-process dask scheduler (see ``_viewer_compute.wrap_levels``) so the
@@ -233,7 +255,58 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
 
         return name
 
+    def tensor(layer):
+        """Read a layer's pixels back as a plain, full-resolution dask array.
+
+        The inverse of :func:`add_tensor`, and the answer to the branch idiom
+        ``layer.data[0] if layer.multiscale else layer.data`` -- which is not
+        one thing: on a multiscale layer ``data[0]`` is *level 0*, on a
+        single-scale one it is *plane 0*, and either way what comes back is a
+        ``_ViewerArray`` proxy rather than a dask array (biopb/biopb#973,
+        biopb/biopb#974).
+
+        Args:
+            layer: A napari layer, or the name of one on this viewer.
+
+        Returns:
+            The layer's array. For a layer ``add_tensor`` loaded, this is
+            ``client.get_tensor(layer.metadata['array_id'])``: full resolution,
+            canonical ``[..., Z, Y, X]`` order, a genuine ``dask.array.Array``
+            -- not level 0 of whatever pyramid the server happened to
+            advertise, and not affected by the viewer's display state. For a
+            layer the agent built with ``add_image``/``add_labels``, this is
+            exactly the array it was given.
+
+        Reads from the *server*, so a layer whose ``.data`` was replaced in
+        place is not what comes back -- ``metadata['array_id']`` still names
+        the tensor it was loaded from. If that read fails (the source was
+        removed, say) this falls back to the layer's own array rather than
+        raising: the pixels on screen are still readable, and for a
+        single-scale layer the fallback is the same array.
+        """
+        if isinstance(layer, str):
+            layer = viewer.layers[layer]
+        if not hasattr(layer, "data"):
+            raise TypeError(
+                f"tensor() takes a layer or a layer name, got {type(layer).__name__}"
+            )
+
+        array_id = (getattr(layer, "metadata", None) or {}).get("array_id")
+        client = connection.client
+        if array_id and client is not None:
+            try:
+                return client.get_tensor(array_id)
+            except Exception:  # noqa: BLE001 - the layer still holds the pixels
+                logger.debug(
+                    "tensor(): server read of %s failed; falling back to the "
+                    "layer's own array",
+                    array_id,
+                    exc_info=True,
+                )
+        return _layer_own_array(layer)
+
     # napari.Viewer is a pydantic evented model with validate_assignment, so a
     # plain ``viewer.add_tensor = ...`` is rejected.  Write through to the
     # instance dict to bypass field validation.
     object.__setattr__(viewer, "add_tensor", add_tensor)
+    object.__setattr__(viewer, "tensor", tensor)
