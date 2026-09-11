@@ -30,12 +30,6 @@ from biopb_mcp.mcp import _app, _jobs, _kernel_rpc, _server, _writers  # noqa: E
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
-def _job_result(stdout):
-    """Unwrap the ``{"r": result, "w": window_alive}`` job-snippet envelope."""
-    payload = _kernel_rpc._extract_json(stdout)
-    return payload["r"] if payload else None
-
-
 @pytest.fixture
 def runner():
     """The in-kernel job runner wired to a fake InteractiveShell (no kernel).
@@ -747,18 +741,10 @@ class TestJobConcurrency:
         host.shutdown()
 
     def _submit(self, kernel, code):
-        res = kernel.execute(
-            _kernel_rpc._payload_snippet("_jobs.submit(" + repr(code) + ")"),
-            timeout=15.0,
-        )
-        return _job_result(res["stdout"])
+        return _kernel_rpc._run_job_call(kernel, "submit", code, timeout=15.0)[0]
 
     def _poll(self, kernel, job_id):
-        res = kernel.execute(
-            _kernel_rpc._payload_snippet("_jobs.poll(" + repr(job_id) + ")"),
-            timeout=15.0,
-        )
-        return _job_result(res["stdout"])
+        return _kernel_rpc._run_job_call(kernel, "poll", job_id, timeout=15.0)[0]
 
     def test_main_thread_free_while_job_runs(self, kernel):
         # A GIL-releasing background job (time.sleep) must not block the kernel
@@ -960,11 +946,7 @@ class TestNapariJobs:
     def _poll_until_done(self, host, job_id, timeout=20.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            res = host.execute(
-                _kernel_rpc._payload_snippet("_jobs.poll(" + repr(job_id) + ")"),
-                timeout=15.0,
-            )
-            snap = _job_result(res["stdout"])
+            snap = _kernel_rpc._run_job_call(host, "poll", job_id, timeout=15.0)[0]
             if snap and snap["status"] != "running":
                 return snap
             time.sleep(0.2)
@@ -974,14 +956,12 @@ class TestNapariJobs:
         # add_image from the background job thread must be marshaled to the Qt
         # main thread (no crash) and the layer must appear.
         before = napari_kernel.execute("print(len(viewer.layers))")["stdout"]
-        sub = napari_kernel.execute(
-            _kernel_rpc._payload_snippet(
-                "_jobs.submit("
-                + repr("viewer.add_image(np.zeros((8, 8)), name='t'); 'ok'")
-                + ")"
-            )
+        sub, _res, _w = _kernel_rpc._run_job_call(
+            napari_kernel,
+            "submit",
+            "viewer.add_image(np.zeros((8, 8)), name='t'); 'ok'",
         )
-        job_id = _job_result(sub["stdout"])["job_id"]
+        job_id = sub["job_id"]
         snap = self._poll_until_done(napari_kernel, job_id)
         assert snap["status"] == "ok", snap
         after = napari_kernel.execute("print(len(viewer.layers))")["stdout"]
@@ -1002,18 +982,12 @@ class TestNapariJobs:
         assert "running" in status
 
     def test_restart_clears_jobs(self, napari_kernel):
-        sub = napari_kernel.execute(
-            _kernel_rpc._payload_snippet(
-                "_jobs.submit(" + repr("import time; time.sleep(30)") + ")"
-            )
+        sub, _res, _w = _kernel_rpc._run_job_call(
+            napari_kernel, "submit", "import time; time.sleep(30)"
         )
-        job_id = _job_result(sub["stdout"])["job_id"]
+        job_id = sub["job_id"]
         napari_kernel.restart()  # respawns + re-bootstraps (resets jobs)
-        res = napari_kernel.execute(
-            _kernel_rpc._payload_snippet("_jobs.poll(" + repr(job_id) + ")"),
-            timeout=15.0,
-        )
-        snap = _job_result(res["stdout"])
+        snap = _kernel_rpc._run_job_call(napari_kernel, "poll", job_id, timeout=15.0)[0]
         assert snap["status"] == "unknown"
 
 

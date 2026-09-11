@@ -1,4 +1,4 @@
-"""The kernel round trip: calling into the kernel's handles, and reading back.
+"""The kernel round trip: calling into the in-kernel job runner, and reading back.
 
 Runs **in the MCP server process**. Every tool call and every observe/chat poll
 crosses this seam, and it is the same crossing each time: build a call
@@ -15,6 +15,7 @@ A leaf module: it knows the shape of the hop and nothing about who is making it
 """
 
 import asyncio
+import functools
 import json
 import logging
 
@@ -114,17 +115,24 @@ def _extract_json(text: str):
         return None
 
 
-def _run_ns_call(host, name: str, *args, **kwargs):
-    """Call ``<name>(*args, **kwargs)`` on a handle in the kernel namespace.
+def _run_job_call(host, name: str, *args, timeout=None, **kwargs):
+    """Call ``_jobs.<name>(*args, **kwargs)`` in the kernel.
 
-    The general form of the hop; :func:`_run_job_call` is the job runner's named
-    specialization, and today its only caller. Arguments are embedded by
-    :func:`_call_expr`, so the repr rule stays in one place. Returns ``(result,
-    raw_result, window_alive)`` where ``result`` is the parsed return value (None
-    if the snippet failed) and ``window_alive`` is the viewer-window liveness
-    flag carried in the same payload (None when unknown).
+    The hop every tool and poll makes. Arguments are passed as values, not as
+    pre-built source: :func:`_call_expr` reprs them, so the repr rule stays in
+    one place. Returns ``(result, raw_result, window_alive)`` where ``result``
+    is the parsed return value (None if the snippet failed) and ``window_alive``
+    is the viewer-window liveness flag carried in the same payload (None when
+    unknown).
+
+    *timeout* bounds this one round trip, defaulting to the host's
+    ``kernel.execute_timeout`` (120 s). Every production caller takes the
+    default; a caller driving a real kernel in a test wants to hear about a
+    wedged one sooner than two minutes.
     """
-    res = host.execute(_payload_snippet(_call_expr(name, *args, **kwargs)))
+    res = host.execute(
+        _payload_snippet(_call_expr("_jobs." + name, *args, **kwargs)), timeout
+    )
     if res.get("status") != "ok":
         return None, res, None
     payload = _extract_json(res.get("stdout", ""))
@@ -133,16 +141,7 @@ def _run_ns_call(host, name: str, *args, **kwargs):
     return payload.get("r"), res, payload.get("w")
 
 
-def _run_job_call(host, name: str, *args, **kwargs):
-    """Call ``_jobs.<name>(*args, **kwargs)`` in the kernel.
-
-    The job runner's :func:`_run_ns_call` -- the hop every tool and poll makes,
-    named for it.
-    """
-    return _run_ns_call(host, "_jobs." + name, *args, **kwargs)
-
-
-async def _job_call(host, name: str, *args, **kwargs):
+async def _job_call(host, name: str, *args, timeout=None, **kwargs):
     """:func:`_run_job_call` off the event loop.
 
     The round trip blocks: it waits on the kernel's lock (up to
@@ -156,7 +155,9 @@ async def _job_call(host, name: str, *args, **kwargs):
     because the tools and the observe API reach it at the same time -- so the
     thread is free of anything but the wait.
     """
-    return await asyncio.to_thread(_run_job_call, host, name, *args, **kwargs)
+    return await asyncio.to_thread(
+        functools.partial(_run_job_call, host, name, *args, timeout=timeout, **kwargs)
+    )
 
 
 async def _execute(host, code: str, timeout=None):

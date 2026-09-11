@@ -51,9 +51,11 @@ _DEAD_CLUSTER_ADVICE = (
     "to the in-process scheduler the napari viewer uses."
 )
 
-# Seconds a worker count stays good enough for the every-job liveness check.
-# The client's own background refresh runs at this rate, so a shorter TTL buys
-# no freshness -- only an RPC per submitted job.
+# Seconds a worker count stays good enough for the liveness readers (the
+# every-job check and `status()`). The client's own background refresh runs at
+# this rate, so a shorter TTL buys no freshness -- only an RPC: one per
+# submitted job, and a second one per attach, which fetches the count to split
+# the cache budget and then reports it.
 _WORKER_COUNT_TTL = 2.0
 
 
@@ -437,7 +439,11 @@ class DaskAttachment:
                 "dead": False,
                 "warning": None,
             }
-        workers = self._worker_count()
+        # Same TTL as the every-job check: `attach()` sizes the cache budget
+        # off a fresh count and then returns this, and asking the scheduler
+        # twice for one attach is a round trip for nothing. A fresh attach
+        # always reads live -- `_publish` clears the reading first.
+        workers = self._worker_count(max_age=_WORKER_COUNT_TTL)
         try:
             dashboard = client.dashboard_link
         except Exception:
