@@ -1,9 +1,5 @@
-# One resolution for the SDK, in the parent package: `biopb.image` is not a
-# distribution of its own, and looking the version up again here left
-# `__version__` *undefined* whenever the lookup failed -- importing from a
-# source tree that was never installed made `biopb.image.__version__` raise
-# AttributeError instead of reporting anything.
-from biopb import __version__
+# No `__version__` here: one distribution, one version, published as
+# `biopb.__version__` (biopb/biopb#998). `biopb.tensor` has never had one.
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiConflict,

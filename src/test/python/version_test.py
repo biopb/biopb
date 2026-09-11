@@ -22,18 +22,10 @@ def _reload_biopb():
 
 @pytest.fixture
 def restore_biopb():
-    """Reload the real modules afterwards: these tests stub what they import.
-
-    ``biopb.image`` too -- it re-exports the parent's ``__version__``, which
-    binds the value at import time, so a reload under the stubs leaves it
-    holding one.
-    """
+    """Reload the real module afterwards: these tests stub what it imports."""
     yield
     sys.modules.pop("biopb._version", None)
     _reload_biopb()
-    image = sys.modules.get("biopb.image")
-    if image is not None:
-        importlib.reload(image)
 
 
 class TestWhichSourceWins:
@@ -74,19 +66,26 @@ class TestWhichSourceWins:
         assert _reload_biopb().__version__ == "0.0.0"
 
 
-class TestTheSubpackageDoesNotResolveItsOwn:
-    def test_biopb_image_reports_the_same_version(self):
-        # `biopb.image` is not a distribution of its own.
+class TestOnlyTheDistributionCarriesOne:
+    """``__version__`` belongs to the distribution, so it lives on ``biopb``
+    and nowhere below it.
+
+    ``biopb.image`` carried its own until biopb/biopb#998 -- a second lookup of
+    the same distribution, with no fallback, that left the attribute undefined
+    when the lookup failed. Subpackages are not separately versioned, so it was
+    removed rather than copied to the siblings.
+    """
+
+    @pytest.mark.parametrize("name", ["biopb.image", "biopb.tensor"])
+    def test_a_subpackage_does_not_carry_one(self, name):
+        module = importlib.import_module(name)
+
+        assert not hasattr(module, "__version__"), (
+            f"{name}.__version__ is a second version for one distribution"
+        )
+
+    def test_the_top_level_package_does(self):
         import biopb
-        import biopb.image
 
-        assert biopb.image.__version__ == biopb.__version__
-
-    def test_it_is_always_defined(self):
-        # It used to be looked up separately and left *undefined* when the
-        # lookup failed, so importing from an uninstalled source tree made this
-        # raise AttributeError rather than report anything.
-        import biopb.image
-
-        assert isinstance(biopb.image.__version__, str)
-        assert biopb.image.__version__
+        assert isinstance(biopb.__version__, str)
+        assert biopb.__version__
