@@ -37,6 +37,7 @@ import httpx
 from biopb._credentials import read_credential
 
 from .. import _endpoint
+from .._message_shape import describe_messages
 from . import _chat
 from ._chat import VisionUnsupported
 
@@ -376,7 +377,17 @@ def make_model(config):
                 raise VisionUnsupported(
                     f"{model_name} rejected an image ({reply.status_code}): {detail}"
                 )
-            raise RuntimeError(f"{model_name} returned {reply.status_code}: {detail}")
+            # A 4xx is a verdict on the payload, so the payload's shape is
+            # what identifies which turn drew it -- the provider names the
+            # field it wanted, never the message that lacked it
+            # (biopb/biopb#990). A 5xx is the provider's own fault and the
+            # thread had nothing to do with it.
+            shape = (
+                f"\n{describe_messages(messages)}" if reply.status_code < 500 else ""
+            )
+            raise RuntimeError(
+                f"{model_name} returned {reply.status_code}: {detail}{shape}"
+            )
         if responses:
             return _responses_message(reply.json(), model_name)
         choices = reply.json().get("choices") or []
