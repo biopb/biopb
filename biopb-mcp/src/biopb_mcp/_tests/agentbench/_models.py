@@ -33,9 +33,10 @@ import functools
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 from ... import _endpoint
+from ..._provider_echo import echoed_fields
 
 #: Where a key may live besides the environment. A non-interactive shell does
 #: not read `~/.bashrc` past its `case $- in *i*` guard, so an export added at
@@ -323,23 +324,6 @@ class EmptyCompletion(RuntimeError):
         self.model = model
         self.reason = reason
         self.max_tokens = max_tokens
-
-
-#: Keys a provider may return on an assistant message and require back on the
-#: next request. Tried in order; the first one *present* is carried under its
-#: own name, because a provider spelling it `reasoning` will not accept
-#: `reasoning_content`. Shared with `_agent.py`: both sides of the conversation
-#: hold history, so both have to echo, and one definition keeps them honest.
-ECHOED_FIELDS = ("reasoning_content", "reasoning")
-
-
-def echoed_fields(message: Any) -> dict:
-    """What *message* carries that has to be sent back with it."""
-    for key in ECHOED_FIELDS:
-        value = getattr(message, key, None)
-        if value is not None:
-            return {key: value}
-    return {}
 
 
 @dataclass(frozen=True)

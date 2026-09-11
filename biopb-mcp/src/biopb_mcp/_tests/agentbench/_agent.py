@@ -34,8 +34,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ... import _endpoint
+from ..._provider_echo import echoed_fields
 from ._bridge import parse_arguments
-from ._models import ModelChoice, agent_choice, echoed_fields
+from ._models import ModelChoice, agent_choice
 
 
 class RequestRejected(RuntimeError):

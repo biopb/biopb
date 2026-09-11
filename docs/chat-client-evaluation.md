@@ -194,7 +194,8 @@ most visible machinery in `_conversation.py` exists *because no human is
 present*: the `Respondent` persona hand-off, the `__BIOPB_TASK_COMPLETE__`
 sentinel, and idle-stall detection are all replaced by a real user. What carries
 over is narrower: tool-call dispatch, tool-result message construction, the
-provider reasoning-field echo (`_models.py:306-320`), and the trace log.
+provider reasoning-field echo (`_provider_echo.py`, now shared with the chat
+loop -- biopb/biopb#975), and the trace log.
 
 Genuinely absent, and needed:
 

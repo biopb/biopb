@@ -45,6 +45,7 @@ import time
 from mcp.types import ImageContent, TextContent
 
 from .. import _endpoint
+from .._provider_echo import ECHOED_FIELDS, echoed_fields
 from . import _app, _kernel_rpc, _server, _writers
 
 # The kernel round trip, off the loop. Bound here under the name this module
@@ -256,8 +257,17 @@ def _append(role, content, **extra):
 
 
 def history():
-    """The conversation as the views render it, oldest first."""
-    return list(_messages)
+    """The conversation as the views render it, oldest first.
+
+    Minus the provider echo (:mod:`.._provider_echo`), which is bookkeeping for
+    the next request and not something anyone said. These dicts go to the views
+    unfiltered, so leaving it on would ship a reasoning turn's reasoning to
+    every browser poll -- the same care the image path takes in
+    :func:`_llm_messages`.
+    """
+    return [
+        {k: v for k, v in msg.items() if k not in ECHOED_FIELDS} for msg in _messages
+    ]
 
 
 def _last_user_text():
@@ -613,13 +623,20 @@ def _llm_messages():
         elif msg["role"] == "assistant" and msg.get("tool_calls"):
             out.append(
                 {
+                    # First, so the keys below cannot be displaced by a
+                    # provider field that happens to share a name with one.
+                    **echoed_fields(msg),
                     "role": "assistant",
                     "content": msg["content"] or None,
                     "tool_calls": msg["tool_calls"],
                 }
             )
         else:
-            out.append({"role": msg["role"], "content": msg["content"]})
+            # Echoed here too: a reasoning turn that answers in text rather
+            # than calling a tool needs it just as much.
+            out.append(
+                {**echoed_fields(msg), "role": msg["role"], "content": msg["content"]}
+            )
     return out
 
 
@@ -867,7 +884,15 @@ async def _run_turn(user_text, model, on_progress):
         for _round in range(_MAX_TOOL_ROUNDS):
             reply, tools = await _ask(model, tools)
             calls = reply.get("tool_calls") or []
-            _append("assistant", reply.get("content") or "", tool_calls=calls)
+            # `**echoed_fields`: the reply is kept for the pane, but what the
+            # provider requires back travels with it or the next request is
+            # refused outright (biopb/biopb#975).
+            _append(
+                "assistant",
+                reply.get("content") or "",
+                tool_calls=calls,
+                **echoed_fields(reply),
+            )
             if not calls:
                 break
             # Images are held back until every call in the round has answered.
