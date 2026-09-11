@@ -726,6 +726,64 @@ class TestReDropRebuilds:
         assert sid in server.sources
         assert server.sources.get(sid) is original
 
+    def test_the_restored_adapter_was_never_closed(self, tmp_path, monkeypatch):
+        """Identity is not enough (biopb/biopb#979): restoring the adapter the
+        swap displaced only keeps the source *served* if nobody closed it on
+        the way through. A registry that closed on swap would satisfy the test
+        above and still leave this source live in ListFlights with its handles
+        released -- which is the reason ``SourceRegistry.swap`` hands the
+        displaced adapter back open rather than closing it.
+        """
+
+        class _FailingDb:
+            def sync_source_added(self, *a, **kw):
+                raise RuntimeError("catalog write failed")
+
+            def sync_source_removed(self, *a, **kw):
+                pass
+
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0].source_id
+        original = server.sources.get(sid)
+
+        closes = []
+        real_close = original.close
+        monkeypatch.setattr(
+            original, "close", lambda: (closes.append(1), real_close())[1]
+        )
+
+        manager._reconciler._metadata_db = _FailingDb()
+        _drain_all(manager.add_local_source(zpath))
+
+        assert server.sources.get(sid) is original
+        assert closes == [], "the restored adapter was closed on its way back"
+
+    def test_a_committed_rebuild_does_close_the_one_it_displaced(
+        self, tmp_path, monkeypatch
+    ):
+        """The other half of the same ownership rule: once the replace has
+        committed there is no rollback left to need the old adapter, so its
+        handles are released rather than held for the life of the server."""
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0].source_id
+        original = server.sources.get(sid)
+
+        closes = []
+        real_close = original.close
+        monkeypatch.setattr(
+            original, "close", lambda: (closes.append(1), real_close())[1]
+        )
+
+        _, _, refreshed, _, _ = _drain_all(manager.add_local_source(zpath))
+
+        assert refreshed == [sid]
+        assert server.sources.get(sid) is not original
+        assert closes == [1], "the displaced adapter was leaked, still open"
+
 
 class TestReDropRemovesVanished:
     """The removal half: a registered source whose files are gone."""

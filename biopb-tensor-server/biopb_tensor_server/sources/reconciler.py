@@ -1043,8 +1043,12 @@ class Reconciler:
 
             self._path_to_source_id[claim.primary_path] = claim.source_id
             if displaced is not None:
-                # Only now: a reader that resolved the old adapter before the
-                # swap is still decoding from it, and close() drains that.
+                # Only now, and this ordering is the reason `swap` hands the
+                # displaced adapter back open rather than closing it: until the
+                # catalog upsert above has succeeded, the except below may still
+                # restore this adapter and go on serving from it. Draining the
+                # reader that resolved it before the swap is close()'s own job,
+                # not what the delay buys.
                 close_adapter(displaced)
             logger.info(f"Registered source with server: {claim.source_id}")
             return True
