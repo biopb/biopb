@@ -30,12 +30,6 @@ from biopb_mcp.mcp import _app, _jobs, _kernel_rpc, _server, _writers  # noqa: E
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
-def _job_result(stdout):
-    """Unwrap the ``{"r": result, "w": window_alive}`` job-snippet envelope."""
-    payload = _kernel_rpc._extract_json(stdout)
-    return payload["r"] if payload else None
-
-
 @pytest.fixture
 def runner():
     """The in-kernel job runner wired to a fake InteractiveShell (no kernel).
@@ -102,12 +96,36 @@ class TestJobRunnerUnit:
             _jobs.interrupt_current()
         self._wait(jid)
 
-    def test_distributed_cancel_rebuilds_futures(self, runner):
+    def test_worker_less_cluster_fails_the_job_instead_of_hanging(self, runner):
+        # biopb/biopb#970's backstop: a scheduler with no workers accepts work
+        # and never runs it, so the cell blocks forever with no error. The runner
+        # refuses to start one, naming the two ways out.
+        class _Ctl:
+            def dead_message(self):
+                return "no workers left; _dask_ctl.attach() or .detach()"
+
+        runner["_dask_ctl"] = _Ctl()
+        jid = _jobs.submit("x = 1")["job_id"]
+        snap = self._wait(jid)
+        assert snap["status"] == "error"
+        assert "_dask_ctl.attach()" in snap["error_text"]
+        assert "x" not in runner  # the code never ran
+
+    def test_healthy_attachment_does_not_block_a_job(self, runner):
+        class _Ctl:
+            def dead_message(self):
+                return None
+
+        runner["_dask_ctl"] = _Ctl()
+        jid = _jobs.submit("x = 1")["job_id"]
+        assert self._wait(jid)["status"] == "ok"
+
+    def test_distributed_cancel_rebuilds_futures(self, runner, monkeypatch):
         # _cancel() must rebuild real Future objects from dc.futures' string
         # keys: Client.cancel() filters its arg through futures_of(), which
         # silently drops bare strings -- so passing list(dc.futures) cancels
         # nothing.  Assert real Futures (resolvable by futures_of) + force=True.
-        from distributed import Future
+        from distributed import Client, Future
         from distributed.client import futures_of
 
         calls = {}
@@ -131,7 +149,11 @@ class TestJobRunnerUnit:
                 calls["futures"] = list(futures)
                 calls["force"] = force
 
-        runner["_dask_client"] = _StubClient()
+        # Whatever client is *live*, not the `_dask_client` binding: a cell that
+        # made its own Client() is attached just as much, and its futures are
+        # just as stuck. That is what makes the hand-rolled path first-class.
+        stub = _StubClient()
+        monkeypatch.setattr(Client, "current", classmethod(lambda cls, **kw: stub))
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         time.sleep(0.05)
         _jobs._cancel_dask_futures(_jobs._jobs[jid])
@@ -719,16 +741,10 @@ class TestJobConcurrency:
         host.shutdown()
 
     def _submit(self, kernel, code):
-        res = kernel.execute(
-            _kernel_rpc._job_snippet("submit(" + repr(code) + ")"), timeout=15.0
-        )
-        return _job_result(res["stdout"])
+        return _kernel_rpc._run_job_call(kernel, "submit", code, timeout=15.0)[0]
 
     def _poll(self, kernel, job_id):
-        res = kernel.execute(
-            _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
-        )
-        return _job_result(res["stdout"])
+        return _kernel_rpc._run_job_call(kernel, "poll", job_id, timeout=15.0)[0]
 
     def test_main_thread_free_while_job_runs(self, kernel):
         # A GIL-releasing background job (time.sleep) must not block the kernel
@@ -930,11 +946,7 @@ class TestNapariJobs:
     def _poll_until_done(self, host, job_id, timeout=20.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            res = host.execute(
-                _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"),
-                timeout=15.0,
-            )
-            snap = _job_result(res["stdout"])
+            snap = _kernel_rpc._run_job_call(host, "poll", job_id, timeout=15.0)[0]
             if snap and snap["status"] != "running":
                 return snap
             time.sleep(0.2)
@@ -944,14 +956,12 @@ class TestNapariJobs:
         # add_image from the background job thread must be marshaled to the Qt
         # main thread (no crash) and the layer must appear.
         before = napari_kernel.execute("print(len(viewer.layers))")["stdout"]
-        sub = napari_kernel.execute(
-            _kernel_rpc._job_snippet(
-                "submit("
-                + repr("viewer.add_image(np.zeros((8, 8)), name='t'); 'ok'")
-                + ")"
-            )
+        sub, _res, _w = _kernel_rpc._run_job_call(
+            napari_kernel,
+            "submit",
+            "viewer.add_image(np.zeros((8, 8)), name='t'); 'ok'",
         )
-        job_id = _job_result(sub["stdout"])["job_id"]
+        job_id = sub["job_id"]
         snap = self._poll_until_done(napari_kernel, job_id)
         assert snap["status"] == "ok", snap
         after = napari_kernel.execute("print(len(viewer.layers))")["stdout"]
@@ -972,17 +982,12 @@ class TestNapariJobs:
         assert "running" in status
 
     def test_restart_clears_jobs(self, napari_kernel):
-        sub = napari_kernel.execute(
-            _kernel_rpc._job_snippet(
-                "submit(" + repr("import time; time.sleep(30)") + ")"
-            )
+        sub, _res, _w = _kernel_rpc._run_job_call(
+            napari_kernel, "submit", "import time; time.sleep(30)"
         )
-        job_id = _job_result(sub["stdout"])["job_id"]
+        job_id = sub["job_id"]
         napari_kernel.restart()  # respawns + re-bootstraps (resets jobs)
-        res = napari_kernel.execute(
-            _kernel_rpc._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
-        )
-        snap = _job_result(res["stdout"])
+        snap = _kernel_rpc._run_job_call(napari_kernel, "poll", job_id, timeout=15.0)[0]
         assert snap["status"] == "unknown"
 
 

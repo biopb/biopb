@@ -19,157 +19,6 @@ from ._jobs import KERNEL_HANDLE_NAMES
 logger = logging.getLogger(__name__)
 
 
-def _configure_dask(config: dict):
-    """Set up dask in the kernel process.
-
-    The kernel never owns a cluster: the session child (``biopb_mcp.mcp``) spins
-    and owns the ``LocalCluster`` (see :class:`_cluster.DaskClusterHost`) and
-    injects its address. Returns a distributed ``Client`` (or ``None`` for the
-    in-process scheduler):
-
-    * ``"distributed"`` + an address (``BIOPB_DASK_ADDRESS`` injected by the
-      session child, or an external ``dask.address``) -> a ``Client`` attached
-      to that scheduler.
-    * ``"distributed"`` + no address -> the session child has no cluster
-      (disabled or a spin failure), so degrade to the in-process ``threads``
-      scheduler rather than spinning a competing kernel-local one.
-    * ``"threads"`` / ``"synchronous"`` -> in-process scheduler.
-
-    ``interrupt_kernel`` can stop an in-flight ``compute()`` in any distributed
-    mode (it holds a real ``Client``). A failure attaching degrades gracefully to
-    ``threads`` rather than aborting the bootstrap.
-    """
-    import dask
-
-    from .._config import get_setting
-
-    scheduler = get_setting(config, "dask.scheduler")
-    num_workers = get_setting(config, "dask.num_workers") or None
-    # The session-child-injected address (its owned cluster) wins over the
-    # configured external one; either takes the plain Client(address) attach path.
-    address = os.environ.get("BIOPB_DASK_ADDRESS") or get_setting(
-        config, "dask.address"
-    )
-
-    if scheduler == "distributed":
-        try:
-            from dask.distributed import Client
-
-            if address:
-                client = Client(address)
-                logger.info("Dask attached to distributed scheduler at %s", address)
-                return client
-
-            # No address: the session child owns the cluster and would have
-            # injected BIOPB_DASK_ADDRESS. None here means it has none (disabled
-            # or a spin failure) -> in-process threads, not a competing
-            # kernel-local cluster.
-            logger.info("No injected dask address; using in-process threads scheduler")
-            scheduler = "threads"
-        except Exception:
-            # A missing `distributed` install or an unreachable address --
-            # degrade to the in-process scheduler so the bootstrap (and the
-            # viewer) survives.
-            logger.exception(
-                "Distributed dask unavailable; "
-                "falling back to in-process threads scheduler"
-            )
-            scheduler = "threads"
-
-    dask.config.set(scheduler=scheduler, num_workers=num_workers)
-    logger.info("Dask scheduler: %s, num_workers: %s", scheduler, num_workers)
-    return None
-
-
-def _make_cache_plugin(location, token, cache_bytes):
-    """Build a dask ``WorkerPlugin`` that pins each worker's chunk-cache budget.
-
-    Lives here, not in the tensor SDK: it is dask-specific glue and a rare edge
-    case. It only matters when the MCP kernel talks *directly* to a **remote**
-    tensor server under the multi-process distributed cluster, where each worker
-    would otherwise replicate the client cache. The usual path is a local
-    server/proxy (localhost -> the tensor client keeps no cache), where this is a
-    no-op.
-
-    Registering the returned plugin runs ``biopb.tensor.client.configure_cache``
-    (the SDK's per-process cache primitive) on every worker -- current and future
-    -- so the budget stays fixed across the cluster; the plugin is ``name``-tagged
-    so re-registration replaces rather than stacks. Returns ``None`` when
-    ``distributed`` is unavailable so callers can no-op.
-    """
-    try:
-        from distributed.diagnostics.plugin import WorkerPlugin
-    except Exception:
-        return None
-
-    class _CacheConfigPlugin(WorkerPlugin):
-        name = "biopb-cache-config"  # named -> idempotent re-registration
-
-        def __init__(self, location, token, cache_bytes):
-            self._args = (location, token, cache_bytes)
-
-        def setup(self, worker):
-            from biopb.tensor.client import configure_cache
-
-            configure_cache(*self._args)
-
-    return _CacheConfigPlugin(location, token, cache_bytes)
-
-
-def _register_cache_plugin(dask_client, url, token, config: dict, planned_workers=None):
-    """Split the data-plane chunk-cache budget across dask workers.
-
-    Divides ``dask.cache_budget`` evenly across the workers and installs a
-    worker-init plugin so each worker (current and future) caps its per-process
-    *copy* cache at ``budget // n_workers`` -- bounding the aggregate cache that
-    would otherwise be replicated per worker.
-
-    This budget now applies on localhost too. It bounds only the strong cache of
-    chunks that cost real RAM (``do_get`` / over-budget copies); on localhost
-    those are rare (the mmap fast path dominates), and its views are cached
-    *weakly* -- shared with the OS page cache, so not replicated per worker and
-    needing no budget. So the old "localhost clamps to 0" special-case is gone;
-    each worker just applies this budget uniformly.
-
-    No-op without a distributed client. Best-effort: a failure here must not
-    break the connect flow that invokes it. Called from
-    ``TensorConnection.on_connect`` with the final ``(url, token)`` (the token is
-    only known after connect).
-    """
-    if dask_client is None:
-        return
-    try:
-        from dask.utils import parse_bytes
-
-        from .._config import get_setting
-
-        n_workers = max(
-            1,
-            planned_workers or len(dask_client.scheduler_info().get("workers", {})),
-        )
-
-        budget_cfg = get_setting(config, "dask.cache_budget")
-        budget = (
-            int(budget_cfg)
-            if isinstance(budget_cfg, int | float)
-            else parse_bytes(budget_cfg)
-        )
-        per_worker = max(0, budget // n_workers)
-
-        plugin = _make_cache_plugin(url, token, per_worker)
-        if plugin is None:
-            return
-        dask_client.register_plugin(plugin)
-        logger.info(
-            "Chunk-cache plugin: %d B/worker x %d workers (%s)",
-            per_worker,
-            n_workers,
-            url,
-        )
-    except Exception:
-        logger.exception("Failed to register chunk-cache budget plugin")
-
-
 def is_scratch_kernel():
     """Whether this kernel was spawned to verify a workflow (``_scratch``).
 
@@ -405,10 +254,10 @@ def _pickle_by_value(mod) -> None:
     ``user_ns`` reports ``__module__ == "__main__"``, which cloudpickle always
     serializes by value. A function reached through an imported module pickles by
     *reference* instead -- a few bytes naming a module no worker can import, since
-    the plugin dir is on no ``sys.path`` but this kernel's. ``dask.scheduler``
-    defaults to distributed and the guides steer the agent toward dask, so without
-    this a plugin function inside a ``da.map_blocks`` would fail at compute time,
-    far from the load that caused it. Fail-open: in-process use still works.
+    the plugin dir is on no ``sys.path`` but this kernel's. So without this, a
+    plugin function inside a ``da.map_blocks`` would fail at compute time --
+    whenever a cluster is attached, far from the load that caused it. Fail-open:
+    in-process use (the default since #970) still works.
     """
     try:
         import cloudpickle
@@ -659,67 +508,37 @@ def _bootstrap_impl():
 
     # 2. Data-access service (dask-free), shared by the widget and the agent
     #    namespace. Created before dask so the viewer can come up without waiting
-    #    on the distributed Client attach below.
+    #    on the attach thread below.
     conn = TensorConnection()
 
-    # 3. Attach dask on a background thread so the viewer opens immediately. The
-    #    cluster is session-child-owned and may still be registering workers, and
-    #    even a bare Client(address) connect costs a round-trip; the viewer never
-    #    needs the distributed cluster (its interactive reads pin to a
-    #    single-process scheduler, issue #8) — only the agent's explicit
-    #    da.compute() uses the distributed default, which is set once the Client
-    #    attaches. Until then `_dask_client` is None; interrupt_kernel /
-    #    server_status guard for that.
+    # 3. Settle dask on a background thread so the viewer opens immediately.
+    #    The default is the *in-process* scheduler the viewer's own slice reads
+    #    use (#8), so there is nothing to wait for and nothing to go stale
+    #    (#970); a cluster is an explicit act -- a cell calling
+    #    `_dask_ctl.attach()`, or a config that asks at startup -- and spinning
+    #    or connecting to one costs seconds, which is why this stays off the
+    #    bootstrap thread. Until it settles `_dask_client` is None;
+    #    interrupt_kernel / server_status guard for that. `_dask_ctl` owns the
+    #    whole arrangement, cluster included (see _dask_ctl).
     import threading
 
-    ip.user_ns["_dask_client"] = None
-    # False until the attach thread resolves (to a Client or, for threads mode /
-    # a degrade, None). Lets server_status distinguish "still attaching" from
-    # "no distributed cluster".
-    ip.user_ns["_dask_attach_done"] = False
+    from ._dask_ctl import DaskAttachment
 
-    # The connect hook and the attach thread race to register the chunk-cache
-    # plugin; whichever runs second (both hold this lock) registers it, since it
-    # needs both a ready Client and a live (url, token). register_plugin is named
-    # / idempotent so a double-register is harmless. The kernel always attaches to
-    # the session child's cluster, so the budget splits across its live worker
-    # count (see _register_cache_plugin).
-    _dask_lock = threading.Lock()
-    _dask_state = {
-        "client": None,
-        "connected": False,
-        "url": None,
-        "token": None,
-    }
-
-    def _register_cache_if_ready():
-        # Caller holds _dask_lock. Splits dask.cache_budget across the worker
-        # processes (localhost workers clamp it to 0 themselves). No-op until both
-        # a Client and a connection exist.
-        client = _dask_state["client"]
-        if client is None or not _dask_state["connected"]:
-            return
-        _register_cache_plugin(client, _dask_state["url"], _dask_state["token"], config)
+    # DaskAttachment seeds `_dask_client` (None) and `_dask_attach_done` (False,
+    # until the thread below resolves to a Client or to the in-process scheduler)
+    # -- it owns both bindings, so it is the one that writes them.
+    dask_ctl = DaskAttachment(config, ip)
+    ip.user_ns["_dask_ctl"] = dask_ctl
 
     # on_connect fires (in the kernel) after every successful connect with the
-    # final (url, token), which is what bounds the dask chunk cache -- the token is
-    # only known post-connect.
-    def _on_connect(url, token):
-        with _dask_lock:
-            _dask_state.update(url=url, token=token, connected=True)
-            _register_cache_if_ready()
+    # final (url, token), which is what bounds the workers' chunk cache -- the
+    # token is only known post-connect. It races the attach thread; whichever
+    # arrives second registers the plugin (_dask_ctl holds the lock for both).
+    conn.on_connect = dask_ctl.on_connect
 
-    conn.on_connect = _on_connect
-
-    def _attach_dask():
-        client = _configure_dask(config)
-        with _dask_lock:
-            _dask_state["client"] = client
-            ip.user_ns["_dask_client"] = client
-            ip.user_ns["_dask_attach_done"] = True
-            _register_cache_if_ready()
-
-    threading.Thread(target=_attach_dask, name="biopb-dask-attach", daemon=True).start()
+    threading.Thread(
+        target=dask_ctl.start, name="biopb-dask-attach", daemon=True
+    ).start()
 
     # 4. napari viewer + Tensor Browser -- unless this is a scratch kernel.
     #

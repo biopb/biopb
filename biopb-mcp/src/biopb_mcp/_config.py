@@ -288,20 +288,23 @@ class DaskConfig:
     """Dask scheduler / cluster for the kernel's compute."""
 
     scheduler: str = _h(
-        "distributed",
-        'Dask scheduler: "distributed" (a LocalCluster; enables mid-compute '
-        'cancel and real CPU parallelism), "threads"/"synchronous" (low-overhead '
-        "in-process, no mid-compute cancel).",
+        "threads",
+        'Scheduler the kernel starts on: "threads"/"synchronous" (in-process, '
+        "shared with the napari viewer; a cell runs `_dask_ctl.attach()` when a "
+        'cluster is wanted), "distributed" (spin one at kernel start, as every '
+        "session did before #970).",
     )
     num_workers: int = _h(
         _DEFAULT_DASK_NUM_WORKERS,
-        "n_workers for the auto-spun LocalCluster (0 -> dask picks ~n_cores). 0 on "
-        "POSIX (fork is cheap); capped at 4 on Windows (each worker is a cold spawn).",
+        "n_workers for a spun LocalCluster (0 -> dask picks ~n_cores). 0 on "
+        "POSIX (fork is cheap); capped at 4 on Windows (each worker is a cold "
+        "spawn). Does not size the in-process scheduler, which uses dask's own "
+        "default.",
     )
     address: str = _h(
         "",
-        "Non-empty -> connect to this external scheduler address; empty -> the "
-        "session child spins/owns a LocalCluster.",
+        "Non-empty -> the kernel attaches to this external scheduler at startup "
+        "(wins over `scheduler`); empty -> no external cluster.",
     )
     threads_per_worker: int = _h(
         1, "LocalCluster threads per worker (local cluster only)."
@@ -319,14 +322,6 @@ class DaskConfig:
         "Cluster-wide chunk-cache budget for the data-plane client, split evenly "
         "across workers. Human size (1G/512M/2GiB) or int bytes; 0 disables. "
         "Applies to localhost and remote alike.",
-    )
-    idle_ttl: float = _h(
-        900.0,
-        "Seconds with no kernel attached after which the session child's own "
-        "LocalCluster is torn down, freeing its workers; the next start_kernel "
-        "re-spins it. Only counts while no kernel is alive, so a live viewer or "
-        "a restart never loses the warm cluster. 0 disables. An external "
-        "dask.address is never reaped (we do not own it).",
     )
 
 
@@ -660,7 +655,6 @@ _CONSTRAINTS = {
     "DaskConfig": {
         "scheduler": Enum({"distributed", "threads", "synchronous"}),
         "num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
-        "idle_ttl": Range(min=0),  # 0 disables the idle reaper
     },
     "TensorRuntimeConfig": {
         "health_poll_min_interval": Range(min=0),  # 0 disables the watcher

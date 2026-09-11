@@ -91,7 +91,8 @@ sets:
 **Writable (`rw`):**
 - the kernel working dir (`KernelHost._launch` passes `cwd`) — where results and
   agent scratch belong;
-- the **dask spill dir** (`DaskClusterHost` `local_dir`);
+- the **dask spill dir** (`_dask_ctl.DaskAttachment._spin`'s `local_directory`),
+  only while a cluster is attached;
 - a private `$TMPDIR` (pyarrow / napari / Qt scratch).
 
 **Readable (only relevant when `enforce_reads=True`):**
@@ -104,12 +105,16 @@ sets:
   falls back to the slower `do_get` socket. So read-enforcement must allowlist
   the server cache root, or accept losing the fast path.
 
-## 5. The two-process-group caveat (do not skip)
+## 5. The worker-process caveat (do not skip)
 
-The kernel and the dask workers are **different processes in different groups**:
-the workers are daemon-owned (`DaskClusterHost` spins `LocalCluster(processes=
-True)`), not children of the kernel. An audit hook installed in the kernel does
-**not** run in the workers.
+The kernel and the dask workers are **different processes**: the workers are
+children of the kernel (`_dask_ctl.DaskAttachment._spin` spins
+`LocalCluster(processes=True)`), so they die with it -- but an audit hook
+installed in the kernel still does **not** run in them.
+
+Since #970 a cluster is opt-in, so the default in-process path has no workers at
+all and the kernel hook is the whole guard there. The gap below opens only once
+something calls `_dask_ctl.attach()`.
 
 So agent file I/O performed *inside a dask task* —
 `da.map_blocks(lambda b: open('/etc/…'))`, a custom `da.store` target — executes
@@ -133,8 +138,8 @@ Both sites read the **same allowlist** from config so they cannot drift.
   open files during setup), so the guard governs agent code only, never the
   bootstrap itself.
 - **Workers:** a `WorkerPlugin` registered where the cluster is created
-  (`mcp/_cluster.py`), applying the identical hook + allowlist in each worker's
-  `setup`.
+  (`mcp/_dask_ctl.py`, `DaskAttachment.attach`), applying the identical hook +
+  allowlist in each worker's `setup`.
 - **Errors:** `PermissionError` with a message that names the allowed workdir, so
   the agent gets an actionable signal ("writes are restricted to `<workdir>`;
   save through napari or `client.upload_array` instead") rather than a bare

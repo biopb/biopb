@@ -15,6 +15,7 @@ A leaf module: it knows the shape of the hop and nothing about who is making it
 """
 
 import asyncio
+import functools
 import json
 import logging
 
@@ -54,24 +55,24 @@ def _call_expr(name: str, *args, **kwargs) -> str:
     return f"{name}({', '.join(parts)})"
 
 
-def _job_snippet(call: str) -> str:
-    """Build a snippet that prints ``_jobs.<call>``'s result as delimited JSON.
+def _payload_snippet(expr: str) -> str:
+    """Build a snippet that prints *expr*'s value as delimited JSON.
 
-    ``call`` is a fully-formed call expression, normally from :func:`_call_expr`
-    (agent code is RCE by design, but embedding via ``repr`` keeps the payload a
-    valid literal regardless of its contents).
+    ``expr`` is a fully-formed expression, normally a call from
+    :func:`_call_expr` (agent code is RCE by design, but embedding via ``repr``
+    keeps the payload a valid literal regardless of its contents).
 
-    The payload is ``{"r": <call result>, "w": <viewer window alive?>}`` so the
-    same round-trip also reports whether the viewer window is still open (a
+    The payload is ``{"r": <value>, "w": <viewer window alive?>}`` so the same
+    round-trip also reports whether the viewer window is still open (a
     user-closed window turns viewer mutations into silent no-ops). The liveness
     probe is auxiliary, so a kernel that never bound ``_viewer_window_alive``
     (e.g. a partial/test bootstrap) reports ``w: null`` rather than breaking the
-    job round-trip.
+    round-trip.
     """
     return (
         "import json as _json\n"
         "print('" + _JOB_DELIM + "' + _json.dumps("
-        "{'r': _jobs." + call + ", "
+        "{'r': " + expr + ", "
         "'w': globals().get('_viewer_window_alive', lambda: None)()}))\n"
     )
 
@@ -114,16 +115,24 @@ def _extract_json(text: str):
         return None
 
 
-def _run_job_call(host, name: str, *args, **kwargs):
+def _run_job_call(host, name: str, *args, timeout=None, **kwargs):
     """Call ``_jobs.<name>(*args, **kwargs)`` in the kernel.
 
-    Arguments are passed as values, not as pre-built source: :func:`_call_expr`
-    reprs them. Returns ``(result, raw_result, window_alive)`` where ``result``
+    The hop every tool and poll makes. Arguments are passed as values, not as
+    pre-built source: :func:`_call_expr` reprs them, so the repr rule stays in
+    one place. Returns ``(result, raw_result, window_alive)`` where ``result``
     is the parsed return value (None if the snippet failed) and ``window_alive``
     is the viewer-window liveness flag carried in the same payload (None when
-    unknown, e.g. the snippet did not run cleanly).
+    unknown).
+
+    *timeout* bounds this one round trip, defaulting to the host's
+    ``kernel.execute_timeout`` (120 s). Every production caller takes the
+    default; a caller driving a real kernel in a test wants to hear about a
+    wedged one sooner than two minutes.
     """
-    res = host.execute(_job_snippet(_call_expr(name, *args, **kwargs)))
+    res = host.execute(
+        _payload_snippet(_call_expr("_jobs." + name, *args, **kwargs)), timeout
+    )
     if res.get("status") != "ok":
         return None, res, None
     payload = _extract_json(res.get("stdout", ""))
@@ -132,7 +141,7 @@ def _run_job_call(host, name: str, *args, **kwargs):
     return payload.get("r"), res, payload.get("w")
 
 
-async def _job_call(host, name: str, *args, **kwargs):
+async def _job_call(host, name: str, *args, timeout=None, **kwargs):
     """:func:`_run_job_call` off the event loop.
 
     The round trip blocks: it waits on the kernel's lock (up to
@@ -146,7 +155,9 @@ async def _job_call(host, name: str, *args, **kwargs):
     because the tools and the observe API reach it at the same time -- so the
     thread is free of anything but the wait.
     """
-    return await asyncio.to_thread(_run_job_call, host, name, *args, **kwargs)
+    return await asyncio.to_thread(
+        functools.partial(_run_job_call, host, name, *args, timeout=timeout, **kwargs)
+    )
 
 
 async def _execute(host, code: str, timeout=None):

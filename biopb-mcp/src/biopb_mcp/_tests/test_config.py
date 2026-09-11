@@ -70,7 +70,7 @@ class TestLoadConfig:
 
         assert config["dask"]["num_workers"] == 4
         # Sibling dask defaults and other sections are intact.
-        assert config["dask"]["scheduler"] == "distributed"
+        assert config["dask"]["scheduler"] == "threads"
         assert config["transport"]["kind"] == "stdio"
 
     def test_handles_malformed_json(self, mock_config_dir):
@@ -243,9 +243,10 @@ class TestDefaultConfig:
         assert "skills" not in services
 
     def test_dask_defaults(self):
-        """MCP dask defaults to a session-child-owned distributed cluster."""
+        """MCP dask defaults to the in-process scheduler: no cluster unless asked
+        for (`_dask_ctl.attach()`, or scheduler=distributed) -- biopb/biopb#970."""
         dask = DEFAULT_CONFIG["dask"]
-        assert dask["scheduler"] == "distributed"
+        assert dask["scheduler"] == "threads"
         assert dask["address"] == ""
         assert "owner" not in dask  # the escape hatch was removed
         for key in (
@@ -300,11 +301,11 @@ class TestGetSetting:
     def test_missing_falls_back_to_default_config(self):
         assert get_setting({}, "transport.port") == 8765
         assert get_setting({}, "widget.server_url") == "localhost:50051"
-        assert get_setting({}, "dask.scheduler") == "distributed"
+        assert get_setting({}, "dask.scheduler") == "threads"
 
     def test_partial_path_falls_back(self):
         config = {"dask": {"num_workers": 4}}
-        assert get_setting(config, "dask.scheduler") == "distributed"
+        assert get_setting(config, "dask.scheduler") == "threads"
         assert get_setting(config, "dask.num_workers") == 4
 
     def test_explicit_default_wins_over_default_config(self):
@@ -485,7 +486,7 @@ class TestValidation:
             },
         )
         assert get_setting(config, "transport.kind") == "stdio"
-        assert get_setting(config, "dask.scheduler") == "distributed"
+        assert get_setting(config, "dask.scheduler") == "threads"
 
     def test_port_out_of_range_clamped(self, mock_config_dir):
         config = _write_and_load(mock_config_dir, {"transport": {"port": 99999}})

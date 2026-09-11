@@ -116,22 +116,28 @@ except Exception as _e:
 
 print("")
 print("## Dask")
+# Which scheduler this kernel's computes run on -- the arrangement, not just a
+# worker count, because "attached to a cluster that has lost its workers" is the
+# state that used to be invisible until a .compute() hung forever (#970).
 try:
-    import dask as _dask
-    print("  scheduler: " + str(_dask.config.get("scheduler", default="unknown")))
+    _dst = _dask_ctl.status()
+    if _dst["mode"] == "attached":
+        _own = " (spun by this kernel)" if _dst["owned"] else " (external)"
+        print("  mode: attached to " + str(_dst["address"]) + _own)
+        print("  workers: " + str(_dst["workers"]))
+        print("  dashboard: " + str(_dst["dashboard"]))
+        if _dst["cache_budget_per_worker"] is not None:
+            print("  chunk_cache: " + str(_dst["cache_budget_per_worker"]) + " B/worker")
+        if _dst["warning"]:
+            print("  WARNING: " + _dst["warning"])
+    elif _dst["mode"] == "attaching":
+        print("  mode: attaching (still connecting to a cluster)")
+    else:
+        print("  mode: in-process (" + str(_dst["scheduler"]) + "), shared with the viewer")
+        print("    `_dask_ctl.attach()` in a cell spins a cluster for multi-process")
+        print("    parallelism / a cancellable compute; guide://kernel explains when")
 except Exception as _e:
     print("  error: " + str(_e))
-try:
-    if _dask_client is not None:
-        _info = _dask_client.scheduler_info()
-        print("  distributed_workers: " + str(len(_info.get("workers", {}))))
-        print("  dashboard: " + str(_dask_client.dashboard_link))
-    elif not globals().get("_dask_attach_done", True):
-        print("  distributed: starting (attaching to cluster)")
-    else:
-        print("  distributed: not active")
-except Exception:
-    print("  distributed: not active")
 
 print("")
 print("## Tensor Server")
@@ -1029,13 +1035,14 @@ async def inspect_object(object_path: str) -> str:
 async def interrupt_kernel() -> str:
     """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
-    Also cancels the job's in-flight dask futures. The job runs in a background
-    worker thread, so a SIGINT (which Python delivers only to the kernel main
-    thread) can't reach it — this raises the exception directly into the worker.
-    Best-effort: it lands at the next bytecode, so a
-    blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
-    it returns to Python; if YOUR job stays stuck, use restart_kernel — the
-    guaranteed stop.
+    Also cancels the job's in-flight dask futures, which is what actually stops a
+    blocking `.compute()` — but only while a cluster is attached (`_dask_ctl.attach()`
+    in a cell); on the in-process default there are no futures to cancel. The job runs in a
+    background worker thread, so a SIGINT (which Python delivers only to the
+    kernel main thread) can't reach it — this raises the exception directly into
+    the worker. Best-effort: it lands at the next bytecode, so a blocking C-level
+    call (gRPC tensor fetch, native dask compute) stops only when it returns to
+    Python; if YOUR job stays stuck, use restart_kernel — the guaranteed stop.
 
     Stops YOUR job only. A cell the user ran from the observe page shares this
     kernel and this one-job-at-a-time runner, but is not yours to stop: this

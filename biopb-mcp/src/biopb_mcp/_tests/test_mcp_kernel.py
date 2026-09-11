@@ -21,129 +21,6 @@ from biopb_mcp.mcp import _kernel  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
-class TestConfigureDask:
-    """Unit tests for _configure_dask (no kernel / no display needed)."""
-
-    def test_in_process_scheduler_returns_no_client(self):
-        """threads/synchronous schedulers yield no client."""
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        assert _configure_dask({"dask": {"scheduler": "threads"}}) is None
-
-    def test_external_address_connects_without_cluster(self, monkeypatch):
-        """distributed + an explicit address attaches a Client."""
-        pytest.importorskip("dask.distributed")
-        import dask.distributed as dd
-
-        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
-        created = {}
-
-        class _FakeClient:
-            def __init__(self, address):
-                created["address"] = address
-
-        monkeypatch.setattr(dd, "Client", _FakeClient)
-
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        client = _configure_dask(
-            {
-                "dask": {
-                    "scheduler": "distributed",
-                    "address": "tcp://1.2.3.4:8786",
-                }
-            }
-        )
-        assert isinstance(client, _FakeClient)
-        assert created["address"] == "tcp://1.2.3.4:8786"
-
-    def test_injected_address_takes_precedence(self, monkeypatch):
-        """BIOPB_DASK_ADDRESS (session-child-injected) wins over the config address."""
-        pytest.importorskip("dask.distributed")
-        import dask.distributed as dd
-
-        monkeypatch.setenv("BIOPB_DASK_ADDRESS", "tcp://daemon:8786")
-        created = {}
-
-        class _FakeClient:
-            def __init__(self, address):
-                created["address"] = address
-
-        monkeypatch.setattr(dd, "Client", _FakeClient)
-
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        _configure_dask(
-            {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}
-        )
-        assert created["address"] == "tcp://daemon:8786"
-
-    def test_no_address_falls_back_to_threads(self, monkeypatch):
-        """distributed + no injected address -> in-process threads. The kernel
-        never owns a cluster, so LocalCluster must never be constructed here."""
-        pytest.importorskip("dask.distributed")
-        import dask.distributed as dd
-
-        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
-
-        def _must_not_spin(*args, **kwargs):
-            raise AssertionError("the kernel must never spin a LocalCluster")
-
-        monkeypatch.setattr(dd, "LocalCluster", _must_not_spin)
-
-        from biopb_mcp.mcp._bootstrap import _configure_dask
-
-        assert (
-            _configure_dask({"dask": {"scheduler": "distributed", "address": ""}})
-            is None
-        )
-
-
-class TestClusterAddressInjection:
-    """_launch injects BIOPB_DASK_ADDRESS from cluster_host.ensure().
-
-    Uses a real bare kernel and reads its inherited env back out, so it covers
-    the full injection path.
-    """
-
-    class _FakeClusterHost:
-        def __init__(self, address):
-            self._address = address
-            self.calls = 0
-
-        def ensure(self):
-            self.calls += 1
-            return self._address
-
-    def test_injects_address_when_ensure_returns_one(self):
-        fake = self._FakeClusterHost("tcp://127.0.0.1:12345")
-        host = KernelHost(
-            health_probe_code=None, startup_timeout=60.0, cluster_host=fake
-        )
-        host.start()
-        try:
-            res = host.execute("import os; print(os.environ.get('BIOPB_DASK_ADDRESS'))")
-            assert "tcp://127.0.0.1:12345" in res["stdout"]
-            assert fake.calls >= 1
-        finally:
-            host.shutdown()
-
-    def test_omits_address_when_ensure_returns_none(self, monkeypatch):
-        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
-        fake = self._FakeClusterHost(None)
-        host = KernelHost(
-            health_probe_code=None, startup_timeout=60.0, cluster_host=fake
-        )
-        host.start()
-        try:
-            res = host.execute(
-                "import os; print(repr(os.environ.get('BIOPB_DASK_ADDRESS')))"
-            )
-            assert "None" in res["stdout"]
-        finally:
-            host.shutdown()
-
-
 @pytest.fixture
 def kernel():
     """A bare kernel with no bootstrap and no health probe."""
@@ -789,6 +666,42 @@ class TestNapariBootstrap:
     def test_viewer_in_namespace(self, napari_kernel):
         res = napari_kernel.execute("print('viewer' in dir())")
         assert "True" in res["stdout"]
+
+    @pytest.fixture
+    def default_config_kernel(self, tmp_path):
+        """A bootstrapped kernel that reads *no* user config.
+
+        The machine's own ``mcp-config.json`` decides whether a kernel attaches
+        at startup, and an install that predates #970 has ``dask.scheduler`` set
+        to ``"distributed"`` on disk -- so a test of the *default* has to isolate
+        the config tree (``$BIOPB_CONFIG_HOME``, biopb/biopb#790) or it measures
+        this machine instead.
+        """
+        line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
+        host = KernelHost(
+            extra_arguments=[f"--IPKernelApp.exec_lines={line}"],
+            startup_timeout=120.0,
+            env=dict(os.environ, BIOPB_CONFIG_HOME=str(tmp_path)),
+        )
+        host.start()
+        yield host
+        host.shutdown()
+
+    def test_kernel_computes_in_process_by_default(self, default_config_kernel):
+        # The #970 default, end to end: a real bootstrap spins no cluster and
+        # leaves dask on the in-process scheduler the viewer reads through.
+        napari_kernel = default_config_kernel
+        snippet = (
+            "import time as _t\n"
+            "for _ in range(100):\n"
+            "    if _dask_attach_done:\n"
+            "        break\n"
+            "    _t.sleep(0.05)\n"
+            "print(_dask_client, _dask_ctl.status()['mode'], "
+            "_dask_ctl.status()['scheduler'])\n"
+        )
+        res = napari_kernel.execute(snippet, 30.0)
+        assert "None in-process threads" in res["stdout"]
 
     def test_screenshot_round_trips(self, napari_kernel):
         snippet = (

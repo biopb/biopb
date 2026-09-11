@@ -18,11 +18,9 @@ import argparse
 import atexit
 import logging
 import os
-import shutil
 import signal
 import socket
 import sys
-import tempfile
 
 from biopb._locations import MCP_SESSION_LOG_ENV
 
@@ -318,7 +316,6 @@ def _serve_http(config, port, view=False):
     """
     from .._config import get_setting
     from . import _app, _scratch, _server, _xvfb
-    from ._cluster import DaskClusterHost
     from ._kernel import ENV_SCRATCH, KernelHost
 
     # Windows: serve on the Selector event loop, not the default Proactor one
@@ -395,31 +392,6 @@ def _serve_http(config, port, view=False):
     # the launcher's stdout/stderr — which, for a shim-spawned session child, is
     # that session's log file (biopb._lifecycle.owned_child.open_child_log).
 
-    # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
-    # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
-    # (which leaves workers no chance to clean up) doesn't leak spill dirs
-    # (issue #13, secondary disk-leak note). Consumed by the session-child-owned
-    # cluster (below) via DaskClusterHost.local_dir.
-    dask_local_dir = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
-
-    def _cleanup_dask_dir():
-        shutil.rmtree(dask_local_dir, ignore_errors=True)
-
-    # Register now (before host.start()) so the scratch dir is still removed on
-    # interpreter exit if start() raises. rmtree(ignore_errors) makes this and
-    # the explicit calls on the os._exit paths harmless if they both run.
-    atexit.register(_cleanup_dask_dir)
-
-    # Session-child-owned dask cluster: spun lazily on the first kernel launch
-    # (from KernelHost._launch, which injects its address), kept warm across
-    # kernel restarts, and closed only on real process exit (the _shutdown
-    # chokepoint + atexit backstop). Detaching the cluster from the kernel avoids
-    # re-spinning N cold workers on every restart_kernel — the dominant restart
-    # cost on Windows (no fork). Construction is cheap (no dask import until
-    # ensure()); atexit is a backstop for exits that skip _shutdown.
-    cluster_host = DaskClusterHost(config, local_dir=dask_local_dir)
-    atexit.register(cluster_host.close)
-
     host = KernelHost(
         extra_arguments=extra_arguments,
         kernel_name=get_setting(config, "kernel.name"),
@@ -431,9 +403,6 @@ def _serve_http(config, port, view=False):
         watchdog_max_respawns=get_setting(config, "kernel.watchdog_max_respawns"),
         watchdog_respawn_window=get_setting(config, "kernel.watchdog_respawn_window"),
         parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
-        # Session-child-owned dask cluster; _launch calls ensure() and injects
-        # its scheduler address so the kernel attaches instead of spinning its own.
-        cluster_host=cluster_host,
     )
 
     # How to build the scratch kernel a verification runs in: the same config
@@ -461,15 +430,10 @@ def _serve_http(config, port, view=False):
             watchdog_interval=0,
             window_close_pipe=False,
             parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
-            cluster_host=cluster_host,
         )
 
     _scratch.set_host_factory(_scratch_host)
 
-    # Now that the kernel host exists, let the cluster's idle reaper ask it
-    # whether a kernel is attached — the one thing that makes a teardown safe.
-    cluster_host.set_kernel_alive(host.is_alive)
-    cluster_host.start_reaper()
     _app.set_kernel_host(host)
     _app.set_promote_after(get_setting(config, "kernel.promote_after"))
     # Advertise the curated-skills catalog only when it is enabled (off by
@@ -582,13 +546,10 @@ def _serve_http(config, port, view=False):
         # attached to. Cheap and idempotent when chat never ran.
         _stop_acp_agent()
         host.shutdown()
-        # After the kernel is reaped (no clients left attached): stop the
-        # session-child-owned cluster, then rmtree its now-idle spill dir. This
-        # is the only path that closes the cluster — kernel restart/reap leaves
-        # it warm. The Xvfb display outlives kernel restarts the same way, so
-        # it too goes down only here (its X clients died with the kernel).
-        cluster_host.close()
-        _cleanup_dask_dir()
+        # Any dask cluster went with the kernel — it is the kernel that spins one
+        # now, and its workers are that process group's. The Xvfb display is the
+        # one thing here that outlives a kernel restart, so it goes down only on
+        # this path (its X clients died with the kernel).
         _xvfb.stop(xvfb_proc)
         os._exit(0)
 
