@@ -617,6 +617,15 @@ class SourceAdapter(ABC):
         Most adapters hold nothing between reads -- see the file-handle policy in
         ARCHITECTURE.md -- so the default is a no-op and only the persistent-handle
         adapters override it. An override must be safe to call twice.
+
+        **An in-flight read is this method's problem, not its caller's.** Nothing
+        drains before calling: ``SourceRegistry.unregister`` and ``close_all``
+        close on the spot, and a replace closes the displaced adapter as soon as
+        the swap has committed (``SourceRegistry.swap``). So an override holding
+        a handle that a read is decoding through must deal with it itself --
+        drain on ``_active_reads`` under a deadline (``OmeTiffAdapter``), decline
+        and leave the release to the idle reaper (mrc / dv / qptiff), or release
+        under ``_io_lock`` (czi / nd2 / ndtiff / bioio).
         """
 
     def release_registration_cache(  # noqa: B027 - concrete no-op default

@@ -28,7 +28,9 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
     """Best-effort release of an adapter's resources (e.g. open file handles).
 
     Public because :meth:`SourceRegistry.swap` hands the displaced adapter back
-    unclosed, so whoever swapped needs this same never-raises close.
+    unclosed -- it may have to be restored rather than closed, so the choice is
+    the caller's -- and whoever swapped then needs this same never-raises close
+    for the branch where the replace committed.
 
     ``SourceAdapter.close()`` is declared on the ABC with a no-op default, so
     this calls it rather than sniffing for it: a wrapper that forwards every
@@ -41,7 +43,7 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
         return
     try:
         adapter.close()
-    except Exception:  # pragma: no cover - cleanup must not fail
+    except Exception:  # cleanup must not fail
         logger.debug("error closing source adapter", exc_info=True)
 
 
@@ -101,6 +103,12 @@ class SourceRegistry:
         """Remove a source and release its adapter's resources.
 
         Returns the removed adapter (or ``None`` if it was not registered).
+
+        Closed here, where :meth:`swap` hands its displaced adapter back open:
+        the id is gone, so there is no rollback that could need this one back.
+        The reader that resolved it a moment ago and is still decoding from it
+        is ``SourceAdapter.close``'s concern, not this method's -- see
+        :meth:`swap` for why that is not what separates the two.
         """
         with self._lock:
             adapter = self._sources.pop(source_id, None)
@@ -115,11 +123,26 @@ class SourceRegistry:
 
         Returns ``(registered, displaced)`` -- the adapter as registered (see
         :meth:`register` on normalization) and the one it replaced, or None if
-        the id was free. The displaced adapter is **not** closed: a reader that
-        already resolved it through :meth:`get` is still decoding from it, so
-        closing is the caller's to do once it has drained (see
-        ``SourceAdapter.close``). That handback is this method's whole content --
-        a bare :meth:`register` over a live id leaks what it overwrote.
+        the id was free. That handback is this method's whole content -- a bare
+        :meth:`register` over a live id leaks what it overwrote.
+
+        **The displaced adapter is not closed, because the swap may be undone.**
+        A replace that fails after the swap -- the catalog upsert raises, say --
+        puts the displaced adapter back and goes on serving from it
+        (``Reconciler._restore_displaced_source``), so a registry that closed it
+        here would restore a source that is live in ListFlights and broken on
+        its first read. Ownership therefore passes to the caller, which either
+        closes with :func:`close_adapter` once the replace has committed, or
+        restores instead of closing.
+
+        What does *not* separate the two methods is draining in-flight readers.
+        :meth:`unregister` closes on the spot under exactly the same condition
+        -- a reader that resolved the adapter a moment earlier is still decoding
+        from it -- because that is ``SourceAdapter.close``'s own obligation in
+        both directions: ``OmeTiffAdapter`` drains on ``_active_reads``, mrc /
+        dv / qptiff defer to the reaper while a read is active, czi / nd2 /
+        ndtiff / bioio release under ``_io_lock``, and the default holds nothing.
+        No caller of either method owes a drain.
         """
         with self._lock:
             displaced = self._sources.get(source_id)
