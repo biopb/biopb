@@ -590,57 +590,56 @@ class TestVersionCommand:
         return out
 
     def test_reports_release_and_sdk(self, monkeypatch, tmp_path):
-        # Two lines only: the product deployment (marker) and the biopb SDK.
-        marker = tmp_path / "release.version"
-        marker.write_text("1.2.3\n")
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
+        # Two lines only: the product deployment and the biopb SDK.
         monkeypatch.setattr(
             cli,
             "_package_version",
-            lambda name: {"biopb": "0.9.3"}.get(name, "not installed"),
+            lambda name: {"biopb": "0.9.3", "biopb-control": "1.2.3"}.get(
+                name, "not installed"
+            ),
         )
 
         res = CliRunner().invoke(cli.app, ["version"])
 
         assert res.exit_code == 0, res.output
         labels = self._labels(res.output)
-        # Deployment version is the marker's contents (the release-v* product
-        # line), distinct from the biopb SDK's own v* version.
+        # The deployment line is a release-v* wheel's own version, distinct from
+        # the biopb SDK's v* version.
         assert labels["release"] == "1.2.3"
         assert labels["biopb"] == "0.9.3"
-        # The product wheels are no longer listed individually — they all share
-        # the release version, so the marker stands in for the set.
+        # The product wheels are not listed individually — they all share the
+        # release version, so one stands in for the set.
         assert set(labels) == {"release", "biopb"}
         assert "biopb-tensor-server" not in labels
         assert "biopb-mcp" not in labels
 
-    def test_release_version_unknown_when_marker_absent(self, monkeypatch, tmp_path):
-        # A dev checkout / non-installer setup has no marker: report 'unknown',
-        # never crash.
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", tmp_path / "missing.version")
+    def test_the_installer_marker_is_not_read_here(self):
+        # Why this is metadata: the marker is user-global, so running from a dev
+        # venv printed that venv's SDK beside a different installation's
+        # deployment. It stays on disk for the auto-updater, which reads it
+        # itself (biopb_mcp.mcp._update).
+        assert not hasattr(cli, "_RELEASE_VERSION_FILE")
+        assert not hasattr(cli, "_read_release_version")
+
+    def test_any_member_of_the_set_answers(self, monkeypatch):
+        # One release-v* tag versions them together, so a partial install (no
+        # control) still reports the deployment.
+        monkeypatch.setattr(
+            cli,
+            "_package_version",
+            lambda name: {"biopb-tensor-server": "1.2.3"}.get(name, "not installed"),
+        )
+
+        assert cli._release_version() == "1.2.3"
+
+    def test_release_is_not_installed_when_no_member_is(self, monkeypatch):
+        # More honest than a stale marker left behind by a previous install.
+        monkeypatch.setattr(cli, "_package_version", lambda _: "not installed")
 
         res = CliRunner().invoke(cli.app, ["version"])
 
         assert res.exit_code == 0, res.output
-        assert self._labels(res.output)["release"] == "unknown"
-
-    def test_read_release_version_strips_marker_contents(self, monkeypatch, tmp_path):
-        marker = tmp_path / "release.version"
-        # The installer writes no trailing newline; be tolerant of both.
-        marker.write_text("  9.9.9\n")
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
-        assert cli._read_release_version() == "9.9.9"
-
-    def test_read_release_version_corrupt_marker_is_unknown(
-        self, monkeypatch, tmp_path
-    ):
-        # A corrupt (non-UTF-8) marker must degrade to 'unknown', not raise a
-        # UnicodeDecodeError out of the command -- reading a version is
-        # best-effort, like _package_version.
-        marker = tmp_path / "release.version"
-        marker.write_bytes(b"\xff\xfe\x00bad")
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
-        assert cli._read_release_version() == "unknown"
+        assert self._labels(res.output)["release"] == "not installed"
 
     def test_package_version_missing_is_not_installed(self):
         # A distribution name that is guaranteed absent maps to 'not installed'.

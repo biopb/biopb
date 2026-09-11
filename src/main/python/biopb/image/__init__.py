@@ -1,10 +1,5 @@
-try:
-    import importlib.metadata
-
-    __version__ = importlib.metadata.version("biopb")
-except Exception:
-    pass
-
+# No `__version__` here: one distribution, one version, published as
+# `biopb.__version__` (biopb/biopb#998). `biopb.tensor` has never had one.
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiConflict,

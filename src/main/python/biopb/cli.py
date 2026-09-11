@@ -32,7 +32,7 @@ from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
-from ._locations import DEFAULT_CONFIG_DIR, find_config
+from ._locations import find_config
 
 console = Console()
 
@@ -112,42 +112,46 @@ DEFAULT_CONFIG = find_config()
 CONTROL_PID_FILE = _locations.control_pid_file()
 
 
-# The installer records the release-v* deployment version it pulled the wheels
-# from in this marker file -- a clean PEP 440 string (e.g. "0.11.0"), the
-# auto-updater's baseline. This is the *product* version: one release-v* tag
-# versions the mutually-paired biopb-tensor-server / biopb-mcp / biopb-control /
-# web set together, so the marker represents them all. (The biopb SDK ships on
-# its own v* line, so its wheel version differs.) Kept in sync with
-# CONFIG_DIR/release.version in install/install.sh.
-_RELEASE_VERSION_FILE = DEFAULT_CONFIG_DIR / "release.version"
+# One release-v* tag versions this set together, so any installed member reports
+# the product version. (The biopb SDK ships on its own v* line, so its wheel
+# version differs.) Tried in order; the first one installed answers.
+_RELEASE_PACKAGES = ("biopb-control", "biopb-mcp", "biopb-tensor-server")
 
 
-def _read_release_version() -> str:
-    """The installed deployment version from the installer's marker file, or
-    'unknown' when it is absent (a dev checkout or non-installer setup that never
-    wrote CONFIG_DIR/release.version) or unreadable. Best-effort like
-    ``_package_version`` -- reading a version must never crash ``biopb version``,
-    so a missing/permission-denied/corrupt (non-UTF-8) marker degrades to
-    'unknown' rather than propagating."""
-    try:
-        # Explicit utf-8 (the installer writes a plain ASCII/utf-8 version), so
-        # decoding is deterministic across platforms rather than dependent on the
-        # reader's locale (cp1252 on Windows would decode a corrupt marker to
-        # garbage instead of failing to 'unknown').
-        return _RELEASE_VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
-    except OSError:
-        return "unknown"
-    except Exception:  # noqa: BLE001 - marker read is best-effort (e.g. decode errors)
-        return "unknown"
+def _release_version() -> str:
+    """The product deployment version, from whichever release-v* wheel is here.
+
+    Read from distribution metadata rather than the installer's
+    ``CONFIG_DIR/release.version`` marker, because the marker is *user-global*:
+    a ``biopb version`` run from another environment -- a dev venv, a second
+    tool install -- printed that environment's SDK beside a different
+    installation's deployment. Metadata is per-environment, so both lines now
+    describe the one you ran from, and a set upgraded by hand rather than by
+    the installer reports what is actually present.
+
+    The marker stays for the auto-updater, which reads it itself
+    (``biopb_mcp.mcp._update``).
+    """
+    for name in _RELEASE_PACKAGES:
+        found = _package_version(name)
+        if found not in ("not installed", "unknown"):
+            return found
+    return "not installed"
 
 
 def _package_version(dist_name: str) -> str:
     """Installed version of distribution `dist_name`, or 'not installed'.
 
-    Reads distribution metadata (like biopb.__init__ does for its own version)
-    instead of importing the package, so `biopb version` never drags in the
-    packages' heavy optional stacks just to print a number, and still reports a
-    version when a package is installed but its runtime imports are broken.
+    Reads distribution metadata rather than importing the package, and that is
+    deliberate: this command reports what is *installed* here -- the same
+    question its release-marker line answers. A package's own ``__version__``
+    answers a different one, what is *running*, and resolves the build-time file
+    first (biopb/biopb#910), so in an editable checkout the two legitimately
+    differ until the next install.
+
+    Not importing also keeps `biopb version` from dragging in the packages'
+    heavy optional stacks just to print a number, and still reports a version
+    when a package is installed but its runtime imports are broken.
     """
     from importlib.metadata import PackageNotFoundError, version as _dist_version
 
@@ -164,9 +168,9 @@ def version():
     """Show the two version lines: the product deployment and the biopb SDK."""
     rows = [
         # The product line (release-v*): biopb-tensor-server / mcp / control / web
-        # all share this version, so the installer's deployment marker stands in
-        # for the whole set -- no need to list each wheel separately.
-        ("release", _read_release_version()),
+        # all share this version, so one member stands in for the whole set --
+        # no need to list each wheel separately.
+        ("release", _release_version()),
         # The SDK line (v*): biopb ships to PyPI/Maven on its own tag, so its
         # version is independent of the product bundle it is also packaged into.
         ("biopb", _package_version("biopb")),

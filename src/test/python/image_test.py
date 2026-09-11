@@ -22,7 +22,9 @@ from biopb.image.utils import (
 def test_import():
     import biopb.image as proto
 
-    assert proto.__version__
+    # The version lives on the distribution's top-level package, not here
+    # (biopb/biopb#998), so this checks the package is populated instead.
+    assert proto.DetectionRequest is not None
 
 
 def test_canonicalize_dtype():
