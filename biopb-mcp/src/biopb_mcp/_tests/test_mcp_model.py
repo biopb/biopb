@@ -231,6 +231,66 @@ class TestCall:
         with pytest.raises(RuntimeError, match="context_length_exceeded"):
             asyncio.run(_model.make_model(config)([], []))
 
+    def test_a_4xx_names_the_shape_of_what_it_sent(self, config, state_home):
+        # The provider names the field it wanted, never the message that
+        # lacked it, and the thread is re-sent whole every turn -- so the
+        # shape is what says which turn drew the rejection (biopb/biopb#990).
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(
+            status=400, text="reasoning_content must be passed back"
+        )
+        messages = [
+            {"role": "user", "content": "segment the nuclei"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "a"}, {"id": "b"}],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        ]
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(_model.make_model(config)(messages, []))
+
+        text = str(caught.value)
+        assert "reasoning_content must be passed back" in text
+        assert "last 3 of 3 messages sent" in text
+        assert "tool_calls=2" in text
+        shape = text.split("messages sent:")[1]
+        assert "reasoning_content" not in shape, (
+            "the assistant turn had no such key; the shape must not invent one"
+        )
+
+    def test_the_shape_never_carries_content(self, config, state_home):
+        # The whole reason this is safe to put in front of a user: keys and
+        # counts, never what the user typed or what a tool returned.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(status=400, text="bad request")
+        messages = [
+            {"role": "user", "content": "my unpublished experiment"},
+            {"role": "tool", "tool_call_id": "a", "content": "patient_07.nd2"},
+        ]
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(_model.make_model(config)(messages, []))
+
+        text = str(caught.value)
+        assert "my unpublished experiment" not in text
+        assert "patient_07.nd2" not in text
+        assert "keys=[content]" in text
+
+    def test_a_5xx_is_the_providers_fault_not_the_threads(self, config, state_home):
+        # Nothing about the payload drew a 502, so its shape is noise between
+        # the reader and the provider's words.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(status=502, text="upstream unavailable")
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(
+                _model.make_model(config)([{"role": "user", "content": "hi"}], [])
+            )
+
+        text = str(caught.value)
+        assert "upstream unavailable" in text
+        assert "messages sent" not in text
+
     def test_an_image_refusal_is_told_apart_from_a_400_it_cannot_act_on(
         self, config, state_home
     ):
