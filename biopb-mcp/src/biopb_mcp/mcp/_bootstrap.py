@@ -659,13 +659,13 @@ def _bootstrap_impl():
         # Internal subsystems (helpers, tools, the Tensor Browser widget) keep
         # the real viewer. See docs/viewer-thread-safety.md.
         from ._helpers import (
-            patch_viewer_add_tensor,
+            patch_viewer_tensor_methods,
             resync_view_for_capture,
             viewer_window_alive,
         )
         from ._viewer_proxy import make_viewer_proxy
 
-        patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
+        patch_viewer_tensor_methods(viewer, conn, compute_scheduler=compute_scheduler)
         ns["viewer"] = make_viewer_proxy(viewer)
         ns["_viewer_window_alive"] = lambda: viewer_window_alive(viewer)
         ns["_resync_view"] = lambda: resync_view_for_capture(viewer)

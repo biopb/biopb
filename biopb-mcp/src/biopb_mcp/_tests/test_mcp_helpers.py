@@ -7,7 +7,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_mcp.mcp._helpers import (
     _get_url_stem,
-    patch_viewer_add_tensor,
+    patch_viewer_tensor_methods,
     resync_view_for_capture,
     viewer_window_alive,
 )
@@ -68,12 +68,12 @@ class TestPatchViewerAddTensor:
     """Tests for the monkey-patched viewer.add_tensor."""
 
     def test_patches_method_on_viewer(self, viewer, connection):
-        patch_viewer_add_tensor(viewer, connection)
+        patch_viewer_tensor_methods(viewer, connection)
         assert hasattr(viewer, "add_tensor")
         assert callable(viewer.add_tensor)
 
     def test_raises_when_no_client(self, viewer, connection):
-        patch_viewer_add_tensor(viewer, connection)
+        patch_viewer_tensor_methods(viewer, connection)
         with pytest.raises(RuntimeError, match="No tensor server connected"):
             viewer.add_tensor("some_source")
 
@@ -83,7 +83,7 @@ class TestPatchViewerAddTensor:
         client.get_descriptor.side_effect = RuntimeError("no such source")
         connection.client = client
         connection.sources = {"a": MagicMock()}
-        patch_viewer_add_tensor(viewer, connection)
+        patch_viewer_tensor_methods(viewer, connection)
 
         with pytest.raises(ValueError, match="not found"):
             viewer.add_tensor("nonexistent")
@@ -105,7 +105,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             name = viewer.add_tensor("remote_src")
 
         client.get_descriptor.assert_called_once_with("remote_src")
@@ -129,7 +129,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[MagicMock()],
         ):
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             viewer.add_tensor("remote_src", tensor_id="remote_src/t2", name="x")
 
         client.get_descriptor.assert_called_once_with("remote_src/t2")
@@ -146,7 +146,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             name = viewer.add_tensor("src1")
 
         assert name == "my_image"
@@ -170,7 +170,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_add_tensor(viewer, connection, compute_scheduler="threads")
+            patch_viewer_tensor_methods(viewer, connection, compute_scheduler="threads")
             viewer.add_tensor("src1")
 
         (passed,), kwargs = viewer.add_image.call_args
@@ -184,7 +184,7 @@ class TestPatchViewerAddTensor:
         src = _make_source("http://server/data/multi", [t1, t2])
         connection.client = MagicMock()
         connection.sources = {"src1": src}
-        patch_viewer_add_tensor(viewer, connection)
+        patch_viewer_tensor_methods(viewer, connection)
 
         with pytest.raises(ValueError, match="specify tensor_id"):
             viewer.add_tensor("src1")
@@ -202,7 +202,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             name = viewer.add_tensor("src1", tensor_id="t2", name="custom")
 
         assert name == "custom"
@@ -221,7 +221,7 @@ class TestPatchViewerAddTensor:
         connection.sources = {"src1": src}
 
         with patch("biopb_mcp._tensor_utils.add_tensor_layer") as add_layer:
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             name = viewer.add_tensor("src1/t2")
 
         _, _, source_id, tensor_id, tensor_desc = add_layer.call_args[0]
@@ -241,7 +241,7 @@ class TestPatchViewerAddTensor:
         connection.sources = {}
 
         with patch("biopb_mcp._tensor_utils.add_tensor_layer") as add_layer:
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             viewer.add_tensor("remote_src/t2")
 
         client.get_descriptor.assert_called_once_with("remote_src/t2")
@@ -259,13 +259,13 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[MagicMock()],
         ):
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             name = viewer.add_tensor(source_id="src1")
 
         assert name == "my_image"
 
     def test_requires_an_id(self, viewer, connection):
-        patch_viewer_add_tensor(viewer, connection)
+        patch_viewer_tensor_methods(viewer, connection)
         with pytest.raises(TypeError, match="requires an array_id"):
             viewer.add_tensor()
 
@@ -281,7 +281,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=levels,
         ):
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             viewer.add_tensor("src1")
 
         viewer.add_image.assert_called_once_with(
@@ -293,7 +293,7 @@ class TestPatchViewerAddTensor:
         src = _make_source("http://server/data/img", [tensor])
         connection.client = MagicMock()
         connection.sources = {"src1": src}
-        patch_viewer_add_tensor(viewer, connection)
+        patch_viewer_tensor_methods(viewer, connection)
 
         with pytest.raises(ValueError, match="Tensor 'wrong' not found"):
             viewer.add_tensor("src1", tensor_id="wrong")
@@ -318,7 +318,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_add_tensor(viewer, connection)
+            patch_viewer_tensor_methods(viewer, connection)
             viewer.add_tensor("src1")
 
         _, kwargs = viewer.add_image.call_args
@@ -464,3 +464,173 @@ class TestResyncViewForCapture:
         v = self._viewer([_FakeLayer([True])])
         v._layer_slicer.submit.side_effect = RuntimeError("boom")
         resync_view_for_capture(v)  # swallowed, no raise
+
+
+class TestViewerTensor:
+    """``viewer.tensor(layer)`` -- reading a layer back as a plain array.
+
+    Retires ``layer.data[0] if layer.multiscale else layer.data``, which meant
+    level 0 on a multiscale layer and plane 0 on a single-scale one, and
+    yielded a ``_ViewerArray`` proxy either way (biopb/biopb#973, #974).
+    """
+
+    @staticmethod
+    def _loaded_layer(levels, array_id="t1"):
+        """A layer as ``add_tensor_layer`` builds one: wrapped, with an origin."""
+        import napari
+
+        from biopb_mcp._viewer_compute import wrap_levels
+
+        wrapped = wrap_levels(levels, "synchronous")
+        metadata = {"array_id": array_id} if array_id else {}
+        if len(levels) > 1:
+            return napari.layers.Image(wrapped, multiscale=True, metadata=metadata)
+        return napari.layers.Image(wrapped[0], metadata=metadata)
+
+    @staticmethod
+    def _pyramid():
+        import dask.array as da
+
+        return [
+            da.zeros((4, 512, 512), dtype="uint8"),
+            da.zeros((4, 256, 256), dtype="uint8"),
+            da.zeros((4, 128, 128), dtype="uint8"),
+        ]
+
+    def test_a_loaded_layer_unwraps_to_its_own_level_0(self, viewer, connection):
+        import dask.array as da
+
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+        levels = self._pyramid()
+
+        arr = viewer.tensor(self._loaded_layer(levels, array_id="src/t1"))
+
+        assert arr is levels[0]
+        assert isinstance(arr, da.Array), "the proxy was handed back unwrapped"
+
+    def test_it_never_goes_back_to_the_server(self, viewer, connection):
+        client = MagicMock()
+        connection.client = client
+        patch_viewer_tensor_methods(viewer, connection)
+
+        viewer.tensor(self._loaded_layer(self._pyramid(), array_id="src/t1"))
+
+        client.get_tensor.assert_not_called()
+        client.get_descriptor.assert_not_called()
+
+    def test_a_name_resolves_against_the_viewer(self, viewer, connection):
+        import dask.array as da
+
+        connection.client = MagicMock()
+        levels = self._pyramid()
+        viewer.layers = {"big": self._loaded_layer(levels)}
+        patch_viewer_tensor_methods(viewer, connection)
+
+        arr = viewer.tensor("big")
+
+        assert arr is levels[0]
+        assert isinstance(arr, da.Array)
+
+    def test_a_layer_the_agent_built_unwraps_the_same_way(self, viewer, connection):
+        import dask.array as da
+
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+
+        own = da.zeros((4, 64, 64), dtype="uint8")
+
+        arr = viewer.tensor(self._loaded_layer([own], array_id=None))
+
+        assert arr is own
+        assert isinstance(arr, da.Array)
+
+    def test_an_unattributed_pyramid_unwraps_level_0(self, viewer, connection):
+        import dask.array as da
+
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+        levels = self._pyramid()
+
+        arr = viewer.tensor(self._loaded_layer(levels, array_id=None))
+
+        assert arr is levels[0]
+        assert isinstance(arr, da.Array)
+
+    def test_level_0_is_the_full_resolution_shape_reports(self, viewer, connection):
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+        layer = self._loaded_layer(self._pyramid())
+
+        assert viewer.tensor(layer).shape == layer.data.shape
+
+    def test_a_numpy_layer_comes_back_as_it_went_in(self, viewer, connection):
+        import napari
+        import numpy as np
+
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+        own = np.zeros((8, 8), dtype=np.int32)
+
+        arr = viewer.tensor(napari.layers.Labels(own))
+
+        assert arr is own
+
+    def test_a_disconnected_server_changes_nothing(self, viewer, connection):
+        import dask.array as da
+
+        connection.client = None
+        patch_viewer_tensor_methods(viewer, connection)
+        levels = self._pyramid()
+
+        assert viewer.tensor(self._loaded_layer(levels)) is levels[0]
+        assert isinstance(levels[0], da.Array)
+
+    def test_something_that_is_not_a_layer_is_rejected(self, viewer, connection):
+        patch_viewer_tensor_methods(viewer, connection)
+
+        with pytest.raises(TypeError, match="takes a layer or a layer name"):
+            viewer.tensor(object())
+
+    def test_it_beats_np_asarray_on_the_layer(self, viewer, connection):
+        """``MultiScaleData.__array__`` returns the *lowest* level, so numpy
+        or scikit-image on ``layer.data`` silently computes at the bottom of
+        the pyramid (biopb/biopb#973)."""
+        import numpy as np
+
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(viewer, connection)
+        layer = self._loaded_layer(self._pyramid())
+
+        assert np.asarray(layer.data).shape == (4, 128, 128)  # the trap
+        assert viewer.tensor(layer).shape == (4, 512, 512)  # the way out
+
+    def test_it_survives_the_agent_facing_viewer_proxy(self, connection):
+        """The agent holds the main-thread marshaling proxy, not the real
+        viewer, so the layer handle and the returned array have to survive it.
+
+        Headless ``ViewerModel`` for the reason ``test_viewer_proxy`` gives:
+        the real viewer's GL canvas segfaults on offscreen runners.
+        """
+        import dask.array as da
+        from napari.components import ViewerModel
+
+        from biopb_mcp._viewer_compute import wrap_levels
+        from biopb_mcp.mcp._viewer_proxy import make_viewer_proxy
+
+        real = ViewerModel()
+        levels = self._pyramid()
+        real.add_image(
+            wrap_levels(levels, "synchronous"),
+            multiscale=True,
+            name="big",
+            metadata={"array_id": "src/t1"},
+        )
+        connection.client = MagicMock()
+        patch_viewer_tensor_methods(real, connection)
+
+        proxy = make_viewer_proxy(real)
+
+        assert proxy.tensor(proxy.layers["big"]) is levels[0]
+        assert isinstance(levels[0], da.Array)
+        assert proxy.tensor("big") is levels[0]

@@ -18,7 +18,7 @@ runs in a background thread to keep the main Qt thread responsive.
 | Name | Type | Description |
 |------|------|-------------|
 | `client` | TensorFlightClient or None | Connection to the data server for browsing/retrieving image data. Marshaled and thread-safe. |
-| `viewer` | napari.Viewer | The active viewer instance that user sees and manipulates |
+| `viewer` | napari.Viewer | The active viewer instance that user sees and manipulates. `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array |
 | `np/da` | module | imported packages: numpy and dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
 | `run_on_main` | callable | runs `fn` on the Qt main thread and returns its result. Use it to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
@@ -33,7 +33,9 @@ runs in a background thread to keep the main Qt thread responsive.
   lazy, thread-safe, picklable dask arrays. See `guide://client` for the full set of client
   operations, including browsing sources, reading tensors, and uploading results; and see
   `guide://data` for the traps when moving pixels between the server, a layer, and your own
-  variables.
+  variables. **Read a layer's pixels with `viewer.tensor(layer)`** — `layer.data` is
+  packaged for the renderer, and handing a multiscale one to numpy silently computes on
+  the lowest pyramid level.
 - `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
   The callable is a thin wrapper around a `biopb.image.ProcessImage` gRPC service on a configured
   server. The callable can take either a numpy array (eager) or a tensor-server array_id string
@@ -242,34 +244,58 @@ breaks because these arrays come off a tensor server, lazily, in a pyramid.
 | Source | You get it with | What you get |
 |---|---|---|
 | **Tensor server** | `client.get_tensor(array_id)` | Lazy dask array, **canonical order** `[..., Z, Y, X]` (`S` last for interleaved colour), full resolution |
-| **Viewer layer** | `layer.data` | What napari is *displaying*: a **list** of pyramid levels when multiscale, each a proxy rather than a dask array, at the same order and rank |
+| **Viewer layer** | `layer.data` | What napari is *displaying*: napari's **`MultiScaleData`** sequence of pyramid levels when multiscale, each level a proxy rather than a dask array, at the same order and rank |
 | **Kernel** | your own variables | Exactly what you made, carrying no physical scale unless you carried it |
 
 `viewer.add_tensor()` is a *conversion between the first two*, not a window onto
-the first. The traps follow from that. The conversion is traceable in one direction:
-a layer it loaded records its origin as `layer.metadata['array_id']` — the same id
-`client.get_tensor()` takes, so you can always go back to the full-resolution
-source-order array (the layer *name* is not reliable for this; it is a display stem
-the user may rename). A layer the agent built with `add_image`/`add_labels` has no such
-entry.
+the first. The traps follow from that. **`viewer.tensor(layer)` undoes the
+packaging** (trap 1).
+
+Going back to the *server* is a different question: `layer.metadata['array_id']`
+is the same id `client.get_tensor()` takes, for when you want a **fresh** read —
+a source re-indexed since the layer loaded. (The layer *name* is not a reliable
+origin; it is a display stem the user may rename. A layer the agent built with
+`add_image`/`add_labels` has no `array_id` entry at all.)
 
 ## The traps
 
-**1. `layer.data` is a list when `layer.multiscale`** — `[full_res, half,
-quarter, ...]`, so `layer.data.shape` raises and anything that appears to work
-on the list is working on the wrong thing. Branch, take level 0 unless you mean
-otherwise, and never pair arrays from two different levels:
+**1. Read a layer's pixels with `viewer.tensor(layer)`, not `layer.data`.**
 
 ```python
-arr = layer.data[0] if layer.multiscale else layer.data
+arr = viewer.tensor(layer)   # or viewer.tensor("layer name")
 ```
+
+A plain, lazy `da.Array` at the layer's full resolution — the shape
+`layer.data.shape` reports — in canonical `[..., Z, Y, X]` order, on either kind
+of layer. It is the array already in hand, unwrapped: level 0 of the pyramid for
+a layer `add_tensor` loaded, and exactly what you passed for one you built with
+`add_image`/`add_labels`. No server round trip, so it works with the server
+disconnected. For a *fresh* read instead, `client.get_tensor(array_id)`.
+
+`layer.data` is what napari is *displaying*, and it is packaged for the
+renderer, not for you:
+
+```python
+layer.data            # multiscale: napari's MultiScaleData, a sequence of levels
+layer.data[0]         # multiscale: level 0, full rank.  single-scale: plane 0.
+layer.data[0, 0:64]   # multiscale: TypeError (list indices ... not tuple)
+layer.data.compute()  # multiscale: AttributeError -- MultiScaleData has none
+np.asarray(layer.data)  # multiscale: the *lowest* level. No error. See trap 4.
+```
+
+`.shape`, `.ndim` and `.dtype` do work on both branches and report level 0, so
+those never need a branch — but `data[0]` returning a different *rank* on each
+branch, silently, is why reading pixels off `.data` needs one. `viewer.tensor`
+is that branch, written once.
 
 **2. Layer data is not a dask array.** Each level is wrapped in a `_ViewerArray`
 proxy that pins napari's slice reads to a single-process scheduler.
 It behaves like a dask array — `.shape`, `.compute()`, slicing, ufuncs — so
-ordinary work is unaffected. But `isinstance(arr, da.Array)` is `False`, and a
-bare `np.asarray(arr)` materializes the **whole** array in the main process
-instead of on the cluster. Slice first, or `.compute()` explicitly.
+ordinary work is unaffected. But `isinstance(arr, da.Array)` is `False`, which
+breaks library code that type-checks its input, and a bare `np.asarray(arr)`
+materializes the **whole** array in the main process instead of on the cluster.
+Slice first, or `.compute()` explicitly. `viewer.tensor()` returns a real dask
+array; `.unwrap()` gets one out of a proxy you already hold.
 
 **3. `layer.scale` is not positional.** A layer carries the source's axes
 unchanged, so each size sits on the axis it describes — which means a 3-D
@@ -282,10 +308,17 @@ the array's last axis is the colour count.
 
 **4. Lazy means the bill arrives at the end.** `.shape` and `.dtype` are free
 while the pixels are not there yet; a scikit-image call, `np.asarray`, or a
-`for` loop over the array materializes all of it at once, unchunked and without
+`for` loop over *an array* materializes all of it at once, unchunked and without
 progress — which is how a session allocates a volume it cannot hold. Crop first,
 keep the chain lazy, `.compute()` once; past `promote_after` that compute is a
 job you can watch and cancel (`guide://kernel`).
+
+Hand those same calls a **multiscale `layer.data`** and they fail the other way,
+silently: `MultiScaleData.__array__` returns the *lowest* level, so
+`np.asarray(layer.data)` and `gaussian(layer.data)` give a result from the
+bottom of the pyramid — no error, no warning, wrong resolution — and
+`for x in layer.data` iterates levels rather than planes. Resolve the layer to
+one array (trap 1) before anything numpy touches it.
 
 **5. A layer you built carries no geometry.** `add_labels(arr)` /
 `add_image(arr)` store exactly that array: no pyramid, `scale` all ones. A
@@ -302,12 +335,12 @@ an uncalibrated layer.
 
 ```python
 # What is on the viewer, and in what shape -- worth running before planning any
-# work off it.
-print([(l.name, type(l).__name__, l.multiscale,
-        (l.data[0] if l.multiscale else l.data).shape) for l in viewer.layers])
+# work off it. `.shape` reports full resolution on either branch, so no branch.
+print([(l.name, type(l).__name__, l.multiscale, l.data.shape)
+       for l in viewer.layers])
 
 layer = viewer.layers[NAME]
-arr = layer.data[0] if layer.multiscale else layer.data   # trap 1
+arr = viewer.tensor(layer)                                # trap 1: real dask array
 print(arr.shape, arr.dtype, layer.scale)
 sub = arr[0, 100:600, 100:600].compute()                  # traps 2, 5: crop, then compute
 ```
@@ -327,8 +360,10 @@ mask_arr = arr > 0.5
 # 3. Upload -- the eager step. Computes and sends chunk by chunk.
 array_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 
-# 4. Back onto the viewer for the user to check (pyramid-shaped again: trap 1)
+# 4. Back onto the viewer for the user to check. It arrives pyramid-shaped, so
+#    read it back with viewer.tensor(), not .data (trap 1).
 layer_name = viewer.add_tensor(array_id)
+check = viewer.tensor(layer_name)   # the layer's pixels, as a plain dask array
 ```
 
 Uploading is also what makes a result *shareable* — an array in the kernel is
@@ -355,16 +390,22 @@ the teardown completes, a tool may instead see `window: CLOSED` with a note to
 `restart_kernel` — either recovers it.)
 
 **Layer data is not a plain array.** A layer loaded by `add_tensor` holds a
-pyramid (`layer.data` is a *list*), in display axis order, wrapped so napari's
-slice reads stay in-process. `guide://data` has the full set of traps; the rule
-of thumb is `layer.data[0] if layer.multiscale else layer.data`.
+pyramid (`layer.data` is napari's `MultiScaleData` sequence of levels), in
+display axis order, wrapped so napari's slice reads stay in-process. Read the
+pixels with **`viewer.tensor(layer)`** — a plain full-resolution dask array from
+any layer — rather than indexing `.data`, where `data[0]` means level 0 on a
+multiscale layer and plane 0 on a single-scale one. `guide://data` has the full
+set of traps.
 
 ## Layers
 ```python
-# List all layers (read)
+# List all layers (read) -- .data reports full resolution on either branch
 for layer in viewer.layers:
-    arr = layer.data[0] if layer.multiscale else layer.data   # multiscale => list
-    print(f"{layer.name}: {type(layer).__name__} {arr.shape} {arr.dtype}")
+    print(f"{layer.name}: {type(layer).__name__} "
+          f"{layer.data.shape} {layer.data.dtype}")
+
+# The pixels, as a plain lazy dask array -- no multiscale branch, no proxy
+arr = viewer.tensor("image_name")
 
 # Get specific layer (read)
 layer = viewer.layers["image_name"]
@@ -416,23 +457,24 @@ image it was derived from (`guide://data`, trap 6). Copy the source layer's
 
 ```python
 # Empty labels layer for the user to paint into, matched to an image layer.
-# The branch is on the *image*: that one came off the server and may be a
-# pyramid. What you add is plain.
+# .shape reports full resolution whether or not the image is a pyramid, so the
+# new labels array matches it. What you add is plain either way.
 img = viewer.layers["image_name"]
-arr = img.data[0] if img.multiscale else img.data
-lab = viewer.add_labels(np.zeros(arr.shape[-2:], dtype=np.int32), name="annotations")
+mask = np.zeros(img.data.shape[-2:], dtype=np.int32)
+lab = viewer.add_labels(mask, name="annotations")
 lab.scale = img.scale[-2:]                             # else measurements are in pixels
 
 # Labels from a mask you computed
 viewer.add_labels((image_data > threshold).astype(np.int32), name="segmentation")
 
-# Read back what the user painted -- a plain array, no branch needed
+# Read back what the user painted -- a plain array you added, so .data is it
 print(f"Labels present: {np.unique(viewer.layers['annotations'].data)}")
 ```
 
 The exception is a segmentation that made the round trip — uploaded, then
 reloaded with `add_tensor`. That one is a server layer like any other, pyramid
-and all, so branch on `multiscale` whenever you did not add the array yourself.
+and all, so read it with `viewer.tensor()` rather than `.data` whenever you did
+not add the array yourself.
 
 Points and shapes follow the same shape; read the signatures rather than
 guessing them:

@@ -683,7 +683,7 @@ async def execute_code(
     """Execute Python code in the napari kernel.
 
     The kernel is a full Jupyter/IPython kernel (imports allowed) with the
-    namespace: viewer (with an add_tensor method), client(image data access), and ops (a
+    namespace: viewer (with add_tensor/tensor methods), client(image data access), and ops (a
     dict of image processing operations). np and da are also imported. Variables persist
     across calls until the kernel is restarted.
 
@@ -723,11 +723,13 @@ async def execute_code(
       multiscale pyramid); client.get_tensor(array_id) returns a lazy dask
       array without adding a layer. Both take the same id: "source_id/t1"
       within a multi-tensor source, a bare "source_id" for a single-tensor one.
-    - reading pixels back off a layer is not plain napari: layer.data is a
-      *list* of pyramid levels when layer.multiscale, in display axis order
-      ([..., Z, Y, X], at the source's own rank), and lazy. Use
-      `layer.data[0] if layer.multiscale else layer.data`, and read
-      guide://data before measuring or computing from a layer.
+    - reading pixels back off a layer is not plain napari: layer.data is
+      napari's MultiScaleData sequence of pyramid levels when layer.multiscale,
+      in display axis order ([..., Z, Y, X], at the source's own rank), and
+      lazy -- np.asarray() of it silently gives the *lowest* level. Use
+      viewer.tensor(layer), which returns a plain full-resolution dask array
+      from any layer, and read guide://data before measuring or computing from
+      a layer.
     """
     host, err = _app._require_kernel_host()
     if err is not None:

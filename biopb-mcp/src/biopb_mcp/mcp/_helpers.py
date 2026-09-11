@@ -1,7 +1,8 @@
 """Helper functions injected into the execute_code namespace.
 
-``add_tensor`` is monkey-patched onto the viewer instance so the agent
-calls ``viewer.add_tensor("array_id")``.
+``add_tensor`` and ``tensor`` are monkey-patched onto the viewer instance so
+the agent calls ``viewer.add_tensor("array_id")`` to put a tensor on the viewer
+and ``viewer.tensor(layer)`` to read one back off it.
 """
 
 import logging
@@ -126,9 +127,29 @@ def resync_view_for_capture(viewer, timeout: float = 30.0) -> None:
         logger.debug("resync_view_for_capture failed", exc_info=True)
 
 
-def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
-    """Monkey-patch ``add_tensor`` onto *viewer*, reading client/sources from
-    the live ``TensorConnection`` *connection*.
+def _layer_own_array(layer):
+    """A layer's own pixels as one array, with the viewer's packaging removed.
+
+    Resolves the multiscale branch (level 0) and unwraps the ``_ViewerArray``
+    proxy, so what comes back is the array that was handed to ``add_image`` --
+    a dask array wherever the layer is backed by one. Duck-typed so it also
+    works on a layer built from a plain numpy array, which has no proxy to
+    unwrap.
+    """
+    data = layer.data
+    if getattr(layer, "multiscale", False):
+        data = data[0]  # MultiScaleData: level 0, not plane 0 (biopb/biopb#973)
+    unwrap = getattr(data, "unwrap", None)
+    return unwrap() if callable(unwrap) else data
+
+
+def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
+    """Monkey-patch ``add_tensor`` and ``tensor`` onto *viewer*, reading
+    client/sources from the live ``TensorConnection`` *connection*.
+
+    ``add_tensor`` puts a tensor on the viewer; ``tensor`` reads one back off
+    it as a plain array (biopb/biopb#974). Only the loader needs *connection*,
+    but both are installed here so both are discoverable on the viewer.
 
     *compute_scheduler*, when set, pins the loaded layer's slice reads to a
     single-process dask scheduler (see ``_viewer_compute.wrap_levels``) so the
@@ -233,7 +254,42 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
 
         return name
 
+    def tensor(layer):
+        """Read a layer's pixels back as a plain, full-resolution dask array.
+
+        The inverse of :func:`add_tensor`, and the replacement for
+        ``layer.data[0] if layer.multiscale else layer.data`` -- which is not
+        one thing: on a multiscale layer ``data[0]`` is *level 0*, on a
+        single-scale one it is *plane 0*, and either way what comes back is a
+        ``_ViewerArray`` proxy rather than a dask array (biopb/biopb#973,
+        biopb/biopb#974).
+
+        Args:
+            layer: A napari layer, or the name of one on this viewer.
+
+        Returns:
+            The layer's own array, unwrapped: level 0 of its pyramid, which is
+            the full resolution ``layer.data.shape`` reports, in canonical
+            ``[..., Z, Y, X]`` order. A genuine ``dask.array.Array`` wherever
+            the layer is backed by one.
+
+        Never reads from the server, though ``metadata['array_id']`` would let
+        it: the array is already here, and a round trip would cost an
+        O(chunks) read plan, mint unscaled chunk_ids that miss the pre-warmed
+        scaled ones, and return stale pixels if the source was re-indexed
+        since the layer loaded. For a deliberate fresh read, ask for it:
+        ``client.get_tensor(layer.metadata['array_id'])``.
+        """
+        if isinstance(layer, str):
+            layer = viewer.layers[layer]
+        if not hasattr(layer, "data"):
+            raise TypeError(
+                f"tensor() takes a layer or a layer name, got {type(layer).__name__}"
+            )
+        return _layer_own_array(layer)
+
     # napari.Viewer is a pydantic evented model with validate_assignment, so a
     # plain ``viewer.add_tensor = ...`` is rejected.  Write through to the
     # instance dict to bypass field validation.
     object.__setattr__(viewer, "add_tensor", add_tensor)
+    object.__setattr__(viewer, "tensor", tensor)
