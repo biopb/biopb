@@ -806,6 +806,7 @@ dependencies = [
     { name = "fsspec" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "ome-types" },
     { name = "pyarrow" },
     { name = "scipy", version = "1.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
@@ -828,6 +829,7 @@ aics = [
     { name = "bioio-tifffile" },
 ]
 bioformats = [
+    { name = "bioio" },
     { name = "bioio-bioformats" },
     { name = "cjdk" },
     { name = "scyjava" },
@@ -870,6 +872,11 @@ test = [
 tls = [
     { name = "cryptography" },
 ]
+vendor = [
+    { name = "mrc" },
+    { name = "nd2", extra = ["legacy"] },
+    { name = "readlif" },
+]
 web = [
     { name = "fastapi" },
     { name = "uvicorn", extra = ["standard"] },
@@ -878,6 +885,7 @@ web = [
 [package.metadata]
 requires-dist = [
     { name = "bioio", marker = "extra == 'aics'", specifier = ">=3.0" },
+    { name = "bioio", marker = "extra == 'bioformats'", specifier = ">=3.0" },
     { name = "bioio-bioformats", marker = "extra == 'bioformats'" },
     { name = "bioio-czi", marker = "extra == 'czi'" },
     { name = "bioio-dv", marker = "extra == 'aics'" },
@@ -893,22 +901,26 @@ requires-dist = [
     { name = "cjdk", marker = "extra == 'bioformats'", specifier = ">=0.5.0" },
     { name = "cryptography", marker = "extra == 'tls'", specifier = ">=41.0.0" },
     { name = "dask", extras = ["array"], specifier = ">=2024.0.0" },
-    { name = "duckdb" },
+    { name = "duckdb", specifier = ">=1.0" },
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.111.0" },
     { name = "fsspec" },
     { name = "h5py", marker = "extra == 'hdf5'", specifier = ">=3.0.0" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.25.0" },
     { name = "imagecodecs", marker = "extra == 'qptiff'", specifier = ">=2023.1.23" },
     { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.18.0" },
+    { name = "mrc", marker = "extra == 'vendor'", specifier = ">=0.2.0" },
+    { name = "nd2", extras = ["legacy"], marker = "extra == 'vendor'", specifier = ">=0.10.3" },
     { name = "ndtiff", marker = "extra == 'ndtiff'", specifier = ">=3.0.0" },
     { name = "nibabel", marker = "extra == 'medical'", specifier = ">=5.0.0" },
     { name = "nibabel", marker = "extra == 'nifti'", specifier = ">=5.0.0" },
     { name = "numpy" },
+    { name = "ome-types", specifier = ">=0.4.0" },
     { name = "pyarrow", specifier = ">=14.0.0" },
     { name = "pydicom", marker = "extra == 'dicom'", specifier = ">=2.4.0" },
     { name = "pydicom", marker = "extra == 'medical'", specifier = ">=2.4.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1.0" },
+    { name = "readlif", marker = "extra == 'vendor'", specifier = ">=0.6.4" },
     { name = "rosettasciio", extras = ["hdf5"], marker = "extra == 'em'" },
     { name = "scipy" },
     { name = "scyjava", marker = "extra == 'bioformats'", specifier = ">=1.9.0" },
@@ -918,7 +930,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = ">=0.30.0" },
     { name = "zarr", specifier = ">=2.0.0,<3" },
 ]
-provides-extras = ["web", "tls", "test", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical", "qptiff", "em"]
+provides-extras = ["web", "tls", "test", "vendor", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical", "qptiff", "em"]
 
 [[package]]
 name = "black"
