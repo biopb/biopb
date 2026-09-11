@@ -45,3 +45,50 @@ def test_cache_stats_listed_in_actions():
     server = TensorFlightServer("grpc://localhost:0")
     action_types = {a.type for a in server.list_actions(None)}
     assert "cache_stats" in action_types
+
+
+def test_decode_rates_action_returns_the_table():
+    """do_action('decode_rates') returns the measured per-array_id throughput."""
+    from biopb_tensor_server.core.retention import (
+        DecodeRates,
+        active_decode_rates,
+        set_active_decode_rates,
+    )
+
+    previous = active_decode_rates()
+    rates = DecodeRates()
+    for _ in range(8):
+        rates.record("src/0", 8 << 20, 0.01)
+    set_active_decode_rates(rates)
+    try:
+        server = TensorFlightServer("grpc://localhost:0")
+        (raw,) = list(server.do_action(None, flight.Action("decode_rates", b"")))
+        table = json.loads(bytes(raw))
+        assert table["src/0"]["samples"] == 8
+        assert table["src/0"]["mbps"] > 0
+    finally:
+        set_active_decode_rates(previous)
+
+
+def test_decode_rates_action_answers_before_anything_is_measured():
+    """An empty table is the honest answer for a server that has only served
+    downsampled reads -- not an error, unlike an uninitialized cache."""
+    from biopb_tensor_server.core.retention import (
+        DecodeRates,
+        active_decode_rates,
+        set_active_decode_rates,
+    )
+
+    previous = active_decode_rates()
+    set_active_decode_rates(DecodeRates())
+    try:
+        server = TensorFlightServer("grpc://localhost:0")
+        (raw,) = list(server.do_action(None, flight.Action("decode_rates", b"")))
+        assert json.loads(bytes(raw)) == {}
+    finally:
+        set_active_decode_rates(previous)
+
+
+def test_decode_rates_listed_in_actions():
+    server = TensorFlightServer("grpc://localhost:0")
+    assert "decode_rates" in {a.type for a in server.list_actions(None)}

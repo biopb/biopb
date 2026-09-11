@@ -220,6 +220,10 @@ _CONSTRAINTS = {
         "memory_max_bytes": _Range(min=1),
         "file_max_segment_bytes": _Range(min=1),
         "file_max_total_bytes": _Range(min=1),
+        # 0 is the off switch (measure, classify nothing); negative would be a
+        # threshold every measured array clears, i.e. the off switch's opposite
+        # spelled like it.
+        "cheap_decode_mbps": _Range(min=0),
     },
     "PyramidConfig": {
         # reduction_method and plane_max_pixels are server-local: on-the-fly
@@ -573,6 +577,18 @@ class CacheConfig:
             "source again, where all of them are present. Faster, and it leaves "
             "those chunks' pages resident for the full-resolution read a coarse "
             "one usually precedes. Set false to always read the source."
+        },
+    )
+    cheap_decode_mbps: float = field(
+        default=0.0,
+        metadata={
+            "help": "Evict a full-resolution chunk early once its tensor is "
+            "measured to decode at least this fast (MB/s) -- rebuilding it is "
+            "cheaper than the cache space it holds. 0 (the default) measures "
+            "but classifies nothing. Read the measurements with "
+            "`biopb tensor decode-rates` and pick a threshold from them: what "
+            "counts as fast enough depends on the machine's disk and the "
+            "formats on it, so there is no portable default."
         },
     )
     file_deferred_write_mb: int = field(

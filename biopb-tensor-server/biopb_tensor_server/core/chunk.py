@@ -209,7 +209,7 @@ def routing_array_id(chunk_id: bytes) -> str:
     """
     if is_proxy_envelope(chunk_id):
         return peel_proxy_envelope(chunk_id)[0]
-    return decode_chunk_id(chunk_id)[0]
+    return array_id_from_chunk_id(chunk_id)
 
 
 def content_version_from_path(path: object) -> Optional[bytes]:
@@ -274,6 +274,18 @@ def decode_chunk_id(chunk_id: bytes) -> Tuple[str, ChunkBounds]:
     bounds = ChunkBounds(start=start, stop=stop)
 
     return array_id, bounds
+
+
+def array_id_from_chunk_id(chunk_id: bytes) -> str:
+    """Just the array_id, without decoding (and discarding) the bounds.
+
+    The prefix is all a caller that only wants to key on the tensor needs, and
+    :func:`decode_chunk_id` builds a ``ChunkBounds`` message to get there --
+    paid per chunk on the routing and retention paths, thrown away by both.
+    """
+    _, chunk_id = _split_version(chunk_id)
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    return chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
 
 def get_bounds_from_chunk_id(chunk_id: bytes) -> ChunkBounds:

@@ -744,3 +744,44 @@ class TestPruneAnnotations:
     def test_days_is_required(self):
         result = runner.invoke(app, ["prune-annotations"])
         assert result.exit_code != 0
+
+
+class TestDecodeRatesCommand:
+    _RATES = {
+        "slow/0": {"mbps": 90.0, "samples": 12},
+        "fast/0": {"mbps": 1400.0, "samples": 40},
+    }
+
+    def _run(self, *args, rates=None):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = MagicMock()
+            client.decode_rates.return_value = self._RATES if rates is None else rates
+            mock_fc_class.return_value = client
+            result = runner.invoke(app, ["decode-rates", *args])
+        return result, mock_fc_class, client
+
+    def test_the_table_leads_with_the_fastest(self):
+        # The threshold is read off the top of the spread, so the candidates for
+        # "cheap" have to be the rows you see first.
+        result, _, client = self._run()
+        assert result.exit_code == 0, result.output
+        output = result.stdout
+        assert output.index("fast/0") < output.index("slow/0")
+        client.close.assert_called_once()
+
+    def test_json_emits_the_raw_table(self):
+        result, _, _ = self._run("--json")
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["fast/0"]["samples"] == 40
+
+    def test_nothing_measured_is_not_an_error(self):
+        # A server that has only served downsampled reads measures nothing, by
+        # design -- unlike cache-stats, an empty answer here is a normal state.
+        result, _, _ = self._run(rates={})
+        assert result.exit_code == 0
+        assert "No decode measurements yet" in result.stdout
+
+    def test_it_asks_for_no_client_side_cache(self):
+        _, mock_fc_class, _ = self._run()
+        assert mock_fc_class.call_args.kwargs["cache_bytes"] == 0

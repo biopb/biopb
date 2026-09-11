@@ -8,6 +8,7 @@ safe concurrent computation of virtual chunks.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
@@ -25,6 +26,13 @@ from biopb_tensor_server.cache.memory_backend import (
     MemoryCacheConfig,
 )
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.retention import DecodeRates, set_active_decode_rates
+
+# Beside the segments the table describes, not in the metadata DB: decode
+# throughput is a read-path fact about an adapter, not a catalog fact about a
+# source (the same reason the transfer chunk_shape is not a `sources` column --
+# biopb/biopb#812), and clearing the cache should clear it with them.
+DECODE_RATES_FILE = "decode_rates.json"
 
 
 class CacheManager:
@@ -51,6 +59,14 @@ class CacheManager:
         # On the manager rather than the backend: the scaled read holds the
         # manager and nothing else of the config.
         self.source_scaled_reads = bool(config.source_scaled_reads)
+        # Installed before the backend so a chunk served during recovery is
+        # classified against the same table every later one is.
+        self._rates_path: Optional[Path] = None
+        self._rates = DecodeRates(config.cheap_decode_mbps)
+        if config.backend == "file":
+            self._rates_path = Path(config.file_cache_dir) / DECODE_RATES_FILE
+            self._rates.load(self._rates_path)
+        set_active_decode_rates(self._rates)
         if config.backend == "memory":
             self._backend = MemoryCacheBackend(
                 MemoryCacheConfig(
@@ -252,5 +268,16 @@ class CacheManager:
         self._backend.release_process_lock()
 
     def close(self) -> None:
-        """Close manager."""
+        """Close manager, persisting the decode rates it measured.
+
+        Saved here rather than per sample: the table is an EMA over a run, and
+        rewriting a file on every full-resolution read would cost more than the
+        read it is describing. A hard kill forfeits the run's measurements and
+        the next one re-measures -- one warmup, not a corruption.
+        """
+        # The table this manager installed, not whatever is active now: a
+        # second manager (a test, a reconfigure) has since replaced it, and its
+        # measurements belong to its own cache directory.
+        if self._rates_path is not None:
+            self._rates.save(self._rates_path)
         self._backend.close()

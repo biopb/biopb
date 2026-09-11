@@ -62,7 +62,10 @@ from biopb_tensor_server.core.errors import (
     UnknownResolutionError,
 )
 from biopb_tensor_server.core.metadata_db import MetadataDatabase, NumpyEncoder
-from biopb_tensor_server.core.retention import set_active_pyramid_config
+from biopb_tensor_server.core.retention import (
+    active_decode_rates,
+    set_active_pyramid_config,
+)
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.upload_manager import UploadManager
 
@@ -716,6 +719,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "cache_stats", "Cache statistics - returns backend CacheStats JSON"
             ),
             flight.ActionType(
+                "decode_rates",
+                "Measured decode throughput (MB/s) per array_id - returns JSON",
+            ),
+            flight.ActionType(
                 "warm",
                 "Hydrate-ahead: recall a resolved cloud source's member files server-side",
             ),
@@ -798,6 +805,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError("Cache not initialized")
             # asdict recurses into the per-pool PoolStats dataclasses under pool_stats.
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
+        elif action.type == "decode_rates":
+            # What the full-resolution read path has measured, per array_id --
+            # the input an operator picks `cache.cheap_decode_mbps` from. A
+            # diagnostic like cache_stats, and unauthorized per source for the
+            # same reason: it names array_ids the caller can already list.
+            yield json.dumps(active_decode_rates().snapshot()).encode("utf-8")
         elif action.type == "resolve":
             source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize_source(context, source_id)

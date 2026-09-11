@@ -83,8 +83,9 @@ in three collaborators it composes:
 | `DoGet` | Fetches data by ticket, either a single pixel chunk or metadata query results; returns a `RecordBatch` stream |
 
 Custom `do_action` verbs extend these: `health`, `create_source`,
-`upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
-`remove_source` (below), and `roi_list` / `roi_put` / `roi_delete`.
+`upload_status`, `chunk_locate`, `cache_stats`, `decode_rates`, `resolve`,
+`warm`, `add_source`, `remove_source` (below), and `roi_list` / `roi_put` /
+`roi_delete`.
 
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 

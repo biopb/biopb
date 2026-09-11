@@ -766,5 +766,67 @@ def cache_stats(
     _render_cache_stats(stats)
 
 
+@app.command(
+    "decode-rates",
+    help="Show measured decode throughput (MB/s) per tensor.",
+)
+def decode_rates(
+    server: Optional[str] = _OPT_SERVER,
+    token: Optional[str] = _OPT_TOKEN,
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show what each tensor has been measured to decode at.
+
+    This is the input for ``cache.cheap_decode_mbps``: a tensor measured well
+    above the threshold has its full-resolution chunks evicted before slower
+    tensors', on the grounds that re-decoding one is cheaper than the cache
+    space it occupies. Pick the threshold by looking at the spread here, not
+    from a portable default -- there isn't one.
+
+    Only full-resolution reads are sampled, so a tensor served exclusively at
+    reduced scale is absent rather than slow, and a row with a handful of
+    samples is still settling -- the server will not classify on one.
+    """
+    client, endpoint = _connect(server, token, cache_bytes=0)
+    try:
+        rates = client.decode_rates()
+    except Exception as exc:  # noqa: BLE001 - rendered by type, not swallowed
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to read decode rates')}[/red]"
+        )
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+    if json_output:
+        print(json.dumps(rates))
+        raise typer.Exit(0)
+
+    if not rates:
+        # Not an error: a server that has served only downsampled reads has
+        # nothing to report, and so has one that just started.
+        console.print(
+            "[yellow]No decode measurements yet -- nothing has been read at "
+            "full resolution.[/yellow]"
+        )
+        raise typer.Exit(0)
+
+    table = Table(title="Measured decode throughput")
+    table.add_column("array_id", style="cyan")
+    table.add_column("MB/s", style="green", justify="right")
+    table.add_column("Samples", justify="right")
+    for array_id, row in sorted(
+        rates.items(), key=lambda kv: kv[1].get("mbps", 0.0), reverse=True
+    ):
+        table.add_row(
+            array_id,
+            f"{row.get('mbps', 0.0):.0f}",
+            str(row.get("samples", 0)),
+        )
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()

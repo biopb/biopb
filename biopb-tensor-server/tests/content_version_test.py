@@ -26,6 +26,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.adapter_base import TensorAdapter, _get_read_plan
 from biopb_tensor_server.core.chunk import (
     _CV_SENTINEL,
+    array_id_from_chunk_id,
     cache_key_for_chunk_id,
     content_version_from_path,
     content_version_of,
@@ -80,6 +81,17 @@ class TestCodecWrapper:
         assert aid == "src/t"
         assert list(bounds.start) == [0, 10] and list(bounds.stop) == [5, 20]
         assert list(get_bounds_from_chunk_id(wrapped).start) == [0, 10]
+
+    def test_the_array_id_shortcut_agrees_with_the_full_decode(self):
+        """``array_id_from_chunk_id`` skips building the bounds message, so it
+        parses the prefix a second time -- it has to keep answering what the
+        full decode answers, wrapper and scale included."""
+        for base in (
+            encode_chunk_id("src/t", _bounds()),
+            encode_chunk_id_with_scale("src/t", _bounds(), (2, 2)),
+        ):
+            for chunk_id in (base, wrap_content_version(base, CV)):
+                assert array_id_from_chunk_id(chunk_id) == decode_chunk_id(chunk_id)[0]
 
     def test_scale_detection_and_decode_through_wrapper(self):
         legacy = encode_chunk_id("src/t", _bounds())
