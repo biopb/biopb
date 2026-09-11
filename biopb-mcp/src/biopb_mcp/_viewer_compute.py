@@ -104,17 +104,14 @@ class _ViewerArray(NDArrayOperatorsMixin):
         return len(self._arr)
 
     def unwrap(self):
-        """The wrapped array itself, unpinned — the documented way out.
+        """The wrapped dask array itself, unpinned.
 
-        ``__getattr__`` delegates well enough that ordinary work never needs
-        this, but type identity does not delegate: ``isinstance(proxy,
-        da.Array)`` is False, so library code that type-checks its input
-        rejects a layer's ``.data`` (biopb/biopb#974). ``viewer.tensor()`` is
-        what the agent should reach for; this is the seam it unwraps through,
-        named rather than reaching into ``._arr`` from another module.
-
-        Safe as a real method: ``dask.array.Array`` defines no ``unwrap``, so
-        this shadows nothing ``__getattr__`` would otherwise have delegated.
+        ``__getattr__`` delegates ordinary work, but not type identity:
+        ``isinstance(proxy, da.Array)`` is False, so library code that
+        type-checks its input rejects a layer's ``.data`` (biopb/biopb#974).
+        This is the named seam ``viewer.tensor()`` unwraps through, rather
+        than reaching into ``._arr`` from another module. (``dask.array.Array``
+        defines no ``unwrap``, so it shadows nothing.)
         """
         return self._arr
 

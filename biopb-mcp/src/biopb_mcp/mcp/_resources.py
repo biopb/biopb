@@ -219,16 +219,13 @@ breaks because these arrays come off a tensor server, lazily, in a pyramid.
 
 `viewer.add_tensor()` is a *conversion between the first two*, not a window onto
 the first. The traps follow from that. **`viewer.tensor(layer)` undoes the
-packaging** — it hands back the layer's own full-resolution array, unwrapped,
-from either kind of layer, without going near the network.
+packaging** (trap 1).
 
-Going back to the *server* is a different question, and a layer it loaded can
-answer it: `layer.metadata['array_id']` is the same id `client.get_tensor()`
-takes. Ask for that only when you want a **fresh** read — a source re-indexed
-since the layer loaded — because it costs a read plan the layer does not need.
-(The layer *name* is not a reliable origin; it is a display stem the user may
-rename. A layer the agent built with `add_image`/`add_labels` has no `array_id`
-entry at all.)
+Going back to the *server* is a different question: `layer.metadata['array_id']`
+is the same id `client.get_tensor()` takes, for when you want a **fresh** read —
+a source re-indexed since the layer loaded. (The layer *name* is not a reliable
+origin; it is a display stem the user may rename. A layer the agent built with
+`add_image`/`add_labels` has no `array_id` entry at all.)
 
 ## The traps
 

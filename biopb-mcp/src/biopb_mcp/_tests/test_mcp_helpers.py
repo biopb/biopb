@@ -469,11 +469,9 @@ class TestResyncViewForCapture:
 class TestViewerTensor:
     """``viewer.tensor(layer)`` -- reading a layer back as a plain array.
 
-    The accessor that retires ``layer.data[0] if layer.multiscale else
-    layer.data`` (biopb/biopb#974). That idiom is not one expression: on a
-    multiscale layer ``data[0]`` is *level 0*, on a single-scale one it is
-    *plane 0*, and what it yields either way is a ``_ViewerArray`` proxy that
-    fails ``isinstance(..., da.Array)`` (biopb/biopb#973).
+    Retires ``layer.data[0] if layer.multiscale else layer.data``, which meant
+    level 0 on a multiscale layer and plane 0 on a single-scale one, and
+    yielded a ``_ViewerArray`` proxy either way (biopb/biopb#973, #974).
     """
 
     @staticmethod
@@ -512,13 +510,6 @@ class TestViewerTensor:
         assert isinstance(arr, da.Array), "the proxy was handed back unwrapped"
 
     def test_it_never_goes_back_to_the_server(self, viewer, connection):
-        """The array is already here, so re-reading it would buy nothing and
-        cost three things: a GetFlightInfo that returns one endpoint *per
-        chunk* (the O(chunks) read plan ``_advertised_pyramid_levels`` exists
-        to avoid), a different chunk-key space from the scale_hint=[1, 1, ...]
-        ids the layer's level 0 was loaded with and the server pre-warmed, and
-        the wrong answer if the source was re-indexed since the layer loaded.
-        """
         client = MagicMock()
         connection.client = client
         patch_viewer_tensor_methods(viewer, connection)
@@ -542,9 +533,6 @@ class TestViewerTensor:
         assert isinstance(arr, da.Array)
 
     def test_a_layer_the_agent_built_unwraps_the_same_way(self, viewer, connection):
-        """Same path, no ``array_id`` needed: what makes the return type one
-        thing is that both kinds of layer end at the array ``add_image`` was
-        given."""
         import dask.array as da
 
         connection.client = MagicMock()
@@ -558,8 +546,6 @@ class TestViewerTensor:
         assert isinstance(arr, da.Array)
 
     def test_an_unattributed_pyramid_unwraps_level_0(self, viewer, connection):
-        """No ``array_id`` and multiscale: ``data[0]`` is the level, and the
-        proxy around it still has to come off."""
         import dask.array as da
 
         connection.client = MagicMock()
@@ -572,10 +558,6 @@ class TestViewerTensor:
         assert isinstance(arr, da.Array)
 
     def test_level_0_is_the_full_resolution_shape_reports(self, viewer, connection):
-        """``.shape`` on a MultiScaleData reports level 0, so what this returns
-        is the array the layer already describes -- no separate claim about
-        what the server holds, which is what makes the accessor answerable
-        without a round trip."""
         connection.client = MagicMock()
         patch_viewer_tensor_methods(viewer, connection)
         layer = self._loaded_layer(self._pyramid())
@@ -595,8 +577,6 @@ class TestViewerTensor:
         assert arr is own
 
     def test_a_disconnected_server_changes_nothing(self, viewer, connection):
-        """Nothing here needs the client, so a session whose server went away
-        still reads every layer on the viewer."""
         import dask.array as da
 
         connection.client = None
@@ -613,11 +593,9 @@ class TestViewerTensor:
             viewer.tensor(object())
 
     def test_it_beats_np_asarray_on_the_layer(self, viewer, connection):
-        """The failure this accessor exists to make unreachable: napari's
-        ``MultiScaleData.__array__`` returns the **lowest** level, so handing
-        ``layer.data`` to numpy or scikit-image silently computes on the bottom
-        of the pyramid -- no error, no signal, wrong resolution
-        (biopb/biopb#973)."""
+        """``MultiScaleData.__array__`` returns the *lowest* level, so numpy
+        or scikit-image on ``layer.data`` silently computes at the bottom of
+        the pyramid (biopb/biopb#973)."""
         import numpy as np
 
         connection.client = MagicMock()
@@ -628,15 +606,11 @@ class TestViewerTensor:
         assert viewer.tensor(layer).shape == (4, 512, 512)  # the way out
 
     def test_it_survives_the_agent_facing_viewer_proxy(self, connection):
-        """The agent never holds the real viewer -- it holds the main-thread
-        marshaling proxy (``_viewer_proxy``), which forwards method calls and
-        unwraps proxied arguments. A layer handle taken off that proxy has to
-        arrive here as a napari layer, and the dask array has to come back out
-        un-proxied (it is inert, so nothing should wrap it).
+        """The agent holds the main-thread marshaling proxy, not the real
+        viewer, so the layer handle and the returned array have to survive it.
 
-        Headless ``ViewerModel`` rather than ``napari.Viewer`` for the reason
-        ``test_viewer_proxy`` gives: the real viewer's GL canvas segfaults on
-        offscreen runners, and nothing here needs a canvas.
+        Headless ``ViewerModel`` for the reason ``test_viewer_proxy`` gives:
+        the real viewer's GL canvas segfaults on offscreen runners.
         """
         import dask.array as da
         from napari.components import ViewerModel

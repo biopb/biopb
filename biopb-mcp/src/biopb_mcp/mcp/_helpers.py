@@ -132,11 +132,9 @@ def _layer_own_array(layer):
 
     Resolves the multiscale branch (level 0) and unwraps the ``_ViewerArray``
     proxy, so what comes back is the array that was handed to ``add_image`` --
-    a dask array wherever the layer is backed by one.
-
-    Duck-typed rather than isinstance-checked on purpose: this also runs on a
-    layer the agent built from a plain numpy array, where there is no proxy and
-    nothing to unwrap.
+    a dask array wherever the layer is backed by one. Duck-typed so it also
+    works on a layer built from a plain numpy array, which has no proxy to
+    unwrap.
     """
     data = layer.data
     if getattr(layer, "multiscale", False):
@@ -149,11 +147,9 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
     """Monkey-patch ``add_tensor`` and ``tensor`` onto *viewer*, reading
     client/sources from the live ``TensorConnection`` *connection*.
 
-    The pair is the round trip: ``add_tensor`` puts a tensor on the viewer,
-    ``tensor`` reads one back off it as a plain array (biopb/biopb#974). Only
-    the loader needs *connection* -- ``tensor`` reads the layer and nothing
-    else -- but both are installed here because both are named on the viewer,
-    and a reader that lives somewhere else is a reader the agent will not find.
+    ``add_tensor`` puts a tensor on the viewer; ``tensor`` reads one back off
+    it as a plain array (biopb/biopb#974). Only the loader needs *connection*,
+    but both are installed here so both are discoverable on the viewer.
 
     *compute_scheduler*, when set, pins the loaded layer's slice reads to a
     single-process dask scheduler (see ``_viewer_compute.wrap_levels``) so the
@@ -261,7 +257,7 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
     def tensor(layer):
         """Read a layer's pixels back as a plain, full-resolution dask array.
 
-        The inverse of :func:`add_tensor`, and the answer to the branch idiom
+        The inverse of :func:`add_tensor`, and the replacement for
         ``layer.data[0] if layer.multiscale else layer.data`` -- which is not
         one thing: on a multiscale layer ``data[0]`` is *level 0*, on a
         single-scale one it is *plane 0*, and either way what comes back is a
@@ -273,25 +269,16 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
 
         Returns:
             The layer's own array, unwrapped: level 0 of its pyramid, which is
-            the full resolution ``layer.data.shape`` reports, in the canonical
-            ``[..., Z, Y, X]`` order the data plane guarantees
-            (``build_pyramid_levels`` transposes nothing). A genuine
-            ``dask.array.Array`` wherever the layer is backed by one.
+            the full resolution ``layer.data.shape`` reports, in canonical
+            ``[..., Z, Y, X]`` order. A genuine ``dask.array.Array`` wherever
+            the layer is backed by one.
 
-        **This does not go back to the server**, though
-        ``metadata['array_id']`` would let it. Three reasons, and the first is
-        the one that matters: the array is already here. Re-reading it would
-        cost a ``GetFlightInfo`` that returns one endpoint **per chunk** --
-        the O(chunks) read plan ``_advertised_pyramid_levels`` already goes out
-        of its way not to build. It would also mint *unscaled* chunk_ids, a
-        different key space from the ``scale_hint=[1, 1, ...]`` ids the layer's
-        level 0 was loaded with and the server pre-warmed, so the same pixels
-        could come back as a cold read. And it would answer the wrong question:
-        a source re-indexed since the layer loaded would hand back pixels the
-        viewer is not displaying.
-
-        For a *fresh* server read -- deliberately, when the source may have
-        changed -- ask for it: ``client.get_tensor(layer.metadata['array_id'])``.
+        Never reads from the server, though ``metadata['array_id']`` would let
+        it: the array is already here, and a round trip would cost an
+        O(chunks) read plan, mint unscaled chunk_ids that miss the pre-warmed
+        scaled ones, and return stale pixels if the source was re-indexed
+        since the layer loaded. For a deliberate fresh read, ask for it:
+        ``client.get_tensor(layer.metadata['array_id'])``.
         """
         if isinstance(layer, str):
             layer = viewer.layers[layer]
