@@ -622,7 +622,7 @@ def _dask_backstop():
     (a host suspend outliving their TTL) still *accepts* work and never runs it,
     turning a 0.2 s read into a cell that hangs until someone interrupts it. A
     worker count off the client makes that an error naming the fix instead. Only
-    fires while attached, which is opt-in (``attach_cluster``).
+    fires while attached, which is opt-in (``_dask_ctl.attach()``).
     """
     ctl = _ip.user_ns.get("_dask_ctl") if _ip is not None else None
     if ctl is None:
@@ -866,31 +866,20 @@ def _cancel_dask_futures(job, reason=None):
     # ``Client.cancel`` filters its argument through ``futures_of()``, which
     # silently drops bare strings -- ``cancel(list(dc.futures))`` cancels nothing.
     # One job at a time, so every tracked future belongs to this job.
-    dc = _ip.user_ns.get("_dask_client") if _ip is not None else None
-    if dc is not None:
-        try:
-            from distributed import Future
+    # Whatever client is live, not the `_dask_client` binding: a cell that made
+    # its own `Client(...)` is attached just as much as `_dask_ctl.attach()` is,
+    # and its futures are just as stuck. `current` finds the global default,
+    # which is what dask itself computes on (raises ValueError when there is
+    # none, i.e. the in-process default).
+    try:
+        from distributed import Client, Future
 
-            keys = list(dc.futures)
-            if keys:
-                dc.cancel([Future(k, dc) for k in keys], force=True)
-        except Exception:  # noqa: BLE001 - cancel is best-effort
-            logger.debug("distributed cancel failed", exc_info=True)
-
-
-def check_writer(writer):
-    """Refuse *writer* if it does not hold this kernel's one-agent claim.
-
-    The claim itself is :func:`submit`'s (first non-user submitter takes it);
-    this is the same test for a state change that is not a submit -- moving the
-    namespace's dask scheduler (``_dask_ctl``). ``None`` when the caller may
-    proceed, otherwise the same ``{"refused": "not_owner", ...}`` shape
-    :func:`interrupt_current` returns, so one refusal is rendered one way.
-    """
-    with _lock:
-        if writer is None or _owner in (None, writer):
-            return None
-        return {"refused": "not_owner", "owner": _owner_label, "owner_id": _owner}
+        dc = Client.current(allow_global=True)
+        keys = list(dc.futures)
+        if keys:
+            dc.cancel([Future(k, dc) for k in keys], force=True)
+    except Exception:  # noqa: BLE001 - cancel is best-effort
+        logger.debug("distributed cancel failed", exc_info=True)
 
 
 def _running_job():

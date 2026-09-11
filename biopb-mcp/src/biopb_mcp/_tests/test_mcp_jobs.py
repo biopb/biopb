@@ -108,13 +108,13 @@ class TestJobRunnerUnit:
         # refuses to start one, naming the two ways out.
         class _Ctl:
             def dead_message(self):
-                return "no workers left; attach_cluster() or detach_cluster()"
+                return "no workers left; _dask_ctl.attach() or .detach()"
 
         runner["_dask_ctl"] = _Ctl()
         jid = _jobs.submit("x = 1")["job_id"]
         snap = self._wait(jid)
         assert snap["status"] == "error"
-        assert "attach_cluster()" in snap["error_text"]
+        assert "_dask_ctl.attach()" in snap["error_text"]
         assert "x" not in runner  # the code never ran
 
     def test_healthy_attachment_does_not_block_a_job(self, runner):
@@ -126,12 +126,12 @@ class TestJobRunnerUnit:
         jid = _jobs.submit("x = 1")["job_id"]
         assert self._wait(jid)["status"] == "ok"
 
-    def test_distributed_cancel_rebuilds_futures(self, runner):
+    def test_distributed_cancel_rebuilds_futures(self, runner, monkeypatch):
         # _cancel() must rebuild real Future objects from dc.futures' string
         # keys: Client.cancel() filters its arg through futures_of(), which
         # silently drops bare strings -- so passing list(dc.futures) cancels
         # nothing.  Assert real Futures (resolvable by futures_of) + force=True.
-        from distributed import Future
+        from distributed import Client, Future
         from distributed.client import futures_of
 
         calls = {}
@@ -155,7 +155,11 @@ class TestJobRunnerUnit:
                 calls["futures"] = list(futures)
                 calls["force"] = force
 
-        runner["_dask_client"] = _StubClient()
+        # Whatever client is *live*, not the `_dask_client` binding: a cell that
+        # made its own Client() is attached just as much, and its futures are
+        # just as stuck. That is what makes the hand-rolled path first-class.
+        stub = _StubClient()
+        monkeypatch.setattr(Client, "current", classmethod(lambda cls, **kw: stub))
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         time.sleep(0.05)
         _jobs._cancel_dask_futures(_jobs._jobs[jid])

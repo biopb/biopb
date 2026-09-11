@@ -5,13 +5,14 @@ a dict stands in for the IPython user namespace. Also covers
 ``_register_cache_plugin``, the cluster-wide chunk-cache budget split.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import biopb.tensor.client as tclient
 import pytest
 
 from biopb_mcp.mcp import _dask_ctl
-from biopb_mcp.mcp._dask_ctl import DASK_ADDRESS_ENV, DaskAttachment
+from biopb_mcp.mcp._dask_ctl import DaskAttachment
 
 _MISSING = object()
 
@@ -62,6 +63,17 @@ class _FakeClient:
         self.closed = True
 
 
+class _FakeCluster:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.scheduler_address = "tcp://127.0.0.1:9999"
+        self.workers = {"w0": object(), "w1": object()}
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture
 def fake_client(monkeypatch):
     """Monkeypatch Client; yields the list of clients it constructs."""
@@ -79,94 +91,110 @@ def fake_client(monkeypatch):
     return created
 
 
+@pytest.fixture
+def fake_cluster(monkeypatch):
+    """Monkeypatch LocalCluster; yields the list of clusters it constructs."""
+    pytest.importorskip("dask.distributed")
+    import dask.distributed as dd
+
+    created = []
+
+    def _factory(**kwargs):
+        cluster = _FakeCluster(**kwargs)
+        created.append(cluster)
+        return cluster
+
+    monkeypatch.setattr(dd, "LocalCluster", _factory)
+    return created
+
+
 def _cfg(**over):
     dask = {"scheduler": "threads", "address": "", "num_workers": 0}
     dask.update(over)
     return {"dask": dask}
 
 
-class TestAutoAttachAddress:
-    def test_default_config_attaches_nothing(self, monkeypatch):
-        monkeypatch.delenv(DASK_ADDRESS_ENV, raising=False)
-        assert DaskAttachment(_cfg()).auto_attach_address() is None
-
-    def test_distributed_without_address_attaches_nothing(self, monkeypatch):
-        """The kernel never spins its own: no injected address -> in-process."""
-        monkeypatch.delenv(DASK_ADDRESS_ENV, raising=False)
-        ctl = DaskAttachment(_cfg(scheduler="distributed"))
-        assert ctl.auto_attach_address() is None
-
-    def test_external_address_wins_over_threads_default(self, monkeypatch):
-        monkeypatch.delenv(DASK_ADDRESS_ENV, raising=False)
-        ctl = DaskAttachment(_cfg(address="tcp://1.2.3.4:8786"))
-        assert ctl.auto_attach_address() == "tcp://1.2.3.4:8786"
-
-    def test_injected_address_wins_over_config(self, monkeypatch):
-        monkeypatch.setenv(DASK_ADDRESS_ENV, "tcp://daemon:8786")
-        ctl = DaskAttachment(_cfg(scheduler="distributed", address="tcp://cfg:1"))
-        assert ctl.auto_attach_address() == "tcp://daemon:8786"
-
-
 class TestStart:
-    def test_default_start_stays_in_process(self, monkeypatch, fake_client):
-        import dask
+    """The config escape hatch -- the only thing that attaches unasked."""
 
-        monkeypatch.delenv(DASK_ADDRESS_ENV, raising=False)
-        ip = _FakeIP()
-        ctl = DaskAttachment(_cfg(), ip)
-        with dask.config.set(scheduler="synchronous"):
-            ctl.start()
-            assert dask.config.get("scheduler") == "threads"
-        assert fake_client == []
-        assert ip.user_ns["_dask_client"] is None
-        assert ip.user_ns["_dask_attach_done"] is True
-        assert ctl.status()["mode"] == "in-process"
-
-    def test_configured_address_attaches_at_start(self, monkeypatch, fake_client):
-        monkeypatch.delenv(DASK_ADDRESS_ENV, raising=False)
-        ip = _FakeIP()
-        DaskAttachment(_cfg(address="tcp://ext:8786"), ip).start()
-        assert [c.address for c in fake_client] == ["tcp://ext:8786"]
-        assert ip.user_ns["_dask_client"] is fake_client[0]
-        assert ip.user_ns["_dask_attach_done"] is True
-
-
-class TestAttachDetach:
-    def test_attach_publishes_client_and_default_scheduler(self, fake_client):
+    def test_default_config_stays_in_process(self, fake_client, fake_cluster):
         import dask
 
         ip = _FakeIP()
         ctl = DaskAttachment(_cfg(), ip)
         ctl.start()
-        with dask.config.set(scheduler="threads"):
-            status = ctl.attach("tcp://127.0.0.1:8786")
-            assert dask.config.get("scheduler") == "distributed"
-        assert status["mode"] == "attached"
-        assert status["address"] == "tcp://127.0.0.1:8786"
-        assert status["workers"] == 2
-        assert status["dead"] is False
+        assert fake_client == [] and fake_cluster == []
+        assert ip.user_ns["_dask_client"] is None
+        assert ip.user_ns["_dask_attach_done"] is True
+        assert ctl.status()["mode"] == "in-process"
+        # Nothing is written to dask's config: an unset "scheduler" key is what
+        # lets a live Client win and a closed one fall back on its own -- and
+        # what makes a hand-rolled Client() in a cell behave like attach().
+        assert not dask.config.get("scheduler", default=None)
+
+    def test_distributed_spins_a_cluster_at_start(self, fake_client, fake_cluster):
+        ip = _FakeIP()
+        DaskAttachment(_cfg(scheduler="distributed"), ip).start()
+        assert len(fake_cluster) == 1
+        assert [c.address for c in fake_client] == ["tcp://127.0.0.1:9999"]
+        assert ip.user_ns["_dask_client"] is fake_client[0]
+
+    def test_configured_address_attaches_without_spinning(
+        self, fake_client, fake_cluster
+    ):
+        ctl = DaskAttachment(_cfg(address="tcp://ext:8786"), _FakeIP())
+        ctl.start()
+        assert [c.address for c in fake_client] == ["tcp://ext:8786"]
+        assert fake_cluster == []  # not ours to spin
+        assert ctl.status()["owned"] is False
+
+    def test_address_wins_over_the_scheduler_setting(self, fake_client, fake_cluster):
+        DaskAttachment(
+            _cfg(scheduler="distributed", address="tcp://ext:8786"), _FakeIP()
+        ).start()
+        assert [c.address for c in fake_client] == ["tcp://ext:8786"]
+        assert fake_cluster == []
+
+
+class TestAttachDetach:
+    def test_bare_attach_spins_a_kernel_owned_cluster(self, fake_client, fake_cluster):
+        ip = _FakeIP()
+        ctl = DaskAttachment(_cfg(num_workers=0, threads_per_worker=1), ip)
+        status = ctl.attach()
+        assert len(fake_cluster) == 1
+        assert fake_cluster[0].kwargs["n_workers"] is None  # 0 -> dask picks
+        assert fake_cluster[0].kwargs["local_directory"]  # its own spill dir
+        assert status["mode"] == "attached" and status["owned"] is True
+        assert status["address"] == "tcp://127.0.0.1:9999"
         assert ip.user_ns["_dask_client"] is fake_client[-1]
 
-    def test_detach_closes_client_and_restores_in_process(self, fake_client):
-        import dask
-
-        ip = _FakeIP()
-        ctl = DaskAttachment(_cfg(), ip)
-        ctl.attach("tcp://127.0.0.1:8786")
-        client = fake_client[-1]
-        with dask.config.set(scheduler="distributed"):
-            status = ctl.detach()
-            assert dask.config.get("scheduler") == "threads"
-        assert client.closed
-        assert status["mode"] == "in-process"
-        assert ip.user_ns["_dask_client"] is None
-
-    def test_reattach_closes_the_previous_client(self, fake_client):
+    def test_detach_closes_the_client_and_the_cluster_it_spun(
+        self, fake_client, fake_cluster
+    ):
         ctl = DaskAttachment(_cfg(), _FakeIP())
-        ctl.attach("tcp://one:8786")
-        ctl.attach("tcp://two:8786")
-        assert fake_client[0].closed
-        assert fake_client[1].closed is False
+        ctl.attach()
+        spill = fake_cluster[0].kwargs["local_directory"]
+        status = ctl.detach()
+        assert fake_client[-1].closed and fake_cluster[0].closed
+        assert not os.path.exists(spill)  # the spill dir goes with it (#13)
+        assert status["mode"] == "in-process"
+
+    def test_detach_leaves_an_external_cluster_alone(self, fake_client, fake_cluster):
+        ctl = DaskAttachment(_cfg(), _FakeIP())
+        ctl.attach("tcp://ext:8786")
+        ctl.detach()
+        assert fake_client[-1].closed
+        assert fake_cluster == []  # nothing of ours was involved
+
+    def test_attaching_elsewhere_tears_down_the_cluster_we_spun(
+        self, fake_client, fake_cluster
+    ):
+        ctl = DaskAttachment(_cfg(), _FakeIP())
+        ctl.attach()
+        ctl.attach("tcp://ext:8786")
+        assert fake_cluster[0].closed
+        assert fake_client[0].closed and fake_client[1].closed is False
+        assert ctl.status()["owned"] is False
 
     def test_failed_attach_leaves_the_arrangement_alone(self, monkeypatch):
         pytest.importorskip("dask.distributed")
@@ -184,15 +212,19 @@ class TestAttachDetach:
         assert ip.user_ns["_dask_client"] is None
         assert ctl.status()["mode"] == "in-process"
 
-    def test_refuses_while_a_job_runs(self, fake_client, monkeypatch):
-        from biopb_mcp.mcp import _jobs
+    def test_a_failed_spin_does_not_leak_the_cluster(self, monkeypatch, fake_cluster):
+        # The cluster comes up, the Client to it does not: close what we started
+        # rather than leaving N workers behind.
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
 
-        monkeypatch.setattr(_jobs, "running_job", lambda: {"job_id": "job-1"})
-        monkeypatch.setattr(_jobs, "check_writer", lambda writer: None)
+        def _boom(address, **kwargs):
+            raise OSError("unreachable")
+
+        monkeypatch.setattr(dd, "Client", _boom)
         ctl = DaskAttachment(_cfg(), _FakeIP())
-        assert ctl.attach("tcp://x:8786").get("busy") is True
-        assert ctl.detach().get("busy") is True
-        assert fake_client == []
+        assert "unreachable" in ctl.attach()["error"]
+        assert fake_cluster[0].closed is True
 
 
 class TestCacheBudget:
@@ -213,25 +245,6 @@ class TestCacheBudget:
         assert len(fake_client[-1].plugins) == 1
 
 
-class TestAdmission:
-    """attach/detach are kernel-state changes, gated where the claim lives."""
-
-    def test_refused_for_a_client_that_does_not_hold_the_kernel(
-        self, fake_client, monkeypatch
-    ):
-        from biopb_mcp.mcp import _jobs
-
-        monkeypatch.setattr(
-            _jobs,
-            "check_writer",
-            lambda writer: {"refused": "not_owner", "owner": "A", "owner_id": "a"},
-        )
-        ctl = DaskAttachment(_cfg(), _FakeIP())
-        assert ctl.attach("tcp://x:8786", writer="b")["refused"] == "not_owner"
-        assert ctl.detach(writer="b")["refused"] == "not_owner"
-        assert fake_client == []
-
-
 class TestDeadMessage:
     def test_none_when_in_process(self):
         assert DaskAttachment(_cfg(), _FakeIP()).dead_message() is None
@@ -248,7 +261,7 @@ class TestDeadMessage:
         ctl._workers_at = 0.0  # expire the every-job count cache
         msg = ctl.dead_message()
         assert "no workers left" in msg
-        assert "attach_cluster()" in msg and "detach_cluster()" in msg
+        assert "_dask_ctl.attach()" in msg and "_dask_ctl.detach()" in msg
         assert ctl.status()["dead"] is True
         assert ctl.status()["warning"] == msg  # one wording, every surface
 

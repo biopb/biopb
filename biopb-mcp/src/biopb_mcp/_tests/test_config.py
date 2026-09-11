@@ -244,7 +244,7 @@ class TestDefaultConfig:
 
     def test_dask_defaults(self):
         """MCP dask defaults to the in-process scheduler: no cluster unless asked
-        for (attach_cluster, or scheduler=distributed) -- biopb/biopb#970."""
+        for (`_dask_ctl.attach()`, or scheduler=distributed) -- biopb/biopb#970."""
         dask = DEFAULT_CONFIG["dask"]
         assert dask["scheduler"] == "threads"
         assert dask["address"] == ""

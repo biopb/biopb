@@ -201,10 +201,9 @@ Measured on the dev box (Ryzen 5 5600X, `.venv`, page cache warm):
 | full bootstrap, real display `:1` | 7.63 s | 584 MiB | — | ~358 MiB |
 
 **1.5 s and ~154 MiB private**, against a 60 s `startup_timeout`. Neither `qtpy`
-nor `napari` is imported at all. Dask adds nothing: no kernel ever spins a
-cluster — since biopb/biopb#970 there is usually none at all, and under a config
-that auto-attaches `_launch` passes the session cluster's address
-(`BIOPB_DASK_ADDRESS`) so a second kernel attaches to the warm one.
+nor `napari` is imported at all. Dask adds nothing: since biopb/biopb#970 a bare
+kernel spins no cluster, so a verification pays for one only under a config that
+asks for it.
 
 Where the memory goes, cumulative through a *full* bootstrap — the two rows the
 headless kernel does not pay are marked:
@@ -360,33 +359,29 @@ Most of the kernel-side claim machinery (`_owner`, `_owner_label`, the busy
 scan) can then shrink, since admission is decided above it.
 
 **A scratch kernel gets the default scheduler, like every other fresh kernel.**
-Since biopb/biopb#970 that default is in-process, and an `attach_cluster` the
-session's agent made does not travel: the attach belongs to the kernel that asked
-for it. That is the same rule as the headless one — the reader of a saved
+Since biopb/biopb#970 that default is in-process, and a cluster the session's
+agent attached does not travel: it belongs to the kernel that asked for it, and
+its workers are that kernel's children. That is the same rule as the headless one — the reader of a saved
 workflow gets a bare kernel, so the run that verifies it gets one too. A workflow
 that needs a cluster says so in a cell, and then the verification proves that
 cell.
 
-**When a cluster *is* in play, the slot is what makes sharing safe.** Under a
-config that auto-attaches, both kernels attach to the session child's one
-`LocalCluster`. That sounds like contention, but under a global slot there is no
-second computation to contend with: while a verification runs, the session kernel
-is by construction not running a job. The other thing that could plausibly be
-computing there — the viewer's own slice reads — is deliberately kept off the
+**When a cluster *is* in play, the slot is what keeps the two kernels apart.**
+Under a config that auto-attaches, each kernel spins its own — they are not
+sharing one any more, so the contention question is now about the machine rather
+than the scheduler, and under a global slot there is no second computation to
+contend with: while a verification runs, the session kernel is by construction
+not running a job. The other thing that could plausibly be computing there — the viewer's own slice reads — is deliberately kept off the
 cluster, `ViewerConfig.compute_scheduler` defaulting to `"threads"` so plane
 reads use "the one shared client cache (~100% hit on revisit, no worker scatter;
 biopb/biopb#8)". Nothing else schedules work on it: outside a job, `_dask_client`
 appears only in `server_status` and the graceful-close snippet.
 
-Sharing then pays twice over, because the workers' per-worker chunk caches (the
-budget `_make_cache_plugin` divides) are already warm from the session's own
-reads — so the verification inherits them, which is most of what the scratch
-process's empty client-side cache would otherwise have cost.
-
-What is left is a cache effect in the other direction: a verification can evict
-the session's cached chunks from those worker caches, so the session's next run
-re-reads them. It is a cache, so nothing is wrong afterwards, only slower —
-secondary, and not worth a second cluster or a worker share to avoid.
+What that costs, now that the caches are not shared: a verification's workers
+start cold, where they used to inherit the session's warm per-worker chunk caches
+(the budget `_make_cache_plugin` divides). It also means a verification can no
+longer evict the session's cached chunks. Both are cache effects — slower, never
+wrong — and the isolation is worth more than the warmth.
 
 **Neither interrupt nor restart grows an argument.** `interrupt_kernel()`
 resolves through `_running_job()` — "the single running job, or None. One job at

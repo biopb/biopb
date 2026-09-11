@@ -1,50 +1,54 @@
-"""Kernel-side dask attachment: where this kernel's computes actually run.
+"""Where this kernel's dask computes run: in-process, or on a cluster it spun.
 
-Runs **in the kernel**. The default is the *in-process* scheduler — the same one
-the napari viewer's slice reads are pinned to (biopb/biopb#8) — and the kernel
-attaches to a distributed cluster only when asked: by config (``dask.scheduler =
-"distributed"``, or a ``dask.address``), or at run time via the
-``attach_cluster`` / ``detach_cluster`` tools.
+Runs **in the kernel**, which owns the whole arrangement -- there is no
+daemon-side cluster machinery. The default is the *in-process* scheduler the
+napari viewer's slice reads are pinned to (biopb/biopb#8); a cluster arrives only
+when something asks for one, and dies with the kernel that asked.
 
 **Why in-process is the default** (biopb/biopb#970). A cluster nobody opted into
 is a cluster nobody watches: the session daemon used to spin one at start and
 wire every kernel to it, so when a host suspend killed its workers the scheduler
 stayed up, accepted work, and blocked every ``.compute()`` forever with no error.
-Making the attach explicit removes the failure by construction — and there is
+Making the attach explicit removes the failure by construction -- and there is
 little to give up on the happy path, because a chunk read over loopback hands
 back an mmap view of the server's own segment file that N worker processes would
 share through the page cache anyway (``docs/localhost-fast-path.md``). Crossing a
 process boundary to fetch it only adds a ``chunk_locate`` round trip and a hop
 back per worker, plus N cold spawns at session start.
 
-**What attaching still buys**, and why the tools exist: real CPU parallelism for
-a compute that is not loopback-IO-bound, an external cluster's machines, and a
-mid-compute cancel — ``interrupt_kernel`` stops a blocking ``.compute()`` by
-cancelling in-flight futures, which needs a real ``Client``. On the in-process
-scheduler that stop is best-effort: a ``KeyboardInterrupt`` that lands at the
-next bytecode, so a chunk fetch inside a C call ends only when it returns.
+**What attaching still buys**: real CPU parallelism for a compute that is not
+loopback-IO-bound, an external cluster's machines, and a mid-compute cancel --
+``interrupt_kernel`` stops a blocking ``.compute()`` by cancelling in-flight
+futures, which needs a real ``Client``. On the in-process scheduler that stop is
+best-effort: a ``KeyboardInterrupt`` that lands at the next bytecode, so a chunk
+fetch inside a C call ends only when it returns.
+
+**Nothing here overrides dask's own precedence**, which is the reason this module
+is small: with ``dask.config["scheduler"]`` left unset, a live ``Client``
+registers itself as the global default and a closed one falls back to the
+threaded scheduler, all by itself. So ``attach``/``detach`` are ordinary
+``Client(...)`` / ``close()`` calls, and an agent that writes those in a cell
+gets exactly what this object would have given it -- plus, here, the worker cache
+budget and a cluster whose lifetime is managed.
 """
 
 import logging
-import os
+import shutil
+import tempfile
 import threading
 import time
 
 logger = logging.getLogger(__name__)
 
-# Env var carrying a session-child-owned cluster's scheduler address into the
-# kernel (set by _cluster/_kernel), read ahead of the dask.address config value.
-DASK_ADDRESS_ENV = "BIOPB_DASK_ADDRESS"
-
 # The one wording of biopb/biopb#970's advice. Every surface that has to say it
-# -- the job runner's refusal, the attach_cluster reply, server_status -- prints
-# this string, so the instruction cannot drift between them.
+# -- the job runner's refusal, server_status -- prints this string, so the
+# instruction cannot drift between them.
 _DEAD_CLUSTER_ADVICE = (
     "The dask cluster attached to this kernel ({address}) has no workers left, "
     "so any .compute() here would block forever instead of failing. This is what "
-    "a host suspend does to a cluster (biopb/biopb#970). Call attach_cluster() to "
-    "re-spin it, or detach_cluster() to go back to the in-process scheduler the "
-    "napari viewer uses. From the observe page: restart the kernel."
+    "a host suspend does to a cluster (biopb/biopb#970). Run "
+    "`_dask_ctl.attach()` to get a fresh one, or `_dask_ctl.detach()` to go back "
+    "to the in-process scheduler the napari viewer uses."
 )
 
 # Seconds a worker count stays good enough for the every-job liveness check.
@@ -95,10 +99,9 @@ def _register_cache_plugin(dask_client, url, token, config: dict, n_workers):
     worker-init plugin so each worker (current and future) caps its per-process
     *copy* cache at ``budget // n_workers`` -- bounding the aggregate cache that
     would otherwise be replicated per worker. Returns the per-worker budget in
-    bytes (``None`` if nothing was registered), which is what ``attach_cluster``
-    reports back.
+    bytes (``None`` if nothing was registered).
 
-    This budget now applies on localhost too. It bounds only the strong cache of
+    This budget applies on localhost too. It bounds only the strong cache of
     chunks that cost real RAM (``do_get`` / over-budget copies); on localhost
     those are rare (the mmap fast path dominates), and its views are cached
     *weakly* -- shared with the OS page cache, so not replicated per worker and
@@ -145,67 +148,39 @@ def _register_cache_plugin(dask_client, url, token, config: dict, n_workers):
         return None
 
 
-def _admission_refusal(writer):
-    """Why *writer* may not change this kernel's scheduler right now, or ``None``.
-
-    Both halves of the answer live in the kernel, where ``interrupt_kernel`` also
-    asks them: the one-agent claim (``_jobs``' owner -- the scheduler is the whole
-    namespace's, so a client that cannot run code here cannot move it either) and
-    whether a job is running. Asking the server's mirrored claim instead would be
-    a check-then-act across a round trip, and would need a second copy of the
-    rule.
-    """
-    try:
-        from . import _jobs
-
-        refusal = _jobs.check_writer(writer)
-        if refusal is not None:
-            return refusal
-        running = _jobs.running_job()
-    except Exception:  # noqa: BLE001 - no job runner (a bare/test kernel)
-        return None
-    if running is None:
-        return None
-    return {
-        "error": (
-            f"job {running['job_id']} is running in this kernel; changing the "
-            "scheduler under it would strand its work. Wait for it, or stop it."
-        ),
-        "busy": True,
-    }
-
-
 class DaskAttachment:
-    """This kernel's dask scheduler: in-process by default, attached on request.
+    """This kernel's dask scheduler: in-process by default, on a cluster on ask.
 
-    One object owns everything that has to move together on an attach — the
-    ``Client``, the ``_dask_client`` binding in the agent's namespace, dask's
-    default scheduler, and the per-worker cache budget (recomputed per attach,
-    since the split depends on the worker count). It is bound in the namespace
-    as ``_dask_ctl``, which is how the ``attach_cluster`` / ``detach_cluster``
-    tools reach it across the kernel hop.
+    Bound in the agent namespace as ``_dask_ctl``; :meth:`attach` and
+    :meth:`detach` are called from a cell like any other handle, which is why
+    there is no MCP tool for either. What it adds over writing ``Client(...)`` by
+    hand is the parts that are easy to forget: a cluster sized from config whose
+    lifetime is tied to this kernel, the per-worker chunk-cache budget, and the
+    liveness the job runner reads.
     """
 
     def __init__(self, config: dict, ip=None):
         self._config = config
         self._ip = ip
-        # Guards the client/address pair and the (url, token) the cache budget
-        # needs. The connect hook and the startup attach genuinely race: either
-        # can be the second to arrive, and the second one registers the plugin.
-        # Never held across a network call -- dead_message() takes it on every
-        # job start, and a stale client's close() can block for its comm timeout.
+        # Guards the client/cluster pair and the (url, token) the cache budget
+        # needs. Never held across a network call -- dead_message() takes no lock
+        # at all and runs on every job start, and a stale client's close() can
+        # block for its comm timeout.
         self._lock = threading.RLock()
         self._client = None
+        # The LocalCluster this kernel spun, if any; None when attached to
+        # someone else's scheduler (which is not ours to close).
+        self._cluster = None
+        self._spill_dir = None
         self._address = None
         self._url = None
         self._token = None
         self._per_worker_budget = None
         # Has the startup decision been made? The authority is here; the
-        # namespace binding below is a mirror for the agent to read.
+        # namespace binding is a mirror for the agent to read.
         self._settled = False
         # Last worker count and when it was read, so the every-job liveness
-        # check can answer from a recent reading instead of an RPC (see
-        # _worker_count).
+        # check can answer from a recent reading instead of an RPC.
         self._workers = None
         self._workers_at = 0.0
         self._publish(None)
@@ -221,154 +196,140 @@ class DaskAttachment:
             self._ip.user_ns["_dask_attach_done"] = self._settled
 
     def _mark_settled(self):
-        """The arrangement is decided; mirror that for the agent.
-
-        Set by whichever path decided it -- :meth:`start`, or an
-        ``attach_cluster`` / ``detach_cluster`` that got there first -- so
-        ``status()`` never reports "attaching" about a kernel that has settled.
-        """
+        """The arrangement is decided; mirror that for the agent."""
         self._settled = True
         if self._ip is not None:
             self._ip.user_ns["_dask_attach_done"] = True
 
     # -- startup -----------------------------------------------------------
 
-    def auto_attach_address(self):
-        """The address to attach at startup, or ``None`` to stay in-process.
-
-        The config escape hatch, and it is entirely an address question.
-        ``dask.scheduler = "distributed"`` reaches here as an *injected* address:
-        the session child reads that setting, spins its ``LocalCluster`` and
-        passes ``BIOPB_DASK_ADDRESS`` down at launch. A configured
-        ``dask.address`` is the external case, and wins on its own whatever the
-        scheduler setting says — a scheduler address that is never attached to
-        would be a setting that silently does nothing.
-
-        No address means no cluster to attach: the session child has none (the
-        default) or its spin failed. Either way the kernel stays in-process; it
-        never spins one of its own, which would die with every restart.
-        """
-        from .._config import get_setting
-
-        # The session-child-injected address (its owned cluster) wins over the
-        # configured external one.
-        return (
-            os.environ.get(DASK_ADDRESS_ENV)
-            or get_setting(self._config, "dask.address")
-            or None
-        )
-
     def start(self):
         """Settle this kernel's scheduler. Runs on the bootstrap's attach thread.
 
-        Off the bootstrap's own thread because even a bare ``Client(address)``
-        connect costs a round trip and the viewer must not wait on it; until
-        this settles, ``_dask_client`` is None and the tools guard for that.
+        Off the bootstrap's own thread because spinning a cluster is seconds (N
+        cold spawns on Windows) and even a bare ``Client(address)`` connect costs
+        a round trip; the viewer must not wait on either. Until this settles,
+        ``_dask_client`` is None and the tools guard for that.
+
+        The config escape hatch, and the only thing that attaches without being
+        asked: ``dask.address`` attaches to that external scheduler, and
+        ``dask.scheduler = "distributed"`` spins a local cluster at kernel start
+        the way every session did before biopb/biopb#970. Neither is the default.
         """
         try:
-            address = self.auto_attach_address()
+            from .._config import get_setting
+
+            address = get_setting(self._config, "dask.address")
             if address:
                 self.attach(address)
-            else:
-                with self._lock:
-                    self._use_in_process()
+            elif get_setting(self._config, "dask.scheduler") == "distributed":
+                self.attach()
         except Exception:
             logger.exception("Dask setup failed; kernel stays on in-process scheduler")
         finally:
             self._mark_settled()
 
-    def _use_in_process(self):
-        """Make dask's default the in-process scheduler. Lock held.
-
-        The same scheduler the viewer's slice reads use, so viewer and agent
-        share one process's chunk cache by construction rather than by the
-        ``_viewer_compute`` pin.
-        """
-        import dask
-
-        from .._config import get_setting
-
-        scheduler = get_setting(self._config, "dask.scheduler")
-        if scheduler == "distributed":
-            # Asked for a cluster we have no address for: threads, not a
-            # kernel-local cluster.
-            scheduler = "threads"
-        num_workers = get_setting(self._config, "dask.num_workers") or None
-        dask.config.set(scheduler=scheduler, num_workers=num_workers)
-        self._address = None
-        self._per_worker_budget = None
-        logger.info("Dask scheduler: %s, num_workers: %s", scheduler, num_workers)
-
     # -- attach / detach ---------------------------------------------------
 
-    def attach(self, address: str, writer=None):
-        """Attach to the scheduler at *address*; return :meth:`status`.
+    def attach(self, address=None):
+        """Compute on a dask cluster; return :meth:`status`.
 
-        The caller resolves *address* — the session child spins or reuses its own
-        ``LocalCluster`` for a bare ``attach_cluster()`` — because only it can
-        own a cluster; a kernel that spun its own would lose it on every restart.
+        Without *address*, spins a ``LocalCluster`` in this kernel sized from the
+        ``dask.*`` config. With one, attaches to that scheduler -- but note its
+        workers have to reach the data plane themselves, and off-loopback they
+        lose the mmap fast path, so a read-heavy graph can be slower than
+        in-process.
 
-        Refused for a client that does not hold this kernel, and while a job is
-        running: the scheduler is the whole namespace's, and swapping it under an
-        in-flight ``compute()`` would strand that job's futures. A failed connect
-        leaves the current arrangement untouched and reports the error, so a bad
-        address costs nothing.
+        Replaces whatever this kernel was on, closing a cluster it had spun. A
+        failed connect leaves the current arrangement untouched and reports the
+        error, so a bad address costs nothing.
         """
-        refusal = _admission_refusal(writer)
-        if refusal is not None:
-            return refusal
+        cluster = None
+        spill = None
         try:
             from dask.distributed import Client
 
+            if address is None:
+                cluster, spill = self._spin()
+                address = cluster.scheduler_address
             client = Client(address)
         except Exception as exc:
-            logger.exception("Failed to attach to dask scheduler at %s", address)
+            logger.exception("Failed to attach to a dask cluster at %s", address)
+            self._discard(cluster, spill)
             return {"error": f"{type(exc).__name__}: {exc}", "address": address}
-        import dask
-
         with self._lock:
-            previous = self._client
+            previous, prev_cluster, prev_spill = (
+                self._client,
+                self._cluster,
+                self._spill_dir,
+            )
             self._publish(client)
+            self._cluster, self._spill_dir = cluster, spill
             self._address = address
-            # Say it in the config rather than relying on `Client.__init__`
-            # registering itself as dask's global default: the in-process default
-            # this kernel starts on is a config value ("threads"), and a config
-            # value wins over the global client -- so an attach that did not
-            # overwrite it would connect a Client that nothing computes on.
-            dask.config.set(scheduler="distributed")
-        self._close(previous, client)
+        # Outside the lock: closing a superseded client can block for its comm
+        # timeout, and that is exactly what a stale scheduler does.
+        self._close(previous, keep=client)
+        self._discard(prev_cluster, prev_spill)
         self._register_cache_if_ready()
         self._mark_settled()
-        logger.info("Dask attached to distributed scheduler at %s", address)
+        logger.info("Dask attached to %s", address)
         return self.status()
 
-    def detach(self, writer=None):
-        """Close the ``Client`` and go back to the in-process scheduler.
+    def detach(self):
+        """Go back to the in-process scheduler; return :meth:`status`.
 
-        The cluster itself is left alone: a session-child-owned one falls to the
-        existing idle reaper (``dask.idle_ttl``), and an external one was never
-        ours. Idempotent — detaching when nothing is attached just reasserts the
-        in-process default. Gated like :meth:`attach`.
+        Closes the client -- which is all it takes, since dask falls back to the
+        threaded scheduler once no client is live -- and tears down the cluster
+        if this kernel spun it. An external one was never ours. Idempotent.
         """
-        refusal = _admission_refusal(writer)
-        if refusal is not None:
-            return refusal
         with self._lock:
-            client = self._client
+            client, cluster, spill = self._client, self._cluster, self._spill_dir
             self._publish(None)
-            self._use_in_process()
-        self._close(client, None)
+            self._cluster, self._spill_dir, self._address = None, None, None
+            self._per_worker_budget = None
+        self._close(client, keep=None)
+        self._discard(cluster, spill)
         self._mark_settled()
         return self.status()
 
-    def _close(self, client, keep):
-        """Close a superseded ``Client``, outside the lock and best-effort.
+    # Teardown for the kernel's own shutdown path (_kernel._DASK_RELEASE_SNIPPET),
+    # which wants the workers stopped gracefully so they clean their spill files
+    # rather than being reaped with the process group.
+    shutdown = detach
 
-        Outside because this is the one call here that can block for a comm
-        timeout -- and it blocks exactly when the scheduler has gone stale, which
-        is the case this whole module is about. Holding the lock through it would
-        stall :meth:`dead_message`, i.e. every job start.
+    def _spin(self):
+        """Start a ``LocalCluster`` in this kernel; return ``(cluster, spill_dir)``.
+
+        Its workers are children of the kernel process, so they go with it --
+        which is the whole reason the daemon no longer owns a cluster: nothing
+        outlives the session that asked for it, and there is no idle reaper, no
+        liveness ledger and no scheduler address to inject. The spill directory
+        is ours to remove, since a group-kill gives the workers no chance to
+        (biopb/biopb#13).
         """
+        from dask.distributed import LocalCluster
+
+        from .._config import get_setting
+
+        spill = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
+        cluster = LocalCluster(
+            # 0 -> None so dask picks ~n_cores.
+            n_workers=get_setting(self._config, "dask.num_workers") or None,
+            processes=True,
+            threads_per_worker=get_setting(self._config, "dask.threads_per_worker"),
+            memory_limit=get_setting(self._config, "dask.memory_limit"),
+            dashboard_address=get_setting(self._config, "dask.dashboard_address"),
+            local_directory=spill,
+        )
+        logger.info(
+            "Spun a kernel-owned dask cluster: %d worker(s) at %s",
+            len(cluster.workers),
+            cluster.scheduler_address,
+        )
+        return cluster, spill
+
+    def _close(self, client, keep):
+        """Close a superseded ``Client``, best-effort. Call without the lock."""
         if client is None or client is keep:
             return
         try:
@@ -376,13 +337,23 @@ class DaskAttachment:
         except Exception:
             logger.debug("dask client close failed", exc_info=True)
 
+    def _discard(self, cluster, spill_dir):
+        """Tear down a cluster we spun and remove its spill dir. No lock."""
+        if cluster is not None:
+            try:
+                cluster.close()
+            except Exception:
+                logger.debug("dask cluster close failed", exc_info=True)
+        if spill_dir:
+            shutil.rmtree(spill_dir, ignore_errors=True)
+
     # -- connection hook ---------------------------------------------------
 
     def on_connect(self, url, token):
         """Data plane connected: (re)install the cache budget on the workers.
 
         Fires in the kernel after every successful connect with the final
-        ``(url, token)`` — the token is only known post-connect, and it is what
+        ``(url, token)`` -- the token is only known post-connect, and it is what
         bounds the workers' chunk cache.
         """
         with self._lock:
@@ -390,7 +361,7 @@ class DaskAttachment:
         self._register_cache_if_ready()
 
     def _register_cache_if_ready(self):
-        """Split the cache budget across the workers, if there is one to split.
+        """Split the cache budget across the workers, if there are any.
 
         Called without the lock (it registers a plugin cluster-wide): it reads a
         consistent snapshot, does the round trip outside, and stores the result
@@ -445,29 +416,27 @@ class DaskAttachment:
     def status(self):
         """A JSON-able description of where this kernel's computes run.
 
-        ``server_status`` renders it, and ``attach_cluster`` returns it. Reports
-        the *mode* (in-process vs. attached, and to what) rather than only the
-        worker count, so the arrangement — the thing biopb/biopb#970 made
-        invisible — is legible in the one place an agent already looks.
-        ``warning`` carries :meth:`dead_message` when it applies, so every
-        surface prints one wording of that advice rather than its own.
+        ``server_status`` renders it. Reports the *mode* (in-process vs. attached,
+        and to what) rather than only a worker count, so the arrangement -- the
+        thing biopb/biopb#970 made invisible -- is legible in the one place an
+        agent already looks. ``warning`` carries :meth:`dead_message` when it
+        applies, so every surface prints one wording of that advice.
         """
         with self._lock:
-            client, address = self._client, self._address
-            if client is None:
-                import dask
-
-                return {
-                    "mode": "in-process" if self._settled else "attaching",
-                    "scheduler": str(dask.config.get("scheduler", default="unknown")),
-                    "workers": None,
-                    "address": None,
-                    "dashboard": None,
-                    "cache_budget_per_worker": None,
-                    "dead": False,
-                    "warning": None,
-                }
+            client, address, owned = self._client, self._address, self._cluster
             budget = self._per_worker_budget
+        if client is None:
+            return {
+                "mode": "in-process" if self._settled else "attaching",
+                "scheduler": "threads",
+                "workers": None,
+                "address": None,
+                "dashboard": None,
+                "owned": False,
+                "cache_budget_per_worker": None,
+                "dead": False,
+                "warning": None,
+            }
         workers = self._worker_count()
         try:
             dashboard = client.dashboard_link
@@ -479,6 +448,7 @@ class DaskAttachment:
             "workers": workers,
             "address": address,
             "dashboard": dashboard,
+            "owned": owned is not None,
             "cache_budget_per_worker": budget,
             "dead": workers == 0,
             "warning": _DEAD_CLUSTER_ADVICE.format(address=address)

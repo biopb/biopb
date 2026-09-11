@@ -35,27 +35,25 @@ client connects and is gone when that client disconnects.
    │ session child            ephemeral, shim-owned   │
    │   FastMCP / uvicorn  — tools + resources         │
    │   KernelHost         — owns the kernel           │
-   │   DaskClusterHost    — owns the cluster, if any  │
    │   observe UI         — job history + cancel      │
-   └───────┬──────────────────────────────┬───────────┘
-           │ spawns; jupyter ZMQ          ┊ spawns on request
-           ▼                              ▼
+   └───────┬──────────────────────────────────────────┘
+           │ spawns; jupyter ZMQ
+           ▼
    ┌────────────────────────────┐   ┌───────────────────────┐
-   │ Jupyter kernel             │   │ dask LocalCluster     │
-   │   napari viewer window (Qt)│┈┈►│   scheduler + workers │
+   │ Jupyter kernel             │┈┈►│ dask LocalCluster     │
+   │   napari viewer window (Qt)│   │   scheduler + workers │
    │   agent namespace          │   └───────────────────────┘
-   │   job runner, viewer proxy │    only once attach_cluster
-   └──────────────┬─────────────┘    (or config) asks for one
+   │   job runner, viewer proxy │    spawned by the kernel,
+   └──────────────┬─────────────┘    only when asked for
                   │ Flight / gRPC
                   ▼
       data plane · algorithm servers · control plane
       (outside this package — see ../development.md)
 ```
 
-Two ownership facts deliberately do not follow the spawn chain: a **dask cluster
-hangs off the session child, not the kernel**, so it survives kernel restarts; and
-the **planes at the bottom are never started here** — the session is a pure client
-of them, and only *registers* itself with the control.
+One ownership fact deliberately does not follow the spawn chain: the **planes at
+the bottom are never started here** — the session is a pure client of them, and
+only *registers* itself with the control.
 
 ### Why this shape
 
@@ -113,22 +111,22 @@ the real `napari.Viewer`, because an off-main napari mutation can segfault the k
 ### dask cluster
 
 By default, the kernel's dask computes run on the in-process scheduler, shared with
-the napari viewer. If needed, the agent can ask the session child to spin up
-a local cluster (`attach_cluster`) for parallel multi-process computation. The default
+the napari viewer. If needed, the agent runs `_dask_ctl.attach()` in a cell to spin
+up a local cluster for parallel multi-process computation. The default
 can also be overridden by the user via config. Defaulting to in-process is a
 reliability choice, not a cost one: a long-lived cluster nobody opted into is one
 nobody watches, and a suspended host left every `.compute()` blocked on a scheduler
 whose workers were gone (**#970**). The trade is that a `.compute()` is cancellable
 mid-flight only while attached.
 
-The dask cluster is owned by the **session child** — not the kernel — so it survives
-kernel restart/respawn/window-close with no cold worker re-spawn (the dominant
-restart cost on Windows). The kernel attaches by scheduler address; worker/memory
-changes therefore need a *session* restart, not just a kernel restart. An idle
-reaper bounds the decoupling: once the cluster has sat with **no kernel attached**
-past its TTL it is torn down, and the next attach re-spins it. The host tracks
-who holds its address, since a live kernel that detached (or restarted) holds
-nothing.
+The cluster belongs to the **kernel** that asked for it — its workers are that
+process group's children, so they go down with it and nothing outlives the session
+that wanted them. That is why there is no cluster machinery in the session child at
+all: no ownership to arbitrate, no idle reaper, no scheduler address to inject. Nor
+is there an MCP tool — attaching is `Client(...)` and detaching is `close()`, so it
+belongs in the kernel with everything else agent code touches; `_dask_ctl` only adds
+config-sized spin-up, the per-worker cache budget, and the liveness `server_status`
+reports.
 
 ### Data connection
 

@@ -86,7 +86,7 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `in
 * **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
   raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
 * **Progress on a big graph:** submit with the distributed client
-  (`_dask_client`, present only while a cluster is attached — see below) and consume
+  (`_dask_client`, bound only while a cluster is attached — see below) and consume
   results as they land — this gives a live processed count via `poll_job`:
   ```python
   from dask.distributed import as_completed
@@ -102,15 +102,24 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `in
 The kernel starts on the **in-process scheduler**, the same one the napari viewer
 reads through. That is the right default for this workload: a chunk read over
 loopback is IO-bound and comes back as an mmap view, so routing it through worker
-processes adds hops rather than speed — and a cluster nobody asked for is one
-that quietly dies with the laptop lid and hangs every later `.compute()` (#970).
+processes adds hops rather than speed — and a cluster nobody asked for is one that
+quietly dies with the laptop lid and hangs every later `.compute()` (#970).
 
-`attach_cluster()` moves your computes onto a distributed cluster; it spins (or
-reuses, and health-checks) the session's own LocalCluster, or takes an
-`address` for an external scheduler. `detach_cluster()` goes back. Reach for it
-when the work is CPU-heavy and parallel — a per-tile filter over a big stack, a
-segmentation sweep — not for reads. `server_status`'s `## Dask` section always
-says which mode is in effect, and `restart_kernel` starts in-process again.
+When the work is CPU-heavy and parallel — a per-tile filter over a big stack, a
+segmentation sweep — put it on a cluster from a cell:
+
+```python
+_dask_ctl.attach()                 # spin a local cluster (sized from config)
+_dask_ctl.attach("tcp://host:8786")  # or an external scheduler
+_dask_ctl.detach()                 # back to in-process
+```
+
+The cluster lives as long as this kernel does. There is no tool for this because
+there is nothing a tool would add: `.attach()` is `Client(...)` and `.detach()` is
+`.close()`, and a client you build yourself works the same way — `_dask_ctl` just
+also sizes the cluster from config and splits the chunk-cache budget across its
+workers. `server_status`'s `## Dask` section always says which mode is in effect.
+`restart_kernel` starts in-process again.
 
 One real difference: **a `.compute()` is fully cancellable only while attached**
 — `interrupt_kernel` cancels the in-flight futures. In-process the stop is

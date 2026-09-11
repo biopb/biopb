@@ -27,13 +27,6 @@ logger = logging.getLogger(__name__)
 
 _kernel_host: KernelHost | None = None
 
-# The session's dask cluster host (``_cluster.DaskClusterHost``), or None when
-# this process owns none. Set by the launcher beside the kernel host: it is the
-# session's, not the kernel's -- the whole point of the arrangement is that it
-# outlives kernel restarts -- so ``attach_cluster`` asks for it here rather than
-# reaching through the KernelHost that merely borrows its address at launch.
-_cluster_host = None
-
 # Seconds execute_code waits for a job to finish before returning a job handle
 # instead of an inline result (set from config by the launcher).
 _promote_after: float = 10.0
@@ -173,12 +166,6 @@ def set_kernel_host(host: KernelHost):
     global _kernel_host
     _kernel_host = host
     clear_claim()
-
-
-def set_cluster_host(host):
-    """Install the session's dask cluster host (see :data:`_cluster_host`)."""
-    global _cluster_host
-    _cluster_host = host
 
 
 def set_promote_after(seconds: float):

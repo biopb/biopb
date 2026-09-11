@@ -111,13 +111,11 @@ def _snapshot(
 @pytest.fixture(autouse=True)
 def reset_server_state():
     old_host = _app._kernel_host
-    old_cluster = _app._cluster_host
     old_promote = _app._promote_after
     old_skills = _app._skills_enabled
     old_instructions = _app.mcp._mcp_server.instructions
     yield
     _app._kernel_host = old_host
-    _app._cluster_host = old_cluster
     _app._promote_after = old_promote
     _app._skills_enabled = old_skills
     _app.mcp._mcp_server.instructions = old_instructions
@@ -1659,129 +1657,6 @@ class TestDataGuide:
         assert "layer.multiscale" in viewer_guide
 
 
-class TestAttachDetachCluster:
-    """The explicit attach the kernel's in-process default replaced (#970)."""
-
-    @pytest.fixture
-    def cluster_host(self):
-        host = MagicMock()
-        host.ensure.return_value = "tcp://127.0.0.1:8786"
-        _app.set_cluster_host(host)
-        yield host
-        _app.set_cluster_host(None)
-
-    def _attached(self, workers=4, warning=None):
-        return _job_reply(
-            mode="attached",
-            address="tcp://127.0.0.1:8786",
-            workers=workers,
-            dashboard="http://127.0.0.1:8787/status",
-            cache_budget_per_worker=250_000_000,
-            dead=workers == 0,
-            warning=warning,
-        )
-
-    def test_bare_attach_spins_the_session_cluster(
-        self, server_with_host, cluster_host
-    ):
-        _install_replies(server_with_host, returns=self._attached())
-        result = _tool(_server.attach_cluster)
-        # on_demand=True: the config default asks for no cluster, this call does.
-        assert cluster_host.ensure.call_args[0] == (True,)
-        # The ledger records the attach the kernel confirmed, not the spin.
-        cluster_host.note_attached.assert_called_once_with("tcp://127.0.0.1:8786")
-        snippet = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "_dask_ctl.attach(" in c[0][0]
-        ][0]
-        assert "tcp://127.0.0.1:8786" in snippet
-        assert "4 worker(s)" in result
-        assert "8787" in result
-
-    def test_explicit_address_skips_the_local_spin(
-        self, server_with_host, cluster_host
-    ):
-        _install_replies(server_with_host, returns=self._attached())
-        _tool(_server.attach_cluster, address="tcp://elsewhere:8786")
-        cluster_host.ensure.assert_not_called()
-
-    def test_spin_failure_leaves_the_kernel_alone(self, server_with_host, cluster_host):
-        cluster_host.ensure.return_value = None
-        result = _tool(_server.attach_cluster)
-        assert "Failed to start" in result
-        assert not [
-            c for c in server_with_host.execute.call_args_list if "_dask_ctl" in c[0][0]
-        ]
-
-    def test_attach_relays_the_kernel_s_worker_less_warning(
-        self, server_with_host, cluster_host
-    ):
-        # One wording, composed in the kernel; the tool passes it through.
-        _install_replies(
-            server_with_host,
-            returns=self._attached(workers=0, warning="no workers left; re-spin it"),
-        )
-        assert "no workers left" in _tool(_server.attach_cluster)
-
-    def test_kernel_refusal_is_relayed(self, server_with_host, cluster_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(error="job job-1 is running in this kernel", busy=True),
-        )
-        assert "job-1" in _tool(_server.attach_cluster)
-        # Spun but never attached: the ledger must not claim a holder, or the
-        # reaper would keep those workers for the life of the session.
-        cluster_host.note_attached.assert_not_called()
-
-    def test_attaching_elsewhere_releases_the_session_cluster(
-        self, server_with_host, cluster_host
-    ):
-        _install_replies(server_with_host, returns=self._attached())
-        _tool(_server.attach_cluster, address="tcp://elsewhere:8786")
-        # note_attached with someone else's address clears our own ledger.
-        cluster_host.note_attached.assert_called_once_with("tcp://elsewhere:8786")
-
-    def test_detach_returns_to_the_in_process_scheduler(
-        self, server_with_host, cluster_host
-    ):
-        _install_replies(
-            server_with_host, returns=_job_reply(mode="in-process", scheduler="threads")
-        )
-        result = _tool(_server.detach_cluster)
-        assert "_dask_ctl.detach(" in server_with_host.execute.call_args_list[0][0][0]
-        assert "Detached" in result and "threads" in result
-        # Nobody holds the cluster now, so its idle reaper starts counting.
-        cluster_host.note_detached.assert_called_once()
-
-    def test_refused_detach_does_not_release_the_cluster(
-        self, server_with_host, cluster_host
-    ):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(refused="not_owner", owner="claude-code", owner_id="A"),
-        )
-        assert "another client" in _tool(_server.detach_cluster)
-        cluster_host.note_detached.assert_not_called()
-
-    def test_not_owner_is_refused_by_the_kernel_and_mirrored_here(
-        self, server_with_host, cluster_host
-    ):
-        # The claim is the kernel's (one agent per namespace); the server relays
-        # the refusal and corrects its mirror from it, as interrupt_kernel does.
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(refused="not_owner", owner="claude-code", owner_id="A"),
-        )
-        assert "another client" in _tool(_server.attach_cluster)
-        assert _writers.claim_holder() == "A"
-
-    def test_no_host(self):
-        _app._kernel_host = None
-        assert "not initialized" in _tool(_server.attach_cluster)
-        assert "not initialized" in _tool(_server.detach_cluster)
-
-
 class TestToolReturnShape:
     """What an *in-process* caller gets back from a tool call, per tool.
 
@@ -1818,8 +1693,6 @@ class TestToolReturnShape:
         ("interrupt_kernel", {}, True),
         ("start_kernel", {}, True),
         ("restart_kernel", {}, True),
-        ("attach_cluster", {}, True),
-        ("detach_cluster", {}, True),
         ("server_status", {}, True),
     ]
 

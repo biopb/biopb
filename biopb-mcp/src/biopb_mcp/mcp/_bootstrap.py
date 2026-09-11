@@ -514,11 +514,12 @@ def _bootstrap_impl():
     # 3. Settle dask on a background thread so the viewer opens immediately.
     #    The default is the *in-process* scheduler the viewer's own slice reads
     #    use (#8), so there is nothing to wait for and nothing to go stale
-    #    (#970); attaching to a cluster is an explicit act -- config, or the
-    #    attach_cluster tool -- and even a bare Client(address) connect costs a
-    #    round trip, which is why this stays off the bootstrap thread. Until it
-    #    settles `_dask_client` is None; interrupt_kernel / server_status guard
-    #    for that. `_dask_ctl` owns the whole arrangement (see _dask_ctl).
+    #    (#970); a cluster is an explicit act -- a cell calling
+    #    `_dask_ctl.attach()`, or a config that asks at startup -- and spinning
+    #    or connecting to one costs seconds, which is why this stays off the
+    #    bootstrap thread. Until it settles `_dask_client` is None;
+    #    interrupt_kernel / server_status guard for that. `_dask_ctl` owns the
+    #    whole arrangement, cluster included (see _dask_ctl).
     import threading
 
     from ._dask_ctl import DaskAttachment

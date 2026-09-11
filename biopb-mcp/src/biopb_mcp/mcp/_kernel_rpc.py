@@ -117,12 +117,12 @@ def _extract_json(text: str):
 def _run_ns_call(host, name: str, *args, **kwargs):
     """Call ``<name>(*args, **kwargs)`` on a handle in the kernel namespace.
 
-    The general form of the hop; :func:`_run_job_call` is the job runner's
-    named specialization of it. Arguments are embedded by :func:`_call_expr`,
-    so the repr rule stays in one place. Returns ``(result, raw_result,
-    window_alive)`` where ``result`` is the parsed return value (None if the
-    snippet failed) and ``window_alive`` is the viewer-window liveness flag
-    carried in the same payload (None when unknown).
+    The general form of the hop; :func:`_run_job_call` is the job runner's named
+    specialization, and today its only caller. Arguments are embedded by
+    :func:`_call_expr`, so the repr rule stays in one place. Returns ``(result,
+    raw_result, window_alive)`` where ``result`` is the parsed return value (None
+    if the snippet failed) and ``window_alive`` is the viewer-window liveness
+    flag carried in the same payload (None when unknown).
     """
     res = host.execute(_payload_snippet(_call_expr(name, *args, **kwargs)))
     if res.get("status") != "ok":
@@ -131,11 +131,6 @@ def _run_ns_call(host, name: str, *args, **kwargs):
     if payload is None:
         return None, res, None
     return payload.get("r"), res, payload.get("w")
-
-
-async def _ns_call(host, name: str, *args, **kwargs):
-    """:func:`_run_ns_call` off the event loop (see :func:`_job_call`)."""
-    return await asyncio.to_thread(_run_ns_call, host, name, *args, **kwargs)
 
 
 def _run_job_call(host, name: str, *args, **kwargs):

@@ -290,15 +290,16 @@ class DaskConfig:
     scheduler: str = _h(
         "threads",
         'Scheduler the kernel starts on: "threads"/"synchronous" (in-process, '
-        "shared with the napari viewer; attach_cluster() attaches a cluster when "
-        'one is wanted), "distributed" (attach at startup to a session-owned '
-        "LocalCluster, as before #970).",
+        "shared with the napari viewer; a cell runs `_dask_ctl.attach()` when a "
+        'cluster is wanted), "distributed" (spin one at kernel start, as every '
+        "session did before #970).",
     )
     num_workers: int = _h(
         _DEFAULT_DASK_NUM_WORKERS,
-        "n_workers for the LocalCluster, and the in-process scheduler's thread "
-        "count (0 -> dask picks ~n_cores). 0 on POSIX (fork is cheap); capped at "
-        "4 on Windows (each worker is a cold spawn).",
+        "n_workers for a spun LocalCluster (0 -> dask picks ~n_cores). 0 on "
+        "POSIX (fork is cheap); capped at 4 on Windows (each worker is a cold "
+        "spawn). Does not size the in-process scheduler, which uses dask's own "
+        "default.",
     )
     address: str = _h(
         "",
@@ -321,15 +322,6 @@ class DaskConfig:
         "Cluster-wide chunk-cache budget for the data-plane client, split evenly "
         "across workers. Human size (1G/512M/2GiB) or int bytes; 0 disables. "
         "Applies to localhost and remote alike.",
-    )
-    idle_ttl: float = _h(
-        900.0,
-        "Seconds with no kernel attached after which the session child's own "
-        "LocalCluster is torn down, freeing its workers; the next attach_cluster "
-        "(or kernel launch, under scheduler=distributed) re-spins it. Only counts "
-        "while no kernel is alive, so a live viewer or a restart never loses the "
-        "warm cluster. 0 disables. An external dask.address is never reaped (we "
-        "do not own it).",
     )
 
 
@@ -663,7 +655,6 @@ _CONSTRAINTS = {
     "DaskConfig": {
         "scheduler": Enum({"distributed", "threads", "synchronous"}),
         "num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
-        "idle_ttl": Range(min=0),  # 0 disables the idle reaper
     },
     "TensorRuntimeConfig": {
         "health_poll_min_interval": Range(min=0),  # 0 disables the watcher
