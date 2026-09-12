@@ -4,51 +4,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { selectTileInfo, useAppStore } from "../store";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { splitArrayVersion } from "@biopb/tensor-flight-client";
+import { readRecents, subscribeRecents } from "../utils/recentSources";
+import {
+  RECENT_FOLDER_ID,
+  type TreeNode,
+  getPathParts,
+  matchesQuery,
+  recentNode,
+  sourceLabel,
+} from "../utils/sourceTree";
 
 // Threshold for switching to server-side SQL query
 const SERVER_QUERY_THRESHOLD = 1000;
-
-// Origin scheme the tensor server stamps on a drag-dropped source's source_url
-// (server-side DND_URL_PREFIX). Display-only marker of drop provenance; the tree
-// strips it so a dropped source renders under a clean root, identical to a
-// scheme-less re-root. Keep in sync with the server constant and the napari
-// plugin's _get_path_parts.
-const DND_URL_PREFIX = "dnd://";
-
-interface TreeNode {
-  id: string;           // unique id (path for folders, source_id for sources)
-  name: string;         // display name
-  type: "folder" | "source";
-  children: TreeNode[];
-  source?: DataSourceDescriptor;  // only for source nodes
-  depth: number;
-}
-
-function getPathParts(url: string): string[] {
-  if (!url) return [];
-  if (url.startsWith(DND_URL_PREFIX)) {
-    // Drag-dropped source: strip the origin scheme and split the re-rooted
-    // remainder as a plain path. String-strip (not URL parse) avoids host/port
-    // misparsing of a basename like "exp:2.zarr".
-    return url.slice(DND_URL_PREFIX.length).split(/[\\/]+/).filter(Boolean);
-  }
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname.split("/").filter(Boolean);
-    // Authority URLs (remote tensor-server mirrors "grpc://host:port/remote/path",
-    // "s3://bucket/key", …) surface the endpoint "<protocol>//<host>" as the root,
-    // so mirrored sources nest by their remote filepath under an endpoint node
-    // instead of collapsing into a flat "grpc:" node (biopb/biopb#297). Local
-    // file:// has an empty host, so it is unchanged (just its path). Mirror of the
-    // napari plugin's _get_path_parts — keep the two behaviorally in lockstep.
-    if (parsed.host) {
-      return [`${parsed.protocol}//${parsed.host}`, ...path];
-    }
-    return path;
-  } catch {
-    return url.split("/").filter(Boolean);
-  }
-}
 
 function tensorShortName(arrayId: string): string {
   const parts = arrayId.split("/").filter(Boolean);
@@ -69,7 +36,7 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
       // No path parts, add directly to root
       root.children.push({
         id: src.source_id,
-        name: src.source_id,
+        name: sourceLabel(src),
         type: "source",
         children: [],
         source: src,
@@ -97,10 +64,9 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
     }
 
     // Add source as leaf
-    const sourceName = parts[parts.length - 1]!;
     current.children.push({
       id: src.source_id,
-      name: sourceName,
+      name: sourceLabel(src),
       type: "source",
       children: [],
       source: src,
@@ -245,7 +211,7 @@ function ChevronSlot() {
   );
 }
 
-interface TreeRowProps {
+export interface TreeRowProps {
   node: TreeNode;
   activeSourceId: string | null;
   activeTensorId: string | null;
@@ -254,7 +220,7 @@ interface TreeRowProps {
   selectSource: (sourceId: string, tensorId?: string) => void;
 }
 
-function TreeRow({
+export function TreeRow({
   node,
   activeSourceId,
   activeTensorId,
@@ -315,7 +281,11 @@ function TreeRow({
           alignItems: "center",
           paddingLeft: indent,
         }}
-        data-source-id={src.source_id}
+        // Only the catalog row carries this: it is what the reveal effect
+        // scrolls to, and the "Recent" copy of the same source -- same
+        // descriptor, different node -- comes first in document order and would
+        // otherwise shadow it.
+        data-source-id={node.id === src.source_id ? src.source_id : undefined}
         onClick={() => {
           if (src.tensors.length === 1) {
             selectSource(src.source_id, src.tensors[0]?.array_id);
@@ -388,11 +358,34 @@ export function SourceTree() {
   });
   const selectSource = useAppStore((s) => s.selectSource);
   const querySources = useAppStore((s) => s.querySources);
+  const recentIds = useAppStore((s) => s.recentIds);
+  const recentSources = useAppStore((s) => s.recentSources);
+  const syncRecents = useAppStore((s) => s.syncRecents);
+  const hydrateRecents = useAppStore((s) => s.hydrateRecents);
 
   const [query, setQuery] = useState("");
   const [serverFilteredIds, setServerFilteredIds] = useState<Set<string> | null>(null);
   const [serverQueryLoading, setServerQueryLoading] = useState(false);
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  // "Recent" starts open: a node nobody opens is a node nobody finds, and it is
+  // the one place an uploaded source can be reached at all.
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
+    () => new Set([RECENT_FOLDER_ID]),
+  );
+
+  // Another tab's writes. localStorage is shared but does not re-render, so
+  // without this two tabs of one link would drift apart -- which is the reason
+  // the list is not in sessionStorage.
+  useEffect(() => {
+    syncRecents(readRecents());
+    return subscribeRecents(syncRecents);
+  }, [syncRecents]);
+
+  // Re-resolved when the list changes or the catalog does: a recent id that the
+  // catalog has just listed should stop costing a `tile_info` round trip, and
+  // one the server has dropped should leave the node.
+  useEffect(() => {
+    void hydrateRecents();
+  }, [hydrateRecents, recentIds, sources]);
 
   // Determine if we should use server-side queries
   const useServerQuery = sources.length > SERVER_QUERY_THRESHOLD;
@@ -441,14 +434,20 @@ export function SourceTree() {
       return sources.filter((s) => serverFilteredIds.has(s.source_id));
     }
 
-    return sources.filter((s) => {
-      const hay = `${s.source_id} ${s.source_url} ${s.source_type}`.toLowerCase();
-      return hay.includes(q);
-    });
+    return sources.filter((s) => matchesQuery(s, q));
   }, [query, sources, serverFilteredIds]);
 
   // Build tree from filtered sources
   const tree = useMemo(() => buildTree(filteredSources), [filteredSources]);
+
+  // Recents filter client-side even when the catalog has switched to a
+  // server-side query: that query is SQL against the catalog, which by
+  // construction does not hold the uploads this node exists to show.
+  const recent = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const matching = q ? recentSources.filter((s) => matchesQuery(s, q)) : recentSources;
+    return recentNode(matching);
+  }, [recentSources, query]);
 
   // Filter tree when search is active (client-side only)
   const displayTree = useMemo(() => {
@@ -525,6 +524,28 @@ export function SourceTree() {
     });
   }, []);
 
+  /**
+   * Selecting from "Recent", which must leave the catalog exactly where it is.
+   *
+   * The reveal effect above keys on `activeSourceId` alone and so cannot tell a
+   * catalog click from a shortcut; without this, picking a row near the top of
+   * the pane expands a folder chain further down and scrolls the tree to it --
+   * a jump to somewhere the reader did not click. Recording the origin here is
+   * what the effect cannot work out for itself.
+   *
+   * Marking it *revealed* rather than adding a flag to skip: the two say the
+   * same thing (this selection needs no reveal) and the latch already means
+   * "shown", so a later catalog poll does not reopen the question either. A
+   * catalog click and a shared link leave it unlatched and still reveal.
+   */
+  const selectFromRecent = useCallback(
+    (sourceId: string, tensorId?: string) => {
+      revealed.current = sourceId;
+      selectSource(sourceId, tensorId);
+    },
+    [selectSource],
+  );
+
   return (
     <section style={{ display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
       <div style={{ padding: "0.5rem 1rem" }}>
@@ -547,25 +568,42 @@ export function SourceTree() {
           <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
             {serverQueryLoading ? "Searching..." : "Loading sources..."}
           </div>
-        ) : filteredSources.length === 0 ? (
-          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
-            {scanning && sources.length === 0
-              ? "Indexing data folder… (sources will appear as they are found)"
-              : "No sources"}
-          </div>
-        ) : displayTree ? (
-          displayTree.children.map((child) => (
-            <TreeRow
-              key={child.id}
-              node={child}
-              activeSourceId={activeSourceId}
-              activeTensorId={activeTensorId}
-              expandedFolders={expandedFolders}
-              toggleFolder={toggleFolder}
-              selectSource={selectSource}
-            />
-          ))
-        ) : null}
+        ) : (
+          <>
+            {recent && (
+              <TreeRow
+                node={recent}
+                activeSourceId={activeSourceId}
+                activeTensorId={activeTensorId}
+                expandedFolders={expandedFolders}
+                toggleFolder={toggleFolder}
+                selectSource={selectFromRecent}
+              />
+            )}
+            {/* The empty notice is about the catalog, so it is suppressed while
+                "Recent" has rows -- "No sources" above a list of sources reads
+                as a bug. */}
+            {filteredSources.length === 0 && !recent ? (
+              <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
+                {scanning && sources.length === 0
+                  ? "Indexing data folder… (sources will appear as they are found)"
+                  : "No sources"}
+              </div>
+            ) : (
+              displayTree.children.map((child) => (
+                <TreeRow
+                  key={child.id}
+                  node={child}
+                  activeSourceId={activeSourceId}
+                  activeTensorId={activeTensorId}
+                  expandedFolders={expandedFolders}
+                  toggleFolder={toggleFolder}
+                  selectSource={selectSource}
+                />
+              ))
+            )}
+          </>
+        )}
       </div>
     </section>
   );
