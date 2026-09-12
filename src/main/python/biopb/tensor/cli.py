@@ -786,8 +786,8 @@ def decode_rates(
     from a portable default -- there isn't one.
 
     Only full-resolution reads are sampled, so a tensor served exclusively at
-    reduced scale is absent rather than slow, and a row with a handful of
-    samples is still settling -- the server will not classify on one.
+    reduced scale is absent rather than slow, and a row with only a few
+    samples may still be settling -- weigh it accordingly.
 
     The rate is what a rebuild costs per byte, not what the format can sustain:
     a tensor with small chunks amortizes its per-read overhead over fewer bytes

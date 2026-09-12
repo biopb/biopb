@@ -110,12 +110,6 @@ def retention_for_scale(
 # reads rather than by every read since boot. Ten-ish samples to converge.
 _EMA_ALPHA = 0.25
 
-# An EMA is meaningless on its first sample and noisy for a few after it. Until
-# an array has this many, it has no rate at all and classifies "normal" -- the
-# conservative direction, and the reason an unmeasured array needs no special
-# case.
-_MIN_SAMPLES = 4
-
 
 class DecodeRates:
     """Per-``array_id`` decode throughput in MB/s, and the class it implies.
@@ -172,19 +166,16 @@ class DecodeRates:
             self._counts[array_id] = self._counts.get(array_id, 0) + 1
 
     def rate(self, array_id: str) -> Optional[float]:
-        """``array_id``'s MB/s, or None while it has too few samples to have one."""
+        """``array_id``'s MB/s, or None if it has never been read at full resolution."""
         with self._lock:
-            if self._counts.get(array_id, 0) < _MIN_SAMPLES:
-                return None
             return self._rates.get(array_id)
 
     def retention_for_array(self, array_id: str) -> RetentionClass:
         """Classify a full-resolution chunk of ``array_id`` by measured cost.
 
         "cheap" only ever *widens* what eviction may take: an array with no
-        rate, too few samples, or a rate under the threshold keeps the declared
-        answer, which is what every full-resolution chunk got before this
-        existed.
+        rate yet, or a rate under the threshold, keeps the declared answer,
+        which is what every full-resolution chunk got before this existed.
         """
         if self.cheap_mbps <= 0.0:
             return "normal"

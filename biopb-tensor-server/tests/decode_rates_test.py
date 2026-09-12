@@ -19,7 +19,6 @@ from biopb_tensor_server.cache.manager import DECODE_RATES_FILE
 from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.retention import (
-    _MIN_SAMPLES,
     DecodeRates,
     active_decode_rates,
     set_active_decode_rates,
@@ -38,8 +37,12 @@ def restore_active_rates():
     set_active_decode_rates(previous)
 
 
-def _converge(rates, array_id, mbps, samples=_MIN_SAMPLES):
-    """Feed ``samples`` identical reads, so the EMA sits exactly on ``mbps``."""
+def _converge(rates, array_id, mbps, samples=1):
+    """Feed ``samples`` identical reads, so the EMA sits exactly on ``mbps``.
+
+    One is enough: the first sample sets the EMA directly (there is no prior
+    value to blend against).
+    """
     for _ in range(samples):
         rates.record(array_id, CHUNK, CHUNK / 1e6 / mbps)
 
@@ -62,12 +65,17 @@ class TestTheStatistic:
 
         assert rates.rate("src") == pytest.approx(100.0, rel=0.05)
 
-    def test_too_few_samples_is_no_rate(self):
-        """An EMA is meaningless on its first sample and noisy just after."""
+    def test_one_sample_is_already_a_rate(self):
+        """No warmup gate: the first read is a real, if noisy, measurement."""
         rates = DecodeRates()
-        _converge(rates, "src", 800.0, samples=_MIN_SAMPLES - 1)
+        rates.record("src", CHUNK, CHUNK / 1e6 / 800.0)
 
-        assert rates.rate("src") is None
+        assert rates.rate("src") == pytest.approx(800.0)
+
+    def test_an_unread_array_has_no_rate(self):
+        rates = DecodeRates()
+
+        assert rates.rate("never-read") is None
 
     def test_a_small_read_is_a_sample_like_any_other(self):
         """A small chunk's MB/s is mostly per-call cost -- the re-mmap in
@@ -78,8 +86,7 @@ class TestTheStatistic:
         cache."""
         tiny = 64 << 10
         rates = DecodeRates(cheap_mbps=100.0)
-        for _ in range(_MIN_SAMPLES):
-            rates.record("tiny", tiny, tiny / 1e6 / 1024)  # 64 KiB at 1024 MB/s
+        rates.record("tiny", tiny, tiny / 1e6 / 1024)  # 64 KiB at 1024 MB/s
 
         assert rates.rate("tiny") == pytest.approx(1024.0)
         assert rates.retention_for_array("tiny") == "cheap"
@@ -99,8 +106,7 @@ class TestTheStatistic:
         """The only read dropped: a duration the clock could not resolve cannot
         be divided by."""
         rates = DecodeRates()
-        for _ in range(_MIN_SAMPLES * 2):
-            rates.record("src", CHUNK, 0.0)
+        rates.record("src", CHUNK, 0.0)
 
         assert rates.rate("src") is None
 
