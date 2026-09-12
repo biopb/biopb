@@ -14,6 +14,7 @@ import {
   selectRoisTruncated,
   selectDraft,
   selectSelectedRoi,
+  selectContrastTrack,
   selectObservedLimits,
   selectTileInfo,
   useAppStore,
@@ -209,6 +210,48 @@ describe("the levels the data has shown", () => {
     // The viewers publish this from a memo on every render; a fresh identity
     // each time would loop through the effect that writes it.
     expect(useAppStore.getState().observedLimits).toBe(before);
+  });
+});
+
+describe("the contrast track", () => {
+  it("hides a track published for another tensor", () => {
+    // The reason it is guarded rather than reset: a viewer that errored out
+    // after publishing leaves its track behind, and a stale one would draw the
+    // panel's bar on the previous tensor's grey levels.
+    useAppStore.getState().setContrastTrack([0, 4000], "first");
+    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+
+    expect(selectContrastTrack(useAppStore.getState())).toBeNull();
+  });
+
+  it("hands the panel the track the viewer derived", () => {
+    // The whole point of publishing it (biopb/biopb#955): one deriver, so the
+    // bar cannot be drawn on a track the shader is not clamping into.
+    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
+    useAppStore.getState().setContrastTrack([12.5, 4000], "first");
+
+    expect(selectContrastTrack(useAppStore.getState())).toEqual([12.5, 4000]);
+  });
+
+  it("does not write when the track is unchanged", () => {
+    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
+    useAppStore.getState().setContrastTrack([0, 4000], "first");
+    const before = useAppStore.getState().contrastTrack;
+    useAppStore.getState().setContrastTrack([0, 4000], "first");
+
+    // The viewer derives this in a memo on every render; a fresh identity each
+    // time would loop through the effect that publishes it.
+    expect(useAppStore.getState().contrastTrack).toBe(before);
+  });
+
+  it("writes an equal track published for a different tensor", () => {
+    // Two tensors can share a dtype and so a track. The id has to move anyway,
+    // or the selector would go on hiding it.
+    useAppStore.getState().setContrastTrack([0, 65535], "first");
+    useAppStore.getState().setContrastTrack([0, 65535], "second");
+    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+
+    expect(selectContrastTrack(useAppStore.getState())).toEqual([0, 65535]);
   });
 });
 

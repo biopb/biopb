@@ -277,6 +277,25 @@ export interface AppState {
   observedLimits: Record<number, [number, number]>;
   observedLimitsFor: string | null;
   /**
+   * The track a contrast window is chosen on -- the dtype's own range, or on a
+   * float tensor the levels the data has shown -- published by whichever viewer
+   * is mounted.
+   *
+   * Published rather than re-derived by the panel (biopb/biopb#955). The
+   * derivation takes the viewer's *local* plane limits, which reach this store
+   * one effect later, so a panel deriving its own drew the bar on a different
+   * track than the shader was clamping into for a render after every plane
+   * change. Publishing makes the viewer the single deriver, which is what the
+   * viewer already is for `appliedLimits`.
+   *
+   * Null while no viewer is mounted -- a WebGL failure, an unsupported tensor,
+   * the lazy chunk still loading. The panel falls back to the dtype's own range
+   * there; see `selectContrastTrack`.
+   */
+  contrastTrack: [number, number] | null;
+  /** The `array_id` the track above was derived for. See `selectContrastTrack`. */
+  contrastTrackFor: string | null;
+  /**
    * Whether what is on the canvas is the slice that was last asked for.
    *
    * Published by whichever viewer is mounted. Play reads it to pace itself to
@@ -355,6 +374,7 @@ export interface AppState {
   setPlayAxis: (key: string | null) => void;
   setAppliedLimits: (value: [number, number]) => void;
   setPlaneLimits: (value: [number, number]) => void;
+  setContrastTrack: (value: [number, number], forArrayId: string) => void;
   noteObservedLimits: (
     value: [number, number],
     forArrayId: string,
@@ -459,6 +479,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   planeLimits: null,
   observedLimits: {},
   observedLimitsFor: null,
+  contrastTrack: null,
+  contrastTrackFor: null,
 
   showAdvancedOptions: false,
   render3d: false,
@@ -574,6 +596,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       s.planeLimits && s.planeLimits[0] === value[0] && s.planeLimits[1] === value[1]
         ? s
         : { planeLimits: value },
+    );
+  },
+
+  setContrastTrack(value, forArrayId) {
+    // Compared by content for the reason `setAppliedLimits` is: the viewer
+    // recomputes the track every render and a fresh identity each time would
+    // loop through its effect.
+    set((s) =>
+      s.contrastTrackFor === forArrayId &&
+      s.contrastTrack &&
+      s.contrastTrack[0] === value[0] &&
+      s.contrastTrack[1] === value[1]
+        ? s
+        : { contrastTrack: value, contrastTrackFor: forArrayId },
     );
   },
 
@@ -1070,6 +1106,21 @@ export function selectTileInfo(s: AppState): TileInfo | null {
 export function selectObservedLimits(s: AppState): [number, number] | null {
   if (s.observedLimitsFor !== currentArrayId(s)) return null;
   return s.observedLimits[s.slice.c] ?? null;
+}
+
+/**
+ * The published contrast track, or null when none belongs to the tensor in view.
+ *
+ * Guarded rather than reset, for the reason `selectObservedLimits` is: a viewer
+ * that errored out after publishing leaves its track behind, and
+ * `applyViewerState` changes the tensor without passing through `selectSource`
+ * at all. A caller treats null as "derive the dtype's own range" -- which is
+ * exact for every dtype that has one, and the only honest answer for a float
+ * tensor nothing has read yet.
+ */
+export function selectContrastTrack(s: AppState): [number, number] | null {
+  if (s.contrastTrackFor !== currentArrayId(s)) return null;
+  return s.contrastTrack;
 }
 
 // --- ROI annotations -------------------------------------------------------

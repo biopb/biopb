@@ -36,7 +36,6 @@ import {
   selectBroadcastAxes,
   selectDraft,
   selectHiddenSets,
-  selectObservedLimits,
   selectRois,
   selectSelectedRoiId,
   useAppStore,
@@ -64,13 +63,10 @@ import {
 } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
+import { useContrastWindow } from "../hooks/useContrastWindow";
 import {
   clampGamma,
-  clampContrastLimits,
-  contrastLimitsFrom,
   contrastSamples,
-  contrastTrack,
-  percentileBounds,
   samplesPerPixel,
   tileCacheSize,
   vivColor,
@@ -368,52 +364,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     };
   }, [loaded, selection, selectionKey]);
 
-  // The plane's own extremes, which the window no longer reports once it is
-  // fixed. Deliberately not keyed to the current selection: the last plane
-  // sampled is what Min/Max should reset onto, and holding it across a read
-  // keeps the button from going dead for the length of one.
-  const planeLimits = useMemo(() => samples ? contrastLimitsFrom(samples.values, 0, 100) : null, [samples]);
-  const setPlaneLimits = useAppStore((s) => s.setPlaneLimits);
-  const noteObservedLimits = useAppStore((s) => s.noteObservedLimits);
-  useEffect(() => {
-    if (!planeLimits) return;
-    setPlaneLimits(planeLimits);
-    noteObservedLimits(planeLimits, arrayId, slice.c);
-  }, [planeLimits, arrayId, slice.c, setPlaneLimits, noteObservedLimits]);
-  // Every level the tensor has shown, which is what a float track is drawn on:
-  // a window fixed against a bright plane has to stay reachable from a dim one.
-  const observedLimits = useAppStore(selectObservedLimits);
-
-  const contrastLimits = useMemo<[number, number]>(() => {
-    if (!info) return [0, 1];
-    const dtype = vivDtype(info.dtype);
-    // `planeLimits` as well as the union: on a tensor's first plane the union
-    // has not been written back to the store yet.
-    const range = contrastTrack(dtype, observedLimits, planeLimits, slice.fixedLimits);
-    // A fixed window is the user's, not the plane's: it is not re-derived per
-    // plane, only brought inside the track it is being applied to -- the
-    // dtype's range, or on a float tensor the levels the data has shown.
-    if (slice.contrastMode === "fixed") {
-      return slice.fixedLimits ? clampContrastLimits(slice.fixedLimits, range, dtype) : range;
-    }
-    if (!samples) return range;
-    const [lo, hi] = percentileBounds(slice.percentileScale);
-    return contrastLimitsFrom(samples.values, lo, hi);
-  }, [
-    info,
-    observedLimits,
-    planeLimits,
-    samples,
-    slice.contrastMode,
-    slice.fixedLimits,
-    slice.percentileScale,
-  ]);
-
-  // Published so the panel can seed a fixed window from what is on screen.
-  const setAppliedLimits = useAppStore((s) => s.setAppliedLimits);
-  useEffect(() => {
-    setAppliedLimits(contrastLimits);
-  }, [contrastLimits, setAppliedLimits]);
+  // Not only a derivation: this also publishes the plane limits, the track and
+  // the applied window that SliceControls reads.
+  const contrastLimits = useContrastWindow(info, samples?.values ?? null, arrayId, slice);
 
   // Never trusted straight from the store: a persisted or hand-edited value of 0
   // or below is a uniform white plane, not a dim one.
