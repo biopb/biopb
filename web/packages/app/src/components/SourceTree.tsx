@@ -524,6 +524,28 @@ export function SourceTree() {
     });
   }, []);
 
+  /**
+   * Selecting from "Recent", which must leave the catalog exactly where it is.
+   *
+   * The reveal effect above keys on `activeSourceId` alone and so cannot tell a
+   * catalog click from a shortcut; without this, picking a row near the top of
+   * the pane expands a folder chain further down and scrolls the tree to it --
+   * a jump to somewhere the reader did not click. Recording the origin here is
+   * what the effect cannot work out for itself.
+   *
+   * Marking it *revealed* rather than adding a flag to skip: the two say the
+   * same thing (this selection needs no reveal) and the latch already means
+   * "shown", so a later catalog poll does not reopen the question either. A
+   * catalog click and a shared link leave it unlatched and still reveal.
+   */
+  const selectFromRecent = useCallback(
+    (sourceId: string, tensorId?: string) => {
+      revealed.current = sourceId;
+      selectSource(sourceId, tensorId);
+    },
+    [selectSource],
+  );
+
   return (
     <section style={{ display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
       <div style={{ padding: "0.5rem 1rem" }}>
@@ -555,7 +577,7 @@ export function SourceTree() {
                 activeTensorId={activeTensorId}
                 expandedFolders={expandedFolders}
                 toggleFolder={toggleFolder}
-                selectSource={selectSource}
+                selectSource={selectFromRecent}
               />
             )}
             {/* The empty notice is about the catalog, so it is suppressed while
