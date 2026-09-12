@@ -1456,7 +1456,7 @@ class MetadataDatabase:
         return parsed if isinstance(parsed, dict) else None
 
     def list_source_descriptors(
-        self, limit: Optional[int] = None
+        self, limit: Optional[int] = None, source_id: Optional[str] = None
     ) -> Tuple[List[DataSourceDescriptor], int]:
         """Rebuild the lean ListFlights descriptors from the catalog.
 
@@ -1485,19 +1485,30 @@ class MetadataDatabase:
         Args:
             limit: Max rows to return (the ListFlights safety cap). ``None`` =
                 no cap.
+            source_id: Restrict to this one source. ``None`` = the whole
+                catalog. A filtered read answers an *address*, so ``total``
+                counts the matching rows (0 or 1) rather than the catalog --
+                which is what makes a single-source lookup incapable of
+                reporting truncation, since one row is never clipped by a cap.
 
         Returns:
-            ``(descriptors, total)`` where ``total`` is the full catalog row
-            count (so the caller can signal truncation when ``limit`` clips it).
+            ``(descriptors, total)`` where ``total`` is the row count matching
+            the filter before ``limit`` (so the caller can signal truncation
+            when ``limit`` clips it).
         """
         cursor = self._get_cursor()
+
+        params: list = []
+        where = ""
+        if source_id is not None:
+            where = " WHERE source_id = ?"
+            params.append(source_id)
 
         sql = (
             "SELECT source_id, source_url, source_type, data_resident, tensors, "
             "COUNT(*) OVER () AS total_count "
-            "FROM sources ORDER BY source_id"
+            f"FROM sources{where} ORDER BY source_id"
         )
-        params: list = []
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)

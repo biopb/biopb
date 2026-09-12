@@ -5,7 +5,13 @@ scene-switching fallback raises) must not abort the whole listing — it should 
 skipped while the remaining healthy sources are still returned.
 """
 
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+import pyarrow.flight as flight
+import pytest
+from biopb.tensor.descriptor_pb2 import (
+    DataSourceDescriptor,
+    TensorCriteria,
+    TensorDescriptor,
+)
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -170,3 +176,126 @@ def test_list_flights_catalog_truncation_signaled():
     assert meta[b"truncated"] == b"True"
     # Deterministic order: first two source_ids.
     assert [_command_source_id(i) for i in infos] == ["a", "b"]
+
+
+class _TokenedAdapter(_HealthyAdapter):
+    """A source readable only by a caller presenting its capability token.
+
+    These exist only on servers built without a metadata DB (the embedded
+    image-base result cache), which is why the adapter path is the one that has
+    to keep them hidden.
+    """
+
+    capability_token = "secret"
+
+
+class TestAddressedByCriteria:
+    """ListFlights narrowed to one source_id.
+
+    The addressed form of a browse: the catalog is asked a WHERE instead of
+    being streamed whole for the caller to search it. What it must NOT do is
+    widen what is visible -- naming a source is not authority to see one the
+    listing would decline.
+    """
+
+    @staticmethod
+    def _for(source_id):
+        return TensorCriteria(source_id=source_id).SerializeToString()
+
+    def test_criteria_narrows_the_catalog_to_one_row(self):
+        db = MetadataDatabase()
+        for sid in ("a", "b", "c"):
+            db.sync_source_added(sid, _CatalogAdapter(sid))
+        server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+
+        infos = list(server.list_flights(None, self._for("b")))
+
+        assert [_command_source_id(i) for i in infos] == ["b"]
+
+    def test_empty_criteria_is_still_the_whole_listing(self):
+        # What every client predating the field sends, and what the pyarrow
+        # default sends. It must keep meaning "everything".
+        db = MetadataDatabase()
+        for sid in ("a", "b"):
+            db.sync_source_added(sid, _CatalogAdapter(sid))
+        server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+
+        assert len(list(server.list_flights(None, b""))) == 2
+
+    def test_an_unknown_id_lists_nothing(self):
+        db = MetadataDatabase()
+        db.sync_source_added("a", _CatalogAdapter("a"))
+        server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+
+        assert list(server.list_flights(None, self._for("nope"))) == []
+
+    def test_a_source_past_the_cap_is_still_addressable(self):
+        # The bug this fixes. The cap bounds a browse; it was also silently
+        # bounding lookup, so a perfectly readable source answered "not found"
+        # purely because of where it sorted.
+        db = MetadataDatabase()
+        for sid in ("a", "b", "c"):
+            db.sync_source_added(sid, _CatalogAdapter(sid))
+        server = TensorFlightServer(
+            location="grpc://localhost:0", metadata_db=db, max_list_flights_results=2
+        )
+
+        browsed = {_command_source_id(i) for i in server.list_flights(None, b"")}
+        assert "c" not in browsed
+
+        addressed = list(server.list_flights(None, self._for("c")))
+        assert [_command_source_id(i) for i in addressed] == ["c"]
+
+    def test_a_filtered_answer_is_never_reported_as_truncated(self):
+        # `total` counts what matched, not the catalog, so one row out of many
+        # is a complete answer rather than a clipped listing.
+        db = MetadataDatabase()
+        for sid in ("a", "b", "c"):
+            db.sync_source_added(sid, _CatalogAdapter(sid))
+        server = TensorFlightServer(
+            location="grpc://localhost:0", metadata_db=db, max_list_flights_results=2
+        )
+
+        info = next(iter(server.list_flights(None, self._for("a"))))
+
+        assert info.schema.metadata[b"truncated"] == b"False"
+        assert info.schema.metadata[b"total_sources"] == b"1"
+
+    def test_criteria_narrows_the_adapter_path_too(self):
+        server = TensorFlightServer(location="grpc://localhost:0")
+        server.sources.replace(
+            {"one": _HealthyAdapter("one"), "two": _HealthyAdapter("two")}
+        )
+
+        infos = list(server.list_flights(None, self._for("two")))
+
+        assert [_command_source_id(i) for i in infos] == ["two"]
+
+    def test_naming_a_tokened_source_does_not_reveal_it(self):
+        # The whole point of excluding them from enumeration is that knowing the
+        # id is not enough. A filter that skipped the token check would hand
+        # that back.
+        server = TensorFlightServer(location="grpc://localhost:0")
+        server.sources.replace({"secret-src": _TokenedAdapter("secret-src")})
+
+        assert list(server.list_flights(None, self._for("secret-src"))) == []
+
+    def test_unparseable_criteria_is_refused_not_ignored(self):
+        # Dropping a filter it could not read would answer "give me one source"
+        # with the entire catalog, and look like it worked.
+        db = MetadataDatabase()
+        db.sync_source_added("a", _CatalogAdapter("a"))
+        server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+
+        with pytest.raises(flight.FlightServerError, match="TensorCriteria"):
+            list(server.list_flights(None, b"\xff\xff\xff\xff"))
+
+    def test_an_id_with_sql_in_it_is_data_not_syntax(self):
+        # source_ids are partly caller-supplied (a drag-dropped path becomes
+        # one), so the filter is bound as a parameter rather than interpolated.
+        db = MetadataDatabase()
+        db.sync_source_added("a", _CatalogAdapter("a"))
+        server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+
+        assert list(server.list_flights(None, self._for("' OR 1=1 --"))) == []
+        assert len(list(server.list_flights(None, b""))) == 1

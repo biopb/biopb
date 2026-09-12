@@ -117,6 +117,12 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     src = src_desc or _make_source_desc()
 
     mc.list_sources.return_value = {src.source_id: src}
+    # The addressed counterpart, which answers None rather than raising for an
+    # id nothing holds -- a MagicMock's default truthy return would otherwise
+    # turn every "source not found" test into a 200.
+    mc.get_source.side_effect = lambda source_id: (
+        src if source_id == src.source_id else None
+    )
 
     def get_descriptor(array_id, **_kwargs):
         """What GetFlightInfo actually does, including the parts that bite.
@@ -3267,3 +3273,66 @@ class TestVolumeStaysWithinTheBudget:
         )
         assert reason is None
         assert self._voxels(plan) <= self.BUDGET
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestSingleSourceIsNotCappedByTheListing:
+    """A source past ``max_list_flights_results`` is unbrowsable but readable.
+
+    Real Flight server, real sidecar. `/api/sources/{id}` used to look the id up
+    in the listing, so it inherited the browse cap and answered 404 for a source
+    that reads perfectly well -- purely because of where the id sorted.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+        # Cap of 1 against 3 sources: "c" sorts last, so it is the one clipped.
+        server = TensorFlightServer("grpc://127.0.0.1:0", max_list_flights_results=1)
+        for sid in ("a", "b", "c"):
+            z = zarr.open_array(
+                str(tmp_path / f"{sid}.zarr"),
+                mode="w",
+                shape=(8, 8),
+                chunks=(8, 8),
+                dtype="uint16",
+            )
+            z[:] = 7
+            server.register_source(sid, ZarrAdapter(z, sid, ["y", "x"]))
+
+        t = threading.Thread(target=server.serve, daemon=True)
+        t.start()
+        time.sleep(0.5)
+
+        self._server = server
+        self._loc = f"grpc://localhost:{server.port}"
+        yield
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+    def _tc(self):
+        return TestClient(
+            create_app(flight_location=self._loc, token=_TOKEN),
+            raise_server_exceptions=True,
+        )
+
+    def test_the_listing_is_still_capped(self):
+        with self._tc() as tc:
+            r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.status_code == 200
+        assert [s["source_id"] for s in r.json()] == ["a"]
+
+    def test_the_clipped_source_still_answers_by_id(self):
+        with self._tc() as tc:
+            r = tc.get("/api/sources/c", headers=_bearer(_TOKEN))
+        assert r.status_code == 200
+        assert r.json()["source_id"] == "c"
+
+    def test_an_id_nothing_holds_is_still_a_404(self):
+        with self._tc() as tc:
+            r = tc.get("/api/sources/nope", headers=_bearer(_TOKEN))
+        assert r.status_code == 404

@@ -39,11 +39,13 @@ from biopb.tensor.descriptor_pb2 import (
     RemoveSourceResult,
     ResolveProgress,
     ResolveStreamMessage,
+    TensorCriteria,
     TensorDescriptor,
     WarmProgress,
     WarmStreamMessage,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
+from google.protobuf.message import DecodeError
 
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.core.activity import ActivityTracker
@@ -1163,19 +1165,47 @@ class TensorFlightServer(flight.FlightServerBase):
         embedded/test server built without a DB (``metadata_db=None``) falls back
         to iterating adapters.
 
+        A ``TensorCriteria`` naming a ``source_id`` narrows this to that one
+        source. That is addressing, not browsing: it asks the catalog a WHERE
+        instead of reading it whole so the caller can discard all but one row,
+        and it widens nothing -- a source this listing would not show is still
+        not shown, on either path.
+
         Args:
             context: Server call context
-            criteria: Unused criteria bytes
+            criteria: serialized ``TensorCriteria``; empty = no filter, which is
+                what every client before the field sent.
 
         Yields:
             FlightInfo for each registered data source (up to max_list_flights_results)
         """
+        source_id = self._criteria_source_id(criteria)
         if self._metadata_db is not None:
-            yield from self._list_flights_from_catalog()
+            yield from self._list_flights_from_catalog(source_id)
         else:
-            yield from self._list_flights_from_adapters()
+            yield from self._list_flights_from_adapters(source_id)
 
-    def _list_flights_from_catalog(self) -> Iterator[flight.FlightInfo]:
+    @staticmethod
+    def _criteria_source_id(criteria: bytes) -> Optional[str]:
+        """The one source ``criteria`` asks for, or None for the whole listing.
+
+        Unparseable criteria is refused rather than ignored: silently dropping a
+        filter answers a request for one source with the entire catalog, which
+        is the opposite of what was asked and looks like a working call.
+        """
+        if not criteria:
+            return None
+        try:
+            parsed = TensorCriteria.FromString(criteria)
+        except DecodeError as exc:
+            raise flight.FlightServerError(
+                f"ListFlights criteria is not a TensorCriteria: {exc}"
+            ) from exc
+        return parsed.source_id or None
+
+    def _list_flights_from_catalog(
+        self, source_id: Optional[str] = None
+    ) -> Iterator[flight.FlightInfo]:
         """Build ListFlights results from the DuckDB catalog (the default path).
 
         One SQL read replaces the per-adapter ``get_source_descriptor()`` calls.
@@ -1183,10 +1213,15 @@ class TensorFlightServer(flight.FlightServerBase):
         in the embedded image-base server, which runs with ``metadata_db=None``
         and therefore takes the adapter fallback instead -- so the DuckDB path
         has no tokened source to leak (biopb/biopb#265).
+
+        ``source_id`` narrows the SQL to one row. It reaches a source the
+        unfiltered read would have clipped at the cap, which is the point: the
+        cap bounds a *browse*, and an addressed lookup was never the thing it
+        was protecting against.
         """
         max_sources = self._max_list_flights_results
         descriptors, total_sources = self._metadata_db.list_source_descriptors(
-            limit=max_sources
+            limit=max_sources, source_id=source_id
         )
         returned_count = len(descriptors)
         truncated = total_sources > returned_count
@@ -1220,14 +1255,23 @@ class TensorFlightServer(flight.FlightServerBase):
                 total_bytes=-1,
             )
 
-    def _list_flights_from_adapters(self) -> Iterator[flight.FlightInfo]:
+    def _list_flights_from_adapters(
+        self, source_id: Optional[str] = None
+    ) -> Iterator[flight.FlightInfo]:
         """List sources by iterating adapters (fallback when no metadata DB).
 
         Used by embedded/test servers built with ``metadata_db=None`` (e.g. the
         image-base result-cache server). Honors per-source capability tokens by
         skipping token-protected sources from enumeration.
+
+        ``source_id`` narrows the snapshot to that one entry *before* the token
+        check, never around it: this is the path where tokened sources actually
+        live, and naming one must not be a way to read what enumerating it
+        would refuse.
         """
         source_items = self.sources.snapshot()
+        if source_id is not None:
+            source_items = [item for item in source_items if item[0] == source_id]
         total_sources = len(source_items)
         max_sources = self._max_list_flights_results
         returned_count = min(total_sources, max_sources)

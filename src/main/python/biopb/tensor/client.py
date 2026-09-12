@@ -259,6 +259,34 @@ class TensorFlightClient:
         """
         return self._catalog.list_sources()
 
+    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
+        """One source's ``DataSourceDescriptor`` by id, or ``None``.
+
+        The addressed form of :meth:`list_sources`: same descriptor, same
+        contract (structural ``tensors`` entries, empty ``chunk_shape`` --
+        biopb/biopb#812), but the server answers it with a single-row lookup
+        instead of streaming the catalog for the caller to search. Use this
+        whenever the id is already known; use ``list_sources`` to browse.
+
+        Because it does not go through the listing, it is **not** subject to
+        ``max_list_flights_results`` -- a source sitting past that cap has a
+        descriptor here even though it has no entry there.
+
+        It does not widen what is visible. A source the listing declines to
+        show -- one carrying a per-source capability token -- is declined here
+        too; knowing its id is not authority to read it.
+
+        Args:
+            source_id: The source's id, e.g. ``"zarr_a3f2"``. This is a *source*
+                id, not an array_id: pass the routing prefix, not
+                ``"aics_7f3/Image:0"``.
+
+        Returns:
+            The ``DataSourceDescriptor``, or ``None`` when nothing answers to
+            that id.
+        """
+        return self._catalog.get_source(source_id)
+
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Execute SQL query against server's source metadata database.
 
