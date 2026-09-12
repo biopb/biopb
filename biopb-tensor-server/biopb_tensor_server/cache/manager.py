@@ -25,6 +25,7 @@ from biopb_tensor_server.cache.memory_backend import (
     MemoryCacheConfig,
 )
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.retention import DecodeRates, set_active_decode_rates
 
 
 class CacheManager:
@@ -51,6 +52,13 @@ class CacheManager:
         # On the manager rather than the backend: the scaled read holds the
         # manager and nothing else of the config.
         self.source_scaled_reads = bool(config.source_scaled_reads)
+        # Installed before the backend so a chunk served during recovery is
+        # classified against the same table every later one is. The threshold
+        # comes from here because it is cache policy; the persistent store is
+        # attached later by the server, which is what holds the catalog (see
+        # core.retention).
+        self._rates = DecodeRates(config.cheap_decode_mbps)
+        set_active_decode_rates(self._rates)
         if config.backend == "memory":
             self._backend = MemoryCacheBackend(
                 MemoryCacheConfig(
@@ -252,5 +260,12 @@ class CacheManager:
         self._backend.release_process_lock()
 
     def close(self) -> None:
-        """Close manager."""
+        """Close manager, persisting the decode rates it measured.
+
+        Flushed here rather than left to the debounce so a clean shutdown keeps
+        the last minute of measurement. The table this manager installed, not
+        whatever is active now: a second manager (a test, a reconfigure) has
+        since replaced it.
+        """
+        self._rates.flush()
         self._backend.close()

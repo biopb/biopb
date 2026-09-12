@@ -9,23 +9,27 @@ Database Schema:
 - Shape summary column for quick size estimates
 - rois table: user-drawn ROI annotations, one row per ROI, anchored on the
   unversioned array_id (docs/roi-annotations.md)
+- decode_rates table: measured full-resolution decode throughput per array_id,
+  the input for cache.cheap_decode_mbps (core/retention.py)
 
 Persistence:
 - In memory by default. Given a store_path the connection is file-backed, which
-  is how annotations survive a restart -- they are the only rows here that no
-  rescan can reproduce.
+  is how annotations and decode rates survive a restart.
 - `sources` rides along because DuckDB has one database per connection and the
   sandbox below blocks ATTACH. It is truncated on open, and the rois table's
-  derived columns are recomputed there, so the file's only load-bearing content
-  is the annotations themselves.
+  derived columns are recomputed there.
+- The decode rates live here rather than beside the cache segments they describe
+  because the cache directory is the operator's to delete: clearing it should
+  cost the bytes, not the measurements that took a run to collect.
 
 Security Model:
 - DuckDB connection runs with enable_external_access=False, so all file/network
   access (read_csv, read_text, glob, COPY, ATTACH, extension loading) is blocked
   at the engine level. This is the primary defense against file exfiltration.
-- Only the 'sources' and 'rois' tables are accessible (keyword/table denylist;
-  defense in depth). 'rois' is readable here for analysis; every ROI write goes
-  through put_rois/delete_rois, never through this surface.
+- Only the 'sources', 'rois' and 'decode_rates' tables are accessible
+  (keyword/table denylist; defense in depth). 'rois' and 'decode_rates' are
+  readable here for analysis; every write goes through put_rois/delete_rois or
+  save_decode_rates, never through this surface.
 - Forbidden keywords: INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, EXECUTE
 - No subqueries referencing external tables
 - Query timeout enforced
@@ -54,6 +58,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -90,6 +95,28 @@ _OPEN_RETRY_SECONDS = 0.5
 # annotations are old enough to need carrying forward.
 _ROI_SCHEMA_VERSION = 1
 _ROI_MIGRATIONS: Dict[int, Callable[[duckdb.DuckDBPyConnection], None]] = {}
+
+# Shape of the `decode_rates` table. Bumping this DROPS the table rather than
+# migrating it: every row is re-measurable by reading, so a schema change costs
+# one warmup, where the migration ladder `rois` needs exists because nothing can
+# reproduce an annotation.
+_DECODE_RATES_SCHEMA_VERSION = 1
+
+_DECODE_RATES_DDL = """
+CREATE TABLE IF NOT EXISTS decode_rates (
+    -- The tensor whose full-resolution reads were timed, in the chunk_id's own
+    -- array_id form -- which is the native pyramid level's id where there is
+    -- one, so a compressed low level and a raw level 0 are separate rows.
+    array_id TEXT PRIMARY KEY,
+    -- EMA of MB/s over that tensor's full-resolution reads.
+    mbps DOUBLE NOT NULL,
+    -- How many reads are behind the EMA. Part of the answer, not bookkeeping:
+    -- a rate off two samples is still settling and should not be read as a
+    -- verdict on the format.
+    samples BIGINT NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+)
+"""
 
 # The `rois` DDL, module level because the schema self-check builds a throwaway
 # copy from it (_expected_roi_columns) rather than keeping a second hand-written
@@ -553,9 +580,12 @@ class MetadataDatabase:
     # ``rois`` when the annotation actions are off. ``rois`` is readable here
     # as an ANALYSIS affordance (count labels, join against sources, find
     # annotations overlapping a region); the viewer never composes SQL -- it
-    # calls list_rois(), which builds parameterized SQL itself. Writes stay off
-    # this surface entirely: FORBIDDEN_KEYWORDS still rejects INSERT/UPDATE/DELETE.
-    ALLOWED_TABLES: Set[str] = {"sources", "rois"}
+    # calls list_rois(), which builds parameterized SQL itself. ``decode_rates``
+    # is read the same way, and is the whole client surface for it -- there is
+    # no action, because a table an operator wants to sort and threshold is
+    # better asked in SQL than in a bespoke RPC. Writes stay off this surface
+    # entirely: FORBIDDEN_KEYWORDS still rejects INSERT/UPDATE/DELETE.
+    ALLOWED_TABLES: Set[str] = {"sources", "rois", "decode_rates"}
 
     # Pattern for detecting table references in SQL
     TABLE_REFERENCE_PATTERN = re.compile(
@@ -584,9 +614,9 @@ class MetadataDatabase:
         # through the SQL surface either. Empty rows would be the wrong answer:
         # the table is unserved, not unpopulated, and a query cannot tell those
         # apart from a result set.
-        self.allowed_tables: Set[str] = (
-            set(self.ALLOWED_TABLES) if annotations_enabled else {"sources"}
-        )
+        self.allowed_tables: Set[str] = set(self.ALLOWED_TABLES)
+        if not annotations_enabled:
+            self.allowed_tables.discard("rois")
 
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
         self._write_lock = threading.Lock()  # Lock for write operations only
@@ -707,13 +737,20 @@ class MetadataDatabase:
         raise AssertionError("unreachable")  # pragma: no cover
 
     @property
+    def store_path(self) -> Optional[Path]:
+        """The file backing this catalog, or None when it is in memory."""
+        return self._store_path
+
+    @property
     def annotations_persisted(self) -> bool:
         """Whether drawn ROIs reach a file, for ``health``.
 
-        False only when the server was asked for a session-only store: an open
-        failure is fatal, so there is no state where this is False by accident.
+        The catalog being file-backed is not enough: a server with the
+        annotation actions off holds one for `decode_rates` alone, and
+        answering True there would promise durability for rows it will not
+        accept in the first place.
         """
-        return self._store_path is not None
+        return self._store_path is not None and self._annotations_enabled
 
     def _get_cursor(self) -> duckdb.DuckDBPyConnection:
         """Get a cursor for thread-safe read operations.
@@ -814,7 +851,30 @@ class MetadataDatabase:
         conn.execute(
             "DELETE FROM rois WHERE starts_with(set_name, ?)", [RESERVED_SET_PREFIX]
         )
-        logger.debug("Created sources and rois tables and indexes")
+
+        # Measured decode throughput. Versioned like `rois` so an older file
+        # cannot silently present the wrong columns, but reconciled by dropping
+        # rather than migrating -- see _DECODE_RATES_SCHEMA_VERSION.
+        stored_version = conn.execute(
+            "SELECT value FROM catalog_meta WHERE key = 'decode_rates_schema_version'"
+        ).fetchone()
+        if stored_version is not None and stored_version[0] != str(
+            _DECODE_RATES_SCHEMA_VERSION
+        ):
+            logger.info(
+                "decode_rates schema %s != %s; dropping the measurements, which "
+                "the next run re-collects",
+                stored_version[0],
+                _DECODE_RATES_SCHEMA_VERSION,
+            )
+            conn.execute("DROP TABLE IF EXISTS decode_rates")
+        conn.execute(_DECODE_RATES_DDL)
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES "
+            "('decode_rates_schema_version', ?)",
+            [str(_DECODE_RATES_SCHEMA_VERSION)],
+        )
+        logger.debug("Created sources, rois and decode_rates tables and indexes")
 
     def _reconcile_roi_schema(
         self, conn: duckdb.DuckDBPyConnection, had_rois: bool
@@ -1959,6 +2019,45 @@ class MetadataDatabase:
 
         logger.debug("delete_rois: removed %s from %s", len(deleted), array_id)
         return deleted
+
+    def load_decode_rates(self) -> Dict[str, Tuple[float, int]]:
+        """Every persisted decode rate, as ``array_id -> (mbps, samples)``.
+
+        The rows of arrays this server no longer serves come back too. Dropping
+        them here would cost the measurement of a source that is merely offline
+        -- an unmounted share, a folder not yet rescanned -- and a stale row is
+        harmless: it is only ever consulted by array_id, which nothing asks for
+        unless the array is being read.
+        """
+        cursor = self._get_cursor()
+        rows = cursor.execute(
+            "SELECT array_id, mbps, samples FROM decode_rates"
+        ).fetchall()
+        return {row[0]: (float(row[1]), int(row[2])) for row in rows}
+
+    def save_decode_rates(self, rows: Mapping[str, Tuple[float, int]]) -> None:
+        """Upsert measured rates, stamping every row written as observed now.
+
+        Raises like any other write here; the read path's caller
+        (:meth:`DecodeRates.flush`) is where a failure is decided to be
+        survivable, because that is where the cost of raising is a failed read.
+        """
+        if not rows:
+            return
+        now = datetime.now()
+        payload = [
+            (array_id, float(mbps), int(samples), now)
+            for array_id, (mbps, samples) in rows.items()
+        ]
+        # Connection first, lock second: _get_connection takes _write_lock to
+        # build one, and it is not reentrant.
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.executemany(
+                "INSERT OR REPLACE INTO decode_rates "
+                "(array_id, mbps, samples, updated_at) VALUES (?, ?, ?, ?)",
+                payload,
+            )
 
     def close(self) -> None:
         """Close the DuckDB connection."""

@@ -55,8 +55,8 @@ from biopb_tensor_server.core.adapter_base import (
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
+    array_id_from_chunk_id,
     cache_key_for_chunk_id,
-    decode_chunk_id,
     encode_chunk_id,
     encode_proxy_envelope,
     is_proxy_envelope,
@@ -300,6 +300,12 @@ class RemoteTensorAdapter(TensorAdapter):
     # replacing those labels in place on every reconcile; an upstream that later
     # upgraded to canonical order would then be re-permuted into the wrong one.
     _normalizable_axes = False
+
+    # A miss here is an upstream round trip plus load on someone else's server,
+    # none of which the local hand-off contains. Measured, a LAN upstream clocks
+    # as fast and is evicted first -- backwards, since it is the one source whose
+    # rebuild leaves this machine.
+    _decode_time_is_rebuild_cost = False
 
     def __init__(
         self,
@@ -895,7 +901,7 @@ class RemoteTensorAdapter(TensorAdapter):
                 # do_get back to the right local tensor view. The upstream's
                 # content_version rides the envelope so the proxy cache namespaces
                 # by upstream content.
-                upstream_aid, _ = decode_chunk_id(ticket.chunk_id)
+                upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
                     ticket.chunk_id,
                     self._to_local_array_id(upstream_aid),

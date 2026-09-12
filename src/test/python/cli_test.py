@@ -744,3 +744,58 @@ class TestPruneAnnotations:
     def test_days_is_required(self):
         result = runner.invoke(app, ["prune-annotations"])
         assert result.exit_code != 0
+
+
+class TestDecodeRatesCommand:
+    """A preset over the catalog's `decode_rates` table. There is no action
+    behind it -- the server surface is SQL, so the command is a query."""
+
+    _ROWS = [
+        {
+            "array_id": "fast/0",
+            "mbps": 1400.0,
+            "samples": 40,
+            "updated_at": datetime(2026, 9, 12, 10, 30),
+        },
+        {
+            "array_id": "slow/0",
+            "mbps": 90.0,
+            "samples": 12,
+            "updated_at": datetime(2026, 8, 1, 9, 0),
+        },
+    ]
+
+    def _run(self, *args, rows=None):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = MagicMock()
+            client.query_sources.return_value = self._ROWS if rows is None else rows
+            mock_fc_class.return_value = client
+            result = runner.invoke(app, ["decode-rates", *args])
+        return result, mock_fc_class, client
+
+    def test_it_reads_the_table_ordered_by_rate(self):
+        # The threshold is read off the top of the spread, so the ordering is
+        # the server's, not a client-side sort of whatever arrived.
+        result, _, client = self._run()
+        assert result.exit_code == 0, result.output
+        sql = client.query_sources.call_args.args[0]
+        assert "FROM decode_rates" in sql
+        assert "ORDER BY mbps DESC" in sql
+        client.close.assert_called_once()
+
+    def test_json_emits_the_rows(self):
+        result, _, _ = self._run("--json")
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload[0]["samples"] == 40
+
+    def test_nothing_measured_is_not_an_error(self):
+        # A server that has only served downsampled reads measures nothing, by
+        # design -- unlike cache-stats, an empty answer here is a normal state.
+        result, _, _ = self._run(rows=[])
+        assert result.exit_code == 0
+        assert "No decode measurements yet" in result.stdout
+
+    def test_it_asks_for_no_client_side_cache(self):
+        _, mock_fc_class, _ = self._run()
+        assert mock_fc_class.call_args.kwargs["cache_bytes"] == 0

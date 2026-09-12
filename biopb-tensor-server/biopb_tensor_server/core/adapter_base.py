@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import (
@@ -46,6 +47,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.cache_source import cache_sourced_units
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
+    array_id_from_chunk_id,
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
@@ -77,6 +79,8 @@ from biopb_tensor_server.core.errors import (
 )
 from biopb_tensor_server.core.retention import (
     computed_ladder,
+    record_decode,
+    retention_for_array,
     retention_for_scale,
 )
 from biopb_tensor_server.core.stream_reduce import (
@@ -695,6 +699,28 @@ class TensorAdapter(SourceAdapter):
     on ``SourceAdapter``.
     """
 
+    # Whether timing ``get_data`` measures what re-producing the chunk would
+    # cost -- the premise the measured retention rule rests on, since "cheap"
+    # means "cheap to rebuild" (see ``core.retention``). True wherever the
+    # adapter decodes its own bytes from a backend it can read again.
+    #
+    # False for the two kinds that would be measured wrong rather than not at
+    # all, in opposite directions. An upload has no backend: its cache entry is
+    # the only copy, so a local read times a memcpy out of the very cache being
+    # classified and a "cheap" stamp is data loss. A passthrough proxy has one,
+    # but a miss costs an upstream round trip that the local hand-off does not
+    # contain, so timing it clocks a LAN upstream as fast and evicts it first.
+    # Both are declined here rather than measured and ignored: a rate nobody may
+    # act on is a diagnostic that reads as fact.
+    #
+    # Both also override ``resolve_chunk_data`` today and so never reach the
+    # sample site, which is what makes this a guard rather than a live switch.
+    # It is declared because that structural exemption is invisible from either
+    # adapter -- neither file mentions retention -- so narrowing an override
+    # (biopb/biopb#265, to serve a cache source's scaled reads from the chunks
+    # it already holds) would otherwise enrol it silently.
+    _decode_time_is_rebuild_cost: bool = True
+
     @abstractmethod
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return the full **serving** descriptor for this bound tensor.
@@ -1092,21 +1118,36 @@ class TensorAdapter(SourceAdapter):
 
         return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
 
-    def _retention_for_chunk(self, chunk_id: bytes) -> RetentionClass:
+    def _retention_for_chunk(
+        self, chunk_id: bytes, *, array_id: Optional[str] = None
+    ) -> RetentionClass:
         """What a miss for this chunk would cost (see ``cache.RetentionClass``).
 
-        A property of the chunk, not of the caller that stored it: the class is
-        written into a cache segment, so a first writer would otherwise fix it
-        for good. ``core.retention`` owns the decision and the ladder config.
+        Never a property of the caller that stored it: the class is written into
+        a cache segment, so a first writer would otherwise fix it for good. A
+        scaled chunk answers from the chunk_id alone; an unscaled one from what
+        its array has been measured to decode at, which is shared process state
+        for the same reason. ``core.retention`` owns both decisions.
 
-        Unscaled returns before the ladder is built, so a source nobody reads a
-        scaled chunk from never pays for one. The ladder is memoized because
-        this runs per chunk and a miss builds a descriptor; unkeyed, because a
-        tensor's shape cannot change under one adapter and the config is
-        installed once at server start.
+        ``array_id``, if the caller already decoded it, saves re-parsing the
+        chunk_id's prefix on the unscaled arm -- ``resolve_chunk_data`` always
+        has, since it needs it for ``compute_fn`` regardless.
+
+        Unscaled answers from the measured table and returns before the ladder
+        is built, so a source nobody reads a scaled chunk from never pays for
+        one. The ladder is memoized because this runs per chunk and a miss
+        builds a descriptor; unkeyed, because a tensor's shape cannot change
+        under one adapter and the config is installed once at server start.
         """
         if not is_scaled_chunk(chunk_id):
-            return "normal"  # full resolution, or a native level's own store
+            # Full resolution, or a native level's own store -- either way the
+            # ladder has nothing to say about it, and only what it costs to
+            # decode can separate one worth keeping from one worth dropping.
+            if not self._decode_time_is_rebuild_cost:
+                return "normal"
+            if array_id is None:
+                array_id = array_id_from_chunk_id(chunk_id)
+            return retention_for_array(array_id)
         ladder = getattr(self, "_ladder_cache", None)
         if ladder is None:
             desc = self.get_tensor_descriptor()
@@ -1124,11 +1165,14 @@ class TensorAdapter(SourceAdapter):
         Scaled chunks are always cacheable when a CacheManager is available.
         With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
 
-        What a stored chunk costs to produce again is declared from the chunk
-        (:meth:`_retention_for_chunk`) rather than measured: a scaled build's
-        cost is a full-resolution read plus a reduction, over an extent the
-        cache may or may not already hold, so timing it would measure the
-        cache's own state and then decide what the cache keeps by it.
+        What a stored chunk costs to produce again (:meth:`_retention_for_chunk`)
+        is declared from the chunk when it is scaled, and measured when it is
+        not. Only the unscaled arm below is timed: a scaled build is a
+        full-resolution read plus a reduction, over an extent the cache may or
+        may not already hold, so timing it would measure the cache's own state
+        and then decide what the cache keeps by it. The unscaled arm cannot be
+        served from the cache -- reaching it means the entry was missing -- so
+        it is the one honest sample of what this array costs to decode.
 
         Raises:
             StaleChunkError: chunk_id carries a content_version that no longer
@@ -1167,7 +1211,18 @@ class TensorAdapter(SourceAdapter):
                     cache_manager,
                 )
             else:
+                # The one read that is always a real decode: a scaled read may
+                # be sourced from the cache (#965) and would time the cache's
+                # own state instead. Measured here rather than inside
+                # ``get_data`` so no adapter has to cooperate, and so a
+                # delegating wrapper's transpose -- a view, materialized after
+                # this returns -- stays out of the number.
+                started = time.perf_counter()
                 result_arr = self.get_data(bounds)
+                if self._decode_time_is_rebuild_cost:
+                    record_decode(
+                        array_id, result_arr.nbytes, time.perf_counter() - started
+                    )
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
             # string, wrapped zero-copy. This preserves the exact dtype including
@@ -1183,7 +1238,9 @@ class TensorAdapter(SourceAdapter):
             # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
-                cache_key, compute_fn, self._retention_for_chunk(chunk_id)
+                cache_key,
+                compute_fn,
+                self._retention_for_chunk(chunk_id, array_id=array_id),
             )
             data = entry.data
             cache_manager.release(cache_key)

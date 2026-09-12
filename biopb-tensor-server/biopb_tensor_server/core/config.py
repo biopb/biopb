@@ -220,6 +220,10 @@ _CONSTRAINTS = {
         "memory_max_bytes": _Range(min=1),
         "file_max_segment_bytes": _Range(min=1),
         "file_max_total_bytes": _Range(min=1),
+        # 0 is the off switch (measure, classify nothing); negative would be a
+        # threshold every measured array clears, i.e. the off switch's opposite
+        # spelled like it.
+        "cheap_decode_mbps": _Range(min=0),
     },
     "PyramidConfig": {
         # reduction_method and plane_max_pixels are server-local: on-the-fly
@@ -575,6 +579,22 @@ class CacheConfig:
             "one usually precedes. Set false to always read the source."
         },
     )
+    cheap_decode_mbps: float = field(
+        default=0.0,
+        metadata={
+            "help": "Evict a full-resolution chunk early once its tensor is "
+            "measured to decode at least this fast (MB/s) -- rebuilding it is "
+            "cheaper than the cache space it holds. 0 (the default) measures "
+            "but classifies nothing. Read the measurements with "
+            "`biopb tensor decode-rates` and pick a threshold from them: what "
+            "counts as fast enough depends on the machine's disk and the "
+            "formats on it, so there is no portable default. The measurements "
+            "live in the catalog database, so clearing the cache does not "
+            "reset them -- and they are session-only when the catalog is not "
+            "persisted (annotations.persist, which despite the name governs "
+            "the whole catalog file)."
+        },
+    )
     file_deferred_write_mb: int = field(
         default=0,
         metadata={
@@ -780,7 +800,9 @@ class AnnotationsConfig:
         default=True,
         metadata={
             "help": "Serve the ROI annotation actions (roi_list / roi_put / "
-            "roi_delete)."
+            "roi_delete). Off makes the catalog strictly read-only -- the "
+            "token says who may read, this says whether anyone may write. It "
+            "does not stop the catalog being persisted: `persist` decides that."
         },
     )
     max_rois_per_tensor: int = field(
@@ -796,7 +818,8 @@ class AnnotationsConfig:
         metadata={
             "help": "Keep annotations across restarts by backing the catalog "
             "with a file. Off means the whole catalog is in memory and drawn "
-            "ROIs are lost when the server stops."
+            "ROIs are lost when the server stops -- as are the cache's decode "
+            "measurements, which share the file."
         },
     )
     store_path: str = field(

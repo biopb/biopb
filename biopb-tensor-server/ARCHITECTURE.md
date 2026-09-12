@@ -323,7 +323,9 @@ and *where to expose it* is the launch command.
 5. Resolve config sources into *static* and *monitored* sets, and build the
    metadata DB (mandatory — it backs `query_sources`). An empty catalog is a
    valid state and boots: sources can still arrive via `add_source`, DoPut, or a
-   monitored dir that fills later.
+   monitored dir that fills later. The cache's measured per-tensor decode
+   throughput is attached to the catalog here too, as a `decode_rates` table —
+   it belongs to the config, not to the cache directory the operator may clear.
 6. Construct `TensorFlightServer` (token, writable, TLS material) — built, not
    yet serving.
 7. Build the watcher + `SourceManager`; wire the runtime `add_source` /

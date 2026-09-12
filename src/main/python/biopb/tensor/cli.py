@@ -766,5 +766,82 @@ def cache_stats(
     _render_cache_stats(stats)
 
 
+@app.command(
+    "decode-rates",
+    help="Show measured decode throughput (MB/s) per tensor.",
+)
+def decode_rates(
+    server: Optional[str] = _OPT_SERVER,
+    token: Optional[str] = _OPT_TOKEN,
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show what each tensor has been measured to decode at.
+
+    This is the input for ``cache.cheap_decode_mbps``: a tensor measured well
+    above the threshold has its full-resolution chunks evicted before slower
+    tensors', on the grounds that re-decoding one is cheaper than the cache
+    space it occupies. Pick the threshold by looking at the spread here, not
+    from a portable default -- there isn't one.
+
+    Only full-resolution reads are sampled, so a tensor served exclusively at
+    reduced scale is absent rather than slow, and a row with only a few
+    samples may still be settling -- weigh it accordingly.
+
+    The rate is what a rebuild costs per byte, not what the format can sustain:
+    a tensor with small chunks amortizes its per-read overhead over fewer bytes
+    and reads slower here than the same format would with large ones.
+
+    This is a preset over the catalog's `decode_rates` table; anything else you
+    want to ask of it -- a join against `sources`, a filter, a different order
+    -- is a `client.query_sources` call.
+    """
+    client, endpoint = _connect(server, token, cache_bytes=0)
+    try:
+        rows = client.query_sources(
+            "SELECT array_id, mbps, samples, updated_at FROM decode_rates "
+            "ORDER BY mbps DESC",
+            format="records",
+        )
+    except Exception as exc:  # noqa: BLE001 - rendered by type, not swallowed
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to read decode rates')}[/red]"
+        )
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+    if json_output:
+        print(json.dumps(rows, default=str))
+        raise typer.Exit(0)
+
+    if not rows:
+        # Not an error: a server that has served only downsampled reads has
+        # nothing to report, and so has one that just started.
+        console.print(
+            "[yellow]No decode measurements yet -- nothing has been read at "
+            "full resolution.[/yellow]"
+        )
+        raise typer.Exit(0)
+
+    table = Table(title="Measured decode throughput")
+    table.add_column("array_id", style="cyan")
+    table.add_column("MB/s", style="green", justify="right")
+    table.add_column("Samples", justify="right")
+    # Rows outlive the run that measured them, so this is what separates a
+    # tensor measured minutes ago from one last read weeks and a remount ago.
+    table.add_column("Updated")
+    for row in rows:
+        updated = row.get("updated_at")
+        table.add_row(
+            str(row.get("array_id", "")),
+            f"{row.get('mbps') or 0.0:.0f}",
+            str(row.get("samples", 0)),
+            updated.strftime("%Y-%m-%d %H:%M") if updated is not None else "-",
+        )
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
