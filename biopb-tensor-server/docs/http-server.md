@@ -57,13 +57,6 @@ is the local **default**, not a property of local mode.
 | `GET` | `/livez` | ✗ | Liveness probe — `{"status":"ok","timestamp":"…"}`. Never contacts the backend |
 | `GET` | `/readyz` | ✗ | Readiness — **200 when Flight reports `SERVING`, 503 otherwise**. Adds `ready`, `backend_health`, `backend_error`, `source_count`, `dev_mode`, `service`, `version` |
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
-
-`/readyz` opens the Flight connection if none exists yet, so it answers from the
-backend rather than from whatever traffic happened to arrive first, and it is
-safe for a supervisor to gate on. `backend_health` is `null` exactly when the
-backend was not reached, and `backend_error` then says why (`connect failed: …`
-vs `health check failed: …`) — the two used to be indistinguishable, and both
-looked the same as "nobody has asked yet" (biopb/biopb#755).
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
 | `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
 | `GET` | `/api/sources/{id}` | ✓ | Single descriptor |
@@ -84,6 +77,14 @@ looked the same as "nobody has asked yet" (biopb/biopb#755).
 > **Route ordering:** `/api/sources/{id}/metadata` and `/ticket/{ticket_hex}` are
 > registered *before* the greedy `{source_id:path}` catch-all to avoid Starlette
 > first-match shadowing.
+
+> `/readyz` opens the Flight connection if none exists yet, so it answers from the
+> backend rather than from whatever traffic happened to arrive first, and it is
+> safe for a supervisor to gate on. `backend_health` is `null` exactly when the
+> backend was not reached, and `backend_error` then says why (`connect failed: …`
+> vs `health check failed: …`) — the two used to be indistinguishable, and both
+> looked the same as "nobody has asked yet" (biopb/biopb#755).
+
 
 > **ROI annotations** (`/api/rois/*`) carry canonical proto3 JSON of
 > `biopb.image.RoiAnnotation` in both directions. The version token is stripped
