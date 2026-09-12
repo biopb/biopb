@@ -45,6 +45,7 @@ from biopb_tensor_server.core.logging_config import (
     setup_logging,
 )
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.core.retention import active_decode_rates
 from biopb_tensor_server.serving.http_server import run as run_http_server
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
@@ -874,6 +875,11 @@ def _setup_flight_server(
     # first touches the catalog: a store that cannot be opened is fatal, and it
     # should be fatal at startup, where the operator is watching.
     metadata_db.open()
+    # Decode measurements live in the catalog, not beside the cache segments:
+    # the cache directory is the operator's to delete. Attached after open() so
+    # the table exists, and after CacheManager.initialize() above, which built
+    # the object this installs a store on.
+    active_decode_rates().attach(metadata_db)
     console.print(
         "[green]Metadata database initialized:[/green] "
         f"max_query_results={server_config.metadata_db.max_query_results}, "

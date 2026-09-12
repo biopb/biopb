@@ -588,7 +588,10 @@ class CacheConfig:
             "but classifies nothing. Read the measurements with "
             "`biopb tensor decode-rates` and pick a threshold from them: what "
             "counts as fast enough depends on the machine's disk and the "
-            "formats on it, so there is no portable default."
+            "formats on it, so there is no portable default. The measurements "
+            "live in the catalog database, so clearing the cache does not "
+            "reset them -- and they are session-only when the catalog is not "
+            "persisted (annotations.persist)."
         },
     )
     file_deferred_write_mb: int = field(

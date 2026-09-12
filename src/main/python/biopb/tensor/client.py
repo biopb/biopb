@@ -1039,28 +1039,6 @@ class TensorFlightClient:
             return json.loads(result.body.to_pybytes())
         return {}
 
-    def decode_rates(self) -> Dict[str, Any]:
-        """Fetch the server's measured decode throughput, per ``array_id``.
-
-        One row per tensor the server has read at full resolution, each
-        ``{"mbps": float, "samples": int}``. A server that has served only
-        downsampled reads reports nothing, by design: a scaled build can come
-        out of the cache, so it is not a measurement of the source. ``samples``
-        is part of the answer because a row with very few has a rate the server
-        will not yet classify on.
-
-        Returns:
-            Mapping of array_id -> {"mbps", "samples"}.
-
-        Raises:
-            FlightError: If server is unreachable or action fails
-        """
-        action = flight.Action("decode_rates", b"")
-        results = self._client.do_action(action, options=self._call_options)
-        for result in results:
-            return json.loads(result.body.to_pybytes())
-        return {}
-
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
         """Get upload status for a writable source.
 

@@ -32,18 +32,27 @@ and a per-chunk call cannot carry one through every override of
 
 from __future__ import annotations
 
-import json
+import logging
 import threading
-from pathlib import Path
-from typing import TYPE_CHECKING, Dict, FrozenSet, Optional, Sequence, Tuple
-
-from biopb._config_io import atomic_write_json
+import time
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    FrozenSet,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from biopb_tensor_server.core.chunk import compute_pyramid_scale_hints
 from biopb_tensor_server.core.config import PyramidConfig
 
 if TYPE_CHECKING:
     from biopb_tensor_server.cache import RetentionClass
+
+logger = logging.getLogger(__name__)
 
 # The server's ladder knobs, set once at construction (TensorFlightServer). A
 # default instance keeps a direct caller -- a test, a script driving an adapter
@@ -110,6 +119,26 @@ def retention_for_scale(
 # reads rather than by every read since boot. Ten-ish samples to converge.
 _EMA_ALPHA = 0.25
 
+# How stale a persisted row may be. The table is written through on a debounce
+# rather than per sample: a read is a few milliseconds and a rewrite of the
+# whole table is comparable, so per-sample persistence would cost more than the
+# thing it measures. A minute bounds both the staleness a live query sees and
+# what a hard kill forfeits.
+_FLUSH_SECONDS = 60.0
+
+
+class DecodeRateStore(Protocol):
+    """Where the table is kept between runs -- the catalog DuckDB database.
+
+    Named as a protocol rather than imported so the read path does not depend on
+    the catalog: an embedded server built without one simply never attaches, and
+    measures for its own lifetime.
+    """
+
+    def load_decode_rates(self) -> Dict[str, Tuple[float, int]]: ...
+
+    def save_decode_rates(self, rows: Mapping[str, Tuple[float, int]]) -> None: ...
+
 
 class DecodeRates:
     """Per-``array_id`` decode throughput in MB/s, and the class it implies.
@@ -131,15 +160,44 @@ class DecodeRates:
     picked a threshold. There is no defensible shipped default -- "fast enough
     that rebuilding beats keeping" is a property of the machine's disk and the
     formats on it, which is what the table is for.
+
+    Once attached to a store the table both survives a restart and *is* the
+    client surface: it is a `decode_rates` table in the catalog database, read
+    with ``client.query_sources``. It is deliberately not kept beside the cache
+    segments -- the cache directory is the operator's to delete, and clearing it
+    should cost the bytes, not a run's worth of measurement.
     """
 
-    __slots__ = ("_lock", "_rates", "_counts", "cheap_mbps")
+    __slots__ = ("_lock", "_rates", "_counts", "_store", "_next_flush", "cheap_mbps")
 
     def __init__(self, cheap_mbps: float = 0.0) -> None:
         self._lock = threading.Lock()
         self._rates: Dict[str, float] = {}
         self._counts: Dict[str, int] = {}
+        self._store: Optional[DecodeRateStore] = None
+        self._next_flush = 0.0
         self.cheap_mbps = float(cheap_mbps)
+
+    def attach(self, store: DecodeRateStore) -> None:
+        """Persist through ``store``, starting from the rows it already holds.
+
+        The stored rows lose to anything measured since this object was built,
+        so attaching late cannot undo a live measurement. Best-effort: a table
+        that will not load leaves this run measuring from scratch, which is one
+        warmup, not a failure worth refusing to serve over.
+        """
+        try:
+            stored = store.load_decode_rates()
+        except Exception:  # noqa: BLE001 - diagnostic data, never load-bearing
+            logger.warning("Could not load persisted decode rates", exc_info=True)
+            stored = {}
+        with self._lock:
+            for array_id, (mbps, samples) in stored.items():
+                if mbps > 0.0 and samples > 0:
+                    self._rates.setdefault(array_id, mbps)
+                    self._counts.setdefault(array_id, samples)
+            self._store = store
+            self._next_flush = time.monotonic() + _FLUSH_SECONDS
 
     def record(self, array_id: str, nbytes: int, seconds: float) -> None:
         """Fold one full-resolution read into ``array_id``'s rate.
@@ -164,6 +222,9 @@ class DecodeRates:
                 mbps if previous is None else previous + _EMA_ALPHA * (mbps - previous)
             )
             self._counts[array_id] = self._counts.get(array_id, 0) + 1
+            due = self._store is not None and time.monotonic() >= self._next_flush
+        if due:
+            self.flush()
 
     def rate(self, array_id: str) -> Optional[float]:
         """``array_id``'s MB/s, or None if it has never been read at full resolution."""
@@ -184,47 +245,30 @@ class DecodeRates:
             return "normal"
         return "cheap" if measured >= self.cheap_mbps else "normal"
 
-    def snapshot(self) -> Dict[str, Dict[str, float]]:
-        """The whole table, for the ``decode_rates`` action and the CLI."""
+    def snapshot(self) -> Dict[str, Tuple[float, int]]:
+        """The whole table, as ``array_id -> (mbps, samples)``."""
         with self._lock:
             return {
-                array_id: {"mbps": rate, "samples": self._counts.get(array_id, 0)}
+                array_id: (rate, self._counts.get(array_id, 0))
                 for array_id, rate in sorted(self._rates.items())
             }
 
-    def load(self, path: Path) -> None:
-        """Merge a persisted table in, so a restart does not re-serve its warmup.
+    def flush(self) -> None:
+        """Write the table through to the attached store. A no-op without one.
 
-        Best-effort in both directions: an absent, truncated or hand-edited file
-        leaves the table empty, which is exactly the state a first run is in.
+        Swallows a store failure, here rather than in the store: this is called
+        from the read path, and losing a write costs one warmup's worth of
+        measurement -- not worth failing a read or a clean shutdown over.
         """
-        try:
-            raw = json.loads(path.read_text())
-        except (OSError, ValueError):
-            return
-        if not isinstance(raw, dict):
-            return
         with self._lock:
-            for array_id, row in raw.items():
-                try:
-                    rate = float(row["mbps"])
-                    count = int(row["samples"])
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if rate > 0.0 and count > 0:
-                    self._rates[array_id] = rate
-                    self._counts[array_id] = count
-
-    def save(self, path: Path) -> None:
-        """Persist the table beside the segments it describes.
-
-        Written atomically, and swallowed on failure: losing it costs one
-        warmup, and this runs on the shutdown path.
-        """
-        snapshot = self.snapshot()
-        if not snapshot:
+            store = self._store
+            self._next_flush = time.monotonic() + _FLUSH_SECONDS
+        if store is None:
             return
-        atomic_write_json(path, snapshot, raise_on_error=False)
+        try:
+            store.save_decode_rates(self.snapshot())
+        except Exception:  # noqa: BLE001 - diagnostic data, never load-bearing
+            logger.warning("Could not persist decode rates", exc_info=True)
 
 
 # Process state, like the ladder above and for the same reason: the read path

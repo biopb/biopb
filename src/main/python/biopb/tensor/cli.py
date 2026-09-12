@@ -792,10 +792,18 @@ def decode_rates(
     The rate is what a rebuild costs per byte, not what the format can sustain:
     a tensor with small chunks amortizes its per-read overhead over fewer bytes
     and reads slower here than the same format would with large ones.
+
+    This is a preset over the catalog's `decode_rates` table; anything else you
+    want to ask of it -- a join against `sources`, a filter, a different order
+    -- is a `client.query_sources` call.
     """
     client, endpoint = _connect(server, token, cache_bytes=0)
     try:
-        rates = client.decode_rates()
+        rows = client.query_sources(
+            "SELECT array_id, mbps, samples, updated_at FROM decode_rates "
+            "ORDER BY mbps DESC",
+            format="records",
+        )
     except Exception as exc:  # noqa: BLE001 - rendered by type, not swallowed
         stderr_console.print(
             f"[red]{_operation_error(exc, endpoint, 'Failed to read decode rates')}[/red]"
@@ -805,10 +813,10 @@ def decode_rates(
         client.close()
 
     if json_output:
-        print(json.dumps(rates))
+        print(json.dumps(rows, default=str))
         raise typer.Exit(0)
 
-    if not rates:
+    if not rows:
         # Not an error: a server that has served only downsampled reads has
         # nothing to report, and so has one that just started.
         console.print(
@@ -821,13 +829,16 @@ def decode_rates(
     table.add_column("array_id", style="cyan")
     table.add_column("MB/s", style="green", justify="right")
     table.add_column("Samples", justify="right")
-    for array_id, row in sorted(
-        rates.items(), key=lambda kv: kv[1].get("mbps", 0.0), reverse=True
-    ):
+    # Rows outlive the run that measured them, so this is what separates a
+    # tensor measured minutes ago from one last read weeks and a remount ago.
+    table.add_column("Updated")
+    for row in rows:
+        updated = row.get("updated_at")
         table.add_row(
-            array_id,
-            f"{row.get('mbps', 0.0):.0f}",
+            str(row.get("array_id", "")),
+            f"{row.get('mbps') or 0.0:.0f}",
             str(row.get("samples", 0)),
+            updated.strftime("%Y-%m-%d %H:%M") if updated is not None else "-",
         )
     console.print(table)
 

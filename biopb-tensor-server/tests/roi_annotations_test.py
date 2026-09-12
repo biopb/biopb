@@ -1654,7 +1654,11 @@ class TestDisabledAnnotationsTouchNothing:
         # Returning empty rows would be the wrong answer: the table is
         # unserved, not unpopulated, and a result set cannot say which.
         db = MetadataDatabase(annotations_enabled=False)
-        assert db.allowed_tables == {"sources"}
+        # Only `rois` goes: `decode_rates` is cache measurement, not annotation
+        # data, and a deployment that turned the annotation actions off did not
+        # ask to stop measuring its own cache.
+        assert "rois" not in db.allowed_tables
+        assert {"sources", "decode_rates"} <= db.allowed_tables
         with pytest.raises(ValueError, match="disallowed table: rois"):
             db._validate_query("SELECT * FROM rois")
         db._validate_query("SELECT * FROM sources")

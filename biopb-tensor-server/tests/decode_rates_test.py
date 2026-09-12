@@ -7,7 +7,7 @@ taken, which reads are refused as samples, and the two source kinds that must
 never be classified this way at all.
 """
 
-import json
+import shutil
 
 import numpy as np
 import pytest
@@ -15,9 +15,9 @@ import zarr
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import ZarrAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.cache.manager import DECODE_RATES_FILE
 from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.core.retention import (
     DecodeRates,
     active_decode_rates,
@@ -93,7 +93,7 @@ class TestTheStatistic:
         rates.record("small", 64 << 10, overhead)
         rates.record("large", 8 << 20, overhead)
 
-        assert rates.snapshot()["small"]["mbps"] < rates.snapshot()["large"]["mbps"]
+        assert rates.snapshot()["small"][0] < rates.snapshot()["large"][0]
 
     def test_a_zero_duration_read_is_not_a_sample(self):
         """The only read dropped: a duration the clock could not resolve cannot
@@ -137,41 +137,193 @@ class TestTheThreshold:
 
 
 class TestPersistence:
+    """The table lives in the catalog database, beside `rois` -- not beside the
+    cache segments it describes. The cache directory is the operator's to
+    delete; clearing it should cost the bytes, not a run of measurement."""
+
+    @staticmethod
+    def _catalog(tmp_path):
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
+        db.open()
+        return db
+
     def test_a_run_does_not_reserve_its_warmup(self, tmp_path):
         """Without this every restart re-measures, and every restart stamps a
         stratum of "normal" segments before it converges."""
-        path = tmp_path / DECODE_RATES_FILE
+        first = self._catalog(tmp_path)
         written = DecodeRates()
+        written.attach(first)
         _converge(written, "src", 800.0)
-        written.save(path)
+        written.flush()
+        first.close()
 
-        restored = DecodeRates(cheap_mbps=500.0)
-        restored.load(path)
+        second = self._catalog(tmp_path)
+        try:
+            restored = DecodeRates(cheap_mbps=500.0)
+            restored.attach(second)
 
-        assert restored.rate("src") == pytest.approx(800.0)
-        assert restored.retention_for_array("src") == "cheap"
+            assert restored.rate("src") == pytest.approx(800.0)
+            assert restored.retention_for_array("src") == "cheap"
+        finally:
+            second.close()
 
-    def test_an_unreadable_table_is_a_first_run(self, tmp_path):
-        path = tmp_path / DECODE_RATES_FILE
-        path.write_text("{ truncated")
+    def test_clearing_the_cache_does_not_clear_the_measurements(self, tmp_path):
+        """The reason this is not a file under file_cache_dir. An operator
+        reclaiming disk is not asking to re-measure every source."""
+        cache_dir = tmp_path / "cache"
+        db = self._catalog(tmp_path)
+        try:
+            manager = CacheManager(
+                CacheConfig(backend="file", file_cache_dir=cache_dir)
+            )
+            active_decode_rates().attach(db)
+            _converge(active_decode_rates(), "src", 800.0)
+            manager.close()
+
+            shutil.rmtree(cache_dir)
+
+            after = DecodeRates()
+            after.attach(db)
+            assert after.rate("src") == pytest.approx(800.0)
+        finally:
+            db.close()
+
+    def test_a_live_measurement_beats_a_stored_one(self, tmp_path):
+        """Attaching cannot undo what this run already measured: the store is
+        the older observation by construction, whatever its timestamp says."""
+        db = self._catalog(tmp_path)
+        try:
+            db.save_decode_rates({"src": (800.0, 40)})
+            rates = DecodeRates()
+            _converge(rates, "src", 100.0)
+            rates.attach(db)
+
+            assert rates.rate("src") == pytest.approx(100.0)
+        finally:
+            db.close()
+
+    def test_the_table_is_read_as_sql_rather_than_through_an_action(self, tmp_path):
+        """The whole client surface. A table an operator wants to sort, filter
+        and join against `sources` is better asked in SQL than in an RPC that
+        can only ever hand back all of it."""
+        db = self._catalog(tmp_path)
+        try:
+            db.save_decode_rates({"fast": (800.0, 12), "slow": (90.0, 3)})
+
+            info = db.handle_query(
+                "SELECT array_id, samples FROM decode_rates "
+                "WHERE mbps > 500 ORDER BY array_id"
+            )
+            table = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+
+            assert table.to_pydict() == {"array_id": ["fast"], "samples": [12]}
+        finally:
+            db.close()
+
+    def test_the_first_write_may_be_what_opens_the_database(self, tmp_path):
+        """A write that arrives before anything has opened the connection has
+        to build it -- and _get_connection takes the same non-reentrant write
+        lock, so taking the lock first deadlocked the read path here."""
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
+        try:
+            db.save_decode_rates({"src": (800.0, 4)})
+
+            assert db.load_decode_rates() == {"src": (800.0, 4)}
+        finally:
+            db.close()
+
+    def test_a_schema_change_drops_the_rows_rather_than_refusing(self, tmp_path):
+        """The difference from `rois`, which refuses a catalog it cannot
+        migrate: every row here is re-measurable by reading, so a version bump
+        costs one warmup and needs no migration ladder."""
+        store = tmp_path / "catalog.duckdb"
+        first = MetadataDatabase(store_path=store)
+        first.open()
+        first.save_decode_rates({"src": (800.0, 12)})
+        first._get_connection().execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES "
+            "('decode_rates_schema_version', '0')"
+        )
+        first.close()
+
+        second = MetadataDatabase(store_path=store)
+        second.open()
+        try:
+            assert second.load_decode_rates() == {}
+            second.save_decode_rates({"src": (100.0, 1)})
+            assert second.load_decode_rates() == {"src": (100.0, 1)}
+        finally:
+            second.close()
+
+    def test_a_store_that_will_not_load_leaves_this_run_measuring(self):
+        """One warmup, not a refusal to serve: these are diagnostics."""
+
+        class Broken:
+            def load_decode_rates(self):
+                raise RuntimeError("no")
+
+            def save_decode_rates(self, rows):
+                raise RuntimeError("no")
+
         rates = DecodeRates()
-        rates.load(path)
+        rates.attach(Broken())
+        _converge(rates, "src", 800.0)
+        rates.flush()
 
-        assert rates.snapshot() == {}
+        assert rates.rate("src") == pytest.approx(800.0)
 
-    def test_a_hand_edited_row_is_dropped_not_believed(self, tmp_path):
-        path = tmp_path / DECODE_RATES_FILE
-        path.write_text(json.dumps({"ok": {"mbps": 800.0, "samples": 8}, "bad": {}}))
+    def test_an_unattached_table_persists_nowhere(self):
+        """An embedded server built without a catalog measures for its own
+        lifetime, and nothing on the read path has to know that."""
         rates = DecodeRates()
-        rates.load(path)
+        _converge(rates, "src", 800.0)
+        rates.flush()
 
-        assert set(rates.snapshot()) == {"ok"}
+        assert rates.rate("src") == pytest.approx(800.0)
 
-    def test_an_empty_table_writes_no_file(self, tmp_path):
-        path = tmp_path / DECODE_RATES_FILE
-        DecodeRates().save(path)
 
-        assert not path.exists()
+class TestTheFlushCadence:
+    """Write-through is debounced: a read is milliseconds and rewriting the
+    table is comparable, so persisting per sample would cost more than the
+    thing being measured."""
+
+    class Recorder:
+        def __init__(self):
+            self.writes = []
+
+        def load_decode_rates(self):
+            return {}
+
+        def save_decode_rates(self, rows):
+            self.writes.append(dict(rows))
+
+    def test_samples_do_not_each_reach_the_store(self):
+        store = self.Recorder()
+        rates = DecodeRates()
+        rates.attach(store)
+        _converge(rates, "src", 800.0, samples=50)
+
+        assert store.writes == []
+
+    def test_a_due_sample_writes_the_table_through(self):
+        """So a live query sees a bounded-staleness table without waiting for a
+        shutdown that may never be clean."""
+        store = self.Recorder()
+        rates = DecodeRates()
+        rates.attach(store)
+        rates._next_flush = 0.0  # as if _FLUSH_SECONDS had elapsed
+        _converge(rates, "src", 800.0)
+
+        assert store.writes == [{"src": (pytest.approx(800.0), 1)}]
+
+    def test_the_write_rearms_the_debounce(self):
+        store = self.Recorder()
+        rates = DecodeRates()
+        rates.attach(store)
+        rates._next_flush = 0.0
+        _converge(rates, "src", 800.0, samples=10)
+
+        assert len(store.writes) == 1
 
 
 class TestTheSampleSite:
@@ -209,7 +361,7 @@ class TestTheSampleSite:
     def test_a_full_resolution_read_is_measured(self, adapter, manager):
         adapter.resolve_chunk_data(self._full_chunk_id(), manager)
 
-        assert active_decode_rates().snapshot()["src"]["samples"] == 1
+        assert active_decode_rates().snapshot()["src"][1] == 1
 
     def test_a_cache_hit_is_not_measured_again(self, adapter, manager):
         """Only a miss reaches the decode. Counting a hit would fold the cache's
@@ -218,7 +370,7 @@ class TestTheSampleSite:
         adapter.resolve_chunk_data(chunk_id, manager)
         adapter.resolve_chunk_data(chunk_id, manager)
 
-        assert active_decode_rates().snapshot()["src"]["samples"] == 1
+        assert active_decode_rates().snapshot()["src"][1] == 1
 
     def test_a_scaled_read_is_not_measured(self, adapter, manager):
         """A scaled build may be sourced from cached full-resolution chunks
@@ -254,34 +406,44 @@ class TestTheSampleSite:
 
 
 class TestTheManagerWiring:
-    def test_the_table_is_loaded_and_saved_beside_the_segments(self, tmp_path):
-        """Not in the metadata DB: decode throughput is a read-path fact about
-        an adapter, not a catalog fact, and clearing the cache clears it."""
-        cache_dir = tmp_path / "cache"
-        config = CacheConfig(
-            backend="file", file_cache_dir=cache_dir, cheap_decode_mbps=500.0
+    def test_the_manager_installs_the_configured_threshold(self, tmp_path):
+        """The threshold is cache policy, so it comes from CacheConfig; the
+        store is the catalog's, attached separately at startup."""
+        mgr = CacheManager(
+            CacheConfig(
+                backend="file",
+                file_cache_dir=tmp_path / "cache",
+                cheap_decode_mbps=500.0,
+            )
         )
-
-        first = CacheManager(config)
-        _converge(active_decode_rates(), "src", 800.0)
-        first.close()
-
-        assert (cache_dir / DECODE_RATES_FILE).exists()
-
-        second = CacheManager(config)
         try:
-            assert active_decode_rates().rate("src") == pytest.approx(800.0)
+            _converge(active_decode_rates(), "src", 800.0)
+
             assert active_decode_rates().retention_for_array("src") == "cheap"
         finally:
-            second.close()
+            mgr.close()
 
-    def test_the_memory_backend_keeps_its_table_in_process(self, tmp_path):
-        """Nothing to persist beside: there are no segments to outlive."""
-        mgr = CacheManager(CacheConfig(backend="memory"))
+    def test_close_flushes_what_the_debounce_has_not(self, tmp_path):
+        """A clean shutdown keeps the last minute of measurement."""
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
+        db.open()
+        try:
+            mgr = CacheManager(CacheConfig(backend="memory"))
+            active_decode_rates().attach(db)
+            _converge(active_decode_rates(), "src", 800.0)
+            mgr.close()
+
+            assert db.load_decode_rates()["src"][0] == pytest.approx(800.0)
+        finally:
+            db.close()
+
+    def test_the_cache_directory_holds_no_measurements(self, tmp_path):
+        cache_dir = tmp_path / "cache"
+        mgr = CacheManager(CacheConfig(backend="file", file_cache_dir=cache_dir))
         _converge(active_decode_rates(), "src", 800.0)
         mgr.close()
 
-        assert not list(tmp_path.iterdir())
+        assert not list(cache_dir.rglob("*decode*"))
 
 
 class TestTheExemptSourceKinds:
