@@ -737,13 +737,20 @@ class MetadataDatabase:
         raise AssertionError("unreachable")  # pragma: no cover
 
     @property
+    def store_path(self) -> Optional[Path]:
+        """The file backing this catalog, or None when it is in memory."""
+        return self._store_path
+
+    @property
     def annotations_persisted(self) -> bool:
         """Whether drawn ROIs reach a file, for ``health``.
 
-        False only when the server was asked for a session-only store: an open
-        failure is fatal, so there is no state where this is False by accident.
+        The catalog being file-backed is not enough: a server with the
+        annotation actions off holds one for `decode_rates` alone, and
+        answering True there would promise durability for rows it will not
+        accept in the first place.
         """
-        return self._store_path is not None
+        return self._store_path is not None and self._annotations_enabled
 
     def _get_cursor(self) -> duckdb.DuckDBPyConnection:
         """Get a cursor for thread-safe read operations.

@@ -667,7 +667,7 @@ def cert_init(
     )
 
 
-def _annotation_store_path(
+def _catalog_store_path(
     server_config: ServerConfig, config_path: Optional[Path]
 ) -> Optional[Path]:
     """Where this server's catalog lives on disk, or None to stay in memory.
@@ -675,16 +675,20 @@ def _annotation_store_path(
     An explicit ``store_path`` wins. Otherwise the default is derived from the
     config file, which is the thing that identifies "this set of data" -- and
     with no config file there is nothing to derive from, so a server started
-    without one keeps annotations only for its own lifetime.
+    without one keeps its catalog only for its own lifetime.
+
+    Deliberately NOT keyed on ``annotations.enabled``. It used to be, back when
+    the file held annotations and a `sources` table rebuilt every boot, so a
+    server not serving the annotation actions could skip the file for free. It
+    is not free now: `decode_rates` lives there too, and a server that measures
+    its own cache wants those across restarts whatever its annotation posture
+    is. What the gate actually bought -- not holding DuckDB's exclusive lock
+    against `prune-annotations`, and not refusing to boot over an unopenable
+    file -- is answered where it belongs: `prune-annotations` requires the
+    server stopped in every case (it says so), and the caller degrades to
+    memory instead of dying when nothing load-bearing is in the file.
     """
     annotations = server_config.annotations
-    if not annotations.enabled:
-        # A server that does not serve the annotation actions has no business
-        # holding the catalog open: DuckDB's lock is exclusive, so it would
-        # block `prune-annotations` and any other reader for a feature it is
-        # not offering -- and, with an unopenable store being fatal, could
-        # refuse to start over annotations it was told not to serve.
-        return None
     if not annotations.persist:
         return None
     if annotations.store_path:
@@ -707,11 +711,53 @@ def _annotation_store_path(
     if config_path is None:
         logger.warning(
             "No config file, so no name to give a persistent catalog: "
-            "annotations will not survive a restart. Set annotations.store_path "
-            "to choose one."
+            "annotations and decode measurements will not survive a restart. "
+            "Set annotations.store_path to choose one."
         )
         return None
     return tensor_catalog_path(config_path)
+
+
+def _open_catalog(
+    server_config: ServerConfig, store_path: Optional[Path]
+) -> MetadataDatabase:
+    """Open the catalog, degrading to memory only when nothing durable is in it.
+
+    Opened here rather than by the lazy init on whichever request first touches
+    it: a store that cannot be opened should fail at startup, where the operator
+    is watching.
+
+    An unopenable store is normally fatal -- ``annotations.persist`` is a promise
+    about durability, and serving anyway would send every ROI drawn on this
+    server to a catalog that disappears at the next restart. A server with the
+    annotation actions off made no such promise: what is left in the file is
+    `sources` (rebuilt every boot) and `decode_rates` (re-measurable by reading),
+    so refusing to serve pixels over it would trade a whole server for one cache
+    warmup.
+    """
+
+    def _build(path: Optional[Path]) -> MetadataDatabase:
+        db = MetadataDatabase(
+            max_query_results=server_config.metadata_db.max_query_results,
+            query_timeout_ms=server_config.metadata_db.query_timeout_ms,
+            max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
+            store_path=path,
+            annotations_enabled=server_config.annotations.enabled,
+        )
+        db.open()
+        return db
+
+    try:
+        return _build(store_path)
+    except AnnotationStoreError:
+        if server_config.annotations.enabled or store_path is None:
+            raise
+        console.print(
+            f"[yellow]Catalog {store_path} did not open; annotations are "
+            f"disabled, so running with an in-memory catalog. Decode "
+            f"measurements will not survive this run.[/yellow]"
+        )
+        return _build(None)
 
 
 def _setup_flight_server(
@@ -863,18 +909,9 @@ def _setup_flight_server(
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
     # it is the canonical source-browsing surface (`client.query_sources`).
-    catalog_store = _annotation_store_path(server_config, config_path)
-    metadata_db = MetadataDatabase(
-        max_query_results=server_config.metadata_db.max_query_results,
-        query_timeout_ms=server_config.metadata_db.query_timeout_ms,
-        max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
-        store_path=catalog_store,
-        annotations_enabled=server_config.annotations.enabled,
+    metadata_db = _open_catalog(
+        server_config, _catalog_store_path(server_config, config_path)
     )
-    # Open it here rather than letting the lazy init fire on whichever request
-    # first touches the catalog: a store that cannot be opened is fatal, and it
-    # should be fatal at startup, where the operator is watching.
-    metadata_db.open()
     # Decode measurements live in the catalog, not beside the cache segments:
     # the cache directory is the operator's to delete. Attached after open() so
     # the table exists, and after CacheManager.initialize() above, which built
@@ -885,7 +922,7 @@ def _setup_flight_server(
         f"max_query_results={server_config.metadata_db.max_query_results}, "
         f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
         f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}, "
-        f"annotations={catalog_store or 'in-memory (not persisted)'}"
+        f"catalog={metadata_db.store_path or 'in-memory (not persisted)'}"
     )
 
     # Create and start server with gRPC message size tuned for 64MB chunks
@@ -1474,7 +1511,7 @@ def prune_annotations(
         )
         raise typer.Exit(2)
 
-    store = _annotation_store_path(server_config, config)
+    store = _catalog_store_path(server_config, config)
     if store is None:
         console.print(
             "[yellow]This config has no persistent annotation store, so there is "

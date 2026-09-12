@@ -591,7 +591,8 @@ class CacheConfig:
             "formats on it, so there is no portable default. The measurements "
             "live in the catalog database, so clearing the cache does not "
             "reset them -- and they are session-only when the catalog is not "
-            "persisted (annotations.persist)."
+            "persisted (annotations.persist, which despite the name governs "
+            "the whole catalog file)."
         },
     )
     file_deferred_write_mb: int = field(
@@ -799,7 +800,9 @@ class AnnotationsConfig:
         default=True,
         metadata={
             "help": "Serve the ROI annotation actions (roi_list / roi_put / "
-            "roi_delete)."
+            "roi_delete). Off makes the catalog strictly read-only -- the "
+            "token says who may read, this says whether anyone may write. It "
+            "does not stop the catalog being persisted: `persist` decides that."
         },
     )
     max_rois_per_tensor: int = field(
@@ -815,7 +818,8 @@ class AnnotationsConfig:
         metadata={
             "help": "Keep annotations across restarts by backing the catalog "
             "with a file. Off means the whole catalog is in memory and drawn "
-            "ROIs are lost when the server stops."
+            "ROIs are lost when the server stops -- as are the cache's decode "
+            "measurements, which share the file."
         },
     )
     store_path: str = field(

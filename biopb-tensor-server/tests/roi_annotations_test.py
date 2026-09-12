@@ -1114,10 +1114,10 @@ class TestStorePathResolution:
 
     def test_the_default_is_derived_from_the_config_path(self, tmp_path):
         from biopb._locations import tensor_catalog_path
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
         config = tmp_path / "biopb.json"
-        assert _annotation_store_path(self._config(), config) == tensor_catalog_path(
+        assert _catalog_store_path(self._config(), config) == tensor_catalog_path(
             config
         )
 
@@ -1129,18 +1129,16 @@ class TestStorePathResolution:
         )
 
     def test_an_explicit_path_wins(self, tmp_path):
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
         chosen = tmp_path / "somewhere.duckdb"
-        assert (
-            _annotation_store_path(self._config(store_path=str(chosen)), None) == chosen
-        )
+        assert _catalog_store_path(self._config(store_path=str(chosen)), None) == chosen
 
     def test_persist_off_stays_in_memory(self, tmp_path):
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
         assert (
-            _annotation_store_path(
+            _catalog_store_path(
                 self._config(persist=False, store_path=str(tmp_path / "x.duckdb")),
                 tmp_path / "biopb.json",
             )
@@ -1148,9 +1146,9 @@ class TestStorePathResolution:
         )
 
     def test_no_config_file_means_no_derived_name(self):
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
-        assert _annotation_store_path(self._config(), None) is None
+        assert _catalog_store_path(self._config(), None) is None
 
 
 class TestOrphanClock:
@@ -1574,48 +1572,44 @@ class TestStorePathIsNotCwdRelative:
         return ServerConfig(annotations=AnnotationsConfig(**annotations))
 
     def test_a_relative_path_resolves_against_the_config(self, tmp_path):
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
         config = tmp_path / "deploy" / "biopb.json"
-        resolved = _annotation_store_path(
-            self._config(store_path="rois.duckdb"), config
-        )
+        resolved = _catalog_store_path(self._config(store_path="rois.duckdb"), config)
         assert resolved == tmp_path / "deploy" / "rois.duckdb"
 
     def test_the_cwd_does_not_change_the_answer(self, tmp_path, monkeypatch):
         # The whole point: a server is started by the control plane, by systemd,
         # or by hand from wherever the user was standing.
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
         config = tmp_path / "biopb.json"
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
-        first = _annotation_store_path(self._config(store_path="a.duckdb"), config)
+        first = _catalog_store_path(self._config(store_path="a.duckdb"), config)
         monkeypatch.chdir(elsewhere)
-        assert (
-            _annotation_store_path(self._config(store_path="a.duckdb"), config) == first
-        )
+        assert _catalog_store_path(self._config(store_path="a.duckdb"), config) == first
 
     def test_an_absolute_path_is_left_alone(self, tmp_path):
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
         chosen = tmp_path / "somewhere" / "x.duckdb"
         assert (
-            _annotation_store_path(
+            _catalog_store_path(
                 self._config(store_path=str(chosen)), tmp_path / "c.json"
             )
             == chosen
         )
 
     def test_a_relative_path_with_no_config_is_refused(self):
-        from biopb_tensor_server.cli import _annotation_store_path
+        from biopb_tensor_server.cli import _catalog_store_path
 
         with pytest.raises(AnnotationStoreError, match="relative"):
-            _annotation_store_path(self._config(store_path="rois.duckdb"), None)
+            _catalog_store_path(self._config(store_path="rois.duckdb"), None)
 
 
 class TestDisabledAnnotationsTouchNothing:
-    """`annotations.enabled = false` means the store is not opened at all."""
+    """`annotations.enabled = false` stops the actions, not the catalog."""
 
     @staticmethod
     def _config(**annotations):
@@ -1623,32 +1617,51 @@ class TestDisabledAnnotationsTouchNothing:
 
         return ServerConfig(annotations=AnnotationsConfig(**annotations))
 
-    def test_no_store_path_so_no_lock(self, tmp_path):
-        # DuckDB's lock is exclusive, so holding the catalog open would block
-        # prune-annotations and any other reader for a feature this server is
-        # not offering.
-        from biopb_tensor_server.cli import _annotation_store_path
+    def test_the_catalog_is_still_on_disk(self, tmp_path):
+        # It used to be skipped here, back when the file held annotations and a
+        # `sources` table rebuilt every boot. `decode_rates` lives there now,
+        # and a server measuring its own cache wants that across restarts
+        # whatever its annotation posture is.
+        from biopb_tensor_server.cli import _catalog_store_path
 
+        chosen = tmp_path / "x.duckdb"
         assert (
-            _annotation_store_path(
-                self._config(enabled=False, store_path=str(tmp_path / "x.duckdb")),
+            _catalog_store_path(
+                self._config(enabled=False, store_path=str(chosen)),
                 tmp_path / "biopb.json",
             )
-            is None
+            == chosen
         )
+
+    def test_health_does_not_promise_durability_for_rows_it_refuses(self):
+        db = MetadataDatabase(store_path=None, annotations_enabled=False)
+        assert db.annotations_persisted is False
 
     def test_a_broken_store_cannot_stop_a_server_that_does_not_serve_it(self, tmp_path):
         # Fail-closed is about a promise of durability. A server told not to
-        # serve annotations made no such promise.
-        from biopb_tensor_server.cli import _annotation_store_path
+        # serve annotations made none, and what is left in the file is rebuilt
+        # (`sources`) or re-measurable (`decode_rates`) -- so it degrades to an
+        # in-memory catalog rather than trading a whole server for one warmup.
+        from biopb_tensor_server.cli import _open_catalog
 
         store = tmp_path / "catalog.duckdb"
         store.write_bytes(b"not a duckdb file")
-        config = self._config(enabled=False, store_path=str(store))
 
-        path = _annotation_store_path(config, tmp_path / "biopb.json")
-        assert path is None
-        MetadataDatabase(store_path=path, annotations_enabled=False).open()
+        db = _open_catalog(self._config(enabled=False), store)
+        try:
+            assert db.store_path is None
+            assert store.read_bytes() == b"not a duckdb file"
+        finally:
+            db.close()
+
+    def test_the_same_store_is_fatal_when_annotations_are_served(self, tmp_path):
+        from biopb_tensor_server.cli import _open_catalog
+
+        store = tmp_path / "catalog.duckdb"
+        store.write_bytes(b"not a duckdb file")
+
+        with pytest.raises(AnnotationStoreError):
+            _open_catalog(self._config(), store)
 
     def test_the_sql_surface_drops_rois_too(self):
         # Returning empty rows would be the wrong answer: the table is

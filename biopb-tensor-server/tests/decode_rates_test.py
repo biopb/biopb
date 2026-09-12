@@ -7,6 +7,7 @@ taken, which reads are refused as samples, and the two source kinds that must
 never be classified this way at all.
 """
 
+import json
 import shutil
 
 import numpy as np
@@ -187,6 +188,18 @@ class TestPersistence:
             assert after.rate("src") == pytest.approx(800.0)
         finally:
             db.close()
+
+    def test_the_annotation_posture_does_not_decide_this(self, tmp_path):
+        """`annotations.enabled = false` used to send the whole catalog to
+        memory, which was free when the file held only annotations and a
+        `sources` table rebuilt every boot. A server measuring its own cache
+        wants those rows across restarts whichever way that switch is set."""
+        from biopb_tensor_server.cli import _catalog_store_path
+        from biopb_tensor_server.core.config import AnnotationsConfig, ServerConfig
+
+        config = ServerConfig(annotations=AnnotationsConfig(enabled=False))
+
+        assert _catalog_store_path(config, tmp_path / "biopb.json") is not None
 
     def test_a_live_measurement_beats_a_stored_one(self, tmp_path):
         """Attaching cannot undo what this run already measured: the store is
@@ -444,6 +457,61 @@ class TestTheManagerWiring:
         mgr.close()
 
         assert not list(cache_dir.rglob("*decode*"))
+
+
+class TestTheStartupWiring:
+    """The seam the parts above cannot check: that a real server start attaches
+    the table to the catalog it just opened."""
+
+    @staticmethod
+    def _serve(config_path):
+        from biopb_tensor_server import cli
+
+        CacheManager.reset()
+        server, source_manager, watcher, precache = cli._setup_flight_server(
+            cli.load_config(config_path), port=0, config_path=config_path
+        )
+        for stoppable in (watcher, precache, source_manager):
+            if stoppable is not None:
+                stoppable.stop()
+        return server
+
+    @staticmethod
+    def _config(tmp_path, **annotations):
+        config_path = tmp_path / "biopb.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "cache": {"backend": "memory"},
+                    "sources": [],
+                    "annotations": annotations,
+                }
+            )
+        )
+        return config_path
+
+    @pytest.mark.parametrize("annotations_enabled", [True, False])
+    def test_a_started_server_measures_into_its_catalog(
+        self, tmp_path, annotations_enabled
+    ):
+        """Both ways round the annotation switch: it decides who may write
+        ROIs, not whether the cache keeps what it measured."""
+        from biopb_tensor_server.cli import tensor_catalog_path
+
+        config_path = self._config(tmp_path, enabled=annotations_enabled)
+        server = self._serve(config_path)
+        try:
+            _converge(active_decode_rates(), "src", 800.0)
+            active_decode_rates().flush()
+
+            # Read back through the server's own database: it holds DuckDB's
+            # exclusive lock, so a second handle on the file would not open.
+            db = server._metadata_db
+            assert db.store_path == tensor_catalog_path(config_path)
+            assert db.load_decode_rates()["src"][0] == pytest.approx(800.0)
+        finally:
+            server.shutdown()
+            CacheManager.reset()
 
 
 class TestTheExemptSourceKinds:

@@ -515,15 +515,7 @@ hatch stays open: an exporter is additive and needs no migration.
 
 ### Which file
 
-Nothing at all when `annotations.enabled` is false. DuckDB's lock is exclusive,
-so a server holding the catalog open would block `prune-annotations` and every
-other reader for a feature it is not serving — and, since an unopenable store is
-fatal, could refuse to start over annotations it was told not to serve. Being
-disabled drops `rois` from the SQL surface too: empty rows would be the wrong
-answer, because the table is unserved rather than unpopulated and a result set
-cannot say which.
-
-Otherwise `annotations.store_path` when set, else `state_dir()/catalogs/<digest
+`annotations.store_path` when set, else `state_dir()/catalogs/<digest
 of the resolved config path>.duckdb`. A **relative** `store_path` anchors on the
 config file's directory, never on the cwd: a server is started by the control
 plane, by systemd, or by hand from wherever the user was standing, so a
@@ -536,7 +528,20 @@ started with no config file has nothing to derive a name from and stays in
 memory, which is also what `annotations.persist = false` selects.
 
 State tree, not cache: `cache_dir()` is documented as safe for a janitor to
-empty, and half this file is not.
+empty, and half this file is not. The cache's `decode_rates` table is here for
+that reason and no other — it describes the segments, but it would be reset by
+every operator who reclaimed disk if it lived beside them.
+
+`annotations.enabled = false` does **not** change any of the above. It used to:
+the file then held annotations plus a `sources` table rebuilt every boot, so a
+server not serving the actions could skip it for free. It is not free now that
+`decode_rates` is in there. What that gate bought is answered elsewhere —
+`prune-annotations` needs the server stopped in every case (it says so), and an
+unopenable store degrades to an in-memory catalog rather than being fatal when
+annotations are off, because nothing left in the file is load-bearing. Being
+disabled still drops `rois` from the SQL surface: empty rows would be the wrong
+answer, because the table is unserved rather than unpopulated and a result set
+cannot say which.
 
 ### Schema versioning
 
@@ -550,6 +555,9 @@ The split is the same one that runs through the rest of this design:
 
 - **`sources` is not versioned at all.** It is scan output, so it is dropped and
   recreated on open. A change to its columns needs nothing.
+- **`decode_rates` is versioned but never migrated.** Every row is re-measurable
+  by reading, so a bump drops the table and the next run re-collects it — one
+  cache warmup, against a migration ladder for rows nothing can reproduce.
 - **`rois` carries `_ROI_SCHEMA_VERSION`**, stamped in a `catalog_meta` key/value
   table (not in `ALLOWED_TABLES`, so the SQL surface cannot reach it). Older
   files run the `_ROI_MIGRATIONS` ladder; a file from a **newer** build is
