@@ -660,6 +660,85 @@ def _filter_empty_metadata(metadata: Dict) -> Dict:
     return filtered
 
 
+# The pane under the tree: secondary information, deliberately quieter than the
+# tree above it. Shared so the identifier rows sit flush with the lines below.
+_MUTED_QSS = "color: #888; font-size: 11px;"
+
+# Small enough to sit inside an 11px line without becoming the thing the eye
+# lands on -- the identifier is what is being read, the button is how it leaves.
+_COPY_BUTTON_QSS = "QPushButton { font-size: 10px; padding: 0px 5px; }"
+
+
+def _make_selectable(label: QLabel):
+    """Let *label*'s text be selected and copied.
+
+    A QLabel is ``NoTextInteraction`` by default, which is right for a caption
+    and wrong for anything a reader has to get out of the window intact
+    (biopb/biopb#972). The residency badge is deliberately not given this: it is
+    a status glyph, not a value.
+    """
+    label.setTextInteractionFlags(
+        Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+    )
+
+
+class _CopyableIdRow(QWidget):
+    """One ``Name: value`` line of the info pane, with a button that copies it.
+
+    The identifiers in this pane are arguments -- ``Tensor`` is what
+    ``client.get_tensor(...)`` takes -- rather than captions, so they have to
+    leave the screen exactly (biopb/biopb#972). Selecting the text works and is
+    enabled here, but a drag that stops one character short of the end produces
+    an ``array_id`` that is wrong in a way nothing downstream can catch. The
+    button copies the value this row was *given*, never the rendered string, so
+    no styling, eliding or wrapping can get between the two.
+    """
+
+    #: The value that reached the clipboard, for the caller to confirm.
+    copied = Signal(str)
+
+    def __init__(self, name: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._name = name
+        self._value = ""
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+
+        self._label = QLabel()
+        self._label.setWordWrap(True)
+        self._label.setStyleSheet(_MUTED_QSS)
+        _make_selectable(self._label)
+        # Stretched, so the label owns the row's width and wraps inside it
+        # rather than widening the dock. An identifier long enough to be worth
+        # a button fills the line, which is what puts the button at the end of
+        # it; on a short one the button sits at the pane's right edge, aligned
+        # with the row below -- the failure mode worth having.
+        row.addWidget(self._label, stretch=1)
+
+        self._button = QPushButton("Copy")
+        self._button.setStyleSheet(_COPY_BUTTON_QSS)
+        self._button.setToolTip(f"Copy the {name.lower()} to the clipboard")
+        # Top-aligned: a wrapped label is two lines tall and a centred button
+        # would float away from the line whose value it copies.
+        row.addWidget(self._button, alignment=Qt.AlignTop)
+        self._button.clicked.connect(self._copy)
+
+    def set_value(self, value: str):
+        """Show *value*, and make it what the button copies."""
+        self._value = value
+        self._label.setText(f"{self._name}: {value}")
+
+    def value(self) -> str:
+        """What the button would copy right now."""
+        return self._value
+
+    def _copy(self):
+        QApplication.clipboard().setText(self._value)
+        self.copied.emit(self._value)
+
+
 class MetadataDialog(QDialog):
     """Dialog to display source and tensor metadata."""
 
@@ -685,6 +764,7 @@ class MetadataDialog(QDialog):
         url_display = "/" + "/".join(url_parts) if url_parts else source.source_id
         url_label = QLabel(url_display)
         url_label.setStyleSheet("color: #60a5fa; font-weight: bold;")
+        _make_selectable(url_label)
         header_layout.addWidget(url_label)
 
         # Tensor info inline
@@ -701,10 +781,12 @@ class MetadataDialog(QDialog):
             shape_str = _format_shape(tensor_desc.shape)
             shape_label = QLabel(shape_str)
             shape_label.setStyleSheet("color: #a78bfa;")
+            _make_selectable(shape_label)
             header_layout.addWidget(shape_label)
 
             dtype_label = QLabel(tensor_desc.dtype)
             dtype_label.setStyleSheet("color: #fbbf24;")
+            _make_selectable(dtype_label)
             header_layout.addWidget(dtype_label)
 
         # Source-level residency badge (omitted when the server didn't report it)
@@ -1007,7 +1089,7 @@ class TensorBrowserWidget(QWidget):
         drop_layout = QHBoxLayout()
         self._drop_hint_label = QLabel()
         self._drop_hint_label.setWordWrap(True)
-        self._drop_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._drop_hint_label.setStyleSheet(_MUTED_QSS)
         drop_layout.addWidget(self._drop_hint_label, stretch=1)
         self._add_cancel_btn = QPushButton("Cancel")
         self._add_cancel_btn.setFixedWidth(60)
@@ -1017,12 +1099,28 @@ class TensorBrowserWidget(QWidget):
         layout.addLayout(drop_layout)
         self._update_drop_hint()
 
-        # Metadata display
+        # Metadata display. Selectable throughout (biopb/biopb#972): this pane
+        # exists to be read *out of* -- into a notebook cell, an issue, a chat
+        # -- and a QLabel refuses a selection by default. The two identifier
+        # lines are their own rows so each can carry a copy button, since a
+        # drag-selection of an array_id has to land on exactly the right
+        # character and silently does not say when it did not.
+        self._metadata_pane = QWidget()
+        metadata_layout = QVBoxLayout(self._metadata_pane)
+        metadata_layout.setContentsMargins(0, 0, 0, 0)
+        metadata_layout.setSpacing(1)
+        self._source_id_row = _CopyableIdRow("Source")
+        self._tensor_id_row = _CopyableIdRow("Tensor")
+        for id_row in (self._source_id_row, self._tensor_id_row):
+            id_row.copied.connect(self._on_id_copied)
+            metadata_layout.addWidget(id_row)
         self._metadata_label = QLabel()
         self._metadata_label.setWordWrap(True)
-        self._metadata_label.setStyleSheet("color: #888; font-size: 11px;")
-        self._metadata_label.setVisible(False)
-        layout.addWidget(self._metadata_label)
+        self._metadata_label.setStyleSheet(_MUTED_QSS)
+        _make_selectable(self._metadata_label)
+        metadata_layout.addWidget(self._metadata_label)
+        self._metadata_pane.setVisible(False)
+        layout.addWidget(self._metadata_pane)
 
         # Bottom message pane: a single callout that carries both transient
         # status/progress ("Indexing…", "added 3 sources") and inline errors,
@@ -1069,7 +1167,7 @@ class TensorBrowserWidget(QWidget):
         self._clear_error()
         self._clear_status()
         self._tree_widget.clear()
-        self._metadata_label.setVisible(False)
+        self._metadata_pane.setVisible(False)
         self._selected_source_id = None
         self._selected_tensor_id = None
 
@@ -1779,7 +1877,7 @@ class TensorBrowserWidget(QWidget):
                 self._expanded_folders.add(item_id)
             else:
                 self._expanded_folders.discard(item_id)
-            self._metadata_label.setVisible(False)
+            self._metadata_pane.setVisible(False)
             return
 
         # Determine selection
@@ -2203,15 +2301,24 @@ class TensorBrowserWidget(QWidget):
         dialog = MetadataDialog(self, src, tensor_id, metadata)
         dialog.exec_()
 
+    def _on_id_copied(self, value: str):
+        """Confirm a copy in the message pane.
+
+        Naming the value rather than saying "Copied": the two rows sit one line
+        apart and the button that was pressed is not visible in the outcome, so
+        an unnamed confirmation cannot be told from the wrong one.
+        """
+        self._show_status(f"Copied {value}")
+
     def _update_metadata_display(self):
         """Update metadata display for selected tensor."""
         if not self._selected_tensor_id or not self._selected_source_id:
-            self._metadata_label.setVisible(False)
+            self._metadata_pane.setVisible(False)
             return
 
         src = self._sources.get(self._selected_source_id)
         if not src:
-            self._metadata_label.setVisible(False)
+            self._metadata_pane.setVisible(False)
             return
 
         # Find tensor descriptor
@@ -2220,16 +2327,16 @@ class TensorBrowserWidget(QWidget):
             None,
         )
         if not tensor_desc:
-            self._metadata_label.setVisible(False)
+            self._metadata_pane.setVisible(False)
             return
 
         shape_str = _format_shape(tensor_desc.shape)
         dims_str = (
             ", ".join(tensor_desc.dim_labels) if tensor_desc.dim_labels else "N/A"
         )
+        self._source_id_row.set_value(self._selected_source_id)
+        self._tensor_id_row.set_value(self._selected_tensor_id)
         lines = [
-            f"Source: {self._selected_source_id}",
-            f"Tensor: {self._selected_tensor_id}",
             f"Shape: {shape_str}",
             f"Dtype: {tensor_desc.dtype}",
             f"Dims: {dims_str}",
@@ -2242,7 +2349,7 @@ class TensorBrowserWidget(QWidget):
         if tensor_desc.chunk_shape:
             lines.append(f"Chunks: {_format_shape(tensor_desc.chunk_shape)}")
         self._metadata_label.setText("\n".join(lines))
-        self._metadata_label.setVisible(True)
+        self._metadata_pane.setVisible(True)
 
     def _on_filter_text_changed(self, _text: str):
         """Handle filter text change with debounce."""

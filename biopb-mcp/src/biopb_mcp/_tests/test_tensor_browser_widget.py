@@ -1295,3 +1295,84 @@ class TestAddToViewer:
         w._report_failure.assert_called_once()
         assert "Failed to load tensor" in w._report_failure.call_args[0][1]
         w._show_error.assert_not_called()
+
+
+class TestInfoPaneIsReadableOut:
+    """The info pane exists to be read *out of* (biopb/biopb#972).
+
+    `Tensor:` is the argument to `client.get_tensor(...)`, so the pane's job is
+    not finished when it renders the identifier -- it is finished when the
+    identifier can leave the window intact.
+    """
+
+    def _select(self, widget, source_id="ome-tiff_8cc0", tensor="Image:0"):
+        w, conn, _ = widget
+        array_id = f"{source_id}/{tensor}"
+        conn.sources = {source_id: _descriptor(source_id, tensors=[array_id])}
+        w._selected_source_id = source_id
+        w._selected_tensor_id = array_id
+        w._update_metadata_display()
+        return w, source_id, array_id
+
+    def test_the_identifiers_get_their_own_rows(self, widget):
+        w, source_id, array_id = self._select(widget)
+
+        assert w._source_id_row.value() == source_id
+        assert w._tensor_id_row.value() == array_id
+        # ...and are no longer buried in the block below them, or the copy
+        # button would be copying one of two things the pane shows.
+        assert "Source:" not in w._metadata_label.text()
+        assert "Tensor:" not in w._metadata_label.text()
+        assert "Shape:" in w._metadata_label.text()
+
+    def test_every_line_can_be_selected(self, widget):
+        from qtpy.QtCore import Qt
+
+        w, _, _ = self._select(widget)
+
+        for label in (
+            w._metadata_label,
+            w._source_id_row._label,
+            w._tensor_id_row._label,
+        ):
+            flags = label.textInteractionFlags()
+            assert flags & Qt.TextSelectableByMouse
+            assert flags & Qt.TextSelectableByKeyboard
+
+    def test_copy_puts_the_identifier_on_the_clipboard(self, widget):
+        from qtpy.QtWidgets import QApplication
+
+        w, source_id, array_id = self._select(widget)
+
+        w._tensor_id_row._button.click()
+        assert QApplication.clipboard().text() == array_id
+
+        w._source_id_row._button.click()
+        assert QApplication.clipboard().text() == source_id
+
+    def test_copy_takes_the_value_not_the_rendered_line(self, widget):
+        # The label carries a "Tensor: " prefix and may wrap; copying what is
+        # drawn would hand over neither the id nor anything that fails loudly.
+        w, _, array_id = self._select(widget)
+
+        assert w._tensor_id_row.value() == array_id
+        assert w._tensor_id_row._label.text() == f"Tensor: {array_id}"
+
+    def test_a_copy_says_what_it_copied(self, widget):
+        w, _, array_id = self._select(widget)
+        w._show_status = MagicMock()
+
+        w._tensor_id_row._button.click()
+
+        # Named, because the two rows are one line apart and the outcome does
+        # not otherwise say which button was pressed.
+        w._show_status.assert_called_once_with(f"Copied {array_id}")
+
+    def test_the_whole_pane_hides_together(self, widget):
+        w, _, _ = self._select(widget)
+        assert w._metadata_pane.isVisible() or w._metadata_pane.isVisibleTo(w)
+
+        w._selected_tensor_id = None
+        w._update_metadata_display()
+
+        assert not w._metadata_pane.isVisibleTo(w)
