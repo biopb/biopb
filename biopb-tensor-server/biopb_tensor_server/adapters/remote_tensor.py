@@ -301,6 +301,12 @@ class RemoteTensorAdapter(TensorAdapter):
     # upgraded to canonical order would then be re-permuted into the wrong one.
     _normalizable_axes = False
 
+    # A miss here is an upstream round trip plus load on someone else's server,
+    # none of which the local hand-off contains. Measured, a LAN upstream clocks
+    # as fast and is evicted first -- backwards, since it is the one source whose
+    # rebuild leaves this machine.
+    _decode_time_is_rebuild_cost = False
+
     def __init__(
         self,
         source_id: str,

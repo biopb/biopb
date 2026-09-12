@@ -699,6 +699,28 @@ class TensorAdapter(SourceAdapter):
     on ``SourceAdapter``.
     """
 
+    # Whether timing ``get_data`` measures what re-producing the chunk would
+    # cost -- the premise the measured retention rule rests on, since "cheap"
+    # means "cheap to rebuild" (see ``core.retention``). True wherever the
+    # adapter decodes its own bytes from a backend it can read again.
+    #
+    # False for the two kinds that would be measured wrong rather than not at
+    # all, in opposite directions. An upload has no backend: its cache entry is
+    # the only copy, so a local read times a memcpy out of the very cache being
+    # classified and a "cheap" stamp is data loss. A passthrough proxy has one,
+    # but a miss costs an upstream round trip that the local hand-off does not
+    # contain, so timing it clocks a LAN upstream as fast and evicts it first.
+    # Both are declined here rather than measured and ignored: a rate nobody may
+    # act on is a diagnostic that reads as fact.
+    #
+    # Both also override ``resolve_chunk_data`` today and so never reach the
+    # sample site, which is what makes this a guard rather than a live switch.
+    # It is declared because that structural exemption is invisible from either
+    # adapter -- neither file mentions retention -- so narrowing an override
+    # (biopb/biopb#265, to serve a cache source's scaled reads from the chunks
+    # it already holds) would otherwise enrol it silently.
+    _decode_time_is_rebuild_cost: bool = True
+
     @abstractmethod
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return the full **serving** descriptor for this bound tensor.
@@ -1121,6 +1143,8 @@ class TensorAdapter(SourceAdapter):
             # Full resolution, or a native level's own store -- either way the
             # ladder has nothing to say about it, and only what it costs to
             # decode can separate one worth keeping from one worth dropping.
+            if not self._decode_time_is_rebuild_cost:
+                return "normal"
             if array_id is None:
                 array_id = array_id_from_chunk_id(chunk_id)
             return retention_for_array(array_id)
@@ -1195,9 +1219,10 @@ class TensorAdapter(SourceAdapter):
                 # this returns -- stays out of the number.
                 started = time.perf_counter()
                 result_arr = self.get_data(bounds)
-                record_decode(
-                    array_id, result_arr.nbytes, time.perf_counter() - started
-                )
+                if self._decode_time_is_rebuild_cost:
+                    record_decode(
+                        array_id, result_arr.nbytes, time.perf_counter() - started
+                    )
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
             # string, wrapped zero-copy. This preserves the exact dtype including

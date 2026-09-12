@@ -49,6 +49,12 @@ class CachedSourceAdapter(TensorAdapter):
     Cache-backed sources allow arbitrary chunk bounds (no uniformity enforcement).
     """
 
+    # There is no backend to re-read: the cache entry is the upload's only copy,
+    # so a read times a memcpy out of the cache being classified. Measured, it
+    # would clock at DRAM speed and be marked "cheap" -- the class eviction takes
+    # first -- for data that cannot be rebuilt at any price.
+    _decode_time_is_rebuild_cost = False
+
     @classmethod
     def create_from_config(
         cls, source: SourceConfig, credentials_config: Optional[Any] = None

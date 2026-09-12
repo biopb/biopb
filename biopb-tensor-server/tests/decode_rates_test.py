@@ -515,23 +515,54 @@ class TestTheStartupWiring:
 
 
 class TestTheExemptSourceKinds:
-    """Two source kinds must never be classified by measured decode cost, and
-    both are exempt by construction: they override ``resolve_chunk_data`` and so
-    never reach the sample site or ``_retention_for_chunk``. Pinned here because
-    the exemption is structural -- nothing in either file mentions retention, so
-    deleting an override would silently enrol it."""
+    """Two source kinds must never be classified by measured decode cost. Both
+    override ``resolve_chunk_data`` and so never reach the sample site today,
+    but that exemption is invisible from either file -- neither mentions
+    retention -- so each also *declares* it. The override is what makes them
+    exempt now; the declaration is what keeps them exempt when one is narrowed
+    (biopb/biopb#265 wants a cache source's scaled reads served through the base
+    seam)."""
 
-    def test_the_proxy_overrides_the_seam_that_would_classify_it(self):
+    def test_the_proxy_declines_to_be_measured(self):
         """A miss on a passthrough proxy is an upstream round trip plus load on
         someone else's server. Timing the local hand-off would clock a LAN
         upstream as fast and evict it first, which is backwards."""
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
-        from biopb_tensor_server.core.adapter_base import TensorAdapter
 
-        assert (
-            RemoteTensorAdapter.resolve_chunk_data
-            is not TensorAdapter.resolve_chunk_data
+        assert not RemoteTensorAdapter._decode_time_is_rebuild_cost
+
+    def test_an_upload_declines_to_be_measured(self):
+        """An upload has no backend at all, so a read times a memcpy out of the
+        cache being classified -- DRAM speed, and "cheap" is data loss."""
+        from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+
+        assert not CachedSourceAdapter._decode_time_is_rebuild_cost
+
+    def test_declining_holds_at_the_seam_itself(self, tmp_path):
+        """The guard, not the override: an adapter that declines is neither
+        sampled nor reclassified even when it reads through the base seam. This
+        is what a narrowed override falls back on."""
+
+        class _Borrowed(ZarrAdapter):
+            _decode_time_is_rebuild_cost = False
+
+        path = tmp_path / "b.zarr"
+        arr = zarr.open_array(str(path), mode="w", shape=(128, 128), chunks=(128, 128))
+        arr[:] = 3
+        adapter = _Borrowed(zarr.open_array(str(path), mode="r"), "lent", ["y", "x"])
+
+        set_active_decode_rates(DecodeRates(cheap_mbps=1e-6))  # everything clears it
+        manager = CacheManager(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
         )
+        try:
+            bounds = ChunkBounds(start=[0, 0], stop=[128, 128])
+            adapter.resolve_chunk_data(encode_chunk_id("lent", bounds), manager)
+
+            assert active_decode_rates().snapshot() == {}
+            assert {key[0] for key in manager.backend._pool_queues} == {"normal"}
+        finally:
+            manager.close()
 
     def test_an_upload_is_neither_measured_nor_reclassified(self, tmp_path):
         """The cache entry is an upload's only copy -- ``get_data`` raises, so
