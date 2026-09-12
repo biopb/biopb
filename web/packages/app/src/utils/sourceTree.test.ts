@@ -63,14 +63,41 @@ describe("recentNode", () => {
     expect(recentNode([])).toBeNull();
   });
 
-  it("keeps the order given, rather than sorting it", () => {
-    // Recency is the whole point of the node, which is why it is built beside
-    // `buildTree` instead of inside it -- that one sorts alphabetically.
+  it("sorts by name, so a click cannot re-order the list under the pointer", () => {
+    // `recents` arrives newest first. Rendering it that way moved the row just
+    // clicked to the top, putting the next row somewhere else.
     const node = recentNode([UPLOAD, source()]);
-    expect(node?.children.map((c) => c.source?.source_id)).toEqual([
-      "upload_7f3",
-      "zarr_a3f2",
+    expect(node?.children.map((c) => c.name)).toEqual(["plate1.zarr", "upload_7f3"]);
+  });
+
+  it("orders the same however recency shuffles", () => {
+    const byName = (n: ReturnType<typeof recentNode>) =>
+      n?.children.map((c) => c.source?.source_id);
+    const a = source({ source_id: "s1", source_url: "file:///d/a.zarr" });
+    const b = source({ source_id: "s2", source_url: "file:///d/b.zarr" });
+    expect(byName(recentNode([a, b]))).toEqual(byName(recentNode([b, a])));
+  });
+
+  it("breaks a name tie on source_id rather than leaving it to recency", () => {
+    // Two folders, one basename. `Array.sort` is stable, so without the
+    // tiebreak these two keep their incoming recency order and still swap on a
+    // click -- the case where the rows look alike and the jump is least
+    // visible.
+    const a = source({ source_id: "aaa", source_url: "file:///one/plate1.zarr" });
+    const b = source({ source_id: "bbb", source_url: "file:///two/plate1.zarr" });
+    expect(recentNode([b, a])?.children.map((c) => c.source?.source_id)).toEqual([
+      "aaa",
+      "bbb",
     ]);
+  });
+
+  it("does not reorder the caller's array", () => {
+    // `recentIds`/`recentSources` stay newest-first: that is what the cap
+    // evicts by, and sorting in place would quietly change which entry is
+    // dropped next.
+    const recents = [UPLOAD, source()];
+    recentNode(recents);
+    expect(recents.map((s) => s.source_id)).toEqual(["upload_7f3", "zarr_a3f2"]);
   });
 
   it("namespaces its row ids away from the catalog's", () => {

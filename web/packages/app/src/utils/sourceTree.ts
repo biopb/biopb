@@ -80,13 +80,30 @@ export function sourceLabel(src: DataSourceDescriptor): string {
 /**
  * The "Recent" folder, or null when nothing is in it.
  *
- * Built beside `buildTree` and prepended rather than merged into it, for two
- * reasons: `buildTree` sorts alphabetically and recency order is the whole point
- * of this node, and a recent source often has no path to hang under -- an upload
- * has no path at all.
+ * Built beside `buildTree` and prepended rather than merged into it because a
+ * recent source often has no path to hang under -- an upload has no path at
+ * all.
+ *
+ * **Recency decides membership, not order.** `recents` arrives newest first and
+ * that is what the cap evicts by, but displaying it that way moved a row to the
+ * top the moment it was clicked, re-sorting the list under the pointer and
+ * leaving the next click somewhere else. Sorted by name the rows stay put, and
+ * a list short enough to be a shortcut does not need to advertise which entry
+ * was most recent.
+ *
+ * The tiebreak is load-bearing rather than tidiness: two sources can share a
+ * leaf name (`plate1.zarr` under different folders), `Array.sort` is stable, and
+ * without it those two would keep their incoming *recency* order -- reproducing
+ * the jump this exists to remove, in exactly the case where two rows look alike
+ * and a swap is hardest to notice.
  */
 export function recentNode(recents: DataSourceDescriptor[]): TreeNode | null {
   if (recents.length === 0) return null;
+  recents = [...recents].sort(
+    (a, b) =>
+      sourceLabel(a).localeCompare(sourceLabel(b)) ||
+      a.source_id.localeCompare(b.source_id),
+  );
   return {
     id: RECENT_FOLDER_ID,
     name: "Recent",
