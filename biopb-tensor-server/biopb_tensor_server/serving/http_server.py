@@ -1884,13 +1884,17 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        sources = client.list_sources()
-        if source_id not in sources:
+        # One row, not the whole catalog. This route is addressed -- the id is
+        # already in hand -- so streaming every source to look one up cost
+        # O(catalog) per call and, worse, inherited the listing's safety cap:
+        # a source past it answered 404 while being perfectly readable.
+        source = client.get_source(source_id)
+        if source is None:
             raise HTTPException(
                 status_code=404, detail=f"Source not found: {source_id}"
             )
         ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-        return JSONResponse(_source_desc_to_dict(sources[source_id]))
+        return JSONResponse(_source_desc_to_dict(source))
     except HTTPException:
         raise
     except Exception as exc:

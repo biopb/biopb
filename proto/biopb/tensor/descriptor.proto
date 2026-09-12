@@ -191,10 +191,20 @@ message SliceHint {
   repeated int64 stop = 2;
 }
 
-// Placeholder for future ListFlights filtering criteria
-// Currently empty - server returns all tensors
+// ListFlights filtering criteria. Empty (or absent) means "every source",
+// which is what an old client sends and what every server before this field
+// returned.
 message TensorCriteria {
   reserved 1 to 10; // Future: prefix, dtype_filter, shape_range, etc.
+
+  // Restrict the listing to the one source with this id.
+  //
+  // Addressing, not browsing: the caller already holds the id, so this asks
+  // the catalog a WHERE rather than reading it whole and discarding the rest.
+  // It does NOT widen what is enumerable -- a source absent from the listing
+  // is absent here too, and the safety cap is simply not reached by a
+  // single-row answer.
+  string source_id = 11;
 }
 
 // Placeholder for future write options

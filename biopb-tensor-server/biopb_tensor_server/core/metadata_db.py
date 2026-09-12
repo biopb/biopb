@@ -1456,7 +1456,7 @@ class MetadataDatabase:
         return parsed if isinstance(parsed, dict) else None
 
     def list_source_descriptors(
-        self, limit: Optional[int] = None
+        self, limit: Optional[int] = None, source_id: Optional[str] = None
     ) -> Tuple[List[DataSourceDescriptor], int]:
         """Rebuild the lean ListFlights descriptors from the catalog.
 
@@ -1485,29 +1485,46 @@ class MetadataDatabase:
         Args:
             limit: Max rows to return (the ListFlights safety cap). ``None`` =
                 no cap.
+            source_id: Restrict to this one source. ``None`` = the whole
+                catalog. A filtered read answers an *address*, so ``total``
+                counts the matching rows (0 or 1) rather than the catalog --
+                which is what makes a single-source lookup incapable of
+                reporting truncation, since one row is never clipped by a cap.
 
         Returns:
-            ``(descriptors, total)`` where ``total`` is the full catalog row
-            count (so the caller can signal truncation when ``limit`` clips it).
+            ``(descriptors, total)`` where ``total`` is the row count matching
+            the filter before ``limit`` (so the caller can signal truncation
+            when ``limit`` clips it).
         """
         cursor = self._get_cursor()
 
-        sql = (
-            "SELECT source_id, source_url, source_type, data_resident, tensors, "
-            "COUNT(*) OVER () AS total_count "
-            "FROM sources ORDER BY source_id"
-        )
-        params: list = []
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
-        rows = cursor.execute(sql, params).fetchall()
-
-        # COUNT(*) OVER () is identical on every row; no rows -> empty catalog.
-        total = rows[0][-1] if rows else 0
+        if source_id is not None:
+            # A single-row address: never clipped by ``limit``, so the window
+            # function that exists only to report truncation is dead weight
+            # here -- ``total`` is just how many rows matched (0 or 1).
+            sql = (
+                "SELECT source_id, source_url, source_type, data_resident, tensors "
+                "FROM sources WHERE source_id = ?"
+            )
+            rows = cursor.execute(sql, [source_id]).fetchall()
+            total = len(rows)
+        else:
+            sql = (
+                "SELECT source_id, source_url, source_type, data_resident, tensors, "
+                "COUNT(*) OVER () AS total_count "
+                "FROM sources ORDER BY source_id"
+            )
+            params: list = []
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(limit)
+            rows = cursor.execute(sql, params).fetchall()
+            # COUNT(*) OVER () is identical on every row; no rows -> empty catalog.
+            total = rows[0][-1] if rows else 0
+            rows = [row[:-1] for row in rows]
 
         descriptors: List[DataSourceDescriptor] = []
-        for source_id, source_url, source_type, data_resident, tensors, _ in rows:
+        for source_id, source_url, source_type, data_resident, tensors in rows:
             tensor_descs = [
                 TensorDescriptor(
                     array_id=t["array_id"],

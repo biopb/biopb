@@ -85,6 +85,35 @@ class TestTensorFlightClientRoundTrip:
         assert list(source_desc.tensors[0].shape) == [128, 128]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_source_answers_one_id(self, server_client):
+        """The addressed counterpart of list_sources: same descriptor, one row."""
+        desc = server_client.get_source("test-tensor")
+        assert desc is not None
+        assert desc.source_id == "test-tensor"
+        assert [t.array_id for t in desc.tensors] == ["test-tensor"]
+        assert list(desc.tensors[0].shape) == [128, 128]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_source_is_none_for_an_unknown_id(self, server_client):
+        assert server_client.get_source("no-such-source") is None
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_source_does_not_pose_as_a_listing(self, server_client):
+        """An addressed answer must not land in the listing cache.
+
+        Callers read that map's membership as "what the catalog holds", so one
+        lookup folded into it would make an unlisted source -- an upload, or one
+        past the cap -- look like it had been browsed.
+        """
+        client = server_client
+        client.list_sources()
+        before = dict(client._catalog._state.sources)
+
+        client.get_source("test-tensor")
+
+        assert client._catalog._state.sources == before
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_shape(self, server_client):
         """Test tensor shape retrieval."""
         darr = server_client.get_tensor("test-tensor")
