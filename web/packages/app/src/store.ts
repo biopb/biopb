@@ -14,6 +14,13 @@ import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
 import { clampSliceTo } from "./utils/vivUtils";
+import {
+  descriptorFromTileInfo,
+  forget as forgetRecents,
+  readRecents,
+  remember as rememberRecent,
+  writeRecents,
+} from "./utils/recentSources";
 import { splitArrayVersion } from "@biopb/tensor-flight-client";
 import {
   DEFAULT_VOLUME_RENDER_MODE,
@@ -112,6 +119,22 @@ export interface AppState {
   // running. Lets the source list show "Indexing…" instead of "No sources" when
   // the catalog is briefly empty at startup. Refreshed from /readyz.
   scanning: boolean;
+
+  /**
+   * source_ids this browser has opened, most recent first. Persisted; see
+   * `utils/recentSources`.
+   */
+  recentIds: readonly string[];
+  /**
+   * `recentIds` resolved to something renderable, same order.
+   *
+   * Shorter than `recentIds` whenever an id did not resolve this pass. A listed
+   * source is taken straight from `sources`; an unlisted one -- a `cache://`
+   * upload, or a source past the catalog cap -- is rebuilt from its `tile_info`,
+   * which resolves against the Flight server's registry rather than the catalog
+   * and so answers for both.
+   */
+  recentSources: DataSourceDescriptor[];
 
   // Active selection
   activeSourceId: string | null;
@@ -345,6 +368,12 @@ export interface AppState {
   loadSources: () => Promise<void>;
   querySources: (sql: string) => Promise<QuerySourcesResult>;
   selectSource: (sourceId: string | null, tensorId?: string) => void;
+  /** Record a source as just opened, and persist the list. */
+  noteRecent: (sourceId: string) => void;
+  /** Adopt a list written by another tab. Does not write it back. */
+  syncRecents: (ids: readonly string[]) => void;
+  /** Resolve `recentIds` into `recentSources`, dropping ids the server 404s. */
+  hydrateRecents: () => Promise<void>;
   setSlice: (partial: Partial<SliceState>) => void;
   setTileInfo: (value: TileInfo | null, forArrayId: string) => void;
   loadRois: (arrayId: string) => Promise<void>;
@@ -430,6 +459,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   sources: [],
   sourcesLoading: false,
   scanning: false,
+
+  // Seeded at module init, like the persisted channel colors below, so the node
+  // is populated on the first render rather than after an effect. `readRecents`
+  // answers [] where there is no storage, which covers node.
+  recentIds: readRecents(),
+  recentSources: [],
 
   activeSourceId: null,
   activeTensorId: null,
@@ -530,6 +565,61 @@ export const useAppStore = create<AppState>((set, get) => ({
     return client.http.querySources(sql);
   },
 
+  noteRecent(sourceId) {
+    const next = rememberRecent(get().recentIds, sourceId);
+    // `remember` hands back the same array when the id is already the head, so
+    // the repeat calls from `applyViewerState` -- one per slider move -- cost a
+    // comparison rather than a write.
+    if (next === get().recentIds) return;
+    set({ recentIds: next });
+    writeRecents(next);
+  },
+
+  syncRecents(ids) {
+    // No write back: this is another tab's list arriving, and echoing it would
+    // have the two tabs writing over each other on every change.
+    set({ recentIds: ids });
+  },
+
+  async hydrateRecents() {
+    const { client, recentIds, sources } = get();
+    if (!client) return;
+    const listed = new Map(sources.map((s) => [s.source_id, s]));
+
+    const gone: string[] = [];
+    const resolved = await Promise.all(
+      recentIds.map(async (id) => {
+        const known = listed.get(id);
+        if (known) return known;
+        try {
+          // Registry-backed, unlike /api/sources, which reads the catalog and so
+          // 404s every `cache://` upload by construction. This is the same call
+          // the render path makes, so an id that resolves here is one that will
+          // open.
+          return descriptorFromTileInfo(id, await client.http.tileInfo(id));
+        } catch (err) {
+          // A 404 is the server saying the id names nothing: evicted, or lost to
+          // a restart. Anything else -- unreachable, 5xx, a timeout -- says
+          // nothing about the id, so the entry stays and simply does not render
+          // this pass.
+          if (err instanceof TensorApiError && err.status === 404) gone.push(id);
+          return null;
+        }
+      }),
+    );
+
+    const kept = forgetRecents(get().recentIds, gone);
+    if (kept !== get().recentIds) {
+      set({ recentIds: kept });
+      writeRecents(kept);
+    }
+    set({
+      recentSources: resolved.filter(
+        (desc): desc is DataSourceDescriptor => desc !== null,
+      ),
+    });
+  },
+
   selectSource(sourceId, tensorId) {
     if (!sourceId) {
       set({ activeSourceId: null, activeTensorId: null, requestedArrayId: null });
@@ -542,6 +632,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // derivations of one identity that can disagree, where the geometry came
     // from tensors[0] and the read went somewhere else.
     const tid = tensorId ?? sourceId;
+    get().noteRecent(sourceId);
     set({
       activeSourceId: sourceId,
       activeTensorId: tid,
@@ -937,8 +1028,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       },
       volumeRenderMode: s.volumeRenderMode,
     });
+    const sourceId = stable.split("/", 1)[0] ?? null;
+    // A link counts as opening the source: reaching a `cache://` upload by its
+    // returned id is the case the list exists for, and that arrives as a URL.
+    // An id that names nothing is recorded too, then dropped by the first
+    // hydrate that 404s it -- cheaper than resolving before recording, and the
+    // same answer.
+    if (sourceId) get().noteRecent(sourceId);
     set({
-      activeSourceId: stable.split("/", 1)[0] ?? null,
+      activeSourceId: sourceId,
       activeTensorId: stable,
       requestedArrayId: requested,
       slice: next.slice,

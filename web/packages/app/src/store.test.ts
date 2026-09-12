@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { TensorApiError } from "@biopb/tensor-flight-client";
 import type {
   DataSourceDescriptor,
   RoiAnnotation,
@@ -887,5 +888,126 @@ describe("the overlay toggle governs the whole annotation surface", () => {
     useAppStore.getState().setShowRois(false);
     useAppStore.getState().setShowRois(true);
     expect(selectDraft(useAppStore.getState())).not.toBeNull();
+  });
+});
+
+describe("recent sources", () => {
+  const recentClient = (
+    sources: DataSourceDescriptor[],
+    tileInfo: (id: string) => Promise<TileInfo>,
+  ) =>
+    ({
+      listSources: vi.fn().mockResolvedValue(sources),
+      http: {
+        readyz: vi.fn().mockResolvedValue({ backend_health: {} }),
+        tileInfo: vi.fn(tileInfo),
+      },
+    }) as unknown as TensorFlightClient;
+
+  const UPLOAD_INFO = {
+    array_id: "upload_7f3@abcd1234",
+    dim_labels: ["Y", "X"],
+    shape: [1024, 1024],
+    chunk_shape: [256, 256],
+    dtype: "uint16",
+  } as unknown as TileInfo;
+
+  const apiError = (status: number) =>
+    new TensorApiError(status, status === 404 ? "Not Found" : "Bad Gateway", "");
+
+  it("rebuilds an unlisted id from tile_info, which the catalog cannot answer", async () => {
+    // The whole point: a cache:// upload is deliberately never in the catalog
+    // (biopb/biopb#265), so /api/sources 404s it and only the registry-backed
+    // tile_info can describe it.
+    const client = recentClient([], async () => UPLOAD_INFO);
+    useAppStore.setState({ client, sources: [], recentIds: ["upload_7f3"] });
+
+    await useAppStore.getState().hydrateRecents();
+
+    const [row] = useAppStore.getState().recentSources;
+    expect(row?.source_id).toBe("upload_7f3");
+    expect(row?.tensors[0]?.shape).toEqual([1024, 1024]);
+  });
+
+  it("reuses the catalog descriptor instead of a round trip", async () => {
+    const tileInfo = vi.fn(async () => UPLOAD_INFO);
+    const client = recentClient([SOURCE], tileInfo);
+    useAppStore.setState({ client, sources: [SOURCE], recentIds: [SOURCE.source_id] });
+
+    await useAppStore.getState().hydrateRecents();
+
+    expect(client.http.tileInfo).not.toHaveBeenCalled();
+    expect(useAppStore.getState().recentSources[0]).toBe(SOURCE);
+  });
+
+  it("drops an id the server says is gone", async () => {
+    const client = recentClient([], async () => {
+      throw apiError(404);
+    });
+    useAppStore.setState({ client, sources: [], recentIds: ["evicted"] });
+
+    await useAppStore.getState().hydrateRecents();
+
+    expect(useAppStore.getState().recentIds).toEqual([]);
+    expect(useAppStore.getState().recentSources).toEqual([]);
+  });
+
+  it("keeps an id the server merely failed to answer for", async () => {
+    // A 502 says nothing about the id. Pruning on it would empty the list
+    // exactly when the server is down -- when it is most worth keeping.
+    const client = recentClient([], async () => {
+      throw apiError(502);
+    });
+    useAppStore.setState({ client, sources: [], recentIds: ["upload_7f3"] });
+
+    await useAppStore.getState().hydrateRecents();
+
+    expect(useAppStore.getState().recentIds).toEqual(["upload_7f3"]);
+    expect(useAppStore.getState().recentSources).toEqual([]);
+  });
+
+  it("keeps recency order across both resolution paths", async () => {
+    const client = recentClient([SOURCE], async () => UPLOAD_INFO);
+    useAppStore.setState({
+      client,
+      sources: [SOURCE],
+      recentIds: ["upload_7f3", SOURCE.source_id],
+    });
+
+    await useAppStore.getState().hydrateRecents();
+
+    expect(useAppStore.getState().recentSources.map((s) => s.source_id)).toEqual([
+      "upload_7f3",
+      SOURCE.source_id,
+    ]);
+  });
+
+  it("records a source opened from a link", async () => {
+    // The case the list exists for: an upload is reachable only by the id its
+    // DoPut returned, which arrives as a URL.
+    useAppStore.setState({ recentIds: [] });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=upload_7f3"));
+    expect(useAppStore.getState().recentIds).toEqual(["upload_7f3"]);
+  });
+
+  it("records the source, not the field, when a link names a tensor", () => {
+    useAppStore.setState({ recentIds: [] });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=multi/Image:2"));
+    expect(useAppStore.getState().recentIds).toEqual(["multi"]);
+  });
+
+  it("does not reorder on a repeat visit to what is already newest", () => {
+    // applyViewerState re-runs on every slider move; a fresh list each time
+    // would be a localStorage write per frame.
+    useAppStore.setState({ recentIds: ["a", "b"] });
+    const before = useAppStore.getState().recentIds;
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=a"));
+    expect(useAppStore.getState().recentIds).toBe(before);
+  });
+
+  it("adopts another tab's list without writing it back", () => {
+    useAppStore.setState({ recentIds: ["a"] });
+    useAppStore.getState().syncRecents(["b", "a"]);
+    expect(useAppStore.getState().recentIds).toEqual(["b", "a"]);
   });
 });
