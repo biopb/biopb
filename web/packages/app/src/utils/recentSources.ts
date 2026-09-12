@@ -27,8 +27,11 @@ import type {
 const STORAGE_KEY = "biopb.recentSources";
 
 /** Long enough to cover a session's hopping, short enough that the node stays a
- * shortcut rather than a second catalog. */
-export const MAX_RECENT = 20;
+ * shortcut rather than a second catalog -- on a laptop-height sidebar a longer
+ * list is the whole pane, and the catalog it sits above has to be scrolled to
+ * at all. Sorting by name removed the recency cue that would have made a longer
+ * list skimmable. */
+export const MAX_RECENT = 15;
 
 /**
  * `id` at the front, every other entry in order, nothing twice, capped.
