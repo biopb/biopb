@@ -34,14 +34,11 @@ import {
   type TileInfo,
   type VolumeAvailable,
 } from "@biopb/tensor-flight-client";
-import { selectObservedLimits, useAppStore } from "../store";
+import { useAppStore } from "../store";
+import { useContrastWindow } from "../hooks/useContrastWindow";
 import type { ViewerErrorKind } from "./ViewerPane";
 import {
-  clampContrastLimits,
-  contrastLimitsFrom,
   contrastSamples,
-  contrastTrack,
-  percentileBounds,
   vivColor,
   CAMERA_MIRROR_MS,
 } from "../utils/vivUtils";
@@ -211,52 +208,9 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   // costs nothing beyond the sort.
   const samples = useMemo(() => (current ? contrastSamples(current) : null), [current]);
 
-  // The plane's own extremes, which the window no longer reports once it is
-  // fixed. Deliberately not keyed to the current selection: the last plane
-  // sampled is what Min/Max should reset onto, and holding it across a read
-  // keeps the button from going dead for the length of one.
-  const planeLimits = useMemo(() => samples ? contrastLimitsFrom(samples, 0, 100) : null, [samples]);
-  const setPlaneLimits = useAppStore((s) => s.setPlaneLimits);
-  const noteObservedLimits = useAppStore((s) => s.noteObservedLimits);
-  useEffect(() => {
-    if (!planeLimits) return;
-    setPlaneLimits(planeLimits);
-    noteObservedLimits(planeLimits, arrayId, slice.c);
-  }, [planeLimits, arrayId, slice.c, setPlaneLimits, noteObservedLimits]);
-  // Every level the tensor has shown, which is what a float track is drawn on:
-  // a window fixed against a bright plane has to stay reachable from a dim one.
-  const observedLimits = useAppStore(selectObservedLimits);
-
-  const contrastLimits = useMemo<[number, number]>(() => {
-    if (!info) return [0, 1];
-    const dtype = vivDtype(info.dtype);
-    // `planeLimits` as well as the union: on a tensor's first plane the union
-    // has not been written back to the store yet.
-    const range = contrastTrack(dtype, observedLimits, planeLimits, slice.fixedLimits);
-    // A fixed window is the user's, not the plane's: it is not re-derived per
-    // plane, only brought inside the track it is being applied to -- the
-    // dtype's range, or on a float tensor the levels the data has shown.
-    if (slice.contrastMode === "fixed") {
-      return slice.fixedLimits ? clampContrastLimits(slice.fixedLimits, range, dtype) : range;
-    }
-    if (!samples) return range;
-    const [lo, hi] = percentileBounds(slice.percentileScale);
-    return contrastLimitsFrom(samples, lo, hi);
-  }, [
-    info,
-    observedLimits,
-    planeLimits,
-    samples,
-    slice.contrastMode,
-    slice.fixedLimits,
-    slice.percentileScale,
-  ]);
-
-  // Published so the panel can seed a fixed window from what is on screen.
-  const setAppliedLimits = useAppStore((s) => s.setAppliedLimits);
-  useEffect(() => {
-    setAppliedLimits(contrastLimits);
-  }, [contrastLimits, setAppliedLimits]);
+  // Not only a derivation: this also publishes the plane limits, the track and
+  // the applied window that SliceControls reads.
+  const contrastLimits = useContrastWindow(info, samples, arrayId, slice);
 
   const color = useMemo(() => {
     const stored = channelColors[sourceId]?.[slice.c] ?? "auto";

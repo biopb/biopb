@@ -3,7 +3,7 @@
 import { sliderAxes, vivDtype, type SliderAxis } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { selectObservedLimits, selectTileInfo, useAppStore } from "../store";
+import { selectContrastTrack, selectTileInfo, useAppStore } from "../store";
 import {
   PRESET_COLORS,
   type ColorValue,
@@ -118,7 +118,6 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const setVolumeRenderMode = useAppStore((s) => s.setVolumeRenderMode);
   const appliedLimits = useAppStore((s) => s.appliedLimits);
   const planeLimits = useAppStore((s) => s.planeLimits);
-  const observedLimits = useAppStore(selectObservedLimits);
   const playAxis = useAppStore((s) => s.playAxis);
   const setPlayAxis = useAppStore((s) => s.setPlayAxis);
 
@@ -267,11 +266,22 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // one, so the window's position on the bar says what part of the possible
   // signal is in view; for a float tensor, which has no such range, every level
   // the data has shown -- not just this plane's, or a window chosen against a
-  // bright plane could not be widened from a dim one. `sliderGrid` supplies the
-  // dtype from the live grid or the catalog.
+  // bright plane could not be widened from a dim one.
+  //
+  // Taken from the viewer rather than re-derived here (biopb/biopb#955): the
+  // viewer derives it from plane limits that reach the store one effect later,
+  // so a copy of the derivation drew this bar on a different track than the
+  // shader was clamping into for a render after every plane change.
+  //
+  // The fallback is reached whenever no viewer is publishing -- a WebGL
+  // failure, an unsupported tensor, the lazy chunk still loading. Dtype alone
+  // is exact for every dtype with an intrinsic range, and for a float tensor
+  // nothing has read yet there is nothing better to say. `sliderGrid` supplies
+  // the dtype from the live grid or the catalog, so this needs no read.
+  const published = useAppStore(selectContrastTrack);
   const track = useMemo<[number, number]>(
-    () => contrastTrack(dtype, observedLimits, planeLimits, slice.fixedLimits),
-    [dtype, observedLimits, planeLimits, slice.fixedLimits],
+    () => published ?? contrastTrack(dtype),
+    [published, dtype],
   );
   const fixedStep = useMemo(() => contrastStep(track, dtype), [track, dtype]);
   // Local first (a drag in progress), then the committed window, then whatever
