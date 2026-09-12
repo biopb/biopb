@@ -77,29 +77,30 @@ is the local **default**, not a property of local mode.
 > **Route ordering:** `/api/sources/{id}/metadata` and `/ticket/{ticket_hex}` are
 > registered *before* the greedy `{source_id:path}` catch-all to avoid Starlette
 > first-match shadowing.
+>
+> **`/readyz` connects.** It opens the Flight connection if none exists yet, so it
+> answers from the backend rather than from whatever traffic happened to arrive
+> first, and it is safe for a supervisor to gate on. `backend_health` is `null`
+> exactly when the backend was not reached, and `backend_error` then says why
+> (`connect failed: …` vs `health check failed: …`) — the two used to be
+> indistinguishable, and both looked the same as "nobody has asked yet"
+> (biopb/biopb#755).
 
-> `/readyz` opens the Flight connection if none exists yet, so it answers from the
-> backend rather than from whatever traffic happened to arrive first, and it is
-> safe for a supervisor to gate on. `backend_health` is `null` exactly when the
-> backend was not reached, and `backend_error` then says why (`connect failed: …`
-> vs `health check failed: …`) — the two used to be indistinguishable, and both
-> looked the same as "nobody has asked yet" (biopb/biopb#755).
+**ROI annotations** (`/api/rois/*`) carry canonical proto3 JSON of
+`biopb.image.RoiAnnotation` in both directions. The version token is stripped
+from `array_id` before the store sees it — from the path *and* from each
+annotation in a POST body, since responses carry versioned ids and a
+read-edit-write round trip hands one back — and spliced onto the response.
+Annotations anchor on the unversioned id so they outlive an in-place edit.
+`501` means the server does not offer annotations (disabled, or no metadata
+DB); `422` means the request was rejected (geometry the store does not accept,
+mismatched `array_id`, per-tensor cap). Design: `roi-annotations.md`.
 
-
-> **ROI annotations** (`/api/rois/*`) carry canonical proto3 JSON of
-> `biopb.image.RoiAnnotation` in both directions. The version token is stripped
-> from `array_id` before the store sees it — from the path *and* from each
-> annotation in a POST body, since responses carry versioned ids and a
-> read-edit-write round trip hands one back — and spliced onto the response.
-> Annotations anchor on the unversioned id so they outlive an in-place edit. `501` means the server does not offer annotations (disabled, or no
-> metadata DB); `422` means the request was rejected (geometry the store does not
-> accept, mismatched `array_id`, per-tensor cap). Design: `roi-annotations.md`.
-
-> **Source listings are structural.** Each `tensors[]` entry on `/api/sources`
-> carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`
-> there and is **not** a usable grid. The transfer grid belongs to the tensor the
-> server binds to serve a read, so ask `/api/tile_info/{array_id}` for it
-> (biopb/biopb#812).
+**Source listings are structural.** Each `tensors[]` entry on `/api/sources`
+carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`
+there and is **not** a usable grid. The transfer grid belongs to the tensor the
+server binds to serve a read, so ask `/api/tile_info/{array_id}` for it
+(biopb/biopb#812).
 
 ## Tile endpoints
 
@@ -271,10 +272,10 @@ The ETag is computed over the **resolved** selection rather than the raw
 parameters, so the two spellings of one plane share a cache entry and a
 parameter the resolution ignored cannot vary the key.
 
-| | |
-|---|---|
+| Part | Contents |
+|------|----------|
 | body | `application/octet-stream`, the tensor's own dtype, C-contiguous. `X-Shape` / `X-Dtype` / `X-Dim-Labels` as on `/api/slice` |
-| always | `ETag`, `Cache-Control: private, max-age=3600`, `Vary: Authorization`, `X-Tile-Size` / `-Level` / `-Col` / `-Row` |
+| headers (always) | `ETag`, `Cache-Control: private, max-age=3600`, `Vary: Authorization`, `X-Tile-Size` / `-Level` / `-Col` / `-Row` |
 
 `If-None-Match` revalidates to **304 without reading tile data**. Revalidation
 still consults the catalog to resolve the tensor descriptor and compute the
@@ -313,24 +314,24 @@ into a cheap 304 by a stale or forged `If-None-Match`.
 > exhausts memory succeeds. Hence the level gate, and hence it rejects before
 > `get_tensor()` rather than letting the read path discover it.
 
-> **Two cache policies, chosen by the URL.** A tile whose `array_id` carries a
-> content version (below) gets `private, max-age=31536000, immutable` — the URL
-> names its own content, so a re-index mints a different id and the old URL 404s
-> rather than answering stale pixels. A source that publishes no version keeps
-> the old `max-age=3600` hedge: nothing distinguishes its content across a
-> re-index, so an hour is still the honest ceiling.
+**Two cache policies, chosen by the URL.** A tile whose `array_id` carries a
+content version (below) gets `private, max-age=31536000, immutable` — the URL
+names its own content, so a re-index mints a different id and the old URL 404s
+rather than answering stale pixels. A source that publishes no version keeps
+the old `max-age=3600` hedge: nothing distinguishes its content across a
+re-index, so an hour is still the honest ceiling.
 
-> **`private`, never `public`.** The URL carries no token — auth is a header, so
-> rotation does not bust the cache — and RFC 9111 §3.5 lets a *shared* cache reuse
-> a response to an authenticated request for a *different* request when the
-> response says `public` (or `s-maxage`, or `must-revalidate`). With no token in
-> the cache key that other request can be an unauthenticated one, so an nginx
-> `proxy_cache`, CDN, or corporate proxy in front of a `--remote` deployment would
-> serve tiles with the token checked exactly once, for someone else. `private`
-> keeps the per-user browser cache that the tiled design actually needs and
-> withholds the shared-cache reuse that bearer auth cannot make safe. CDN caching
-> would need a different grant in the cache key — signed URLs — not a header
-> change.
+**`private`, never `public`.** The URL carries no token — auth is a header, so
+rotation does not bust the cache — and RFC 9111 §3.5 lets a *shared* cache reuse
+a response to an authenticated request for a *different* request when the
+response says `public` (or `s-maxage`, or `must-revalidate`). With no token in
+the cache key that other request can be an unauthenticated one, so an nginx
+`proxy_cache`, CDN, or corporate proxy in front of a `--remote` deployment would
+serve tiles with the token checked exactly once, for someone else. `private`
+keeps the per-user browser cache that the tiled design actually needs and
+withholds the shared-cache reuse that bearer auth cannot make safe. CDN caching
+would need a different grant in the cache key — signed URLs — not a header
+change.
 
 ## Cancellation
 
