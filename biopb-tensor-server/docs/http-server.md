@@ -59,7 +59,7 @@ is the local **default**, not a property of local mode.
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
 | `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
-| `GET` | `/api/sources/{id}` | ✓ | Single descriptor |
+| `GET` | `/api/sources/{id}` | ✓ | Single descriptor, by targeted lookup — not capped like the listing |
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
@@ -101,6 +101,14 @@ carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`
 there and is **not** a usable grid. The transfer grid belongs to the tensor the
 server binds to serve a read, so ask `/api/tile_info/{array_id}` for it
 (biopb/biopb#812).
+
+**`/api/sources/{id}` is a single-row lookup** (`ListFlights` carrying a
+`TensorCriteria.source_id`), so it is not bounded by
+`max_list_flights_results` — a source past that cap has a descriptor here but
+no entry on `/api/sources` (biopb/biopb#1006). It shows no more than the
+listing: a token-protected source is declined here too, and a `cache:` upload
+has no catalog row at all (biopb/biopb#265) — reach one through
+`/api/tile_info/{array_id}`.
 
 ## Tile endpoints
 
