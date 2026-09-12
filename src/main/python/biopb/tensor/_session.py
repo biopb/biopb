@@ -402,9 +402,7 @@ class CatalogClient:
         for info in self._state.client.list_flights(options=self._state.call_options):
             source_desc = DataSourceDescriptor.FromString(info.descriptor.command)
             source_descriptors[source_desc.source_id] = source_desc
-            # Cache tensor descriptors
-            for tensor_desc in source_desc.tensors:
-                self._state.cache_descriptor(tensor_desc)
+            self._cache_tensors(source_desc)
 
             # Check schema metadata for truncation info
             if info.schema.metadata:
@@ -439,14 +437,17 @@ class CatalogClient:
                 # the whole catalog. Filtering here keeps this correct against
                 # one -- slowly, but never wrongly.
                 continue
-            for tensor_desc in source_desc.tensors:
-                self._state.cache_descriptor(tensor_desc)
+            self._cache_tensors(source_desc)
             # Deliberately not written to ``self._state.sources``: that map is
             # the last *listing*, and callers read its size and membership as
             # "what the catalog holds". Folding one addressed answer into it
             # would make a lookup look like a browse result.
             return source_desc
         return None
+
+    def _cache_tensors(self, source_desc: DataSourceDescriptor) -> None:
+        for tensor_desc in source_desc.tensors:
+            self._state.cache_descriptor(tensor_desc)
 
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Backs TensorFlightClient.query_sources; see that method for the full

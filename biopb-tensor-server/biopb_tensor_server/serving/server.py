@@ -1264,14 +1264,16 @@ class TensorFlightServer(flight.FlightServerBase):
         image-base result-cache server). Honors per-source capability tokens by
         skipping token-protected sources from enumeration.
 
-        ``source_id`` narrows the snapshot to that one entry *before* the token
+        ``source_id`` narrows the lookup to that one entry *before* the token
         check, never around it: this is the path where tokened sources actually
         live, and naming one must not be a way to read what enumerating it
         would refuse.
         """
-        source_items = self.sources.snapshot()
         if source_id is not None:
-            source_items = [item for item in source_items if item[0] == source_id]
+            adapter = self.sources.get(source_id)
+            source_items = [(source_id, adapter)] if adapter is not None else []
+        else:
+            source_items = self.sources.snapshot()
         total_sources = len(source_items)
         max_sources = self._max_list_flights_results
         returned_count = min(total_sources, max_sources)
@@ -1292,7 +1294,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         count = 0
         skipped = 0
-        for source_id, adapter in source_items:
+        for item_id, adapter in source_items:
             if count >= max_sources:
                 break
 
@@ -1332,7 +1334,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 )
             except Exception as e:
                 logger.exception(
-                    f"list_flights: skipping source {source_id} due to "
+                    f"list_flights: skipping source {item_id} due to "
                     f"descriptor build failure: {e}",
                 )
                 skipped += 1

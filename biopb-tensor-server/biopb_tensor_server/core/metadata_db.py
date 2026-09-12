@@ -1498,27 +1498,33 @@ class MetadataDatabase:
         """
         cursor = self._get_cursor()
 
-        params: list = []
-        where = ""
         if source_id is not None:
-            where = " WHERE source_id = ?"
-            params.append(source_id)
-
-        sql = (
-            "SELECT source_id, source_url, source_type, data_resident, tensors, "
-            "COUNT(*) OVER () AS total_count "
-            f"FROM sources{where} ORDER BY source_id"
-        )
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
-        rows = cursor.execute(sql, params).fetchall()
-
-        # COUNT(*) OVER () is identical on every row; no rows -> empty catalog.
-        total = rows[0][-1] if rows else 0
+            # A single-row address: never clipped by ``limit``, so the window
+            # function that exists only to report truncation is dead weight
+            # here -- ``total`` is just how many rows matched (0 or 1).
+            sql = (
+                "SELECT source_id, source_url, source_type, data_resident, tensors "
+                "FROM sources WHERE source_id = ?"
+            )
+            rows = cursor.execute(sql, [source_id]).fetchall()
+            total = len(rows)
+        else:
+            sql = (
+                "SELECT source_id, source_url, source_type, data_resident, tensors, "
+                "COUNT(*) OVER () AS total_count "
+                "FROM sources ORDER BY source_id"
+            )
+            params: list = []
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(limit)
+            rows = cursor.execute(sql, params).fetchall()
+            # COUNT(*) OVER () is identical on every row; no rows -> empty catalog.
+            total = rows[0][-1] if rows else 0
+            rows = [row[:-1] for row in rows]
 
         descriptors: List[DataSourceDescriptor] = []
-        for source_id, source_url, source_type, data_resident, tensors, _ in rows:
+        for source_id, source_url, source_type, data_resident, tensors in rows:
             tensor_descs = [
                 TensorDescriptor(
                     array_id=t["array_id"],
