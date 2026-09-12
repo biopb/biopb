@@ -33,19 +33,17 @@ and a per-chunk call cannot carry one through every override of
 from __future__ import annotations
 
 import json
-import logging
-import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, FrozenSet, Optional, Sequence, Tuple
+
+from biopb._config_io import atomic_write_json
 
 from biopb_tensor_server.core.chunk import compute_pyramid_scale_hints
 from biopb_tensor_server.core.config import PyramidConfig
 
 if TYPE_CHECKING:
     from biopb_tensor_server.cache import RetentionClass
-
-logger = logging.getLogger(__name__)
 
 # The server's ladder knobs, set once at construction (TensorFlightServer). A
 # default instance keeps a direct caller -- a test, a script driving an adapter
@@ -235,13 +233,7 @@ class DecodeRates:
         snapshot = self.snapshot()
         if not snapshot:
             return
-        tmp = path.parent / (path.name + ".tmp")
-        try:
-            tmp.write_text(json.dumps(snapshot))
-            os.replace(tmp, path)
-        except OSError:
-            logger.debug("could not persist decode rates to %s", path, exc_info=True)
-            tmp.unlink(missing_ok=True)
+        atomic_write_json(path, snapshot, raise_on_error=False)
 
 
 # Process state, like the ladder above and for the same reason: the read path

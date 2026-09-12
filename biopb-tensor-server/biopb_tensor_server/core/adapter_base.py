@@ -1096,7 +1096,9 @@ class TensorAdapter(SourceAdapter):
 
         return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
 
-    def _retention_for_chunk(self, chunk_id: bytes) -> RetentionClass:
+    def _retention_for_chunk(
+        self, chunk_id: bytes, *, array_id: Optional[str] = None
+    ) -> RetentionClass:
         """What a miss for this chunk would cost (see ``cache.RetentionClass``).
 
         Never a property of the caller that stored it: the class is written into
@@ -1104,6 +1106,10 @@ class TensorAdapter(SourceAdapter):
         scaled chunk answers from the chunk_id alone; an unscaled one from what
         its array has been measured to decode at, which is shared process state
         for the same reason. ``core.retention`` owns both decisions.
+
+        ``array_id``, if the caller already decoded it, saves re-parsing the
+        chunk_id's prefix on the unscaled arm -- ``resolve_chunk_data`` always
+        has, since it needs it for ``compute_fn`` regardless.
 
         Unscaled answers from the measured table and returns before the ladder
         is built, so a source nobody reads a scaled chunk from never pays for
@@ -1115,7 +1121,9 @@ class TensorAdapter(SourceAdapter):
             # Full resolution, or a native level's own store -- either way the
             # ladder has nothing to say about it, and only what it costs to
             # decode can separate one worth keeping from one worth dropping.
-            return retention_for_array(array_id_from_chunk_id(chunk_id))
+            if array_id is None:
+                array_id = array_id_from_chunk_id(chunk_id)
+            return retention_for_array(array_id)
         ladder = getattr(self, "_ladder_cache", None)
         if ladder is None:
             desc = self.get_tensor_descriptor()
@@ -1205,7 +1213,9 @@ class TensorAdapter(SourceAdapter):
             # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
-                cache_key, compute_fn, self._retention_for_chunk(chunk_id)
+                cache_key,
+                compute_fn,
+                self._retention_for_chunk(chunk_id, array_id=array_id),
             )
             data = entry.data
             cache_manager.release(cache_key)
