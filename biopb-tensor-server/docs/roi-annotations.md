@@ -515,7 +515,7 @@ hatch stays open: an exporter is additive and needs no migration.
 
 ### Which file
 
-`annotations.store_path` when set, else `state_dir()/catalogs/<digest
+`catalog.store_path` when set, else `state_dir()/catalogs/<digest
 of the resolved config path>.duckdb`. A **relative** `store_path` anchors on the
 config file's directory, never on the cwd: a server is started by the control
 plane, by systemd, or by hand from wherever the user was standing, so a
@@ -525,12 +525,19 @@ launch — and the one place it appears to work is the developer's own shell.
 per data set: two servers on two `biopb.json` files are ordinary, and a shared
 file would have them take turns clearing each other's `sources`. A server
 started with no config file has nothing to derive a name from and stays in
-memory, which is also what `annotations.persist = false` selects.
+memory, which is also what `catalog.persist = false` selects.
 
 State tree, not cache: `cache_dir()` is documented as safe for a janitor to
 empty, and half this file is not. The cache's `decode_rates` table is here for
 that reason and no other — it describes the segments, but it would be reset by
 every operator who reclaimed disk if it lived beside them.
+
+These two keys were `annotations.persist` / `annotations.store_path` until
+biopb#1002. The file holds `sources` and `decode_rates` as well, so an
+annotations key was deciding the fate of two tables that are not annotations.
+Renamed outright, with no alias: they were five days old (biopb#946) and nothing
+was deployed on them, so a permanent second spelling would have cost more than
+the window it covered.
 
 `annotations.enabled = false` does **not** change any of the above. It used to:
 the file then held annotations plus a `sources` table rebuilt every boot, so a
@@ -585,7 +592,7 @@ catalog at the original path, and the annotations split across two files with
 nothing anywhere to say so. That is the exact failure the per-config path exists
 to prevent, reintroduced by the error handler.
 
-**Not "fall back to memory."** `annotations.persist` is a promise about
+**Not "fall back to memory."** `catalog.persist` is a promise about
 durability. Serving anyway keeps the server up while every ROI drawn on it goes
 to a catalog that vanishes at the next restart — loss discovered a day later,
 with the work already gone. A health flag does not fix that; nobody reads health
@@ -595,7 +602,7 @@ So the server refuses to start, with a message naming the file and the four
 things it can be. All four are decisions for a person — restore the file, fix
 the permissions, match the DuckDB version that wrote it, or stop the other
 server — and the operator who genuinely wants a session-only store says
-`annotations.persist = false`, which is not an error at all.
+`catalog.persist = false`, which is not an error at all.
 
 **The retry comes first** (3 attempts, 0.5 s apart), and it is the only
 distinction available between the four: a lock held by a server on its way down
@@ -801,7 +808,7 @@ which is part of the identity by design — see *remote-tensor-cache.md*.
    `config_schema.py`. (`source_url` is written from step 2, since rows without
    it can never be reported or re-attached.)
 6. Docs: this file linked from `docs/http-server.md` and `ARCHITECTURE.md`.
-7. Persistence: `annotations.persist` / `annotations.store_path`, the file-backed
+7. Persistence: `catalog.persist` / `catalog.store_path`, the file-backed
    connection and its on-open pass.
 8. The orphan clock: `mark_sources_seen` / `unseen_rois` / `prune_unseen`, driven
    from `SourceManager._mark_catalog_complete`. No UI yet — `unseen_rois` is the

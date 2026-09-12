@@ -173,10 +173,10 @@ class WriteNotSupportedError(Exception):
 
 
 class AnnotationStoreError(RuntimeError):
-    """The persistent annotation catalog was configured but could not be opened.
+    """The persistent catalog was configured but could not be opened.
 
-    Fatal on purpose. ``annotations.persist`` is a promise about durability, and
-    the alternative to refusing here is serving normally while every ROI a user
+    Fatal on purpose. ``catalog.persist`` is a promise about durability, and the
+    alternative to refusing here is serving normally while every ROI a user
     draws goes to an in-memory catalog and disappears at the next restart --
     loss that is discovered a day later, by which time the work is gone.
 
@@ -185,5 +185,9 @@ class AnnotationStoreError(RuntimeError):
     DuckDB wants the versions matched, and a held lock means another server is
     already serving this catalog. Running anyway is wrong for all four; the
     operator who genuinely wants a session-only store says so with
-    ``annotations.persist = false``.
+    ``catalog.persist = false``.
+
+    Named for annotations because they are the rows the promise is about -- a
+    server not serving them degrades to an in-memory catalog instead of raising
+    this, since nothing else in the file is load-bearing.
     """

@@ -773,6 +773,14 @@ class TensorFlightServer(flight.FlightServerBase):
                 health_status["annotations_persisted"] = (
                     self._metadata_db.annotations_persisted
                 )
+                # The same question one level down, and not the same answer: the
+                # catalog also holds `decode_rates`, and a server with the
+                # annotation actions off keeps a file for those alone. A sibling
+                # key rather than a redefinition -- `annotations_persisted` is
+                # already on the wire and means what it says.
+                health_status["catalog_persisted"] = (
+                    self._metadata_db.store_path is not None
+                )
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "create_source":
             if not self._writable:

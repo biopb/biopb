@@ -688,11 +688,11 @@ def _catalog_store_path(
     server stopped in every case (it says so), and the caller degrades to
     memory instead of dying when nothing load-bearing is in the file.
     """
-    annotations = server_config.annotations
-    if not annotations.persist:
+    catalog = server_config.catalog
+    if not catalog.persist:
         return None
-    if annotations.store_path:
-        chosen = Path(annotations.store_path).expanduser()
+    if catalog.store_path:
+        chosen = Path(catalog.store_path).expanduser()
         if chosen.is_absolute():
             return chosen
         # Relative to the config file, never to the cwd. A server is started by
@@ -703,8 +703,8 @@ def _catalog_store_path(
         # config keeps a config directory portable.
         if config_path is None:
             raise AnnotationStoreError(
-                f"annotations.store_path {annotations.store_path!r} is relative "
-                f"and there is no config file to resolve it against. Give an "
+                f"catalog.store_path {catalog.store_path!r} is relative and "
+                f"there is no config file to resolve it against. Give an "
                 f"absolute path."
             )
         return (Path(config_path).expanduser().resolve().parent / chosen).resolve()
@@ -712,7 +712,7 @@ def _catalog_store_path(
         logger.warning(
             "No config file, so no name to give a persistent catalog: "
             "annotations and decode measurements will not survive a restart. "
-            "Set annotations.store_path to choose one."
+            "Set catalog.store_path to choose one."
         )
         return None
     return tensor_catalog_path(config_path)
@@ -727,7 +727,7 @@ def _open_catalog(
     it: a store that cannot be opened should fail at startup, where the operator
     is watching.
 
-    An unopenable store is normally fatal -- ``annotations.persist`` is a promise
+    An unopenable store is normally fatal -- ``catalog.persist`` is a promise
     about durability, and serving anyway would send every ROI drawn on this
     server to a catalog that disappears at the next restart. A server with the
     annotation actions off made no such promise: what is left in the file is
@@ -1514,8 +1514,8 @@ def prune_annotations(
     store = _catalog_store_path(server_config, config)
     if store is None:
         console.print(
-            "[yellow]This config has no persistent annotation store, so there is "
-            "nothing on disk to prune.[/yellow]"
+            "[yellow]This config has no persistent catalog, so there is nothing "
+            "on disk to prune.[/yellow]"
         )
         raise typer.Exit(0)
     if not store.exists():

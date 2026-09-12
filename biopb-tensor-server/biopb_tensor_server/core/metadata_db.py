@@ -697,7 +697,7 @@ class MetadataDatabase:
         starts a fresh catalog at the original path, and the annotations split
         across two files with nothing to say so.
 
-        It never **falls back to memory**. ``annotations.persist`` is a promise
+        It never **falls back to memory**. ``catalog.persist`` is a promise
         about durability; serving anyway would keep the server up while every
         ROI drawn on it went to a catalog that disappears at the next restart,
         and that loss surfaces a day later with the work already gone. So this
@@ -718,13 +718,13 @@ class MetadataDatabase:
             except Exception as exc:
                 if attempt == _OPEN_ATTEMPTS:
                     raise AnnotationStoreError(
-                        f"Could not open the annotation catalog {self._store_path} "
+                        f"Could not open the catalog {self._store_path} "
                         f"after {_OPEN_ATTEMPTS} attempts: {exc}. The file has "
                         f"been left untouched. Restore it, fix its permissions, "
                         f"match the DuckDB version that wrote it, or stop the "
                         f"other server holding it -- or set "
-                        f'"annotations": {{"persist": false}} to run with a '
-                        f"session-only annotation store."
+                        f'"catalog": {{"persist": false}} to run with a '
+                        f"session-only catalog."
                     ) from exc
                 logger.warning(
                     "Catalog %s did not open (attempt %d/%d): %s",
@@ -904,7 +904,7 @@ class MetadataDatabase:
                 f"The annotation catalog was written by a newer biopb "
                 f"(rois schema v{stored}; this build understands "
                 f"v{_ROI_SCHEMA_VERSION}). Upgrade, or point "
-                f"annotations.store_path somewhere else. The file is untouched."
+                f"catalog.store_path somewhere else. The file is untouched."
             )
 
         while stored < _ROI_SCHEMA_VERSION:
