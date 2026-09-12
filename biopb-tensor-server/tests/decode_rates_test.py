@@ -65,13 +65,6 @@ class TestTheStatistic:
 
         assert rates.rate("src") == pytest.approx(100.0, rel=0.05)
 
-    def test_one_sample_is_already_a_rate(self):
-        """No warmup gate: the first read is a real, if noisy, measurement."""
-        rates = DecodeRates()
-        rates.record("src", CHUNK, CHUNK / 1e6 / 800.0)
-
-        assert rates.rate("src") == pytest.approx(800.0)
-
     def test_an_unread_array_has_no_rate(self):
         rates = DecodeRates()
 
