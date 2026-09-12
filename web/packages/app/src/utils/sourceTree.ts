@@ -22,7 +22,7 @@ export const RECENT_FOLDER_ID = " recent";
 // source, which is a different node holding the same descriptor. Sharing an id
 // would make `folderPathTo` reveal whichever copy it reached first, and the
 // reveal is meant to find the source in its real place in the hierarchy.
-const RECENT_ROW_PREFIX = " recent:";
+const RECENT_ROW_PREFIX = `${RECENT_FOLDER_ID}:`;
 
 export interface TreeNode {
   id: string;           // unique id (path for folders, source_id for sources)
@@ -59,9 +59,20 @@ export function getPathParts(url: string): string[] {
   }
 }
 
-/** What to call a recent row: its leaf name where a url is known, the id
- * otherwise -- which is the only name an upload has. */
-export function recentLabel(src: DataSourceDescriptor): string {
+/** Whether a source matches a (already-lowercased, trimmed) search query,
+ * against the same fields the tree search box and the catalog SQL fallback
+ * both check. */
+export function matchesQuery(src: DataSourceDescriptor, q: string): boolean {
+  return `${src.source_id} ${src.source_url} ${src.source_type}`
+    .toLowerCase()
+    .includes(q);
+}
+
+/** What to call a source in the tree: its leaf path segment where a url is
+ * known, the id otherwise -- which is the only name an upload has. Shared by
+ * `buildTree`'s catalog nodes and `recentNode`'s, so the two trees never
+ * disagree on what a source is called. */
+export function sourceLabel(src: DataSourceDescriptor): string {
   const parts = getPathParts(src.source_url);
   return parts[parts.length - 1] ?? src.source_id;
 }
@@ -83,7 +94,7 @@ export function recentNode(recents: DataSourceDescriptor[]): TreeNode | null {
     depth: 1,
     children: recents.map((src) => ({
       id: RECENT_ROW_PREFIX + src.source_id,
-      name: recentLabel(src),
+      name: sourceLabel(src),
       type: "source" as const,
       children: [],
       source: src,

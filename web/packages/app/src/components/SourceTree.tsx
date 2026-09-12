@@ -9,7 +9,9 @@ import {
   RECENT_FOLDER_ID,
   type TreeNode,
   getPathParts,
+  matchesQuery,
   recentNode,
+  sourceLabel,
 } from "../utils/sourceTree";
 
 // Threshold for switching to server-side SQL query
@@ -34,7 +36,7 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
       // No path parts, add directly to root
       root.children.push({
         id: src.source_id,
-        name: src.source_id,
+        name: sourceLabel(src),
         type: "source",
         children: [],
         source: src,
@@ -62,10 +64,9 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
     }
 
     // Add source as leaf
-    const sourceName = parts[parts.length - 1]!;
     current.children.push({
       id: src.source_id,
-      name: sourceName,
+      name: sourceLabel(src),
       type: "source",
       children: [],
       source: src,
@@ -433,10 +434,7 @@ export function SourceTree() {
       return sources.filter((s) => serverFilteredIds.has(s.source_id));
     }
 
-    return sources.filter((s) => {
-      const hay = `${s.source_id} ${s.source_url} ${s.source_type}`.toLowerCase();
-      return hay.includes(q);
-    });
+    return sources.filter((s) => matchesQuery(s, q));
   }, [query, sources, serverFilteredIds]);
 
   // Build tree from filtered sources
@@ -447,11 +445,7 @@ export function SourceTree() {
   // construction does not hold the uploads this node exists to show.
   const recent = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const matching = q
-      ? recentSources.filter((s) =>
-          `${s.source_id} ${s.source_url} ${s.source_type}`.toLowerCase().includes(q),
-        )
-      : recentSources;
+    const matching = q ? recentSources.filter((s) => matchesQuery(s, q)) : recentSources;
     return recentNode(matching);
   }, [recentSources, query]);
 
@@ -567,15 +561,13 @@ export function SourceTree() {
             {/* The empty notice is about the catalog, so it is suppressed while
                 "Recent" has rows -- "No sources" above a list of sources reads
                 as a bug. */}
-            {filteredSources.length === 0 ? (
-              recent ? null : (
-                <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
-                  {scanning && sources.length === 0
-                    ? "Indexing data folder… (sources will appear as they are found)"
-                    : "No sources"}
-                </div>
-              )
-            ) : displayTree ? (
+            {filteredSources.length === 0 && !recent ? (
+              <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
+                {scanning && sources.length === 0
+                  ? "Indexing data folder… (sources will appear as they are found)"
+                  : "No sources"}
+              </div>
+            ) : (
               displayTree.children.map((child) => (
                 <TreeRow
                   key={child.id}
@@ -587,7 +579,7 @@ export function SourceTree() {
                   selectSource={selectSource}
                 />
               ))
-            ) : null}
+            )}
           </>
         )}
       </div>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
-import { getPathParts, recentLabel, recentNode } from "./sourceTree";
+import { getPathParts, recentNode, sourceLabel } from "./sourceTree";
 
 const source = (over: Partial<DataSourceDescriptor> = {}): DataSourceDescriptor => ({
   source_id: "zarr_a3f2",
@@ -48,13 +48,13 @@ describe("getPathParts", () => {
   });
 });
 
-describe("recentLabel", () => {
+describe("sourceLabel", () => {
   it("names a listed source by its leaf, not its whole path", () => {
-    expect(recentLabel(source())).toBe("plate1.zarr");
+    expect(sourceLabel(source())).toBe("plate1.zarr");
   });
 
   it("names an upload by its id, the only name it has", () => {
-    expect(recentLabel(UPLOAD)).toBe("upload_7f3");
+    expect(sourceLabel(UPLOAD)).toBe("upload_7f3");
   });
 });
 
