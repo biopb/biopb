@@ -393,6 +393,135 @@ class TestCachedSourceAdapter:
             shutil.rmtree(cache_dir, ignore_errors=True)
 
 
+class TestScaledReads:
+    """A cache source serves the pyramid it advertises (biopb/biopb#265).
+
+    The server advertises a computed ladder for every tensor, uploads included,
+    but this adapter used to reject every scaled chunk_id -- so an uploaded
+    result was addressable, opened, and then 404'd on the first coarse tile.
+    That is every upload of 2048^2 or more, which is where the ladder gains its
+    second rung, and it is the shape the documented agent workflow produces:
+    upload a result as ``cache:``, then display it.
+    """
+
+    SHAPE = [1024, 1024]
+    GRID = [256, 256]
+
+    @pytest.fixture
+    def cache(self, tmp_path):
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        yield CacheManager.get_instance()
+        CacheManager.reset()
+
+    def _upload(self, cache, *, skip=()):
+        """An adapter with every chunk written but those in ``skip``."""
+        adapter = CachedSourceAdapter(
+            source_id="up",
+            shape=self.SHAPE,
+            dtype="<u2",
+            chunk_shape=self.GRID,
+            dim_labels=["y", "x"],
+        )
+        source = np.zeros(self.SHAPE, dtype="<u2")
+        step = self.GRID[0]
+        for y in range(0, self.SHAPE[0], step):
+            for x in range(0, self.SHAPE[1], step):
+                value = (y // step) * 4 + (x // step) + 1
+                source[y : y + step, x : x + step] = value
+                if (y, x) in skip:
+                    continue
+                adapter.write_chunk(
+                    ChunkBounds(start=[y, x], stop=[y + step, x + step]),
+                    np.full((step, step), value, dtype="<u2"),
+                )
+        return adapter, source
+
+    @staticmethod
+    def _scaled_id(bounds, scale, method="area"):
+        from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
+
+        return encode_chunk_id_with_scale("up", bounds, scale, method)
+
+    def test_a_scaled_read_is_assembled_from_the_uploaded_chunks(self, cache):
+        """The reduction comes out of the cache, which is where an upload lives
+        -- so it needs no backend, and ``get_data`` is never reached."""
+        from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
+
+        adapter, source = self._upload(cache)
+        adapter.get_data = lambda bounds: pytest.fail("reached get_data")
+
+        bounds = ChunkBounds(start=[0, 0], stop=[512, 512])
+        batch = adapter.resolve_chunk_data(self._scaled_id(bounds, (2, 2)), cache)
+
+        expected = (
+            source[0:512, 0:512].reshape(256, 2, 256, 2).mean(axis=(1, 3)).astype("<u2")
+        )
+        np.testing.assert_array_equal(unpack_chunk_array(batch), expected)
+
+    def test_nearest_is_served_too(self, cache):
+        """The advertised ladder asks for ``nearest``, so the method the viewer
+        actually requests has to round-trip, not just the default."""
+        from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
+
+        adapter, source = self._upload(cache)
+        bounds = ChunkBounds(start=[0, 0], stop=[512, 512])
+
+        batch = adapter.resolve_chunk_data(
+            self._scaled_id(bounds, (2, 2), "nearest"), cache
+        )
+
+        np.testing.assert_array_equal(
+            unpack_chunk_array(batch), source[0:512:2, 0:512:2]
+        )
+
+    def test_a_scaled_read_over_a_hole_raises_and_names_it(self, cache):
+        """Missing data always raises -- there is nothing to reconstruct it
+        from. The message has to name the bounds, because by then the caller
+        asked for a coarse tile and the hole is two layers down."""
+        adapter, _ = self._upload(cache, skip={(0, 256)})
+        bounds = ChunkBounds(start=[0, 0], stop=[512, 512])
+
+        with pytest.raises(
+            flight.FlightServerError,
+            match=r"scaled read of \[0, 0\]\.\.\[512, 512\]: 65536 of 262144",
+        ):
+            adapter.resolve_chunk_data(self._scaled_id(bounds, (2, 2)), cache)
+
+    def test_an_unwritten_full_resolution_chunk_raises_and_names_it(self, cache):
+        adapter, _ = self._upload(cache, skip={(0, 0)})
+
+        with pytest.raises(flight.FlightServerError, match=r"no chunk at \[0, 0\]"):
+            adapter.resolve_chunk_data(
+                encode_chunk_id("up", ChunkBounds(start=[0, 0], stop=[256, 256])),
+                cache,
+            )
+
+    def test_every_advertised_rung_serves(self, cache):
+        """The regression itself, through the seam the viewers use: whatever the
+        server advertises for this tensor, it must also serve."""
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+        from biopb_tensor_server.core.config import PyramidConfig
+
+        # Big enough that the computed ladder has a second rung at all.
+        self.SHAPE = [2048, 2048]
+        adapter, _ = self._upload(cache)
+
+        plan = adapter.plan_flight_info(
+            TensorReadOption(with_pyramid=True, with_read_plan=False), PyramidConfig()
+        )
+        rungs = [tuple(level.scale_hint) for level in plan.descriptor.pyramid]
+        assert len(rungs) > 1, "fixture too small to cover the regression"
+
+        extent = ChunkBounds(start=[0, 0], stop=[512, 512])
+        for scale in rungs:
+            if all(factor == 1 for factor in scale):
+                continue
+            adapter.resolve_chunk_data(self._scaled_id(extent, scale), cache)
+
+
 class TestChunkEncoding:
     """Tests for chunk ID encoding with cache sources."""
 
