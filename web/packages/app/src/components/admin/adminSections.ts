@@ -112,6 +112,17 @@ export const ADMIN_NAV: AdminNavItem[] = [
     commonFields: ["max_query_results", "query_timeout_ms"],
   },
   {
+    id: "catalog",
+    label: "Catalog",
+    description:
+      "The database file holding the source listing, drawn ROIs, and the cache's " +
+      "measured decode throughput. Off keeps it in memory, so none of that " +
+      "outlives the server.",
+    kind: "fields",
+    section: "catalog",
+    commonFields: ["persist", "store_path"],
+  },
+  {
     id: "annotations",
     label: "Annotations",
     description:

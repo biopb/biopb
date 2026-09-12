@@ -277,13 +277,21 @@ _SECTION_FOR = {
     "PrecacheConfig": "precache",
     "MetadataDbConfig": "metadata_db",
     "AnnotationsConfig": "annotations",
+    "CatalogConfig": "catalog",
     "ServerConfig": "server",
 }
 
 # The nested sections the checker walks. ServerConfig itself is the "server"
 # section (its scalars are top-level fields, not a nested dataclass), so it is
 # passed separately in _sections_of.
-_NESTED_SECTIONS = ("cache", "pyramid", "precache", "metadata_db", "annotations")
+_NESTED_SECTIONS = (
+    "cache",
+    "pyramid",
+    "precache",
+    "metadata_db",
+    "annotations",
+    "catalog",
+)
 
 
 def _sections_of(config: ServerConfig) -> List[Tuple[str, Any]]:
@@ -590,9 +598,8 @@ class CacheConfig:
             "counts as fast enough depends on the machine's disk and the "
             "formats on it, so there is no portable default. The measurements "
             "live in the catalog database, so clearing the cache does not "
-            "reset them -- and they are session-only when the catalog is not "
-            "persisted (annotations.persist, which despite the name governs "
-            "the whole catalog file)."
+            "reset them -- and they are session-only when catalog.persist is "
+            "off."
         },
     )
     file_deferred_write_mb: int = field(
@@ -783,6 +790,45 @@ class MetadataDbConfig:
 
 
 @dataclass
+class CatalogConfig:
+    """The DuckDB catalog file: whether there is one, and where.
+
+    Three tables share it and only one is annotations, which is why these keys
+    are not under ``annotations`` any more (biopb/biopb#1002):
+
+    - ``sources`` -- scan output, dropped and recreated on every open.
+    - ``rois`` -- drawn annotations (docs/roi-annotations.md). Nothing can
+      reproduce these, which is what makes the file worth having.
+    - ``decode_rates`` -- the cache's measured per-tensor decode throughput.
+      Re-measurable by reading, but a run's worth of it at a time.
+
+    State tree, not cache: ``cache_dir()`` is documented as safe for a janitor
+    to empty and this file is not, which is the whole reason the measurements
+    live here rather than beside the segments they describe.
+
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
+    """
+
+    persist: bool = field(
+        default=True,
+        metadata={
+            "help": "Back the catalog with a file so it outlives the server. "
+            "Off keeps the whole catalog in memory: drawn ROIs are lost when "
+            "the server stops, and so are the cache's decode measurements."
+        },
+    )
+    store_path: str = field(
+        default="",
+        metadata={
+            "help": "Where the on-disk catalog lives. Empty derives it from the "
+            "config file's path, which is what keeps two servers on two configs "
+            "off each other's file."
+        },
+    )
+
+
+@dataclass
 class AnnotationsConfig:
     """User-drawn ROI annotations (biopb-tensor-server/docs/roi-annotations.md).
 
@@ -791,6 +837,10 @@ class AnnotationsConfig:
     tied to ``writable``: an annotation writes no pixels, so the token is its
     boundary and ``enabled`` is the switch for a deployment that wants a strictly
     read-only catalog.
+
+    Whether that catalog reaches a file, and which one, is :class:`CatalogConfig`
+    -- three tables share it and only this one is annotations
+    (biopb/biopb#1002).
 
     Per-field help lives in each field's ``metadata["help"]`` (read by the config
     JSON Schema).
@@ -811,23 +861,6 @@ class AnnotationsConfig:
             "help": "Cap on stored annotations per tensor. Deliberately "
             "human-scale: this is an annotation store, not an object store -- a "
             "segmentation belongs in a label tensor."
-        },
-    )
-    persist: bool = field(
-        default=True,
-        metadata={
-            "help": "Keep annotations across restarts by backing the catalog "
-            "with a file. Off means the whole catalog is in memory and drawn "
-            "ROIs are lost when the server stops -- as are the cache's decode "
-            "measurements, which share the file."
-        },
-    )
-    store_path: str = field(
-        default="",
-        metadata={
-            "help": "Where the on-disk catalog lives. Empty derives it from the "
-            "config file's path, which is what keeps two servers on two configs "
-            "off each other's file."
         },
     )
     prune_unseen_days: int = field(
@@ -963,6 +996,7 @@ class ServerConfig:
     credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
     metadata_db: MetadataDbConfig = field(default_factory=MetadataDbConfig)
     annotations: AnnotationsConfig = field(default_factory=AnnotationsConfig)
+    catalog: CatalogConfig = field(default_factory=CatalogConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
 
@@ -1564,10 +1598,19 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     annotations_kwargs: Dict[str, Any] = {}
     _carry(annotations_kwargs, "enabled", annotations_data)
     _carry(annotations_kwargs, "max_rois_per_tensor", annotations_data)
-    _carry(annotations_kwargs, "persist", annotations_data)
-    _carry(annotations_kwargs, "store_path", annotations_data)
     _carry(annotations_kwargs, "prune_unseen_days", annotations_data, cast=int)
     annotations_config = AnnotationsConfig(**annotations_kwargs)
+
+    # Parse catalog settings. These lived under `annotations` for the five days
+    # between biopb/biopb#946 and biopb/biopb#1002 -- no alias, because nothing
+    # was deployed on them and a permanent second spelling costs more than the
+    # window it covers. An old config's keys land on the unknown-key warning,
+    # which names them.
+    catalog_data = data.get("catalog", {})
+    catalog_kwargs: Dict[str, Any] = {}
+    _carry(catalog_kwargs, "persist", catalog_data)
+    _carry(catalog_kwargs, "store_path", catalog_data)
+    catalog_config = CatalogConfig(**catalog_kwargs)
 
     # Parse sources. `url` accepts the legacy `path` alias; every other field is
     # carried only when present so SourceConfig owns the defaults.
@@ -1629,6 +1672,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         credentials=credentials_config,
         metadata_db=metadata_db_config,
         annotations=annotations_config,
+        catalog=catalog_config,
         sources=sources,
         **server_kwargs,
     )

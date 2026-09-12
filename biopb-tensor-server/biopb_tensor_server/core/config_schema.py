@@ -36,6 +36,7 @@ from biopb_tensor_server.core.config import (
     _SECTION_FOR,
     AnnotationsConfig,
     CacheConfig,
+    CatalogConfig,
     MetadataDbConfig,
     PrecacheConfig,
     PyramidConfig,
@@ -58,6 +59,7 @@ _SECTION_CLASSES = (
     PrecacheConfig,
     MetadataDbConfig,
     AnnotationsConfig,
+    CatalogConfig,
 )
 
 # (ClassName, dataclass field) -> (on-disk section, on-disk key) for the fields

@@ -1102,22 +1102,79 @@ class TestPersistence:
     def test_a_session_only_server_says_so(self):
         assert MetadataDatabase().annotations_persisted is False
 
+    def test_health_separates_the_catalog_from_the_annotations(self, tmp_path):
+        """Not the same question since the catalog grew `decode_rates`: a server
+        with the annotation actions off keeps a file for those alone, so
+        `annotations_persisted` False no longer means nothing is persisted."""
+        server = TensorFlightServer(
+            "grpc://localhost:0",
+            metadata_db=MetadataDatabase(
+                store_path=tmp_path / "catalog.duckdb", annotations_enabled=False
+            ),
+            annotations_enabled=False,
+        )
+        try:
+            (raw,) = list(server.do_action(None, flight.Action("health", b"")))
+            health = json.loads(bytes(raw))
+
+            assert health["annotations_persisted"] is False
+            assert health["catalog_persisted"] is True
+        finally:
+            server.shutdown()
+
+
+class TestTheCatalogSection:
+    """`persist` / `store_path` were under [annotations] until biopb/biopb#1002.
+
+    They decide whether the catalog FILE exists, and that file holds `sources`
+    and `decode_rates` as well -- so an annotations key was deciding the fate of
+    two tables that are not annotations.
+    """
+
+    @staticmethod
+    def _parse(data):
+        from biopb_tensor_server.core.config import parse_config
+
+        return parse_config({"sources": [], **data})
+
+    def test_the_keys_are_read_from_catalog(self):
+        config = self._parse(
+            {"catalog": {"persist": False, "store_path": "/tmp/new.duckdb"}}
+        )
+
+        assert config.catalog.persist is False
+        assert config.catalog.store_path == "/tmp/new.duckdb"
+
+    def test_the_old_spelling_is_not_a_second_way_to_say_it(self, caplog):
+        """No alias: the keys were five days old (biopb/biopb#946) and nothing
+        was deployed on them, so a permanent second spelling would cost more
+        than the window it covers. The unknown-key warning names them."""
+        config = self._parse(
+            {"annotations": {"persist": False, "store_path": "/tmp/old.duckdb"}}
+        )
+
+        assert config.catalog.persist is True
+        assert config.catalog.store_path == ""
+        assert "persist" in caplog.text and "store_path" in caplog.text
+
+    def test_annotations_keeps_what_is_actually_about_annotations(self):
+        config = self._parse(
+            {"annotations": {"enabled": False, "prune_unseen_days": 30}}
+        )
+
+        assert config.annotations.enabled is False
+        assert config.annotations.prune_unseen_days == 30
+
 
 class TestStorePathResolution:
     """Which file a server picks, which is what keeps two servers apart."""
-
-    @staticmethod
-    def _config(**annotations):
-        from biopb_tensor_server.core.config import AnnotationsConfig, ServerConfig
-
-        return ServerConfig(annotations=AnnotationsConfig(**annotations))
 
     def test_the_default_is_derived_from_the_config_path(self, tmp_path):
         from biopb._locations import tensor_catalog_path
         from biopb_tensor_server.cli import _catalog_store_path
 
         config = tmp_path / "biopb.json"
-        assert _catalog_store_path(self._config(), config) == tensor_catalog_path(
+        assert _catalog_store_path(_server_config(), config) == tensor_catalog_path(
             config
         )
 
@@ -1132,14 +1189,16 @@ class TestStorePathResolution:
         from biopb_tensor_server.cli import _catalog_store_path
 
         chosen = tmp_path / "somewhere.duckdb"
-        assert _catalog_store_path(self._config(store_path=str(chosen)), None) == chosen
+        assert (
+            _catalog_store_path(_server_config(store_path=str(chosen)), None) == chosen
+        )
 
     def test_persist_off_stays_in_memory(self, tmp_path):
         from biopb_tensor_server.cli import _catalog_store_path
 
         assert (
             _catalog_store_path(
-                self._config(persist=False, store_path=str(tmp_path / "x.duckdb")),
+                _server_config(persist=False, store_path=str(tmp_path / "x.duckdb")),
                 tmp_path / "biopb.json",
             )
             is None
@@ -1148,7 +1207,7 @@ class TestStorePathResolution:
     def test_no_config_file_means_no_derived_name(self):
         from biopb_tensor_server.cli import _catalog_store_path
 
-        assert _catalog_store_path(self._config(), None) is None
+        assert _catalog_store_path(_server_config(), None) is None
 
 
 class TestOrphanClock:
@@ -1324,17 +1383,48 @@ class TestOrphanClock:
         assert db.prune_unseen(datetime.now() - timedelta(days=30)) == 1
 
 
+def _server_config(**settings):
+    """A ServerConfig from a flat bag, each key routed to the section owning it.
+
+    The store-path tests and the annotation-posture tests set keys that now live
+    in two different dataclasses; this is so neither has to remember which.
+    """
+    import dataclasses
+
+    from biopb_tensor_server.core.config import (
+        AnnotationsConfig,
+        CatalogConfig,
+        ServerConfig,
+    )
+
+    catalog_fields = {f.name for f in dataclasses.fields(CatalogConfig)}
+    return ServerConfig(
+        annotations=AnnotationsConfig(
+            **{k: v for k, v in settings.items() if k not in catalog_fields}
+        ),
+        catalog=CatalogConfig(
+            **{k: v for k, v in settings.items() if k in catalog_fields}
+        ),
+    )
+
+
 class TestPruneCli:
     """`prune-annotations`: the escape hatch, and the fact that it needs the server down."""
 
     @staticmethod
-    def _config(tmp_path, store, **annotations):
+    def _config(tmp_path, store, *, prune_unseen_days=None, **catalog):
         path = tmp_path / "biopb.json"
+        annotations = (
+            {}
+            if prune_unseen_days is None
+            else {"prune_unseen_days": prune_unseen_days}
+        )
         path.write_text(
             json.dumps(
                 {
                     "sources": [],
-                    "annotations": {"store_path": str(store), **annotations},
+                    "catalog": {"store_path": str(store), **catalog},
+                    "annotations": annotations,
                 }
             )
         )
@@ -1565,17 +1655,11 @@ class TestSchemaVersioning:
 class TestStorePathIsNotCwdRelative:
     """A relative store_path anchors on the config file, never on the cwd."""
 
-    @staticmethod
-    def _config(**annotations):
-        from biopb_tensor_server.core.config import AnnotationsConfig, ServerConfig
-
-        return ServerConfig(annotations=AnnotationsConfig(**annotations))
-
     def test_a_relative_path_resolves_against_the_config(self, tmp_path):
         from biopb_tensor_server.cli import _catalog_store_path
 
         config = tmp_path / "deploy" / "biopb.json"
-        resolved = _catalog_store_path(self._config(store_path="rois.duckdb"), config)
+        resolved = _catalog_store_path(_server_config(store_path="rois.duckdb"), config)
         assert resolved == tmp_path / "deploy" / "rois.duckdb"
 
     def test_the_cwd_does_not_change_the_answer(self, tmp_path, monkeypatch):
@@ -1586,9 +1670,11 @@ class TestStorePathIsNotCwdRelative:
         config = tmp_path / "biopb.json"
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
-        first = _catalog_store_path(self._config(store_path="a.duckdb"), config)
+        first = _catalog_store_path(_server_config(store_path="a.duckdb"), config)
         monkeypatch.chdir(elsewhere)
-        assert _catalog_store_path(self._config(store_path="a.duckdb"), config) == first
+        assert (
+            _catalog_store_path(_server_config(store_path="a.duckdb"), config) == first
+        )
 
     def test_an_absolute_path_is_left_alone(self, tmp_path):
         from biopb_tensor_server.cli import _catalog_store_path
@@ -1596,7 +1682,7 @@ class TestStorePathIsNotCwdRelative:
         chosen = tmp_path / "somewhere" / "x.duckdb"
         assert (
             _catalog_store_path(
-                self._config(store_path=str(chosen)), tmp_path / "c.json"
+                _server_config(store_path=str(chosen)), tmp_path / "c.json"
             )
             == chosen
         )
@@ -1605,17 +1691,11 @@ class TestStorePathIsNotCwdRelative:
         from biopb_tensor_server.cli import _catalog_store_path
 
         with pytest.raises(AnnotationStoreError, match="relative"):
-            _catalog_store_path(self._config(store_path="rois.duckdb"), None)
+            _catalog_store_path(_server_config(store_path="rois.duckdb"), None)
 
 
 class TestDisabledAnnotationsTouchNothing:
     """`annotations.enabled = false` stops the actions, not the catalog."""
-
-    @staticmethod
-    def _config(**annotations):
-        from biopb_tensor_server.core.config import AnnotationsConfig, ServerConfig
-
-        return ServerConfig(annotations=AnnotationsConfig(**annotations))
 
     def test_the_catalog_is_still_on_disk(self, tmp_path):
         # It used to be skipped here, back when the file held annotations and a
@@ -1627,7 +1707,7 @@ class TestDisabledAnnotationsTouchNothing:
         chosen = tmp_path / "x.duckdb"
         assert (
             _catalog_store_path(
-                self._config(enabled=False, store_path=str(chosen)),
+                _server_config(enabled=False, store_path=str(chosen)),
                 tmp_path / "biopb.json",
             )
             == chosen
@@ -1647,7 +1727,7 @@ class TestDisabledAnnotationsTouchNothing:
         store = tmp_path / "catalog.duckdb"
         store.write_bytes(b"not a duckdb file")
 
-        db = _open_catalog(self._config(enabled=False), store)
+        db = _open_catalog(_server_config(enabled=False), store)
         try:
             assert db.store_path is None
             assert store.read_bytes() == b"not a duckdb file"
@@ -1661,7 +1741,7 @@ class TestDisabledAnnotationsTouchNothing:
         store.write_bytes(b"not a duckdb file")
 
         with pytest.raises(AnnotationStoreError):
-            _open_catalog(self._config(), store)
+            _open_catalog(_server_config(), store)
 
     def test_the_sql_surface_drops_rois_too(self):
         # Returning empty rows would be the wrong answer: the table is

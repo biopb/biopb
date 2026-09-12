@@ -2659,6 +2659,7 @@ async def admin_status(request: Request) -> JSONResponse:
             "full_scan_in_progress": _h("full_scan_in_progress"),
             "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
             "annotations_persisted": _h("annotations_persisted"),
+            "catalog_persisted": _h("catalog_persisted"),
         }
     )
 
