@@ -788,6 +788,10 @@ def decode_rates(
     Only full-resolution reads are sampled, so a tensor served exclusively at
     reduced scale is absent rather than slow, and a row with a handful of
     samples is still settling -- the server will not classify on one.
+
+    The rate is what a rebuild costs per byte, not what the format can sustain:
+    a tensor with small chunks amortizes its per-read overhead over fewer bytes
+    and reads slower here than the same format would with large ones.
     """
     client, endpoint = _connect(server, token, cache_bytes=0)
     try:

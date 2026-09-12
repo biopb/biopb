@@ -19,15 +19,15 @@ from biopb_tensor_server.cache.manager import DECODE_RATES_FILE
 from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.retention import (
-    _MIN_SAMPLE_BYTES,
     _MIN_SAMPLES,
     DecodeRates,
     active_decode_rates,
     set_active_decode_rates,
 )
 
-# Comfortably over the floor, so a sample is accepted on its size.
-BIG = _MIN_SAMPLE_BYTES * 4
+# An ordinary full-resolution chunk. Nothing turns on the size -- every read is
+# a sample -- so this is just a realistic number to divide by.
+CHUNK = 4 << 20
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +41,7 @@ def restore_active_rates():
 def _converge(rates, array_id, mbps, samples=_MIN_SAMPLES):
     """Feed ``samples`` identical reads, so the EMA sits exactly on ``mbps``."""
     for _ in range(samples):
-        rates.record(array_id, BIG, BIG / 1e6 / mbps)
+        rates.record(array_id, CHUNK, CHUNK / 1e6 / mbps)
 
 
 class TestTheStatistic:
@@ -69,21 +69,38 @@ class TestTheStatistic:
 
         assert rates.rate("src") is None
 
-    def test_a_small_read_is_not_a_sample(self):
-        """Under the floor the wall clock is per-call cost -- the re-mmap in
-        biopb/biopb#816, a seek, opening a handle -- not throughput, so its MB/s
-        describes the call and would poison the array's number."""
-        rates = DecodeRates()
-        for _ in range(_MIN_SAMPLES * 4):
-            rates.record("src", _MIN_SAMPLE_BYTES - 1, 1e-6)
+    def test_a_small_read_is_a_sample_like_any_other(self):
+        """A small chunk's MB/s is mostly per-call cost -- the re-mmap in
+        biopb/biopb#816, a seek, opening a handle -- but that cost is part of
+        what rebuilding it would take, which is the question. Dropping these
+        left an array whose chunks are all small permanently unmeasured, and so
+        permanently "normal", when some of them are the cheapest things in the
+        cache."""
+        tiny = 64 << 10
+        rates = DecodeRates(cheap_mbps=100.0)
+        for _ in range(_MIN_SAMPLES):
+            rates.record("tiny", tiny, tiny / 1e6 / 1024)  # 64 KiB at 1024 MB/s
 
-        assert rates.rate("src") is None
-        assert rates.snapshot() == {}
+        assert rates.rate("tiny") == pytest.approx(1024.0)
+        assert rates.retention_for_array("tiny") == "cheap"
+
+    def test_a_chunk_size_shows_up_in_the_rate(self):
+        """The number is cost per byte as the read path issues it, not what the
+        format can sustain: the same per-call overhead over fewer bytes reads
+        slower, which is why a threshold has to come off a real table."""
+        rates = DecodeRates()
+        overhead = 200e-6  # a fixed per-read cost, independent of size
+        rates.record("small", 64 << 10, overhead)
+        rates.record("large", 8 << 20, overhead)
+
+        assert rates.snapshot()["small"]["mbps"] < rates.snapshot()["large"]["mbps"]
 
     def test_a_zero_duration_read_is_not_a_sample(self):
+        """The only read dropped: a duration the clock could not resolve cannot
+        be divided by."""
         rates = DecodeRates()
         for _ in range(_MIN_SAMPLES * 2):
-            rates.record("src", BIG, 0.0)
+            rates.record("src", CHUNK, 0.0)
 
         assert rates.rate("src") is None
 
@@ -161,9 +178,10 @@ class TestPersistence:
 class TestTheSampleSite:
     """Where the measurement is taken, through a real adapter and cache."""
 
-    # Chunks over the sample floor, so an ordinary read is measurable.
-    SHAPE = (2048, 1024)
-    CHUNKS = (1024, 1024)
+    # Deliberately small: a chunk this size is mostly per-call cost, and has to
+    # be measured anyway.
+    SHAPE = (256, 256)
+    CHUNKS = (128, 128)
 
     @pytest.fixture
     def adapter(self, tmp_path):

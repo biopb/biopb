@@ -112,13 +112,6 @@ def retention_for_scale(
 # reads rather than by every read since boot. Ten-ish samples to converge.
 _EMA_ALPHA = 0.25
 
-# Below this a read is dominated by per-call fixed cost -- opening a handle,
-# re-mmapping (biopb/biopb#816), a seek -- not by decode throughput, and its
-# MB/s describes the call overhead instead of the format. Such reads are dropped
-# rather than damped: an array whose chunks are all smaller than this simply
-# never accumulates a rate, and stays "normal".
-_MIN_SAMPLE_BYTES = 1 << 20
-
 # An EMA is meaningless on its first sample and noisy for a few after it. Until
 # an array has this many, it has no rate at all and classifies "normal" -- the
 # conservative direction, and the reason an unmeasured array needs no special
@@ -133,6 +126,13 @@ class DecodeRates:
     native pyramid level's own id where there is one, so a compressed low level
     and a raw level 0 are measured separately rather than averaged into a number
     describing neither.
+
+    The rate is what a rebuild costs per byte, not what the format can sustain:
+    a read is timed as the read path issues it, so an array with small chunks
+    reports lower MB/s than the same format would over large ones, because its
+    per-call cost is amortized over fewer bytes. That is the right number for
+    deciding what to keep, and the reason the threshold has to be read off the
+    spread of a particular server's table rather than reasoned about.
 
     ``cheap_mbps`` of 0 (the default) measures everything and classifies
     nothing: the table is a diagnostic until an operator has looked at it and
@@ -152,10 +152,18 @@ class DecodeRates:
     def record(self, array_id: str, nbytes: int, seconds: float) -> None:
         """Fold one full-resolution read into ``array_id``'s rate.
 
-        Silently ignores a read too small to measure or too fast to have a
-        meaningful duration -- both describe the clock, not the format.
+        Every read counts, however small. A small chunk's MB/s is dominated by
+        per-call fixed cost -- opening a handle, re-mmapping (biopb/biopb#816),
+        a seek -- rather than by the format's decode speed, but that cost is
+        part of what rebuilding the chunk would take, which is the question
+        being asked. Discarding those reads would have left an array whose
+        chunks are all small permanently unmeasured, and so permanently
+        "normal", when some of them are the cheapest things in the cache.
+
+        Only a duration the clock could not resolve is dropped, because it
+        cannot be divided by.
         """
-        if nbytes < _MIN_SAMPLE_BYTES or seconds <= 0.0:
+        if seconds <= 0.0:
             return
         mbps = nbytes / 1e6 / seconds
         with self._lock:
