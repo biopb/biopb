@@ -29,7 +29,12 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
-from biopb_tensor_server.core.chunk import encode_chunk_id, wrap_content_version
+from biopb_tensor_server.core.chunk import (
+    decode_chunk_id,
+    encode_chunk_id,
+    is_scaled_chunk,
+    wrap_content_version,
+)
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA
 
 if TYPE_CHECKING:
@@ -181,9 +186,15 @@ class CachedSourceAdapter(TensorAdapter):
         # Validate bounds via the base TensorAdapter.get_data contract.
         super().get_data(bounds)
 
+        # A scaled read whose extent is fully uploaded never arrives here -- the
+        # base assembles it from the cached chunks -- and one that is not is
+        # refused earlier, by _require_full_coverage, where the extent is still
+        # visible. So this is a direct call, and the answer is simply that there
+        # is no backend behind it.
         raise flight.FlightServerError(
-            f"Cannot read data from cache-backed source {self.source_id}. "
-            f"Cache-backed sources have no backend data - use chunk_id access."
+            f"Cache-backed source {self.source_id} cannot read "
+            f"{list(bounds.start)}..{list(bounds.stop)} from a backend: it has "
+            f"none. Uploaded chunks are served by chunk_id."
         )
 
     def write_chunk(self, bounds: ChunkBounds, data: np.ndarray) -> None:
@@ -274,15 +285,67 @@ class CachedSourceAdapter(TensorAdapter):
             f"{list(bounds.start)} to {list(bounds.stop)}"
         )
 
+    def _require_full_coverage(self, chunk_id: bytes) -> None:
+        """Raise unless every pixel of a scaled chunk's extent was uploaded.
+
+        Checked here because it is the last place the *extent* is visible. The
+        base streams the extent in units and only notices a gap when one unit
+        cannot be sourced from the cache, by which point it is calling
+        ``get_data`` on some other unit -- one that may well be present, so the
+        error would name the wrong bounds. There is nothing to fall back on
+        either way: a region never uploaded, or since evicted, cannot be
+        reconstructed.
+
+        Uploaded chunks do not overlap (a re-upload lands in a fresh
+        ``content_version`` namespace), so summed intersection volume is an
+        exact coverage test.
+        """
+        _, extent = decode_chunk_id(chunk_id)
+        start, stop = list(extent.start), list(extent.stop)
+
+        wanted = 1
+        for lo, hi in zip(start, stop, strict=True):
+            wanted *= max(0, hi - lo)
+
+        covered = 0
+        for bounds in self._written_chunks.values():
+            overlap = 1
+            for lo, hi, c_lo, c_hi in zip(
+                start, stop, bounds.start, bounds.stop, strict=True
+            ):
+                overlap *= max(0, min(hi, c_hi) - max(lo, c_lo))
+            covered += overlap
+
+        if covered < wanted:
+            raise flight.FlightServerError(
+                f"Cache-backed source {self.source_id} cannot serve a scaled "
+                f"read of {start}..{stop}: {wanted - covered} of {wanted} "
+                f"elements were never uploaded, or have been evicted. An "
+                f"upload's cache entry is its only copy, so there is no backend "
+                f"to rebuild them from."
+            )
+
     def resolve_chunk_data(
         self,
         chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
     ) -> pa.RecordBatch:
-        """Resolve chunk data from cache manager.
+        """Serve a written chunk, or a reduction assembled from written chunks.
 
-        Cache-backed sources have no backend data - all data is stored in
-        the cache manager via write_chunk/write_chunk_arrow.
+        A **scaled** chunk_id goes to the base, which builds the reduction out
+        of the full-resolution chunks the cache already holds rather than from a
+        backend (``core.cache_source.cache_sourced_units``). Nothing here has to
+        cooperate: a scaled chunk's extent tiles exactly into the transfer grid
+        this source's chunk_ids are minted on -- the uploader's own write grid,
+        which nothing may re-shape (biopb/biopb#809) -- and every one of those
+        chunks is present, because the cache is where an upload lives. Without
+        this, every rung of the advertised pyramid past the first fails, which
+        is what left an uploaded result unviewable in both the SPA and napari
+        once it was big enough to be pyramided at all (biopb/biopb#265).
+
+        An **unscaled** chunk_id is served only if it was written. A miss cannot
+        be computed -- there is no backend -- so it raises rather than falling
+        through to ``get_data``, which would only raise less clearly.
 
         Args:
             chunk_id: Chunk identifier bytes
@@ -299,10 +362,18 @@ class CachedSourceAdapter(TensorAdapter):
                 f"CacheManager required for cache-backed source {self.source_id}"
             )
 
+        if is_scaled_chunk(chunk_id):
+            self._require_full_coverage(chunk_id)
+            return super().resolve_chunk_data(chunk_id, cache_manager)
+
         # Check if chunk was written
         if chunk_id not in self._written_chunks:
+            _, bounds = decode_chunk_id(chunk_id)
             raise flight.FlightServerError(
-                f"Chunk not found in cache-backed source {self.source_id}"
+                f"Cache-backed source {self.source_id} holds no chunk at "
+                f"{list(bounds.start)}..{list(bounds.stop)}: it was never "
+                f"uploaded, or the cache has since evicted it. An upload's "
+                f"cache entry is its only copy."
             )
 
         # Retrieve from cache manager directly
