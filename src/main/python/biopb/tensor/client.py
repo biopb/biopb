@@ -218,13 +218,7 @@ class TensorFlightClient:
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
-        self._upload = UploadSession(
-            self._client,
-            self._call_options,
-            location=self._location,
-            token=self._token,
-            tls_trust=tls_trust,
-        )
+        self._upload = UploadSession(self._state)
 
     # The catalog caches live on the shared _ClientState; expose them here so a
     # caller's reads, in-place mutation, AND reassignment (client._sources = {})
@@ -912,7 +906,6 @@ class TensorFlightClient:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
-        max_workers: Optional[int] = None,
     ) -> str:
         """Upload dask array to server.
 
@@ -931,10 +924,6 @@ class TensorFlightClient:
                          automatic rechunking if chunks are non-uniform.
             dim_labels: Optional dimension labels
             ome_metadata: Optional OME metadata dict
-            max_workers: Pin the upload to N concurrent chunks on the local
-                         threaded scheduler. None (the default) lets dask
-                         schedule it, which is what puts the writes on an
-                         attached distributed cluster; 1 uploads serially.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
@@ -945,7 +934,6 @@ class TensorFlightClient:
             chunk_shape,
             dim_labels,
             ome_metadata,
-            max_workers=max_workers,
         )
 
     def upload_zarr(
@@ -955,7 +943,6 @@ class TensorFlightClient:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
-        max_workers: Optional[int] = None,
     ) -> str:
         """Upload local zarr to server.
 
@@ -973,10 +960,6 @@ class TensorFlightClient:
             chunk_shape: Override chunk shape. If None, uses zarr's chunk shape.
             dim_labels: Optional dimension labels (read from zarr if not provided)
             ome_metadata: Optional OME metadata (read from zarr if not provided)
-            max_workers: Pin the upload to N concurrent chunks on the local
-                         threaded scheduler. None (the default) lets dask
-                         schedule it, which is what puts the writes on an
-                         attached distributed cluster; 1 uploads serially.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
@@ -987,7 +970,6 @@ class TensorFlightClient:
             chunk_shape,
             dim_labels,
             ome_metadata,
-            max_workers=max_workers,
         )
 
     def create_source(

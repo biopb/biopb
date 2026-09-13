@@ -2,17 +2,21 @@
 
 Extracted from :mod:`biopb.tensor.client` (issue #278 item C): source creation,
 chunk writing, and upload-status polling are a self-contained concern that
-depends only on the Flight connection (client + call options) -- not on the
-catalog / descriptor caches the read path shares. :class:`UploadSession` owns
-that concern; ``TensorFlightClient`` holds one and delegates its public upload
-methods to it.
+reads the shared ``_ClientState`` for its connection and touches none of the
+catalog / descriptor caches the read path keeps there. :class:`UploadSession`
+owns that concern; ``TensorFlightClient`` holds one and delegates its public
+upload methods to it.
+
+It needs both halves of that state: the live connection for its own foreground
+RPCs, and the plain ``(location, token, trust)`` triple for anything that rides
+into a dask graph -- which is the read path's arrangement too (``_session``).
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -24,6 +28,9 @@ from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
+
+if TYPE_CHECKING:  # import-time cycle-free; _session never imports this module
+    from biopb.tensor._session import _ClientState
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +77,8 @@ class _UploadTarget:
     it against this module's per-thread connection pool. A worker then dials
     once and every later block on that thread rides the same connection.
 
-    The upside is not just that it works: the writes then issue from the
-    worker processes, in parallel and off the client's GIL, next to the compute
-    that produced the block.
+    A worker's writes then issue from its own process, beside the compute that
+    produced the block.
     """
 
     __slots__ = ("_location", "_token", "_trust", "_source_id", "shape", "dtype")
@@ -93,27 +99,6 @@ class _UploadTarget:
         # ``store`` reads these off the target to check it can hold the array.
         self.shape = tuple(shape)
         self.dtype = dtype
-
-    # __slots__ without __dict__ needs these spelled out for pickle.
-    def __getstate__(self) -> Tuple[Any, ...]:
-        return (
-            self._location,
-            self._token,
-            self._trust,
-            self._source_id,
-            self.shape,
-            self.dtype,
-        )
-
-    def __setstate__(self, state: Tuple[Any, ...]) -> None:
-        (
-            self._location,
-            self._token,
-            self._trust,
-            self._source_id,
-            self.shape,
-            self.dtype,
-        ) = state
 
     def __setitem__(self, index: Tuple[slice, ...], value: np.ndarray) -> None:
         client = _get_thread_client(self._location, self._token, self._trust)
@@ -140,26 +125,14 @@ class UploadSession:
        / ``upload_zarr``, chunk upload, and upload-status polling -- is
        experimental and its behavior may change.
 
-    Holds only the connection handles (``FlightClient`` + ``FlightCallOptions``);
-    it never touches the catalog / descriptor caches. ``TensorFlightClient``
+    Takes the shared ``_ClientState`` its two sibling collaborators take
+    (``CatalogClient``, ``ChunkFetcher``) and reads only the connection fields
+    from it -- never the catalog / descriptor caches. ``TensorFlightClient``
     constructs one in its ``__init__`` and delegates its public upload API here.
     """
 
-    def __init__(
-        self,
-        client: flight.FlightClient,
-        call_options: flight.FlightCallOptions,
-        location: str = "",
-        token: Optional[str] = None,
-        tls_trust: Optional[TlsTrust] = None,
-    ):
-        self._client = client
-        self._call_options = call_options
-        # Plain data, carried so `upload_array` can hand a dask worker
-        # something it can rebuild a connection from; see `_UploadTarget`.
-        self._location = location
-        self._token = token
-        self._tls_trust = tls_trust
+    def __init__(self, state: "_ClientState"):
+        self._state = state
 
     def upload_array(
         self,
@@ -168,7 +141,6 @@ class UploadSession:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
-        max_workers: Optional[int] = None,
     ) -> str:
         """Backs TensorFlightClient.upload_array; see that method for the full
         documentation."""
@@ -202,15 +174,11 @@ class UploadSession:
             ome_metadata=ome_metadata,
         )
 
-        # The chunk grid is `arr`'s own by now -- the rechunk above saw to that
-        # -- so `store` walks it rather than this method recomputing it.
-        self._store_chunks(source_id, arr, max_workers)
+        self._store_chunks(source_id, arr)
 
         return source_id
 
-    def _store_chunks(
-        self, source_id: str, arr: da.Array, max_workers: Optional[int]
-    ) -> None:
+    def _store_chunks(self, source_id: str, arr: da.Array) -> None:
         """Hand the whole upload to dask as one graph.
 
         ``upload_array`` has already rechunked *arr* onto the upload grid, so
@@ -221,35 +189,28 @@ class UploadSession:
         per chunk, and separate ``.compute()`` calls share no cache, so any
         task two chunks need is computed once *per chunk*. That is the ordinary
         case rather than a corner -- the rechunk above is exactly what makes
-        one output chunk draw on a coarser shared source block. Here the writes
-        hang off the array's own graph: one optimization pass, and a shared
-        ancestor computed once.
+        one output chunk draw on a coarser shared source block.
 
         ``lock=False`` because the default exists for targets that cannot take
         a concurrent ``__setitem__`` (an h5py dataset). Each block writes a
         disjoint region and the server counts arrivals into a set keyed by
         chunk id, so locking would serialize the uploads and buy nothing.
 
-        Scheduling is then dask's, which is the point: with a distributed
-        cluster attached the writes run on its workers, and otherwise on the
-        threaded pool. Naming *max_workers* opts out of that and pins the local
-        threaded scheduler, since a worker count is a property of it -- so it
-        is the dial for "upload serially" or "this link wants exactly N in
-        flight", not the normal path.
+        Nothing here names a scheduler. That is the caller's, as it is for
+        every other dask surface this SDK returns: an attached distributed
+        client gets the writes, and
+        ``dask.config.set(scheduler="threads", num_workers=N)`` around the call
+        is how a link that wants exactly N in flight -- or one -- says so.
         """
         target = _UploadTarget(
-            self._location,
-            self._token,
-            self._tls_trust,
+            self._state.location,
+            self._state.token,
+            self._state.tls_trust,
             source_id,
             arr.shape,
             arr.dtype,
         )
-        kwargs: Dict[str, Any] = {}
-        if max_workers is not None:
-            kwargs["scheduler"] = "threads"
-            kwargs["num_workers"] = max(1, int(max_workers))
-        da.store(arr, target, lock=False, **kwargs)
+        da.store(arr, target, lock=False)
 
     def upload_zarr(
         self,
@@ -258,7 +219,6 @@ class UploadSession:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
-        max_workers: Optional[int] = None,
     ) -> str:
         """Backs TensorFlightClient.upload_zarr; see that method for the full
         documentation."""
@@ -288,7 +248,6 @@ class UploadSession:
             chunk_shape=effective_chunk_shape,
             dim_labels=dim_labels,
             ome_metadata=ome_metadata,
-            max_workers=max_workers,
         )
 
     def create_source(
@@ -312,7 +271,7 @@ class UploadSession:
         )
 
         action = flight.Action("create_source", req_desc.SerializeToString())
-        results = self._client.do_action(action, options=self._call_options)
+        results = self._state.client.do_action(action, options=self._state.call_options)
         try:
             result = next(results)
         except StopIteration as exc:
@@ -330,13 +289,15 @@ class UploadSession:
     ) -> None:
         """Backs TensorFlightClient.upload_chunk; see that method for the full
         documentation."""
-        _put_chunk(self._client, self._call_options, source_id, bounds, data)
+        _put_chunk(
+            self._state.client, self._state.call_options, source_id, bounds, data
+        )
 
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
         """Backs TensorFlightClient.get_upload_status; see that method for the full
         documentation."""
         action = flight.Action("upload_status", source_id.encode("utf-8"))
-        results = self._client.do_action(action, options=self._call_options)
+        results = self._state.client.do_action(action, options=self._state.call_options)
         for result in results:
             return json.loads(result.body.to_pybytes())
         return {
