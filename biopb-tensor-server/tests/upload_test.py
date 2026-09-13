@@ -6,6 +6,7 @@ and Python client upload methods.
 
 import tempfile
 import threading
+import time
 from itertools import product
 from pathlib import Path
 
@@ -1423,3 +1424,233 @@ class TestCachedSourceContentVersion:
         assert cv1 is not None and cv2 is not None
         assert cv1.startswith(b"gen:") and cv2.startswith(b"gen:")
         assert cv1 != cv2  # a fresh namespace per upload session
+
+
+class TestConcurrentChunkUpload:
+    """`upload_array` fans its chunks out across a bounded pool (#590).
+
+    The serial loop this replaced paid a full `do_put` round trip
+    (open/write/done/close/read) per chunk with nothing overlapping it, so the
+    cost was latency multiplied by chunk count. These tests pin the three
+    things that has to keep true while several are in flight: the bytes still
+    land, a failure still surfaces as itself, and the concurrency is real.
+    """
+
+    @staticmethod
+    def _writable_server(tmpdir):
+        """A live, writable Flight server on an OS-assigned port."""
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=512))
+
+        server = TensorFlightServer(
+            location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
+        )
+        server.mark_ready()
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+        return server
+
+    def test_a_fanned_out_upload_round_trips_every_chunk(self, tmp_path):
+        """The whole point: concurrent chunks, byte-identical on the way back.
+
+        Twelve chunks against eight workers, so the window genuinely refills
+        rather than the pool simply being wider than the work. Values differ per
+        chunk, which is what makes a swapped or dropped chunk visible -- a
+        uniform array would round-trip through almost any bug.
+        """
+        import dask.array as da
+        from biopb.tensor import TensorFlightClient
+
+        server = self._writable_server(tmp_path)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            source = np.arange(12 * 40 * 40, dtype=np.uint16).reshape(12, 40, 40)
+            arr = da.from_array(source, chunks=(1, 40, 40))
+
+            source_id = client.upload_array(arr, "cache:fanout")
+
+            client.wait_for_upload_ready(source_id, timeout_seconds=30)
+            np.testing.assert_array_equal(
+                client.get_tensor(source_id).compute(), source
+            )
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+
+    def test_the_chunks_really_do_overlap(self, tmp_path):
+        """Concurrency, observed rather than assumed.
+
+        Without this the suite would pass just as happily on a pool of one, and
+        #590 would be "fixed" by code that still serializes. `upload_chunk` is
+        wrapped to count how many calls are inside it at once; a serial upload
+        can never exceed 1.
+        """
+        import dask.array as da
+        from biopb.tensor import TensorFlightClient
+
+        server = self._writable_server(tmp_path)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            session = client._upload
+            inner = session.upload_chunk
+            lock = threading.Lock()
+            live = 0
+            peak = 0
+
+            def counting_upload_chunk(*args, **kwargs):
+                nonlocal live, peak
+                with lock:
+                    live += 1
+                    peak = max(peak, live)
+                try:
+                    # Held open long enough for its siblings to arrive. A real
+                    # upload's own latency is what creates the overlap in
+                    # production; here it has to be forced, or a loopback round
+                    # trip can finish before the next task is even scheduled.
+                    time.sleep(0.05)
+                    return inner(*args, **kwargs)
+                finally:
+                    with lock:
+                        live -= 1
+
+            session.upload_chunk = counting_upload_chunk
+            arr = da.from_array(
+                np.zeros((16, 20, 20), dtype=np.uint8), chunks=(1, 20, 20)
+            )
+            client.upload_array(arr, "cache:overlap", max_workers=4)
+
+            assert peak > 1, "uploads ran one at a time"
+            assert peak <= 4, f"pool of 4 ran {peak} at once"
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+
+    def test_max_workers_one_is_still_a_serial_upload(self, tmp_path):
+        """The escape hatch, for a backend that cannot take concurrent reads.
+
+        `.compute()` already parallelizes internally under dask's threaded
+        scheduler, so this is not a general thread-safety promise -- it is the
+        one dial a caller has when fanning out makes things worse.
+        """
+        import dask.array as da
+        from biopb.tensor import TensorFlightClient
+
+        server = self._writable_server(tmp_path)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            session = client._upload
+            inner = session.upload_chunk
+            lock = threading.Lock()
+            live = 0
+            peak = 0
+
+            def counting_upload_chunk(*args, **kwargs):
+                nonlocal live, peak
+                with lock:
+                    live += 1
+                    peak = max(peak, live)
+                try:
+                    time.sleep(0.02)
+                    return inner(*args, **kwargs)
+                finally:
+                    with lock:
+                        live -= 1
+
+            session.upload_chunk = counting_upload_chunk
+            source = np.arange(6 * 20 * 20, dtype=np.uint16).reshape(6, 20, 20)
+            arr = da.from_array(source, chunks=(1, 20, 20))
+            source_id = client.upload_array(arr, "cache:serial", max_workers=1)
+
+            assert peak == 1
+            client.wait_for_upload_ready(source_id, timeout_seconds=30)
+            np.testing.assert_array_equal(
+                client.get_tensor(source_id).compute(), source
+            )
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+
+    def test_a_failed_chunk_surfaces_as_itself(self, tmp_path):
+        """A chunk that raises must still reach the caller, with its own type.
+
+        The serial loop let the exception propagate straight out of the loop
+        body. Callers catch on type (`flight.FlightError` and friends), so the
+        pool re-raises the worker's exception rather than wrapping it -- and it
+        must not swallow it or hang waiting on the siblings either.
+        """
+        import dask.array as da
+        from biopb.tensor import TensorFlightClient
+
+        server = self._writable_server(tmp_path)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            session = client._upload
+            inner = session.upload_chunk
+            seen = []
+
+            class ChunkRefused(RuntimeError):
+                pass
+
+            def failing_upload_chunk(source_id, bounds, data):
+                # The fourth chunk, so some have already landed and others are
+                # still queued -- the state the unwind actually has to handle.
+                if len(seen) == 3:
+                    raise ChunkRefused("no")
+                seen.append(tuple(bounds.start))
+                return inner(source_id, bounds, data)
+
+            session.upload_chunk = failing_upload_chunk
+            arr = da.from_array(
+                np.zeros((10, 20, 20), dtype=np.uint8), chunks=(1, 20, 20)
+            )
+
+            with pytest.raises(ChunkRefused):
+                client.upload_array(arr, "cache:doomed", max_workers=2)
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+
+    def test_out_of_order_arrival_still_completes_the_upload(self, tmp_path):
+        """Readiness counts chunks into a set, so order is not observable.
+
+        Fanning out makes arrival order arbitrary; this pins the server-side
+        property that makes that safe, by uploading the chunks deliberately
+        backwards and asking for READY.
+        """
+        import dask.array as da
+        from biopb.tensor import TensorFlightClient
+
+        server = self._writable_server(tmp_path)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            session = client._upload
+            source = np.arange(5 * 20 * 20, dtype=np.uint16).reshape(5, 20, 20)
+            arr = da.from_array(source, chunks=(1, 20, 20))
+
+            source_id = session.create_source(
+                source_name="cache:backwards",
+                shape=source.shape,
+                dtype=arr.dtype.str,
+                chunk_shape=(1, 20, 20),
+                dim_labels=["z", "y", "x"],
+            )
+            for z in reversed(range(5)):
+                session.upload_chunk(
+                    source_id,
+                    ChunkBounds(start=[z, 0, 0], stop=[z + 1, 20, 20]),
+                    source[z : z + 1],
+                )
+
+            status = client.wait_for_upload_ready(source_id, timeout_seconds=30)
+            assert status["state"] == "READY"
+            assert status["uploaded_chunks"] == 5
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()

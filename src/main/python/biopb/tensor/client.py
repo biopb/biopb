@@ -906,6 +906,7 @@ class TensorFlightClient:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
+        max_workers: Optional[int] = None,
     ) -> str:
         """Upload dask array to server.
 
@@ -924,12 +925,21 @@ class TensorFlightClient:
                          automatic rechunking if chunks are non-uniform.
             dim_labels: Optional dimension labels
             ome_metadata: Optional OME metadata dict
+            max_workers: Chunk uploads to run at once. None (the default)
+                         uses the SDK default; 1 restores a strictly serial
+                         upload. Each running upload holds one materialized
+                         chunk, so this also bounds the memory the call uses.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
         """
         return self._upload.upload_array(
-            arr, source_name, chunk_shape, dim_labels, ome_metadata
+            arr,
+            source_name,
+            chunk_shape,
+            dim_labels,
+            ome_metadata,
+            max_workers=max_workers,
         )
 
     def upload_zarr(
@@ -939,6 +949,7 @@ class TensorFlightClient:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
+        max_workers: Optional[int] = None,
     ) -> str:
         """Upload local zarr to server.
 
@@ -956,12 +967,21 @@ class TensorFlightClient:
             chunk_shape: Override chunk shape. If None, uses zarr's chunk shape.
             dim_labels: Optional dimension labels (read from zarr if not provided)
             ome_metadata: Optional OME metadata (read from zarr if not provided)
+            max_workers: Chunk uploads to run at once. None (the default)
+                         uses the SDK default; 1 restores a strictly serial
+                         upload. Each running upload holds one materialized
+                         chunk, so this also bounds the memory the call uses.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
         """
         return self._upload.upload_zarr(
-            zarr_path, source_name, chunk_shape, dim_labels, ome_metadata
+            zarr_path,
+            source_name,
+            chunk_shape,
+            dim_labels,
+            ome_metadata,
+            max_workers=max_workers,
         )
 
     def create_source(

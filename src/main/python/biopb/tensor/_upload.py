@@ -11,9 +11,10 @@ methods to it.
 import json
 import logging
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from itertools import product
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -25,6 +26,26 @@ from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 
 logger = logging.getLogger(__name__)
+
+#: Chunk uploads in flight at once, when the caller names no ``max_workers``.
+#:
+#: Each *running* task holds one materialized chunk, so this doubles as the
+#: memory bound: ``workers x chunk_nbytes``, or ~64 MiB at the 8 MiB transfer
+#: cap. The work is a ``do_put`` round trip per chunk, so the useful setting
+#: tracks link latency rather than core count -- eight is enough to keep a
+#: remote server busy and costs a loopback one nothing.
+_DEFAULT_UPLOAD_WORKERS = 8
+
+
+def _chunk_bounds(
+    shape: Sequence[int], chunk_shape: Sequence[int], chunk_idx: Sequence[int]
+) -> ChunkBounds:
+    """The half-open bounds of one chunk, clipped to *shape* at the far edge."""
+    start: List[int] = [idx * chunk_shape[d] for d, idx in enumerate(chunk_idx)]
+    stop: List[int] = [
+        min((idx + 1) * chunk_shape[d], shape[d]) for d, idx in enumerate(chunk_idx)
+    ]
+    return ChunkBounds(start=start, stop=stop)
 
 
 def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
@@ -61,6 +82,7 @@ class UploadSession:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
+        max_workers: Optional[int] = None,
     ) -> str:
         """Backs TensorFlightClient.upload_array; see that method for the full
         documentation."""
@@ -102,24 +124,94 @@ class UploadSession:
             for d in range(ndim)
         ]
 
-        for chunk_idx in product(*(range(n) for n in chunks_per_dim)):
-            chunk_start = [
-                idx * chunk_shape_tuple[d] for d, idx in enumerate(chunk_idx)
-            ]
-            chunk_stop = [
-                min((idx + 1) * chunk_shape_tuple[d], arr.shape[d])
-                for d, idx in enumerate(chunk_idx)
-            ]
-
-            bounds = ChunkBounds(start=chunk_start, stop=chunk_stop)
-
-            slices = tuple(
-                slice(chunk_start[d], chunk_stop[d]) for d in range(arr.ndim)
-            )
-            chunk_data = arr[slices].compute()
-            self.upload_chunk(source_id, bounds, chunk_data)
+        self._upload_chunks(
+            source_id, arr, chunk_shape_tuple, chunks_per_dim, max_workers
+        )
 
         return source_id
+
+    def _upload_chunks(
+        self,
+        source_id: str,
+        arr: da.Array,
+        chunk_shape: Tuple[int, ...],
+        chunks_per_dim: Sequence[int],
+        max_workers: Optional[int],
+    ) -> None:
+        """Compute and upload every chunk of *arr*, several at a time.
+
+        One task per chunk, each doing its own ``.compute()`` and its own
+        ``do_put``. Both halves belong in the task: uploading serially pays a
+        full round trip (open/write/done/close/read) per chunk with nothing
+        overlapping it, and computing serially would then leave the link idle
+        for the length of a graph execution. That serialization was the whole
+        of biopb/biopb#590, and what it wastes is latency, not bandwidth.
+
+        Submission is windowed rather than issued all at once. A *queued* task
+        holds only its bounds -- ``arr`` is lazy -- so the window costs no
+        memory and exists to keep a worker's next chunk waiting rather than
+        idling for the submit that follows a completion. Memory is bounded by
+        the *running* tasks, one materialized chunk each.
+
+        Chunks may land out of order. The server counts them into a set keyed
+        by chunk id (``UploadManager.mark_chunk``) and each one writes a
+        disjoint region, so arrival order is not observable.
+        """
+        workers = (
+            _DEFAULT_UPLOAD_WORKERS if max_workers is None else max(1, int(max_workers))
+        )
+        pending: Dict[Future, ChunkBounds] = {}
+
+        def drain(limit: int) -> None:
+            """Block until fewer than *limit* tasks are outstanding.
+
+            Raises the first failure seen. The exception is re-raised as-is
+            rather than wrapped: a caller's ``except flight.FlightError`` has to
+            keep working across this change, so the type and traceback pass
+            through untouched and the log line is what names the chunk.
+            """
+            while len(pending) >= limit:
+                done, _ = wait(set(pending), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    bounds = pending.pop(fut)
+                    exc = fut.exception()
+                    if exc is not None:
+                        logger.error(
+                            "upload_array: chunk at %s of %s failed",
+                            list(bounds.start),
+                            source_id,
+                        )
+                        raise exc
+
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="biopb-upload"
+        ) as pool:
+            try:
+                for chunk_idx in product(*(range(n) for n in chunks_per_dim)):
+                    drain(workers * 2)
+                    bounds = _chunk_bounds(arr.shape, chunk_shape, chunk_idx)
+                    pending[
+                        pool.submit(self._compute_and_put, source_id, arr, bounds)
+                    ] = bounds
+                drain(1)
+            except BaseException:
+                # Drop the queued backlog before the pool's own shutdown waits on
+                # it: a failed upload should stop, not finish uploading into a
+                # source the caller is about to hear has failed. Tasks already
+                # running cannot be cancelled, and are waited for.
+                for fut in pending:
+                    fut.cancel()
+                raise
+
+    def _compute_and_put(
+        self, source_id: str, arr: da.Array, bounds: ChunkBounds
+    ) -> None:
+        """One chunk, end to end: materialize it, then ship it."""
+        slices = tuple(
+            slice(start, stop)
+            for start, stop in zip(bounds.start, bounds.stop, strict=True)
+        )
+        self.upload_chunk(source_id, bounds, arr[slices].compute())
 
     def upload_zarr(
         self,
@@ -128,6 +220,7 @@ class UploadSession:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
+        max_workers: Optional[int] = None,
     ) -> str:
         """Backs TensorFlightClient.upload_zarr; see that method for the full
         documentation."""
@@ -157,6 +250,7 @@ class UploadSession:
             chunk_shape=effective_chunk_shape,
             dim_labels=dim_labels,
             ome_metadata=ome_metadata,
+            max_workers=max_workers,
         )
 
     def create_source(
