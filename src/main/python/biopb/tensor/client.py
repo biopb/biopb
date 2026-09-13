@@ -218,7 +218,13 @@ class TensorFlightClient:
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
-        self._upload = UploadSession(self._client, self._call_options)
+        self._upload = UploadSession(
+            self._client,
+            self._call_options,
+            location=self._location,
+            token=self._token,
+            tls_trust=tls_trust,
+        )
 
     # The catalog caches live on the shared _ClientState; expose them here so a
     # caller's reads, in-place mutation, AND reassignment (client._sources = {})
@@ -907,7 +913,6 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
-        strategy: str = "store",
     ) -> str:
         """Upload dask array to server.
 
@@ -926,14 +931,10 @@ class TensorFlightClient:
                          automatic rechunking if chunks are non-uniform.
             dim_labels: Optional dimension labels
             ome_metadata: Optional OME metadata dict
-            max_workers: Chunk uploads to run at once. None (the default)
-                         lets the strategy choose; 1 restores a strictly
-                         serial upload.
-            strategy: How chunks reach the server. "store" (the default) hands
-                      the whole upload to dask as one graph, so a task two
-                      chunks share is computed once. "pool" computes each
-                      chunk separately, several at a time, which trades that
-                      away for a hard `max_workers x chunk` memory ceiling.
+            max_workers: Pin the upload to N concurrent chunks on the local
+                         threaded scheduler. None (the default) lets dask
+                         schedule it, which is what puts the writes on an
+                         attached distributed cluster; 1 uploads serially.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
@@ -945,7 +946,6 @@ class TensorFlightClient:
             dim_labels,
             ome_metadata,
             max_workers=max_workers,
-            strategy=strategy,
         )
 
     def upload_zarr(
@@ -956,7 +956,6 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
-        strategy: str = "store",
     ) -> str:
         """Upload local zarr to server.
 
@@ -974,14 +973,10 @@ class TensorFlightClient:
             chunk_shape: Override chunk shape. If None, uses zarr's chunk shape.
             dim_labels: Optional dimension labels (read from zarr if not provided)
             ome_metadata: Optional OME metadata (read from zarr if not provided)
-            max_workers: Chunk uploads to run at once. None (the default)
-                         lets the strategy choose; 1 restores a strictly
-                         serial upload.
-            strategy: How chunks reach the server. "store" (the default) hands
-                      the whole upload to dask as one graph, so a task two
-                      chunks share is computed once. "pool" computes each
-                      chunk separately, several at a time, which trades that
-                      away for a hard `max_workers x chunk` memory ceiling.
+            max_workers: Pin the upload to N concurrent chunks on the local
+                         threaded scheduler. None (the default) lets dask
+                         schedule it, which is what puts the writes on an
+                         attached distributed cluster; 1 uploads serially.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
@@ -993,7 +988,6 @@ class TensorFlightClient:
             dim_labels,
             ome_metadata,
             max_workers=max_workers,
-            strategy=strategy,
         )
 
     def create_source(

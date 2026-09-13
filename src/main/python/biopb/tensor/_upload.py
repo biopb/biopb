@@ -11,48 +11,47 @@ methods to it.
 import json
 import logging
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from itertools import product
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
+from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
+from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 
 logger = logging.getLogger(__name__)
 
-#: Chunk uploads in flight at once, when the caller names no ``max_workers``.
-#:
-#: The work is a ``do_put`` round trip per chunk, so the useful setting tracks
-#: link latency rather than core count -- eight is enough to keep a remote
-#: server busy and costs a loopback one nothing. It is not a memory bound: see
-#: :meth:`UploadSession._upload_chunks`.
-_DEFAULT_UPLOAD_WORKERS = 8
 
-#: How ``upload_array`` gets its chunks to the server.
-#:
-#: ``"store"`` hands the whole upload to dask as one graph (``da.store``);
-#: ``"pool"`` walks the chunks here and computes each one separately, several
-#: at a time. They differ in everything upstream of the write -- see
-#: :meth:`UploadSession._store_chunks`.
-_DEFAULT_UPLOAD_STRATEGY = "store"
+def _put_chunk(
+    client: flight.FlightClient,
+    call_options: flight.FlightCallOptions,
+    source_id: str,
+    bounds: ChunkBounds,
+    data: np.ndarray,
+) -> None:
+    """One ``do_put``: open, write the batch, close, read the ack.
 
+    Free of any session state, so the same code serves
+    :meth:`UploadSession.upload_chunk` and a target that has been unpickled in a
+    dask worker with no session to hand.
+    """
+    upload = ChunkUpload(source_id=source_id, bounds=bounds)
+    desc = flight.FlightDescriptor.for_command(upload.SerializeToString())
+    schema = pa.schema([pa.field("data", pa.from_numpy_dtype(data.dtype))])
 
-def _chunk_bounds(
-    shape: Sequence[int], chunk_shape: Sequence[int], chunk_idx: Sequence[int]
-) -> ChunkBounds:
-    """The half-open bounds of one chunk, clipped to *shape* at the far edge."""
-    start: List[int] = [idx * chunk_shape[d] for d, idx in enumerate(chunk_idx)]
-    stop: List[int] = [
-        min((idx + 1) * chunk_shape[d], shape[d]) for d, idx in enumerate(chunk_idx)
-    ]
-    return ChunkBounds(start=start, stop=stop)
+    writer, reader = client.do_put(desc, schema, options=call_options)
+    batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
+    writer.write_batch(batch)
+    writer.done_writing()
+    writer.close()
+    reader.read()
+    logger.debug(f"upload_chunk: uploaded {data.nbytes} bytes to {source_id}")
 
 
 class _UploadTarget:
@@ -62,28 +61,67 @@ class _UploadTarget:
     the ``ChunkBounds`` an upload wants -- so the whole adapter is that one
     translation, and the scheduling, the memory ordering and the sharing of
     common ancestors between blocks all stay dask's.
+
+    **Holds connection parameters, never a connection.** ``store`` puts the
+    target *into the graph*, so under a distributed scheduler it is pickled out
+    to the workers -- and a ``FlightClient`` cannot be pickled at all. This is
+    the read path's own arrangement (``_session._fetch_endpoints...``): carry
+    the plain ``(location, token, trust)`` triple, and let each worker resolve
+    it against this module's per-thread connection pool. A worker then dials
+    once and every later block on that thread rides the same connection.
+
+    The upside is not just that it works: the writes then issue from the
+    worker processes, in parallel and off the client's GIL, next to the compute
+    that produced the block.
     """
 
-    __slots__ = ("_session", "_source_id", "shape", "dtype")
+    __slots__ = ("_location", "_token", "_trust", "_source_id", "shape", "dtype")
 
     def __init__(
         self,
-        session: "UploadSession",
+        location: str,
+        token: Optional[str],
+        trust: Optional[TlsTrust],
         source_id: str,
         shape: Sequence[int],
         dtype: np.dtype,
     ):
-        self._session = session
+        self._location = location
+        self._token = token
+        self._trust = trust or NO_TLS
         self._source_id = source_id
         # ``store`` reads these off the target to check it can hold the array.
         self.shape = tuple(shape)
         self.dtype = dtype
 
+    # __slots__ without __dict__ needs these spelled out for pickle.
+    def __getstate__(self) -> Tuple[Any, ...]:
+        return (
+            self._location,
+            self._token,
+            self._trust,
+            self._source_id,
+            self.shape,
+            self.dtype,
+        )
+
+    def __setstate__(self, state: Tuple[Any, ...]) -> None:
+        (
+            self._location,
+            self._token,
+            self._trust,
+            self._source_id,
+            self.shape,
+            self.dtype,
+        ) = state
+
     def __setitem__(self, index: Tuple[slice, ...], value: np.ndarray) -> None:
+        client = _get_thread_client(self._location, self._token, self._trust)
+        call_options = _get_shared_call_options(self._location, self._token)
         bounds = ChunkBounds(
             start=[s.start for s in index], stop=[s.stop for s in index]
         )
-        self._session.upload_chunk(self._source_id, bounds, value)
+        _put_chunk(client, call_options, self._source_id, bounds, value)
 
 
 def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
@@ -108,10 +146,20 @@ class UploadSession:
     """
 
     def __init__(
-        self, client: flight.FlightClient, call_options: flight.FlightCallOptions
+        self,
+        client: flight.FlightClient,
+        call_options: flight.FlightCallOptions,
+        location: str = "",
+        token: Optional[str] = None,
+        tls_trust: Optional[TlsTrust] = None,
     ):
         self._client = client
         self._call_options = call_options
+        # Plain data, carried so `upload_array` can hand a dask worker
+        # something it can rebuild a connection from; see `_UploadTarget`.
+        self._location = location
+        self._token = token
+        self._tls_trust = tls_trust
 
     def upload_array(
         self,
@@ -121,7 +169,6 @@ class UploadSession:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
-        strategy: str = _DEFAULT_UPLOAD_STRATEGY,
     ) -> str:
         """Backs TensorFlightClient.upload_array; see that method for the full
         documentation."""
@@ -155,24 +202,9 @@ class UploadSession:
             ome_metadata=ome_metadata,
         )
 
-        # Upload chunks
-        ndim = arr.ndim
-        chunk_shape_tuple = tuple(chunk_shape)
-        chunks_per_dim = [
-            (arr.shape[d] + chunk_shape_tuple[d] - 1) // chunk_shape_tuple[d]
-            for d in range(ndim)
-        ]
-
-        if strategy == "store":
-            self._store_chunks(source_id, arr, max_workers)
-        elif strategy == "pool":
-            self._upload_chunks(
-                source_id, arr, chunk_shape_tuple, chunks_per_dim, max_workers
-            )
-        else:
-            raise ValueError(
-                f"unknown upload strategy {strategy!r}; expected 'store' or 'pool'"
-            )
+        # The chunk grid is `arr`'s own by now -- the rechunk above saw to that
+        # -- so `store` walks it rather than this method recomputing it.
+        self._store_chunks(source_id, arr, max_workers)
 
         return source_id
 
@@ -184,121 +216,40 @@ class UploadSession:
         ``upload_array`` has already rechunked *arr* onto the upload grid, so
         one dask block is one chunk and ``store`` needs no alignment help.
 
-        What this buys over :meth:`_upload_chunks` is everything upstream of
-        the write. That one walks the chunks itself and calls ``.compute()``
-        per chunk, so an N-chunk array pays N graph optimizations, and any task
-        two chunks share -- a rechunk, a ``map_overlap`` halo, anything derived
-        from a differently-chunked input -- is computed once per chunk that
-        wants it, because separate ``.compute()`` calls share no cache. Here
-        the writes hang off the array's own graph, so there is one optimization
-        pass and a shared ancestor is computed once.
+        Why ``store`` rather than a loop that computes and ships each chunk
+        itself (biopb/biopb#590): a per-chunk loop pays a graph optimization
+        per chunk, and separate ``.compute()`` calls share no cache, so any
+        task two chunks need is computed once *per chunk*. That is the ordinary
+        case rather than a corner -- the rechunk above is exactly what makes
+        one output chunk draw on a coarser shared source block. Here the writes
+        hang off the array's own graph: one optimization pass, and a shared
+        ancestor computed once.
 
         ``lock=False`` because the default exists for targets that cannot take
-        a concurrent ``__setitem__`` (an h5py dataset). Each block here writes
-        a disjoint region and the server counts arrivals into a set keyed by
+        a concurrent ``__setitem__`` (an h5py dataset). Each block writes a
+        disjoint region and the server counts arrivals into a set keyed by
         chunk id, so locking would serialize the uploads and buy nothing.
 
-        Concurrency and memory are then dask's: its scheduler runs the writes
-        on the threaded pool and orders the graph so a computed block is freed
-        once stored. That is a scheduler's ordering rather than the hard
-        ``workers x chunk`` ceiling the pool gives, which is the trade.
+        Scheduling is then dask's, which is the point: with a distributed
+        cluster attached the writes run on its workers, and otherwise on the
+        threaded pool. Naming *max_workers* opts out of that and pins the local
+        threaded scheduler, since a worker count is a property of it -- so it
+        is the dial for "upload serially" or "this link wants exactly N in
+        flight", not the normal path.
         """
-        target = _UploadTarget(self, source_id, arr.shape, arr.dtype)
+        target = _UploadTarget(
+            self._location,
+            self._token,
+            self._tls_trust,
+            source_id,
+            arr.shape,
+            arr.dtype,
+        )
         kwargs: Dict[str, Any] = {}
         if max_workers is not None:
             kwargs["scheduler"] = "threads"
             kwargs["num_workers"] = max(1, int(max_workers))
         da.store(arr, target, lock=False, **kwargs)
-
-    def _upload_chunks(
-        self,
-        source_id: str,
-        arr: da.Array,
-        chunk_shape: Tuple[int, ...],
-        chunks_per_dim: Sequence[int],
-        max_workers: Optional[int],
-    ) -> None:
-        """Compute and upload every chunk of *arr*, several at a time.
-
-        One task per chunk, each doing its own ``.compute()`` and its own
-        ``do_put``. Both halves belong in the task: uploading serially pays a
-        full round trip (open/write/done/close/read) per chunk with nothing
-        overlapping it, and computing serially would then leave the link idle
-        for the length of a graph execution. That serialization was the whole
-        of biopb/biopb#590, and what it wastes is latency, not bandwidth.
-
-        Submission is windowed rather than issued all at once. A *queued* task
-        holds only its bounds -- ``arr`` is lazy -- so the window costs no
-        memory and exists to keep a worker's next chunk waiting rather than
-        idling for the submit that follows a completion.
-
-        This does **not** bound memory at ``workers x chunk``, which is what it
-        looks like it should do and what an earlier version of this comment
-        claimed. Each task runs a whole ``.compute()``, which brings its own
-        intermediates and its own fan-out across dask's thread pool, so the
-        real peak is several times that -- measured above ``store``'s on the
-        same array, not below it. Nothing here bounds memory; the window
-        bounds only how far ahead submission runs.
-
-        Chunks may land out of order. The server counts them into a set keyed
-        by chunk id (``UploadManager.mark_chunk``) and each one writes a
-        disjoint region, so arrival order is not observable.
-        """
-        workers = (
-            _DEFAULT_UPLOAD_WORKERS if max_workers is None else max(1, int(max_workers))
-        )
-        pending: Dict[Future, ChunkBounds] = {}
-
-        def drain(limit: int) -> None:
-            """Block until fewer than *limit* tasks are outstanding.
-
-            Raises the first failure seen. The exception is re-raised as-is
-            rather than wrapped: a caller's ``except flight.FlightError`` has to
-            keep working across this change, so the type and traceback pass
-            through untouched and the log line is what names the chunk.
-            """
-            while len(pending) >= limit:
-                done, _ = wait(set(pending), return_when=FIRST_COMPLETED)
-                for fut in done:
-                    bounds = pending.pop(fut)
-                    exc = fut.exception()
-                    if exc is not None:
-                        logger.error(
-                            "upload_array: chunk at %s of %s failed",
-                            list(bounds.start),
-                            source_id,
-                        )
-                        raise exc
-
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="biopb-upload"
-        ) as pool:
-            try:
-                for chunk_idx in product(*(range(n) for n in chunks_per_dim)):
-                    drain(workers * 2)
-                    bounds = _chunk_bounds(arr.shape, chunk_shape, chunk_idx)
-                    pending[
-                        pool.submit(self._compute_and_put, source_id, arr, bounds)
-                    ] = bounds
-                drain(1)
-            except BaseException:
-                # Drop the queued backlog before the pool's own shutdown waits on
-                # it: a failed upload should stop, not finish uploading into a
-                # source the caller is about to hear has failed. Tasks already
-                # running cannot be cancelled, and are waited for.
-                for fut in pending:
-                    fut.cancel()
-                raise
-
-    def _compute_and_put(
-        self, source_id: str, arr: da.Array, bounds: ChunkBounds
-    ) -> None:
-        """One chunk, end to end: materialize it, then ship it."""
-        slices = tuple(
-            slice(start, stop)
-            for start, stop in zip(bounds.start, bounds.stop, strict=True)
-        )
-        self.upload_chunk(source_id, bounds, arr[slices].compute())
 
     def upload_zarr(
         self,
@@ -308,7 +259,6 @@ class UploadSession:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
-        strategy: str = _DEFAULT_UPLOAD_STRATEGY,
     ) -> str:
         """Backs TensorFlightClient.upload_zarr; see that method for the full
         documentation."""
@@ -339,7 +289,6 @@ class UploadSession:
             dim_labels=dim_labels,
             ome_metadata=ome_metadata,
             max_workers=max_workers,
-            strategy=strategy,
         )
 
     def create_source(
@@ -381,21 +330,7 @@ class UploadSession:
     ) -> None:
         """Backs TensorFlightClient.upload_chunk; see that method for the full
         documentation."""
-        upload = ChunkUpload(
-            source_id=source_id,
-            bounds=bounds,
-        )
-
-        desc = flight.FlightDescriptor.for_command(upload.SerializeToString())
-        schema = pa.schema([pa.field("data", pa.from_numpy_dtype(data.dtype))])
-
-        writer, reader = self._client.do_put(desc, schema, options=self._call_options)
-        batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
-        writer.write_batch(batch)
-        writer.done_writing()
-        writer.close()
-        reader.read()
-        logger.debug(f"upload_chunk: uploaded {data.nbytes} bytes to {source_id}")
+        _put_chunk(self._client, self._call_options, source_id, bounds, data)
 
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
         """Backs TensorFlightClient.get_upload_status; see that method for the full
