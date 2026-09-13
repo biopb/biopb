@@ -35,8 +35,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _process_ops,
         "build_ops_from_config",
-        # The real builder closes over `lambda: conn.client`; keeping the getter
-        # here is what lets a test watch ops follow a reconnect.
+        # Keeps the getter so a test can watch ops follow a reconnect.
         lambda config, getter: {"segment": getter},
     )
     monkeypatch.setattr(_locations, "mcp_plugin_dir", lambda: tmp_path)
@@ -97,13 +96,8 @@ class TestHandles:
         assert "segment" in ns["ops"]
 
     def test_what_came_back_tracks_a_reconnect(self, env):
-        # Why the connection and not the client: a reconnect swaps the client
-        # out, and the session kernel re-derives it before every cell
-        # (`_jobs._REFRESH_PREFIX`) rather than binding it once. A notebook has
-        # no such prefix, so a returned client would be a snapshot with nothing
-        # to refresh it -- while a returned connection is the live handle that
-        # ops already resolve through, and that a Tensor Browser can be hung off
-        # (`TensorBrowserWidget(viewer, connection=conn)`).
+        # The reason the connection comes back and not the client: a reconnect
+        # swaps the client out, and both the caller and ops must follow it.
         ns = _run()
         conn = ns["conn"]
         resolve_client = ns["ops"]["segment"]
@@ -113,8 +107,7 @@ class TestHandles:
         assert resolve_client() == "reconnected"
 
     def test_the_documents_own_spelling_still_reaches_the_client(self, env):
-        # The two-line first cell the verify_workflow guidance prints: a
-        # document rewritten from a session keeps calling it `client`.
+        # The two-line first cell the verify_workflow guidance prints.
         ns = _run("conn, ops = workflow_env()\nclient = conn.client")
         assert ns["client"] == "a-client"
 
@@ -139,7 +132,6 @@ class TestHandles:
         from biopb_mcp import _connection
 
         monkeypatch.setattr(_connection, "TensorConnection", lambda: _Conn(client=None))
+        # The connection comes back unconnected rather than not at all.
         ns = _run("conn, ops = workflow_env(require_client=False)")
-        # The connection comes back either way: unconnected is a state a caller
-        # can retry from, which a None client is not.
         assert ns["conn"].client is None

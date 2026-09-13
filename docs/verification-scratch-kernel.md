@@ -515,21 +515,17 @@ reconstructs a session it recorded and so still writes its own.
 `biopb_mcp.workflow_env` is the one public API this added: the setup a saved
 workflow calls, and the reason the scratch kernel can hand a run nothing.
 
-It returns `(conn, ops)` — the connection, not the client. A session binds
-`client` to `None` and re-derives it from `_conn` before every cell
-(`_jobs._REFRESH_PREFIX`), because a reconnect swaps the client out; a notebook
-has no such prefix, so a client handed back once is a snapshot with nothing to
-refresh it. The document takes it on the next line, in the kernel's own
-spelling:
+It returns `(conn, ops)` — the connection, not the client, since a reconnect
+swaps the client out. The document derives it on the next line, as the session
+kernel does per cell (`_jobs._REFRESH_PREFIX`):
 
 ```python
 conn, ops = workflow_env()
 client = conn.client
 ```
 
-It is also what lets a notebook that opens a napari viewer hang
-`TensorBrowserWidget(viewer, connection=conn)` off the session it is already
-working in, rather than a second connection to the same server.
+`conn` is also what `TensorBrowserWidget(viewer, connection=conn)` takes, so a
+notebook that opens a viewer browses the session it is already working in.
 
 Deleted with the namespace model: `_jobs._verified` and its
 promote-on-success gate, `_jobs.mark_baseline` / `_scratch_ns` / the baseline
