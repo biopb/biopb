@@ -799,7 +799,8 @@ async def verify_workflow(document: str, title: str = "") -> str:
         import numpy as np
         from biopb_mcp.workflow_env import workflow_env
 
-        client, ops = workflow_env()
+        conn, ops = workflow_env()
+        client = conn.client
 
     A workflow that skips it fails with ``NameError``, which is the verdict: it
     would have failed the same way for whoever opened the notebook.

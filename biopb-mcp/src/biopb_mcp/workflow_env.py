@@ -16,6 +16,15 @@ verification runs it.
 No viewer, and there will not be one. The viewer is how an agent shows
 something to the person it is working with; a saved workflow is run by someone
 already looking at their own screen.
+
+What comes back is the *connection*, not a client. In a session the kernel
+binds ``client`` to ``None`` and prepends ``_jobs._REFRESH_PREFIX`` --
+``client = _conn.client`` -- to every ordinary cell, because a reconnect swaps
+the client out and a handle bound once goes stale. A notebook has no such
+prefix, so handing one back would hand back the one thing the kernel refuses to
+keep. The document derives it in the same line the kernel uses, and whoever
+wants to hang a Tensor Browser off the session already open -- rather than a
+second connection saying the same thing -- has the object that takes.
 """
 
 import logging
@@ -41,11 +50,21 @@ class WorkflowEnvError(RuntimeError):
 
 
 def workflow_env(*, plugins=True, require_client=True):
-    """Build a workflow's handles; return ``(client, ops)``.
+    """Build a workflow's handles; return ``(conn, ops)``.
 
-    *client* is a ``TensorFlightClient`` for this machine's data plane and *ops*
-    the ProcessImage callables the config names (an empty dict when it names
-    none).
+    *conn* is a connected ``TensorConnection`` for this machine's data plane and
+    *ops* the ProcessImage callables the config names (an empty dict when it
+    names none). The client is ``conn.client``, derived rather than returned --
+    see the module docstring for why that is the live handle and a bound
+    ``client`` is a snapshot. A document that wants the session's spelling takes
+    it on the next line::
+
+        conn, ops = workflow_env()
+        client = conn.client
+
+    *conn* is also what ``TensorBrowserWidget(viewer, connection=conn)`` takes,
+    so a notebook that opens a napari viewer browses the session it is already
+    working in instead of connecting a second time.
 
     **It also binds the user's kernel plugins into the notebook's namespace**,
     which is a side effect and is named here because a function that writes to
@@ -64,7 +83,9 @@ def workflow_env(*, plugins=True, require_client=True):
     Raises :class:`WorkflowEnvError` when no data plane can be reached and
     *require_client* is set. Failing here is the point: the alternative is a
     ``None`` client and a cell three steps later blaming the workflow for the
-    environment.
+    environment. With *require_client* off, *conn* still comes back -- an
+    unconnected connection is a thing a caller can retry, which a ``None``
+    client is not.
     """
     from ._config import load_config
     from ._connection import TensorConnection
@@ -82,7 +103,7 @@ def workflow_env(*, plugins=True, require_client=True):
     ops = build_ops_from_config(config, lambda: conn.client)
     if plugins:
         _load_plugins(config, _caller_namespace())
-    return conn.client, ops
+    return conn, ops
 
 
 def _caller_namespace():
