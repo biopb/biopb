@@ -1426,14 +1426,20 @@ class TestCachedSourceContentVersion:
         assert cv1 != cv2  # a fresh namespace per upload session
 
 
-class TestConcurrentChunkUpload:
-    """`upload_array` fans its chunks out across a bounded pool (#590).
+BOTH_STRATEGIES = pytest.mark.parametrize("strategy", ["store", "pool"])
 
-    The serial loop this replaced paid a full `do_put` round trip
+
+class TestConcurrentChunkUpload:
+    """`upload_array` ships several chunks at once (#590).
+
+    The serial loop these replaced paid a full `do_put` round trip
     (open/write/done/close/read) per chunk with nothing overlapping it, so the
-    cost was latency multiplied by chunk count. These tests pin the three
-    things that has to keep true while several are in flight: the bytes still
-    land, a failure still surfaces as itself, and the concurrency is real.
+    cost was latency multiplied by chunk count.
+
+    Two strategies do it, and every behavioural test runs against both: they
+    differ in what happens *upstream* of the write, not in what a caller sees.
+    `store` hands the whole upload to dask as one graph; `pool` walks the
+    chunks here and computes each separately, several at a time.
     """
 
     @staticmethod
@@ -1452,7 +1458,8 @@ class TestConcurrentChunkUpload:
         time.sleep(1)
         return server
 
-    def test_a_fanned_out_upload_round_trips_every_chunk(self, tmp_path):
+    @BOTH_STRATEGIES
+    def test_a_fanned_out_upload_round_trips_every_chunk(self, tmp_path, strategy):
         """The whole point: concurrent chunks, byte-identical on the way back.
 
         Twelve chunks against eight workers, so the window genuinely refills
@@ -1469,7 +1476,7 @@ class TestConcurrentChunkUpload:
             source = np.arange(12 * 40 * 40, dtype=np.uint16).reshape(12, 40, 40)
             arr = da.from_array(source, chunks=(1, 40, 40))
 
-            source_id = client.upload_array(arr, "cache:fanout")
+            source_id = client.upload_array(arr, "cache:fanout", strategy=strategy)
 
             client.wait_for_upload_ready(source_id, timeout_seconds=30)
             np.testing.assert_array_equal(
@@ -1480,7 +1487,8 @@ class TestConcurrentChunkUpload:
             server.shutdown()
             CacheManager.reset()
 
-    def test_the_chunks_really_do_overlap(self, tmp_path):
+    @BOTH_STRATEGIES
+    def test_the_chunks_really_do_overlap(self, tmp_path, strategy):
         """Concurrency, observed rather than assumed.
 
         Without this the suite would pass just as happily on a pool of one, and
@@ -1520,7 +1528,7 @@ class TestConcurrentChunkUpload:
             arr = da.from_array(
                 np.zeros((16, 20, 20), dtype=np.uint8), chunks=(1, 20, 20)
             )
-            client.upload_array(arr, "cache:overlap", max_workers=4)
+            client.upload_array(arr, "cache:overlap", max_workers=4, strategy=strategy)
 
             assert peak > 1, "uploads ran one at a time"
             assert peak <= 4, f"pool of 4 ran {peak} at once"
@@ -1529,7 +1537,8 @@ class TestConcurrentChunkUpload:
             server.shutdown()
             CacheManager.reset()
 
-    def test_max_workers_one_is_still_a_serial_upload(self, tmp_path):
+    @BOTH_STRATEGIES
+    def test_max_workers_one_is_still_a_serial_upload(self, tmp_path, strategy):
         """The escape hatch, for a backend that cannot take concurrent reads.
 
         `.compute()` already parallelizes internally under dask's threaded
@@ -1563,7 +1572,9 @@ class TestConcurrentChunkUpload:
             session.upload_chunk = counting_upload_chunk
             source = np.arange(6 * 20 * 20, dtype=np.uint16).reshape(6, 20, 20)
             arr = da.from_array(source, chunks=(1, 20, 20))
-            source_id = client.upload_array(arr, "cache:serial", max_workers=1)
+            source_id = client.upload_array(
+                arr, "cache:serial", max_workers=1, strategy=strategy
+            )
 
             assert peak == 1
             client.wait_for_upload_ready(source_id, timeout_seconds=30)
@@ -1575,7 +1586,8 @@ class TestConcurrentChunkUpload:
             server.shutdown()
             CacheManager.reset()
 
-    def test_a_failed_chunk_surfaces_as_itself(self, tmp_path):
+    @BOTH_STRATEGIES
+    def test_a_failed_chunk_surfaces_as_itself(self, tmp_path, strategy):
         """A chunk that raises must still reach the caller, with its own type.
 
         The serial loop let the exception propagate straight out of the loop
@@ -1610,7 +1622,9 @@ class TestConcurrentChunkUpload:
             )
 
             with pytest.raises(ChunkRefused):
-                client.upload_array(arr, "cache:doomed", max_workers=2)
+                client.upload_array(
+                    arr, "cache:doomed", max_workers=2, strategy=strategy
+                )
             client.close()
         finally:
             server.shutdown()
@@ -1650,6 +1664,61 @@ class TestConcurrentChunkUpload:
             status = client.wait_for_upload_ready(source_id, timeout_seconds=30)
             assert status["state"] == "READY"
             assert status["uploaded_chunks"] == 5
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+
+    def test_store_computes_a_shared_upstream_block_once(self, tmp_path):
+        """The substantive difference between the two, pinned.
+
+        `upload_array` rechunks onto the upload grid whenever the caller's
+        array is not already on it, so an output chunk drawing on a coarser
+        source block is the ordinary case, not a corner. `pool` slices that
+        rechunked array per output chunk and each `.compute()` is an
+        independent graph execution sharing no cache, so it recomputes the
+        source block once per output chunk that wants it. `store` puts the
+        writes in one graph, so it runs once.
+
+        Counted rather than timed: duplication shows up in invocations
+        regardless of how cheap the upstream task happens to be, where a
+        stopwatch would drown it in per-`.compute()` fixed cost.
+        """
+        import dask.array as da
+        from biopb.tensor import TensorFlightClient
+
+        server = self._writable_server(tmp_path)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            counted = threading.Lock()
+            runs = {"n": 0}
+
+            def count(block):
+                with counted:
+                    runs["n"] += 1
+                return block
+
+            def build():
+                # Source on a 4-thick grid, uploaded on a 1-thick one: eight
+                # source blocks feeding 32 output chunks.
+                base = np.zeros((32, 64, 64), dtype=np.uint16)
+                coarse = da.from_array(base, chunks=(4, 64, 64))
+                return coarse.map_blocks(count).rechunk((1, 64, 64))
+
+            runs["n"] = 0
+            client.upload_array(build(), "cache:shared-store", strategy="store")
+            store_runs = runs["n"]
+
+            runs["n"] = 0
+            client.upload_array(build(), "cache:shared-pool", strategy="pool")
+            pool_runs = runs["n"]
+
+            # Eight source blocks, so eight runs is "each computed once".
+            assert store_runs <= 10, f"store recomputed: {store_runs}"
+            assert pool_runs > store_runs * 2, (
+                f"pool {pool_runs} vs store {store_runs}: expected the per-chunk "
+                "computes to duplicate the shared source block"
+            )
             client.close()
         finally:
             server.shutdown()

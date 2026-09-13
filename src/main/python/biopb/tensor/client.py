@@ -907,6 +907,7 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
+        strategy: str = "store",
     ) -> str:
         """Upload dask array to server.
 
@@ -926,9 +927,13 @@ class TensorFlightClient:
             dim_labels: Optional dimension labels
             ome_metadata: Optional OME metadata dict
             max_workers: Chunk uploads to run at once. None (the default)
-                         uses the SDK default; 1 restores a strictly serial
-                         upload. Each running upload holds one materialized
-                         chunk, so this also bounds the memory the call uses.
+                         lets the strategy choose; 1 restores a strictly
+                         serial upload.
+            strategy: How chunks reach the server. "store" (the default) hands
+                      the whole upload to dask as one graph, so a task two
+                      chunks share is computed once. "pool" computes each
+                      chunk separately, several at a time, which trades that
+                      away for a hard `max_workers x chunk` memory ceiling.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
@@ -940,6 +945,7 @@ class TensorFlightClient:
             dim_labels,
             ome_metadata,
             max_workers=max_workers,
+            strategy=strategy,
         )
 
     def upload_zarr(
@@ -950,6 +956,7 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
+        strategy: str = "store",
     ) -> str:
         """Upload local zarr to server.
 
@@ -968,9 +975,13 @@ class TensorFlightClient:
             dim_labels: Optional dimension labels (read from zarr if not provided)
             ome_metadata: Optional OME metadata (read from zarr if not provided)
             max_workers: Chunk uploads to run at once. None (the default)
-                         uses the SDK default; 1 restores a strictly serial
-                         upload. Each running upload holds one materialized
-                         chunk, so this also bounds the memory the call uses.
+                         lets the strategy choose; 1 restores a strictly
+                         serial upload.
+            strategy: How chunks reach the server. "store" (the default) hands
+                      the whole upload to dask as one graph, so a task two
+                      chunks share is computed once. "pool" computes each
+                      chunk separately, several at a time, which trades that
+                      away for a hard `max_workers x chunk` memory ceiling.
 
         Returns:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
@@ -982,6 +993,7 @@ class TensorFlightClient:
             dim_labels,
             ome_metadata,
             max_workers=max_workers,
+            strategy=strategy,
         )
 
     def create_source(

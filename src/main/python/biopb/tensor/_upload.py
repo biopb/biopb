@@ -29,12 +29,19 @@ logger = logging.getLogger(__name__)
 
 #: Chunk uploads in flight at once, when the caller names no ``max_workers``.
 #:
-#: Each *running* task holds one materialized chunk, so this doubles as the
-#: memory bound: ``workers x chunk_nbytes``, or ~64 MiB at the 8 MiB transfer
-#: cap. The work is a ``do_put`` round trip per chunk, so the useful setting
-#: tracks link latency rather than core count -- eight is enough to keep a
-#: remote server busy and costs a loopback one nothing.
+#: The work is a ``do_put`` round trip per chunk, so the useful setting tracks
+#: link latency rather than core count -- eight is enough to keep a remote
+#: server busy and costs a loopback one nothing. It is not a memory bound: see
+#: :meth:`UploadSession._upload_chunks`.
 _DEFAULT_UPLOAD_WORKERS = 8
+
+#: How ``upload_array`` gets its chunks to the server.
+#:
+#: ``"store"`` hands the whole upload to dask as one graph (``da.store``);
+#: ``"pool"`` walks the chunks here and computes each one separately, several
+#: at a time. They differ in everything upstream of the write -- see
+#: :meth:`UploadSession._store_chunks`.
+_DEFAULT_UPLOAD_STRATEGY = "store"
 
 
 def _chunk_bounds(
@@ -46,6 +53,37 @@ def _chunk_bounds(
         min((idx + 1) * chunk_shape[d], shape[d]) for d, idx in enumerate(chunk_idx)
     ]
     return ChunkBounds(start=start, stop=stop)
+
+
+class _UploadTarget:
+    """A ``da.store`` target that ships each block as one ``do_put``.
+
+    ``store`` hands over a block and the slices it occupies, which is exactly
+    the ``ChunkBounds`` an upload wants -- so the whole adapter is that one
+    translation, and the scheduling, the memory ordering and the sharing of
+    common ancestors between blocks all stay dask's.
+    """
+
+    __slots__ = ("_session", "_source_id", "shape", "dtype")
+
+    def __init__(
+        self,
+        session: "UploadSession",
+        source_id: str,
+        shape: Sequence[int],
+        dtype: np.dtype,
+    ):
+        self._session = session
+        self._source_id = source_id
+        # ``store`` reads these off the target to check it can hold the array.
+        self.shape = tuple(shape)
+        self.dtype = dtype
+
+    def __setitem__(self, index: Tuple[slice, ...], value: np.ndarray) -> None:
+        bounds = ChunkBounds(
+            start=[s.start for s in index], stop=[s.stop for s in index]
+        )
+        self._session.upload_chunk(self._source_id, bounds, value)
 
 
 def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
@@ -83,6 +121,7 @@ class UploadSession:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
+        strategy: str = _DEFAULT_UPLOAD_STRATEGY,
     ) -> str:
         """Backs TensorFlightClient.upload_array; see that method for the full
         documentation."""
@@ -124,11 +163,52 @@ class UploadSession:
             for d in range(ndim)
         ]
 
-        self._upload_chunks(
-            source_id, arr, chunk_shape_tuple, chunks_per_dim, max_workers
-        )
+        if strategy == "store":
+            self._store_chunks(source_id, arr, max_workers)
+        elif strategy == "pool":
+            self._upload_chunks(
+                source_id, arr, chunk_shape_tuple, chunks_per_dim, max_workers
+            )
+        else:
+            raise ValueError(
+                f"unknown upload strategy {strategy!r}; expected 'store' or 'pool'"
+            )
 
         return source_id
+
+    def _store_chunks(
+        self, source_id: str, arr: da.Array, max_workers: Optional[int]
+    ) -> None:
+        """Hand the whole upload to dask as one graph.
+
+        ``upload_array`` has already rechunked *arr* onto the upload grid, so
+        one dask block is one chunk and ``store`` needs no alignment help.
+
+        What this buys over :meth:`_upload_chunks` is everything upstream of
+        the write. That one walks the chunks itself and calls ``.compute()``
+        per chunk, so an N-chunk array pays N graph optimizations, and any task
+        two chunks share -- a rechunk, a ``map_overlap`` halo, anything derived
+        from a differently-chunked input -- is computed once per chunk that
+        wants it, because separate ``.compute()`` calls share no cache. Here
+        the writes hang off the array's own graph, so there is one optimization
+        pass and a shared ancestor is computed once.
+
+        ``lock=False`` because the default exists for targets that cannot take
+        a concurrent ``__setitem__`` (an h5py dataset). Each block here writes
+        a disjoint region and the server counts arrivals into a set keyed by
+        chunk id, so locking would serialize the uploads and buy nothing.
+
+        Concurrency and memory are then dask's: its scheduler runs the writes
+        on the threaded pool and orders the graph so a computed block is freed
+        once stored. That is a scheduler's ordering rather than the hard
+        ``workers x chunk`` ceiling the pool gives, which is the trade.
+        """
+        target = _UploadTarget(self, source_id, arr.shape, arr.dtype)
+        kwargs: Dict[str, Any] = {}
+        if max_workers is not None:
+            kwargs["scheduler"] = "threads"
+            kwargs["num_workers"] = max(1, int(max_workers))
+        da.store(arr, target, lock=False, **kwargs)
 
     def _upload_chunks(
         self,
@@ -150,8 +230,15 @@ class UploadSession:
         Submission is windowed rather than issued all at once. A *queued* task
         holds only its bounds -- ``arr`` is lazy -- so the window costs no
         memory and exists to keep a worker's next chunk waiting rather than
-        idling for the submit that follows a completion. Memory is bounded by
-        the *running* tasks, one materialized chunk each.
+        idling for the submit that follows a completion.
+
+        This does **not** bound memory at ``workers x chunk``, which is what it
+        looks like it should do and what an earlier version of this comment
+        claimed. Each task runs a whole ``.compute()``, which brings its own
+        intermediates and its own fan-out across dask's thread pool, so the
+        real peak is several times that -- measured above ``store``'s on the
+        same array, not below it. Nothing here bounds memory; the window
+        bounds only how far ahead submission runs.
 
         Chunks may land out of order. The server counts them into a set keyed
         by chunk id (``UploadManager.mark_chunk``) and each one writes a
@@ -221,6 +308,7 @@ class UploadSession:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
         max_workers: Optional[int] = None,
+        strategy: str = _DEFAULT_UPLOAD_STRATEGY,
     ) -> str:
         """Backs TensorFlightClient.upload_zarr; see that method for the full
         documentation."""
@@ -251,6 +339,7 @@ class UploadSession:
             dim_labels=dim_labels,
             ome_metadata=ome_metadata,
             max_workers=max_workers,
+            strategy=strategy,
         )
 
     def create_source(
