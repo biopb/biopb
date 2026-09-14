@@ -222,11 +222,9 @@ class _MultiSceneBioImage:
 
 
 def _multi_scene_source():
-    # dim_labels=None: each scene reports its own axis order, which is half the
-    # per-scene state a shared grid would flatten.
-    return ZeissAdapter(
-        _MultiSceneBioImage(), scene_index=None, source_id="multi", dim_labels=None
-    )
+    # Each scene reports its own axis order, which is half the per-scene
+    # state a shared grid would flatten.
+    return ZeissAdapter(_MultiSceneBioImage(), scene_index=None, source_id="multi")
 
 
 def test_no_scene_state_leaks_into_a_sibling_scene():

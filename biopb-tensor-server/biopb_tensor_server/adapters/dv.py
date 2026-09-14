@@ -115,13 +115,12 @@ class DeltaVisionAdapter(TensorAdapter):
         url = str(source.url)
         path = url[len("file://") :] if url.startswith("file://") else url
 
-        return cls(path, source.source_id, dim_labels=source.dim_labels)
+        return cls(path, source.source_id)
 
     def __init__(
         self,
         url: str,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
     ):
         self.source_id = source_id
         self._url = url
@@ -140,18 +139,7 @@ class DeltaVisionAdapter(TensorAdapter):
             self._dtype = probe.dtype
             self._voxel = probe.voxel_size
 
-        native_labels = list(self._axes)
-        if dim_labels and len(dim_labels) != len(native_labels):
-            logger.warning(
-                "dv: ignoring %d configured dim_labels for %s -- this document "
-                "reads as a %d-axis %s array",
-                len(dim_labels),
-                url,
-                len(native_labels),
-                "".join(native_labels),
-            )
-            dim_labels = None
-        self.dim_labels = list(dim_labels or native_labels)
+        self.dim_labels = list(self._axes)
 
         # Fences the mapping's open/close against reads, same protocol as
         # adapters/mrc.py: _active_reads (not _io_lock) is what actually keeps

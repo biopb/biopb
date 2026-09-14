@@ -113,7 +113,7 @@ def _resolve_axes(
     return y_idx, x_idx, z_idx, s_idx
 
 
-def canonical_dim_labels(tensor_desc, source_desc=None) -> List[str] | None:
+def canonical_dim_labels(tensor_desc) -> List[str] | None:
     """Per-axis labels for the array :func:`build_pyramid_levels` returns.
 
     The source's own labels, lowercased -- which is the whole job now that the
@@ -129,7 +129,7 @@ def canonical_dim_labels(tensor_desc, source_desc=None) -> List[str] | None:
     Returns ``None`` when the source declares no usable labels -- there is then
     nothing to name the axes with, and the caller keeps its own fallback.
     """
-    dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
+    dim_labels = tensor_desc.dim_labels
     shape = list(tensor_desc.shape)
     if not dim_labels or len(dim_labels) != len(shape):
         return None
@@ -181,7 +181,6 @@ def build_pyramid_levels(
     source_id: str,
     tensor_id: str,
     tensor_desc,
-    source_desc=None,
 ) -> List:
     """Build resolution-pyramid levels for a tensor in napari display order.
 
@@ -246,7 +245,6 @@ def build_layer_scale(
     *,
     tensor_id: str | None = None,
     tensor_desc=None,
-    source_desc=None,
     rgb: bool = False,
 ) -> Tuple[List[float] | None, dict | None]:
     """Build a napari ``scale`` vector from a source's physical pixel sizes.
@@ -257,8 +255,8 @@ def build_layer_scale(
     µm²) instead of pixels, without the heavy ``get_source_metadata`` (full OME)
     round trip. The summary is in *source* axis order -- which the server
     guarantees is canonical -- so :func:`_resolve_axes` reads x/y/z off it
-    positionally, using the source's ``dim_labels`` (per-tensor, falling back to
-    *source_desc*) only to tell whether a z axis is there at all.
+    positionally, using the tensor's ``dim_labels`` only to tell whether a z
+    axis is there at all.
 
     *ndim* is the rank of the layer **array**, which is the source's own rank:
     ``build_pyramid_levels`` neither transposes nor pads. So each resolved size
@@ -297,11 +295,7 @@ def build_layer_scale(
         scale_vec, unit_vec = phys
 
         # Map source-order physical sizes onto x/y/z by dim label.
-        dim_labels = None
-        if tensor_desc is not None:
-            dim_labels = tensor_desc.dim_labels
-        if not dim_labels:
-            dim_labels = getattr(source_desc, "dim_labels", None)
+        dim_labels = tensor_desc.dim_labels if tensor_desc is not None else None
         src_shape = list(tensor_desc.shape) if tensor_desc is not None else scale_vec
         y_idx, x_idx, z_idx, _ = _resolve_axes(src_shape, dim_labels)
 
@@ -372,7 +366,6 @@ def add_tensor_layer(
     tensor_desc,
     *,
     name: str,
-    source_desc=None,
     compute_scheduler: str | None = None,
 ):
     """Build a tensor's pyramid and add it to *viewer* as an image layer.
@@ -403,7 +396,6 @@ def add_tensor_layer(
         source_id,
         tensor_id,
         tensor_desc,
-        source_desc=source_desc,
     )
     # Present napari native-byte-order levels (biopb/biopb#296). napari's
     # thumbnail path (convert_to_uint8) does np.maximum(data, 0, out=data,
@@ -417,8 +409,7 @@ def add_tensor_layer(
     # composites a trailing size-3/4 axis into colour only when
     # told to: rgb is left unset otherwise so napari's own auto-detection still
     # applies to unlabelled data exactly as before.
-    dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
-    _, _, _, s_idx = _resolve_axes(tensor_desc.shape, dim_labels)
+    _, _, _, s_idx = _resolve_axes(tensor_desc.shape, tensor_desc.dim_labels)
     rgb = s_idx is not None
 
     # Levels are the source arrays, in canonical order, at the source's rank,
@@ -435,7 +426,6 @@ def add_tensor_layer(
         out_ndim,
         tensor_id=tensor_id,
         tensor_desc=tensor_desc,
-        source_desc=source_desc,
         rgb=rgb,
     )
     if scale is not None:
@@ -451,7 +441,7 @@ def add_tensor_layer(
     # handed only napari's (path, data, meta), so with no labels there it falls
     # back to a positional guess that mislabels every leading pair that isn't
     # (C, T) -- writing a TCZYX source with T and C swapped.
-    labels = canonical_dim_labels(tensor_desc, source_desc=source_desc)
+    labels = canonical_dim_labels(tensor_desc)
     if labels:
         metadata["dim_labels"] = labels
     add_kwargs["metadata"] = metadata

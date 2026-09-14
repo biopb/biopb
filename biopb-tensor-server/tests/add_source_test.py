@@ -404,19 +404,8 @@ class TestAddSourceRoundtrip:
         finally:
             server.shutdown()
 
-    def test_plain_tiff_folder_drop_carries_no_dim_labels(self, tmp_path):
-        """A drop that names no labels must not register as labelled.
-
-        ``AddSourceRequest.dim_labels`` is unset here, and an unset repeated
-        field is ``[]``. Passing that on stamps the empty list onto the claim,
-        and an adapter that reads a claim's labels as an override then rejects
-        every series -- so this drop failed with "cannot read TIFF source" for
-        every plain TIFF, drag-drop included.
-
-        A *folder*, because that is the branch that carried it: the walk hands
-        its labels to ``discover_sources``, while the per-claim assignment
-        beside it already tests them for truth and so never saw the bug.
-        """
+    def test_plain_tiff_folder_drop_uses_format_labels(self, tmp_path):
+        """A dropped folder registers with the format's own axis semantics."""
         import tifffile
         from biopb.tensor import TensorFlightClient
 

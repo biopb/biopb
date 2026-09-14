@@ -360,7 +360,6 @@ def _source_adapter(tmp_path, data, labels, chunks, scenes):
         scene_index=None,
         source_id="source",
         source_url=str(path),
-        dim_labels=list(labels),
     )
 
 

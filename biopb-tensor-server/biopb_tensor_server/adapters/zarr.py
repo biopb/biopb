@@ -124,7 +124,7 @@ class ZarrAdapter(TensorAdapter):
         """Create adapter instance from SourceConfig.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -149,7 +149,7 @@ class ZarrAdapter(TensorAdapter):
             path = Path(source.url)
             arr = zarr.open_array(str(path), mode="r")
 
-        return cls(arr, source.source_id, source.dim_labels)
+        return cls(arr, source.source_id)
 
     def __init__(
         self,
@@ -162,7 +162,6 @@ class ZarrAdapter(TensorAdapter):
         Args:
             zarr_array: Zarr array object
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels
         """
         self.zarr_array = zarr_array
         self.source_id = source_id

@@ -407,8 +407,9 @@ message AddSourceRequest {
   // the adapters' claim() protocol.
   string source_type = 2;
 
-  // Optional dimension labels applied to the registered tensor(s).
-  repeated string dim_labels = 3;
+  // Source axes come from the format; registration cannot relabel them.
+  reserved 3;
+  reserved "dim_labels";
 
   // Field 4 was `bool monitor` — a drag-drop could register a live-monitored
   // root that existed in no config (invisible, unpersisted, self-re-adding after

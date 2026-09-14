@@ -1377,11 +1377,7 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
         registry=get_default_registry(),
         watcher=None,
         # a local static source so there is something to serve (else it bails)
-        static_sources=[
-            SourceConfig(
-                type="zarr", url=zarr_path, source_id="local", dim_labels=["y", "x"]
-            )
-        ],
+        static_sources=[SourceConfig(type="zarr", url=zarr_path, source_id="local")],
         monitored_sources=[
             SourceConfig(url="grpc://lab:8815", alias="lab", monitor=True),
             SourceConfig(url="grpc://lab:8815/one", alias="lab", monitor=True),

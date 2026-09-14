@@ -141,7 +141,6 @@ class SourceManager:
         watcher: Optional[DirectoryWatcher],
         monitored_dirs: Set[Path],
         metadata_db: Optional[MetadataDatabase] = None,
-        dim_labels: Optional[List[str]] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
         probe_open_files: bool = True,
@@ -194,7 +193,6 @@ class SourceManager:
         # Last reported unreachable failure per upstream url, as (when, message),
         # so a sustained outage reports on a window instead of on every tick.
         self._upstream_failures: Dict[str, Tuple[float, str]] = {}
-        self._dim_labels = dim_labels
         self._stability_window = stability_window
         self._probe_open_files = probe_open_files
         self._full_rescan_interval = full_rescan_interval
@@ -596,7 +594,6 @@ class SourceManager:
                     ),
                     self._registry,
                     state=discovered_state,
-                    dim_labels=self._dim_labels,
                     path_filter=self._should_scan_resolved,
                     skipped_dirs=skipped_dirs,
                     cloud_by_path=next_cloud,
@@ -1116,7 +1113,6 @@ class SourceManager:
         self,
         url: str,
         source_type: str = "",
-        dim_labels: Optional[List[str]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ):
         """Register ``url`` (a path on the server) as source(s) at runtime.
@@ -1226,7 +1222,6 @@ class SourceManager:
                     Path(url),
                     self._registry,
                     scratch,
-                    dim_labels=dim_labels,
                 )
                 claims = list(scratch.claims.values())
             else:
@@ -1237,8 +1232,6 @@ class SourceManager:
             for claim in claims:
                 if source_type:
                     claim.source_type = source_type
-                if dim_labels:
-                    claim.dim_labels = list(dim_labels)
                 if not claim.source_id:
                     claim.source_id = generate_source_id(
                         str(claim.primary_path), claim.source_type
@@ -1537,7 +1530,6 @@ def create_source_manager(
         watcher=watcher,
         monitored_dirs=monitored_dirs,
         metadata_db=metadata_db,
-        dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
         credentials_config=credentials_config,
         stability_window=stability_window,
         probe_open_files=probe_open_files,
@@ -1583,7 +1575,6 @@ def create_source_manager(
             source_type=source.type,
             primary_path=primary_path,  # resolved local path; remote URL verbatim
             source_id=source.source_id,
-            dim_labels=source.dim_labels,
             extra_config=extra_config,
             # A static source explicitly flagged cloud is always deferred: the
             # user said "don't open it eagerly". If it is in fact resident, the

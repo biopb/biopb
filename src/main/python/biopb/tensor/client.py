@@ -558,7 +558,6 @@ class TensorFlightClient:
         url: str,
         *,
         source_type: str = "",
-        dim_labels: Optional[List[str]] = None,
         on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> AddSourceResult:
@@ -580,7 +579,6 @@ class TensorFlightClient:
             url: Absolute path (or directory) on the server's filesystem.
             source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
                 empty means auto-detect via the adapters' claim protocol.
-            dim_labels: Optional dimension labels for the registered tensor(s).
             on_progress: Optional callback invoked with an ``AddSourceProgress``
                 (count + current path + last descriptor) per source as it
                 registers. Called on the calling thread; keep it cheap.
@@ -613,7 +611,6 @@ class TensorFlightClient:
         return self._catalog.add_source(
             url,
             source_type=source_type,
-            dim_labels=dim_labels,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )

@@ -477,16 +477,14 @@ class TestTiffSequenceStackAll:
             with pytest.raises(ValueError, match="No TIFF files found"):
                 TiffSequenceAdapter(str(tmpdir), "sid")
 
-    def test_explicit_dim_labels_single_page(self):
-        """Caller-supplied dim_labels override the default 'i' file axis."""
+    def test_native_labels_single_page(self):
+        """The file axis keeps its native 'i' label; registration cannot relabel."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 4):
                 _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
 
-            adapter = TiffSequenceAdapter(
-                str(tmpdir), "sid", dim_labels=["z", "y", "x"]
-            )
-            assert adapter.dim_labels == ["z", "y", "x"]
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.dim_labels == ["i", "y", "x"]
             assert adapter.full_shape == [3, 8, 8]
 
     def test_multi_page_files(self):

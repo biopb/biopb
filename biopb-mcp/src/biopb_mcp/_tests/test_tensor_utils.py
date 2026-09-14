@@ -410,26 +410,6 @@ class TestBuildPyramidCanonicalOrder:
         assert levels[0].shape == (64, 32, 3)
         assert _resolve_axes([64, 32, 3], ["y", "x", "c"])[:2] == (1, 2)
 
-    def test_uses_source_desc_labels_when_tensor_unlabeled(self):
-        # Per-tensor labels missing -> fall back to the source descriptor's.
-        # The rank no longer varies, so the observable difference is whether the
-        # trailing 3 is recognized as colour: unlabeled it is just an axis.
-        viewer = MagicMock()
-        source_desc = MagicMock(dim_labels=["y", "x", "s"])
-        client = _make_physical_client(None)
-        client.get_tensor.return_value = da.zeros((64, 32, 3))
-
-        add_tensor_layer(
-            viewer,
-            client,
-            "src",
-            "t1",
-            _make_tensor_desc([64, 32, 3], None),
-            name="lyr",
-            source_desc=source_desc,
-        )
-        assert viewer.add_image.call_args[1]["rgb"] is True
-
 
 class TestCanonicalDimLabels:
     """The source's labels, lowercased -- they name the layer's axes one for one
@@ -471,11 +451,6 @@ class TestCanonicalDimLabels:
 
     def test_none_on_a_length_mismatch(self):
         assert canonical_dim_labels(_make_tensor_desc([3, 64, 32], ["y", "x"])) is None
-
-    def test_falls_back_to_the_source_descriptor(self):
-        desc = _make_tensor_desc([3, 64, 32], None)
-        source_desc = MagicMock(dim_labels=["c", "y", "x"])
-        assert canonical_dim_labels(desc, source_desc=source_desc) == ["c", "y", "x"]
 
 
 def _make_physical_client(scale_vec=None, unit_vec=None, raises=False):

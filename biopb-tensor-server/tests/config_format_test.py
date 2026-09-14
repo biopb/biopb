@@ -38,7 +38,6 @@ max_bytes = 123456789
 [[sources]]
 type = "zarr"
 url = "/data/a.zarr"
-dim_labels = ["z", "y", "x"]
 """
 
 _JSON = {
@@ -48,7 +47,6 @@ _JSON = {
         {
             "type": "zarr",
             "url": "/data/a.zarr",
-            "dim_labels": ["z", "y", "x"],
         }
     ],
 }
@@ -63,7 +61,6 @@ def _assert_expected(cfg):
     assert src.type == "zarr"
     # source_id is derived from the URL, not user-assigned (biopb/biopb#308).
     assert src.source_id == generate_source_id("/data/a.zarr", "zarr")
-    assert src.dim_labels == ["z", "y", "x"]
 
 
 def test_json_config_loads(tmp_path):
@@ -218,3 +215,22 @@ def test_source_id_absent_does_not_warn(caplog):
         cfg = parse_config({"sources": [{"type": "zarr", "url": "/data/a.zarr"}]})
     assert cfg.sources[0].source_id == generate_source_id("/data/a.zarr", "zarr")
     assert not any("sources.source_id" in r.message for r in caplog.records)
+
+
+def test_retired_dim_labels_key_warns_and_is_ignored(tmp_path, caplog):
+    """A config that still sets ``dim_labels`` loads; the key is ignored."""
+    import logging
+
+    payload = {
+        "server": {"log_level": "DEBUG"},
+        "sources": [
+            {"type": "zarr", "url": "/data/a.zarr", "dim_labels": ["z", "y", "x"]}
+        ],
+    }
+    p = tmp_path / "biopb.json"
+    p.write_text(json.dumps(payload))
+    with caplog.at_level(logging.WARNING):
+        cfg = load_config(p)
+    assert len(cfg.sources) == 1
+    assert not hasattr(cfg.sources[0], "dim_labels")
+    assert "Unknown config key `dim_labels`" in caplog.text

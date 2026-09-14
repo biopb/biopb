@@ -59,43 +59,14 @@ def test_native_store_persistence_starts_at_page_threshold(tmp_path):
     assert scene._should_persist_store() is True
 
 
-def test_configured_dim_labels_stay_native(tmp_path):
-    data = np.arange(5 * 8 * 9, dtype=np.uint16).reshape(5, 8, 9)
-    path = Path(tmp_path).joinpath("configured.tif")
-    tifffile.imwrite(path, data)
-
-    source = TiffAdapter.create_from_config(
-        SourceConfig(
-            url=str(path),
-            type="tiff",
-            source_id="configured",
-            dim_labels=["z", "y", "x"],
-        )
-    )
-    descriptor = source.list_tensor_descriptors()[0]
-    assert list(descriptor.dim_labels) == ["z", "y", "x"]
-    assert list(descriptor.shape) == [5, 8, 9]
-
-    scene = source.get_tensor_adapter(descriptor.array_id)
-    bounds = ChunkBounds(start=[1, 2, 3], stop=[4, 7, 9])
-    actual = scene.get_data(bounds)
-    np.testing.assert_array_equal(actual, data[1:4, 2:7, 3:9])
-
-
-def test_empty_dim_labels_are_not_an_override(tmp_path):
-    """An unset protobuf repeated field arrives as ``[]``, not ``None``.
-
-    Reading that as "the caller specified labels" fails the rank check for every
-    series, leaving no descriptors and turning a readable TIFF into
-    "cannot read TIFF source" -- which is how runtime registration of every
-    plain TIFF broke while the config path, which passes ``None``, kept working.
-    """
+def test_plain_tiff_labels_come_from_the_format(tmp_path):
+    """Axis semantics come from the file; registration cannot relabel them."""
     data = np.arange(5 * 8 * 9, dtype=np.uint16).reshape(5, 8, 9)
     path = Path(tmp_path).joinpath("unlabelled.tif")
     tifffile.imwrite(path, data)
 
     source = TiffAdapter.create_from_config(
-        SourceConfig(url=str(path), type="tiff", source_id="empty", dim_labels=[])
+        SourceConfig(url=str(path), type="tiff", source_id="native")
     )
     descriptor = source.list_tensor_descriptors()[0]
     assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]

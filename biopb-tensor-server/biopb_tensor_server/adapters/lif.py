@@ -166,7 +166,6 @@ class LifAdapter(TensorAdapter):
             path,
             source.source_id,
             layout=read_layout(path),
-            dim_labels=source.dim_labels,
         )
 
     def __init__(
@@ -174,7 +173,6 @@ class LifAdapter(TensorAdapter):
         url: str,
         source_id: str,
         layout: _LifLayout,
-        dim_labels: Optional[List[str]] = None,
         image_position: Optional[int] = None,
     ):
         self.source_id = source_id
@@ -188,21 +186,10 @@ class LifAdapter(TensorAdapter):
         self.image_position = image_position
 
         if image_position is None:
-            self.dim_labels = dim_labels
+            self.dim_labels = None
         else:
             info = self._layout.image_list[image_position]
-            native_labels = list(_native_labels(info))
-            if dim_labels and len(dim_labels) != len(native_labels):
-                logger.warning(
-                    "lif: ignoring %d configured dim_labels for %s -- this "
-                    "image reads as a %d-axis %s array",
-                    len(dim_labels),
-                    url,
-                    len(native_labels),
-                    "".join(native_labels),
-                )
-                dim_labels = None
-            self.dim_labels = list(dim_labels or native_labels)
+            self.dim_labels = list(_native_labels(info))
 
         self._tensor_adapters: Dict[str, LifAdapter] = {}
 
@@ -256,7 +243,6 @@ class LifAdapter(TensorAdapter):
             self._url,
             self.source_id,
             self._layout,
-            dim_labels=self.dim_labels if self.image_position is None else None,
             image_position=position,
         )
         adapter._tensor_name = field

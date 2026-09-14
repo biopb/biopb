@@ -172,9 +172,6 @@ def _sources_schema() -> Dict[str, Any]:
             "url": _prop("url", {"type": "string"}),
             "source_id": _prop("source_id", {"type": "string", "deprecated": True}),
             "dataset": _prop("dataset", {"type": "string"}),
-            "dim_labels": _prop(
-                "dim_labels", {"type": "array", "items": {"type": "string"}}
-            ),
             "monitor": _prop("monitor", {"type": "boolean"}),
             "cloud": _prop("cloud", {"type": "boolean"}),
             "credentials_profile": _prop("credentials_profile", {"type": "string"}),

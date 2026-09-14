@@ -2271,7 +2271,6 @@ class TensorBrowserWidget(QWidget):
                         tensor.array_id,
                         tensor,
                         name=layer_name,
-                        source_desc=src,
                         compute_scheduler=self._compute_scheduler,
                     )
                     logger.info(
@@ -2449,7 +2448,6 @@ class TensorBrowserWidget(QWidget):
                 self._selected_tensor_id,
                 tensor_desc,
                 name=layer_name,
-                source_desc=src,
                 compute_scheduler=self._compute_scheduler,
             )
             logger.info(

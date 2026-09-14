@@ -380,7 +380,7 @@ class SourceAdapter(ABC):
         This is used by the server to instantiate adapters based on discovery claims.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels, and format-specific options
+            source: SourceConfig with url, source_id, and format-specific options
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:

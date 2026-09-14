@@ -396,7 +396,7 @@ class DicomAdapter(TensorAdapter):
         """Create adapter instance from SourceConfig.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -429,7 +429,6 @@ class DicomAdapter(TensorAdapter):
         return cls(
             ds,
             source.source_id,
-            source.dim_labels,
             source_url=str(source.url),
             remote_fs=fs,
             remote_path=fs_path,
@@ -439,7 +438,6 @@ class DicomAdapter(TensorAdapter):
         self,
         dicom_dataset,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         remote_fs: Optional[Any] = None,
         remote_path: Optional[str] = None,
@@ -450,7 +448,6 @@ class DicomAdapter(TensorAdapter):
             dicom_dataset: pydicom Dataset object. Only its header is retained;
                 any pixel data it carries is dropped (#821).
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels
             source_url: Optional source URL (overrides filename-derived path)
             remote_fs: Optional fsspec filesystem that reads reopen the file
                 on; ``None`` for a local source
@@ -496,14 +493,10 @@ class DicomAdapter(TensorAdapter):
         pixel_repr = int(self.ds.get("PixelRepresentation", 0))
         self._dtype = _dicom_dtype(bits_stored, pixel_repr)
 
-        # Dimension labels
-        if dim_labels:
-            self.dim_labels = dim_labels
+        if self._is_multiframe:
+            self.dim_labels = ["frame", "y", "x"]
         else:
-            if self._is_multiframe:
-                self.dim_labels = ["frame", "y", "x"]
-            else:
-                self.dim_labels = ["y", "x"]
+            self.dim_labels = ["y", "x"]
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
@@ -708,25 +701,23 @@ class DicomSeriesAdapter(TensorAdapter):
         """Create adapter instance from SourceConfig.
 
         Args:
-            source: SourceConfig with url (directory), source_id, dim_labels
+            source: SourceConfig with url (directory), source_id
 
         Returns:
             DicomSeriesAdapter instance
         """
-        return cls(str(source.url), source.source_id, source.dim_labels)
+        return cls(str(source.url), source.source_id)
 
     def __init__(
         self,
         directory: str,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
     ):
         """Initialize DICOM series adapter.
 
         Args:
             directory: Path to directory containing DICOM series
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels
         """
         import pydicom
 
@@ -820,10 +811,7 @@ class DicomSeriesAdapter(TensorAdapter):
         self._cols = cols
 
         # Dimension labels
-        if dim_labels:
-            self.dim_labels = dim_labels
-        else:
-            self.dim_labels = ["z", "y", "x"]
+        self.dim_labels = ["z", "y", "x"]
 
         # Store first dataset for metadata extraction
         self._first_ds = first_full
