@@ -548,16 +548,6 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* A server-owned set. Listed so a client knows it is there; its rows are not
-   loaded, so the row carries no control. */
-.roi-sets .roi-set-name {
-  align-items: center;
-  display: flex;
-  opacity: 0.55;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .roi-note { color: #64748b; margin: 0.5rem 0 0; }
 .roi-error { color: #fca5a5; }
 

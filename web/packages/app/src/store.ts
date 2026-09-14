@@ -11,6 +11,7 @@ import type {
 } from "@biopb/tensor-flight-client";
 import { DEFAULT_POLYLINE_WIDTH, clampPolylineWidth } from "./utils/roiDraft";
 import type { RoiDraft, RoiTool } from "./utils/roiDraft";
+import { roiSetCounts } from "./utils/roiSets";
 import { TensorApiError, isReservedSetName } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
@@ -799,19 +800,21 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (currentArrayId(get()) !== arrayId) return;
     if (get().roisUnavailable) return;
 
-    const s = get();
-    const landed = s.roisFor === arrayId ? s.roiScopes : {};
-    const pending = s.roisPendingFor === arrayId ? s.roisPending : [];
+    const { roisFor, roiScopes, roiSets, roisPendingFor, roisPending } = get();
+    const listed = roisFor === arrayId;
+    const landed = listed ? roiScopes : {};
+    const pending = roisPendingFor === arrayId ? roisPending : [];
     // The unqualified listing always; a server-owned set only while it is on
-    // screen, which is what makes a set that can reach megabytes lazy. Before
-    // any listing has landed the name's prefix decides whether it needs its
-    // own fetch; after, the listing does, so a link naming a set that is not
-    // there costs nothing.
+    // screen, which is what makes a set that can reach megabytes lazy. Once a
+    // listing has landed it says which names are server-owned, so a link
+    // naming a set that is not there costs nothing; before that, the prefix
+    // is the only guess there is.
     const wanted = [CLIENT_OWNED_SCOPE];
-    for (const name of selectVisibleSets(s) ?? []) {
-      const known = s.roisFor === arrayId ? s.roiSets.find((set) => set.setName === name) : undefined;
-      const reserved = known ? known.reserved : isReservedSetName(name);
-      if (reserved && (known || s.roisFor !== arrayId)) wanted.push(name);
+    for (const name of selectVisibleSets(get()) ?? []) {
+      const reserved = listed
+        ? roiSets.find((set) => set.setName === name)?.reserved
+        : isReservedSetName(name);
+      if (reserved) wanted.push(name);
     }
     // Idempotent: already held, or already asked for. Callers fire this from a
     // mount effect, and the 2-D subtree remounts on every render-mode flip.
@@ -1392,11 +1395,6 @@ export function selectRoisPending(s: AppState): string[] {
   return s.roisPendingFor === currentArrayId(s) ? s.roisPending : NO_SETS;
 }
 
-/** The client-owned listing is in flight for the tensor in view. */
-export function selectRoisLoading(s: AppState): boolean {
-  return selectRoisPending(s).includes(CLIENT_OWNED_SCOPE);
-}
-
 export function selectRoisError(s: AppState): string | null {
   return s.roisErrorFor === currentArrayId(s) ? s.roisError : null;
 }
@@ -1407,10 +1405,11 @@ export function selectRoisError(s: AppState): string | null {
  * been chosen yet.
  */
 function defaultVisibleSets(s: AppState): string[] {
-  const names = new Set<string>();
-  for (const set of selectRoiSets(s)) if (!set.reserved) names.add(set.setName);
-  for (const roi of selectRois(s)) if (!isReservedSetName(roi.setName)) names.add(roi.setName);
-  return [...names];
+  const names = [
+    ...selectRoiSets(s).filter((set) => !set.reserved).map((set) => set.setName),
+    ...roiSetCounts(selectRois(s)).map((set) => set.setName),
+  ];
+  return [...new Set(names)].filter((name) => !isReservedSetName(name));
 }
 
 /** `roiSets` with one set's stored count moved by `delta`, added if it is new. */
@@ -1444,6 +1443,9 @@ function inScope(roi: RoiAnnotation, scope: string): boolean {
  * it again -- which is how a reserved set the server rebuilt on a
  * re-registration, or a set another client wrote to, catches up without a
  * reload. A clipped scope is exempt: it disagrees by construction.
+ *
+ * Counts are a proxy: a per-set version in `RoiSetInfo` would make this an
+ * exact comparison and let the writes stop shadowing the counts.
  */
 function landRoiScope(
   s: AppState,
@@ -1463,19 +1465,22 @@ function landRoiScope(
   // here; otherwise every sibling landing would refetch a scope with one.
   // Per scope rather than per set, because the client-owned listing's skips
   // cannot be attributed to a set.
-  const storedIn = (setName: string) => result.sets.find((set) => set.setName === setName)?.count ?? 0;
-  const heldIn = (setName: string) =>
-    rois.filter((roi) => roi.setName === setName && !isProvisionalRoiId(roi.roiId)).length;
+  const stored = new Map(result.sets.map((set) => [set.setName, set.count]));
+  const held = new Map(
+    roiSetCounts(rois.filter((roi) => !isProvisionalRoiId(roi.roiId))).map((set) => [
+      set.setName,
+      set.count,
+    ]),
+  );
+  const total = (counts: Map<string, number>, names: string[]) =>
+    names.reduce((sum, name) => sum + (counts.get(name) ?? 0), 0);
   for (const [other, state] of Object.entries(scopes)) {
     if (other === scope || state.truncated) continue;
     const names =
       other === CLIENT_OWNED_SCOPE
-        ? [...new Set([...result.sets.map((set) => set.setName), ...rois.map((roi) => roi.setName)])]
-            .filter((name) => !isReservedSetName(name))
+        ? [...new Set([...stored.keys(), ...held.keys()])].filter((name) => !isReservedSetName(name))
         : [other];
-    const stored = names.reduce((sum, name) => sum + storedIn(name), 0);
-    const held = names.reduce((sum, name) => sum + heldIn(name), 0);
-    if (stored !== held + state.skipped) delete scopes[other];
+    if (total(stored, names) !== total(held, names) + state.skipped) delete scopes[other];
   }
 
   return {

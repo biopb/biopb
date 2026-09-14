@@ -9,10 +9,10 @@ import {
   planeFromSelection,
   roiPath,
   roiRing,
-  roiSetCounts,
   setColor,
   visibleRois,
 } from "./roiLayers";
+import { roiSetCounts } from "./roiSets";
 
 function roi(over: Partial<RoiAnnotation> & { geometry: RoiGeometry }): RoiAnnotation {
   return {

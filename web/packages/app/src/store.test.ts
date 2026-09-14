@@ -3,6 +3,7 @@ import { TensorApiError } from "@biopb/tensor-flight-client";
 import type {
   DataSourceDescriptor,
   RoiAnnotation,
+  RoiSetInfo,
   TensorFlightClient,
   TileInfo,
 } from "@biopb/tensor-flight-client";
@@ -11,7 +12,7 @@ import {
   selectRoiSets,
   selectRois,
   selectRoisError,
-  selectRoisLoading,
+  selectRoisPending,
   selectVisibleSets,
   selectDraft,
   selectSelectedRoi,
@@ -389,9 +390,9 @@ describe("ROI state across a tensor change", () => {
       roisPendingFor: "second",
       roisPending: [""],
     });
-    expect(selectRoisLoading(useAppStore.getState())).toBe(false);
+    expect(selectRoisPending(useAppStore.getState())).toEqual([]);
     useAppStore.setState({ roisPendingFor: "first" });
-    expect(selectRoisLoading(useAppStore.getState())).toBe(true);
+    expect(selectRoisPending(useAppStore.getState())).toEqual([""]);
   });
 });
 
@@ -449,16 +450,39 @@ describe("the sets on screen", () => {
 });
 
 describe("loadRois", () => {
-  /** A client whose listRois records what it was asked for, as `id` or `id?set`. */
-  function stubClient(asked: string[], sets: Array<{ setName: string; count: number; reserved: boolean }> = []) {
+  type Listing = { rois?: RoiAnnotation[]; sets?: RoiSetInfo[]; truncated?: boolean; skipped?: number };
+
+  /**
+   * A client whose listRois records what it was asked for, as `id` or
+   * `id?set`, and answers with `respond(setName)` -- `setName` undefined for
+   * the unqualified listing.
+   */
+  function stubClient(asked: string[], respond: (setName?: string) => Listing = () => ({})) {
     return {
       http: {
         listRois: (arrayId: string, setName?: string) => {
           asked.push(setName ? `${arrayId}?${setName}` : arrayId);
-          return Promise.resolve({ rois: [], sets, truncated: false, skipped: 0 });
+          const r = respond(setName);
+          return Promise.resolve({
+            rois: r.rois ?? [],
+            sets: r.sets ?? [],
+            truncated: r.truncated ?? false,
+            skipped: r.skipped ?? 0,
+          });
         },
       },
     } as unknown as TensorFlightClient;
+  }
+
+  const OME_ROW = { ...ROI_FIXTURE[0]!, roiId: "o1", setName: "@ome" };
+
+  /** Forget the client-owned listing landed, so the next loadRois fetches it again. */
+  function unlandListing() {
+    useAppStore.setState((s) => {
+      const scopes = { ...s.roiScopes };
+      delete scopes[""];
+      return { roiScopes: scopes };
+    });
   }
 
   function fresh(client: TensorFlightClient, over: Record<string, unknown> = {}) {
@@ -517,7 +541,7 @@ describe("loadRois", () => {
   it("does not fetch a server-owned set until it is on screen", async () => {
     // The lazy half: the listing names it, the rows wait for the toggle.
     const asked: string[] = [];
-    fresh(stubClient(asked, [{ setName: "@ome", count: 120, reserved: true }]));
+    fresh(stubClient(asked, () => ({ sets: [{ setName: "@ome", count: 120, reserved: true }] })));
     await useAppStore.getState().loadRois("first");
     expect(asked).toEqual(["first"]);
     useAppStore.getState().toggleSetVisible("@ome");
@@ -537,7 +561,7 @@ describe("loadRois", () => {
 
   it("does not fetch a named set the listing says is not there", async () => {
     const asked: string[] = [];
-    fresh(stubClient(asked, [{ setName: "@ome", count: 1, reserved: true }]));
+    fresh(stubClient(asked, () => ({ sets: [{ setName: "@ome", count: 1, reserved: true }] })));
     await useAppStore.getState().loadRois("first");
     useAppStore.setState({ visibleSets: ["@gone"], visibleSetsFor: "first" });
     await useAppStore.getState().loadRois("first");
@@ -545,21 +569,13 @@ describe("loadRois", () => {
   });
 
   it("holds a named set's rows beside the listing's, and replaces only its own on a refetch", async () => {
-    const row = (roiId: string, setName: string) => ({ ...ROI_FIXTURE[0]!, roiId, setName });
-    const client = {
-      http: {
-        listRois: (_arrayId: string, setName?: string) =>
-          Promise.resolve({
-            rois: setName ? [row("o1", "@ome")] : [row("n1", "nuclei")],
-            sets: [
-              { setName: "nuclei", count: 1, reserved: false },
-              { setName: "@ome", count: 1, reserved: true },
-            ],
-            truncated: false,
-            skipped: 0,
-          }),
-      },
-    } as unknown as TensorFlightClient;
+    const client = stubClient([], (setName) => ({
+      rois: setName ? [OME_ROW] : [{ ...ROI_FIXTURE[0]!, roiId: "n1" }],
+      sets: [
+        { setName: "nuclei", count: 1, reserved: false },
+        { setName: "@ome", count: 1, reserved: true },
+      ],
+    }));
     fresh(client, { visibleSets: ["nuclei", "@ome"], visibleSetsFor: "first" });
     await useAppStore.getState().loadRois("first");
     expect(useAppStore.getState().rois.map((r) => r.roiId).sort()).toEqual(["n1", "o1"]);
@@ -572,19 +588,10 @@ describe("loadRois", () => {
     // -- and the next loadRois fetches them again.
     const asked: string[] = [];
     let omeCount = 1;
-    const client = {
-      http: {
-        listRois: (arrayId: string, setName?: string) => {
-          asked.push(setName ? `${arrayId}?${setName}` : arrayId);
-          return Promise.resolve({
-            rois: setName ? [{ ...ROI_FIXTURE[0]!, roiId: "o1", setName: "@ome" }] : [],
-            sets: [{ setName: "@ome", count: omeCount, reserved: true }],
-            truncated: false,
-            skipped: 0,
-          });
-        },
-      },
-    } as unknown as TensorFlightClient;
+    const client = stubClient(asked, (setName) => ({
+      rois: setName ? [OME_ROW] : [],
+      sets: [{ setName: "@ome", count: omeCount, reserved: true }],
+    }));
     fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
     await useAppStore.getState().loadRois("first");
     expect(Object.keys(selectRoiScopes(useAppStore.getState())).sort()).toEqual(["", "@ome"]);
@@ -592,11 +599,7 @@ describe("loadRois", () => {
     // Something re-registered the source; the listing is fetched again for
     // whatever reason and now says two rows.
     omeCount = 2;
-    useAppStore.setState((s) => {
-      const scopes = { ...s.roiScopes };
-      delete scopes[""];
-      return { roiScopes: scopes };
-    });
+    unlandListing();
     await useAppStore.getState().loadRois("first");
     expect(selectRoiScopes(useAppStore.getState())["@ome"]).toBeUndefined();
     await useAppStore.getState().loadRois("first");
@@ -604,47 +607,27 @@ describe("loadRois", () => {
   });
 
   it("counts a row it could not read as held, rather than as someone else's change", async () => {
-    const client = {
-      http: {
-        listRois: (_arrayId: string, setName?: string) =>
-          Promise.resolve({
-            rois: setName ? [{ ...ROI_FIXTURE[0]!, roiId: "o1", setName: "@ome" }] : [],
-            sets: [{ setName: "@ome", count: 2, reserved: true }],
-            truncated: false,
-            skipped: setName ? 1 : 0,
-          }),
-      },
-    } as unknown as TensorFlightClient;
+    const client = stubClient([], (setName) => ({
+      rois: setName ? [OME_ROW] : [],
+      sets: [{ setName: "@ome", count: 2, reserved: true }],
+      skipped: setName ? 1 : 0,
+    }));
     fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
     await useAppStore.getState().loadRois("first");
-    useAppStore.setState((s) => {
-      const scopes = { ...s.roiScopes };
-      delete scopes[""];
-      return { roiScopes: scopes };
-    });
+    unlandListing();
     await useAppStore.getState().loadRois("first");
     expect(selectRoiScopes(useAppStore.getState())["@ome"]).toEqual({ truncated: false, skipped: 1 });
   });
 
   it("does not un-land a set the cap clipped, which disagrees by construction", async () => {
-    const client = {
-      http: {
-        listRois: (_arrayId: string, setName?: string) =>
-          Promise.resolve({
-            rois: setName ? [{ ...ROI_FIXTURE[0]!, roiId: "o1", setName: "@ome" }] : [],
-            sets: [{ setName: "@ome", count: 5000, reserved: true }],
-            truncated: setName !== undefined,
-            skipped: 0,
-          }),
-      },
-    } as unknown as TensorFlightClient;
+    const client = stubClient([], (setName) => ({
+      rois: setName ? [OME_ROW] : [],
+      sets: [{ setName: "@ome", count: 5000, reserved: true }],
+      truncated: setName !== undefined,
+    }));
     fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
     await useAppStore.getState().loadRois("first");
-    useAppStore.setState((s) => {
-      const scopes = { ...s.roiScopes };
-      delete scopes[""];
-      return { roiScopes: scopes };
-    });
+    unlandListing();
     await useAppStore.getState().loadRois("first");
     expect(selectRoiScopes(useAppStore.getState())["@ome"]).toEqual({ truncated: true, skipped: 0 });
   });

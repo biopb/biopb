@@ -23,7 +23,7 @@ import { pinnableAxes, planePinFor, roiVisibleOnPlane, sliderAxes } from "@biopb
 import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-client";
 import { vivSelection, type SliceIndices } from "./vivUtils";
 import { CLOSE_HANDLE_PX, type RoiDraft } from "./roiDraft";
-import { isSetShown } from "./roiVisibility";
+import { isSetShown } from "./roiSets";
 
 /** An `[x, y]` in level-0 image pixels, the space deck.gl draws these in. */
 export type XY = [number, number];
@@ -186,15 +186,6 @@ export function visibleRois(
   return rois.filter(
     (roi) => isSetShown(roi.setName, visibleSets) && roiVisibleOnPlane(roi.plane, currentPlane),
   );
-}
-
-/** Sets present in a fetched collection, with their counts, in first-seen order. */
-export function roiSetCounts(rois: RoiAnnotation[]): Array<{ setName: string; count: number }> {
-  const counts = new Map<string, number>();
-  for (const roi of rois) {
-    counts.set(roi.setName, (counts.get(roi.setName) ?? 0) + 1);
-  }
-  return [...counts].map(([setName, count]) => ({ setName, count }));
 }
 
 /**

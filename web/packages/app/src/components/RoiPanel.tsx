@@ -34,14 +34,8 @@ import {
   useAppStore,
   type RoiScopeState,
 } from "../store";
-import {
-  currentPlaneFor,
-  defaultBroadcastAxes,
-  roiSetCounts,
-  setColor,
-  visibleRois,
-} from "../utils/roiLayers";
-import { isSetShown } from "../utils/roiVisibility";
+import { currentPlaneFor, defaultBroadcastAxes, setColor, visibleRois } from "../utils/roiLayers";
+import { isSetShown, roiSetCounts } from "../utils/roiSets";
 import { isReservedSetName, pinnableAxes, roiVisibleOnPlane } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, RoiSetInfo, SliderAxis } from "@biopb/tensor-flight-client";
 
@@ -131,7 +125,7 @@ export function RoiPanelView({
   const owned = roiSetCounts(rois.filter((roi) => !isReservedSetName(roi.setName)));
   const serverOwned = sets.filter((set) => set.reserved);
   const loading = pending.includes(CLIENT_OWNED_SCOPE);
-  const truncated = Object.keys(scopes).filter((scope) => scopes[scope]?.truncated);
+  const truncated = Object.entries(scopes).filter(([, s]) => s.truncated).map(([scope]) => scope);
   const skipped = Object.values(scopes).reduce((sum, scope) => sum + scope.skipped, 0);
   const onPlane = visibleRois(rois, currentPlane, visibleSets).length;
 
@@ -215,9 +209,8 @@ export function RoiPanelView({
 
       {truncated.map((scope) => (
         <p key={scope} className="roi-note">
-          {scope === CLIENT_OWNED_SCOPE
-            ? "The server returned its per-tensor maximum — this tensor holds more annotations than are shown."
-            : `The server returned its per-tensor maximum for ${scope} — that set holds more annotations than are shown.`}
+          The server returned its per-tensor maximum{scope && ` for ${scope}`} —{" "}
+          {scope ? "that set" : "this tensor"} holds more annotations than are shown.
         </p>
       ))}
       {skipped > 0 && (
