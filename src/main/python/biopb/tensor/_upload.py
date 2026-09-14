@@ -2,29 +2,111 @@
 
 Extracted from :mod:`biopb.tensor.client` (issue #278 item C): source creation,
 chunk writing, and upload-status polling are a self-contained concern that
-depends only on the Flight connection (client + call options) -- not on the
-catalog / descriptor caches the read path shares. :class:`UploadSession` owns
-that concern; ``TensorFlightClient`` holds one and delegates its public upload
-methods to it.
+reads the shared ``_ClientState`` for its connection and touches none of the
+catalog / descriptor caches the read path keeps there. :class:`UploadSession`
+owns that concern; ``TensorFlightClient`` holds one and delegates its public
+upload methods to it.
+
+It needs both halves of that state: the live connection for its own foreground
+RPCs, and the plain ``(location, token, trust)`` triple for anything that rides
+into a dask graph -- which is the read path's arrangement too (``_session``).
 """
 
 import json
 import logging
 import time
-from itertools import product
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
+from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
+from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 
+if TYPE_CHECKING:  # import-time cycle-free; _session never imports this module
+    from biopb.tensor._session import _ClientState
+
 logger = logging.getLogger(__name__)
+
+
+def _put_chunk(
+    client: flight.FlightClient,
+    call_options: flight.FlightCallOptions,
+    source_id: str,
+    bounds: ChunkBounds,
+    data: np.ndarray,
+) -> None:
+    """One ``do_put``: open, write the batch, close, read the ack.
+
+    Free of any session state, so the same code serves
+    :meth:`UploadSession.upload_chunk` and a target that has been unpickled in a
+    dask worker with no session to hand.
+    """
+    upload = ChunkUpload(source_id=source_id, bounds=bounds)
+    desc = flight.FlightDescriptor.for_command(upload.SerializeToString())
+    schema = pa.schema([pa.field("data", pa.from_numpy_dtype(data.dtype))])
+
+    writer, reader = client.do_put(desc, schema, options=call_options)
+    batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
+    writer.write_batch(batch)
+    writer.done_writing()
+    writer.close()
+    reader.read()
+    logger.debug(f"upload_chunk: uploaded {data.nbytes} bytes to {source_id}")
+
+
+class _UploadTarget:
+    """A ``da.store`` target that ships each block as one ``do_put``.
+
+    ``store`` hands over a block and the slices it occupies, which is exactly
+    the ``ChunkBounds`` an upload wants -- so the whole adapter is that one
+    translation, and the scheduling, the memory ordering and the sharing of
+    common ancestors between blocks all stay dask's.
+
+    **Holds connection parameters, never a connection.** ``store`` puts the
+    target *into the graph*, so under a distributed scheduler it is pickled out
+    to the workers -- and a ``FlightClient`` cannot be pickled at all. This is
+    the read path's own arrangement (``_session._fetch_endpoints...``): carry
+    the plain ``(location, token, trust)`` triple, and let each worker resolve
+    it against this module's per-thread connection pool. A worker then dials
+    once and every later block on that thread rides the same connection.
+
+    A worker's writes then issue from its own process, beside the compute that
+    produced the block.
+    """
+
+    __slots__ = ("_location", "_token", "_trust", "_source_id", "shape", "dtype")
+
+    def __init__(
+        self,
+        location: str,
+        token: Optional[str],
+        trust: Optional[TlsTrust],
+        source_id: str,
+        shape: Sequence[int],
+        dtype: np.dtype,
+    ):
+        self._location = location
+        self._token = token
+        self._trust = trust or NO_TLS
+        self._source_id = source_id
+        # ``store`` reads these off the target to check it can hold the array.
+        self.shape = tuple(shape)
+        self.dtype = dtype
+
+    def __setitem__(self, index: Tuple[slice, ...], value: np.ndarray) -> None:
+        client = _get_thread_client(self._location, self._token, self._trust)
+        call_options = _get_shared_call_options(self._location, self._token)
+        bounds = ChunkBounds(
+            start=[s.start for s in index], stop=[s.stop for s in index]
+        )
+        _put_chunk(client, call_options, self._source_id, bounds, value)
 
 
 def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
@@ -43,16 +125,14 @@ class UploadSession:
        / ``upload_zarr``, chunk upload, and upload-status polling -- is
        experimental and its behavior may change.
 
-    Holds only the connection handles (``FlightClient`` + ``FlightCallOptions``);
-    it never touches the catalog / descriptor caches. ``TensorFlightClient``
+    Takes the shared ``_ClientState`` its two sibling collaborators take
+    (``CatalogClient``, ``ChunkFetcher``) and reads only the connection fields
+    from it -- never the catalog / descriptor caches. ``TensorFlightClient``
     constructs one in its ``__init__`` and delegates its public upload API here.
     """
 
-    def __init__(
-        self, client: flight.FlightClient, call_options: flight.FlightCallOptions
-    ):
-        self._client = client
-        self._call_options = call_options
+    def __init__(self, state: "_ClientState"):
+        self._state = state
 
     def upload_array(
         self,
@@ -94,32 +174,43 @@ class UploadSession:
             ome_metadata=ome_metadata,
         )
 
-        # Upload chunks
-        ndim = arr.ndim
-        chunk_shape_tuple = tuple(chunk_shape)
-        chunks_per_dim = [
-            (arr.shape[d] + chunk_shape_tuple[d] - 1) // chunk_shape_tuple[d]
-            for d in range(ndim)
-        ]
-
-        for chunk_idx in product(*(range(n) for n in chunks_per_dim)):
-            chunk_start = [
-                idx * chunk_shape_tuple[d] for d, idx in enumerate(chunk_idx)
-            ]
-            chunk_stop = [
-                min((idx + 1) * chunk_shape_tuple[d], arr.shape[d])
-                for d, idx in enumerate(chunk_idx)
-            ]
-
-            bounds = ChunkBounds(start=chunk_start, stop=chunk_stop)
-
-            slices = tuple(
-                slice(chunk_start[d], chunk_stop[d]) for d in range(arr.ndim)
-            )
-            chunk_data = arr[slices].compute()
-            self.upload_chunk(source_id, bounds, chunk_data)
+        self._store_chunks(source_id, arr)
 
         return source_id
+
+    def _store_chunks(self, source_id: str, arr: da.Array) -> None:
+        """Hand the whole upload to dask as one graph.
+
+        ``upload_array`` has already rechunked *arr* onto the upload grid, so
+        one dask block is one chunk and ``store`` needs no alignment help.
+
+        Why ``store`` rather than a loop that computes and ships each chunk
+        itself (biopb/biopb#590): a per-chunk loop pays a graph optimization
+        per chunk, and separate ``.compute()`` calls share no cache, so any
+        task two chunks need is computed once *per chunk*. That is the ordinary
+        case rather than a corner -- the rechunk above is exactly what makes
+        one output chunk draw on a coarser shared source block.
+
+        ``lock=False`` because the default exists for targets that cannot take
+        a concurrent ``__setitem__`` (an h5py dataset). Each block writes a
+        disjoint region and the server counts arrivals into a set keyed by
+        chunk id, so locking would serialize the uploads and buy nothing.
+
+        Nothing here names a scheduler. That is the caller's, as it is for
+        every other dask surface this SDK returns: an attached distributed
+        client gets the writes, and
+        ``dask.config.set(scheduler="threads", num_workers=N)`` around the call
+        is how a link that wants exactly N in flight -- or one -- says so.
+        """
+        target = _UploadTarget(
+            self._state.location,
+            self._state.token,
+            self._state.tls_trust,
+            source_id,
+            arr.shape,
+            arr.dtype,
+        )
+        da.store(arr, target, lock=False)
 
     def upload_zarr(
         self,
@@ -180,7 +271,7 @@ class UploadSession:
         )
 
         action = flight.Action("create_source", req_desc.SerializeToString())
-        results = self._client.do_action(action, options=self._call_options)
+        results = self._state.client.do_action(action, options=self._state.call_options)
         try:
             result = next(results)
         except StopIteration as exc:
@@ -198,27 +289,15 @@ class UploadSession:
     ) -> None:
         """Backs TensorFlightClient.upload_chunk; see that method for the full
         documentation."""
-        upload = ChunkUpload(
-            source_id=source_id,
-            bounds=bounds,
+        _put_chunk(
+            self._state.client, self._state.call_options, source_id, bounds, data
         )
-
-        desc = flight.FlightDescriptor.for_command(upload.SerializeToString())
-        schema = pa.schema([pa.field("data", pa.from_numpy_dtype(data.dtype))])
-
-        writer, reader = self._client.do_put(desc, schema, options=self._call_options)
-        batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
-        writer.write_batch(batch)
-        writer.done_writing()
-        writer.close()
-        reader.read()
-        logger.debug(f"upload_chunk: uploaded {data.nbytes} bytes to {source_id}")
 
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
         """Backs TensorFlightClient.get_upload_status; see that method for the full
         documentation."""
         action = flight.Action("upload_status", source_id.encode("utf-8"))
-        results = self._client.do_action(action, options=self._call_options)
+        results = self._state.client.do_action(action, options=self._state.call_options)
         for result in results:
             return json.loads(result.body.to_pybytes())
         return {

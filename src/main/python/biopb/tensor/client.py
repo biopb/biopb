@@ -218,7 +218,7 @@ class TensorFlightClient:
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
-        self._upload = UploadSession(self._client, self._call_options)
+        self._upload = UploadSession(self._state)
 
     # The catalog caches live on the shared _ClientState; expose them here so a
     # caller's reads, in-place mutation, AND reassignment (client._sources = {})
@@ -929,7 +929,11 @@ class TensorFlightClient:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
         """
         return self._upload.upload_array(
-            arr, source_name, chunk_shape, dim_labels, ome_metadata
+            arr,
+            source_name,
+            chunk_shape,
+            dim_labels,
+            ome_metadata,
         )
 
     def upload_zarr(
@@ -961,7 +965,11 @@ class TensorFlightClient:
             source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
         """
         return self._upload.upload_zarr(
-            zarr_path, source_name, chunk_shape, dim_labels, ome_metadata
+            zarr_path,
+            source_name,
+            chunk_shape,
+            dim_labels,
+            ome_metadata,
         )
 
     def create_source(

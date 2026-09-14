@@ -4,15 +4,21 @@ Tests for CachedSourceAdapter, server-side do_put handler,
 and Python client upload methods.
 """
 
+import itertools
+import pickle
 import tempfile
 import threading
+import time
 from itertools import product
 from pathlib import Path
 
+import dask
+import dask.array as da
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
+from biopb.tensor import TensorFlightClient, _upload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
@@ -1423,3 +1429,240 @@ class TestCachedSourceContentVersion:
         assert cv1 is not None and cv2 is not None
         assert cv1.startswith(b"gen:") and cv2.startswith(b"gen:")
         assert cv1 != cv2  # a fresh namespace per upload session
+
+
+class TestConcurrentChunkUpload:
+    """`upload_array` ships several chunks at once, via `da.store` (#590).
+
+    The serial loop this replaced paid a full `do_put` round trip
+    (open/write/done/close/read) per chunk with nothing overlapping it, so the
+    cost was latency multiplied by chunk count.
+    """
+
+    @pytest.fixture
+    def client(self, tmp_path):
+        """A client connected to a live, writable server on an OS-assigned port.
+
+        No wait after `serve()`: `FlightServerBase` binds and starts serving in
+        `__init__`, so the port is live before this returns -- the thread only
+        parks on it.
+        """
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=512))
+        server = TensorFlightServer(
+            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+        )
+        server.mark_ready()
+        threading.Thread(target=server.serve, daemon=True).start()
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            yield client
+            client.close()
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+
+    @staticmethod
+    def _counting_put(monkeypatch, hold=0.0):
+        """Swap in a `_put_chunk` that records how many run at once.
+
+        `_put_chunk` is the seam because that is what the store target calls --
+        it holds connection parameters rather than a session, precisely so it
+        can be pickled to a worker, so there is no session method left to wrap.
+        """
+        real = _upload._put_chunk
+        lock = threading.Lock()
+        state = {"live": 0, "peak": 0}
+
+        def counting(*args, **kwargs):
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+            try:
+                if hold:
+                    time.sleep(hold)
+                return real(*args, **kwargs)
+            finally:
+                with lock:
+                    state["live"] -= 1
+
+        monkeypatch.setattr(_upload, "_put_chunk", counting)
+        return state
+
+    def test_a_fanned_out_upload_round_trips_every_chunk(self, client):
+        """The whole point: concurrent chunks, byte-identical on the way back.
+
+        Values differ per chunk, which is what makes a swapped or dropped chunk
+        visible -- a uniform array would round-trip through almost any bug.
+        """
+        source = np.arange(12 * 40 * 40, dtype=np.uint16).reshape(12, 40, 40)
+        source_id = client.upload_array(
+            da.from_array(source, chunks=(1, 40, 40)), "cache:fanout"
+        )
+
+        client.wait_for_upload_ready(source_id, timeout_seconds=30)
+        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
+
+    def test_the_chunks_really_do_overlap(self, client, monkeypatch):
+        """Concurrency, observed rather than assumed.
+
+        Without this the suite would pass just as happily on something that
+        still uploads one at a time, and #590 would be "fixed" by code that
+        does not overlap anything. The hold is load-bearing: over loopback a
+        round trip can finish before the next task is even scheduled.
+        """
+        state = self._counting_put(monkeypatch, hold=0.05)
+        arr = da.from_array(np.zeros((16, 20, 20), dtype=np.uint8), chunks=(1, 20, 20))
+
+        with dask.config.set(scheduler="threads", num_workers=4):
+            client.upload_array(arr, "cache:overlap")
+
+        assert state["peak"] > 1, "uploads ran one at a time"
+        assert state["peak"] <= 4, f"asked for 4 at once, ran {state['peak']}"
+
+    def test_the_caller_can_still_ask_for_a_serial_upload(self, client, monkeypatch):
+        """Throttling is dask's own dial, not an argument this SDK invents.
+
+        `upload_array` names no scheduler, so a link or a backend that wants
+        exactly one write in flight says so the way it would for any other dask
+        call -- and that has to actually reach `da.store`.
+        """
+        state = self._counting_put(monkeypatch)
+        source = np.arange(6 * 20 * 20, dtype=np.uint16).reshape(6, 20, 20)
+        arr = da.from_array(source, chunks=(1, 20, 20))
+
+        with dask.config.set(scheduler="threads", num_workers=1):
+            source_id = client.upload_array(arr, "cache:serial")
+
+        assert state["peak"] == 1
+        client.wait_for_upload_ready(source_id, timeout_seconds=30)
+        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
+
+    def test_a_failed_chunk_surfaces_as_itself(self, client, monkeypatch):
+        """A chunk that raises must reach the caller, with its own type.
+
+        Callers catch on type (`flight.FlightError` and friends), so a write
+        failing inside the graph has to come back out as itself rather than
+        wrapped in something dask-shaped -- and must not hang on the siblings.
+        """
+        real = _upload._put_chunk
+        # Not the first, so some have landed and others are still to come --
+        # the state the unwind actually has to handle. `count.__next__` is
+        # atomic, so the workers need no lock of their own.
+        calls = itertools.count()
+
+        class ChunkRefused(RuntimeError):
+            pass
+
+        def failing(*args, **kwargs):
+            if next(calls) == 3:
+                raise ChunkRefused("no")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(_upload, "_put_chunk", failing)
+        arr = da.from_array(np.zeros((10, 20, 20), dtype=np.uint8), chunks=(1, 20, 20))
+
+        with pytest.raises(ChunkRefused):
+            client.upload_array(arr, "cache:doomed")
+
+    def test_out_of_order_arrival_still_completes_the_upload(self, client):
+        """Readiness counts chunks into a set, so order is not observable.
+
+        Fanning out makes arrival order arbitrary; this pins the server-side
+        property that makes that safe, by uploading the chunks deliberately
+        backwards and asking for READY.
+        """
+        session = client._upload
+        source = np.arange(5 * 20 * 20, dtype=np.uint16).reshape(5, 20, 20)
+        source_id = session.create_source(
+            source_name="cache:backwards",
+            shape=source.shape,
+            dtype=source.dtype.str,
+            chunk_shape=(1, 20, 20),
+            dim_labels=["z", "y", "x"],
+        )
+        for z in reversed(range(5)):
+            session.upload_chunk(
+                source_id,
+                ChunkBounds(start=[z, 0, 0], stop=[z + 1, 20, 20]),
+                source[z : z + 1],
+            )
+
+        status = client.wait_for_upload_ready(source_id, timeout_seconds=30)
+        assert status["state"] == "READY"
+        assert status["uploaded_chunks"] == 5
+
+    def test_a_shared_upstream_block_is_computed_once(self, client):
+        """Why `da.store` and not a compute-and-ship loop per chunk.
+
+        `upload_array` rechunks onto the upload grid whenever the caller's
+        array is not already on it, so an output chunk drawing on a coarser
+        source block is the ordinary case rather than a corner. A per-chunk
+        loop would slice that rechunked array and `.compute()` once per output
+        chunk, and separate `.compute()` calls share no cache -- measured at 34
+        runs of the source block against 10 on this very graph.
+
+        Counted rather than timed: duplication shows up in invocations however
+        cheap the upstream task is, where a stopwatch would drown it in
+        per-`.compute()` fixed cost.
+        """
+        # A list, not an `itertools.count`: this function rides into the dask
+        # graph and gets pickled, which itertools objects will stop supporting
+        # in 3.14. `append` is atomic and a total is all this needs.
+        runs = []
+
+        def count(block):
+            runs.append(1)
+            return block
+
+        # Source on a 4-thick grid, uploaded on a 1-thick one: eight source
+        # blocks feeding 32 output chunks.
+        coarse = da.from_array(
+            np.zeros((32, 64, 64), dtype=np.uint16), chunks=(4, 64, 64)
+        )
+        client.upload_array(
+            coarse.map_blocks(count).rechunk((1, 64, 64)), "cache:shared"
+        )
+
+        # Eight source blocks; dask's rechunk splits two, hence ten. What
+        # matters is the order of magnitude against a loop's 34.
+        assert len(runs) <= 10
+
+    def test_the_store_target_survives_a_trip_to_a_worker(self, client):
+        """`da.store` puts the target in the graph, so it must pickle -- and work.
+
+        A target holding an `UploadSession` would drag a `FlightClient` along,
+        which does not pickle at all, failing every upload the moment an agent
+        called `_dask_ctl.attach()`. Surviving the round trip is the easy half:
+        this asserts the revived target, holding no session, dials for itself.
+        """
+        session = client._upload
+        source = np.arange(4 * 8 * 8, dtype=np.uint16).reshape(4, 8, 8)
+        source_id = session.create_source(
+            source_name="cache:revived",
+            shape=source.shape,
+            dtype=source.dtype.str,
+            chunk_shape=(1, 8, 8),
+            dim_labels=["z", "y", "x"],
+        )
+        target = _upload._UploadTarget(
+            session._state.location,
+            session._state.token,
+            session._state.tls_trust,
+            source_id,
+            source.shape,
+            source.dtype,
+        )
+
+        revived = pickle.loads(pickle.dumps(target))
+
+        for z in range(4):
+            revived[(slice(z, z + 1), slice(0, 8), slice(0, 8))] = source[z : z + 1]
+
+        assert (
+            client.wait_for_upload_ready(source_id, timeout_seconds=30)["state"]
+            == "READY"
+        )
+        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
