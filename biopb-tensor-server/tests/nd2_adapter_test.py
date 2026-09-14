@@ -352,6 +352,23 @@ def test_reader_reused_across_reads_and_closed_explicitly(tmp_path, monkeypatch)
     assert field._persistent_reader is None
 
 
+def test_source_close_also_closes_its_cached_position_adapters(tmp_path, monkeypatch):
+    path = tmp_path / "img.nd2"
+    path.write_bytes(b"\x00")
+    _install_fake(monkeypatch, sizes={"P": 2, "T": 2, "Y": 2, "X": 2})
+    source = Nd2Adapter.create_from_config(_source(path))
+
+    fields = [source.get_tensor_adapter(f"P:{i}") for i in range(2)]
+    bounds = ChunkBounds(start=[0, 0, 0], stop=[2, 2, 2])
+    for field in fields:
+        field.get_data(bounds)
+        assert field._persistent_reader is not None
+
+    source.close()
+    for field in fields:
+        assert field._persistent_reader is None
+
+
 def test_source_level_adapter_refuses_to_read(tmp_path, monkeypatch):
     path = tmp_path / "img.nd2"
     path.write_bytes(b"\x00")

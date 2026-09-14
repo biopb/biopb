@@ -511,6 +511,9 @@ class Nd2Adapter(TensorAdapter):
                 logger.debug("error closing persistent ND2 reader", exc_info=True)
 
     def close(self) -> None:
+        """Release this source's reader, including its position adapters'."""
+        for adapter in list(self._tensor_adapters.values()):
+            adapter.close()
         with self._io_lock:
             self._release_persistent_handle()
 
