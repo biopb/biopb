@@ -3,6 +3,7 @@
 Extends ZarrAdapter with OME multiscales metadata support.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import catalog_entry
+from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -174,6 +176,43 @@ class _HcsFieldAdapter(ZarrAdapter):
         field then carries just the plate row.
         """
         return self._field_metadata
+
+
+#: OME-NGFF axis "type" for each canonical axis ``core.axes.canonical_axis``
+#: resolves a label to. An axis it doesn't recognize gets no "type", same as
+#: OME-NGFF allows.
+_OME_AXIS_TYPE = {"x": "space", "y": "space", "z": "space", "c": "channel", "t": "time"}
+
+
+def minimal_ome_metadata(desc: TensorDescriptor) -> dict:
+    """The smallest ``.zattrs`` that makes an uploaded array an OME-Zarr."""
+    dim_labels = (
+        list(desc.dim_labels)
+        if desc.dim_labels
+        else [f"dim{i}" for i in range(len(desc.shape))]
+    )
+
+    axes = []
+    for label in dim_labels:
+        ome_type = _OME_AXIS_TYPE.get(canonical_axis(label) or "")
+        axes.append({"name": label, "type": ome_type} if ome_type else {"name": label})
+
+    return {
+        "multiscales": [
+            {
+                "version": "0.4",
+                "axes": axes,
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0] * len(desc.shape)}
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
 
 
 class OmeZarrAdapter(ZarrAdapter):
@@ -423,6 +462,47 @@ class OmeZarrAdapter(ZarrAdapter):
         if source.is_remote:
             return zarr.open_array(zarr_store, path=relpath, mode="r")
         return zarr.open_array(os.path.join(zarr_path, relpath), mode="r")
+
+    @classmethod
+    def create_upload(
+        cls,
+        name: str,
+        desc: TensorDescriptor,
+        *,
+        metadata: Optional[dict],
+        write_dir: Optional[Path],
+    ) -> "OmeZarrAdapter":
+        """Create a real ``.zarr`` under *write_dir* and an adapter tracking its upload.
+
+        Nothing touches disk until the ``.zattrs`` payload is resolved: a bad
+        request must not leave a partial store behind, since ``zarr.create``
+        refuses an existing one and the orphan would block a corrected retry
+        under the same name (biopb/biopb#354).
+        """
+        import zarr
+
+        if write_dir is None:
+            raise ValueError("write_dir not configured for zarr-backed sources")
+        zattrs = metadata if metadata is not None else minimal_ome_metadata(desc)
+
+        zarr_name = name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
+        zarr_path = write_dir / f"{zarr_name}.zarr"
+        zarr_path.mkdir(parents=True, exist_ok=True)
+        arr = zarr.create(
+            store=zarr.DirectoryStore(str(zarr_path)),
+            shape=desc.shape,
+            dtype=desc.dtype,
+            chunks=desc.chunk_shape,
+        )
+        with open(zarr_path / ".zattrs", "w") as f:
+            json.dump(zattrs, f)
+
+        source_id = f"ome_zarr_{hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()[:12]}"
+        adapter = cls(
+            arr, source_id, list(desc.dim_labels) if desc.dim_labels else None
+        )
+        adapter.begin_upload(desc.shape, desc.chunk_shape)
+        return adapter
 
     def __init__(
         self,

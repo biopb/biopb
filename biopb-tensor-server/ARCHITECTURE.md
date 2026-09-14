@@ -47,7 +47,8 @@ logic), which may expose multiple tensors (e.g., multi-field) from one source.
 The `biopb_tensor_server` package is organized into layered subpackages:
 
 - **`core/`** — foundational primitives and contracts: adapter ABCs, `config`,
-  the `axes` vocabulary + its `normalize` seam, and the low-level
+  the `axes` vocabulary + its `normalize` seam, `writable` (the upload half of
+  an adapter: progress, completion, disposal), and the low-level
   `source_registry` / `metadata_db` stores.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
   sidecar), `upload_manager`, `precache`, `renderer`. Builds on `core`.
@@ -72,7 +73,7 @@ in three collaborators it composes:
 |---|---|---|
 | `server.sources` | `SourceRegistry` |  The `source_id → SourceAdapter` map and adapter-lifecycle |
 | `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
-| `server.uploads` | `UploadManager` | The writable-server DoPut path: source creation (`cache:`/`ome_zarr:`), polymorphic chunk writes, and upload-progress state machine |
+| `server.uploads` | `UploadManager` | The writable-server DoPut boundary: picks the upload kind by `array_id` prefix (`cache:`/`ome_zarr:`), registers what the adapter class builds, translates adapter errors to Flight errors. Progress and discard live on the adapter (`core.writable.WritableSource`), so a discarded upload is a registered tombstone, not a second record |
 
 ### Flight methods
 

@@ -1,17 +1,22 @@
-"""Writable-server upload path: source creation, chunk writing, progress state.
+"""Writable-server upload path: the DoPut boundary.
 
-Extracted from ``TensorFlightServer`` (biopb/biopb#278 item A). Owns everything
-behind ``DoPut`` when the server is writable:
+Extracted from ``TensorFlightServer`` (biopb/biopb#278 item A). What is left
+here is only what a boundary does:
 
-- **Source creation** (``create_source``) -- the ``cache:`` / ``ome_zarr:``
-  array_id prefixes, adapter construction, catalog sync, and OME-Zarr metadata
-  scaffolding.
-- **Chunk writing** (``write_chunk``) -- polymorphic ``put_chunk`` dispatch to
-  the source adapter, translating adapter write errors into Flight errors at the
-  server boundary.
-- **Upload-progress state machine** -- a per-source ``_UploadState`` (typed,
-  replacing the former stringly-keyed dict) counting uploaded chunks and
-  reporting PENDING/READY, surfaced by the ``upload_status`` Flight action.
+- **Kind selection** -- the ``cache:`` / ``ome_zarr:`` ``array_id`` prefix names
+  the adapter class (``UPLOAD_KINDS``); the class builds its own upload
+  (``create_upload``) and the manager registers it, syncing the catalog when
+  the kind is durable.
+- **Error translation** -- adapters stay transport-agnostic and raise typed
+  errors; this is where they become Flight errors.
+- **Lookup** -- ``status`` / ``discard`` / ``write_chunk`` find the adapter
+  and hand over.
+
+Progress, completion and disposal are the adapter's own
+(:class:`~biopb_tensor_server.core.writable.WritableSource`), so there is no
+second registry to keep in step with ``SourceRegistry``: an upload's state is
+created with its adapter, lives as long as it is registered, and a discarded
+one stays registered as a tombstone until reclaimed.
 
 The manager registers created sources through the shared ``SourceRegistry`` and
 never holds a back-reference to the server, so the collaborators stay acyclic.
@@ -19,73 +24,43 @@ never holds a back-reference to the server, so the collaborators stay acyclic.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import os
-import threading
-import time
-from dataclasses import dataclass, field
-from enum import Enum
-from math import ceil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Type
 
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
+from biopb.tensor.ticket_pb2 import ChunkUpload
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.core.axes import noncanonical_order
-from biopb_tensor_server.core.chunk import encode_chunk_id
-from biopb_tensor_server.core.errors import WriteNotSupportedError
+from biopb_tensor_server.core.errors import UploadDiscardedError, WriteNotSupportedError
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
-from biopb_tensor_server.core.source_registry import SourceRegistry
+from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
+from biopb_tensor_server.core.writable import (
+    UploadStatus,
+    WritableSource,
+    unknown_upload_status,
+    upload_of,
+)
+
+__all__ = ["UPLOAD_KINDS", "UploadManager", "UploadStatus"]
 
 logger = logging.getLogger(__name__)
 
-
-class UploadStatus(str, Enum):
-    """Wire-facing upload state (the string values are the ``upload_status`` API
-    contract, parsed by the client SDK)."""
-
-    PENDING = "PENDING"
-    READY = "READY"
-    UNKNOWN = "UNKNOWN"
-
-
-def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
-    count = 1
-    for dim, chunk in zip(shape, chunk_shape, strict=True):
-        count *= ceil(dim / chunk)
-    return count
-
-
-@dataclass
-class _UploadState:
-    """Per-source upload progress. ``READY`` once every expected chunk arrives."""
-
-    source_id: str
-    expected_chunks: int
-    status: UploadStatus = UploadStatus.PENDING
-    uploaded_chunk_ids: Set[bytes] = field(default_factory=set)
-
-    @property
-    def uploaded_chunks(self) -> int:
-        return len(self.uploaded_chunk_ids)
-
-    def as_status_dict(self) -> Dict[str, Any]:
-        return {
-            "source_id": self.source_id,
-            "state": self.status.value,
-            "expected_chunks": self.expected_chunks,
-            "uploaded_chunks": self.uploaded_chunks,
-        }
+#: ``array_id`` prefix -> the adapter class that builds an upload of that kind.
+#: The prefixes are a wire contract, so the table is closed; what each kind
+#: does with a request is the class's own (``create_upload``).
+UPLOAD_KINDS: Dict[str, Type[WritableSource]] = {
+    "cache": CachedSourceAdapter,
+    "ome_zarr": OmeZarrAdapter,
+}
 
 
 class UploadManager:
-    """Owns source creation, chunk writes, and per-source upload progress."""
+    """The DoPut boundary: picks the kind, registers, translates errors."""
 
     def __init__(
         self,
@@ -96,87 +71,28 @@ class UploadManager:
         self._registry = registry
         self._write_dir = write_dir
         self._metadata_db = metadata_db
-        self._lock = threading.RLock()
-        self._states: Dict[str, _UploadState] = {}
-        # Monotonic generation clock for biopb-written (cache:) sources (#178).
-        self._last_generation: int = 0
 
-    # -- progress state machine ------------------------------------------------
-
-    def initialize(
-        self,
-        source_id: str,
-        shape: List[int] | Tuple[int, ...],
-        chunk_shape: List[int] | Tuple[int, ...],
-    ) -> None:
-        """Begin tracking upload progress for a source.
-
-        Called by ``create_source`` on the DoPut wire path, and directly by
-        in-process cache producers (e.g. the image-runtime EmbeddedTensorCache)
-        that register a cache source and write its chunks without going over the
-        wire. Public so those in-process callers reach it through
-        ``server.uploads`` rather than a removed server method.
-        """
-        expected = _expected_chunk_count(list(shape), list(chunk_shape))
-        with self._lock:
-            self._states[source_id] = _UploadState(
-                source_id=source_id, expected_chunks=expected
-            )
-
-    def mark_chunk(self, source_id: str, bounds: ChunkBounds) -> None:
-        """Record that the chunk at *bounds* arrived (flips to READY when full).
-
-        Public for the same in-process producers as :meth:`initialize`; the
-        wire path reaches it via :meth:`write_chunk`.
-        """
-        chunk_id = encode_chunk_id(source_id, bounds)
-        with self._lock:
-            state = self._states.get(source_id)
-            if state is None:
-                return
-            state.uploaded_chunk_ids.add(chunk_id)
-            state.status = (
-                UploadStatus.READY
-                if state.uploaded_chunks >= state.expected_chunks
-                else UploadStatus.PENDING
-            )
+    # -- lookup ----------------------------------------------------------------
 
     def status(self, source_id: str) -> Dict[str, Any]:
-        with self._lock:
-            state = self._states.get(source_id)
-            if state is None:
-                return {
-                    "source_id": source_id,
-                    "state": UploadStatus.UNKNOWN.value,
-                    "expected_chunks": 0,
-                    "uploaded_chunks": 0,
-                }
-            return state.as_status_dict()
+        """The ``upload_status`` answer: UNKNOWN for anything not tracking an upload."""
+        upload = upload_of(self._registry.get(source_id))
+        if upload is None:
+            return unknown_upload_status(source_id)
+        return upload.as_status_dict(source_id)
 
-    def forget(self, source_id: str) -> None:
-        """Drop a source's upload state (called when the source is unregistered)."""
-        with self._lock:
-            self._states.pop(source_id, None)
+    def discard(self, source_id: str, reason: str = "") -> Dict[str, Any]:
+        """Give up on an upload; see ``WritableSource.discard``.
 
-    def _next_content_version(self) -> bytes:
-        """A process-monotonic generation token for a biopb-written cache: source.
-
-        cache: sources have deterministic ids (``cache:<name>`` -> a fixed
-        ``source_id``), so a re-upload reuses the id. Without a fresh namespace,
-        ``CacheManager.put`` finds the prior upload's chunk already present and
-        declines to overwrite it -- serving stale data (biopb/biopb#178). Folding a
-        distinct token into each upload's chunk_ids sidesteps that.
-
-        Wall-clock ns keeps the token distinct across a restart, where a persisted
-        file cache may still hold the prior upload's chunks; ``max(..., last + 1)``
-        keeps it strictly increasing even if the clock steps backwards. This is the
-        cache: analogue of the file adapters' stat signature -- those sources have no
-        file to stat, so biopb (the writer) supplies the version itself.
+        Total: a source that is not tracking an upload -- never was, or has
+        since been reclaimed -- reads UNKNOWN rather than raising, so a retry
+        after the tombstone is gone is not an error. A kind that refuses raises
+        ``ValueError``; callers today are in-process, so it is not translated.
         """
-        with self._lock:
-            gen = max(time.time_ns(), self._last_generation + 1)
-            self._last_generation = gen
-        return f"gen:{gen}".encode()
+        adapter = self._registry.get(source_id)
+        if upload_of(adapter) is None:
+            return unknown_upload_status(source_id)
+        return adapter.discard(reason)
 
     # -- write path ------------------------------------------------------------
 
@@ -216,146 +132,63 @@ class UploadManager:
         - "ome_zarr:name" → zarr-backed with given name
         - "ome_zarr:" → zarr-backed with server-generated name
         """
-        array_id = req_desc.array_id
         self._require_canonical_axes(req_desc)
 
-        # Physical calibration is echoed on the response only for cache sources:
-        # they store it in the adapter AND re-serve it verbatim on the read hot
-        # path. The ome_zarr branch persists scale via the .zattrs (or drops it),
-        # so echoing req_desc here would advertise a vector a later read won't
-        # reproduce -- left None for that branch (issue #272).
-        resp_physical_scale: Optional[List[float]] = None
-        resp_physical_unit: Optional[List[str]] = None
-
-        if array_id.startswith("cache:"):
-            # Cache-backed source
-            provided_name = array_id[6:]  # After 'cache:'
-            if provided_name:
-                source_id = (
-                    f"cache_{hashlib.sha256(provided_name.encode()).hexdigest()[:12]}"
-                )
-            else:
-                source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
-
-            ome_metadata = self._parse_metadata_json(req_desc.metadata_json)
-
-            # Carry the uploader's physical calibration through the round-trip so
-            # a client re-serving scaled data doesn't lose it (issue #272).
-            resp_physical_scale = (
-                list(req_desc.physical_scale) if req_desc.physical_scale else None
-            )
-            resp_physical_unit = (
-                list(req_desc.physical_unit) if req_desc.physical_unit else None
-            )
-
-            adapter = CachedSourceAdapter(
-                source_id=source_id,
-                shape=list(req_desc.shape),
-                dtype=req_desc.dtype,
-                chunk_shape=list(req_desc.chunk_shape),
-                dim_labels=list(req_desc.dim_labels) if req_desc.dim_labels else None,
-                ome_metadata=ome_metadata,
-                physical_scale=resp_physical_scale,
-                physical_unit=resp_physical_unit,
-                content_version=self._next_content_version(),
-            )
-            self._registry.register(source_id, adapter)
-            self.initialize(source_id, req_desc.shape, req_desc.chunk_shape)
-
-            logger.info(f"Created cache-backed source: {source_id}")
-
-        elif array_id.startswith("ome_zarr:"):
-            # Zarr-backed source
-            import zarr
-
-            provided_name = array_id[9:]  # After 'ome_zarr:'
-            zarr_name = (
-                provided_name
-                or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
-            )
-
-            if self._write_dir is None:
-                raise flight.FlightServerError(
-                    "write_dir not configured for zarr-backed sources"
-                )
-
-            # Resolve the .zattrs payload *before* touching disk. A malformed
-            # metadata_json must fail the request without leaving a partial
-            # .zarr behind -- an orphan that would also block a corrected retry
-            # under the same name, since zarr.create refuses an existing store
-            # (biopb/biopb#354). _build_minimal_ome_metadata is pure, so this is
-            # side-effect-free either way.
-            if req_desc.metadata_json:
-                zattrs = self._parse_metadata_json(req_desc.metadata_json)
-            else:
-                zattrs = self._build_minimal_ome_metadata(req_desc)
-
-            zarr_path = self._write_dir / f"{zarr_name}.zarr"
-            zarr_path.mkdir(parents=True, exist_ok=True)
-
-            store = zarr.DirectoryStore(str(zarr_path))
-            arr = zarr.create(
-                store=store,
-                shape=req_desc.shape,
-                dtype=req_desc.dtype,
-                chunks=req_desc.chunk_shape,
-            )
-
-            with open(zarr_path / ".zattrs", "w") as f:
-                json.dump(zattrs, f)
-
-            source_id = f"ome_zarr_{hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()[:12]}"
-
-            adapter = OmeZarrAdapter(
-                arr,
-                source_id,
-                list(req_desc.dim_labels) if req_desc.dim_labels else None,
-            )
-
-            self._registry.register(source_id, adapter)
-            # File-backed uploads are durable (a real .zarr on disk), so add them
-            # to the catalog to be discoverable via list_sources/query_sources.
-            # Cache-backed uploads (the `cache:` branch above) are intentionally
-            # NOT synced: they are volatile and have no removal hook, so a row
-            # would dangle after eviction -- they stay readable by their returned
-            # id but are not enumerable (biopb/biopb#265). Best-effort: a catalog
-            # write must not fail the upload (the source is already usable by id).
-            if self._metadata_db is not None:
-                try:
-                    self._metadata_db.sync_source_added(source_id, adapter)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to sync uploaded source {source_id} to catalog "
-                        f"(readable by id, not listed): {e}"
-                    )
-            self.initialize(source_id, req_desc.shape, req_desc.chunk_shape)
-
-            logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")
-
-        else:
+        prefix, sep, name = req_desc.array_id.partition(":")
+        kind = UPLOAD_KINDS.get(prefix) if sep else None
+        if kind is None:
             raise flight.FlightServerError(
-                f"Invalid array_id format: {array_id}. Use 'cache:' or 'ome_zarr:' prefix"
+                f"Invalid array_id format: {req_desc.array_id}. Use 'cache:' or "
+                f"'ome_zarr:' prefix"
             )
 
-        return TensorDescriptor(
-            array_id=source_id,
-            dim_labels=req_desc.dim_labels,
-            shape=req_desc.shape,
-            chunk_shape=req_desc.chunk_shape,
-            dtype=req_desc.dtype,
-            physical_scale=resp_physical_scale,
-            physical_unit=resp_physical_unit,
+        # Parsed at the boundary: a malformed payload is the request's fault and
+        # must fail before the kind touches anything (biopb/biopb#354).
+        metadata = (
+            self._parse_metadata_json(req_desc.metadata_json)
+            if req_desc.metadata_json
+            else None
         )
+        try:
+            adapter = kind.create_upload(
+                name, req_desc, metadata=metadata, write_dir=self._write_dir
+            )
+        except ValueError as e:
+            raise flight.FlightServerError(str(e)) from e
+
+        # A deterministic id (a named cache: upload) lands on whatever holds the
+        # name now -- a prior upload, or its tombstone. Replace rather than
+        # overwrite so the displaced adapter is released, not leaked.
+        source_id = adapter.source_id
+        registered, displaced = self._registry.swap(source_id, adapter)
+        close_adapter(displaced)
+
+        # Only a durable upload belongs in the catalog; a volatile one is
+        # readable by its returned id but not enumerable (biopb/biopb#265).
+        # Best-effort: a catalog write must not fail the upload.
+        if kind.durable and self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_added(source_id, registered)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to sync uploaded source {source_id} to catalog "
+                    f"(readable by id, not listed): {e}"
+                )
+
+        logger.info(f"Created {prefix} upload: {source_id}")
+        return adapter.upload_response(req_desc)
 
     def write_chunk(
         self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
     ) -> None:
-        """Write chunk data by delegating to the source adapter's ``put_chunk``.
+        """Hand one uploaded chunk to its source's ``put_chunk``.
 
         Each source format owns its write contract: OmeZarr/Zarr enforce
         chunk-grid alignment; cache-backed sources accept arbitrary bounds;
-        read-only formats reject the write. The handler no longer sniffs adapter
-        attributes to pick a path.
+        read-only formats reject the write; a discarded upload refuses with its
+        reason. Adapters stay transport-agnostic, so their errors become Flight
+        errors here -- a discard as ``FlightCancelledError``, so a client
+        discriminates on the type rather than the message (biopb/biopb#1).
         """
         table = reader.read_all()
         data_column = table.column(0)
@@ -368,19 +201,13 @@ class UploadManager:
         expected_shape = tuple(
             stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
-
-        # Dispatch the write polymorphically: each source format owns its write
-        # contract (Zarr/OmeZarr enforce chunk-grid alignment; a cache source
-        # takes arbitrary bounds; read-only formats raise WriteNotSupportedError).
-        # Adapters stay transport-agnostic, so translate their write errors into a
-        # Flight error at this server boundary (alignment/size -> ValueError).
         dtype = table.schema.field(0).type.to_pandas_dtype()
         try:
             adapter.put_chunk(bounds, data_column, expected_shape, dtype)
+        except UploadDiscardedError as e:
+            raise flight.FlightCancelledError(str(e)) from e
         except (ValueError, WriteNotSupportedError) as e:
-            raise flight.FlightServerError(str(e))
-
-        self.mark_chunk(upload.source_id, bounds)
+            raise flight.FlightServerError(str(e)) from e
 
         logger.debug(
             f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"
@@ -403,8 +230,6 @@ class UploadManager:
         ``.zattrs``, both of which require a mapping, so a non-dict must fail here
         rather than surface as a confusing error downstream.
         """
-        if not metadata_json:
-            return {}
         try:
             parsed = json.loads(metadata_json)
         except json.JSONDecodeError as e:
@@ -414,40 +239,3 @@ class UploadManager:
                 f"invalid metadata_json: expected a JSON object, got {type(parsed).__name__}"
             )
         return parsed
-
-    @staticmethod
-    def _build_minimal_ome_metadata(desc: TensorDescriptor) -> dict:
-        """Build minimal OME-Zarr metadata from a TensorDescriptor."""
-        dim_labels = (
-            list(desc.dim_labels)
-            if desc.dim_labels
-            else [f"dim{i}" for i in range(len(desc.shape))]
-        )
-
-        axes = []
-        for label in dim_labels:
-            if label.lower() in ("x", "y", "z"):
-                axes.append({"name": label, "type": "space"})
-            elif label.lower() in ("c", "channel"):
-                axes.append({"name": label, "type": "channel"})
-            elif label.lower() in ("t", "time"):
-                axes.append({"name": label, "type": "time"})
-            else:
-                axes.append({"name": label})
-
-        return {
-            "multiscales": [
-                {
-                    "version": "0.4",
-                    "axes": axes,
-                    "datasets": [
-                        {
-                            "path": "0",
-                            "coordinateTransformations": [
-                                {"type": "scale", "scale": [1.0] * len(desc.shape)}
-                            ],
-                        }
-                    ],
-                }
-            ]
-        }

@@ -7,10 +7,11 @@ fused source+tensor adapter pattern used by OmeZarrAdapter, etc.
 - Metadata (shape, dtype, chunk_shape) stored in adapter instance
 - Chunk data stored in CacheManager keyed by chunk_id
 - When cache evicts chunks, adapter returns Flight error on read (source "gone")
-- "Dead" adapters accumulate until server restart (acceptable for ephemeral sources)
+- Upload progress and disposal live on the adapter (``core.writable``); a
+  discarded adapter stays registered as a tombstone until reclaimed
 
-Registration flow (bypasses discovery/registry):
-DoPut → direct instantiation → server.sources registry
+Registration flow (bypasses discovery): DoPut → ``create_upload`` →
+server.sources registry
 
 Chunk ID format: array_id + "/" + chunk_key
 Chunk data: stored in CacheManager keyed by full chunk_id
@@ -18,7 +19,11 @@ Chunk data: stored in CacheManager keyed by full chunk_id
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import threading
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -36,23 +41,34 @@ from biopb_tensor_server.core.chunk import (
     wrap_content_version,
 )
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA
+from biopb_tensor_server.core.errors import UploadDiscardedError
+from biopb_tensor_server.core.writable import WritableSource
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from biopb_tensor_server.core.config import SourceConfig
 
 logger = logging.getLogger(__name__)
 
 
-class CachedSourceAdapter(TensorAdapter):
+class CachedSourceAdapter(WritableSource, TensorAdapter):
     """Adapter for cache-backed uploaded sources.
 
-    One instance per source, registered in server.sources registry.
+    One instance per source, registered in server.sources registry. Every
+    instance is an upload, so the constructor begins tracking one.
 
     Chunk ID format: array_id + "/" + chunk_key (bounds start coords as "0/1/2")
     Chunk data stored in CacheManager keyed by full chunk_id.
 
     Cache-backed sources allow arbitrary chunk bounds (no uniformity enforcement).
     """
+
+    # Process-monotonic generation clock for the content_version of every
+    # upload (see next_content_version). One per process, not per server: a
+    # persisted file cache is shared by whatever serves it.
+    _generation_lock = threading.Lock()
+    _last_generation: int = 0
 
     # There is no backend to re-read: the cache entry is the upload's only copy,
     # so a read times a memcpy out of the cache being classified. Measured, it
@@ -70,6 +86,60 @@ class CachedSourceAdapter(TensorAdapter):
         """
         raise NotImplementedError(
             "CachedSourceAdapter is created via DoPut, not config"
+        )
+
+    @staticmethod
+    def upload_source_id(name: str) -> str:
+        """The source_id a ``cache:<name>`` upload lands on.
+
+        Deterministic for a name, so a re-upload under the same name reuses the
+        id (and replaces the source); minted for an empty one.
+        """
+        if name:
+            return f"cache_{hashlib.sha256(name.encode()).hexdigest()[:12]}"
+        return f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
+
+    @classmethod
+    def next_content_version(cls) -> bytes:
+        """A process-monotonic generation token for a biopb-written cache: source.
+
+        cache: sources have deterministic ids (``cache:<name>`` -> a fixed
+        ``source_id``), so a re-upload reuses the id. Without a fresh namespace,
+        ``CacheManager.put`` finds the prior upload's chunk already present and
+        declines to overwrite it -- serving stale data (biopb/biopb#178). Folding a
+        distinct token into each upload's chunk_ids sidesteps that.
+
+        Wall-clock ns keeps the token distinct across a restart, where a persisted
+        file cache may still hold the prior upload's chunks; ``max(..., last + 1)``
+        keeps it strictly increasing even if the clock steps backwards. This is the
+        cache: analogue of the file adapters' stat signature -- those sources have no
+        file to stat, so biopb (the writer) supplies the version itself.
+        """
+        with cls._generation_lock:
+            gen = max(time.time_ns(), cls._last_generation + 1)
+            cls._last_generation = gen
+        return f"gen:{gen}".encode()
+
+    @classmethod
+    def create_upload(
+        cls,
+        name: str,
+        desc: TensorDescriptor,
+        *,
+        metadata: Optional[dict],
+        write_dir: Optional[Path],
+    ) -> CachedSourceAdapter:
+        """A cache-backed upload: no store to create, so this is a constructor call."""
+        return cls(
+            source_id=cls.upload_source_id(name),
+            shape=list(desc.shape),
+            dtype=desc.dtype,
+            chunk_shape=list(desc.chunk_shape),
+            dim_labels=list(desc.dim_labels) if desc.dim_labels else None,
+            ome_metadata=metadata,
+            physical_scale=list(desc.physical_scale) if desc.physical_scale else None,
+            physical_unit=list(desc.physical_unit) if desc.physical_unit else None,
+            content_version=cls.next_content_version(),
         )
 
     def __init__(
@@ -134,6 +204,23 @@ class CachedSourceAdapter(TensorAdapter):
         # Required fields for the adapter interface
         self._source_url = f"cache://{source_id}"
         self._source_type = "cache"
+
+        self.begin_upload(self._shape, self._chunk_shape)
+
+    def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
+        """Echo the uploader's physical calibration on the response.
+
+        A cache source stores it AND re-serves it verbatim on the read path, so
+        what is advertised here is exactly what a later read reproduces
+        (issue #272). The zarr kind persists scale via the ``.zattrs`` or drops
+        it, so it does not echo.
+        """
+        response = super().upload_response(desc)
+        if self._physical_scale_vec:
+            response.physical_scale.extend(self._physical_scale_vec)
+        if self._physical_unit_vec:
+            response.physical_unit.extend(self._physical_unit_vec)
+        return response
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this cache source.
@@ -204,9 +291,11 @@ class CachedSourceAdapter(TensorAdapter):
         )
 
     def write_chunk(self, bounds: ChunkBounds, data: np.ndarray) -> None:
-        """Write chunk data to cache.
+        """Write a NumPy chunk: the in-process producer's entry to ``put_chunk``.
 
-        For cache-backed sources, arbitrary bounds allowed.
+        For cache-backed sources, arbitrary bounds allowed. Goes through
+        ``put_chunk`` so the write is counted, and refused once discarded, the
+        same as one arriving over the wire.
 
         Args:
             bounds: Chunk start/stop coordinates
@@ -214,9 +303,9 @@ class CachedSourceAdapter(TensorAdapter):
         """
         # Pass the flat element values (a primitive Arrow array), NOT a list<T>
         # wrapper -- write_chunk_arrow stores the raw value buffer directly.
-        self.write_chunk_arrow(bounds, pa.array(data.ravel()), data.shape, data.dtype)
+        self.put_chunk(bounds, pa.array(data.ravel()), data.shape, data.dtype)
 
-    def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
+    def _store_chunk(self, bounds, data, expected_shape, dtype) -> None:
         """Arbitrary-bounds write: cache-backed sources accept any bounds.
 
         Delegates straight to ``write_chunk_arrow`` (no NumPy round-trip -- the
@@ -367,6 +456,15 @@ class CachedSourceAdapter(TensorAdapter):
             raise flight.FlightServerError(
                 f"CacheManager required for cache-backed source {self.source_id}"
             )
+
+        # A tombstone: still registered so a writer learns the reason, and a
+        # reader should learn the same rather than "no chunk here". Shared
+        # with the write path's refusal (WritableSource._refuse_if_discarded);
+        # only the wire error it becomes differs.
+        try:
+            self._refuse_if_discarded()
+        except UploadDiscardedError as e:
+            raise flight.FlightServerError(str(e)) from e
 
         if is_scaled_chunk(chunk_id):
             self._require_full_coverage(chunk_id)

@@ -6,7 +6,6 @@ Optionally starts an embedded tensor cache server for lazy data handling.
 """
 
 import logging
-import os
 import secrets
 import threading
 from concurrent import futures
@@ -163,19 +162,13 @@ class EmbeddedTensorCache:
         source_name: Optional[str] = None,
         dim_labels: Optional[Sequence[str]] = None,
     ) -> tuple[str, da.Array, tuple[int, ...]]:
-        import hashlib
 
         from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 
         chunk_shape = _uniform_chunk_shape(array_template)
-        normalized_name = _normalize_cache_source_name(source_name)
-
-        if normalized_name:
-            source_id = (
-                f"cache_{hashlib.sha256(normalized_name.encode()).hexdigest()[:12]}"
-            )
-        else:
-            source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
+        source_id = CachedSourceAdapter.upload_source_id(
+            _normalize_cache_source_name(source_name)
+        )
 
         adapter = CachedSourceAdapter(
             source_id=source_id,
@@ -190,7 +183,6 @@ class EmbeddedTensorCache:
         # this token gates read-back without a server-wide secret.
         adapter.capability_token = secrets.token_urlsafe(32)
         self._server.register_source(source_id, adapter)
-        self._server.uploads.initialize(source_id, array_template.shape, chunk_shape)
         return source_id, array_template, chunk_shape
 
     def create_array(
@@ -220,14 +212,32 @@ class EmbeddedTensorCache:
         endpoint: ChunkBounds,
         chunk: np.ndarray,
     ) -> None:
+        import pyarrow.flight as flight
+        from biopb_tensor_server.core.errors import UploadDiscardedError
+
         adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
-        adapter.write_chunk(endpoint, chunk)
-        self._server.uploads.mark_chunk(source_id, endpoint)
+        # The adapter counts the chunk and refuses once discarded; a discard
+        # surfaces as the same exception type the wire path raises, so a
+        # servicer's job discriminates on it the way a remote client would.
+        try:
+            adapter.write_chunk(endpoint, chunk)
+        except UploadDiscardedError as e:
+            raise flight.FlightCancelledError(str(e)) from e
 
     def get_upload_status(self, source_id: str) -> dict:
         return self._server.uploads.status(source_id)
+
+    def discard(self, source_id: str, reason: str = "") -> dict:
+        """Give up on a result: drop the source, leave a tombstone saying why.
+
+        For a servicer whose background job died or was told to stop. Stopping
+        the job itself is the servicer's own concern -- this disposes of the
+        output it was going to fill, and makes any write still in flight fail
+        with *reason* rather than with a missing source (biopb/biopb#1).
+        """
+        return self._server.uploads.discard(source_id, reason)
 
     def create_source(
         self,

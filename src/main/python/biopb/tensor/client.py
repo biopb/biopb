@@ -1136,7 +1136,8 @@ class TensorFlightClient:
         Raises:
             ValueError: If the server tracks no upload for the source (UNKNOWN).
             TimeoutError: If the upload does not reach READY within the timeout.
-            RuntimeError: If the upload reports FAILED.
+            RuntimeError: If the owner discarded the upload (DISCARDED); the
+                reason they gave is included.
         """
         return self._upload.wait_for_upload_ready(
             source_id, timeout_seconds, poll_interval_seconds

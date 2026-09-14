@@ -151,6 +151,7 @@ def test_embedded_create_array_tracks_upload_status(
         "state": "PENDING",
         "expected_chunks": 4,
         "uploaded_chunks": 0,
+        "reason": "",
     }
 
     embedded_cache.upload_array_chunks(
@@ -201,3 +202,32 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     location = served_embedded_cache._external_location
     listed = TensorFlightClient(location).list_sources()
     assert source_id not in listed
+
+
+def test_discard_refuses_later_writes_with_the_reason(
+    embedded_cache: EmbeddedTensorCache,
+):
+    """What a servicer does when its background job dies or is told to stop.
+
+    A write still in flight then fails with the reason rather than with a
+    missing source, which is what tells the worker whether it was given up on
+    or hit a genuine fault (biopb/biopb#1).
+    """
+    import pyarrow.flight as flight
+
+    serialized = embedded_cache.create_array("cache:", ["Y", "X"], _uniform_template())
+    source_id = serialized.tensor_descriptor.array_id
+
+    status = embedded_cache.discard(source_id, "client disconnected")
+
+    assert status["state"] == "DISCARDED"
+    assert (
+        embedded_cache.get_upload_status(source_id)["reason"] == "client disconnected"
+    )
+
+    with pytest.raises(flight.FlightCancelledError, match="client disconnected"):
+        embedded_cache.upload_array_chunks(
+            source_id,
+            ChunkBounds(start=[0, 0], stop=[2, 2]),
+            np.ones((2, 2), dtype=np.float32),
+        )

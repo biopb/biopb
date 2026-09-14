@@ -189,14 +189,17 @@ class TestTensorFlightClient:
         finally:
             client.close()
 
-    def test_wait_for_upload_ready_pb_raises_on_failed_state(self):
+    def test_wait_for_upload_ready_pb_raises_on_discarded_state(self):
+        """DISCARDED is terminal, so the poll ends on it -- carrying the reason,
+        which is the only thing distinguishing it from a source that failed."""
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
         client._upload.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
-                "state": "FAILED",
+                "state": "DISCARDED",
                 "expected_chunks": 4,
                 "uploaded_chunks": 2,
+                "reason": "client disconnected",
             }
         )
 
@@ -204,7 +207,8 @@ class TestTensorFlightClient:
 
         try:
             with pytest.raises(
-                RuntimeError, match="Upload failed for source 'cache_test'"
+                RuntimeError,
+                match="Upload discarded for source 'cache_test': client disconnected",
             ):
                 client.wait_for_upload_ready_pb(
                     pb,

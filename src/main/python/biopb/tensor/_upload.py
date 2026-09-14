@@ -337,8 +337,14 @@ class UploadSession:
                     "(not an upload target, or its record was dropped by a "
                     "server restart or source removal)."
                 )
-            if state == "FAILED":
-                raise RuntimeError(f"Upload failed for source '{source_id}'")
+            if state == "DISCARDED":
+                # The owner gave up on this upload (biopb/biopb#1). Terminal, so
+                # it is a prompt answer rather than a poll to the timeout -- and
+                # the reason is the whole point of reporting it.
+                reason = status.get("reason") or "no reason given"
+                raise RuntimeError(
+                    f"Upload discarded for source '{source_id}': {reason}"
+                )
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Timed out waiting for upload readiness for source '{source_id}'"
