@@ -151,7 +151,6 @@ class MrcAdapter(TensorAdapter):
             axes=axes,
             std_header=std_header,
             original_metadata=sig["original_metadata"],
-            dim_labels=source.dim_labels,
             source_url=url,
         )
 
@@ -164,7 +163,6 @@ class MrcAdapter(TensorAdapter):
         axes: List[dict],
         std_header: dict,
         original_metadata: dict,
-        dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
     ):
         self.source_id = source_id
@@ -181,15 +179,10 @@ class MrcAdapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "mrc"
 
-        # Dimension labels: caller override, else the reader's axis names
-        # (default z,y,x), else positional.
-        if dim_labels:
-            self.dim_labels = list(dim_labels)
-        else:
-            self.dim_labels = [
-                str(ax.get("name")) if ax.get("name") else f"dim{i}"
-                for i, ax in enumerate(axes)
-            ]
+        self.dim_labels = [
+            str(ax.get("name")) if ax.get("name") else f"dim{i}"
+            for i, ax in enumerate(axes)
+        ]
 
         # Offset of the contiguous data region; reads map from here (per read --
         # see the module docstring). Probe the mapping once now so an unmappable

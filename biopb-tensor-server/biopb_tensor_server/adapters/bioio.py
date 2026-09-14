@@ -194,7 +194,7 @@ class _BioioAdapterBase(TensorAdapter):
         """Create source-level adapter instance from SourceConfig.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -221,7 +221,6 @@ class _BioioAdapterBase(TensorAdapter):
             img,
             scene_index=None,  # Source-level adapter
             source_id=source.source_id,
-            dim_labels=source.dim_labels,
             source_url=str(source.url),
         )
 
@@ -230,7 +229,6 @@ class _BioioAdapterBase(TensorAdapter):
         bio_image: "BioImage",
         scene_index: Optional[int],
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
         metadata_cache: Optional[Any] = None,
@@ -242,7 +240,6 @@ class _BioioAdapterBase(TensorAdapter):
             bio_image: BioImage instance
             scene_index: None for source-level, int for scene-level
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels (overrides auto-detected dims)
             source_url: Optional source URL
             io_lock: Optional thread lock for IO serialization. Source-level
                      adapters create a new lock if None; scene-level adapters
@@ -298,16 +295,14 @@ class _BioioAdapterBase(TensorAdapter):
             with self._io_lock:
                 self._bio_image.set_scene(scene_index)
                 self._dask_data = self._bio_image.dask_data
-                self.dim_labels = (
-                    dim_labels if dim_labels else list(self._bio_image.dims.order)
-                )
+                self.dim_labels = list(self._bio_image.dims.order)
                 if not self.RETAIN_SCENE_DASK:
                     self._scene_descriptor = self._descriptor_from_dask(self._dask_data)
                     self._dask_data = None
                     self._release_bioio_dask_cache()
         else:
-            # Source-level: no bound reader; dim_labels is the default for scenes.
-            self.dim_labels = dim_labels
+            # Source-level: no bound scene; axis labels come from the reader.
+            self.dim_labels = None
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -455,11 +450,7 @@ class _BioioAdapterBase(TensorAdapter):
                 and hasattr(ome_meta, "images")
                 and len(ome_meta.images) == len(scene_ids)
             ):
-                labels = (
-                    list(self.dim_labels)
-                    if self.dim_labels
-                    else list(self._bio_image.dims.order)
-                )
+                labels = list(self._bio_image.dims.order)
                 # The OME-pixels shape below is canonical 5-D TCZYX. It only
                 # agrees with `labels` when the image really is plain TCZYX. An
                 # RGB/samples source reports dims.order "TCZYXS" (bioio
@@ -510,11 +501,7 @@ class _BioioAdapterBase(TensorAdapter):
             for scene_id in scene_ids:
                 self._bio_image.set_scene(scene_id)
                 dask_data = self._bio_image.dask_data
-                labels = (
-                    list(self.dim_labels)
-                    if self.dim_labels
-                    else list(self._bio_image.dims.order)
-                )
+                labels = list(self._bio_image.dims.order)
 
                 descriptors.append(
                     TensorDescriptor(
@@ -582,7 +569,6 @@ class _BioioAdapterBase(TensorAdapter):
             self._bio_image,
             scene_index=scene_idx,
             source_id=self.source_id,
-            dim_labels=self.dim_labels,
             source_url=self._source_url,
             io_lock=self._io_lock,
             metadata_cache=self._metadata_cache,

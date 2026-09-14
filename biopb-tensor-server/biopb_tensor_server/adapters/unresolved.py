@@ -261,7 +261,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
         from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         resolved_type = self._source_type
-        dim_labels = self._config.dim_labels
         dataset = self._config.dataset
 
         try:
@@ -283,8 +282,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
         if claims:
             claim = claims[0]
             resolved_type = claim.source_type
-            if claim.dim_labels:
-                dim_labels = claim.dim_labels
             if claim.extra_config.get("dataset"):
                 dataset = claim.extra_config["dataset"]
 
@@ -299,7 +296,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
             url=self._source_url,
             type=resolved_type,
             source_id=self.source_id,
-            dim_labels=dim_labels,
             dataset=dataset,
             credentials_profile=self._config.credentials_profile,
             alias=self._config.alias,

@@ -682,10 +682,10 @@ class TestFallback:
         adapter._source_url = "s3://bucket/x.ome.tif"
         assert adapter._tifffile_descriptors() is None
 
-    def test_custom_dim_labels_fall_back(self, tmp_path):
+    def test_tifffile_descriptors_come_from_the_format(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = OmeTiffAdapter(path, "customdims", dim_labels=["C", "Y", "X"])
-        assert adapter._tifffile_descriptors() is None
+        adapter = OmeTiffAdapter(path, "native")
+        assert adapter._tifffile_descriptors() is not None
 
     def test_plain_non_ome_tiff_falls_back(self, tmp_path):
         import tifffile

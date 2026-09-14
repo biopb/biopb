@@ -248,7 +248,6 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
             tensor_id,
             tensor_desc,
             name=name,
-            source_desc=src,
             compute_scheduler=compute_scheduler,
         )
 

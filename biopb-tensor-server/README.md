@@ -145,8 +145,7 @@ You can create a custom config file to fine-tune server behavior, e.g. specifyin
     {
       "url": "/experiment.zarr",
       "alias": "my-zarr",
-      "type": "zarr",
-      "dim_labels": ["z", "y", "x"]
+      "type": "zarr"
     }
   ]
 }

@@ -284,7 +284,6 @@ class Nd2Adapter(TensorAdapter):
             path,
             source.source_id,
             layout=read_layout(path),
-            dim_labels=source.dim_labels,
         )
 
     def __init__(
@@ -292,7 +291,6 @@ class Nd2Adapter(TensorAdapter):
         url: str,
         source_id: str,
         layout: _Nd2Layout,
-        dim_labels: Optional[List[str]] = None,
         position: Optional[int] = None,
         io_lock: Optional[threading.Lock] = None,
         shared_handle: Optional["_Nd2Reader"] = None,
@@ -305,22 +303,9 @@ class Nd2Adapter(TensorAdapter):
         self._content_version = content_version_from_path(url)
         self.position = position
 
-        if position is None:
-            self.dim_labels = dim_labels
-        else:
-            native_labels = layout.field_labels
-            if dim_labels and len(dim_labels) != len(native_labels):
-                logger.warning(
-                    "nd2: ignoring %d configured dim_labels for %s -- position "
-                    "%d reads as a %d-axis %s array",
-                    len(dim_labels),
-                    url,
-                    position,
-                    len(native_labels),
-                    "".join(native_labels),
-                )
-                dim_labels = None
-            self.dim_labels = list(dim_labels or native_labels)
+        # Source-level: no bound position, no labels. Position-level: the
+        # file's own axes, with P folded away.
+        self.dim_labels = None if position is None else list(layout.field_labels)
 
         # T/Z only: P is fixed for a position-level adapter, never looped.
         self._present_loop_axes = tuple(
@@ -404,7 +389,6 @@ class Nd2Adapter(TensorAdapter):
             self._url,
             self.source_id,
             self._layout,
-            dim_labels=self.dim_labels if self.position is None else None,
             position=position,
             io_lock=self._io_lock,
             shared_handle=self._reader_handle(),

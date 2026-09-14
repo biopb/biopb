@@ -185,14 +185,13 @@ backend = "memory"
 [[sources]]
 type = "zarr"
 url = "/data/a.zarr"
-dim_labels = ["z", "y", "x"]
 ```
 
 ```json
 {
   "cache": { "backend": "memory" },
   "sources": [
-    { "type": "zarr", "url": "/data/a.zarr", "dim_labels": ["z", "y", "x"] }
+    { "type": "zarr", "url": "/data/a.zarr" }
   ]
 }
 ```

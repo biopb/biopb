@@ -561,7 +561,6 @@ def _register_source_with_server(
         url=path,
         type=registry_type,
         source_id=source_id,
-        dim_labels=spec.get("dim_labels"),
         dataset="data" if source_type == "hdf5" else None,
     )
 

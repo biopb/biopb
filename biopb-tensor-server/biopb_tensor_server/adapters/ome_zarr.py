@@ -301,7 +301,7 @@ class OmeZarrAdapter(ZarrAdapter):
         the root it just descended from.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -332,7 +332,6 @@ class OmeZarrAdapter(ZarrAdapter):
         return cls(
             arr,
             source.source_id,
-            source.dim_labels,
             _threaded_zattrs=zattrs or None,
             _threaded_root=threaded_root,
         )
@@ -439,7 +438,8 @@ class OmeZarrAdapter(ZarrAdapter):
         Args:
             zarr_array: Zarr array object (from specific resolution level)
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels (overrides OME metadata)
+            dim_labels: Labels supplied by the caller materializing this tensor
+                (the upload path); when None, OME metadata wins
             resolution_level: Which resolution level to use (default 0)
             _threaded_zattrs / _threaded_root: the root ``.zattrs`` and its local
                 path, supplied by :meth:`create_from_config` (which already read
@@ -496,7 +496,8 @@ class OmeZarrAdapter(ZarrAdapter):
                         ch.get("label", f"ch{i}") for i, ch in enumerate(channels)
                     ]
 
-        # Override dimension labels from OME metadata if not explicitly provided
+        # Dimension labels come from OME metadata unless the caller
+        # materializing this tensor supplied them (upload/internal).
         if dim_labels is None and self.axes:
             self.dim_labels = _axes_to_dim_labels(self.axes)
 

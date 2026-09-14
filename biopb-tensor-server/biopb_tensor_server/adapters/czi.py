@@ -317,7 +317,6 @@ class CziAdapter(TensorAdapter):
             path,
             source.source_id,
             layout=read_layout(path),
-            dim_labels=source.dim_labels,
         )
 
     def __init__(
@@ -325,7 +324,6 @@ class CziAdapter(TensorAdapter):
         url: str,
         source_id: str,
         layout: _CziLayout,
-        dim_labels: Optional[List[str]] = None,
         scene_position: Optional[int] = None,
         io_lock: Optional[threading.Lock] = None,
     ):
@@ -341,17 +339,7 @@ class CziAdapter(TensorAdapter):
         native_labels = list(layout.plane_axes) + list(_SPATIAL_DIMS)
         if layout.samples > 1:
             native_labels.append(_SAMPLES_DIM)
-        if dim_labels and len(dim_labels) != len(native_labels):
-            logger.warning(
-                "czi: ignoring %d configured dim_labels for %s -- this document "
-                "reads as a %d-axis %s array",
-                len(dim_labels),
-                url,
-                len(native_labels),
-                "".join(native_labels),
-            )
-            dim_labels = None
-        self.dim_labels = list(dim_labels or native_labels)
+        self.dim_labels = native_labels
 
         # One lock per source, shared with its scene adapters: libCZI's reader
         # is not documented as thread-safe, and it also fences a reaper close
@@ -421,7 +409,6 @@ class CziAdapter(TensorAdapter):
             self._url,
             self.source_id,
             self._layout,
-            dim_labels=self.dim_labels,
             scene_position=position,
             io_lock=self._io_lock,
         )
@@ -566,9 +553,8 @@ class CziAdapter(TensorAdapter):
         starts = [int(value) for value in bounds.start]
         stops = [int(value) for value in bounds.stop]
 
-        # Positions, not labels: a configured dim_labels renames the axes but
-        # never reorders the array this adapter builds. The plane axes come
-        # first, then Y and X, then samples for an RGB document.
+        # Positions, not labels: the plane axes come first, then Y and X,
+        # then samples for an RGB document.
         n_plane = len(layout.plane_axes)
         y0, x0 = starts[n_plane], starts[n_plane + 1]
         y1, x1 = stops[n_plane], stops[n_plane + 1]

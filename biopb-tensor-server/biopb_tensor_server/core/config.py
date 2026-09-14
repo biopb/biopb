@@ -16,7 +16,6 @@ Example config (explicit):
       "type": "zarr",
       "url": "/data/images.zarr",
       "alias": "my-image",
-      "dim_labels": ["z", "y", "x"]
     },
     { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images/channel0" }
   ]
@@ -411,17 +410,6 @@ class SourceConfig:
         metadata={
             "help": "Deprecated and ignored: a source's id is derived from its "
             "resolved URL (biopb/biopb#308). Use `alias` for a display name."
-        },
-    )
-    dim_labels: Optional[List[str]] = field(
-        default=None,
-        metadata={
-            "help": "Dimension labels applied to all tensors in the source. This "
-            "is how a store that carries no axis semantics of its own (plain "
-            "zarr, HDF5 -- which otherwise report dim0, dim1, ...) gets them: "
-            "the server reorders labelled axes into canonical [..., z, y, x, s] "
-            "order, but never invents a label it was not given "
-            "(biopb/biopb#596)."
         },
     )
     dataset: Optional[str] = field(
@@ -1657,7 +1645,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
                 "always maps to one catalog entry (dropping explicit ids closes "
                 "biopb/biopb#308). Use `alias` to give the source a display name."
             )
-        _carry(src_kwargs, "dim_labels", src_data)
         _carry(src_kwargs, "dataset", src_data)
         _carry(src_kwargs, "monitor", src_data)
         _carry(src_kwargs, "cloud", src_data)
@@ -2075,7 +2062,6 @@ def discover_sources(
     state = claim_based_discover(
         local_path,
         registry,
-        dim_labels=source.dim_labels,
         admit_nonresident=source.cloud,
         cloud_root=source.cloud,
     )
@@ -2089,7 +2075,7 @@ def _claim_to_source_config(
 
     Args:
         claim: SourceClaim from discovery
-        original_source: Original SourceConfig for dim_labels and credentials_profile inheritance
+        original_source: Original SourceConfig for credentials_profile inheritance
 
     Returns:
         SourceConfig with claim information
@@ -2110,7 +2096,6 @@ def _claim_to_source_config(
         type=claim.source_type,
         url=str(claim.primary_path),
         source_id=source_id,
-        dim_labels=claim.dim_labels or original_source.dim_labels,
         dataset=dataset,
         credentials_profile=original_source.credentials_profile,  # preserve credentials_profile
         cloud=original_source.cloud,  # propagate cloud gating to expanded sources

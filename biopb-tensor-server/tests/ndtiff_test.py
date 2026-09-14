@@ -123,7 +123,6 @@ class TestNdTiffAdapterDescriptor:
             dataset=mock_dataset,
             source_id="test-ndtiff",
             source_url="/test/path",
-            dim_labels=None,
         )
 
         desc = adapter.get_tensor_descriptor()
@@ -133,31 +132,6 @@ class TestNdTiffAdapterDescriptor:
         # dtype is string representation - can be either 'uint16' or '<u2'
         assert desc.dtype in ("uint16", "<u2")
         assert list(desc.dim_labels) == ["p", "t", "c", "z", "y", "x"]
-
-    def test_descriptor_with_custom_dim_labels(self):
-        """Test descriptor with custom dim_labels override."""
-        from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
-
-        mock_dataset = MagicMock()
-        mock_axes = MagicMock()
-        mock_axes.keys.return_value = ["time", "channel", "z", "row", "column"]
-        mock_dataset.axes = mock_axes
-
-        mock_dask = MagicMock()
-        mock_dask.shape = (10, 3, 5, 64, 64)
-        mock_dask.dtype = np.dtype("uint8")
-        mock_dataset.as_array.return_value = mock_dask
-
-        adapter = NdTiffAdapter(
-            dataset=mock_dataset,
-            source_id="test-ndtiff",
-            source_url="/test/path",
-            dim_labels=["t", "c", "z", "y", "x"],  # Custom labels
-        )
-
-        desc = adapter.get_tensor_descriptor()
-
-        assert list(desc.dim_labels) == ["t", "c", "z", "y", "x"]
 
     def test_chunk_shape_is_whole_planes(self):
         """The transfer grid is built from whole 2D planes (biopb/biopb#809)."""

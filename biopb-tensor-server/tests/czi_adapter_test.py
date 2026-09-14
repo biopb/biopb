@@ -170,22 +170,6 @@ def test_descriptor_carries_the_physical_scale(tmp_path):
     assert list(descriptor.physical_scale) == pytest.approx([0.0, 0.0, 1.5, 0.3, 0.2])
 
 
-def test_configured_dim_labels_rename_axes_without_reordering(tmp_path):
-    path, expected = create_zeiss_czi(str(tmp_path), n_c=2, n_z=3, image_shape=(16, 16))
-    source = CziAdapter.create_from_config(
-        _source(path, dim_labels=["time", "chan", "depth", "row", "col"])
-    )
-
-    descriptor = source.list_tensor_descriptors()[0]
-    assert list(descriptor.dim_labels) == ["time", "chan", "depth", "row", "col"]
-    assert list(descriptor.shape) == [1, 2, 3, 16, 16]
-
-    scene = source.get_tensor_adapter(descriptor.array_id)
-    np.testing.assert_array_equal(
-        scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 2, 3, 16, 16])), expected
-    )
-
-
 def test_file_url_is_read_as_a_local_path(tmp_path):
     """``file://`` is a local URL here, but libCZI takes a filesystem path."""
     path, expected = create_zeiss_czi(str(tmp_path), n_c=1, n_z=2, image_shape=(8, 8))
@@ -198,23 +182,6 @@ def test_file_url_is_read_as_a_local_path(tmp_path):
     np.testing.assert_array_equal(
         scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 2, 8, 8])), expected
     )
-
-
-def test_wrong_rank_dim_labels_are_reported_not_silently_dropped(tmp_path, caplog):
-    path, _ = create_zeiss_czi(str(tmp_path), n_c=1, n_z=2, image_shape=(8, 8))
-    with caplog.at_level("WARNING"):
-        source = CziAdapter.create_from_config(
-            _source(path, dim_labels=["z", "y", "x"])
-        )
-
-    assert list(source.list_tensor_descriptors()[0].dim_labels) == [
-        "T",
-        "C",
-        "Z",
-        "Y",
-        "X",
-    ]
-    assert "ignoring 3 configured dim_labels" in caplog.text
 
 
 def test_metadata_is_the_image_information_subtree(tmp_path):

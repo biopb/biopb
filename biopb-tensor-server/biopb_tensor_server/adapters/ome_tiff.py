@@ -389,7 +389,6 @@ class OmeTiffAdapter(TensorAdapter):
         source_id: str,
         scene_index: Optional[int] = None,
         tensor_descriptor: Optional[TensorDescriptor] = None,
-        dim_labels: Optional[List[str]] = None,
         io_lock: Optional[threading.Lock] = None,
     ):
         """Initialize an OME-TIFF adapter.
@@ -400,9 +399,6 @@ class OmeTiffAdapter(TensorAdapter):
             scene_index: None for source-level, int for a bound scene.
             tensor_descriptor: The scene's authoritative tifffile descriptor
                 (scene-level only); its dim_labels become this adapter's.
-            dim_labels: Optional dimension-label override (source-level; a set
-                value routes off the canonical tifffile path -- see
-                ``_tifffile_descriptors``).
             io_lock: Shared IO lock. Source-level creates one if None; scene-level
                 receives the source's lock.
         """
@@ -421,7 +417,7 @@ class OmeTiffAdapter(TensorAdapter):
         if tensor_descriptor is not None:
             self.dim_labels = list(tensor_descriptor.dim_labels)
         else:
-            self.dim_labels = dim_labels
+            self.dim_labels = None
 
         # Persistent aszarr-store state (opened lazily on first get_data). The
         # read serves regions straight from the zarr array -- no dask.
@@ -469,7 +465,7 @@ class OmeTiffAdapter(TensorAdapter):
         cls, source: "SourceConfig", credentials_config: Optional[object] = None
     ) -> "OmeTiffAdapter":
         """Create a source-level adapter from a SourceConfig."""
-        return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
+        return cls(str(source.url), source.source_id)
 
     # ---- reads --------------------------------------------------------------
 
@@ -820,17 +816,11 @@ class OmeTiffAdapter(TensorAdapter):
         """Build per-scene descriptors straight from tifffile (biopb/biopb#168).
 
         Returns a list of ``TensorDescriptor`` on success, or ``None`` to decline
-        (custom ``dim_labels`` override, remote/non-``file://`` URL, non-OME TIFF,
-        zero series, or a non-OME axis). Scene IDs match the OME ``Image`` IDs so
+        (remote/non-``file://`` URL, non-OME TIFF, zero series, or a non-OME axis). Scene IDs match the OME ``Image`` IDs so
         the catalog array_ids are stable, and only the tiny OME-XML header is read
         (no ome-types object graph). Canonical ``TCZYX`` and interleaved RGB(A)
         (``TCZYXS``) are both mapped natively via ``_ome_axes_shape``.
         """
-        # An explicit dim_labels override is not supported on the pure-tifffile
-        # path (it owned the non-canonical relabeling in the old aicsimageio path).
-        if self.dim_labels:
-            return None
-
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
             return None  # remote/fsspec source: no local tifffile handle

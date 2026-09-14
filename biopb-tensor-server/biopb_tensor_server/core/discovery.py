@@ -697,7 +697,6 @@ class SourceClaim:
         source_type: Type identifier ("zarr", "ome-tiff", "hdf5", etc.)
         primary_path: Main entry point for the source (str to support URLs)
         source_id: Unique identifier (auto-generated if None)
-        dim_labels: Optional dimension labels
         extra_config: Adapter-specific configuration (e.g., HDF5 dataset path)
         is_remote: Flag indicating if this is a remote source
         unresolved: True when the adapter recognized this source by recall-free
@@ -711,7 +710,6 @@ class SourceClaim:
         "source_type",
         "primary_path",
         "source_id",
-        "dim_labels",
         "extra_config",
         "is_remote",
         "member_paths",
@@ -723,7 +721,6 @@ class SourceClaim:
         source_type: str,
         primary_path: Path | str,
         source_id: Optional[str] = None,
-        dim_labels: Optional[List[str]] = None,
         extra_config: Optional[dict] = None,
         is_remote: bool = False,
         member_paths: Optional[Set[str] | List[str]] = None,
@@ -734,7 +731,6 @@ class SourceClaim:
             str(primary_path) if isinstance(primary_path, Path) else primary_path
         )
         self.source_id = source_id
-        self.dim_labels = dim_labels
         self.extra_config = extra_config if extra_config is not None else {}
         self.is_remote = is_remote
         self.unresolved = unresolved
@@ -1160,20 +1156,16 @@ def generate_source_id(url: str, source_type: str) -> str:
 def _record_claim(
     state: DiscoveryState,
     claims: List[SourceClaim],
-    dim_labels: Optional[List[str]],
 ) -> Optional[SourceClaim]:
     """Finalize the winning claim from ``get_claims_for_path`` into ``state``.
 
-    Applies the default ``dim_labels`` (only when the claim carries none) and
-    registers the claim. Shared by every discovery entry point so the
+    Registers the claim. Shared by every discovery entry point so the
     claim-finalization policy lives in one place. Returns the recorded claim, or
     ``None`` when no adapter claimed the path.
     """
     if not claims:
         return None
     claim = claims[0]
-    if claim.dim_labels is None and dim_labels is not None:
-        claim.dim_labels = dim_labels
     state.add_claim(claim)
     return claim
 
@@ -1182,7 +1174,6 @@ def discover_sources(
     root: Path,
     registry: AdapterRegistry,
     state: Optional[DiscoveryState] = None,
-    dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[Path], bool]] = None,
     admit_nonresident: bool = False,
     cloud_root: bool = False,
@@ -1196,7 +1187,6 @@ def discover_sources(
         root: Root directory to scan
         registry: Adapter registry for claims
         state: Existing DiscoveryState to update (creates new if None)
-        dim_labels: Optional dimension labels to apply to all claims
         admit_nonresident: Under a cloud root, admit dehydrated placeholders
             instead of skipping them.
         cloud_root: Under a cloud root, set ``ClaimContext.cloud_root`` so the
@@ -1227,7 +1217,7 @@ def discover_sources(
 
     # Check if root itself is a data source (e.g., a .zarr directory)
     ctx = ClaimContext(root, cloud_root=cloud_root)
-    claim = _record_claim(state, registry.get_claims_for_path(ctx, state), dim_labels)
+    claim = _record_claim(state, registry.get_claims_for_path(ctx, state))
     if claim is not None:
         logger.info(f"discover_sources: root {root} claimed as {claim.source_type}")
         return state  # Root claimed, no need to recurse
@@ -1251,7 +1241,7 @@ def discover_sources(
             continue
 
         ctx = ClaimContext(path, cloud_root=cloud_root)
-        _record_claim(state, registry.get_claims_for_path(ctx, state), dim_labels)
+        _record_claim(state, registry.get_claims_for_path(ctx, state))
 
     logger.debug(
         f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources"
@@ -1263,7 +1253,6 @@ def discover_sources_from_entries(
     entries: Iterable[Tuple[str, bool, Optional[Tuple]]],
     registry: AdapterRegistry,
     state: Optional[DiscoveryState] = None,
-    dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[str], bool]] = None,
     skipped_dirs: Optional[Set[str]] = None,
     cloud_by_path: Optional[Dict[str, bool]] = None,
@@ -1356,9 +1345,7 @@ def discover_sources_from_entries(
             # children); files carry no listing.
             child_listing=children_by_dir.get(path_str) if is_dir else None,
         )
-        claim = _record_claim(
-            state, registry.get_claims_for_path(ctx, state), dim_labels
-        )
+        claim = _record_claim(state, registry.get_claims_for_path(ctx, state))
         if claim is not None and is_dir:
             prune_stack.append(path_str)
 
@@ -1372,7 +1359,6 @@ def discover_remote_source(
     credentials_config: Optional[Any] = None,
     profile_name: Optional[str] = None,
     state: Optional[DiscoveryState] = None,
-    dim_labels: Optional[List[str]] = None,
 ) -> DiscoveryState:
     """Discover a single remote source using fsspec.
 
@@ -1386,7 +1372,6 @@ def discover_remote_source(
         credentials_config: CredentialsConfig for authentication
         profile_name: Credential profile name to use
         state: Existing DiscoveryState to update (creates new if None)
-        dim_labels: Optional dimension labels
 
     Returns:
         DiscoveryState with discovered remote source
@@ -1417,7 +1402,7 @@ def discover_remote_source(
 
     # Check if root URL is a data source
     ctx = ClaimContext("", store)
-    claim = _record_claim(state, registry.get_claims_for_path(ctx, state), dim_labels)
+    claim = _record_claim(state, registry.get_claims_for_path(ctx, state))
     if claim is not None:
         logger.info(f"discover_remote_source: {url} claimed as {claim.source_type}")
 

@@ -720,7 +720,7 @@ class TestHdf5Integration:
             dset.attrs["element_size_um"] = np.array([2.0, 0.25, 0.25])
 
         with h5py.File(h5_path, "r") as f:
-            adapter = Hdf5Adapter(f["data"], "cal", ["z", "y", "x"])
+            adapter = Hdf5Adapter(f["data"], "cal")
 
             server = TensorFlightServer("grpc://localhost:0")
             server.register_source("cal", adapter)
