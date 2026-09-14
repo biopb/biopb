@@ -349,24 +349,31 @@ def test_reader_reused_across_reads_and_closed_explicitly(tmp_path, monkeypatch)
     # The persistent reader is reused across reads, not reopened each time.
     assert _FakeND2File.opens == 2
     field.close()
-    assert field._persistent_reader is None
+    assert field._reader_handle()._reader is None
 
 
-def test_source_close_also_closes_its_cached_position_adapters(tmp_path, monkeypatch):
+def test_position_adapters_share_one_reader_and_close_together(tmp_path, monkeypatch):
+    """A reader per position would map the same file once per position; all
+    positions of one source instead share the one persistent reader, and
+    closing the source closes it for every position adapter at once."""
     path = tmp_path / "img.nd2"
     path.write_bytes(b"\x00")
+    _FakeND2File.opens = 0  # class-level counter; reset for this test's count
     _install_fake(monkeypatch, sizes={"P": 2, "T": 2, "Y": 2, "X": 2})
     source = Nd2Adapter.create_from_config(_source(path))
+    assert _FakeND2File.opens == 1  # read_layout's probe
 
     fields = [source.get_tensor_adapter(f"P:{i}") for i in range(2)]
     bounds = ChunkBounds(start=[0, 0, 0], stop=[2, 2, 2])
     for field in fields:
         field.get_data(bounds)
-        assert field._persistent_reader is not None
+    # One persistent reader serves both positions, not one each.
+    assert _FakeND2File.opens == 2
+    assert fields[0]._reader_handle() is fields[1]._reader_handle()
 
     source.close()
     for field in fields:
-        assert field._persistent_reader is None
+        assert field._reader_handle()._reader is None
 
 
 def test_source_level_adapter_refuses_to_read(tmp_path, monkeypatch):

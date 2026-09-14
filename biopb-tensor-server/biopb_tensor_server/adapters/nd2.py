@@ -89,6 +89,59 @@ _READER_TTL = 5.0
 _reader_reaper = IdleHandleReaper(_READER_TTL, "nd2-reader-reaper", max_handles=8)
 
 
+class _Nd2Reader:
+    """One ND2 reader, shared by every position adapter of one source.
+
+    The handle is per *file* while adapters are per position -- a reader per
+    position would map the same file once per position to serve reads that
+    are already serialized behind the one ``_io_lock`` they share.
+    """
+
+    def __init__(self, url: str, io_lock: threading.Lock) -> None:
+        self._url = url
+        # The source's lock, shared with every position adapter -- so the
+        # fence the reaper takes is the same one reads hold.
+        self._io_lock = io_lock
+        self._reader = None
+        # Reads hold ``_io_lock`` end to end, so none is ever in flight when
+        # the reaper takes it.
+        self._active_reads = 0
+        self._persistent_last_access = 0.0
+
+    def acquire(self):
+        """Open (or reuse) the reader. Caller holds ``_io_lock``."""
+        # Stamped before register, so this handle sorts newest and a cap
+        # eviction triggered by its own register never picks it.
+        self._persistent_last_access = time.monotonic()
+        if self._reader is None:
+            import nd2
+
+            self._reader = nd2.ND2File(self._url)
+            _reader_reaper.register(self)
+        return self._reader
+
+    def _release_persistent_handle(self) -> None:
+        """Close the reader and permit a later reopen.
+
+        The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
+        hook. Caller holds ``_io_lock`` (read path / reaper) or is the GC
+        finalizer. Safe to call repeatedly.
+        """
+        reader, self._reader = self._reader, None
+        _reader_reaper.discard(self)
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                logger.debug("error closing persistent ND2 reader", exc_info=True)
+
+    def __del__(self):
+        try:
+            self._release_persistent_handle()
+        except Exception:
+            pass
+
+
 @dataclass(frozen=True)
 class _Nd2Layout:
     """What one probe of an ND2 file tells the adapter. Built once, at registration."""
@@ -241,6 +294,8 @@ class Nd2Adapter(TensorAdapter):
         layout: _Nd2Layout,
         dim_labels: Optional[List[str]] = None,
         position: Optional[int] = None,
+        io_lock: Optional[threading.Lock] = None,
+        shared_handle: Optional["_Nd2Reader"] = None,
     ):
         self.source_id = source_id
         self._url = url
@@ -278,14 +333,13 @@ class Nd2Adapter(TensorAdapter):
                 layout, position
             )
 
-        # One reader per position, held warm the same way CziAdapter holds its
-        # libCZI reader -- ``nd2.read_frame`` returns a zero-copy view onto
-        # the reader's mmap, so a reopen re-faults every page a crop touches
-        # even when the bytes are already resident.
-        self._io_lock = threading.Lock()
-        self._persistent_reader = None
-        self._persistent_last_access = 0.0
-        self._active_reads = 0
+        # One reader per file, shared by every position adapter -- held warm
+        # the same way CziAdapter holds its libCZI reader, since
+        # ``nd2.read_frame`` returns a zero-copy view onto the reader's mmap
+        # and a reopen re-faults every page a crop touches even when the
+        # bytes are already resident.
+        self._io_lock = io_lock if io_lock is not None else threading.Lock()
+        self._shared_handle: Optional[_Nd2Reader] = shared_handle
         self._tensor_adapters: Dict[str, Nd2Adapter] = {}
 
     def _position_frame_plan(
@@ -352,10 +406,23 @@ class Nd2Adapter(TensorAdapter):
             self._layout,
             dim_labels=self.dim_labels if self.position is None else None,
             position=position,
+            io_lock=self._io_lock,
+            shared_handle=self._reader_handle(),
         )
         adapter._tensor_name = field
         self._tensor_adapters[field] = adapter
         return adapter
+
+    def _reader_handle(self) -> "_Nd2Reader":
+        """This source's shared reader, made on first use.
+
+        Position adapters receive it from the source-level adapter (via
+        :meth:`get_tensor_adapter`); one constructed directly -- a test, a
+        benchmark -- makes its own.
+        """
+        if self._shared_handle is None:
+            self._shared_handle = _Nd2Reader(self._url, self._io_lock)
+        return self._shared_handle
 
     def _position_for_field(self, field: Optional[str]) -> int:
         if not field or field == self.source_id:
@@ -446,8 +513,9 @@ class Nd2Adapter(TensorAdapter):
             range(starts[axis], stops[axis], steps[axis]) for axis in sequence_axes
         ]
 
+        handle = self._reader_handle()
         with self._io_lock:
-            reader = self._acquire_reader()
+            reader = handle.acquire()
             try:
                 for coordinates in product(*sequence_ranges):
                     coordinate_by_axis = dict(
@@ -476,52 +544,25 @@ class Nd2Adapter(TensorAdapter):
                             )
                             output_slices.append(slice(None))
                     output[tuple(output_slices)] = frame[tuple(source_slices)]
-                self._persistent_last_access = time.monotonic()
             except Exception:
-                self._release_persistent_handle()
+                # A half-open reader is not reusable; drop it so the next
+                # read (on this or any sibling position adapter) reopens
+                # rather than failing on the same handle.
+                handle._release_persistent_handle()
                 raise
         return output
 
-    def _acquire_reader(self):
-        """Open (or reuse) the ND2 reader. Caller holds ``_io_lock``."""
-        if self._persistent_reader is not None:
-            return self._persistent_reader
-
-        import nd2
-
-        reader = nd2.ND2File(self._url)
-        self._persistent_reader = reader
-        self._persistent_last_access = time.monotonic()
-        _reader_reaper.register(self)
-        return reader
-
-    def _release_persistent_handle(self) -> None:
-        """Close the reader and permit a later reopen.
-
-        The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
-        hook. Caller holds ``_io_lock`` (read path / reaper) or is the GC
-        finalizer. Safe to call repeatedly.
-        """
-        reader, self._persistent_reader = self._persistent_reader, None
-        _reader_reaper.discard(self)
-        if reader is not None:
-            try:
-                reader.close()
-            except Exception:
-                logger.debug("error closing persistent ND2 reader", exc_info=True)
-
     def close(self) -> None:
-        """Release this source's reader, including its position adapters'."""
+        """Release this source's reader, including its position adapters'.
+
+        They share one, so closing it here closes it for all of them; the
+        next read on any of them reopens.
+        """
         for adapter in list(self._tensor_adapters.values()):
             adapter.close()
-        with self._io_lock:
-            self._release_persistent_handle()
-
-    def __del__(self):
-        try:
-            self._release_persistent_handle()
-        except Exception:
-            pass
+        if self._shared_handle is not None:
+            with self._io_lock:
+                self._shared_handle._release_persistent_handle()
 
     # ---- metadata -------------------------------------------------------------
 
