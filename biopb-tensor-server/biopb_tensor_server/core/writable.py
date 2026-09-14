@@ -12,9 +12,11 @@ consulted before every write, by hand, in three places.
 :class:`WritableSource` is a mixin for the two writable formats
 (``CachedSourceAdapter``, ``ZarrAdapter``). It owns the shared half --
 progress, status, disposal -- and leaves the format its own half: how a chunk
-is stored (``_store_chunk``), how an upload of this kind is created
-(``create_upload``), and whether it may be discarded (``discard``). The DoPut
-boundary (``serving.upload_manager``) picks the kind, registers the result and
+is stored (``_store_chunk``) and how an upload of this kind is created
+(``create_upload``). Disposal (``discard``) is shared too, gated by the
+``durable`` flag: a durable kind (a real store on disk, catalogued) refuses it
+outright rather than overriding the method. The DoPut boundary
+(``serving.upload_manager``) picks the kind, registers the result and
 translates exceptions; nothing else about an upload lives there.
 
 Wrappers: ``SourceRegistry.register`` may wrap an adapter (``normalize_adapter``),
@@ -76,6 +78,17 @@ def unknown_upload_status(source_id: str) -> Dict[str, Any]:
     }
 
 
+def upload_of(adapter: object) -> Optional[UploadProgress]:
+    """The upload progress an adapter is tracking, or None.
+
+    By attribute, not ``isinstance`` (the mixin's own contract -- see the
+    module docstring): a caller outside this module that needs to know
+    whether an adapter is an upload, and whether it's discarded, should go
+    through this rather than repeating ``getattr(adapter, "upload", None)``.
+    """
+    return getattr(adapter, "upload", None)
+
+
 def _expected_chunk_count(shape: Sequence[int], chunk_shape: Sequence[int]) -> int:
     count = 1
     for dim, chunk in zip(shape, chunk_shape, strict=True):
@@ -109,6 +122,9 @@ class UploadProgress:
     # Set at discard, where the ids are dropped but how far the upload got is
     # still worth reporting -- it is how much work a poller learns was lost.
     final_chunk_count: Optional[int] = None
+    # Guards this record. Lives here rather than beside the optional `_upload`
+    # on WritableSource, so the two are never out of step with each other.
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def uploaded_chunks(self) -> int:
@@ -146,11 +162,17 @@ class WritableSource:
     #: A durable upload owns bytes that outlive the process (a store on disk)
     #: and belongs in the catalog. A volatile one is readable by its returned id
     #: only: it has no removal hook, so a catalog row would dangle after
-    #: eviction (biopb/biopb#265).
+    #: eviction (biopb/biopb#265). Durable uploads also own something disposal
+    #: can't release (a store on disk, a catalog row), so the base ``discard``
+    #: below refuses for them.
     durable: bool = False
 
+    #: Every host class sets this before ``begin_upload`` is reachable; declared
+    #: here so the mixin's own methods don't each need to silence the type
+    #: checker for an attribute they assume rather than define.
+    source_id: str
+
     _upload: Optional[UploadProgress] = None
-    _upload_lock: Optional[threading.Lock] = None
 
     # -- the format's half -----------------------------------------------------
 
@@ -195,7 +217,7 @@ class WritableSource:
         will reproduce it verbatim (issue #272).
         """
         return TensorDescriptor(
-            array_id=self.source_id,  # type: ignore[attr-defined]
+            array_id=self.source_id,
             dim_labels=desc.dim_labels,
             shape=desc.shape,
             chunk_shape=desc.chunk_shape,
@@ -216,14 +238,20 @@ class WritableSource:
         first reason wins, and with it the first timestamp -- a second discard
         must not extend the tombstone's life.
 
-        A kind whose upload owns something this cannot release overrides to
-        refuse (``ZarrAdapter``).
+        Refuses for a durable kind (``ZarrAdapter``): a real ``.zarr`` on disk
+        and a catalog row are not this call's to release.
         """
-        source_id = self.source_id  # type: ignore[attr-defined]
+        source_id = self.source_id
+        if self.durable:
+            raise ValueError(
+                f"discard: {source_id} is not a cache-backed upload. A "
+                "zarr-backed source owns a .zarr directory and a catalog row, "
+                "which this does not remove."
+            )
         progress = self._upload
         if progress is None:
             return unknown_upload_status(source_id)
-        with self._upload_lock:  # type: ignore[arg-type]
+        with progress.lock:
             if not progress.is_discarded:
                 progress.status = UploadStatus.DISCARDED
                 progress.reason = reason
@@ -241,7 +269,6 @@ class WritableSource:
 
     def begin_upload(self, shape: Sequence[int], chunk_shape: Sequence[int]) -> None:
         """Start tracking an upload of ``shape`` written in ``chunk_shape`` units."""
-        self._upload_lock = threading.Lock()
         self._upload = UploadProgress(
             expected_chunks=_expected_chunk_count(list(shape), list(chunk_shape))
         )
@@ -254,9 +281,9 @@ class WritableSource:
     def upload_status(self) -> Dict[str, Any]:
         progress = self._upload
         if progress is None:
-            return unknown_upload_status(self.source_id)  # type: ignore[attr-defined]
-        with self._upload_lock:  # type: ignore[arg-type]
-            return progress.as_status_dict(self.source_id)  # type: ignore[attr-defined]
+            return unknown_upload_status(self.source_id)
+        with progress.lock:
+            return progress.as_status_dict(self.source_id)
 
     def put_chunk(
         self,
@@ -271,15 +298,21 @@ class WritableSource:
         self._mark_chunk(bounds)
 
     def _refuse_if_discarded(self) -> None:
+        """Raise :class:`UploadDiscardedError` if the upload has been given up on.
+
+        Shared by both directions: :meth:`put_chunk` calls it for a write, and
+        a read path (``CachedSourceAdapter.resolve_chunk_data``) calls it too,
+        so a tombstone answers a still-unwinding reader the same reason it
+        gives a writer rather than "no chunk here". Each boundary maps the
+        exception to its own wire error (write -> ``FlightCancelledError``,
+        read -> ``FlightServerError``).
+        """
         progress = self._upload
         if progress is None:
             return
-        with self._upload_lock:  # type: ignore[arg-type]
+        with progress.lock:
             if progress.is_discarded:
-                raise UploadDiscardedError(
-                    self.source_id,  # type: ignore[attr-defined]
-                    progress.reason,
-                )
+                raise UploadDiscardedError(self.source_id, progress.reason)
 
     def _mark_chunk(self, bounds: ChunkBounds) -> None:
         """Record that the chunk at *bounds* landed (flips to READY when full).
@@ -291,8 +324,8 @@ class WritableSource:
         progress = self._upload
         if progress is None:
             return
-        chunk_id = encode_chunk_id(self.source_id, bounds)  # type: ignore[attr-defined]
-        with self._upload_lock:  # type: ignore[arg-type]
+        chunk_id = encode_chunk_id(self.source_id, bounds)
+        with progress.lock:
             if progress.is_discarded:
                 return
             progress.uploaded_chunk_ids.add(chunk_id)

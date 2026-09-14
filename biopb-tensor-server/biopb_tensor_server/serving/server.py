@@ -71,6 +71,7 @@ from biopb_tensor_server.core.metadata_db import (
 )
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
+from biopb_tensor_server.core.writable import upload_of
 from biopb_tensor_server.serving.upload_manager import UploadManager
 
 logger = logging.getLogger(__name__)
@@ -1319,7 +1320,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # A discarded upload is registered only as a tombstone, for the
             # writer still unwinding onto it; it is not a source to offer.
-            upload = getattr(adapter, "upload", None)
+            upload = upload_of(adapter)
             if upload is not None and upload.is_discarded:
                 continue
 

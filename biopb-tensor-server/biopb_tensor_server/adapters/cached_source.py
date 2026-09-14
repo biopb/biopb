@@ -41,6 +41,7 @@ from biopb_tensor_server.core.chunk import (
     wrap_content_version,
 )
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA
+from biopb_tensor_server.core.errors import UploadDiscardedError
 from biopb_tensor_server.core.writable import WritableSource
 
 if TYPE_CHECKING:
@@ -457,12 +458,13 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             )
 
         # A tombstone: still registered so a writer learns the reason, and a
-        # reader should learn the same rather than "no chunk here".
-        if self._upload is not None and self._upload.is_discarded:
-            raise flight.FlightServerError(
-                f"Cache-backed source {self.source_id} was discarded"
-                + (f": {self._upload.reason}" if self._upload.reason else "")
-            )
+        # reader should learn the same rather than "no chunk here". Shared
+        # with the write path's refusal (WritableSource._refuse_if_discarded);
+        # only the wire error it becomes differs.
+        try:
+            self._refuse_if_discarded()
+        except UploadDiscardedError as e:
+            raise flight.FlightServerError(str(e)) from e
 
         if is_scaled_chunk(chunk_id):
             self._require_full_coverage(chunk_id)

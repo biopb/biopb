@@ -15,6 +15,7 @@ from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import catalog_entry
+from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -177,6 +178,12 @@ class _HcsFieldAdapter(ZarrAdapter):
         return self._field_metadata
 
 
+#: OME-NGFF axis "type" for each canonical axis ``core.axes.canonical_axis``
+#: resolves a label to. An axis it doesn't recognize gets no "type", same as
+#: OME-NGFF allows.
+_OME_AXIS_TYPE = {"x": "space", "y": "space", "z": "space", "c": "channel", "t": "time"}
+
+
 def minimal_ome_metadata(desc: TensorDescriptor) -> dict:
     """The smallest ``.zattrs`` that makes an uploaded array an OME-Zarr."""
     dim_labels = (
@@ -187,14 +194,8 @@ def minimal_ome_metadata(desc: TensorDescriptor) -> dict:
 
     axes = []
     for label in dim_labels:
-        if label.lower() in ("x", "y", "z"):
-            axes.append({"name": label, "type": "space"})
-        elif label.lower() in ("c", "channel"):
-            axes.append({"name": label, "type": "channel"})
-        elif label.lower() in ("t", "time"):
-            axes.append({"name": label, "type": "time"})
-        else:
-            axes.append({"name": label})
+        ome_type = _OME_AXIS_TYPE.get(canonical_axis(label) or "")
+        axes.append({"name": label, "type": ome_type} if ome_type else {"name": label})
 
     return {
         "multiscales": [

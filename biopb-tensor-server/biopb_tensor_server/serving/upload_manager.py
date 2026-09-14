@@ -43,6 +43,7 @@ from biopb_tensor_server.core.writable import (
     UploadStatus,
     WritableSource,
     unknown_upload_status,
+    upload_of,
 )
 
 __all__ = ["UPLOAD_KINDS", "UploadManager", "UploadStatus"]
@@ -75,7 +76,7 @@ class UploadManager:
 
     def status(self, source_id: str) -> Dict[str, Any]:
         """The ``upload_status`` answer: UNKNOWN for anything not tracking an upload."""
-        upload = getattr(self._registry.get(source_id), "upload", None)
+        upload = upload_of(self._registry.get(source_id))
         if upload is None:
             return unknown_upload_status(source_id)
         return upload.as_status_dict(source_id)
@@ -89,7 +90,7 @@ class UploadManager:
         ``ValueError``; callers today are in-process, so it is not translated.
         """
         adapter = self._registry.get(source_id)
-        if getattr(adapter, "upload", None) is None:
+        if upload_of(adapter) is None:
             return unknown_upload_status(source_id)
         return adapter.discard(reason)
 
