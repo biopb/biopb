@@ -110,8 +110,28 @@ export interface RoiAnnotation {
 
 ## Fetching
 
-`GET /api/rois/{array_id}` returns the tensor's whole set. One fetch per tensor,
-held in the store, filtered in memory.
+`GET /api/rois/{array_id}` returns the tensor's client-owned sets, all at once,
+held in the store and filtered in memory. A server-owned (`@`) set is fetched
+on its own, `?set=<name>`, and only while it is on screen — it is the kind of
+set that reaches megabytes, and it is off by default.
+
+Every response carries `sets`: each set on the tensor with its stored row count,
+server-owned ones included. That is the discovery step; there is no separate
+call for it, because the client-owned listing is bounded (its write cap is the
+read cap) and so is cheap to carry it on. The panel lists a server-owned set
+from `sets` before it holds any rows for it, and switching it on is what
+fetches it. The client-owned counts come from the resident rows rather than
+from `sets`, so an optimistic create shows up before any refetch.
+
+The store records what has landed per *scope* — `""` for the client-owned
+listing, a set name for a named fetch — under the tensor it belongs to. The
+tensor is the unit of eviction: the next tensor's first landing replaces
+everything. A scope is un-landed again when a later response's `sets` counts
+disagree with the rows held for it, and the next `loadRois` fetches it afresh;
+that is how a reserved set the server rebuilt on re-registration, or a set
+another client wrote to, catches up without a reload. A clipped scope is exempt
+(it disagrees by construction), and local writes move the resident counts with
+them so they are not read as someone else's change.
 
 **Why not a viewport filter.** The ROI being edited would vanish on a pan.
 
@@ -150,7 +170,7 @@ so flipping to the volume viewer unmounts the whole 2-D subtree. The overlay and
 the panel are the only two callers of `loadRois`, and the panel is not rendered
 in volume mode — so 3-D issues no request for a set it cannot draw.
 
-That makes `loadRois` idempotent on `roisFor` load-bearing rather than an
+That makes `loadRois` idempotent on the landed scopes load-bearing rather than an
 optimisation: the mode flip is a full remount, so without it a 2-D → 3-D → 2-D
 round trip would refetch a set that can reach megabytes.
 
@@ -446,15 +466,33 @@ annotation" one keystroke apart.
 New store slice, cleared on tensor change alongside the existing per-tensor state:
 
 ```
-rois: RoiAnnotation[]         // the fetched set
+rois: RoiAnnotation[]         // every row held, across the landed scopes
+roiSets: RoiSetInfo[]         // every set on the tensor, with its stored count
 roisFor: string | null        // which array_id they belong to (as tileInfoFor does)
-roisLoading / roisError
-activeSet: string             // "" = every set
-visibleSets: Set<string>
+roiScopes: Record<string, {truncated, skipped}>   // "" = client-owned listing; else a set name
+roisPending / roisError
+visibleSets: string[] | null  // the sets on screen; null = this tensor's default
 tool: "none" | "point" | "rect" | "polygon" | "polyline"
 draft: DraftShape | null      // vertices placed so far
 selectedRoiId: string | null
 ```
+
+**The visible sets are a positive list, or `null` for the tensor's default**
+(client-owned sets on, server-owned off). A hidden list could not say the thing
+a link needs to say — *show* `@ome` — and could not be resolved from a URL
+before the listing lands. `null` is materialised into the explicit list on the
+first toggle, the way `broadcastAxes` is, and a new annotation's set is added to
+a materialised list so the shape just drawn cannot vanish. A server-owned set
+on the list is what `loadRois` fetches by name: visibility drives the lazy
+fetch.
+
+The list rides the URL as `rs`, one parameter per set (`rs=default&rs=@ome`), in
+the non-inherited group with the indices — set names belong to the tensor.
+Absent means the default; present, even bare `rs=`, means exactly these. A link
+naming sets also turns the overlay on, since a link to sets with the overlay
+off is a link to nothing; `showRois` itself is not in the URL. Names are taken
+as given, like the axis keys, and a name the listing does not know is simply
+never fetched.
 
 **The overlay toggle turns the annotation surface off, not just the stored
 shapes.** With it off nothing is drawn, no tool is offered, a click places
@@ -469,11 +507,10 @@ per-set toggles are for. Like the plane guard, the draft is hidden rather than
 destroyed, so toggling back restores it.
 
 `tool` and the overlay toggle are viewer preferences and outlive a tensor change.
-Overlay visibility belongs in `useViewerUrlSync` so a shared link carries it.
 
 **Everything else is scoped by a selector, not reset by a writer.** Each piece
-carries the tensor it belongs to (`roisFor`, `hiddenSetsFor`, `roisErrorFor`) and
-is read through `selectRois` / `selectHiddenSets` / `selectRoisTruncated` and
+carries the tensor it belongs to (`roisFor`, `visibleSetsFor`, `roisErrorFor`) and
+is read through `selectRois` / `selectVisibleSets` / `selectRoiScopes` and
 friends, which hide it when it belongs to another tensor.
 
 That is not tidiness. `selectSource` is *not* the only way the tensor in view

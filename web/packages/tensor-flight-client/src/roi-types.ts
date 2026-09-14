@@ -84,8 +84,36 @@ export interface RoiAnnotationInput {
   drawnAgainstVersion?: string;
 }
 
+/**
+ * Whether a set name is server-owned, by the server's own naming rule.
+ *
+ * `RoiSetInfo.reserved` is the authoritative answer, but it exists only once a
+ * listing has landed; a name met before that -- one a link carries -- is judged
+ * by the prefix the server reserves.
+ */
+export function isReservedSetName(setName: string): boolean {
+  return setName.startsWith("@");
+}
+
+/** One annotation layer on a tensor, as the server enumerates it. */
+export interface RoiSetInfo {
+  setName: string;
+  /** Rows stored in this set, whatever `rois` covers. */
+  count: number;
+  /**
+   * The server owns this set: it is rebuilt from the source file, is read-only,
+   * and `rois` carries it only when the request named it.
+   */
+  reserved: boolean;
+}
+
 export interface RoiListResult {
   rois: RoiAnnotation[];
+  /**
+   * Every set on the tensor, including those `rois` does not cover -- an
+   * unqualified list returns the client-owned sets alone.
+   */
+  sets: RoiSetInfo[];
   /** True when the server's per-tensor cap clipped the set. */
   truncated: boolean;
   /**

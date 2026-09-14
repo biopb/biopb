@@ -9,10 +9,10 @@ import {
   planeFromSelection,
   roiPath,
   roiRing,
-  roiSetCounts,
   setColor,
   visibleRois,
 } from "./roiLayers";
+import { roiSetCounts } from "./roiSets";
 
 function roi(over: Partial<RoiAnnotation> & { geometry: RoiGeometry }): RoiAnnotation {
   return {
@@ -140,20 +140,28 @@ describe("visibleRois", () => {
     roi({ roiId: "b", geometry: POLY, plane: { 1: 9 } }),
     roi({ roiId: "c", geometry: POLY, plane: {} }),
     roi({ roiId: "d", geometry: POLY, setName: "other", plane: { 1: 4 } }),
+    roi({ roiId: "e", geometry: POLY, setName: "@ome", plane: { 1: 4 } }),
   ];
 
   it("keeps this plane's annotations and the unpinned ones", () => {
-    const ids = visibleRois(set, { 1: 4 }, []).map((r) => r.roiId);
+    const ids = visibleRois(set, { 1: 4 }, null).map((r) => r.roiId);
     expect(ids).toEqual(["a", "c", "d"]);
   });
 
-  it("drops a hidden set", () => {
-    const ids = visibleRois(set, { 1: 4 }, ["other"]).map((r) => r.roiId);
+  it("shows exactly the chosen sets", () => {
+    const ids = visibleRois(set, { 1: 4 }, ["default"]).map((r) => r.roiId);
     expect(ids).toEqual(["a", "c"]);
   });
 
+  it("holds a server-owned set back by default, and shows it when chosen", () => {
+    // The default is not "everything": a reserved set is on screen only by
+    // name, which is also what fetches it.
+    expect(visibleRois(set, { 1: 4 }, null).map((r) => r.roiId)).not.toContain("e");
+    expect(visibleRois(set, { 1: 4 }, ["@ome"]).map((r) => r.roiId)).toEqual(["e"]);
+  });
+
   it("keeps an unpinned annotation on every plane", () => {
-    expect(visibleRois(set, { 1: 99 }, []).map((r) => r.roiId)).toEqual(["c"]);
+    expect(visibleRois(set, { 1: 99 }, null).map((r) => r.roiId)).toEqual(["c"]);
   });
 });
 
@@ -220,7 +228,7 @@ describe("buildRoiLayers", () => {
     const layers = buildRoiLayers({
       rois: set,
       currentPlane: {},
-      hiddenSets: [],
+      visibleSets: null,
       visible: true,
     }) as Array<{ id: string }>;
     // Four, not three: a polyline is a band plus its centreline, which is how
@@ -233,14 +241,14 @@ describe("buildRoiLayers", () => {
     const layers = buildRoiLayers({
       rois: [roi({ geometry: POINT })],
       currentPlane: {},
-      hiddenSets: [],
+      visibleSets: null,
       visible: true,
     }) as Array<{ id: string }>;
     expect(layers.map((l) => l.id)).toEqual([roiLayerId("points")]);
   });
 
   it("draws nothing when the overlay is off", () => {
-    expect(buildRoiLayers({ rois: set, currentPlane: {}, hiddenSets: [], visible: false })).toEqual(
+    expect(buildRoiLayers({ rois: set, currentPlane: {}, visibleSets: null, visible: false })).toEqual(
       [],
     );
   });
@@ -248,7 +256,7 @@ describe("buildRoiLayers", () => {
   it("draws nothing when the plane filter empties the set", () => {
     const pinned = [roi({ geometry: POLY, plane: { 1: 1 } })];
     expect(
-      buildRoiLayers({ rois: pinned, currentPlane: { 1: 2 }, hiddenSets: [], visible: true }),
+      buildRoiLayers({ rois: pinned, currentPlane: { 1: 2 }, visibleSets: null, visible: true }),
     ).toEqual([]);
   });
 
@@ -258,7 +266,7 @@ describe("buildRoiLayers", () => {
     const layers = buildRoiLayers({
       rois: set,
       currentPlane: {},
-      hiddenSets: [],
+      visibleSets: null,
       visible: true,
     }) as Array<{ id: string; props: Record<string, unknown> }>;
     const alpha = (id: string, accessor: string) => {
@@ -287,7 +295,7 @@ describe("buildRoiLayers", () => {
     // The point of splitting selection out: a click must not change this
     // memo's output, or deck.gl regenerates every attribute of every layer --
     // earcut included -- for the whole set.
-    const opts = { rois: set, currentPlane: {}, hiddenSets: [], visible: true };
+    const opts = { rois: set, currentPlane: {}, visibleSets: null, visible: true };
     const layers = buildRoiLayers(opts) as Array<{ id: string; props: Record<string, unknown> }>;
     for (const layer of layers) {
       for (const accessor of ["getLineColor", "getColor", "getFillColor"]) {
@@ -309,7 +317,7 @@ describe("buildRoiLayers", () => {
     const layers = buildRoiLayers({
       rois: set,
       currentPlane: {},
-      hiddenSets: [],
+      visibleSets: null,
       visible: true,
     }) as Array<{ props: { pickable: boolean } }>;
     for (const layer of layers) expect(layer.props.pickable).toBe(false);
@@ -354,7 +362,7 @@ describe("buildSelectionLayers", () => {
     const base = buildRoiLayers({
       rois: [roi({ geometry: POLY })],
       currentPlane: {},
-      hiddenSets: [],
+      visibleSets: null,
       visible: true,
     }) as Array<{ props: Record<string, unknown> }>;
     const picked = buildSelectionLayers(roi({ geometry: POLY })) as Array<{

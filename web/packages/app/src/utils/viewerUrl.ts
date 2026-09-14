@@ -28,8 +28,17 @@ export const PARAM_ID = "id";
 const PERCENTILE_MIN = 0;
 const PERCENTILE_MAX = 4;
 
+/**
+ * An annotation set to show, repeated once per set (`rs=default&rs=@ome`).
+ *
+ * Repeated rather than joined: a set name is free text on the server, so no
+ * separator is safe. Absent means the tensor's default; present -- even empty,
+ * `rs=` -- means exactly these.
+ */
+const PARAM_SETS = "rs";
+
 /** Every parameter this module owns, so unrelated ones survive a write. */
-const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "cl", "g", "v", "vm", "tg", "zm", "rx", "ro"]);
+const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "cl", "g", "v", "vm", "tg", "zm", "rx", "ro", PARAM_SETS]);
 
 /** `OrbitController` clamps pitch to this; a link may not ask for more. */
 const ROTATION_X_LIMIT = 90;
@@ -53,6 +62,12 @@ export interface ViewerUrlState {
   camera3d: Camera3DState | null;
   /** Null when the view was never panned, i.e. "open at the fitted camera". */
   camera2d: Camera2DState | null;
+  /**
+   * The annotation sets on screen, or null for the tensor's default. Names are
+   * taken as given, like the axis keys: which sets exist is a property of the
+   * tensor, and the listing is what drops the ones naming nothing.
+   */
+  visibleSets: string[] | null;
 }
 
 function isVolumeRenderMode(v: string): v is VolumeRenderMode {
@@ -182,6 +197,11 @@ export function decodeViewerState(
   const g = num(params.get("g"));
   const vm = params.get("vm");
   const fixed = decodeFixedLimits(params);
+  // `rs=` alone is a deliberate "none": the parameter is present, so the list
+  // is chosen, and an empty name is not a set.
+  const sets = params.has(PARAM_SETS)
+    ? [...new Set(params.getAll(PARAM_SETS).filter((name) => name !== ""))]
+    : null;
 
   return {
     arrayId: params.get(PARAM_ID) ?? defaults.arrayId,
@@ -205,6 +225,7 @@ export function decodeViewerState(
     volumeRenderMode: vm !== null && isVolumeRenderMode(vm) ? vm : defaults.volumeRenderMode,
     camera3d: decodeCamera3d(params) ?? defaults.camera3d,
     camera2d: decodeCamera2d(params) ?? defaults.camera2d,
+    visibleSets: sets ?? defaults.visibleSets,
   };
 }
 
@@ -255,6 +276,12 @@ export function encodeViewerState(params: URLSearchParams, state: ViewerUrlState
       if (camera.rotationOrbit !== 0) out.set("ro", String(round(camera.rotationOrbit, 1)));
     }
   }
+  // Only a chosen list; the default is the tensor's own and needs no saying.
+  // An empty choice still writes the bare parameter, so it decodes as a choice.
+  if (state.visibleSets !== null) {
+    if (state.visibleSets.length === 0) out.append(PARAM_SETS, "");
+    for (const name of state.visibleSets) out.append(PARAM_SETS, name);
+  }
   return out;
 }
 
@@ -279,4 +306,5 @@ export const DEFAULT_VIEWER_URL_STATE: Omit<ViewerUrlState, "arrayId"> = {
   volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
   camera3d: null,
   camera2d: null,
+  visibleSets: null,
 };

@@ -153,6 +153,10 @@ tensor", which scopes reserved sets out instead: nothing in that request was
 addressed to them, they are not the caller's data, and re-import would restore
 them anyway.
 
+**Reading scopes them out the same way.** `list_rois` without a `set_name`
+returns the client-owned sets, and naming the set is the only way to read a
+reserved one.
+
 **A reserved set is outside the orphan machinery too** — `unseen_rois` skips it
 and `prune_unseen` will not delete it. The clock exists to give hand-drawn work a
 long grace period before anything removes it; a cache of the source file has
@@ -395,13 +399,22 @@ message RoiDeleteRequest { string array_id = 1; repeated string roi_ids = 2; str
 message RoiDeleteResult  { repeated string deleted = 1; }
 
 message RoiListRequest { string array_id = 1; string set_name = 2; }
-message RoiListResult  { repeated RoiAnnotation rois = 1; bool truncated = 2; }
+message RoiSetInfo     { string set_name = 1; int64 count = 2; bool reserved = 3; }
+message RoiListResult  { repeated RoiAnnotation rois = 1; bool truncated = 2;
+                         repeated RoiSetInfo sets = 3; }
 ```
 
-`RoiListRequest` takes no plane or bbox filter on purpose. The client fetches a
-tensor's whole annotation set once and filters in memory: it needs every ROI
-resident anyway to hit-test, drag a vertex and re-render, and a viewport-filtered
-fetch would make the ROI you are mid-edit disappear on a pan.
+`RoiListRequest` takes no plane or bbox filter: the client filters the resident
+set in memory.
+
+`set_name` scopes the read. Empty returns the tensor's client-owned sets; a
+reserved set comes back only when named. An import is not bounded by the write
+cap and its rows carry the registration timestamp, so sharing the read cap with
+them clips hand-drawn rows out of the result.
+
+`sets` covers the whole tensor whatever `rois` carries, and counts stored rows
+rather than returned ones. It is how a client learns a reserved set is there and
+what to name to read it.
 
 Concurrency is per-ROI optimistic: the server bumps `rev` on every write and
 returns the stored record. With `check_rev` set, a request whose `rev` does not

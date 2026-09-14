@@ -648,20 +648,20 @@ class TensorFlightClient:
     def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
         """Fetch a tensor's ROI annotations.
 
-        Returns the tensor's WHOLE annotation set (optionally one layer); there
-        is no plane or bbox filter. A client needs every ROI resident to
-        hit-test, drag a vertex and re-render anyway, and a viewport-filtered
-        fetch would make the ROI being edited disappear on a pan. For analytic
-        slicing -- counts per label, annotations overlapping a region, a join
-        against the catalog -- query the ``rois`` table with
-        :meth:`query_sources`.
+        There is no plane or bbox filter: a client hit-tests and re-renders
+        from the resident set. For analytic slicing -- counts per label,
+        annotations overlapping a region, a join against the catalog -- query
+        the ``rois`` table with :meth:`query_sources`.
 
         Args:
             array_id: Unversioned array_id of the tensor.
-            set_name: Restrict to one layer; empty means every set.
+            set_name: Restrict to one layer, and the only way to read a
+                reserved (``@``) set. Empty means the client-owned sets.
 
         Returns:
-            ``RoiListResult`` with ``rois`` and a ``truncated`` flag.
+            ``RoiListResult`` with ``rois``, a ``truncated`` flag, and ``sets``
+            -- every set on the tensor with its stored row count, whatever
+            ``rois`` covers.
 
         Raises:
             flight.FlightServerError: annotations disabled, or no metadata DB.

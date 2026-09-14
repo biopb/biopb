@@ -109,16 +109,28 @@ message RoiPutResult {
 
 // Body of the "roi_list" action.
 //
-// There is deliberately NO plane or bbox filter: a client fetches a tensor's
-// whole annotation set and filters in memory (it needs every ROI resident to
-// hit-test, drag a vertex and re-render anyway), and a viewport-filtered fetch
-// would make the ROI being edited disappear on a pan. Analytic slicing is the
-// SQL surface's job (the `rois` table is readable via query_sources).
+// There is no plane or bbox filter: a client filters the resident set in
+// memory. Analytic slicing is the SQL surface's job (the `rois` table is
+// readable via query_sources).
 message RoiListRequest {
   string array_id = 1;
 
-  // Restrict to one layer. Empty -> every set on the tensor.
+  // Restrict to one layer, and the only way to read a reserved ("@") set.
+  // Empty -> the tensor's client-owned sets.
   string set_name = 2;
+}
+
+// One annotation layer on a tensor, for a client listing what is there.
+message RoiSetInfo {
+  string set_name = 1;
+
+  // Rows in this set, before the read cap clips anything.
+  int64 count = 2;
+
+  // The server owns this set: it is rebuilt from the source file on every
+  // registration, is read-only to clients, and `rois` does not carry it unless
+  // RoiListRequest named it.
+  bool reserved = 3;
 }
 
 message RoiListResult {
@@ -126,6 +138,10 @@ message RoiListResult {
 
   // True when the per-tensor cap clipped the result.
   bool truncated = 2;
+
+  // Every set on the tensor, including those `rois` does not cover. Always the
+  // whole tensor, so a set_name-scoped request still enumerates its siblings.
+  repeated RoiSetInfo sets = 3;
 }
 
 // Body of the "roi_delete" action. Deletes `roi_ids` when given; otherwise

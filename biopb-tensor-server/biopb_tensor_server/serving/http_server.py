@@ -1940,11 +1940,11 @@ def _roi_flight_error(exc: Exception) -> HTTPException:
 
 @_router.get("/api/rois/{array_id:path}")
 async def list_rois(array_id: str, request: Request) -> JSONResponse:
-    """A tensor's whole annotation set, optionally one layer (``?set=``).
+    """A tensor's annotations, or one layer (``?set=``).
 
-    No plane or bbox filter by design: the client needs every ROI resident to
-    hit-test, drag a vertex and re-render, and a viewport-filtered fetch would
-    make the ROI being edited vanish on a pan.
+    Without ``?set=`` the result covers the client-owned sets; a reserved
+    (``@``) set is returned only when named. No plane or bbox filter: the
+    client hit-tests and re-renders from the resident set.
     """
     ctx = _sidecar(request)
     ctx.check_token(request)

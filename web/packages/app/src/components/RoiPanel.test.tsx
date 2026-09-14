@@ -39,13 +39,13 @@ const render = (over: Partial<RoiPanelViewProps> = {}) =>
   renderToStaticMarkup(
     <RoiPanelView
       rois={[]}
+      sets={[]}
       currentPlane={{}}
-      hiddenSets={[]}
+      visibleSets={null}
+      scopes={{}}
+      pending={[]}
       showRois
-      loading={false}
       error={null}
-      truncated={false}
-      skipped={0}
       unavailable={false}
       onToggleOverlay={() => {}}
       onClearSet={() => {}}
@@ -74,6 +74,49 @@ describe("RoiPanelView", () => {
     expect(html).toContain("2 of 3 here");
   });
 
+  it("names a server-owned set it holds no rows for, switched off", () => {
+    // An unqualified fetch does not carry them, so the listing is the only way
+    // the panel knows the set is there -- and the row is how it gets fetched.
+    const html = render({
+      rois: [roi({ setName: "nuclei" })],
+      sets: [
+        { setName: "@ome", count: 120, reserved: true },
+        { setName: "nuclei", count: 1, reserved: false },
+      ],
+    });
+    expect(html).toContain("@ome");
+    expect(html).toContain("120");
+    // Off by default: unchecked, where the client-owned row is checked.
+    expect(html.match(/checked=""/g) ?? []).toHaveLength(2); // the overlay and nuclei
+    // No clear button: the server refuses the write.
+    expect(html).not.toContain('aria-label="Delete every annotation in @ome"');
+  });
+
+  it("shows a server-owned set as fetching once switched on", () => {
+    const html = render({
+      sets: [{ setName: "@ome", count: 120, reserved: true }],
+      visibleSets: ["@ome"],
+      pending: ["@ome"],
+    });
+    expect(html).toContain("loading…");
+    expect(html.match(/checked=""/g) ?? []).toHaveLength(2);
+  });
+
+  it("counts a fetched server-owned set among what is here", () => {
+    const html = render({
+      rois: [roi({ setName: "@ome" }), roi({ setName: "nuclei" })],
+      sets: [
+        { setName: "@ome", count: 1, reserved: true },
+        { setName: "nuclei", count: 1, reserved: false },
+      ],
+      visibleSets: ["@ome", "nuclei"],
+      scopes: { "": { truncated: false, skipped: 0 }, "@ome": { truncated: false, skipped: 0 } },
+    });
+    expect(html).toContain("2 of 2 here");
+    // Listed once, under the server-owned rows, not again as a client set.
+    expect(html.match(/@ome/g) ?? []).toHaveLength(1);
+  });
+
   it("lists each set with its count", () => {
     const html = render({
       rois: [roi({ setName: "nuclei" }), roi({ setName: "nuclei" }), roi({ setName: "debris" })],
@@ -87,18 +130,32 @@ describe("RoiPanelView", () => {
   });
 
   it("distinguishes a first load from an empty tensor", () => {
-    expect(render({ loading: true })).toContain("loading");
+    expect(render({ pending: [""] })).toContain("loading");
     // Not while a set is already on screen: a refetch should not blank a count.
-    expect(render({ loading: true, rois: [roi()] })).toContain("1 of 1 here");
+    expect(render({ pending: [""], rois: [roi()] })).toContain("1 of 1 here");
   });
 
   it("says the set was clipped by the server's cap", () => {
-    expect(render({ rois: [roi()], truncated: true })).toContain("per-tensor maximum");
+    const html = render({ rois: [roi()], scopes: { "": { truncated: true, skipped: 0 } } });
+    expect(html).toContain("per-tensor maximum");
+    expect(html).not.toContain("for @");
   });
 
-  it("owns up to rows it could not read", () => {
-    const html = render({ rois: [roi()], skipped: 2 });
-    expect(html).toContain("2 annotations could not be read");
+  it("names the server-owned set the cap clipped", () => {
+    const html = render({
+      rois: [roi({ setName: "@ome" })],
+      visibleSets: ["@ome"],
+      scopes: { "": { truncated: false, skipped: 0 }, "@ome": { truncated: true, skipped: 0 } },
+    });
+    expect(html).toContain("per-tensor maximum for @ome");
+  });
+
+  it("owns up to rows it could not read, across every fetch", () => {
+    const html = render({
+      rois: [roi()],
+      scopes: { "": { truncated: false, skipped: 2 }, "@ome": { truncated: false, skipped: 1 } },
+    });
+    expect(html).toContain("3 annotations could not be read");
   });
 
   it("reports a load failure", () => {
@@ -107,7 +164,7 @@ describe("RoiPanelView", () => {
 
   it("shows a hidden set as unchecked but still listed", () => {
     // Still listed, because the row is how it gets switched back on.
-    const html = render({ rois: [roi({ setName: "nuclei" })], hiddenSets: ["nuclei"] });
+    const html = render({ rois: [roi({ setName: "nuclei" })], visibleSets: [] });
     expect(html).toContain("nuclei");
     expect(html).not.toContain('checked=""/> <span');
   });

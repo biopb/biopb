@@ -35,9 +35,10 @@ import {
 import {
   selectBroadcastAxes,
   selectDraft,
-  selectHiddenSets,
+  selectRoiScopes,
   selectRois,
   selectSelectedRoiId,
+  selectVisibleSets,
   useAppStore,
 } from "../store";
 import {
@@ -187,7 +188,8 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // worse than drawing nothing.
   const rois = useAppStore(selectRois);
   const showRois = useAppStore((s) => s.showRois);
-  const hiddenSets = useAppStore(selectHiddenSets);
+  const visibleSets = useAppStore(selectVisibleSets);
+  const roiScopes = useAppStore(selectRoiScopes);
   const loadRois = useAppStore((s) => s.loadRois);
   const tool = useAppStore((s) => s.tool);
   const draft = useAppStore(selectDraft);
@@ -471,13 +473,18 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // --- ROI annotations -----------------------------------------------------
   // Fetched from here rather than from the store's tensor-change path, so the
   // 3-D viewer never pays for a set it cannot draw: this component does not
-  // exist in volume mode. `loadRois` is idempotent on the array_id, which is
+  // exist in volume mode. `loadRois` is idempotent on what has landed, which is
   // what keeps a 2-D -> 3-D -> 2-D round trip (a full remount, see ViewerPane's
   // key) from refetching.
+  //
+  // Re-run on the visible sets, because a server-owned set is fetched only
+  // once it is switched on; and on the landed scopes, because a landing is
+  // what tells `loadRois` which named sets exist -- and a landing can also
+  // un-land a scope whose rows went stale, which is fetched again from here.
   useEffect(() => {
     if (!client) return;
     void loadRois(arrayId);
-  }, [client, arrayId, loadRois]);
+  }, [client, arrayId, loadRois, visibleSets, roiScopes]);
 
   // The plane the overlay is drawn for is the one ON SCREEN, not the one asked
   // for. They are the same except while a read is outstanding -- and during
@@ -502,21 +509,21 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
       buildRoiLayers({
         rois,
         currentPlane: shownPlane ?? {},
-        hiddenSets,
+        visibleSets,
         // Nothing has landed yet, so no plane is on screen to annotate. An
         // empty pin would match every unpinned annotation and draw them over a
         // frame that is not there.
         visible: showRois && shownPlane !== null,
       }),
-    [rois, shownPlane, hiddenSets, showRois],
+    [rois, shownPlane, visibleSets, showRois],
   );
 
   // --- authoring -----------------------------------------------------------
   // What a click can hit: exactly what is drawn, so selection cannot pick an
   // annotation the user cannot see.
   const shown = useMemo(
-    () => (showRois ? visibleRois(rois, shownPlane ?? {}, hiddenSets) : []),
-    [rois, shownPlane, hiddenSets, showRois],
+    () => (showRois ? visibleRois(rois, shownPlane ?? {}, visibleSets) : []),
+    [rois, shownPlane, visibleSets, showRois],
   );
 
   // Where the pointer is, for the segment trailing an in-progress shape. State,

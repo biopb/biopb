@@ -27,6 +27,7 @@ import type {
   RoiListResult,
   RoiPoint,
   RoiPutResult,
+  RoiSetInfo,
 } from "./roi-types.js";
 
 type Json = Record<string, unknown>;
@@ -245,10 +246,20 @@ export function encodeRoiAnnotation(input: RoiAnnotationInput): Json {
 // Results
 // ---------------------------------------------------------------------------
 
+function decodeSetInfo(value: unknown): RoiSetInfo {
+  const s = obj(value);
+  return { setName: str(s.setName), count: num(s.count), reserved: s.reserved === true };
+}
+
 export function decodeRoiListResult(value: unknown): RoiListResult {
   const body = obj(value);
   const { rois, skipped } = decodeAnnotations(body.rois);
-  return { rois, truncated: body.truncated === true, skipped };
+  return {
+    rois,
+    sets: arr(body.sets).map(decodeSetInfo),
+    truncated: body.truncated === true,
+    skipped,
+  };
 }
 
 function decodeConflict(value: unknown): RoiConflict {

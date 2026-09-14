@@ -28,6 +28,7 @@ from biopb.image.annotation_pb2 import (
     RoiListResult,
     RoiPutRequest,
     RoiPutResult,
+    RoiSetInfo,
 )
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -63,7 +64,11 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
-from biopb_tensor_server.core.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.core.metadata_db import (
+    MetadataDatabase,
+    NumpyEncoder,
+    is_reserved_set,
+)
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.upload_manager import UploadManager
@@ -671,7 +676,15 @@ class TensorFlightServer(flight.FlightServerBase):
                 rois, truncated = self._metadata_db.list_rois(
                     req.array_id, req.set_name
                 )
-                return RoiListResult(rois=rois, truncated=truncated).SerializeToString()
+                sets = [
+                    RoiSetInfo(
+                        set_name=name, count=count, reserved=is_reserved_set(name)
+                    )
+                    for name, count in self._metadata_db.list_roi_sets(req.array_id)
+                ]
+                return RoiListResult(
+                    rois=rois, truncated=truncated, sets=sets
+                ).SerializeToString()
 
             if action_type == "roi_put":
                 req = RoiPutRequest.FromString(body)

@@ -5,11 +5,14 @@ import type {
   QuerySourcesResult,
   RoiAnnotation,
   RoiGeometry,
+  RoiListResult,
+  RoiSetInfo,
   TileInfo,
 } from "@biopb/tensor-flight-client";
 import { DEFAULT_POLYLINE_WIDTH, clampPolylineWidth } from "./utils/roiDraft";
 import type { RoiDraft, RoiTool } from "./utils/roiDraft";
-import { TensorApiError } from "@biopb/tensor-flight-client";
+import { roiSetCounts } from "./utils/roiSets";
+import { TensorApiError, isReservedSetName } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
@@ -104,6 +107,14 @@ export interface Camera3DState {
   rotationOrbit: number;
 }
 
+/** What one landed fetch scope said about itself. */
+export interface RoiScopeState {
+  /** The server's per-tensor cap clipped this fetch: it holds more than was returned. */
+  truncated: boolean;
+  /** Rows whose geometry this client could not read -- see `decodeRoiListResult`. */
+  skipped: number;
+}
+
 export interface AppState {
   // Client
   client: TensorFlightClient | null;
@@ -186,26 +197,44 @@ export interface AppState {
   tileInfoFor: string | null;
 
   // --- ROI annotations (docs/roi-annotations-ui.md) -----------------------
-  /** The tensor's whole annotation set. Filtered to the plane at render time. */
+  /**
+   * The rows held for the tensor in view, across every scope that has landed.
+   * Filtered to the plane and to the visible sets at render time.
+   */
   rois: RoiAnnotation[];
   /**
-   * The `array_id` `rois` was fetched for, as `tileInfoFor` is for the grid.
+   * Every set on the tensor, server-owned ones included, with its stored row
+   * count. The discovery half of the listing: `rois` holds a server-owned set
+   * only once it was asked for by name.
+   */
+  roiSets: RoiSetInfo[];
+  /**
+   * The `array_id` the rows and sets belong to, as `tileInfoFor` is for the grid.
    *
-   * This is what makes `loadRois` idempotent, and that is load-bearing rather
-   * than an optimisation: switching to the 3-D viewer and back remounts the
-   * whole 2-D subtree (`ViewerPane` keys on the render mode), so without it a
-   * round trip through 3-D would refetch a set that can reach megabytes.
+   * The unit of eviction is the tensor: the next tensor's first landing replaces
+   * everything below, and until then the selectors hide it.
    */
   roisFor: string | null;
-  /** The fetch in flight, so a superseded response cannot overwrite a newer one. */
-  roisPending: string | null;
+  /**
+   * The fetch scopes that have landed for `roisFor`: `""` for the unqualified
+   * listing (the client-owned sets, all at once), a set name for a server-owned
+   * set fetched on its own. Presence is what makes `loadRois` idempotent, and
+   * that is load-bearing rather than an optimisation: switching to the 3-D
+   * viewer and back remounts the whole 2-D subtree (`ViewerPane` keys on the
+   * render mode), so without it a round trip through 3-D would refetch a set
+   * that can reach megabytes.
+   *
+   * A scope is dropped again when a later listing's counts disagree with the
+   * rows held for it -- the server rebuilds a reserved set on every
+   * registration -- so the next `loadRois` fetches it afresh.
+   */
+  roiScopes: Record<string, RoiScopeState>;
+  /** Scopes in flight for `roisPendingFor`, so a superseded response is dropped. */
+  roisPending: string[];
+  roisPendingFor: string | null;
   roisError: string | null;
   /** The tensor `roisError` is about. See `selectRoisError`. */
   roisErrorFor: string | null;
-  /** The per-tensor cap clipped the set: what is shown is not all there is. */
-  roisTruncated: boolean;
-  /** Rows whose geometry this client could not read -- see `decodeRoiListResult`. */
-  roisSkipped: number;
   /**
    * The server does not offer annotations at all (501: disabled, or no metadata
    * DB). Distinct from an error, because it is a fact about the deployment
@@ -215,15 +244,21 @@ export interface AppState {
   /** Overlay on/off. A view preference, so it outlives a tensor change. */
   showRois: boolean;
   /**
-   * Sets switched off by name. Absence means visible, so a set that appears
-   * later shows up rather than starting hidden.
+   * The sets on screen, by name, or `null` for this tensor's default: the
+   * client-owned sets shown, the server-owned ones not.
    *
-   * Read through `selectHiddenSets`: names mean nothing outside the tensor they
-   * were hidden in, and `hiddenSetsFor` is what scopes them to it.
+   * A positive list rather than a hidden one because the default is not "all":
+   * a link has to be able to say *show* `@ome`, and a hidden list could only
+   * say the opposite. The default is materialised on the first toggle, as
+   * `broadcastAxes` is. A server-owned set on the list is what `loadRois`
+   * fetches by name -- visibility is what drives the lazy fetch.
+   *
+   * Read through `selectVisibleSets`: names mean nothing outside the tensor they
+   * were chosen in, and `visibleSetsFor` is what scopes them to it.
    */
-  hiddenSets: string[];
-  /** The tensor `hiddenSets` names sets of. See `selectHiddenSets`. */
-  hiddenSetsFor: string | null;
+  visibleSets: string[] | null;
+  /** The tensor `visibleSets` names sets of. See `selectVisibleSets`. */
+  visibleSetsFor: string | null;
 
   // --- authoring ----------------------------------------------------------
   /** Which tool the pointer carries. A preference: it outlives a tensor change. */
@@ -376,9 +411,15 @@ export interface AppState {
   hydrateRecents: () => Promise<void>;
   setSlice: (partial: Partial<SliceState>) => void;
   setTileInfo: (value: TileInfo | null, forArrayId: string) => void;
+  /**
+   * Fetch what the tensor in view should hold and does not yet: the client-owned
+   * sets, and every server-owned set that is visible. Idempotent on what has
+   * landed and what is in flight, so callers fire it freely -- on mount, and
+   * whenever the visible sets change.
+   */
   loadRois: (arrayId: string) => Promise<void>;
   setShowRois: (value: boolean) => void;
-  toggleSetHidden: (setName: string) => void;
+  toggleSetVisible: (setName: string) => void;
   setTool: (tool: RoiTool) => void;
   setDraft: (draft: RoiDraft | null) => void;
   setSelectedRoi: (roiId: string | null) => void;
@@ -485,16 +526,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   tileInfoFor: null,
 
   rois: [],
+  roiSets: [],
   roisFor: null,
-  roisPending: null,
+  roiScopes: {},
+  roisPending: [],
+  roisPendingFor: null,
   roisError: null,
   roisErrorFor: null,
-  roisTruncated: false,
-  roisSkipped: 0,
   roisUnavailable: false,
   showRois: true,
-  hiddenSets: [],
-  hiddenSetsFor: null,
+  visibleSets: null,
+  visibleSetsFor: null,
 
   tool: "select",
   draft: null,
@@ -756,38 +798,59 @@ export const useAppStore = create<AppState>((set, get) => ({
     // never be shown -- enforced here rather than trusted to the callers, the
     // same way the reads are guarded rather than the writers.
     if (currentArrayId(get()) !== arrayId) return;
+    if (get().roisUnavailable) return;
+
+    const { roisFor, roiScopes, roiSets, roisPendingFor, roisPending } = get();
+    const listed = roisFor === arrayId;
+    const landed = listed ? roiScopes : {};
+    const pending = roisPendingFor === arrayId ? roisPending : [];
+    // The unqualified listing always; a server-owned set only while it is on
+    // screen, which is what makes a set that can reach megabytes lazy. Once a
+    // listing has landed it says which names are server-owned, so a link
+    // naming a set that is not there costs nothing; before that, the prefix
+    // is the only guess there is.
+    const wanted = [CLIENT_OWNED_SCOPE];
+    for (const name of selectVisibleSets(get()) ?? []) {
+      const reserved = listed
+        ? roiSets.find((set) => set.setName === name)?.reserved
+        : isReservedSetName(name);
+      if (reserved) wanted.push(name);
+    }
     // Idempotent: already held, or already asked for. Callers fire this from a
     // mount effect, and the 2-D subtree remounts on every render-mode flip.
-    if (get().roisFor === arrayId || get().roisPending === arrayId) return;
-    if (get().roisUnavailable) return;
-    set({ roisPending: arrayId, roisError: null });
-    try {
-      const result = await client.http.listRois(arrayId);
-      // A response for a tensor that is no longer the one being asked about.
-      if (get().roisPending !== arrayId) return;
-      set({
-        rois: result.rois,
-        roisFor: arrayId,
-        roisPending: null,
-        roisTruncated: result.truncated,
-        roisSkipped: result.skipped,
-      });
-    } catch (err) {
-      if (get().roisPending !== arrayId) return;
-      // 501 is the server saying it does not do annotations. Latched for the
-      // session so every later tensor skips the round trip.
-      if (err instanceof TensorApiError && err.status === 501) {
-        set({ roisPending: null, roisUnavailable: true });
-        return;
+    const scopes = wanted.filter((scope) => !(scope in landed) && !pending.includes(scope));
+    if (scopes.length === 0) return;
+    set({ roisPendingFor: arrayId, roisPending: [...pending, ...scopes], roisError: null });
+
+    /** Still the fetch being waited for, i.e. not superseded by a tensor change. */
+    const stillPending = (scope: string) => {
+      const now = get();
+      return now.roisPendingFor === arrayId && now.roisPending.includes(scope);
+    };
+    const fetchScope = async (scope: string) => {
+      try {
+        const result = await client.http.listRois(arrayId, scope || undefined);
+        if (!stillPending(scope)) return;
+        set((s) => landRoiScope(s, arrayId, scope, result));
+      } catch (err) {
+        if (!stillPending(scope)) return;
+        // 501 is the server saying it does not do annotations. Latched for the
+        // session so every later tensor skips the round trip.
+        if (err instanceof TensorApiError && err.status === 501) {
+          set({ roisPending: [], roisUnavailable: true });
+          return;
+        }
+        // The scope deliberately stays un-landed so a remount or a tensor switch
+        // can try again; the effect's own deps keep that from becoming a retry
+        // loop.
+        set((s) => ({
+          roisPending: s.roisPending.filter((p) => p !== scope),
+          roisErrorFor: arrayId,
+          roisError: err instanceof Error ? err.message : String(err),
+        }));
       }
-      // `roisFor` deliberately stays null so a remount or a tensor switch can
-      // try again; the effect's own deps keep that from becoming a retry loop.
-      set({
-        roisPending: null,
-        roisErrorFor: arrayId,
-        roisError: err instanceof Error ? err.message : String(err),
-      });
-    }
+    };
+    await Promise.all(scopes.map(fetchScope));
   },
 
   setTool(tool) {
@@ -896,10 +959,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       // Swapped in place rather than appended, so the annotation does not jump
       // to the end of a list it was already drawn in.
-      set((s) => ({
-        rois: s.rois.map((roi) => (roi.roiId === provisional.roiId ? stored : roi)),
-        selectedRoiId: stored.roiId,
-      }));
+      set((s) => {
+        const visible = selectVisibleSets(s);
+        return {
+          rois: s.rois.map((roi) => (roi.roiId === provisional.roiId ? stored : roi)),
+          selectedRoiId: stored.roiId,
+          // The listing's count follows the write, so a later listing does not
+          // read this row as someone else's change (see landRoiScope).
+          roiSets: withSetCount(s.roiSets, stored.setName, 1),
+          // Onto the screen it was drawn on. A materialised list is exactly
+          // the sets shown, so a new name -- or one switched off -- would
+          // otherwise swallow the shape the user just traced.
+          ...(visible !== null && !visible.includes(stored.setName)
+            ? { visibleSets: [...visible, stored.setName], visibleSetsFor: arrayId }
+            : {}),
+        };
+      });
     } catch (err) {
       set((s) => ({
         rois: withoutProvisional(s.rois),
@@ -926,6 +1001,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({
       roiWriteError: null,
       rois: s.rois.filter((roi) => roi.roiId !== roiId),
+      roiSets: removed ? withSetCount(s.roiSets, removed.setName, -1) : s.roiSets,
       selectedRoiId: s.selectedRoiId === roiId ? null : s.selectedRoiId,
     }));
 
@@ -943,7 +1019,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (!removed || currentArrayId(get()) !== arrayId || s.roisFor !== arrayId) return failed;
         const rois = [...s.rois];
         rois.splice(Math.min(index, rois.length), 0, removed);
-        return { ...failed, rois };
+        return { ...failed, rois, roiSets: withSetCount(s.roiSets, removed.setName, 1) };
       });
     }
   },
@@ -961,16 +1037,25 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Filtered by name rather than by the ids that came back, for the same
       // reason: what was deleted is the set, and the response enumerates only
       // what the server chose to list.
-      set((s) => ({
-        rois: s.rois.filter((roi) => roi.setName !== setName),
-        selectedRoiId:
-          s.rois.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
-            ? null
-            : s.selectedRoiId,
-        // The name means nothing once the set is gone, and leaving it behind
-        // would start a later set of the same name hidden.
-        hiddenSets: s.hiddenSets.filter((name) => name !== setName),
-      }));
+      set((s) => {
+        const visible = selectVisibleSets(s);
+        return {
+          rois: s.rois.filter((roi) => roi.setName !== setName),
+          // Gone from the listing too, as the server's own next listing would
+          // have it: it enumerates stored rows, and there are none.
+          roiSets: s.roiSets.filter((set) => set.setName !== setName),
+          selectedRoiId:
+            s.rois.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
+              ? null
+              : s.selectedRoiId,
+          // The name means nothing once the set is gone, and leaving it on the
+          // list would pin a later set of the same name to whatever this one
+          // was toggled to.
+          ...(visible !== null && visible.includes(setName)
+            ? { visibleSets: visible.filter((name) => name !== setName) }
+            : {}),
+        };
+      });
     } catch (err) {
       set({ roiWriteError: err instanceof Error ? err.message : String(err) });
     }
@@ -980,15 +1065,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => (s.showRois === value ? s : { showRois: value }));
   },
 
-  toggleSetHidden(setName) {
+  toggleSetVisible(setName) {
     set((s) => {
       // Scoped to the tensor in view: a list carried over from another one is
-      // not "nothing hidden here", it is a list of names that mean nothing here.
+      // not "this tensor's default", it is a list of names that mean nothing
+      // here. `null` means the default, so materialise that before editing --
+      // otherwise the first toggle would silently also hide every other
+      // client-owned set.
       const arrayId = currentArrayId(s);
-      const current = s.hiddenSetsFor === arrayId ? s.hiddenSets : [];
+      const current = selectVisibleSets(s) ?? defaultVisibleSets(s);
       return {
-        hiddenSetsFor: arrayId,
-        hiddenSets: current.includes(setName)
+        visibleSetsFor: arrayId,
+        visibleSets: current.includes(setName)
           ? current.filter((name) => name !== setName)
           : [...current, setName],
       };
@@ -1055,6 +1143,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       volumeRenderMode: next.volumeRenderMode,
       camera3d: next.camera3d,
       camera2d: next.camera2d,
+      // Set names belong to the tensor, like the indices: a link that names
+      // none opens on the tensor's default rather than on the last choice.
+      visibleSets: next.visibleSets,
+      visibleSetsFor: requested,
+      // A link to particular sets is a link to see them; with the overlay off
+      // it would be a link to nothing.
+      ...(next.visibleSets !== null ? { showRois: true } : {}),
       // `tileInfo` is left alone: `selectTileInfo` already hides a grid fetched
       // for another id, and clearing it here would depend on a viewer mounting
       // afterwards to put one back.
@@ -1271,30 +1366,130 @@ export function isProvisionalRoiId(roiId: string): boolean {
  */
 const DEFAULT_ROI_SET = "default";
 
+/** The scope of the unqualified listing: every client-owned set at once. */
+export const CLIENT_OWNED_SCOPE = "";
+
 const NO_ROIS: RoiAnnotation[] = [];
 const NO_SETS: string[] = [];
+const NO_SCOPES: Record<string, RoiScopeState> = {};
 
 /** This tensor's annotations, or none while another tensor's are still held. */
 export function selectRois(s: AppState): RoiAnnotation[] {
   return s.roisFor === currentArrayId(s) ? s.rois : NO_ROIS;
 }
 
-/** A fetch is in flight for the tensor in view. */
-export function selectRoisLoading(s: AppState): boolean {
-  return s.roisPending !== null && s.roisPending === currentArrayId(s);
+const NO_ROI_SETS: RoiSetInfo[] = [];
+
+/** Every set on the tensor in view, server-owned ones included. */
+export function selectRoiSets(s: AppState): RoiSetInfo[] {
+  return s.roisFor === currentArrayId(s) ? s.roiSets : NO_ROI_SETS;
 }
 
-/** The cap clipped THIS tensor's set -- not one looked at earlier. */
-export function selectRoisTruncated(s: AppState): boolean {
-  return s.roisFor === currentArrayId(s) && s.roisTruncated;
+/** The scopes landed for the tensor in view, with what each fetch said. */
+export function selectRoiScopes(s: AppState): Record<string, RoiScopeState> {
+  return s.roisFor === currentArrayId(s) ? s.roiScopes : NO_SCOPES;
 }
 
-export function selectRoisSkipped(s: AppState): number {
-  return s.roisFor === currentArrayId(s) ? s.roisSkipped : 0;
+/** The scopes in flight for the tensor in view -- not one looked at earlier. */
+export function selectRoisPending(s: AppState): string[] {
+  return s.roisPendingFor === currentArrayId(s) ? s.roisPending : NO_SETS;
 }
 
 export function selectRoisError(s: AppState): string | null {
   return s.roisErrorFor === currentArrayId(s) ? s.roisError : null;
+}
+
+/**
+ * The sets this tensor shows by default, spelled out: every client-owned one
+ * the listing knows or the rows hold. What a toggle edits when nothing has
+ * been chosen yet.
+ */
+function defaultVisibleSets(s: AppState): string[] {
+  const names = [
+    ...selectRoiSets(s).filter((set) => !set.reserved).map((set) => set.setName),
+    ...roiSetCounts(selectRois(s)).map((set) => set.setName),
+  ];
+  return [...new Set(names)].filter((name) => !isReservedSetName(name));
+}
+
+/** `roiSets` with one set's stored count moved by `delta`, added if it is new. */
+function withSetCount(sets: RoiSetInfo[], setName: string, delta: number): RoiSetInfo[] {
+  if (!sets.some((set) => set.setName === setName)) {
+    return delta > 0
+      ? [...sets, { setName, count: delta, reserved: isReservedSetName(setName) }]
+      : sets;
+  }
+  return sets.map((set) =>
+    set.setName === setName ? { ...set, count: Math.max(0, set.count + delta) } : set,
+  );
+}
+
+/** The rows a scope's fetch answers for. */
+function inScope(roi: RoiAnnotation, scope: string): boolean {
+  return scope === CLIENT_OWNED_SCOPE ? !isReservedSetName(roi.setName) : roi.setName === scope;
+}
+
+/**
+ * Fold a landed fetch into the store.
+ *
+ * The first landing for a tensor replaces everything held for the last one --
+ * the tensor is the unit of eviction -- and a later one merges: its rows
+ * replace the rows of its own scope, and a provisional row is kept wherever it
+ * is, since its write is still in flight.
+ *
+ * Every response enumerates the whole tensor's sets with their stored counts,
+ * so it also says whether the rows held for *other* scopes are still current.
+ * A scope whose counts disagree is un-landed, and the next `loadRois` fetches
+ * it again -- which is how a reserved set the server rebuilt on a
+ * re-registration, or a set another client wrote to, catches up without a
+ * reload. A clipped scope is exempt: it disagrees by construction.
+ *
+ * Counts are a proxy: a per-set version in `RoiSetInfo` would make this an
+ * exact comparison and let the writes stop shadowing the counts.
+ */
+function landRoiScope(
+  s: AppState,
+  arrayId: string,
+  scope: string,
+  result: RoiListResult,
+): Partial<AppState> {
+  const same = s.roisFor === arrayId;
+  const kept = same
+    ? s.rois.filter((roi) => !inScope(roi, scope) || isProvisionalRoiId(roi.roiId))
+    : [];
+  const rois = [...kept, ...result.rois];
+  const scopes: Record<string, RoiScopeState> = same ? { ...s.roiScopes } : {};
+  scopes[scope] = { truncated: result.truncated, skipped: result.skipped };
+
+  // A row the decoder skipped is stored but not held, so it counts as held
+  // here; otherwise every sibling landing would refetch a scope with one.
+  // Per scope rather than per set, because the client-owned listing's skips
+  // cannot be attributed to a set.
+  const stored = new Map(result.sets.map((set) => [set.setName, set.count]));
+  const held = new Map(
+    roiSetCounts(rois.filter((roi) => !isProvisionalRoiId(roi.roiId))).map((set) => [
+      set.setName,
+      set.count,
+    ]),
+  );
+  const total = (counts: Map<string, number>, names: string[]) =>
+    names.reduce((sum, name) => sum + (counts.get(name) ?? 0), 0);
+  for (const [other, state] of Object.entries(scopes)) {
+    if (other === scope || state.truncated) continue;
+    const names =
+      other === CLIENT_OWNED_SCOPE
+        ? [...new Set([...stored.keys(), ...held.keys()])].filter((name) => !isReservedSetName(name))
+        : [other];
+    if (total(stored, names) !== total(held, names) + state.skipped) delete scopes[other];
+  }
+
+  return {
+    rois,
+    roiSets: result.sets,
+    roisFor: arrayId,
+    roiScopes: scopes,
+    roisPending: s.roisPending.filter((p) => p !== scope),
+  };
 }
 
 /**
@@ -1307,9 +1502,12 @@ export function sliceKey(slice: SliceState): string {
   return `${slice.t}|${slice.z}|${slice.c}|${JSON.stringify(slice.axes)}`;
 }
 
-/** Sets hidden in the tensor in view. Names do not carry across tensors. */
-export function selectHiddenSets(s: AppState): string[] {
-  return s.hiddenSetsFor === currentArrayId(s) ? s.hiddenSets : NO_SETS;
+/**
+ * The sets chosen for the tensor in view, or null for its default. Names do not
+ * carry across tensors.
+ */
+export function selectVisibleSets(s: AppState): string[] | null {
+  return s.visibleSetsFor === currentArrayId(s) ? s.visibleSets : null;
 }
 
 /**
