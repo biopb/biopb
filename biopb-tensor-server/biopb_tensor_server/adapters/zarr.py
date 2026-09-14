@@ -5,7 +5,7 @@ Relies on OS page cache for raw data caching.
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -20,19 +20,26 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.writable import WritableSource
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
 
-class ZarrAdapter(TensorAdapter):
+class ZarrAdapter(WritableSource, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
     Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
     For remote storage, uses zarr.FSStore with fsspec filesystem.
 
+    Writable: a chunk-aligned ``put_chunk`` lands in the store. Only an adapter
+    built by ``OmeZarrAdapter.create_upload`` tracks an upload; a catalogued
+    store accepts writes untracked.
     """
+
+    # A real store on disk: catalogued, and not this side's to throw away.
+    durable = True
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -242,7 +249,21 @@ class ZarrAdapter(TensorAdapter):
 
         self.zarr_array[slices] = data
 
-    def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
+    def discard(self, reason: str = "") -> Dict[str, Any]:
+        """Refused: a .zarr on disk and a catalog row are not this call's to release.
+
+        Leaving them silently would be worse than refusing, since a partial
+        store blocks a retry under the same name (biopb/biopb#354); releasing
+        them is destructive, has no capability token behind it, and is its own
+        decision.
+        """
+        raise ValueError(
+            f"discard: {self.source_id} is not a cache-backed upload. A "
+            "zarr-backed source owns a .zarr directory and a catalog row, "
+            "which this does not remove."
+        )
+
+    def _store_chunk(self, bounds, data, expected_shape, dtype) -> None:
         """Chunk-aligned write: ``bounds`` must land on the zarr chunk grid.
 
         Absorbs the alignment/reshape the DoPut handler used to perform inline,

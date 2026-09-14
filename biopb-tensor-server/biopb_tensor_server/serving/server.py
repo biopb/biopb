@@ -475,9 +475,8 @@ class TensorFlightServer(flight.FlightServerBase):
         return self.sources.swap(source_id, adapter)
 
     def unregister_source(self, source_id: str) -> None:
-        """Unregister a data source and drop any in-flight upload state."""
+        """Unregister a data source (its upload state, if any, goes with it)."""
         self.sources.unregister(source_id)
-        self.uploads.forget(source_id)
 
     def shutdown(self) -> None:
         """Release source-adapter resources, then shut down the Flight server.
@@ -1316,6 +1315,12 @@ class TensorFlightServer(flight.FlightServerBase):
             # Token-protected sources (per-source capabilities) are not
             # enumerable: knowing the source_id must not be enough to list them.
             if adapter.capability_token:
+                continue
+
+            # A discarded upload is registered only as a tombstone, for the
+            # writer still unwinding onto it; it is not a source to offer.
+            upload = getattr(adapter, "upload", None)
+            if upload is not None and upload.is_discarded:
                 continue
 
             # Building a source's descriptor can fail (e.g. an aicsimageio

@@ -22,6 +22,7 @@ from biopb.tensor import TensorFlightClient, _upload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+from biopb_tensor_server.adapters.ome_zarr import minimal_ome_metadata
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.chunk import (
     content_version_of,
@@ -50,6 +51,38 @@ def _read_cached_batch(cache_manager: CacheManager, chunk_id: bytes) -> pa.Recor
         return entry.data
     finally:
         cache_manager.release(chunk_id)
+
+
+@pytest.fixture
+def writable_server(tmp_path):
+    """A live, writable server on an OS-assigned port.
+
+    No wait after `serve()`: `FlightServerBase` binds and starts serving in
+    `__init__`, so the port is live before this returns -- the thread only parks
+    on it.
+    """
+    from biopb_tensor_server.serving.server import TensorFlightServer
+
+    CacheManager.reset()
+    CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=512))
+    server = TensorFlightServer(
+        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+    )
+    server.mark_ready()
+    threading.Thread(target=server.serve, daemon=True).start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        CacheManager.reset()
+
+
+@pytest.fixture
+def client(writable_server):
+    """A client connected to `writable_server`."""
+    client = TensorFlightClient(f"grpc://localhost:{writable_server.port}")
+    yield client
+    client.close()
 
 
 class TestCachedSourceAdapter:
@@ -1252,10 +1285,6 @@ class TestBuildMinimalOmeMetadata:
 
     def test_minimal_metadata_structure(self):
         """Generated metadata has required fields."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer(location="grpc://localhost:0")
-
         desc = TensorDescriptor(
             array_id="test",
             shape=[100, 100, 100],
@@ -1264,7 +1293,7 @@ class TestBuildMinimalOmeMetadata:
             dim_labels=["z", "y", "x"],
         )
 
-        metadata = server.uploads._build_minimal_ome_metadata(desc)
+        metadata = minimal_ome_metadata(desc)
 
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
@@ -1277,10 +1306,6 @@ class TestBuildMinimalOmeMetadata:
 
     def test_axis_types_detected(self):
         """Axis types are detected from labels."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer(location="grpc://localhost:0")
-
         desc = TensorDescriptor(
             array_id="test",
             shape=[1, 100, 100, 100],
@@ -1288,7 +1313,7 @@ class TestBuildMinimalOmeMetadata:
             dim_labels=["c", "z", "y", "x"],
         )
 
-        metadata = server.uploads._build_minimal_ome_metadata(desc)
+        metadata = minimal_ome_metadata(desc)
         axes = metadata["multiscales"][0]["axes"]
 
         assert axes[0]["type"] == "channel"  # 'c' detected as channel
@@ -1397,12 +1422,8 @@ class TestCachedSourceContentVersion:
         finally:
             CacheManager.reset()
 
-    def test_upload_manager_generation_monotonic_and_distinct(self):
-        from biopb_tensor_server.core.source_registry import SourceRegistry
-        from biopb_tensor_server.serving.upload_manager import UploadManager
-
-        mgr = UploadManager(SourceRegistry(), None, None)
-        tokens = [mgr._next_content_version() for _ in range(5)]
+    def test_generation_monotonic_and_distinct(self):
+        tokens = [CachedSourceAdapter.next_content_version() for _ in range(5)]
         assert all(t.startswith(b"gen:") for t in tokens)
         assert len(set(tokens)) == 5  # all distinct
         gens = [int(t.split(b":")[1]) for t in tokens]
@@ -1438,31 +1459,6 @@ class TestConcurrentChunkUpload:
     (open/write/done/close/read) per chunk with nothing overlapping it, so the
     cost was latency multiplied by chunk count.
     """
-
-    @pytest.fixture
-    def client(self, tmp_path):
-        """A client connected to a live, writable server on an OS-assigned port.
-
-        No wait after `serve()`: `FlightServerBase` binds and starts serving in
-        `__init__`, so the port is live before this returns -- the thread only
-        parks on it.
-        """
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=512))
-        server = TensorFlightServer(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
-        )
-        server.mark_ready()
-        threading.Thread(target=server.serve, daemon=True).start()
-        try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}")
-            yield client
-            client.close()
-        finally:
-            server.shutdown()
-            CacheManager.reset()
 
     @staticmethod
     def _counting_put(monkeypatch, hold=0.0):
@@ -1666,3 +1662,276 @@ class TestConcurrentChunkUpload:
             == "READY"
         )
         np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
+
+
+class TestDiscard:
+    """Giving up on an upload: the adapter stays, in a terminal state (#1).
+
+    Disposal rather than cancellation -- stopping whatever was producing the
+    data belongs to whoever runs it. What is tested here is only the fate of the
+    source, and that a writer still in flight learns *why* it can no longer
+    write rather than that its source is missing.
+    """
+
+    @staticmethod
+    def _tombstone(source_id="cache_tombstone", shape=(4,), chunk=(2,)):
+        """A discarded cache adapter, off the wire, for the guards it keeps."""
+        adapter = CachedSourceAdapter(
+            source_id=source_id, shape=list(shape), dtype="<u2", chunk_shape=list(chunk)
+        )
+        adapter.discard("gone")
+        return adapter
+
+    @staticmethod
+    def _make_source(client, name="cache:discard-me", shape=(4, 4), chunk=(2, 2)):
+        return client.create_source(
+            source_name=name, shape=shape, dtype="<u2", chunk_shape=chunk
+        )
+
+    @staticmethod
+    def _put(client, source_id, start, stop, fill=7):
+        data = np.full(
+            [b - a for a, b in zip(start, stop, strict=True)], fill, dtype=np.uint16
+        )
+        client.upload_chunk(
+            source_id, ChunkBounds(start=list(start), stop=list(stop)), data
+        )
+
+    def test_discard_leaves_a_tombstone_that_refuses_reads_too(
+        self, writable_server, client
+    ):
+        """The adapter stays registered, terminal, so both a writer and a
+        reader still unwinding learn the reason instead of "not found"."""
+        source_id = self._make_source(client, shape=(2, 2), chunk=(2, 2))
+        self._put(client, source_id, (0, 0), (2, 2))
+        adapter = writable_server.sources.get(source_id)
+
+        status = writable_server.uploads.discard(source_id, "client went away")
+
+        assert status["state"] == "DISCARDED"
+        assert status["reason"] == "client went away"
+        assert writable_server.sources.get(source_id) is adapter
+        assert client.get_upload_status(source_id)["state"] == "DISCARDED"
+        # It is a tombstone, not a source: not listed, and its bytes are gone.
+        assert source_id not in client.list_sources()
+        chunk_id = encode_chunk_id(source_id, ChunkBounds(start=[0, 0], stop=[2, 2]))
+        with pytest.raises(flight.FlightServerError, match="client went away"):
+            adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
+
+    def test_a_write_after_discard_says_discarded_not_missing(
+        self, writable_server, client
+    ):
+        """The reason the tombstone exists.
+
+        Were the adapter dropped at discard, the lookup would fail first and
+        tell a job unwinding after its own discard that the source never
+        existed.
+        """
+        source_id = self._make_source(client)
+        writable_server.uploads.discard(source_id, "superseded")
+
+        with pytest.raises(flight.FlightCancelledError) as exc:
+            self._put(client, source_id, (0, 0), (2, 2))
+
+        # Type discriminates, so a client never has to match on the message;
+        # the reason rides along for a human.
+        assert "superseded" in str(exc.value)
+
+    def test_a_forgotten_source_is_missing_not_discarded(self, writable_server, client):
+        """An unregistered source still means "not found" -- the states are distinct."""
+        source_id = self._make_source(client)
+        writable_server.unregister_source(source_id)
+
+        with pytest.raises(flight.FlightError) as exc:
+            self._put(client, source_id, (0, 0), (2, 2))
+
+        assert not isinstance(exc.value, flight.FlightCancelledError)
+        assert "not found" in str(exc.value).lower()
+
+    def test_an_in_flight_upload_stops_at_a_chunk_boundary(
+        self, writable_server, client, monkeypatch
+    ):
+        """Discard mid-upload surfaces through `da.store` as the cancelled error.
+
+        One worker, so the order is deterministic: the first chunk lands, the
+        discard happens, the second is refused. Disposal stops the upload where
+        it stands rather than rewinding it -- the chunk already written stays
+        counted on the tombstone.
+        """
+        source_id = self._make_source(client, shape=(8, 2), chunk=(2, 2))
+        real = _upload._put_chunk
+        written = []
+
+        def put_then_discard(*args, **kwargs):
+            real(*args, **kwargs)
+            written.append(1)
+            if len(written) == 1:
+                writable_server.uploads.discard(source_id, "stopped early")
+
+        monkeypatch.setattr(_upload, "_put_chunk", put_then_discard)
+
+        arr = da.from_array(np.arange(16, dtype=np.uint16).reshape(8, 2), chunks=(2, 2))
+        with pytest.raises(flight.FlightCancelledError, match="stopped early"):
+            with dask.config.set(scheduler="threads", num_workers=1):
+                client._upload._store_chunks(source_id, arr)
+
+        status = client.get_upload_status(source_id)
+        assert status["state"] == "DISCARDED"
+        assert status["uploaded_chunks"] == 1
+        assert len(written) == 1
+        # How far it got is reported, but the chunk ids behind that number are
+        # not kept: a tombstone outlives its upload and must not scale with it.
+        assert writable_server.sources.get(source_id).upload.uploaded_chunk_ids == set()
+
+    def test_a_straggler_does_not_walk_the_tombstone_back(self):
+        """A write that passed the refusal check before the discard landed still
+        stores its chunk, but must not count it: the mark guards itself."""
+        adapter = self._tombstone()
+
+        adapter._mark_chunk(ChunkBounds(start=[0], stop=[2]))
+
+        status = adapter.upload_status()
+        assert status["state"] == "DISCARDED"
+        assert status["uploaded_chunks"] == 0
+
+    def test_discard_is_idempotent_and_keeps_the_first_reason(
+        self, writable_server, client
+    ):
+        source_id = self._make_source(client)
+        writable_server.uploads.discard(source_id, "first")
+
+        again = writable_server.uploads.discard(source_id, "second")
+
+        assert again["state"] == "DISCARDED"
+        assert again["reason"] == "first"
+
+    def test_discarding_an_untracked_source_reports_unknown(self, writable_server):
+        """Total, so a retry after the tombstone is reaped is not an error."""
+        assert writable_server.uploads.discard("cache_never", "x")["state"] == "UNKNOWN"
+
+    def test_discarding_a_source_that_is_not_an_upload_reports_unknown(
+        self, writable_server
+    ):
+        """A catalogued store accepts writes untracked; there is nothing to discard."""
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        source_id = "plain_zarr"
+        zarr_module = pytest.importorskip("zarr")
+        adapter = ZarrAdapter(zarr_module.zeros((2, 2), chunks=(2, 2)), source_id)
+        writable_server.register_source(source_id, adapter)
+
+        assert writable_server.uploads.status(source_id)["state"] == "UNKNOWN"
+        assert writable_server.uploads.discard(source_id, "x")["state"] == "UNKNOWN"
+
+    def test_the_same_name_can_be_uploaded_again_after_a_discard(
+        self, writable_server, client
+    ):
+        """Retrying under the same name, which giving up has to leave possible.
+
+        A named cache source's id is a hash of that name, so the retry lands on
+        the tombstone rather than beside it. What clears it is `create_source`
+        replacing the registered adapter outright; were that ever made to keep
+        an existing one, a discard would poison the name for the life of the
+        server and every other test here would still pass.
+        """
+        first = self._make_source(
+            client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2)
+        )
+        writable_server.uploads.discard(first, "gave up")
+
+        second = self._make_source(
+            client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2)
+        )
+
+        # Same name, same id: the retry really is reusing the discarded record.
+        assert second == first
+        assert client.get_upload_status(second)["state"] == "PENDING"
+
+        # And the write goes through rather than being refused as discarded.
+        self._put(client, second, (0, 0), (2, 2))
+        assert client.get_upload_status(second)["state"] == "READY"
+
+    def test_a_completed_upload_can_still_be_discarded(self, writable_server, client):
+        """Disposal is not only for failures: dropping a finished result is the
+        same operation."""
+        source_id = self._make_source(client, shape=(2, 2), chunk=(2, 2))
+        self._put(client, source_id, (0, 0), (2, 2))
+        assert client.get_upload_status(source_id)["state"] == "READY"
+
+        assert writable_server.uploads.discard(source_id, "done with it")["state"] == (
+            "DISCARDED"
+        )
+
+    def test_zarr_backed_uploads_are_refused(self, writable_server, client):
+        """A .zarr on disk and a catalog row are not this call's to release."""
+        source_id = client.create_source(
+            source_name="ome_zarr:keepme", shape=(4, 4), dtype="<u2", chunk_shape=(2, 2)
+        )
+
+        with pytest.raises(ValueError, match="not a cache-backed upload"):
+            writable_server.uploads.discard(source_id, "nope")
+
+        assert client.get_upload_status(source_id)["state"] == "PENDING"
+
+    def test_the_poll_loop_fails_promptly_with_the_reason(
+        self, writable_server, client
+    ):
+        """A discarded upload is terminal, so `wait_for_upload_ready` says so
+        instead of polling to its timeout."""
+        source_id = self._make_source(client)
+        writable_server.uploads.discard(source_id, "client disconnected")
+
+        with pytest.raises(RuntimeError, match="client disconnected"):
+            client.wait_for_upload_ready(source_id, timeout_seconds=30)
+
+    def test_the_record_tracks_when_it_last_moved(self, writable_server, client):
+        """`updated_at` is what will bound a tombstone's life, and what tells a
+        stalled upload from a slow one. Both halves read the same field, so both
+        are checked here: progress writes it, and discard writes it.
+
+        Poisons the field and checks it was replaced, rather than comparing two
+        clock readings. `time.monotonic` resolves to ~15.6ms on Windows before
+        CPython 3.13 (GetTickCount64), and both operations finish well inside one
+        tick -- so `after > before` is not merely flaky there, it is false.
+        """
+        source_id = self._make_source(client, shape=(4, 2), chunk=(2, 2))
+        state = writable_server.sources.get(source_id).upload
+        assert state.updated_at > 0  # stamped at creation
+
+        state.updated_at = -1.0
+        self._put(client, source_id, (0, 0), (2, 2))
+        assert state.updated_at > 0
+
+        state.updated_at = -1.0
+        writable_server.uploads.discard(source_id, "enough")
+        assert state.updated_at > 0
+
+    def test_a_second_discard_does_not_extend_the_tombstone(
+        self, writable_server, client
+    ):
+        """Otherwise a retrying caller could keep a tombstone alive forever."""
+        source_id = self._make_source(client)
+        writable_server.uploads.discard(source_id, "first")
+        first = writable_server.sources.get(source_id).upload.updated_at
+
+        writable_server.uploads.discard(source_id, "second")
+
+        assert writable_server.sources.get(source_id).upload.updated_at == first
+
+    def test_a_straggler_does_not_extend_the_tombstone(self):
+        """The mark guard returns before touching the clock."""
+        adapter = self._tombstone()
+        at_discard = adapter.upload.updated_at
+
+        adapter._mark_chunk(ChunkBounds(start=[0], stop=[2]))
+
+        assert adapter.upload.updated_at == at_discard
+
+    def test_the_clock_stays_off_the_wire(self, writable_server, client):
+        """A monotonic reading means nothing in another process, so it is not in
+        the status contract. A client-facing "discarded at" would be a wall clock
+        and a separate field."""
+        source_id = self._make_source(client)
+        writable_server.uploads.discard(source_id, "x")
+
+        assert "updated_at" not in client.get_upload_status(source_id)

@@ -172,6 +172,26 @@ class WriteNotSupportedError(Exception):
     """
 
 
+class UploadDiscardedError(Exception):
+    """A write to an upload its owner has given up on (biopb/biopb#1).
+
+    Raised by ``WritableSource.put_chunk`` once the source is discarded, so a
+    job still unwinding learns it was given up on rather than that its source
+    is missing. Off the ``ValueError`` hierarchy for the same reason as
+    :class:`WriteNotSupportedError`. The DoPut boundary maps it to
+    ``FlightCancelledError`` so a client discriminates on the exception type
+    rather than matching a string; the reason rides in the message.
+    """
+
+    def __init__(self, source_id: str, reason: str = "") -> None:
+        super().__init__(
+            f"Upload discarded for source '{source_id}'"
+            + (f": {reason}" if reason else "")
+        )
+        self.source_id = source_id
+        self.reason = reason
+
+
 class AnnotationStoreError(RuntimeError):
     """The persistent catalog was configured but could not be opened.
 
