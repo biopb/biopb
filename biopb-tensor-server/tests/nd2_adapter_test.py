@@ -19,6 +19,7 @@ from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     LiveLocalContext,
 )
+from biopb_tensor_server.core.errors import TensorNotFound
 
 pytest.importorskip("nd2")
 
@@ -45,6 +46,7 @@ class _FakeOme:
 
 
 _DEFAULT_DTYPE = np.dtype("<u2")
+_DEFAULT_SIZES = {"P": 2, "T": 3, "Z": 2, "C": 2, "Y": 4, "X": 5}
 
 
 class _FakeND2File:
@@ -70,7 +72,7 @@ class _FakeND2File:
     ):
         type(self).opens += 1
         self.path = path
-        self._sizes = sizes or {"P": 2, "T": 3, "Z": 2, "C": 2, "Y": 4, "X": 5}
+        self._sizes = sizes or dict(_DEFAULT_SIZES)
         self._dtype = dtype
         self._voxel = voxel
         self._loop_indices = loop_indices
@@ -144,11 +146,11 @@ class _RemoteCtx(LiveLocalContext):
         return True
 
 
-def _expected(sizes, present):
-    shape = tuple(
-        sizes[axis] for axis in ("P", "T", "Z", "C", "Y", "X") if axis in sizes
-    )
+def _expected_field(sizes, position, present):
+    """The full (P,T,Z,C,Y,X) array the fake would generate, cropped to one
+    position -- i.e. what one field's tensor should read as."""
     labels = [axis for axis in ("P", "T", "Z", "C", "Y", "X") if axis in sizes]
+    shape = tuple(sizes[axis] for axis in labels)
     out = np.zeros(shape, dtype=np.uint16)
     from itertools import product
 
@@ -168,10 +170,16 @@ def _expected(sizes, present):
             idx = list(index)
             idx[c_pos] = c
             out[tuple(idx)] = base + c
-    return out, labels
+
+    field_labels = [label for label in labels if label != "P"]
+    if "P" in labels:
+        out = out[position]
+    return out, field_labels
 
 
-def test_local_nd2_claims_natively_and_reads_through_nd2_package(tmp_path, monkeypatch):
+def test_local_nd2_claims_natively_and_splits_positions_into_tensors(
+    tmp_path, monkeypatch
+):
     path = tmp_path / "img.nd2"
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch)
@@ -184,16 +192,15 @@ def test_local_nd2_claims_natively_and_reads_through_nd2_package(tmp_path, monke
     assert isinstance(source, Nd2Adapter)
 
     descriptors = source.list_tensor_descriptors()
-    assert len(descriptors) == 1
-    desc = descriptors[0]
-    assert list(desc.dim_labels) == ["P", "T", "Z", "C", "Y", "X"]
-    assert list(desc.shape) == [2, 3, 2, 2, 4, 5]
-    assert desc.dtype == np.dtype("<u2").str
+    assert [d.array_id for d in descriptors] == ["nd2/P:0", "nd2/P:1"]
+    for desc in descriptors:
+        assert list(desc.dim_labels) == ["T", "Z", "C", "Y", "X"]
+        assert list(desc.shape) == [3, 2, 2, 4, 5]
+        assert desc.dtype == np.dtype("<u2").str
 
-    expected, _ = _expected(
-        dict(zip(desc.dim_labels, desc.shape, strict=True)), ("P", "T", "Z")
-    )
-    whole = source.get_data(ChunkBounds(start=[0] * 6, stop=list(desc.shape)))
+    field = source.get_tensor_adapter(descriptors[1].array_id)
+    expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
+    whole = field.get_data(ChunkBounds(start=[0] * 5, stop=list(descriptors[1].shape)))
     np.testing.assert_array_equal(whole, expected)
 
 
@@ -202,12 +209,12 @@ def test_interior_crop_reads_only_the_requested_window(tmp_path, monkeypatch):
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch)
     source = Nd2Adapter.create_from_config(_source(path))
-    sizes = dict(zip(source.dim_labels, source._layout.shape, strict=True))
-    expected, _ = _expected(sizes, ("P", "T", "Z"))
+    field = source.get_tensor_adapter("P:0")
+    expected, _ = _expected_field(_DEFAULT_SIZES, 0, ("P", "T", "Z"))
 
-    bounds = ChunkBounds(start=[0, 1, 0, 0, 1, 1], stop=[2, 3, 2, 2, 3, 4])
-    got = source.get_data(bounds)
-    np.testing.assert_array_equal(got, expected[0:2, 1:3, 0:2, 0:2, 1:3, 1:4])
+    bounds = ChunkBounds(start=[1, 0, 0, 1, 1], stop=[3, 2, 2, 3, 4])
+    got = field.get_data(bounds)
+    np.testing.assert_array_equal(got, expected[1:3, 0:2, 0:2, 1:3, 1:4])
 
 
 def test_decimated_read_matches_a_strided_slice_of_the_full_read(tmp_path, monkeypatch):
@@ -215,27 +222,54 @@ def test_decimated_read_matches_a_strided_slice_of_the_full_read(tmp_path, monke
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch)
     source = Nd2Adapter.create_from_config(_source(path))
-    sizes = dict(zip(source.dim_labels, source._layout.shape, strict=True))
-    expected, _ = _expected(sizes, ("P", "T", "Z"))
+    field = source.get_tensor_adapter("P:1")
+    expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
 
-    bounds = ChunkBounds(start=[0] * 6, stop=list(source._layout.shape))
-    step = (1, 2, 1, 1, 1, 2)
-    decimated = source.get_decimated_data(bounds, step)
-    np.testing.assert_array_equal(decimated, expected[:, ::2, :, :, :, ::2])
+    field_shape = field.get_tensor_descriptor().shape
+    bounds = ChunkBounds(start=[0] * 5, stop=list(field_shape))
+    step = (2, 1, 1, 1, 2)
+    decimated = field.get_decimated_data(bounds, step)
+    np.testing.assert_array_equal(decimated, expected[::2, :, :, :, ::2])
 
 
-def test_single_position_file_drops_the_p_axis(tmp_path, monkeypatch):
-    """``ND2File.sizes`` omits size-1 axes; the descriptor follows."""
+def test_single_position_file_has_one_field_with_no_p_axis(tmp_path, monkeypatch):
+    """``ND2File.sizes`` omits size-1 axes; a single-position file still
+    exposes exactly one tensor, and its shape never carries ``P``."""
     path = tmp_path / "img.nd2"
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch, sizes={"T": 3, "Z": 2, "C": 1, "Y": 4, "X": 5})
     source = Nd2Adapter.create_from_config(_source(path))
-    desc = source.get_tensor_descriptor()
+    descriptors = source.list_tensor_descriptors()
+    assert len(descriptors) == 1
+    desc = descriptors[0]
+    assert desc.array_id == "nd2/P:0"
     assert "P" not in desc.dim_labels
     assert list(desc.dim_labels) == ["T", "Z", "C", "Y", "X"]
 
-    whole = source.get_data(ChunkBounds(start=[0] * 5, stop=list(desc.shape)))
+    field = source.get_tensor_adapter(desc.array_id)
+    whole = field.get_data(ChunkBounds(start=[0] * 5, stop=list(desc.shape)))
     assert whole.shape == tuple(desc.shape)
+
+
+def test_bare_source_id_and_none_resolve_to_the_first_position(tmp_path, monkeypatch):
+    path = tmp_path / "img.nd2"
+    path.write_bytes(b"\x00")
+    _install_fake(monkeypatch)
+    source = Nd2Adapter.create_from_config(_source(path))
+
+    assert source.get_tensor_adapter(None).position == 0
+    assert source.get_tensor_adapter("nd2").position == 0
+    assert source.get_tensor_descriptor().array_id == "nd2/P:0"
+
+
+def test_unknown_position_raises(tmp_path, monkeypatch):
+    path = tmp_path / "img.nd2"
+    path.write_bytes(b"\x00")
+    _install_fake(monkeypatch)
+    source = Nd2Adapter.create_from_config(_source(path))
+
+    with pytest.raises(TensorNotFound):
+        source.get_tensor_adapter("P:99")
 
 
 def test_ambiguous_loop_coordinate_is_rejected_at_registration(tmp_path, monkeypatch):
@@ -258,12 +292,21 @@ def test_physical_scale_reports_nd2_voxel_size(tmp_path, monkeypatch):
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch, voxel=(0.11, 0.22, 0.33))
     source = Nd2Adapter.create_from_config(_source(path))
-    scale, unit = source._physical_scale()
-    labels = source.dim_labels
+    field = source.get_tensor_adapter("P:0")
+    scale, unit = field._physical_scale()
+    labels = field.dim_labels
     assert scale[labels.index("X")] == pytest.approx(0.11)
     assert scale[labels.index("Y")] == pytest.approx(0.22)
     assert scale[labels.index("Z")] == pytest.approx(0.33)
     assert unit[labels.index("X")] == "µm"
+
+
+def test_source_level_physical_scale_is_none(tmp_path, monkeypatch):
+    path = tmp_path / "img.nd2"
+    path.write_bytes(b"\x00")
+    _install_fake(monkeypatch)
+    source = Nd2Adapter.create_from_config(_source(path))
+    assert source._physical_scale() is None
 
 
 def test_get_metadata_returns_the_ome_summary(tmp_path, monkeypatch):
@@ -299,13 +342,47 @@ def test_reader_reused_across_reads_and_closed_explicitly(tmp_path, monkeypatch)
     # One open for read_layout's probe.
     assert _FakeND2File.opens == 1
 
+    field = source.get_tensor_adapter("P:0")
     bounds = ChunkBounds(start=[0, 0, 0], stop=[2, 2, 2])
-    source.get_data(bounds)
-    source.get_data(bounds)
+    field.get_data(bounds)
+    field.get_data(bounds)
     # The persistent reader is reused across reads, not reopened each time.
     assert _FakeND2File.opens == 2
+    field.close()
+    assert field._reader_handle()._reader is None
+
+
+def test_position_adapters_share_one_reader_and_close_together(tmp_path, monkeypatch):
+    """A reader per position would map the same file once per position; all
+    positions of one source instead share the one persistent reader, and
+    closing the source closes it for every position adapter at once."""
+    path = tmp_path / "img.nd2"
+    path.write_bytes(b"\x00")
+    _FakeND2File.opens = 0  # class-level counter; reset for this test's count
+    _install_fake(monkeypatch, sizes={"P": 2, "T": 2, "Y": 2, "X": 2})
+    source = Nd2Adapter.create_from_config(_source(path))
+    assert _FakeND2File.opens == 1  # read_layout's probe
+
+    fields = [source.get_tensor_adapter(f"P:{i}") for i in range(2)]
+    bounds = ChunkBounds(start=[0, 0, 0], stop=[2, 2, 2])
+    for field in fields:
+        field.get_data(bounds)
+    # One persistent reader serves both positions, not one each.
+    assert _FakeND2File.opens == 2
+    assert fields[0]._reader_handle() is fields[1]._reader_handle()
+
     source.close()
-    assert source._persistent_reader is None
+    for field in fields:
+        assert field._reader_handle()._reader is None
+
+
+def test_source_level_adapter_refuses_to_read(tmp_path, monkeypatch):
+    path = tmp_path / "img.nd2"
+    path.write_bytes(b"\x00")
+    _install_fake(monkeypatch, sizes={"T": 2, "Y": 2, "X": 2})
+    source = Nd2Adapter.create_from_config(_source(path))
+    with pytest.raises(ValueError, match="source-level"):
+        source.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 1, 1]))
 
 
 def test_remote_source_is_refused_rather_than_rerouted(tmp_path):

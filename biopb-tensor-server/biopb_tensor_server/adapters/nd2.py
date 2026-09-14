@@ -9,18 +9,21 @@ metadata still went through BioIO's ``BioImage``/OME conversion. This module
 finishes the migration (biopb/biopb#799 phase 3): every fact this adapter
 reports, structural or physical, is read from the ``nd2`` package alone.
 
-**Stage positions are a leading axis, not a scene split.** BioIO models each
-XY stage position (nd2's ``P`` loop) as its own scene/tensor, matching its
-general per-format convention. The ``nd2`` package does not: ``ND2File.sizes``
-folds ``P`` in as an ordinary loop axis alongside ``T``/``Z``, because every
-position in an ND2 experiment shares the same T/Z/C/Y/X shape -- there is
-nothing scene-like (no independent bounding box, no per-position channel set)
-to split apart the way a CZI scene or a LIF image would need to be. Reporting
-one array with a leading ``P`` axis is both truer to the format and simpler
-than re-deriving BioIO's split, and the normalization contract only requires
-Y/X (and a samples axis) last -- any other axis order or extra label is legal
-(see :mod:`~biopb_tensor_server.adapters.czi`). So this is a single-tensor
-source, unlike ``NikonAdapter``.
+**One tensor per XY stage position.** ``ND2File.sizes`` folds ``P`` (nd2's
+XY-position loop) in as an ordinary loop axis alongside ``T``/``Z``: every
+position in an ND2 experiment shares the same T/Z/C/Y/X shape, because the
+file's ``experiment`` structure is a single flat nested-loop definition (one
+scalar ``count`` per loop, applied to the whole file) with no per-position
+sub-loop to make positions vary. That uniformity would make folding ``P`` into
+a leading descriptor axis *safe* -- but this adapter still splits each
+position into its own tensor, matching the multi-field convention every other
+adapter here uses (:class:`~biopb_tensor_server.adapters.lif.LifAdapter`'s
+one-tensor-per-image, the BioIO adapter's one-tensor-per-scene, and BioIO's
+own ``NikonAdapter``, which this module replaces for local files). A client
+that wants one position doesn't want the
+others' bytes folded into its shape, and ``dim_labels`` stays the canonical
+T/Z/C/Y/X/S rather than carrying a format-specific ``P`` a generic consumer
+has no reason to know about.
 
 **Frame addressing.**  ``nd2.read_frame`` decodes one loop coordinate
 (P/T/Z) at a time and hands back the full C/Y/X[/S] block for it --
@@ -62,6 +65,7 @@ from biopb_tensor_server.core.chunk import (
     estimate_chunk_bytes,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.errors import TensorNotFound
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -74,6 +78,7 @@ ND2_EXTENSION = ".nd2"
 # The loop axes nd2 addresses one frame at a time (see the module docstring).
 # C and S (RGB) are baked into the frame ``read_frame`` returns, never looped.
 _LOOP_AXES = ("P", "T", "Z")
+_POSITION_AXIS = "P"
 
 # Same TTL and reasoning as bioio.py's ND2 reader pool: what a held reader
 # saves is a warm page table over ``nd2.read_frame``'s mmap view, which is
@@ -82,6 +87,59 @@ _LOOP_AXES = ("P", "T", "Z")
 _READER_TTL = 5.0
 
 _reader_reaper = IdleHandleReaper(_READER_TTL, "nd2-reader-reaper", max_handles=8)
+
+
+class _Nd2Reader:
+    """One ND2 reader, shared by every position adapter of one source.
+
+    The handle is per *file* while adapters are per position -- a reader per
+    position would map the same file once per position to serve reads that
+    are already serialized behind the one ``_io_lock`` they share.
+    """
+
+    def __init__(self, url: str, io_lock: threading.Lock) -> None:
+        self._url = url
+        # The source's lock, shared with every position adapter -- so the
+        # fence the reaper takes is the same one reads hold.
+        self._io_lock = io_lock
+        self._reader = None
+        # Reads hold ``_io_lock`` end to end, so none is ever in flight when
+        # the reaper takes it.
+        self._active_reads = 0
+        self._persistent_last_access = 0.0
+
+    def acquire(self):
+        """Open (or reuse) the reader. Caller holds ``_io_lock``."""
+        # Stamped before register, so this handle sorts newest and a cap
+        # eviction triggered by its own register never picks it.
+        self._persistent_last_access = time.monotonic()
+        if self._reader is None:
+            import nd2
+
+            self._reader = nd2.ND2File(self._url)
+            _reader_reaper.register(self)
+        return self._reader
+
+    def _release_persistent_handle(self) -> None:
+        """Close the reader and permit a later reopen.
+
+        The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
+        hook. Caller holds ``_io_lock`` (read path / reaper) or is the GC
+        finalizer. Safe to call repeatedly.
+        """
+        reader, self._reader = self._reader, None
+        _reader_reaper.discard(self)
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                logger.debug("error closing persistent ND2 reader", exc_info=True)
+
+    def __del__(self):
+        try:
+            self._release_persistent_handle()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
@@ -96,6 +154,27 @@ class _Nd2Layout:
     #: loop coordinate (one int per axis in ``_LOOP_AXES`` present in ``labels``)
     #: -> frame index, i.e. what ``read_frame`` takes.
     frame_indices: Dict[Tuple[int, ...], int]
+
+    @property
+    def n_positions(self) -> int:
+        """Positions to expose as tensors. 1 when the file has no ``P`` axis
+        (``ND2File.sizes`` omits size-1 axes)."""
+        if _POSITION_AXIS not in self.labels:
+            return 1
+        return int(self.shape[self.labels.index(_POSITION_AXIS)])
+
+    @property
+    def field_labels(self) -> List[str]:
+        """This file's native axes with the position loop removed."""
+        return [label for label in self.labels if label != _POSITION_AXIS]
+
+    @property
+    def field_shape(self) -> List[int]:
+        return [
+            int(size)
+            for label, size in zip(self.labels, self.shape, strict=True)
+            if label != _POSITION_AXIS
+        ]
 
 
 def _loop_key(coordinates: Dict[str, int], present: Tuple[str, ...]) -> Tuple[int, ...]:
@@ -153,7 +232,16 @@ def read_layout(path: str) -> _Nd2Layout:
 
 
 class Nd2Adapter(TensorAdapter):
-    """Reads a Nikon ND2 file through the ``nd2`` package. Single-tensor source."""
+    """Reads a Nikon ND2 file through the ``nd2`` package, one tensor per XY
+    stage position.
+
+    Dual-role, the same shape :class:`~biopb_tensor_server.adapters.lif.LifAdapter`
+    uses:
+
+    - Source-level (``position=None``): manages the file's layout, lists every
+      position as its own tensor.
+    - Position-level (``position=int``): handles data access for one position.
+    """
 
     SOURCE_TYPE = "nd2"
 
@@ -205,6 +293,9 @@ class Nd2Adapter(TensorAdapter):
         source_id: str,
         layout: _Nd2Layout,
         dim_labels: Optional[List[str]] = None,
+        position: Optional[int] = None,
+        io_lock: Optional[threading.Lock] = None,
+        shared_handle: Optional["_Nd2Reader"] = None,
     ):
         self.source_id = source_id
         self._url = url
@@ -212,57 +303,150 @@ class Nd2Adapter(TensorAdapter):
         self._source_url = url
         self._source_type = self.SOURCE_TYPE
         self._content_version = content_version_from_path(url)
+        self.position = position
 
-        native_labels = list(layout.labels)
-        if dim_labels and len(dim_labels) != len(native_labels):
-            logger.warning(
-                "nd2: ignoring %d configured dim_labels for %s -- this file "
-                "reads as a %d-axis %s array",
-                len(dim_labels),
-                url,
-                len(native_labels),
-                "".join(native_labels),
-            )
-            dim_labels = None
-        self.dim_labels = list(dim_labels or native_labels)
+        if position is None:
+            self.dim_labels = dim_labels
+        else:
+            native_labels = layout.field_labels
+            if dim_labels and len(dim_labels) != len(native_labels):
+                logger.warning(
+                    "nd2: ignoring %d configured dim_labels for %s -- position "
+                    "%d reads as a %d-axis %s array",
+                    len(dim_labels),
+                    url,
+                    position,
+                    len(native_labels),
+                    "".join(native_labels),
+                )
+                dim_labels = None
+            self.dim_labels = list(dim_labels or native_labels)
+
+        # T/Z only: P is fixed for a position-level adapter, never looped.
         self._present_loop_axes = tuple(
-            axis for axis in _LOOP_AXES if axis in layout.labels
+            axis
+            for axis in _LOOP_AXES
+            if axis in layout.labels and axis != _POSITION_AXIS
         )
+        if position is not None:
+            self._frame_indices, self._frame_shape = self._position_frame_plan(
+                layout, position
+            )
 
-        # One reader per source, held warm the same way CziAdapter holds its
-        # libCZI reader -- ``nd2.read_frame`` returns a zero-copy view onto
-        # the reader's mmap, so a reopen re-faults every page a crop touches
-        # even when the bytes are already resident.
-        self._io_lock = threading.Lock()
-        self._persistent_reader = None
-        self._persistent_last_access = 0.0
-        self._active_reads = 0
+        # One reader per file, shared by every position adapter -- held warm
+        # the same way CziAdapter holds its libCZI reader, since
+        # ``nd2.read_frame`` returns a zero-copy view onto the reader's mmap
+        # and a reopen re-faults every page a crop touches even when the
+        # bytes are already resident.
+        self._io_lock = io_lock if io_lock is not None else threading.Lock()
+        self._shared_handle: Optional[_Nd2Reader] = shared_handle
+        self._tensor_adapters: Dict[str, Nd2Adapter] = {}
+
+    def _position_frame_plan(
+        self, layout: "_Nd2Layout", position: int
+    ) -> Tuple[Dict[Tuple[int, ...], int], Tuple[int, ...]]:
+        """The (T, Z) frame-index lookup and reshape target for one fixed
+        position, computed once rather than re-derived on every read.
+
+        ``read_frame`` never returns a ``P`` axis, so both live in field
+        space from the start -- no leading size-1 axis is ever created only
+        to be sliced back off.
+        """
+        if _POSITION_AXIS not in layout.labels:
+            frame_indices = dict(layout.frame_indices)
+        else:
+            present = tuple(axis for axis in _LOOP_AXES if axis in layout.labels)
+            p_index = present.index(_POSITION_AXIS)
+            frame_indices = {
+                key[:p_index] + key[p_index + 1 :]: frame_index
+                for key, frame_index in layout.frame_indices.items()
+                if key[p_index] == position
+            }
+        frame_shape = tuple(self._native_block(layout.field_labels, layout.field_shape))
+        return frame_indices, frame_shape
 
     # ---- descriptors --------------------------------------------------------
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        shape = list(self._layout.shape)
+    def _descriptor_for(
+        self, position: int, labels: Optional[List[str]] = None
+    ) -> TensorDescriptor:
+        if labels is None:
+            labels = self._layout.field_labels
+        shape = self._layout.field_shape
         dtype = self._layout.dtype.str
         return TensorDescriptor(
-            array_id=self.array_id,
-            dim_labels=self.dim_labels,
-            chunk_shape=self._transfer_chunk_shape(shape, dtype),
+            array_id=f"{self.source_id}/{_POSITION_AXIS}:{position}",
+            dim_labels=labels,
+            chunk_shape=self._transfer_chunk_shape(labels, shape, dtype),
             shape=shape,
             dtype=dtype,
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
-
-    def _native_block(self) -> List[int]:
-        """One full C/Y/X[/S] frame: ``read_frame`` addresses P/T/Z, not those."""
-        shape = self._layout.shape
         return [
-            1 if label.upper() in {"P", "T", "Z"} else int(size)
-            for label, size in zip(self.dim_labels, shape, strict=True)
+            catalog_entry(self._descriptor_for(position))
+            for position in range(self._layout.n_positions)
         ]
 
-    def _transfer_chunk_shape(self, shape: List[int], dtype: str) -> List[int]:
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        if self.position is not None:
+            return self._descriptor_for(self.position, labels=self.dim_labels)
+        return self.get_tensor_adapter(f"{_POSITION_AXIS}:0").get_tensor_descriptor()
+
+    def get_tensor_adapter(self, tensor_id: Optional[str]) -> "Nd2Adapter":
+        field = self._within_source_field(tensor_id)
+        position = self._position_for_field(field)
+        cached = self._tensor_adapters.get(field)
+        if cached is not None:
+            return cached
+
+        adapter = self.__class__(
+            self._url,
+            self.source_id,
+            self._layout,
+            dim_labels=self.dim_labels if self.position is None else None,
+            position=position,
+            io_lock=self._io_lock,
+            shared_handle=self._reader_handle(),
+        )
+        adapter._tensor_name = field
+        self._tensor_adapters[field] = adapter
+        return adapter
+
+    def _reader_handle(self) -> "_Nd2Reader":
+        """This source's shared reader, made on first use.
+
+        Position adapters receive it from the source-level adapter (via
+        :meth:`get_tensor_adapter`); one constructed directly -- a test, a
+        benchmark -- makes its own.
+        """
+        if self._shared_handle is None:
+            self._shared_handle = _Nd2Reader(self._url, self._io_lock)
+        return self._shared_handle
+
+    def _position_for_field(self, field: Optional[str]) -> int:
+        if not field or field == self.source_id:
+            return 0
+        prefix = f"{_POSITION_AXIS}:"
+        if field.startswith(prefix):
+            try:
+                position = int(field[len(prefix) :])
+            except ValueError:
+                position = -1
+            if 0 <= position < self._layout.n_positions:
+                return position
+        raise TensorNotFound(f"Unknown position: {field}", reason="unknown_field")
+
+    def _native_block(self, labels: List[str], shape: List[int]) -> List[int]:
+        """One full C/Y/X[/S] frame: ``read_frame`` addresses T/Z, not those."""
+        return [
+            1 if label.upper() in {"T", "Z"} else int(size)
+            for label, size in zip(labels, shape, strict=True)
+        ]
+
+    def _transfer_chunk_shape(
+        self, labels: List[str], shape: List[int], dtype: str
+    ) -> List[int]:
         """Never split an ND2's component axes -- they are inside the pixel.
 
         Mirrors ``NikonAdapter._transfer_chunk_shape`` (biopb/biopb#806): a
@@ -270,23 +454,23 @@ class Nd2Adapter(TensorAdapter):
         component)``, so C and S sit *below* X and a per-channel chunk would
         fault in every page the other components occupy.
         """
-        labels = [str(label).upper() for label in self.dim_labels]
-        if len(labels) != len(shape):
-            return default_transfer_chunk_shape(shape, dtype, self.dim_labels)
+        upper_labels = [str(label).upper() for label in labels]
+        if len(upper_labels) != len(shape):
+            return default_transfer_chunk_shape(shape, dtype, labels)
         unit = [
             int(size) if label in {"C", "S"} else 1
-            for label, size in zip(labels, shape, strict=True)
+            for label, size in zip(upper_labels, shape, strict=True)
         ]
         if math.prod(unit) <= 1:
             return default_transfer_chunk_shape(
-                shape, dtype, self.dim_labels, native=self._native_block()
+                shape, dtype, labels, native=self._native_block(labels, shape)
             )
         if estimate_chunk_bytes(tuple(unit), dtype) >= (
             chunk_policy.PREFERRED_ARROW_BATCH_BYTES
         ):
             return unit
         return list(
-            compute_transfer_chunk_size(tuple(unit), tuple(shape), dtype, labels)
+            compute_transfer_chunk_size(tuple(unit), tuple(shape), dtype, upper_labels)
         )
 
     # ---- reads --------------------------------------------------------------
@@ -302,13 +486,15 @@ class Nd2Adapter(TensorAdapter):
     def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
-        """The step selects frames on P/T/Z and strides the mmap view inside one."""
+        """The step selects frames on T/Z and strides the mmap view inside one."""
         return self._read(bounds, step)
 
     def _read(self, bounds: ChunkBounds, step: Tuple[int, ...]) -> np.ndarray:
+        if self.position is None:
+            raise ValueError("Cannot get data from source-level adapter")
+
         super().get_data(bounds)  # validate bounds against the descriptor
         labels = [label.upper() for label in self.dim_labels]
-        shape = tuple(int(size) for size in self._layout.shape)
         starts = tuple(int(value) for value in bounds.start)
         stops = tuple(int(value) for value in bounds.stop)
         steps = tuple(max(1, int(size)) for size in step)
@@ -321,18 +507,15 @@ class Nd2Adapter(TensorAdapter):
         )
 
         sequence_axes = [
-            axis for axis, label in enumerate(labels) if label in {"P", "T", "Z"}
+            axis for axis, label in enumerate(labels) if label in {"T", "Z"}
         ]
         sequence_ranges = [
             range(starts[axis], stops[axis], steps[axis]) for axis in sequence_axes
         ]
-        frame_shape = tuple(
-            1 if label in {"P", "T", "Z"} else size
-            for label, size in zip(labels, shape, strict=True)
-        )
 
+        handle = self._reader_handle()
         with self._io_lock:
-            reader = self._acquire_reader()
+            reader = handle.acquire()
             try:
                 for coordinates in product(*sequence_ranges):
                     coordinate_by_axis = dict(
@@ -343,13 +526,13 @@ class Nd2Adapter(TensorAdapter):
                         for axis, coordinate in coordinate_by_axis.items()
                     }
                     key = _loop_key(coordinate_by_label, self._present_loop_axes)
-                    frame_index = self._layout.frame_indices[key]
-                    frame = reader.read_frame(frame_index).reshape(frame_shape)
+                    frame_index = self._frame_indices[key]
+                    frame = reader.read_frame(frame_index).reshape(self._frame_shape)
 
                     source_slices = []
                     output_slices = []
                     for axis, label in enumerate(labels):
-                        if label in {"P", "T", "Z"}:
+                        if label in {"T", "Z"}:
                             index = (coordinate_by_axis[axis] - starts[axis]) // steps[
                                 axis
                             ]
@@ -361,53 +544,31 @@ class Nd2Adapter(TensorAdapter):
                             )
                             output_slices.append(slice(None))
                     output[tuple(output_slices)] = frame[tuple(source_slices)]
-                self._persistent_last_access = time.monotonic()
             except Exception:
-                self._release_persistent_handle()
+                # A half-open reader is not reusable; drop it so the next
+                # read (on this or any sibling position adapter) reopens
+                # rather than failing on the same handle.
+                handle._release_persistent_handle()
                 raise
         return output
 
-    def _acquire_reader(self):
-        """Open (or reuse) the ND2 reader. Caller holds ``_io_lock``."""
-        if self._persistent_reader is not None:
-            return self._persistent_reader
-
-        import nd2
-
-        reader = nd2.ND2File(self._url)
-        self._persistent_reader = reader
-        self._persistent_last_access = time.monotonic()
-        _reader_reaper.register(self)
-        return reader
-
-    def _release_persistent_handle(self) -> None:
-        """Close the reader and permit a later reopen.
-
-        The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
-        hook. Caller holds ``_io_lock`` (read path / reaper) or is the GC
-        finalizer. Safe to call repeatedly.
-        """
-        reader, self._persistent_reader = self._persistent_reader, None
-        _reader_reaper.discard(self)
-        if reader is not None:
-            try:
-                reader.close()
-            except Exception:
-                logger.debug("error closing persistent ND2 reader", exc_info=True)
-
     def close(self) -> None:
-        with self._io_lock:
-            self._release_persistent_handle()
+        """Release this source's reader, including its position adapters'.
 
-    def __del__(self):
-        try:
-            self._release_persistent_handle()
-        except Exception:
-            pass
+        They share one, so closing it here closes it for all of them; the
+        next read on any of them reopens.
+        """
+        for adapter in list(self._tensor_adapters.values()):
+            adapter.close()
+        if self._shared_handle is not None:
+            with self._io_lock:
+                self._shared_handle._release_persistent_handle()
 
     # ---- metadata -------------------------------------------------------------
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        if self.position is None:
+            return None
         return scale_by_label(self.dim_labels, self._layout.voxel_um, MICRON)
 
     def get_metadata(self) -> dict:
