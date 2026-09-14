@@ -1024,7 +1024,8 @@ def _setup_flight_server(
 
     background_scan_running = False
     try:
-        background_scan_running = source_manager.start()
+        source_manager.start()
+        background_scan_running = source_manager.is_running()
         if background_scan_running:
             console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
     except Exception as e:
@@ -1041,17 +1042,11 @@ def _setup_flight_server(
     server.mark_ready()
 
     if not background_scan_running:
-        # No rescan loop will drive the bootstrap scan. Two cases:
-        #  - monitored dirs but rescanning is off (or the loop failed to start):
-        #    scan synchronously now so those sources are still registered;
-        #    run_initial_scan also stamps freshness, flips the startup gate, and
-        #    seeds the backlog.
-        #  - static-only config (no monitored dirs, nothing to scan): advance the
-        #    completion protocol directly so it still reports a timestamp and seeds.
-        if monitored_dirs:
-            source_manager.run_initial_scan()
-        else:
-            source_manager.complete_initial_scan()
+        # No rescan loop is driving the bootstrap scan (rescanning is off, the
+        # loop failed to start, or there was nothing to monitor). The manager
+        # knows which fallback that calls for -- a synchronous scan, or just
+        # advancing the completion protocol for a static-only config.
+        source_manager.run_bootstrap_fallback()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 

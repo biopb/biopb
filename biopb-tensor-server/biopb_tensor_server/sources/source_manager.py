@@ -137,7 +137,6 @@ class SourceManager:
         discovery_state: DiscoveryState,
         monitored_dirs: Set[Path],
         rescan_interval: float = 30.0,
-        initial_immediate: bool = True,
         metadata_db: Optional[MetadataDatabase] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
@@ -212,17 +211,21 @@ class SourceManager:
         self._prune_unseen_days = max(0, prune_unseen_days)
         self._started_at = time.monotonic()
 
-        # The rescan loop: a bare timer on its own thread. ``_wake`` is what the
-        # loop waits on rather than sleeping, so :meth:`stop` returns at once
-        # instead of running out the current interval. A ``rescan_interval`` of
-        # 0 or less means no loop at all (config ``monitor_mode = "off"``); the
-        # launcher then drives a single scan itself.
-        self._rescan_interval = rescan_interval
-        self._initial_immediate = initial_immediate
+        # The rescan loop: a bare timer on its own thread. ``_stop`` doubles as
+        # the loop's wait condition and its wake signal (the ``precache``
+        # worker's idiom), so :meth:`stop` returns at once instead of running
+        # out the current interval, and no separate running flag has to be kept
+        # in step with it. A ``rescan_interval`` of 0 or less means no loop at
+        # all (config ``monitor_mode = "off"``); the launcher then drives a
+        # single scan itself. A positive one is floored at 0.1s -- a config
+        # value below that is almost certainly a mistake, and without a floor
+        # it would drive back-to-back full tree walks.
+        self._rescan_interval = (
+            rescan_interval if rescan_interval <= 0 else max(0.1, rescan_interval)
+        )
         self._next_rescan_at: float = 0.0
-        self._wake = threading.Event()
+        self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._running = False
 
         # Startup protocol, and the precache routing gate it drives.
         # ``_initial_scan_done`` flips at the end of the first successful full
@@ -264,33 +267,29 @@ class SourceManager:
             notify_source_committed=self._notify_source_committed,
         )
 
-    def start(self) -> bool:
-        """Start the periodic rescan loop; return whether it is running.
+    def start(self) -> None:
+        """Start the periodic rescan loop, if there is anything for it to do.
 
-        A no-op -- returning False -- when there is nothing for the loop to do:
-        rescanning is disabled (``rescan_interval <= 0``), or neither a monitored
-        directory nor a monitored upstream is configured. The launcher reads the
-        return value to decide whether it must drive the bootstrap scan itself.
+        A no-op when rescanning is disabled (``rescan_interval <= 0``), or
+        neither a monitored directory nor a monitored upstream is configured;
+        callers check :meth:`is_running` afterward to tell.
 
-        The bootstrap scan runs in this loop, whose first tick fires immediately
-        by default. Until it completes, ``_initial_scan_done`` stays False so its
-        sources route to the precache backlog rather than the prompt enqueue.
+        The bootstrap scan runs in this loop, whose first tick fires
+        immediately. Until it completes, ``_initial_scan_done`` stays False so
+        its sources route to the precache backlog rather than the prompt
+        enqueue.
         """
         if self._rescan_interval <= 0:
-            return False
+            return
         if not self._monitored_dirs and not self._monitored_upstreams:
-            return False
+            return
 
         if self._thread is not None and self._thread.is_alive():
             logger.warning("SourceManager already running")
-            return True
+            return
 
-        now = time.monotonic()
-        self._next_rescan_at = (
-            now if self._initial_immediate else now + self._rescan_interval
-        )
-        self._wake.clear()
-        self._running = True
+        self._next_rescan_at = time.monotonic()
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._event_loop,
             daemon=True,
@@ -300,7 +299,21 @@ class SourceManager:
         logger.info(
             "SourceManager started; rescanning every %.1fs", self._rescan_interval
         )
-        return True
+
+    def run_bootstrap_fallback(self) -> None:
+        """Run the startup scan the caller must drive itself, when :meth:`start`
+        didn't (call only after checking :meth:`is_running` is False).
+
+        Centralizes the branch a launcher would otherwise have to re-derive from
+        ``monitored_dirs`` -- this manager already knows which case it is: a
+        monitored tree with rescanning off still needs one synchronous walk
+        (:meth:`run_initial_scan`); a static-only config has nothing to walk, so
+        the startup protocol is advanced directly (:meth:`complete_initial_scan`).
+        """
+        if self._monitored_dirs:
+            self.run_initial_scan()
+        else:
+            self.complete_initial_scan()
 
     # --- Startup-protocol seam ------------------------------------------------
     # The launcher drives startup through these public methods rather than the
@@ -438,8 +451,7 @@ class SourceManager:
         daemon, does not need a clean join at process exit -- a long wait there
         only burns the shutdown budget. That in-flight RPC is not cancelled.
         """
-        self._running = False
-        self._wake.set()
+        self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=join_timeout)
             self._thread = None
@@ -447,7 +459,7 @@ class SourceManager:
 
     def is_running(self) -> bool:
         """Check if the manager is actively processing events."""
-        return self._running and (self._thread is not None and self._thread.is_alive())
+        return self._thread is not None and self._thread.is_alive()
 
     def _event_loop(self) -> None:
         """Run a rescan every ``rescan_interval`` seconds until stopped.
@@ -457,11 +469,7 @@ class SourceManager:
         A failed rescan is logged and the cadence continues; the next pass sees
         the same tree and retries.
         """
-        while self._running:
-            timeout = max(0.0, self._next_rescan_at - time.monotonic())
-            if self._wake.wait(timeout):
-                break  # stop() woke us
-
+        while not self._stop.wait(max(0.0, self._next_rescan_at - time.monotonic())):
             try:
                 self._handle_rescan()
             except Exception:

@@ -312,7 +312,7 @@ class TestRescanLoop:
     def test_start_is_a_no_op_with_nothing_to_rescan(self, tmp_path):
         """A static-only config has no tree to walk, so no thread is spawned."""
         manager = self._manager(_FakeServer(), set())
-        assert manager.start() is False
+        manager.start()
         assert manager.is_running() is False
 
     def test_start_is_a_no_op_when_rescanning_is_off(self, tmp_path):
@@ -321,7 +321,7 @@ class TestRescanLoop:
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0)
-        assert manager.start() is False
+        manager.start()
         assert manager.is_running() is False
 
     def test_the_loop_rescans_on_the_interval(self, tmp_path, monkeypatch):
@@ -333,7 +333,8 @@ class TestRescanLoop:
         rescans = threading.Semaphore(0)
         monkeypatch.setattr(manager, "_handle_rescan", rescans.release)
         try:
-            assert manager.start() is True
+            manager.start()
+            assert manager.is_running() is True
             for _ in range(3):
                 assert rescans.acquire(timeout=5)
         finally:
