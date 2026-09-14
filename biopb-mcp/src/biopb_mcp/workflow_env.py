@@ -16,6 +16,11 @@ verification runs it.
 No viewer, and there will not be one. The viewer is how an agent shows
 something to the person it is working with; a saved workflow is run by someone
 already looking at their own screen.
+
+What comes back is the *connection*, not a client: a reconnect swaps the client
+out, so a document derives it per use (``client = conn.client``) the way the
+session kernel does (``_jobs._REFRESH_PREFIX``). The connection is also what
+``TensorBrowserWidget(viewer, connection=conn)`` takes.
 """
 
 import logging
@@ -41,11 +46,15 @@ class WorkflowEnvError(RuntimeError):
 
 
 def workflow_env(*, plugins=True, require_client=True):
-    """Build a workflow's handles; return ``(client, ops)``.
+    """Build a workflow's handles; return ``(conn, ops)``.
 
-    *client* is a ``TensorFlightClient`` for this machine's data plane and *ops*
-    the ProcessImage callables the config names (an empty dict when it names
-    none).
+    *conn* is a connected ``TensorConnection`` for this machine's data plane and
+    *ops* the ProcessImage callables the config names (an empty dict when it
+    names none). A document that wants the session's spelling for the client
+    takes it on the next line::
+
+        conn, ops = workflow_env()
+        client = conn.client
 
     **It also binds the user's kernel plugins into the notebook's namespace**,
     which is a side effect and is named here because a function that writes to
@@ -64,7 +73,8 @@ def workflow_env(*, plugins=True, require_client=True):
     Raises :class:`WorkflowEnvError` when no data plane can be reached and
     *require_client* is set. Failing here is the point: the alternative is a
     ``None`` client and a cell three steps later blaming the workflow for the
-    environment.
+    environment. With *require_client* off, *conn* still comes back unconnected,
+    which a caller can retry.
     """
     from ._config import load_config
     from ._connection import TensorConnection
@@ -82,7 +92,7 @@ def workflow_env(*, plugins=True, require_client=True):
     ops = build_ops_from_config(config, lambda: conn.client)
     if plugins:
         _load_plugins(config, _caller_namespace())
-    return conn.client, ops
+    return conn, ops
 
 
 def _caller_namespace():

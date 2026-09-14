@@ -20,7 +20,8 @@ peak sits at 0.3.
 import numpy as np
 from biopb_mcp.workflow_env import workflow_env
 
-client, ops = workflow_env()
+conn, ops = workflow_env()
+client = conn.client
 ```
 
 Run the saved notebook from a shell with:

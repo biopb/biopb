@@ -515,6 +515,18 @@ reconstructs a session it recorded and so still writes its own.
 `biopb_mcp.workflow_env` is the one public API this added: the setup a saved
 workflow calls, and the reason the scratch kernel can hand a run nothing.
 
+It returns `(conn, ops)` — the connection, not the client, since a reconnect
+swaps the client out. The document derives it on the next line, as the session
+kernel does per cell (`_jobs._REFRESH_PREFIX`):
+
+```python
+conn, ops = workflow_env()
+client = conn.client
+```
+
+`conn` is also what `TensorBrowserWidget(viewer, connection=conn)` takes, so a
+notebook that opens a viewer browses the session it is already working in.
+
 Deleted with the namespace model: `_jobs._verified` and its
 promote-on-success gate, `_jobs.mark_baseline` / `_scratch_ns` / the baseline
 name set, `added_layers` and the `_layer_names` bookkeeping behind it, and
