@@ -989,22 +989,7 @@ def _setup_flight_server(
         stable_rescans_required=server_config.stable_rescans_required,
         aggressive_dir_pruning=server_config.aggressive_dir_pruning,
         prune_unseen_days=server_config.annotations.prune_unseen_days,
-        # An empty (or all-invalid) source set is a valid runtime state: build an
-        # empty manager and serve an empty catalog rather than refusing to boot
-        # (biopb/biopb#515).
-        allow_empty=True,
     )
-
-    # With allow_empty=True an empty/all-invalid source set yields an empty manager
-    # (served as an empty catalog), so a None here no longer means "no sources" --
-    # it can only be a genuine construction failure. Guard it: the startup code
-    # below dereferences source_manager unconditionally (unlike _graceful_shutdown,
-    # which tolerates None), so fail cleanly rather than with an opaque
-    # AttributeError. This exit is inside serve()/launch()'s try, so the finally
-    # still releases the cache lock (biopb/biopb#515).
-    if source_manager is None:
-        console.print("[red]Failed to initialize the source manager[/red]")
-        raise typer.Exit(1)
 
     # Wire the runtime add_source handler (tensor-browser drag-drop): the server
     # holds no SourceManager reference, so inject the entrypoint that routes a
