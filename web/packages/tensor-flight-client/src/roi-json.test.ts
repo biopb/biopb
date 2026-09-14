@@ -178,7 +178,26 @@ describe("encodeRoiAnnotation", () => {
 
 describe("result decoders", () => {
   it("reads an empty list result, which is `{}` on the wire", () => {
-    expect(decodeRoiListResult({})).toEqual({ rois: [], truncated: false, skipped: 0 });
+    expect(decodeRoiListResult({})).toEqual({
+      rois: [],
+      sets: [],
+      truncated: false,
+      skipped: 0,
+    });
+  });
+
+  it("reads the set listing, whose count is an int64 string", () => {
+    const result = decodeRoiListResult({
+      sets: [
+        { setName: "@ome", count: "120", reserved: true },
+        // A proto3 default is simply absent on the wire.
+        { setName: "nuclei", count: "3" },
+      ],
+    });
+    expect(result.sets).toEqual([
+      { setName: "@ome", count: 120, reserved: true },
+      { setName: "nuclei", count: 3, reserved: false },
+    ]);
   });
 
   it("reports truncation", () => {

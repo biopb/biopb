@@ -84,8 +84,25 @@ export interface RoiAnnotationInput {
   drawnAgainstVersion?: string;
 }
 
+/** One annotation layer on a tensor, as the server enumerates it. */
+export interface RoiSetInfo {
+  setName: string;
+  /** Rows stored in this set, whatever `rois` covers. */
+  count: number;
+  /**
+   * The server owns this set: it is rebuilt from the source file, is read-only,
+   * and `rois` carries it only when the request named it.
+   */
+  reserved: boolean;
+}
+
 export interface RoiListResult {
   rois: RoiAnnotation[];
+  /**
+   * Every set on the tensor, including those `rois` does not cover -- an
+   * unqualified list returns the client-owned sets alone.
+   */
+  sets: RoiSetInfo[];
   /** True when the server's per-tensor cap clipped the set. */
   truncated: boolean;
   /**

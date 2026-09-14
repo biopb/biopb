@@ -111,8 +111,14 @@ export interface RoiAnnotation {
 ## Fetching
 
 `GET /api/rois/{array_id}` returns the tensor's client-owned sets. One fetch per
-tensor, held in the store, filtered in memory. A server-owned (`@`) set is
-returned only when named with `?set=`, so the SPA does not see one today.
+tensor, held in the store, filtered in memory.
+
+The response also carries `sets`: every set on the tensor with its stored row
+count, server-owned (`@`) ones included. The panel lists those alongside the
+client-owned sets but holds no rows for them, so they carry no control — a
+server-owned set is read by naming it with `?set=`, which the SPA does not do
+yet. The client-owned counts come from the resident rows rather than from
+`sets`, so an optimistic create shows up before any refetch.
 
 **Why not a viewport filter.** The ROI being edited would vanish on a pan.
 

@@ -23,6 +23,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   selectBroadcastAxes,
   selectHiddenSets,
+  selectRoiSets,
   selectRois,
   selectRoisError,
   selectRoisLoading,
@@ -40,7 +41,7 @@ import {
   visibleRois,
 } from "../utils/roiLayers";
 import { pinnableAxes, roiVisibleOnPlane } from "@biopb/tensor-flight-client";
-import type { RoiAnnotation, SliderAxis } from "@biopb/tensor-flight-client";
+import type { RoiAnnotation, RoiSetInfo, SliderAxis } from "@biopb/tensor-flight-client";
 
 /**
  * How long a clear button stays armed. Long enough to mean the second click,
@@ -64,6 +65,12 @@ function swatch(setName: string) {
 export interface RoiPanelViewProps {
   /** This tensor's annotations. The caller has already checked they are its own. */
   rois: RoiAnnotation[];
+  /**
+   * Every set on the tensor. Only the server-owned entries are read here: the
+   * client-owned counts come from `rois`, which an optimistic create updates
+   * before any refetch.
+   */
+  sets: RoiSetInfo[];
   /** `axis -> index` for the plane on screen. */
   currentPlane: Record<number, number>;
   hiddenSets: string[];
@@ -84,6 +91,7 @@ export interface RoiPanelViewProps {
 
 export function RoiPanelView({
   rois,
+  sets,
   currentPlane,
   hiddenSets,
   showRois,
@@ -112,7 +120,8 @@ export function RoiPanelView({
   // rather than show a permanently empty panel.
   if (unavailable) return null;
 
-  const sets = roiSetCounts(rois);
+  const owned = roiSetCounts(rois);
+  const serverOwned = sets.filter((set) => set.reserved);
   const onPlane = visibleRois(rois, currentPlane, hiddenSets).length;
 
   return (
@@ -135,9 +144,9 @@ export function RoiPanelView({
         </span>
       </header>
 
-      {sets.length > 0 && (
+      {(owned.length > 0 || serverOwned.length > 0) && (
         <ul className="roi-sets">
-          {sets.map(({ setName, count }) => {
+          {owned.map(({ setName, count }) => {
             const hidden = hiddenSets.includes(setName);
             return (
               <li key={setName}>
@@ -168,6 +177,20 @@ export function RoiPanelView({
               </li>
             );
           })}
+          {serverOwned.map(({ setName, count }) => (
+            <li key={setName}>
+              <span
+                className="roi-set-name"
+                title="Filled from the source file and read-only. Ask for it by name to read it."
+              >
+                <span style={swatch(setName)} />
+                {setName}
+              </span>
+              <span className="roi-set-actions">
+                <span className="roi-count">{count}</span>
+              </span>
+            </li>
+          ))}
         </ul>
       )}
 
@@ -196,6 +219,7 @@ export function RoiPanelView({
  */
 export function RoiPanel() {
   const rois = useAppStore(selectRois);
+  const sets = useAppStore(selectRoiSets);
   const loading = useAppStore(selectRoisLoading);
   const error = useAppStore(selectRoisError);
   const truncated = useAppStore(selectRoisTruncated);
@@ -213,6 +237,7 @@ export function RoiPanel() {
   return (
     <RoiPanelView
       rois={rois}
+      sets={sets}
       currentPlane={currentPlane}
       hiddenSets={hiddenSets}
       showRois={showRois}

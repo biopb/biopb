@@ -659,7 +659,9 @@ class TensorFlightClient:
                 reserved (``@``) set. Empty means the client-owned sets.
 
         Returns:
-            ``RoiListResult`` with ``rois`` and a ``truncated`` flag.
+            ``RoiListResult`` with ``rois``, a ``truncated`` flag, and ``sets``
+            -- every set on the tensor with its stored row count, whatever
+            ``rois`` covers.
 
         Raises:
             flight.FlightServerError: annotations disabled, or no metadata DB.

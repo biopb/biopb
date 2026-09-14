@@ -39,6 +39,7 @@ const render = (over: Partial<RoiPanelViewProps> = {}) =>
   renderToStaticMarkup(
     <RoiPanelView
       rois={[]}
+      sets={[]}
       currentPlane={{}}
       hiddenSets={[]}
       showRois
@@ -72,6 +73,23 @@ describe("RoiPanelView", () => {
     });
     // The axis-1=4 one and the unpinned one, out of three.
     expect(html).toContain("2 of 3 here");
+  });
+
+  it("names a server-owned set it holds no rows for", () => {
+    // An unqualified fetch does not carry them, so the listing is the only way
+    // the panel knows the set is there.
+    const html = render({
+      rois: [roi({ setName: "nuclei" })],
+      sets: [
+        { setName: "@ome", count: 120, reserved: true },
+        { setName: "nuclei", count: 1, reserved: false },
+      ],
+    });
+    expect(html).toContain("@ome");
+    expect(html).toContain("120");
+    // No control on the row: there is nothing loaded to hide, and the server
+    // refuses a delete.
+    expect(html).not.toContain('aria-label="Delete every annotation in @ome"');
   });
 
   it("lists each set with its count", () => {

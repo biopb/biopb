@@ -164,6 +164,19 @@ class TestListingAReservedSet:
         assert [r.roi_id for r in rois] == ["mine"]
         assert not truncated
 
+    def test_the_set_listing_names_both_kinds_with_stored_counts(self):
+        # The read cap does not reach these: the listing is what tells a client
+        # a reserved set is there and what to name to read it.
+        db = MetadataDatabase(max_rois_per_tensor=1)
+        _plant(db, "ROI:0")
+        _plant(db, "ROI:1")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="mine", set_name="mine")])
+
+        assert db.list_roi_sets(ARRAY_ID) == [(RESERVED, 2), ("mine", 1)]
+
+    def test_the_set_listing_is_empty_for_a_tensor_with_nothing(self):
+        assert MetadataDatabase().list_roi_sets(ARRAY_ID) == []
+
     def test_truncation_counts_only_the_rows_in_scope(self):
         db = MetadataDatabase(max_rois_per_tensor=2)
         for i in range(3):

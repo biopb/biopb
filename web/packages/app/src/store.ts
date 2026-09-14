@@ -5,6 +5,7 @@ import type {
   QuerySourcesResult,
   RoiAnnotation,
   RoiGeometry,
+  RoiSetInfo,
   TileInfo,
 } from "@biopb/tensor-flight-client";
 import { DEFAULT_POLYLINE_WIDTH, clampPolylineWidth } from "./utils/roiDraft";
@@ -186,8 +187,14 @@ export interface AppState {
   tileInfoFor: string | null;
 
   // --- ROI annotations (docs/roi-annotations-ui.md) -----------------------
-  /** The tensor's whole annotation set. Filtered to the plane at render time. */
+  /** The tensor's client-owned annotations. Filtered to the plane at render time. */
   rois: RoiAnnotation[];
+  /**
+   * Every set on the tensor, server-owned ones included. `rois` covers only the
+   * client-owned sets, so this is how the panel knows a server-owned set exists
+   * and how many rows it holds.
+   */
+  roiSets: RoiSetInfo[];
   /**
    * The `array_id` `rois` was fetched for, as `tileInfoFor` is for the grid.
    *
@@ -485,6 +492,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   tileInfoFor: null,
 
   rois: [],
+  roiSets: [],
   roisFor: null,
   roisPending: null,
   roisError: null,
@@ -767,6 +775,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (get().roisPending !== arrayId) return;
       set({
         rois: result.rois,
+        roiSets: result.sets,
         roisFor: arrayId,
         roisPending: null,
         roisTruncated: result.truncated,
@@ -1277,6 +1286,13 @@ const NO_SETS: string[] = [];
 /** This tensor's annotations, or none while another tensor's are still held. */
 export function selectRois(s: AppState): RoiAnnotation[] {
   return s.roisFor === currentArrayId(s) ? s.rois : NO_ROIS;
+}
+
+const NO_ROI_SETS: RoiSetInfo[] = [];
+
+/** Every set on the tensor in view, server-owned ones included. */
+export function selectRoiSets(s: AppState): RoiSetInfo[] {
+  return s.roisFor === currentArrayId(s) ? s.roiSets : NO_ROI_SETS;
 }
 
 /** A fetch is in flight for the tensor in view. */

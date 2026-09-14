@@ -1970,6 +1970,29 @@ class MetadataDatabase:
             rows = rows[: self._max_rois_per_tensor]
         return [_row_to_proto(row) for row in rows], truncated
 
+    def list_roi_sets(self, array_id: str) -> List[Tuple[str, int]]:
+        """Every set on a tensor with its row count, ordered by name.
+
+        Counts the stored rows, not what :meth:`list_rois` returns: an
+        unqualified list carries no reserved set and either list can be clipped
+        by the read cap, so this is how a client learns a set is there and what
+        to name to read it.
+        """
+        if not array_id:
+            raise ValueError("array_id is required")
+        _require_bare_array_id(array_id)
+
+        rows = (
+            self._get_cursor()
+            .execute(
+                "SELECT set_name, COUNT(*) FROM rois WHERE array_id = ? "
+                "GROUP BY set_name ORDER BY set_name",
+                [array_id],
+            )
+            .fetchall()
+        )
+        return [(name, int(count)) for name, count in rows]
+
     def delete_rois(
         self, array_id: str, roi_ids: Iterable[str] = (), set_name: str = ""
     ) -> List[str]:

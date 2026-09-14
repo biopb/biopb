@@ -698,6 +698,9 @@ class TestFlightActions:
             assert not listed.truncated
             assert [r.roi_id for r in listed.rois] == [roi_id]
             assert listed.rois[0].label == "nucleus"
+            assert [(s.set_name, s.count, s.reserved) for s in listed.sets] == [
+                ("default", 1, False)
+            ]
 
             # A rejected geometry comes back as a server error, not a silent drop.
             with pytest.raises(flight.FlightServerError, match="not accepted"):
@@ -741,10 +744,20 @@ class TestSidecarRoutes:
 
         class _FakeFlightClient:
             def list_rois(self, array_id, set_name=""):
-                from biopb.image.annotation_pb2 import RoiListResult
+                from biopb.image.annotation_pb2 import RoiListResult, RoiSetInfo
+                from biopb_tensor_server.core.metadata_db import is_reserved_set
 
                 rois, truncated = db.list_rois(array_id, set_name)
-                return RoiListResult(rois=rois, truncated=truncated)
+                return RoiListResult(
+                    rois=rois,
+                    truncated=truncated,
+                    sets=[
+                        RoiSetInfo(
+                            set_name=name, count=count, reserved=is_reserved_set(name)
+                        )
+                        for name, count in db.list_roi_sets(array_id)
+                    ],
+                )
 
             def put_rois(self, array_id, rois, *, check_rev=False):
                 from biopb.image.annotation_pb2 import RoiPutResult
@@ -767,6 +780,41 @@ class TestSidecarRoutes:
             app.state.sidecar, "get_client", lambda: _FakeFlightClient()
         )
         return TestClient(app), db
+
+    def test_the_listing_names_a_server_owned_set_it_does_not_return(
+        self, client_and_app
+    ):
+        from biopb_tensor_server.core.metadata_db import RESERVED_SET_PREFIX
+
+        client, db = client_and_app
+        now = datetime.now()
+        geometry = json_format.MessageToJson(
+            _polygon((0, 0), (4, 0), (4, 4)), indent=0
+        ).replace("\n", "")
+        db._get_connection().execute(
+            "INSERT INTO rois (roi_id, array_id, source_id, set_name, label, "
+            "shape_kind, geometry, rev, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, '', 'polygon', ?, 1, ?, ?)",
+            [
+                "ROI:0",
+                ARRAY_ID,
+                ARRAY_ID.split("/")[0],
+                f"{RESERVED_SET_PREFIX}ome",
+                geometry,
+                now,
+                now,
+            ],
+        )
+
+        got = client.get(f"/api/rois/{ARRAY_ID}").json()
+        assert got.get("rois", []) == []
+        assert got["sets"] == [
+            {"setName": f"{RESERVED_SET_PREFIX}ome", "count": "1", "reserved": True}
+        ]
+
+        # Naming it is how the rows are reached.
+        named = client.get(f"/api/rois/{ARRAY_ID}?set={RESERVED_SET_PREFIX}ome").json()
+        assert [r["roiId"] for r in named["rois"]] == ["ROI:0"]
 
     def test_post_then_get_round_trips_proto3_json(self, client_and_app):
         client, _db = client_and_app

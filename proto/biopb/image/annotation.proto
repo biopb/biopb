@@ -120,11 +120,28 @@ message RoiListRequest {
   string set_name = 2;
 }
 
+// One annotation layer on a tensor, for a client listing what is there.
+message RoiSetInfo {
+  string set_name = 1;
+
+  // Rows in this set, before the read cap clips anything.
+  int64 count = 2;
+
+  // The server owns this set: it is rebuilt from the source file on every
+  // registration, is read-only to clients, and `rois` does not carry it unless
+  // RoiListRequest named it.
+  bool reserved = 3;
+}
+
 message RoiListResult {
   repeated RoiAnnotation rois = 1;
 
   // True when the per-tensor cap clipped the result.
   bool truncated = 2;
+
+  // Every set on the tensor, including those `rois` does not cover. Always the
+  // whole tensor, so a set_name-scoped request still enumerates its siblings.
+  repeated RoiSetInfo sets = 3;
 }
 
 // Body of the "roi_delete" action. Deletes `roi_ids` when given; otherwise
