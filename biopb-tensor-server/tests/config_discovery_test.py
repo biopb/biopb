@@ -200,45 +200,6 @@ class TestDeleteSourceRegression:
         removed = state.remove_claim(str(resolved))
         assert removed == "test_456"
 
-    def test_handle_moved_arguments_order(self):
-        """Test that _handle_moved receives correct old_path and new_path order.
-
-        The watcher stores MOVED events with:
-        - WatcherEvent.path = old_path (original location)
-        - WatcherEvent.old_path = new_path (new location) - confusing naming!
-
-        Before the fix, _handle_moved was called with swapped arguments:
-        _handle_moved(event.old_path, event.path) = _handle_moved(new_path, old_path)
-
-        After the fix:
-        _handle_moved(event.path, event.old_path) = _handle_moved(old_path, new_path)
-        """
-        from pathlib import Path
-
-        from biopb_tensor_server.sources.watcher import WatcherEvent, WatcherEventType
-
-        # Simulate what the watcher creates for a move event
-        # The watcher stores: event_buffer[old_path] = (MOVED, time, new_path)
-        # So WatcherEvent has: path=old_path, old_path=new_path
-        original_path = Path("/home/user/data/test.tif")
-        new_path = Path("/home/user/data/test_.tif")
-
-        # Watcher creates this (confusing naming in WatcherEvent.old_path)
-        event = WatcherEvent(
-            event_type=WatcherEventType.MOVED,
-            path=original_path,  # This is actually the OLD path
-            old_path=new_path,  # This is actually the NEW path
-            is_directory=False,
-        )
-
-        # Verify the confusing naming
-        assert event.path == original_path  # OLD path (original location)
-        assert event.old_path == new_path  # NEW path (destination)
-
-        # Correct call order: _handle_moved(old_path, new_path)
-        # Should be: _handle_moved(event.path, event.old_path)
-        # NOT: _handle_moved(event.old_path, event.path) - SWAPPED!
-
 
 class TestCreatedSourceRegression:
     """Regression tests for source creation using ClaimContext."""

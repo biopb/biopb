@@ -160,7 +160,7 @@ class TestAddSource:
     def test_cancel_mid_walk_returns_empty_tally(self):
         # A genuine mid-walk cancel (before the terminal ever arrives) returns an
         # empty tally rather than raising; sources already registered surface
-        # later via the watcher re-list.
+        # later via the upstream re-list.
         client = _bare_client()
         client._state.client = _FakeFlight(
             [

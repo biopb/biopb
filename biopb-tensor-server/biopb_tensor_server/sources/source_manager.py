@@ -1,7 +1,9 @@
 """Source lifecycle manager for the periodic catalog rescan runtime.
 
-Coordinates the periodic rescan watcher, discovery state, server catalog updates,
-and metadata database synchronization for monitored local directories.
+Owns the rescan timer, discovery state, server catalog updates, and metadata
+database synchronization for monitored local directories. Monitoring is
+timer-driven: every ``rescan_interval`` seconds the whole monitored tree is
+walked and diffed, so there are no per-path filesystem events to handle.
 """
 
 from __future__ import annotations
@@ -31,11 +33,6 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
 from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
-from biopb_tensor_server.sources.watcher import (
-    DirectoryWatcher,
-    WatcherEvent,
-    WatcherEventType,
-)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.metadata_db import MetadataDatabase
@@ -138,8 +135,9 @@ class SourceManager:
         server: TensorFlightServer,
         registry: AdapterRegistry,
         discovery_state: DiscoveryState,
-        watcher: Optional[DirectoryWatcher],
         monitored_dirs: Set[Path],
+        rescan_interval: float = 30.0,
+        initial_immediate: bool = True,
         metadata_db: Optional[MetadataDatabase] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
@@ -156,7 +154,6 @@ class SourceManager:
         # Reconciler built at the end of this method, which holds its own copy.
         self._server = server
         self._registry = registry
-        self._watcher = watcher
         self._metadata_db = metadata_db
 
         # What is watched. Under a cloud root (config ``cloud=true``) dehydrated
@@ -215,7 +212,15 @@ class SourceManager:
         self._prune_unseen_days = max(0, prune_unseen_days)
         self._started_at = time.monotonic()
 
-        # The event-loop thread that drains watcher events.
+        # The rescan loop: a bare timer on its own thread. ``_wake`` is what the
+        # loop waits on rather than sleeping, so :meth:`stop` returns at once
+        # instead of running out the current interval. A ``rescan_interval`` of
+        # 0 or less means no loop at all (config ``monitor_mode = "off"``); the
+        # launcher then drives a single scan itself.
+        self._rescan_interval = rescan_interval
+        self._initial_immediate = initial_immediate
+        self._next_rescan_at: float = 0.0
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = False
 
@@ -259,19 +264,32 @@ class SourceManager:
             notify_source_committed=self._notify_source_committed,
         )
 
-    def start(self) -> None:
-        """Start the event processing loop."""
-        if self._watcher is None:
-            return  # Static-only mode; no filesystem events to process
+    def start(self) -> bool:
+        """Start the periodic rescan loop; return whether it is running.
+
+        A no-op -- returning False -- when there is nothing for the loop to do:
+        rescanning is disabled (``rescan_interval <= 0``), or neither a monitored
+        directory nor a monitored upstream is configured. The launcher reads the
+        return value to decide whether it must drive the bootstrap scan itself.
+
+        The bootstrap scan runs in this loop, whose first tick fires immediately
+        by default. Until it completes, ``_initial_scan_done`` stays False so its
+        sources route to the precache backlog rather than the prompt enqueue.
+        """
+        if self._rescan_interval <= 0:
+            return False
+        if not self._monitored_dirs and not self._monitored_upstreams:
+            return False
 
         if self._thread is not None and self._thread.is_alive():
             logger.warning("SourceManager already running")
-            return
+            return True
 
-        # The background bootstrap scan runs in this event loop (the watcher
-        # fires its first rescan immediately). Until that first scan completes,
-        # ``_initial_scan_done`` stays False so its sources route to the precache
-        # backlog rather than the prompt enqueue.
+        now = time.monotonic()
+        self._next_rescan_at = (
+            now if self._initial_immediate else now + self._rescan_interval
+        )
+        self._wake.clear()
         self._running = True
         self._thread = threading.Thread(
             target=self._event_loop,
@@ -279,7 +297,10 @@ class SourceManager:
             name="SourceManager-EventLoop",
         )
         self._thread.start()
-        logger.info("SourceManager started")
+        logger.info(
+            "SourceManager started; rescanning every %.1fs", self._rescan_interval
+        )
+        return True
 
     # --- Startup-protocol seam ------------------------------------------------
     # The launcher drives startup through these public methods rather than the
@@ -313,9 +334,9 @@ class SourceManager:
         """Run the bootstrap scan synchronously (public seam for the launcher).
 
         Under progressive discovery the bootstrap scan normally runs in the
-        event loop after :meth:`start`. When no event loop will drive it -- the
-        watcher failed to start but monitored dirs exist -- the launcher calls
-        this to run one full rescan inline. Being the first pass, it force-fulls,
+        rescan loop after :meth:`start`. When no loop will drive it -- rescanning
+        is off but monitored dirs exist -- the launcher calls this to run one
+        full rescan inline. Being the first pass, it force-fulls,
         stamps freshness, flips the startup gate, and fires the completion hook,
         exactly as the background path would.
         """
@@ -393,8 +414,8 @@ class SourceManager:
         Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
         can't be stat-ed (e.g. removed between commit and this call).
         """
-        # The Reconciler snapshots claims under its state lock (the watcher's
-        # event-loop thread adds/removes claims concurrently); we stat() outside
+        # The Reconciler snapshots claims under its state lock (the rescan
+        # thread adds/removes claims concurrently); we stat() outside
         # that lock (I/O).
         snapshot = self._reconciler.local_claim_paths()
         out: List[Tuple[str, float]] = []
@@ -418,6 +439,7 @@ class SourceManager:
         only burns the shutdown budget. That in-flight RPC is not cancelled.
         """
         self._running = False
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=join_timeout)
             self._thread = None
@@ -428,34 +450,23 @@ class SourceManager:
         return self._running and (self._thread is not None and self._thread.is_alive())
 
     def _event_loop(self) -> None:
-        """Process periodic rescan triggers from the watcher."""
+        """Run a rescan every ``rescan_interval`` seconds until stopped.
+
+        The next tick is scheduled from the moment the previous one *finished*,
+        so a rescan that outruns the interval does not immediately queue another.
+        A failed rescan is logged and the cadence continues; the next pass sees
+        the same tree and retries.
+        """
         while self._running:
+            timeout = max(0.0, self._next_rescan_at - time.monotonic())
+            if self._wake.wait(timeout):
+                break  # stop() woke us
+
             try:
-                events = self._watcher.get_events(timeout=0.5)
-
-                if events:
-                    for event in events:
-                        self._process_event(event)
-
-            except Exception as e:
-                logger.exception(f"Error processing events: {e}")
-
-            # Small sleep to prevent busy polling
-            time.sleep(0.1)
-
-    def _process_event(self, event: WatcherEvent) -> None:
-        """Handle a watcher event."""
-        try:
-            logger.debug(f"Processing event: {event.event_type.value} {event.path}")
-            if event.event_type == WatcherEventType.RESCAN:
                 self._handle_rescan()
-            else:
-                logger.debug(
-                    "Ignoring unsupported watcher event type: %s",
-                    event.event_type.value,
-                )
-        except Exception as e:
-            logger.exception(f"Error handling event {event}: {e}")
+            except Exception:
+                logger.exception("Rescan failed")
+            self._next_rescan_at = time.monotonic() + self._rescan_interval
 
     def _handle_rescan(self) -> None:
         """Run one periodic rescan: walk monitored dirs first, then re-list upstreams.
@@ -1345,7 +1356,6 @@ class SourceManager:
 def create_source_manager(
     server: TensorFlightServer,
     registry: AdapterRegistry,
-    watcher: Optional[DirectoryWatcher],
     monitored_sources: Optional[List[SourceConfig]] = None,
     static_sources: Optional[List[SourceConfig]] = None,
     metadata_db: Optional[MetadataDatabase] = None,
@@ -1356,11 +1366,12 @@ def create_source_manager(
     stable_rescans_required: int = 0,
     aggressive_dir_pruning: bool = False,
     prune_unseen_days: int = 0,
+    rescan_interval: float = 30.0,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
     Handles both static sources (explicit config, registered once) and monitored
-    sources (filesystem-discovered, kept live via the watcher). Both paths use
+    sources (filesystem-discovered, kept live by the rescan loop). Both paths use
     the same DiscoveryState/callback machinery. Remote sources are never
     filesystem-watched: a bare-host ``grpc://`` upstream is monitored through the
     background catalog re-list, and any other remote source is registered
@@ -1375,7 +1386,6 @@ def create_source_manager(
     Args:
         server: TensorFlightServer the sources are registered into.
         registry: AdapterRegistry used for claim detection and adapter creation.
-        watcher: DirectoryWatcher supplying rescan events (None for static-only).
         monitored_sources: SourceConfig entries with monitor=True.
         static_sources: Explicit SourceConfig entries (monitor=False).
         metadata_db: MetadataDatabase kept in sync as sources are added and
@@ -1393,6 +1403,9 @@ def create_source_manager(
             own signature is unchanged without descending into it.
         prune_unseen_days: Days of absence after which annotations for a missing
             source are auto-pruned; 0 disables auto-prune.
+        rescan_interval: Seconds between rescans. <= 0 leaves the manager with
+            no rescan loop, so :meth:`SourceManager.start` no-ops and the caller
+            drives any scan itself (config ``monitor_mode = "off"``).
 
     Returns:
         A SourceManager, empty if no source is usable.
@@ -1493,8 +1506,8 @@ def create_source_manager(
         server=server,
         registry=registry,
         discovery_state=discovery_state,
-        watcher=watcher,
         monitored_dirs=monitored_dirs,
+        rescan_interval=rescan_interval,
         metadata_db=metadata_db,
         credentials_config=credentials_config,
         stability_window=stability_window,
@@ -1553,8 +1566,8 @@ def create_source_manager(
         manager._reconciler._commit_add_claim(claim, catalog_url=source._catalog_url)
 
     # Monitored discovery is NOT run synchronously here: under progressive
-    # discovery the launcher starts the manager's event loop and the watcher
-    # fires the first rescan immediately, so the (possibly slow) bootstrap scan
+    # discovery the launcher starts the manager's rescan loop, whose first tick
+    # fires immediately, so the (possibly slow) bootstrap scan
     # happens in the background while the server already reports SERVING. A
     # static-only config (no monitored_dirs) has nothing to scan -- the launcher
     # drives the first-scan-complete path directly so it still reports a

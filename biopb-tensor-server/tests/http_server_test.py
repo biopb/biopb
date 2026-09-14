@@ -1029,7 +1029,7 @@ class TestWindowsShutdownListener:
         from biopb import _locations
         from biopb_tensor_server.serving.http_server import shutdown_sentinel_path
 
-        # Both this watcher and DataPlaneSupervisor._win_stop_sentinel (the control
+        # Both this poller and DataPlaneSupervisor._win_stop_sentinel (the control
         # writes it) bind to the one shared definition, so they cannot drift. Fixed
         # name (not pid-keyed) under the biopb state dir so stop and the daemon agree.
         assert shutdown_sentinel_path() == _locations.tensor_stop_sentinel()
@@ -1045,7 +1045,7 @@ class TestWindowsShutdownListener:
         with patch("biopb_tensor_server.serving.http_server.sys") as mock_sys:
             mock_sys.platform = "linux"
             _install_windows_shutdown_listener(server)  # must not raise
-        assert threading.active_count() == before  # no watcher thread started
+        assert threading.active_count() == before  # no poller thread started
         assert server.should_exit is False
 
 

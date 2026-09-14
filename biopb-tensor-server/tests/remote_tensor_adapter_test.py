@@ -1330,7 +1330,6 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
-                watcher=None,
                 monitored_dirs=set(),
                 metadata_db=None,
                 monitored_upstreams=[
@@ -1375,7 +1374,6 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
     manager = create_source_manager(
         server=server,
         registry=get_default_registry(),
-        watcher=None,
         # a local static source so there is something to serve (else it bails)
         static_sources=[SourceConfig(type="zarr", url=zarr_path, source_id="local")],
         monitored_sources=[
@@ -1409,7 +1407,6 @@ def test_handle_rescan_walks_local_dirs_before_upstream_relist(tmp_path):
         server=MagicMock(),
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs={tmp_path},
         metadata_db=None,
         monitored_upstreams=[SourceConfig(url="grpc://lab:8815", alias="lab")],
@@ -1440,7 +1437,6 @@ def test_handle_rescan_suppresses_live_precache_for_boot_tick_upstream(tmp_path)
         server=MagicMock(),
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs={tmp_path},
         metadata_db=None,
         monitored_upstreams=[SourceConfig(url="grpc://lab:8815", alias="lab")],
@@ -1502,7 +1498,6 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
             server=proxy,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(),
             metadata_db=None,
             monitored_upstreams=[SourceConfig(url=url, alias="lab")],
@@ -1561,7 +1556,6 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
-                watcher=None,
                 monitored_dirs=set(),
                 metadata_db=None,
                 monitored_upstreams=[SourceConfig(url=url, alias="lab")],
@@ -1616,7 +1610,6 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
             server=proxy,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(),
             credentials_config=credentials,
             monitored_upstreams=[upstream],
@@ -1792,7 +1785,6 @@ class TestUnreachableUpstreamIsReportedOnAWindow:
             server=proxy,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(),
             monitored_upstreams=[upstream],
         )
@@ -2016,7 +2008,6 @@ def test_unreachable_sole_monitored_upstream_does_not_block_startup():
     manager = create_source_manager(
         server=server,
         registry=get_default_registry(),
-        watcher=None,
         static_sources=[],  # expansion of the down upstream yielded nothing
         monitored_sources=[
             SourceConfig(url="grpc://localhost:59599", alias="lab", monitor=True)
@@ -2556,7 +2547,6 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
-                watcher=None,
                 monitored_dirs=set(),
                 metadata_db=local_db,
                 monitored_upstreams=[
@@ -2689,7 +2679,6 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
-                watcher=None,
                 monitored_dirs=set(),
                 metadata_db=local_db,
                 monitored_upstreams=[
@@ -2769,7 +2758,6 @@ def _register_static_proxy(url, alias):
     create_source_manager(
         server=server,
         registry=get_default_registry(),
-        watcher=None,
         static_sources=expanded,
         monitored_sources=[],
         metadata_db=None,
@@ -2845,7 +2833,6 @@ class TestAliasAndSchemeSurviveRegistration:
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
-                watcher=None,
                 monitored_dirs=set(),
                 metadata_db=None,
                 monitored_upstreams=[

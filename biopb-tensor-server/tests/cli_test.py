@@ -120,14 +120,13 @@ class _FakeStoppable:
 
     def stop(self, join_timeout=None):
         # _graceful_shutdown passes a short join_timeout to source_manager.stop();
-        # accept-and-ignore it here (also used as the watcher, called with no arg).
+        # accept-and-ignore it here.
         self.stop_calls += 1
 
 
 def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     server = _FakeServer()
     source_manager = _FakeStoppable()
-    watcher = _FakeStoppable()
     server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
@@ -136,13 +135,12 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *args, **kwargs: (server, source_manager, watcher, None),
+        lambda *args, **kwargs: (server, source_manager, None),
     )
 
     _run_serve(Path("unused.json"))
 
     assert source_manager.stop_calls == 1
-    assert watcher.stop_calls == 1
     assert server.shutdown_calls == 1
 
 
@@ -163,7 +161,6 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
 
     flight_server = SimpleNamespace(serve=lambda: None)
     source_manager = _FakeStoppable()
-    watcher = _FakeStoppable()
     server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
@@ -174,7 +171,7 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *args, **kwargs: (flight_server, source_manager, watcher, None),
+        lambda *args, **kwargs: (flight_server, source_manager, None),
     )
     monkeypatch.setattr(
         cli, "_install_sigterm_handler", lambda: order.append("install_sigterm")
@@ -213,12 +210,7 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
 
     def _capture_setup(cfg, **kwargs):
         captured.update(kwargs)
-        return (
-            SimpleNamespace(serve=lambda: None),
-            _FakeStoppable(),
-            _FakeStoppable(),
-            None,
-        )
+        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
 
     monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
     monkeypatch.setattr(
@@ -254,7 +246,7 @@ def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
     assert not _cache_lock_is_free(lock_path)  # held while server "runs"
 
     try:
-        cli._graceful_shutdown(source_manager=None, watcher=None, flight_server=None)
+        cli._graceful_shutdown(source_manager=None, flight_server=None)
         assert _cache_lock_is_free(lock_path)  # released on shutdown
     finally:
         mgr = CacheManager.get_instance()
@@ -292,7 +284,6 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
     try:
         cli._graceful_shutdown(
             source_manager=_SourceManager(),
-            watcher=None,
             flight_server=_Flight(),
         )
         # Lock released before the flight drain and the join.
@@ -337,7 +328,6 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
         start = time.monotonic()
         cli._graceful_shutdown(
             source_manager=None,
-            watcher=None,
             flight_server=_HangingFlight(),
         )
         elapsed = time.monotonic() - start
@@ -370,7 +360,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *a, **k: (server, _FakeStoppable(), _FakeStoppable(), None),
+        lambda *a, **k: (server, _FakeStoppable(), None),
     )
 
     _run_serve(Path("unused.json"))
@@ -449,17 +439,13 @@ def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
 
     config = cli.load_config(config_path)
     CacheManager.reset()
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
+    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
         mgr = CacheManager.get_instance()
         assert not isinstance(mgr.backend, ArrowFileBackend)  # demoted to memory
         # The file cache dir was never created (backend never touched disk).
         assert not cache_dir.exists()
     finally:
-        if watcher is not None:
-            watcher.stop()
         if precache_worker is not None:
             precache_worker.stop()
         if source_manager is not None:
@@ -489,15 +475,11 @@ def test_file_cache_on_local_dir_stays_file(tmp_path):
 
     config = cli.load_config(config_path)
     CacheManager.reset()
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
+    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
         mgr = CacheManager.get_instance()
         assert isinstance(mgr.backend, ArrowFileBackend)  # tmp_path is local disk
     finally:
-        if watcher is not None:
-            watcher.stop()
         if precache_worker is not None:
             precache_worker.stop()
         if source_manager is not None:
@@ -532,9 +514,7 @@ def test_setup_empty_sources_serves_empty_catalog(tmp_path):
     )
 
     config = cli.load_config(config_path)
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
+    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
         assert server.is_ready is True
         assert source_manager is not None  # an empty manager, not None
@@ -547,8 +527,6 @@ def test_setup_empty_sources_serves_empty_catalog(tmp_path):
         # And the empty catalog lists no flights.
         assert list(server.list_flights(None, None)) == []
     finally:
-        if watcher is not None:
-            watcher.stop()
         if precache_worker is not None:
             precache_worker.stop()
         if source_manager is not None:
@@ -713,9 +691,7 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
     )
 
     config = cli.load_config(config_path)
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
+    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
         assert server.is_ready is True
 
@@ -726,8 +702,6 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
         assert health["last_full_scan_finished_at"] is not None
         assert health["source_count"] == 1
     finally:
-        if watcher is not None:
-            watcher.stop()
         if precache_worker is not None:
             precache_worker.stop()
         server.shutdown()
@@ -778,7 +752,7 @@ def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypat
 
     def _capture(config, port=None, **kwargs):
         loaded["config"] = config
-        return _FakeServer(), _FakeStoppable(), _FakeStoppable(), None
+        return _FakeServer(), _FakeStoppable(), None
 
     monkeypatch.setattr(cli, "_setup_flight_server", _capture)
     _run_serve(config_path)
@@ -828,12 +802,7 @@ def _launch_capturing_tls(monkeypatch, server_config, **launch_kwargs):
 
     def _capture_setup(cfg, **kwargs):
         captured["flight_cert"] = kwargs.get("tls_cert_chain")
-        return (
-            SimpleNamespace(serve=lambda: None),
-            _FakeStoppable(),
-            _FakeStoppable(),
-            None,
-        )
+        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
 
     monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
     monkeypatch.setattr(cli, "run_http_server", lambda **kw: captured.update(kw))

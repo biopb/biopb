@@ -54,7 +54,6 @@ def _make_manager():
         server=server,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs=set(),
         metadata_db=None,
     )
@@ -185,7 +184,6 @@ class TestAddLocalSource:
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            watcher=None,
             static_sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
         )
         assert manager is not None
@@ -223,7 +221,6 @@ class TestAddLocalSource:
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            watcher=None,
             static_sources=static_sources,
         )
         assert manager is not None
@@ -569,7 +566,6 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
             server=server,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(monitored_dirs),
             metadata_db=None,
             stability_window=0.0,

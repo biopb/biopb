@@ -369,7 +369,6 @@ class TestRuntimePhaseGating:
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(),
         )
         return server, sm
@@ -379,8 +378,8 @@ class TestRuntimePhaseGating:
         try:
             assert sm._initial_scan_done is False
             # start() no longer flips the precache gate -- only the first full
-            # scan completing does. A static-only (watcher=None) start() is a
-            # no-op and leaves it False.
+            # scan completing does. With nothing to rescan, start() is a no-op
+            # and leaves it False.
             sm.start()
             assert sm._initial_scan_done is False
         finally:
@@ -717,7 +716,6 @@ class TestIterLocalSourceMtimes:
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(),
         )
         return server, sm
@@ -749,7 +747,7 @@ class TestIterLocalSourceMtimes:
     def test_snapshot_taken_under_lock(self):
         # The read must snapshot _state.claims under self._lock (the same lock
         # _commit_add_claim/_commit_remove_claim hold) so it can't iterate the
-        # dict while the watcher's event loop mutates it. Prove it by holding the
+        # dict while the rescan loop mutates it. Prove it by holding the
         # lock in another thread: the reader must block until it is released.
         server, sm = self._bare_sm()
         holder = None
