@@ -7,12 +7,12 @@ import type {
   TileInfo,
 } from "@biopb/tensor-flight-client";
 import {
-  selectHiddenSets,
+  selectRoiScopes,
+  selectRoiSets,
   selectRois,
   selectRoisError,
   selectRoisLoading,
-  selectRoisSkipped,
-  selectRoisTruncated,
+  selectVisibleSets,
   selectDraft,
   selectSelectedRoi,
   selectContrastTrack,
@@ -314,12 +314,11 @@ function seedAnnotated() {
     requestedArrayId: null,
     rois: ROI_FIXTURE,
     roisFor: "first",
-    roisTruncated: true,
-    roisSkipped: 3,
+    roiScopes: { "": { truncated: true, skipped: 3 } },
     roisError: "boom",
     roisErrorFor: "first",
-    hiddenSets: ["nuclei"],
-    hiddenSetsFor: "first",
+    visibleSets: ["nuclei"],
+    visibleSetsFor: "first",
   });
 }
 
@@ -328,10 +327,9 @@ describe("ROI state across a tensor change", () => {
     seedAnnotated();
     const s = useAppStore.getState();
     expect(selectRois(s)).toHaveLength(1);
-    expect(selectRoisTruncated(s)).toBe(true);
-    expect(selectRoisSkipped(s)).toBe(3);
+    expect(selectRoiScopes(s)).toEqual({ "": { truncated: true, skipped: 3 } });
     expect(selectRoisError(s)).toBe("boom");
-    expect(selectHiddenSets(s)).toEqual(["nuclei"]);
+    expect(selectVisibleSets(s)).toEqual(["nuclei"]);
   });
 
   it("hides all of it once another tensor is selected", () => {
@@ -339,10 +337,9 @@ describe("ROI state across a tensor change", () => {
     useAppStore.getState().selectSource("second");
     const s = useAppStore.getState();
     expect(selectRois(s)).toEqual([]);
-    expect(selectRoisTruncated(s)).toBe(false);
-    expect(selectRoisSkipped(s)).toBe(0);
+    expect(selectRoiScopes(s)).toEqual({});
     expect(selectRoisError(s)).toBeNull();
-    expect(selectHiddenSets(s)).toEqual([]);
+    expect(selectVisibleSets(s)).toBeNull();
   });
 
   it("hides all of it when a LINK changes the tensor", () => {
@@ -351,11 +348,11 @@ describe("ROI state across a tensor change", () => {
     useAppStore.getState().applyViewerState(new URLSearchParams({ id: "second/Image:0" }));
     const s = useAppStore.getState();
     expect(selectRois(s)).toEqual([]);
-    expect(selectHiddenSets(s)).toEqual([]);
-    // And the raw fields are untouched, which is the point: nothing cleared
-    // them, so reading them directly is what the leak was.
-    expect(s.hiddenSets).toEqual(["nuclei"]);
-    expect(s.roisTruncated).toBe(true);
+    expect(selectVisibleSets(s)).toBeNull();
+    // And the rows are untouched, which is the point: nothing cleared them, so
+    // reading them directly is what the leak was.
+    expect(s.rois).toHaveLength(1);
+    expect(s.roiScopes[""]?.truncated).toBe(true);
   });
 
   it("does not carry a warning onto a tensor it is not about", () => {
@@ -364,8 +361,7 @@ describe("ROI state across a tensor change", () => {
     seedAnnotated();
     useAppStore.getState().applyViewerState(new URLSearchParams({ id: "second" }));
     const s = useAppStore.getState();
-    expect(selectRoisTruncated(s)).toBe(false);
-    expect(selectRoisSkipped(s)).toBe(0);
+    expect(selectRoiScopes(s)).toEqual({});
     expect(selectRoisError(s)).toBeNull();
   });
 
@@ -379,79 +375,131 @@ describe("ROI state across a tensor change", () => {
     expect(selectRois(useAppStore.getState())).toHaveLength(1);
   });
 
-  it("starts a fresh hidden list rather than editing another tensor's", () => {
+  it("starts from the new tensor's default rather than editing another tensor's list", () => {
     seedAnnotated();
     useAppStore.getState().selectSource("second");
-    useAppStore.getState().toggleSetHidden("debris");
-    expect(selectHiddenSets(useAppStore.getState())).toEqual(["debris"]);
+    useAppStore.getState().toggleSetVisible("debris");
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["debris"]);
   });
 
   it("reports loading only for the tensor in view", () => {
     useAppStore.setState({
       activeTensorId: "first",
       requestedArrayId: null,
-      roisPending: "second",
+      roisPendingFor: "second",
+      roisPending: [""],
     });
     expect(selectRoisLoading(useAppStore.getState())).toBe(false);
-    useAppStore.setState({ roisPending: "first" });
+    useAppStore.setState({ roisPendingFor: "first" });
     expect(selectRoisLoading(useAppStore.getState())).toBe(true);
   });
 });
 
+describe("the sets on screen", () => {
+  const SETS = [
+    { setName: "nuclei", count: 1, reserved: false },
+    { setName: "cells", count: 2, reserved: false },
+    { setName: "@ome", count: 120, reserved: true },
+  ];
+
+  function seedListed() {
+    useAppStore.setState({
+      activeTensorId: "first",
+      requestedArrayId: null,
+      rois: ROI_FIXTURE,
+      roiSets: SETS,
+      roisFor: "first",
+      roiScopes: { "": { truncated: false, skipped: 0 } },
+      visibleSets: null,
+      visibleSetsFor: null,
+    });
+  }
+
+  it("materialises the default before the first toggle", () => {
+    // `null` is "this tensor's default", which is not "none": switching one set
+    // off must leave the other client-owned sets on.
+    seedListed();
+    useAppStore.getState().toggleSetVisible("cells");
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
+  });
+
+  it("switches a server-owned set on by name", () => {
+    seedListed();
+    useAppStore.getState().toggleSetVisible("@ome");
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei", "cells", "@ome"]);
+  });
+
+  it("adopts the sets a link names, and turns the overlay on for them", () => {
+    seedListed();
+    useAppStore.setState({ showRois: false });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=first&rs=@ome"));
+    const s = useAppStore.getState();
+    expect(selectVisibleSets(s)).toEqual(["@ome"]);
+    expect(s.showRois).toBe(true);
+  });
+
+  it("leaves the overlay toggle alone when a link names no sets", () => {
+    seedListed();
+    useAppStore.setState({ showRois: false });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=first"));
+    expect(useAppStore.getState().showRois).toBe(false);
+    // A preference, so it outlives this test too.
+    useAppStore.setState({ showRois: true });
+  });
+});
+
 describe("loadRois", () => {
-  /** A client whose listRois records what it was asked for. */
-  function stubClient(asked: string[]) {
+  /** A client whose listRois records what it was asked for, as `id` or `id?set`. */
+  function stubClient(asked: string[], sets: Array<{ setName: string; count: number; reserved: boolean }> = []) {
     return {
       http: {
-        listRois: (arrayId: string) => {
-          asked.push(arrayId);
-          return Promise.resolve({ rois: [], truncated: false, skipped: 0 });
+        listRois: (arrayId: string, setName?: string) => {
+          asked.push(setName ? `${arrayId}?${setName}` : arrayId);
+          return Promise.resolve({ rois: [], sets, truncated: false, skipped: 0 });
         },
       },
     } as unknown as TensorFlightClient;
   }
 
-  it("fetches the tensor in view", async () => {
-    const asked: string[] = [];
+  function fresh(client: TensorFlightClient, over: Record<string, unknown> = {}) {
     useAppStore.setState({
-      client: stubClient(asked),
+      client,
       activeTensorId: "first",
       requestedArrayId: null,
+      rois: [],
+      roiSets: [],
       roisFor: null,
-      roisPending: null,
+      roiScopes: {},
+      roisPending: [],
+      roisPendingFor: null,
       roisUnavailable: false,
+      visibleSets: null,
+      visibleSetsFor: null,
+      ...over,
     });
+  }
+
+  it("fetches the tensor in view", async () => {
+    const asked: string[] = [];
+    fresh(stubClient(asked));
     await useAppStore.getState().loadRois("first");
     expect(asked).toEqual(["first"]);
     expect(useAppStore.getState().roisFor).toBe("first");
+    expect(selectRoiScopes(useAppStore.getState())).toEqual({ "": { truncated: false, skipped: 0 } });
   });
 
   it("refuses a tensor that is not in view", async () => {
     // Nothing could display it: every selector hides a set whose tensor is not
     // the current one, so the round trip would be pure waste.
     const asked: string[] = [];
-    useAppStore.setState({
-      client: stubClient(asked),
-      activeTensorId: "first",
-      requestedArrayId: null,
-      roisFor: null,
-      roisPending: null,
-      roisUnavailable: false,
-    });
+    fresh(stubClient(asked));
     await useAppStore.getState().loadRois("second");
     expect(asked).toEqual([]);
   });
 
   it("follows the pinned address when a link named one", async () => {
     const asked: string[] = [];
-    useAppStore.setState({
-      client: stubClient(asked),
-      activeTensorId: "first",
-      requestedArrayId: "first@9f1c4e2b",
-      roisFor: null,
-      roisPending: null,
-      roisUnavailable: false,
-    });
+    fresh(stubClient(asked), { requestedArrayId: "first@9f1c4e2b" });
     await useAppStore.getState().loadRois("first");
     expect(asked).toEqual([]);
     await useAppStore.getState().loadRois("first@9f1c4e2b");
@@ -460,17 +508,165 @@ describe("loadRois", () => {
 
   it("asks once for a set it already holds", async () => {
     const asked: string[] = [];
-    useAppStore.setState({
-      client: stubClient(asked),
-      activeTensorId: "first",
-      requestedArrayId: null,
-      roisFor: null,
-      roisPending: null,
-      roisUnavailable: false,
-    });
+    fresh(stubClient(asked));
     await useAppStore.getState().loadRois("first");
     await useAppStore.getState().loadRois("first");
     expect(asked).toEqual(["first"]);
+  });
+
+  it("does not fetch a server-owned set until it is on screen", async () => {
+    // The lazy half: the listing names it, the rows wait for the toggle.
+    const asked: string[] = [];
+    fresh(stubClient(asked, [{ setName: "@ome", count: 120, reserved: true }]));
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first"]);
+    useAppStore.getState().toggleSetVisible("@ome");
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first", "first?@ome"]);
+    expect(Object.keys(selectRoiScopes(useAppStore.getState()))).toEqual(["", "@ome"]);
+  });
+
+  it("fetches a server-owned set a link names alongside the listing, not after it", async () => {
+    // Before any listing has landed the prefix says the set needs its own
+    // fetch, so a link straight to it does not wait a round trip to find out.
+    const asked: string[] = [];
+    fresh(stubClient(asked), { visibleSets: ["@ome"], visibleSetsFor: "first" });
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first", "first?@ome"]);
+  });
+
+  it("does not fetch a named set the listing says is not there", async () => {
+    const asked: string[] = [];
+    fresh(stubClient(asked, [{ setName: "@ome", count: 1, reserved: true }]));
+    await useAppStore.getState().loadRois("first");
+    useAppStore.setState({ visibleSets: ["@gone"], visibleSetsFor: "first" });
+    await useAppStore.getState().loadRois("first");
+    expect(asked).toEqual(["first"]);
+  });
+
+  it("holds a named set's rows beside the listing's, and replaces only its own on a refetch", async () => {
+    const row = (roiId: string, setName: string) => ({ ...ROI_FIXTURE[0]!, roiId, setName });
+    const client = {
+      http: {
+        listRois: (_arrayId: string, setName?: string) =>
+          Promise.resolve({
+            rois: setName ? [row("o1", "@ome")] : [row("n1", "nuclei")],
+            sets: [
+              { setName: "nuclei", count: 1, reserved: false },
+              { setName: "@ome", count: 1, reserved: true },
+            ],
+            truncated: false,
+            skipped: 0,
+          }),
+      },
+    } as unknown as TensorFlightClient;
+    fresh(client, { visibleSets: ["nuclei", "@ome"], visibleSetsFor: "first" });
+    await useAppStore.getState().loadRois("first");
+    expect(useAppStore.getState().rois.map((r) => r.roiId).sort()).toEqual(["n1", "o1"]);
+    expect(selectRoiSets(useAppStore.getState())).toHaveLength(2);
+  });
+
+  it("un-lands a set whose stored count no longer matches what it holds", async () => {
+    // The server rebuilds a reserved set on every registration. A later
+    // listing carries the new count, which is how the stale rows are noticed
+    // -- and the next loadRois fetches them again.
+    const asked: string[] = [];
+    let omeCount = 1;
+    const client = {
+      http: {
+        listRois: (arrayId: string, setName?: string) => {
+          asked.push(setName ? `${arrayId}?${setName}` : arrayId);
+          return Promise.resolve({
+            rois: setName ? [{ ...ROI_FIXTURE[0]!, roiId: "o1", setName: "@ome" }] : [],
+            sets: [{ setName: "@ome", count: omeCount, reserved: true }],
+            truncated: false,
+            skipped: 0,
+          });
+        },
+      },
+    } as unknown as TensorFlightClient;
+    fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
+    await useAppStore.getState().loadRois("first");
+    expect(Object.keys(selectRoiScopes(useAppStore.getState())).sort()).toEqual(["", "@ome"]);
+
+    // Something re-registered the source; the listing is fetched again for
+    // whatever reason and now says two rows.
+    omeCount = 2;
+    useAppStore.setState((s) => {
+      const scopes = { ...s.roiScopes };
+      delete scopes[""];
+      return { roiScopes: scopes };
+    });
+    await useAppStore.getState().loadRois("first");
+    expect(selectRoiScopes(useAppStore.getState())["@ome"]).toBeUndefined();
+    await useAppStore.getState().loadRois("first");
+    expect(asked.filter((a) => a.endsWith("?@ome"))).toHaveLength(2);
+  });
+
+  it("counts a row it could not read as held, rather than as someone else's change", async () => {
+    const client = {
+      http: {
+        listRois: (_arrayId: string, setName?: string) =>
+          Promise.resolve({
+            rois: setName ? [{ ...ROI_FIXTURE[0]!, roiId: "o1", setName: "@ome" }] : [],
+            sets: [{ setName: "@ome", count: 2, reserved: true }],
+            truncated: false,
+            skipped: setName ? 1 : 0,
+          }),
+      },
+    } as unknown as TensorFlightClient;
+    fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
+    await useAppStore.getState().loadRois("first");
+    useAppStore.setState((s) => {
+      const scopes = { ...s.roiScopes };
+      delete scopes[""];
+      return { roiScopes: scopes };
+    });
+    await useAppStore.getState().loadRois("first");
+    expect(selectRoiScopes(useAppStore.getState())["@ome"]).toEqual({ truncated: false, skipped: 1 });
+  });
+
+  it("does not un-land a set the cap clipped, which disagrees by construction", async () => {
+    const client = {
+      http: {
+        listRois: (_arrayId: string, setName?: string) =>
+          Promise.resolve({
+            rois: setName ? [{ ...ROI_FIXTURE[0]!, roiId: "o1", setName: "@ome" }] : [],
+            sets: [{ setName: "@ome", count: 5000, reserved: true }],
+            truncated: setName !== undefined,
+            skipped: 0,
+          }),
+      },
+    } as unknown as TensorFlightClient;
+    fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
+    await useAppStore.getState().loadRois("first");
+    useAppStore.setState((s) => {
+      const scopes = { ...s.roiScopes };
+      delete scopes[""];
+      return { roiScopes: scopes };
+    });
+    await useAppStore.getState().loadRois("first");
+    expect(selectRoiScopes(useAppStore.getState())["@ome"]).toEqual({ truncated: true, skipped: 0 });
+  });
+
+  it("lands a response for a tensor that moved on, out of view", async () => {
+    // Held under its own tensor, where the selectors hide it -- and where a
+    // switch back finds it without another round trip.
+    let resolve: (v: unknown) => void = () => {};
+    const client = {
+      http: {
+        listRois: () => new Promise((r) => { resolve = r; }),
+      },
+    } as unknown as TensorFlightClient;
+    fresh(client);
+    const load = useAppStore.getState().loadRois("first");
+    useAppStore.getState().selectSource("second");
+    resolve({ rois: [ROI_FIXTURE[0]], sets: [], truncated: false, skipped: 0 });
+    await load;
+    expect(useAppStore.getState().roisFor).toBe("first");
+    expect(selectRois(useAppStore.getState())).toEqual([]);
+    useAppStore.getState().selectSource("first");
+    expect(selectRois(useAppStore.getState())).toHaveLength(1);
   });
 });
 
@@ -713,19 +909,54 @@ describe("authoring state", () => {
     expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["srv3"]);
   });
 
-  it("drops a selection that was in the cleared set, and the set's hidden flag", async () => {
-    // The name means nothing once the set is gone, and leaving it behind would
-    // start a later set of the same name hidden.
+  it("drops a selection that was in the cleared set, and the set from the chosen list", async () => {
+    // The name means nothing once the set is gone, and leaving it on the list
+    // would pin a later set of the same name to this one's toggle.
     seedFor({ http: { deleteRois: () => Promise.resolve(["srv1"]) } });
     useAppStore.setState({
       rois: [stored({ roiId: "srv1", setName: "nuclei" }), stored({ roiId: "srv2", setName: "cells" })],
+      roiSets: [
+        { setName: "nuclei", count: 1, reserved: false },
+        { setName: "cells", count: 1, reserved: false },
+      ],
       selectedRoiId: "srv1",
-      hiddenSets: ["nuclei", "cells"],
-      hiddenSetsFor: "first",
+      visibleSets: ["nuclei", "cells"],
+      visibleSetsFor: "first",
     });
     await useAppStore.getState().clearRoiSet("nuclei");
     expect(useAppStore.getState().selectedRoiId).toBeNull();
-    expect(useAppStore.getState().hiddenSets).toEqual(["cells"]);
+    expect(useAppStore.getState().visibleSets).toEqual(["cells"]);
+    expect(useAppStore.getState().roiSets.map((set) => set.setName)).toEqual(["cells"]);
+  });
+
+  it("puts a new annotation's set on screen when the chosen list would hide it", async () => {
+    // A materialised list is exactly the sets shown, so a set switched off --
+    // or one that did not exist a moment ago -- would swallow the shape the
+    // user just traced.
+    seedFor({ http: { putRois: () => Promise.resolve({ stored: [stored({ setName: "fresh" })], conflicts: [], skipped: 0 }) } });
+    useAppStore.setState({
+      newSetName: "fresh",
+      roiSets: [],
+      visibleSets: ["nuclei"],
+      visibleSetsFor: "first",
+    });
+    await useAppStore.getState().createRoi(GEOM, {});
+    expect(useAppStore.getState().visibleSets).toEqual(["nuclei", "fresh"]);
+    // And the listing counts it, so a later listing does not read the row as
+    // someone else's change.
+    expect(useAppStore.getState().roiSets).toEqual([{ setName: "fresh", count: 1, reserved: false }]);
+  });
+
+  it("moves the listing's count with a delete, and back when it fails", async () => {
+    seedFor({ http: { deleteRois: () => Promise.reject(new Error("500 upstream")) } });
+    useAppStore.setState({
+      rois: [stored({ roiId: "srv1", setName: "nuclei" })],
+      roiSets: [{ setName: "nuclei", count: 1, reserved: false }],
+    });
+    const done = useAppStore.getState().deleteRoi("srv1");
+    expect(useAppStore.getState().roiSets[0]?.count).toBe(0);
+    await done;
+    expect(useAppStore.getState().roiSets[0]?.count).toBe(1);
   });
 
   it("keeps a selection that was in another set", async () => {

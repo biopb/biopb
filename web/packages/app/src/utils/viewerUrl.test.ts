@@ -149,6 +149,7 @@ describe("encodeViewerState", () => {
       volumeRenderMode: "minip",
       camera3d: { target: [12.5, 30, 7.2], zoom: -2.125, rotationX: 20, rotationOrbit: -45 },
       camera2d: null,
+      visibleSets: ["default", "@ome"],
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
     expect(decodeViewerState(qs, defaults(TENSOR.array_id))).toEqual(state);
@@ -241,6 +242,7 @@ describe("the 2-D camera", () => {
       volumeRenderMode: DEFAULT_VIEWER_URL_STATE.volumeRenderMode,
       camera3d: null,
       camera2d: { target: [10.5, 20.25], zoom: -1.5 },
+      visibleSets: null,
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
     // The target rounds to a tenth, as the encoder documents.
@@ -248,5 +250,34 @@ describe("the 2-D camera", () => {
       target: [10.5, 20.3],
       zoom: -1.5,
     });
+  });
+});
+
+describe("the annotation sets", () => {
+  it("are the tensor's default when the link names none", () => {
+    expect(decode("").visibleSets).toBeNull();
+  });
+
+  it("are exactly the ones named, one parameter each", () => {
+    // Repeated rather than joined: a set name is free text on the server, so
+    // a comma in one is a name, not a separator.
+    expect(decode("rs=default&rs=@ome&rs=a,b").visibleSets).toEqual(["default", "@ome", "a,b"]);
+    expect(decode("rs=default&rs=default").visibleSets).toEqual(["default"]);
+  });
+
+  it("reads a bare parameter as a choice of none, not as the default", () => {
+    expect(decode("rs=").visibleSets).toEqual([]);
+    expect(decode("rs=&rs=@ome").visibleSets).toEqual(["@ome"]);
+  });
+
+  it("is not written for the default, and is for a choice -- even of none", () => {
+    expect(enc({ visibleSets: null })).not.toContain("rs");
+    expect(enc({ visibleSets: [] })).toContain("rs=");
+    const out = enc({ visibleSets: ["default", "@ome"] });
+    expect(decodeURIComponent(out)).toContain("rs=default&rs=@ome");
+  });
+
+  it("replaces the link's sets rather than adding to them", () => {
+    expect(decodeURIComponent(enc({ visibleSets: ["@ome"] }, "rs=nuclei"))).not.toContain("nuclei");
   });
 });

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
-import { selectTileInfo, useAppStore } from "../store";
+import { selectTileInfo, selectVisibleSets, useAppStore } from "../store";
 import { DEFAULT_VIEWER_URL_STATE, encodeViewerState } from "../utils/viewerUrl";
 
 /**
@@ -28,6 +28,9 @@ export function useViewerUrlSync() {
   const requestedArrayId = useAppStore((s) => s.requestedArrayId);
   const camera3d = useAppStore((s) => s.camera3d);
   const camera2d = useAppStore((s) => s.camera2d);
+  // Scoped: a list chosen on the previous tensor must not be written into a
+  // link to this one.
+  const visibleSets = useAppStore(selectVisibleSets);
 
   const hydrated = useRef(false);
   // The effects below must not re-run when the URL changes -- they are what
@@ -61,7 +64,7 @@ export function useViewerUrlSync() {
     const arrayId = tileInfo?.array_id ?? requestedArrayId ?? activeTensorId;
     const next = encodeViewerState(
       paramsRef.current,
-      { arrayId, slice, render3d, volumeRenderMode, camera3d, camera2d },
+      { arrayId, slice, render3d, volumeRenderMode, camera3d, camera2d, visibleSets },
       { arrayId, ...DEFAULT_VIEWER_URL_STATE },
     );
     // Both scrub paths debounce before reaching the store, so this is already
@@ -78,6 +81,7 @@ export function useViewerUrlSync() {
     volumeRenderMode,
     camera3d,
     camera2d,
+    visibleSets,
     setSearchParams,
   ]);
 }

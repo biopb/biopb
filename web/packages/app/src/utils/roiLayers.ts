@@ -23,6 +23,7 @@ import { pinnableAxes, planePinFor, roiVisibleOnPlane, sliderAxes } from "@biopb
 import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-client";
 import { vivSelection, type SliceIndices } from "./vivUtils";
 import { CLOSE_HANDLE_PX, type RoiDraft } from "./roiDraft";
+import { isSetShown } from "./roiVisibility";
 
 /** An `[x, y]` in level-0 image pixels, the space deck.gl draws these in. */
 export type XY = [number, number];
@@ -180,11 +181,10 @@ export function roiPath(geometry: RoiGeometry): XY[] | null {
 export function visibleRois(
   rois: RoiAnnotation[],
   currentPlane: Record<number, number>,
-  hiddenSets: string[],
+  visibleSets: string[] | null,
 ): RoiAnnotation[] {
-  const hidden = new Set(hiddenSets);
   return rois.filter(
-    (roi) => !hidden.has(roi.setName) && roiVisibleOnPlane(roi.plane, currentPlane),
+    (roi) => isSetShown(roi.setName, visibleSets) && roiVisibleOnPlane(roi.plane, currentPlane),
   );
 }
 
@@ -235,7 +235,8 @@ export interface RoiLayerOptions {
   rois: RoiAnnotation[];
   /** `axis -> index` for the plane on screen; see `planePinFor`. */
   currentPlane: Record<number, number>;
-  hiddenSets: string[];
+  /** The sets on screen, or null for the default; see `isSetShown`. */
+  visibleSets: string[] | null;
   /** The overlay toggle. False yields no layers at all rather than hidden ones. */
   visible: boolean;
 }
@@ -257,9 +258,9 @@ export interface RoiLayerOptions {
  * annotation lies. Phase 3 has to route around that rather than just flip this.
  */
 export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
-  const { rois, currentPlane, hiddenSets, visible } = options;
+  const { rois, currentPlane, visibleSets, visible } = options;
   if (!visible) return [];
-  const shown = visibleRois(rois, currentPlane, hiddenSets);
+  const shown = visibleRois(rois, currentPlane, visibleSets);
   if (shown.length === 0) return [];
 
   const rings = shown

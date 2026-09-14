@@ -21,17 +21,18 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  CLIENT_OWNED_SCOPE,
   selectBroadcastAxes,
-  selectHiddenSets,
+  selectRoiScopes,
   selectRoiSets,
   selectRois,
   selectRoisError,
-  selectRoisLoading,
-  selectRoisSkipped,
-  selectRoisTruncated,
+  selectRoisPending,
   selectSelectedRoi,
   selectTileInfo,
+  selectVisibleSets,
   useAppStore,
+  type RoiScopeState,
 } from "../store";
 import {
   currentPlaneFor,
@@ -40,7 +41,8 @@ import {
   setColor,
   visibleRois,
 } from "../utils/roiLayers";
-import { pinnableAxes, roiVisibleOnPlane } from "@biopb/tensor-flight-client";
+import { isSetShown } from "../utils/roiVisibility";
+import { isReservedSetName, pinnableAxes, roiVisibleOnPlane } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, RoiSetInfo, SliderAxis } from "@biopb/tensor-flight-client";
 
 /**
@@ -73,14 +75,18 @@ export interface RoiPanelViewProps {
   sets: RoiSetInfo[];
   /** `axis -> index` for the plane on screen. */
   currentPlane: Record<number, number>;
-  hiddenSets: string[];
+  /** The sets on screen, or null for the tensor's default. */
+  visibleSets: string[] | null;
+  /**
+   * What has landed: `""` for the client-owned listing, a set name for a
+   * server-owned set fetched on its own. Where the cap and the unreadable-row
+   * warnings come from, per fetch.
+   */
+  scopes: Record<string, RoiScopeState>;
+  /** The scopes in flight, keyed the same way. */
+  pending: string[];
   showRois: boolean;
-  loading: boolean;
   error: string | null;
-  /** The per-tensor cap clipped the set: what is shown is not all there is. */
-  truncated: boolean;
-  /** Rows whose geometry this client could not read. */
-  skipped: number;
   /** The server does not offer annotations at all -- render nothing. */
   unavailable: boolean;
   onToggleOverlay: (value: boolean) => void;
@@ -93,12 +99,11 @@ export function RoiPanelView({
   rois,
   sets,
   currentPlane,
-  hiddenSets,
+  visibleSets,
+  scopes,
+  pending,
   showRois,
-  loading,
   error,
-  truncated,
-  skipped,
   unavailable,
   onToggleOverlay,
   onToggleSet,
@@ -120,9 +125,15 @@ export function RoiPanelView({
   // rather than show a permanently empty panel.
   if (unavailable) return null;
 
-  const owned = roiSetCounts(rois);
+  // The client-owned sets from the rows, so an optimistic create counts before
+  // any refetch; the server-owned ones from the listing, which is the only
+  // place a set not fetched yet is named at all.
+  const owned = roiSetCounts(rois.filter((roi) => !isReservedSetName(roi.setName)));
   const serverOwned = sets.filter((set) => set.reserved);
-  const onPlane = visibleRois(rois, currentPlane, hiddenSets).length;
+  const loading = pending.includes(CLIENT_OWNED_SCOPE);
+  const truncated = Object.keys(scopes).filter((scope) => scopes[scope]?.truncated);
+  const skipped = Object.values(scopes).reduce((sum, scope) => sum + scope.skipped, 0);
+  const onPlane = visibleRois(rois, currentPlane, visibleSets).length;
 
   return (
     <section className="roi-panel">
@@ -147,7 +158,7 @@ export function RoiPanelView({
       {(owned.length > 0 || serverOwned.length > 0) && (
         <ul className="roi-sets">
           {owned.map(({ setName, count }) => {
-            const hidden = hiddenSets.includes(setName);
+            const hidden = !isSetShown(setName, visibleSets);
             return (
               <li key={setName}>
                 <label style={{ opacity: hidden ? 0.45 : 1 }}>
@@ -177,29 +188,38 @@ export function RoiPanelView({
               </li>
             );
           })}
-          {serverOwned.map(({ setName, count }) => (
-            <li key={setName}>
-              <span
-                className="roi-set-name"
-                title="Filled from the source file and read-only. Ask for it by name to read it."
-              >
-                <span style={swatch(setName)} />
-                {setName}
-              </span>
-              <span className="roi-set-actions">
-                <span className="roi-count">{count}</span>
-              </span>
-            </li>
-          ))}
+          {serverOwned.map(({ setName, count }) => {
+            // Switched on is what fetches it, so the row is where that is
+            // seen to happen. No clear button: the server refuses the write.
+            const hidden = !isSetShown(setName, visibleSets);
+            return (
+              <li key={setName}>
+                <label
+                  style={{ opacity: hidden ? 0.45 : 1 }}
+                  title="Filled from the source file, and read-only. Fetched when switched on."
+                >
+                  <input type="checkbox" checked={!hidden} onChange={() => onToggleSet(setName)} />{" "}
+                  <span style={swatch(setName)} />
+                  {setName}
+                </label>
+                <span className="roi-set-actions">
+                  <span className="roi-count">
+                    {pending.includes(setName) ? "loading…" : count}
+                  </span>
+                </span>
+              </li>
+            );
+          })}
         </ul>
       )}
 
-      {truncated && (
-        <p className="roi-note">
-          The server returned its per-tensor maximum — this tensor holds more
-          annotations than are shown.
+      {truncated.map((scope) => (
+        <p key={scope} className="roi-note">
+          {scope === CLIENT_OWNED_SCOPE
+            ? "The server returned its per-tensor maximum — this tensor holds more annotations than are shown."
+            : `The server returned its per-tensor maximum for ${scope} — that set holds more annotations than are shown.`}
         </p>
-      )}
+      ))}
       {skipped > 0 && (
         <p className="roi-note">
           {skipped} annotation{skipped === 1 ? "" : "s"} could not be read by this
@@ -220,15 +240,14 @@ export function RoiPanelView({
 export function RoiPanel() {
   const rois = useAppStore(selectRois);
   const sets = useAppStore(selectRoiSets);
-  const loading = useAppStore(selectRoisLoading);
+  const scopes = useAppStore(selectRoiScopes);
+  const pending = useAppStore(selectRoisPending);
   const error = useAppStore(selectRoisError);
-  const truncated = useAppStore(selectRoisTruncated);
-  const skipped = useAppStore(selectRoisSkipped);
-  const hiddenSets = useAppStore(selectHiddenSets);
+  const visibleSets = useAppStore(selectVisibleSets);
   const unavailable = useAppStore((s) => s.roisUnavailable);
   const showRois = useAppStore((s) => s.showRois);
   const onToggleOverlay = useAppStore((s) => s.setShowRois);
-  const onToggleSet = useAppStore((s) => s.toggleSetHidden);
+  const onToggleSet = useAppStore((s) => s.toggleSetVisible);
   const onClearSet = useAppStore((s) => s.clearRoiSet);
   const tileInfo = useAppStore(selectTileInfo);
   const slice = useAppStore((s) => s.slice);
@@ -239,12 +258,11 @@ export function RoiPanel() {
       rois={rois}
       sets={sets}
       currentPlane={currentPlane}
-      hiddenSets={hiddenSets}
+      visibleSets={visibleSets}
+      scopes={scopes}
+      pending={pending}
       showRois={showRois}
-      loading={loading}
       error={error}
-      truncated={truncated}
-      skipped={skipped}
       unavailable={unavailable}
       onToggleOverlay={onToggleOverlay}
       onToggleSet={onToggleSet}

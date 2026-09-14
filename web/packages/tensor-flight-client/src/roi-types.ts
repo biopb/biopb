@@ -84,6 +84,17 @@ export interface RoiAnnotationInput {
   drawnAgainstVersion?: string;
 }
 
+/**
+ * Whether a set name is server-owned, by the server's own naming rule.
+ *
+ * `RoiSetInfo.reserved` is the authoritative answer, but it exists only once a
+ * listing has landed; a name met before that -- one a link carries -- is judged
+ * by the prefix the server reserves.
+ */
+export function isReservedSetName(setName: string): boolean {
+  return setName.startsWith("@");
+}
+
 /** One annotation layer on a tensor, as the server enumerates it. */
 export interface RoiSetInfo {
   setName: string;
