@@ -267,9 +267,16 @@ class Nd2Adapter(TensorAdapter):
                 dim_labels = None
             self.dim_labels = list(dim_labels or native_labels)
 
+        # T/Z only: P is fixed for a position-level adapter, never looped.
         self._present_loop_axes = tuple(
-            axis for axis in _LOOP_AXES if axis in layout.labels
+            axis
+            for axis in _LOOP_AXES
+            if axis in layout.labels and axis != _POSITION_AXIS
         )
+        if position is not None:
+            self._frame_indices, self._frame_shape = self._position_frame_plan(
+                layout, position
+            )
 
         # One reader per position, held warm the same way CziAdapter holds its
         # libCZI reader -- ``nd2.read_frame`` returns a zero-copy view onto
@@ -281,13 +288,38 @@ class Nd2Adapter(TensorAdapter):
         self._active_reads = 0
         self._tensor_adapters: Dict[str, Nd2Adapter] = {}
 
+    def _position_frame_plan(
+        self, layout: "_Nd2Layout", position: int
+    ) -> Tuple[Dict[Tuple[int, ...], int], Tuple[int, ...]]:
+        """The (T, Z) frame-index lookup and reshape target for one fixed
+        position, computed once rather than re-derived on every read.
+
+        ``read_frame`` never returns a ``P`` axis, so both live in field
+        space from the start -- no leading size-1 axis is ever created only
+        to be sliced back off.
+        """
+        if _POSITION_AXIS not in layout.labels:
+            frame_indices = dict(layout.frame_indices)
+        else:
+            present = tuple(axis for axis in _LOOP_AXES if axis in layout.labels)
+            p_index = present.index(_POSITION_AXIS)
+            frame_indices = {
+                key[:p_index] + key[p_index + 1 :]: frame_index
+                for key, frame_index in layout.frame_indices.items()
+                if key[p_index] == position
+            }
+        frame_shape = tuple(self._native_block(layout.field_labels, layout.field_shape))
+        return frame_indices, frame_shape
+
     # ---- descriptors --------------------------------------------------------
 
-    def _descriptor_for(self, position: int) -> TensorDescriptor:
-        native_labels = self._layout.field_labels
+    def _descriptor_for(
+        self, position: int, labels: Optional[List[str]] = None
+    ) -> TensorDescriptor:
+        if labels is None:
+            labels = self._layout.field_labels
         shape = self._layout.field_shape
         dtype = self._layout.dtype.str
-        labels = list(self.dim_labels) if self.position == position else native_labels
         return TensorDescriptor(
             array_id=f"{self.source_id}/{_POSITION_AXIS}:{position}",
             dim_labels=labels,
@@ -304,7 +336,7 @@ class Nd2Adapter(TensorAdapter):
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         if self.position is not None:
-            return self._descriptor_for(self.position)
+            return self._descriptor_for(self.position, labels=self.dim_labels)
         return self.get_tensor_adapter(f"{_POSITION_AXIS}:0").get_tensor_descriptor()
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> "Nd2Adapter":
@@ -414,16 +446,6 @@ class Nd2Adapter(TensorAdapter):
             range(starts[axis], stops[axis], steps[axis]) for axis in sequence_axes
         ]
 
-        full_labels = [label.upper() for label in self._layout.labels]
-        full_shape = tuple(int(size) for size in self._layout.shape)
-        frame_shape = tuple(
-            1 if label in {"P", "T", "Z"} else size
-            for label, size in zip(full_labels, full_shape, strict=True)
-        )
-        position_axis = (
-            full_labels.index(_POSITION_AXIS) if _POSITION_AXIS in full_labels else None
-        )
-
         with self._io_lock:
             reader = self._acquire_reader()
             try:
@@ -435,15 +457,9 @@ class Nd2Adapter(TensorAdapter):
                         labels[axis]: coordinate
                         for axis, coordinate in coordinate_by_axis.items()
                     }
-                    if position_axis is not None:
-                        coordinate_by_label[_POSITION_AXIS] = self.position
                     key = _loop_key(coordinate_by_label, self._present_loop_axes)
-                    frame_index = self._layout.frame_indices[key]
-                    frame = reader.read_frame(frame_index).reshape(frame_shape)
-                    if position_axis is not None:
-                        # This position is fixed for the whole read, not a
-                        # bound; always take its one row rather than slicing it.
-                        frame = frame[(slice(None),) * position_axis + (0,)]
+                    frame_index = self._frame_indices[key]
+                    frame = reader.read_frame(frame_index).reshape(self._frame_shape)
 
                     source_slices = []
                     output_slices = []

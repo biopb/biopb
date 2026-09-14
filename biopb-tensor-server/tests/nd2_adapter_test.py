@@ -46,6 +46,7 @@ class _FakeOme:
 
 
 _DEFAULT_DTYPE = np.dtype("<u2")
+_DEFAULT_SIZES = {"P": 2, "T": 3, "Z": 2, "C": 2, "Y": 4, "X": 5}
 
 
 class _FakeND2File:
@@ -71,7 +72,7 @@ class _FakeND2File:
     ):
         type(self).opens += 1
         self.path = path
-        self._sizes = sizes or {"P": 2, "T": 3, "Z": 2, "C": 2, "Y": 4, "X": 5}
+        self._sizes = sizes or dict(_DEFAULT_SIZES)
         self._dtype = dtype
         self._voxel = voxel
         self._loop_indices = loop_indices
@@ -198,9 +199,7 @@ def test_local_nd2_claims_natively_and_splits_positions_into_tensors(
         assert desc.dtype == np.dtype("<u2").str
 
     field = source.get_tensor_adapter(descriptors[1].array_id)
-    expected, _ = _expected_field(
-        {"P": 2, "T": 3, "Z": 2, "C": 2, "Y": 4, "X": 5}, 1, ("P", "T", "Z")
-    )
+    expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
     whole = field.get_data(ChunkBounds(start=[0] * 5, stop=list(descriptors[1].shape)))
     np.testing.assert_array_equal(whole, expected)
 
@@ -211,8 +210,7 @@ def test_interior_crop_reads_only_the_requested_window(tmp_path, monkeypatch):
     _install_fake(monkeypatch)
     source = Nd2Adapter.create_from_config(_source(path))
     field = source.get_tensor_adapter("P:0")
-    sizes = {"P": 2, "T": 3, "Z": 2, "C": 2, "Y": 4, "X": 5}
-    expected, _ = _expected_field(sizes, 0, ("P", "T", "Z"))
+    expected, _ = _expected_field(_DEFAULT_SIZES, 0, ("P", "T", "Z"))
 
     bounds = ChunkBounds(start=[1, 0, 0, 1, 1], stop=[3, 2, 2, 3, 4])
     got = field.get_data(bounds)
@@ -225,8 +223,7 @@ def test_decimated_read_matches_a_strided_slice_of_the_full_read(tmp_path, monke
     _install_fake(monkeypatch)
     source = Nd2Adapter.create_from_config(_source(path))
     field = source.get_tensor_adapter("P:1")
-    sizes = {"P": 2, "T": 3, "Z": 2, "C": 2, "Y": 4, "X": 5}
-    expected, _ = _expected_field(sizes, 1, ("P", "T", "Z"))
+    expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
 
     field_shape = field.get_tensor_descriptor().shape
     bounds = ChunkBounds(start=[0] * 5, stop=list(field_shape))
