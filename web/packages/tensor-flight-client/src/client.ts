@@ -652,11 +652,11 @@ export class TensorHttpClient {
   // -------------------------------------------------------------------------
 
   /**
-   * A tensor's whole annotation set (`GET /api/rois`), optionally one layer.
+   * A tensor's annotations (`GET /api/rois`), or one layer.
    *
-   * Whole-set by design -- there is no plane or bbox filter on the route. The
-   * client needs every ROI resident to hit-test and re-render, and a
-   * viewport-filtered fetch would make the ROI being edited vanish on a pan.
+   * Without `setName` the result covers the client-owned sets; a reserved
+   * (`@`) set comes back only when named. No plane or bbox filter on the
+   * route -- the client filters the resident set in memory.
    */
   async listRois(arrayId: string, setName?: string, opts?: RequestOptions): Promise<RoiListResult> {
     const query = setName ? `?set=${encodeURIComponent(setName)}` : "";

@@ -110,8 +110,9 @@ export interface RoiAnnotation {
 
 ## Fetching
 
-`GET /api/rois/{array_id}` returns the tensor's whole set. One fetch per tensor,
-held in the store, filtered in memory.
+`GET /api/rois/{array_id}` returns the tensor's client-owned sets. One fetch per
+tensor, held in the store, filtered in memory. A server-owned (`@`) set is
+returned only when named with `?set=`, so the SPA does not see one today.
 
 **Why not a viewport filter.** The ROI being edited would vanish on a pan.
 

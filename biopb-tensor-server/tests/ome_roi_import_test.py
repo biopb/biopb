@@ -444,7 +444,7 @@ class TestRegistration:
         db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=2))))
 
         assert _reserved(db) == ["Shape:0"]
-        (roi,), _ = db.list_rois(ARRAY_0)
+        (roi,), _ = db.list_rois(ARRAY_0, set_name=OME_SET_NAME)
         assert (roi.roi.point.x, roi.roi.point.y) == (1.0, 2.0)
 
     def test_the_rois_are_stripped_from_source_metadata(self):
@@ -474,7 +474,7 @@ class TestRegistration:
             SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=9, y=9, id="Shape:0")))
         )
         assert _reserved(db) == ["Shape:0"]
-        (roi,), _ = db.list_rois(ARRAY_0)
+        (roi,), _ = db.list_rois(ARRAY_0, set_name=OME_SET_NAME)
         assert (roi.roi.point.x, roi.roi.point.y) == (9.0, 9.0)
 
     def test_a_file_that_loses_its_rois_loses_its_rows(self):

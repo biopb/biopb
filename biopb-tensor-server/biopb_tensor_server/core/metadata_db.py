@@ -1928,17 +1928,18 @@ class MetadataDatabase:
     def list_rois(
         self, array_id: str, set_name: str = ""
     ) -> Tuple[List[RoiAnnotation], bool]:
-        """Return a tensor's whole annotation set (optionally one layer).
+        """A tensor's annotations.
 
-        No plane or bbox filter by design: a client needs every ROI resident to
-        hit-test, drag a vertex and re-render, and a viewport-filtered fetch
-        would make the ROI being edited vanish on a pan. Analytic slicing is the
-        SQL surface's job.
+        ``set_name`` selects one layer, and is the only way to read a reserved
+        set: an unqualified list covers the client-owned sets alone.
+
+        No plane or bbox filter: a client hit-tests and re-renders from the
+        resident set. Analytic slicing is the SQL surface's job.
 
         Returns:
-            ``(rois, truncated)``. ``truncated`` is true only if the row count
-            somehow exceeds the per-tensor cap (rows written before a lowered
-            cap), in which case the result is clipped.
+            ``(rois, truncated)``. ``truncated`` is true when the tensor holds
+            more rows in scope than the per-tensor cap, in which case the result
+            is clipped.
         """
         if not array_id:
             raise ValueError("array_id is required")
@@ -1953,6 +1954,12 @@ class MetadataDatabase:
         if set_name:
             sql += " AND set_name = ?"
             params.append(set_name)
+        else:
+            # Reserved sets are outside the write cap and their rows carry the
+            # registration timestamp, so in created_at order a large import
+            # fills the read cap ahead of anything a user drew.
+            sql += " AND NOT starts_with(set_name, ?)"
+            params.append(RESERVED_SET_PREFIX)
         # Stable order so a client diffing two reads sees no spurious churn.
         sql += " ORDER BY created_at, roi_id LIMIT ?"
         params.append(self._max_rois_per_tensor + 1)

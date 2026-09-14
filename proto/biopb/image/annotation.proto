@@ -109,15 +109,14 @@ message RoiPutResult {
 
 // Body of the "roi_list" action.
 //
-// There is deliberately NO plane or bbox filter: a client fetches a tensor's
-// whole annotation set and filters in memory (it needs every ROI resident to
-// hit-test, drag a vertex and re-render anyway), and a viewport-filtered fetch
-// would make the ROI being edited disappear on a pan. Analytic slicing is the
-// SQL surface's job (the `rois` table is readable via query_sources).
+// There is no plane or bbox filter: a client filters the resident set in
+// memory. Analytic slicing is the SQL surface's job (the `rois` table is
+// readable via query_sources).
 message RoiListRequest {
   string array_id = 1;
 
-  // Restrict to one layer. Empty -> every set on the tensor.
+  // Restrict to one layer, and the only way to read a reserved ("@") set.
+  // Empty -> the tensor's client-owned sets.
   string set_name = 2;
 }
 

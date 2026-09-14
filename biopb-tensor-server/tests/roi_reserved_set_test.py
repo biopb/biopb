@@ -134,6 +134,46 @@ class TestReusingAnImportedId:
         assert _sets(db) == {"ROI:3": RESERVED, "clone-1": "mine"}
 
 
+class TestListingAReservedSet:
+    def test_an_unqualified_list_omits_it(self):
+        db = MetadataDatabase()
+        _plant(db, "ROI:3")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="mine", set_name="mine")])
+
+        rois, _ = db.list_rois(ARRAY_ID)
+        assert [r.roi_id for r in rois] == ["mine"]
+
+    def test_naming_it_returns_it(self):
+        db = MetadataDatabase()
+        _plant(db, "ROI:3")
+
+        rois, _ = db.list_rois(ARRAY_ID, set_name=RESERVED)
+        assert [r.roi_id for r in rois] == ["ROI:3"]
+
+    def test_an_import_at_the_cap_leaves_hand_drawn_rows_readable(self):
+        # An import is not bounded by the write cap and its rows carry the
+        # registration timestamp, so in created_at order they sort ahead of
+        # anything a user drew.
+        db = MetadataDatabase(max_rois_per_tensor=3)
+        earlier = datetime.now() - timedelta(hours=1)
+        for i in range(3):
+            _plant(db, f"ROI:{i}", when=earlier)
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="mine", set_name="mine")])
+
+        rois, truncated = db.list_rois(ARRAY_ID)
+        assert [r.roi_id for r in rois] == ["mine"]
+        assert not truncated
+
+    def test_truncation_counts_only_the_rows_in_scope(self):
+        db = MetadataDatabase(max_rois_per_tensor=2)
+        for i in range(3):
+            _plant(db, f"ROI:{i}")
+        db.put_rois(ARRAY_ID, [_annotation(roi_id="mine", set_name="mine")])
+
+        assert db.list_rois(ARRAY_ID)[1] is False
+        assert db.list_rois(ARRAY_ID, set_name=RESERVED)[1] is True
+
+
 class TestDeletingAReservedSet:
     def test_naming_the_set_is_refused(self):
         db = MetadataDatabase()
