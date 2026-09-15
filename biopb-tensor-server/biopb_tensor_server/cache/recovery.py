@@ -1,10 +1,13 @@
-"""Crash recovery utilities for file-based cache.
+"""Crash recovery utilities and Sieve-K bookkeeping for the file-based cache.
 
 Provides:
 - WriteAheadLog: Detect incomplete writes after crash
 - ProcessLock: Single-owner lock on the cache dir + unclean-exit detection
 - SegmentEntryInfo: Metadata for entries stored in segments
 - RecoveryStatus: Result of crash recovery
+- SieveKSegmentInfo / PoolQueueInfo: own the Sieve-K counter, hand-sweep
+  eviction, and hit/miss accounting; ``ArrowFileBackend`` drives them but
+  does not reach into their fields directly.
 """
 
 from __future__ import annotations
@@ -15,9 +18,12 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from biopb._lifecycle.file_lock import ExclusiveFileLock
+
+# Sieve-K counter saturation cap (levels: 0, 1, ..., K).
+K = 2
 
 
 @dataclass
@@ -59,6 +65,19 @@ class SieveKSegmentInfo:
     frequency: int = 0  # Saturating counter (0 to K=2)
     mmap_released: bool = False  # True if mmap handle was released for cold segment
 
+    def record_hit(self, now: float) -> None:
+        """Count an access: saturate the Sieve-K counter, refresh recency."""
+        self.frequency = min(K, self.frequency + 1)
+        self.last_access_time = now
+
+    def is_cold(self) -> bool:
+        """True once the Sieve-K hand has swept this segment's counter to 0."""
+        return self.frequency <= 0
+
+    def decay(self) -> None:
+        """One Sieve-K hand sweep past a hot segment: decrement its counter."""
+        self.frequency -= 1
+
 
 @dataclass
 class PoolQueueInfo:
@@ -85,6 +104,63 @@ class PoolQueueInfo:
     )  # segment_id -> info
     hits: int = 0
     misses: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
+
+    def add_segment(self, seg_info: SieveKSegmentInfo, *, newest: bool) -> None:
+        """Track a new segment. ``newest=True`` for one just opened for writes;
+        ``newest=False`` for one restored at boot, oldest at the tail."""
+        if newest:
+            self.queue.appendleft(seg_info.segment_id)
+        else:
+            self.queue.append(seg_info.segment_id)
+        self.segments[seg_info.segment_id] = seg_info
+
+    def record_hit(self, seg_info: SieveKSegmentInfo, now: float) -> None:
+        """Count a hit against both the segment's Sieve-K counter and the pool."""
+        seg_info.record_hit(now)
+        self.hits += 1
+
+    def record_miss(self) -> None:
+        self.misses += 1
+
+    def select_victim(self, is_evictable: Callable[[int], bool]) -> Optional[int]:
+        """Run one Sieve-K hand sweep, evicting the first cold segment found.
+
+        Two sweeps around the queue at most: a segment whose counter is still
+        hot after a full pass has had it decremented, so a second pass can
+        reach zero. The victim is popped from ``queue``/``segments`` before it
+        is returned; the caller still owns removing its files.
+        """
+        for _ in range(len(self.queue) * 2):
+            if self.hand >= len(self.queue):
+                self.hand = 0
+
+            # deque: newest at left (index 0), oldest at right (index -1).
+            # -1 - hand: tail is index -1, hand=0 -> -1, hand=1 -> -2, etc.
+            idx = -1 - self.hand
+            seg_id = self.queue[idx]
+            seg_info = self.segments.get(seg_id)
+
+            # Skip a segment with no info, or one still being served.
+            if seg_info is None or not is_evictable(seg_id):
+                self.hand += 1
+                continue
+
+            if not seg_info.is_cold():
+                seg_info.decay()
+                self.hand += 1
+                continue
+
+            # Cold segment: evict. Hand stays at this position for next time.
+            del self.queue[idx]
+            self.segments.pop(seg_id, None)
+            return seg_id
+
+        return None
 
 
 @dataclass

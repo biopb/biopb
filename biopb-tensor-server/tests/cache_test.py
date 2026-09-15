@@ -25,10 +25,10 @@ from biopb_tensor_server.cache.file_backend import (
     SIZE_CLASS_TINY_THRESHOLD,
     ArrowFileBackend,
     ArrowFileConfig,
-    K,
     _get_size_class,
 )
 from biopb_tensor_server.cache.recovery import (
+    K,
     ProcessLock,
     WriteAheadLog,
 )

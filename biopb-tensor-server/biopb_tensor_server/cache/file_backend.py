@@ -47,10 +47,8 @@ __all__ = ["ArrowFileBackend", "ArrowFileConfig", "ChunkLocation"]
 logger = logging.getLogger(__name__)
 
 
-# Sieve-K constants
-K = 2  # Counter saturates at K (levels: 0, 1, 2)
+# Segment mmap lifecycle (release the handle for a segment gone cold+idle).
 COLD_THRESHOLD_SECONDS = 300  # 5 minutes without access
-COLD_FREQUENCY_THRESHOLD = 0  # frequency == 0
 MMAP_LIFECYCLE_THRESHOLD = 100  # Only manage mmaps when segments > 100
 
 
@@ -783,15 +781,15 @@ class ArrowFileBackend(CacheBackend):
         pool_queue = self._get_or_create_pool_queue(pool_key)
         self._segment_pool_key[segment_id] = pool_key
         # Oldest at the tail: a rebuilt segment predates this session's writes.
-        pool_queue.queue.append(segment_id)
-        pool_queue.segments[segment_id] = SieveKSegmentInfo(
-            segment_id=segment_id,
-            size_bytes=st.st_size,
-            created_at=segment_created,
-            last_access_time=segment_created,
-            entry_count=len(records),
-            frequency=0,
-            mmap_released=False,
+        pool_queue.add_segment(
+            SieveKSegmentInfo(
+                segment_id=segment_id,
+                size_bytes=st.st_size,
+                created_at=segment_created,
+                last_access_time=segment_created,
+                entry_count=len(records),
+            ),
+            newest=False,
         )
 
     def _load_segment_from_sidecar(self, segment_id: int, seg_file: Path) -> bool:
@@ -942,15 +940,15 @@ class ArrowFileBackend(CacheBackend):
         pool_queue = self._get_or_create_pool_queue(pool_key)
 
         # Track segment in pool queue (at head since newest)
-        pool_queue.queue.appendleft(segment_id)
-        pool_queue.segments[segment_id] = SieveKSegmentInfo(
-            segment_id=segment_id,
-            size_bytes=0,
-            created_at=time.time(),
-            last_access_time=time.time(),
-            entry_count=0,
-            frequency=0,  # New segments start with counter=0
-            mmap_released=False,
+        pool_queue.add_segment(
+            SieveKSegmentInfo(
+                segment_id=segment_id,
+                size_bytes=0,
+                created_at=time.time(),
+                last_access_time=time.time(),
+                entry_count=0,
+            ),
+            newest=True,
         )
 
         # Register in pool tracking
@@ -1119,12 +1117,7 @@ class ArrowFileBackend(CacheBackend):
 
         def order(pool_key: Tuple[RetentionClass, SizeClass]):
             pool = self._pool_queues[pool_key]
-            total = pool.hits + pool.misses
-            return (
-                EVICTION_RANK[pool_key[0]],
-                pool.hits / total if total > 0 else 0.0,
-                -len(pool.queue),
-            )
+            return (EVICTION_RANK[pool_key[0]], pool.hit_rate, -len(pool.queue))
 
         # A class absent from EVICTION_RANK (pinned) is never a victim.
         candidates = [
@@ -1142,39 +1135,9 @@ class ArrowFileBackend(CacheBackend):
         target_pool = self._select_pool_for_eviction()
         if target_pool is not None:
             pool_queue = self._pool_queues[target_pool]
-
-            # One sweep of the hand per candidate, twice around at most: a
-            # segment whose counter is still hot after a full pass has had it
-            # decremented, so a second pass can reach zero.
-            for _ in range(len(pool_queue.queue) * 2):
-                # Wrap hand if it exceeds queue length
-                if pool_queue.hand >= len(pool_queue.queue):
-                    pool_queue.hand = 0
-
-                # Get segment at hand offset from tail
-                # deque: newest at left (index 0), oldest at right (index -1 is tail)
-                # -1 - hand: tail is index -1, hand=0 → -1, hand=1 → -2, etc.
-                idx = -1 - pool_queue.hand
-                seg_id = pool_queue.queue[idx]
-                seg_info = pool_queue.segments.get(seg_id)
-
-                # Skip a segment with no info, or one still being served.
-                if seg_info is None or not self._segment_is_evictable(seg_id):
-                    pool_queue.hand += 1
-                    continue
-
-                if seg_info.frequency > 0:
-                    # Hot segment: decrement counter, advance hand
-                    seg_info.frequency -= 1
-                    pool_queue.hand += 1
-                    continue
-
-                # Cold segment (frequency == 0): evict
+            seg_id = pool_queue.select_victim(self._segment_is_evictable)
+            if seg_id is not None:
                 self._do_evict_segment(seg_id)
-                pool_queue.segments.pop(seg_id, None)
-                # O(n) deletion from deque, acceptable for <1000 segments
-                del pool_queue.queue[idx]
-                # Hand stays at this position for next eviction
                 return True
 
         # Nothing to evict
@@ -1206,10 +1169,7 @@ class ArrowFileBackend(CacheBackend):
         for _pool_key, pool in self._pool_queues.items():
             for seg_id, seg_info in pool.segments.items():
                 age = now - seg_info.last_access_time
-                if (
-                    seg_info.frequency <= COLD_FREQUENCY_THRESHOLD
-                    and age > COLD_THRESHOLD_SECONDS
-                ):
+                if seg_info.is_cold() and age > COLD_THRESHOLD_SECONDS:
                     self._forget_segment_mmap(seg_id)
                     seg_info.mmap_released = True
 
@@ -1513,10 +1473,7 @@ class ArrowFileBackend(CacheBackend):
         seg_info = pool_queue.segments.get(segment_id) if pool_queue else None
         if seg_info is None:
             return
-        # Sieve-K: increment counter on hit, saturating at K=2
-        seg_info.frequency = min(K, seg_info.frequency + 1)
-        seg_info.last_access_time = time.time()
-        pool_queue.hits += 1
+        pool_queue.record_hit(seg_info, time.time())
 
     def start_compute(
         self, key: bytes, retention: RetentionClass = "normal"
@@ -1655,7 +1612,7 @@ class ArrowFileBackend(CacheBackend):
                 # persisted by the writer thread, which has only the key.
                 pool_key = (entry.retention, size_class)
                 pool_queue = self._get_or_create_pool_queue(pool_key)
-                pool_queue.misses += 1
+                pool_queue.record_miss()
 
                 # Find or create the open segment for this pool.
                 # _create_segment_for_pool registers writer and sink together,
@@ -2024,15 +1981,13 @@ class ArrowFileBackend(CacheBackend):
         pool_stats = {}
         for pool_key, pool in self._pool_queues.items():
             pool_name = f"{pool_key[0]}-{pool_key[1]}"
-            total = pool.hits + pool.misses
-            hit_rate = pool.hits / total if total > 0 else 0.0
             pool_stats[pool_name] = PoolStats(
                 pool_key=pool_name,
                 hits=pool.hits,
                 misses=pool.misses,
                 segments=len(pool.queue),
                 bytes=sum(s.size_bytes for s in pool.segments.values()),
-                hit_rate=hit_rate,
+                hit_rate=pool.hit_rate,
             )
 
         return CacheStats(
