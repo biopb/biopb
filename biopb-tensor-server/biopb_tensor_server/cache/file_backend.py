@@ -4,35 +4,30 @@ Implements segmented storage with:
 - Mmap reads for near-memory-speed access
 - Segment-level LRU eviction
 - Crash recovery via WAL and process lock
-- The CacheBackend future/promise pattern (see cache.base)
+- The future/promise pattern over the value types in cache.types
+
+Everything here is concurrent and lock-disciplined: read the ``_lock`` /
+``_write_lock`` notes in ``__init__`` before moving code between methods. The
+two parts that are *not* live under those locks live elsewhere --
+``cache.bootstrap`` (the single-threaded boot path and the cache directory's
+layout) and ``cache.segment_index`` (the ``.arrow`` / ``.idx`` file formats).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
-from typing import Callable, Dict, Literal, Optional, Tuple, get_args
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import pyarrow as pa
 
-from biopb_tensor_server.cache.base import (
-    EVICTION_RANK,
-    MAX_ARROW_BATCH_BYTES,
-    CacheBackend,
-    CacheEntry,
-    CacheStats,
-    ChunkLocation,
-    EntryState,
-    PoolStats,
-    RetentionClass,
-    estimate_batch_bytes,
-)
+from biopb_tensor_server.cache import bootstrap, segment_index
+from biopb_tensor_server.cache.bootstrap import CacheLayout
 from biopb_tensor_server.cache.recovery import (
     PoolQueueInfo,
     ProcessLock,
@@ -40,6 +35,18 @@ from biopb_tensor_server.cache.recovery import (
     SegmentEntryInfo,
     SieveKSegmentInfo,
     WriteAheadLog,
+)
+from biopb_tensor_server.cache.segment_index import CACHE_KEY_FIELD, IndexRecord
+from biopb_tensor_server.cache.types import (
+    EVICTION_RANK,
+    MAX_ARROW_BATCH_BYTES,
+    CacheEntry,
+    CacheStats,
+    ChunkLocation,
+    EntryState,
+    PoolStats,
+    RetentionClass,
+    estimate_batch_bytes,
 )
 
 __all__ = ["ArrowFileBackend", "ArrowFileConfig", "ChunkLocation"]
@@ -65,8 +72,6 @@ SIZE_CLASS_BULK_THRESHOLD = 32 * 1024 * 1024  # 1-32MB: the transfer grid's rang
 
 SizeClass = Literal["tiny", "bulk", "large"]
 
-_KNOWN_RETENTIONS = frozenset(get_args(RetentionClass))
-
 
 def _get_size_class(size_bytes: int) -> SizeClass:
     """Classify chunk size for pooling."""
@@ -76,58 +81,6 @@ def _get_size_class(size_bytes: int) -> SizeClass:
         return "bulk"
     else:
         return "large"
-
-
-# Name of the per-batch column carrying the entry's cache key. The key MUST
-# travel as a column value, not as schema metadata: an Arrow IPC stream
-# serializes the schema exactly once (taken from the first batch written to the
-# segment), so per-batch schema metadata is lost on read-back and every batch
-# would report the first entry's key. A column value is stored per row and
-# round-trips correctly. See _rebuild_index_from_segments.
-CACHE_KEY_FIELD = "__biopb_cache_key__"
-
-# On-disk segment format version for the localhost cache-file handoff (issue
-# #9). The server reports it in chunk_locate and a client declines the fast
-# path (falls back to do_get) for any version it doesn't understand.
-#
-# v2: biopb/biopb#596 implemented axis order normalization. A v1 segment holds the
-# pre-transpose bytes, so reusing it would serve axes in the wrong order.
-CACHE_FILE_FORMAT_VERSION = 2
-
-# Name of the on-disk marker file (in the cache root, beside ``lock`` and
-# ``wal.json``) recording the CACHE_FILE_FORMAT_VERSION the segments were written
-# under. ``_enforce_format_version`` reads it at init and wipes the cache when it
-# is missing or mismatched, so a segment-layout / key-composition change can't
-# silently reuse incompatible on-disk segments. See _enforce_format_version.
-FORMAT_VERSION_MARKER = "format_version"
-
-# Per-segment sidecar index (biopb/biopb#300). Each sealed segment gets a
-# ``seg_NNNN.idx`` sidecar written at seal time, recording every entry's key ->
-# byte range, so boot restores the index from these small files instead of
-# faulting the whole on-disk cache. The retention class rides in the sidecar's
-# schema metadata.
-#
-# A sealed segment is immutable, so the sidecar needs no manifest or generation
-# counter: a boot trusts a sidecar iff its recorded ``.arrow`` size matches the
-# file on disk. The tiny ``.idx`` bytes are deliberately NOT counted toward
-# ``max_total_bytes``.
-#
-# The key travels as a real column (not schema-only): a sidecar is an Arrow
-# IPC FILE, so this is belt-and-suspenders, but it keeps the record self-describing.
-SIDECAR_FORMAT_VERSION = 1
-_SIDECAR_VERSION_KEY = b"biopb_sidecar_version"
-_SIDECAR_SEGMENT_SIZE_KEY = b"biopb_segment_size"
-_SIDECAR_RETENTION_KEY = b"biopb_retention"
-_SIDECAR_VERSION_BYTES = str(SIDECAR_FORMAT_VERSION).encode()
-_SIDECAR_SCHEMA = pa.schema(
-    [
-        pa.field("key", pa.binary()),
-        pa.field("byte_offset", pa.int64()),
-        pa.field("byte_length", pa.int64()),
-        pa.field("size_bytes", pa.int64()),
-        pa.field("offset", pa.int64()),
-    ]
-)
 
 
 def _schema_message_length(path: Path) -> Optional[int]:
@@ -176,20 +129,21 @@ class ArrowFileConfig:
             self.cache_dir = Path(self.cache_dir)
 
 
-class ArrowFileBackend(CacheBackend):
+class ArrowFileBackend:
     """Thread-safe persistent file cache with future/promise pattern.
 
-    Directory structure:
+    Directory structure (see ``cache.bootstrap.CacheLayout``):
         cache_dir/
         ├── segments/
-        │   ├── seg_0001.arrow
-        │   ├── seg_0002.arrow
+        │   ├── seg_0001.arrow   # the batches
+        │   ├── seg_0001.idx     # its seal-time index sidecar
         │   └── ...
+        ├── format_version
         ├── wal.json
         └── lock
 
     Key features:
-    1. Future/Promise: see cache.base.CacheBackend
+    1. Future/Promise: get_or_acquire / start_compute below
     2. Mmap reads: OS page cache provides near-memory performance
     3. Segment-level eviction: Delete least-recently-used segment
     4. Crash recovery: WAL detects incomplete writes
@@ -197,6 +151,7 @@ class ArrowFileBackend(CacheBackend):
 
     def __init__(self, config: ArrowFileConfig):
         self._config = config
+        self._layout = CacheLayout(config.cache_dir)
         # ``_lock`` guards the in-memory index (``_entries``, ``_metadata``,
         # ``_pool_*``, ``_segment_mmaps``). It is held ONLY for short in-memory
         # mutations and must NEVER be held across a blocking disk write
@@ -299,40 +254,13 @@ class ArrowFileBackend(CacheBackend):
         self._initialize()
 
     def _initialize(self) -> None:
-        """Initialize backend: create dirs, acquire lock, rebuild index."""
-        # Create directories. Restrict the cache root to the owner (0o700):
-        # segment files hold decoded chunk payloads and their paths are handed
-        # to localhost clients (issue #9), so other users on a shared host must
-        # not be able to read them. (mode is masked by umask; re-assert with
-        # chmod. No-op hardening on Windows, which ignores POSIX modes.)
-        segments_dir = self._segments_dir
-        segments_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self._config.cache_dir, 0o700)
-        except OSError:
-            pass
+        """Initialize backend: take the cache dir, recover, rebuild the index.
 
-        # Take exclusive ownership of the cache dir. The lock is held on an open
-        # descriptor for the life of this process, so it is the acquire itself
-        # that answers "is someone else using this?" -- staleness is read after,
-        # from the leftover owner record (biopb/biopb#544).
-        lock_path = self._config.cache_dir / "lock"
-        self._process_lock = ProcessLock(lock_path)
-
-        if not self._process_lock.acquire():
-            raise RuntimeError(
-                f"Cannot acquire cache lock at {lock_path}. "
-                "Another process is using the cache."
-            )
-
-        was_stale = self._process_lock.is_stale()
-        if was_stale:
-            prior = self._process_lock.prior_owner() or {}
-            logger.warning(
-                "Cache directory was not released cleanly (previous owner pid=%s); "
-                "running recovery",
-                prior.get("pid", "unknown"),
-            )
+        Single-threaded and pre-publication: no other thread can reach this
+        backend yet, which is why nothing here takes ``_lock``. See
+        ``cache.bootstrap`` for the directory-level steps.
+        """
+        self._process_lock, was_stale = bootstrap.acquire_cache_dir(self._layout)
 
         # Everything past the acquire releases the lock if it raises: a failed
         # init must not leave the cache dir locked until a later boot reclaims
@@ -350,22 +278,23 @@ class ArrowFileBackend(CacheBackend):
         # exclusive owner and before anything reads the segments: a missing or
         # mismatched marker wipes the on-disk cache (segments + WAL). Must run
         # ahead of WAL init and the index rebuild.
-        wiped = self._enforce_format_version()
+        wiped = bootstrap.enforce_format_version(self._layout)
 
-        self._wal = WriteAheadLog(self._wal_path)
+        self._wal = WriteAheadLog(self._layout.wal_path)
 
         # Check for crash recovery. A version wipe already dropped the segments
         # and WAL, so there is nothing to recover from.
         if not wiped and (was_stale or self._wal.has_pending()):
             logger.info("Cache recovery: stale lock or pending WAL entries detected")
-            self._recovery_status = self._recover()
+            self._recovery_status = bootstrap.recover(self._wal, self._layout)
 
         # Rebuild metadata index from segment files
         self._rebuild_index_from_segments()
 
-        # Backfill the recovered-entry count from the rebuilt index: _recover()
-        # deliberately skips the segment read (biopb/biopb#300), so the
-        # authoritative count comes from the walk that had to happen anyway.
+        # Backfill the recovered-entry count from the rebuilt index:
+        # bootstrap.recover() deliberately skips the segment read
+        # (biopb/biopb#300), so the authoritative count comes from the walk that
+        # had to happen anyway.
         if self._recovery_status is not None:
             self._recovery_status.recovered_entries = len(self._metadata)
 
@@ -374,120 +303,6 @@ class ArrowFileBackend(CacheBackend):
         for pool in self._pool_queues.values():
             all_segment_ids.update(pool.queue)
         self._next_segment_id = max(all_segment_ids, default=0) + 1
-
-    def _enforce_format_version(self) -> bool:
-        """Wipe the on-disk cache when its segment format version != code.
-
-        ``CACHE_FILE_FORMAT_VERSION`` is the segment message layout / cache-key
-        encoding contract (see the constant). A marker file records the version the
-        on-disk segments were written under, and a missing or mismatched marker
-        drops them before the index rebuild. A cache dir with segments but no marker
-        counts as a mismatch.
-
-        Must run while the process lock is held and before WAL init / recovery /
-        index rebuild read the segments. Returns True iff a (re)stamp happened
-        (marker missing or mismatched), in which case the segments and WAL were
-        just wiped and there is nothing to recover.
-        """
-        marker_path = self._config.cache_dir / FORMAT_VERSION_MARKER
-
-        try:
-            on_disk: Optional[int] = int(marker_path.read_text().strip())
-        except (OSError, ValueError):
-            # Missing marker (pre-enforcement / fresh dir) or an unparseable one
-            # (torn write) -> treat as a mismatch and re-stamp.
-            on_disk = None
-
-        if on_disk == CACHE_FILE_FORMAT_VERSION:
-            return False
-
-        self._wipe_cache_contents(stale_version=on_disk)
-
-        # Stamp the current version. Write to a temp file and atomically replace
-        # so a crash mid-write cannot leave a torn marker that spuriously wipes a
-        # good cache on the next boot.
-        tmp_path = marker_path.with_suffix(".tmp")
-        tmp_path.write_text(f"{CACHE_FILE_FORMAT_VERSION}\n")
-        os.replace(tmp_path, marker_path)
-        return True
-
-    def _wipe_cache_contents(self, stale_version: Optional[int]) -> None:
-        """Delete the version-sensitive on-disk state (segments + WAL), leaving
-        the held process lock and marker in place, and recreate an empty
-        ``segments`` dir. Logs loudly only when data was actually discarded (a
-        fresh dir wipe is a silent no-op). Runs before any mmap is opened, so no
-        segment is mapped and the removal is safe on Windows too (issue #5).
-
-        Fail-closed on a partial wipe: ``shutil.rmtree(ignore_errors=True)`` can
-        leave files behind without surfacing an error -- an NFS unlink that
-        returns ESTALE/EIO, a permission glitch, a handle another process still
-        holds.
-        """
-        segments_dir = self._segments_dir
-        wal_path = self._wal_path
-        had_data = (segments_dir.exists() and any(segments_dir.iterdir())) or (
-            wal_path.exists()
-        )
-        if had_data:
-            logger.warning(
-                "Cache format-version mismatch (on-disk=%s, code=%d): discarding "
-                "the incompatible on-disk cache at %s before rebuild.",
-                "unversioned" if stale_version is None else stale_version,
-                CACHE_FILE_FORMAT_VERSION,
-                self._config.cache_dir,
-            )
-
-        shutil.rmtree(segments_dir, ignore_errors=True)
-        segments_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            wal_path.unlink()
-        except OSError:
-            pass
-
-        leftover = sorted(segments_dir.glob("seg_*.arrow"))
-        if leftover:
-            # _initialize releases the process lock on the way out, so an
-            # aborted init doesn't wedge a retry or the next start.
-            raise RuntimeError(
-                f"Failed to clear the incompatible cache at {segments_dir}: "
-                f"{len(leftover)} segment file(s) survived the wipe "
-                f"(e.g. {leftover[0].name}). Refusing to start rather than serve "
-                "them; remove the cache directory manually and retry."
-            )
-
-    def _recover(self) -> RecoveryStatus:
-        """Recover from crash: drop incomplete writes recorded in the WAL.
-
-        Does NOT read segment bodies (biopb/biopb#300). Take the recovered byte total
-        from the segment files' on-disk sizes (a ``stat``, no read) and let
-        ``_initialize`` backfill ``recovered_entries`` from the rebuilt index.
-        """
-        lost_entries = 0
-
-        # Clear WAL - pending (incomplete) writes never reached a segment, so lost.
-        for key in self._wal.get_pending_keys():
-            lost_entries += 1
-            logger.warning(f"Cache recovery: lost pending write for key {key.hex()}")
-        self._wal.clear()
-
-        # Recovered byte total from file sizes -- no segment read (issue #300).
-        # (This is the on-disk footprint; corrupt segments are dropped, and any
-        # read errors are surfaced, by the rebuild pass that follows.)
-        segments_dir = self._segments_dir
-        recovered_bytes = 0
-        for seg_file in segments_dir.glob("seg_*.arrow"):
-            try:
-                recovered_bytes += seg_file.stat().st_size
-            except OSError:
-                pass
-
-        return RecoveryStatus(
-            recovered_entries=0,  # backfilled from the rebuilt index in _initialize
-            lost_entries=lost_entries,
-            recovered_bytes=recovered_bytes,
-            lost_bytes=0,
-            errors=[],
-        )
 
     def _rebuild_index_from_segments(self) -> None:
         """Rebuild the metadata index and pool queues from segment files at boot.
@@ -501,8 +316,7 @@ class ArrowFileBackend(CacheBackend):
         sidecar falls back to the pre-#300 body walk, which also backfills a
         fresh sidecar so the next boot is fast.
         """
-        segments_dir = self._segments_dir
-        seg_files = sorted(segments_dir.glob("seg_*.arrow"))
+        seg_files = sorted(self._layout.segments_dir.glob("seg_*.arrow"))
         walked = 0
         for seg_file in seg_files:
             try:
@@ -543,24 +357,13 @@ class ArrowFileBackend(CacheBackend):
                 len(seg_files),
             )
 
-    @property
-    def _segments_dir(self) -> Path:
-        """Directory holding the segment bodies and their sidecar indexes."""
-        return self._config.cache_dir / "segments"
-
-    @property
-    def _wal_path(self) -> Path:
-        return self._config.cache_dir / "wal.json"
-
     def _segment_path(self, segment_id: int) -> Path:
         """Path of a segment's body file (``seg_NNNN.arrow``)."""
-        return self._segments_dir / f"seg_{segment_id:04d}.arrow"
+        return self._layout.segment_path(segment_id)
 
-    def _sidecar_path(self, segment_id: int) -> Path:
-        """Path of a segment's sidecar index file (``seg_NNNN.idx``)."""
-        return self._segments_dir / f"seg_{segment_id:04d}.idx"
-
-    def _index_records_for_segment(self, segment_id: int) -> Optional[list]:
+    def _index_records_for_segment(
+        self, segment_id: int
+    ) -> Optional[List[IndexRecord]]:
         """Index records for a sealed segment, taken from the live index.
 
         A sidecar records exactly what ``_metadata`` already holds, so sealing
@@ -576,15 +379,15 @@ class ArrowFileBackend(CacheBackend):
             if not info.byte_offset or not info.byte_length:
                 return None
             records.append(
-                (
-                    key,
-                    info.byte_offset,
-                    info.byte_length,
-                    info.size_bytes,
-                    info.offset,
+                IndexRecord(
+                    key=key,
+                    byte_offset=info.byte_offset,
+                    byte_length=info.byte_length,
+                    size_bytes=info.size_bytes,
+                    offset=info.offset,
                 )
             )
-        records.sort(key=lambda r: r[1])
+        records.sort(key=lambda r: r.byte_offset)
         return records
 
     def _index_entry(self, key: bytes, info: SegmentEntryInfo) -> None:
@@ -615,7 +418,7 @@ class ArrowFileBackend(CacheBackend):
     def _remove_segment_sidecar(self, segment_id: int) -> None:
         """Best-effort unlink of a segment's sidecar (safe if absent)."""
         try:
-            self._sidecar_path(segment_id).unlink(missing_ok=True)
+            self._layout.sidecar_path(segment_id).unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -659,67 +462,21 @@ class ArrowFileBackend(CacheBackend):
             pass
         self._remove_segment_sidecar(segment_id)
 
-    def _scan_segment_records(self, seg_file: Path) -> Optional[list]:
-        """Walk a sealed segment's IPC stream, returning one index record per
-        entry: ``(key, byte_offset, byte_length, size_bytes, offset)``.
+    def _scan_segment_records(self, seg_file: Path) -> Optional[List[IndexRecord]]:
+        """Walk a sealed segment's body for its index records, or None if it
+        cannot be indexed (see :func:`segment_index.scan_segment_records`).
 
-        The single source of truth for how a segment body maps to index entries,
-        reused by the boot fallback walk and the seal-time sidecar fallback so
-        every index path agrees byte-for-byte. Reads message-by-message off a private
-        mmap to bracket each record batch (issue #9 needs the byte range) and
-        stops at the first unreadable/torn trailing message -- a prior partial
-        write's slack. Returns None for a legacy/corrupt segment (no per-batch key
-        column, or unreadable), signalling the caller to drop or skip it. The mmap
-        is always closed (an open handle blocks unlink on Windows, issue #5).
+        A method rather than a direct call so the single body-reading chokepoint
+        stays overridable -- both the boot fallback walk and the seal-time
+        sidecar fallback go through it.
         """
-        try:
-            mm = pa.memory_map(str(seg_file), "r")
-        except (OSError, pa.ArrowInvalid):
-            return None
-        try:
-            try:
-                schema = pa.ipc.open_stream(mm).schema
-            except Exception:
-                return None
-            # A segment written before the per-batch key-column fix stored the
-            # key only in schema metadata, which an IPC stream collapses to the
-            # first entry's key on read-back -- it cannot be indexed correctly.
-            if CACHE_KEY_FIELD not in schema.names:
-                return None
-            mm.seek(0)
-            pa.ipc.read_message(mm)  # consume the leading schema message
-            records = []
-            entry_index = 0
-            while True:
-                pos = mm.tell()
-                try:
-                    msg = pa.ipc.read_message(mm)
-                except (pa.ArrowInvalid, EOFError, StopIteration, OSError):
-                    break
-                if msg is None:
-                    break
-                msg_len = mm.tell() - pos
-                try:
-                    batch = pa.ipc.read_record_batch(msg, schema)
-                except Exception:
-                    break
-                key = batch.column(CACHE_KEY_FIELD)[0].as_py()
-                if key is None:
-                    continue
-                size_bytes = sum(
-                    batch.column(name).nbytes for name in ("data", "shape", "dtype")
-                )
-                records.append((key, pos, msg_len, size_bytes, entry_index))
-                entry_index += 1
-            return records
-        finally:
-            mm.close()
+        return segment_index.scan_segment_records(seg_file)
 
     def _install_segment_records(
         self,
         segment_id: int,
         seg_file: Path,
-        records: list,
+        records: List[IndexRecord],
         retention: RetentionClass = "normal",
     ) -> None:
         """Populate ``_metadata`` + pool queues for one segment from its index
@@ -734,21 +491,21 @@ class ArrowFileBackend(CacheBackend):
         """
         st = seg_file.stat()
         segment_created = st.st_mtime  # file mtime, matching the pre-#300 walk
-        for key, byte_offset, byte_length, size_bytes, offset in records:
+        for record in records:
             self._index_entry(
-                key,
+                record.key,
                 SegmentEntryInfo(
                     segment_id=segment_id,
-                    offset=offset,  # entry index for the sequential reader
-                    size_bytes=size_bytes,
+                    offset=record.offset,  # entry index for the sequential reader
+                    size_bytes=record.size_bytes,
                     created_at=segment_created,
                     last_access_time=segment_created,
-                    byte_offset=byte_offset,
-                    byte_length=byte_length,
+                    byte_offset=record.byte_offset,
+                    byte_length=record.byte_length,
                 ),
             )
 
-        pool_key = (retention, _get_size_class(records[-1][3]))
+        pool_key = (retention, _get_size_class(records[-1].size_bytes))
         pool_queue = self._get_or_create_pool_queue(pool_key)
         self._segment_pool_key[segment_id] = pool_key
         # Oldest at the tail: a rebuilt segment predates this session's writes.
@@ -766,50 +523,22 @@ class ArrowFileBackend(CacheBackend):
     def _load_segment_from_sidecar(self, segment_id: int, seg_file: Path) -> bool:
         """Restore a segment's index from its ``.idx`` sidecar without reading the
         body. Returns True on the fast path; False (fall back to the walk) if the
-        sidecar is absent, the wrong version, or stale (recorded ``.arrow`` size
-        != the file on disk). The sidecar is read fully into RAM and its handle
-        closed before we touch the segment, so it never blocks unlink (issue #5).
-        A read-only mmap of the segment is still created (cheap, and required to
-        serve reads) -- only the per-batch body reads are skipped.
+        sidecar is absent, the wrong version, or stale. A read-only mmap of the
+        segment is still created (cheap, and required to serve reads) -- only the
+        per-batch body reads are skipped.
         """
-        idx_path = self._sidecar_path(segment_id)
-        if not idx_path.exists():
-            return False
-        try:
-            with pa.OSFile(str(idx_path), "rb") as f:
-                reader = pa.ipc.open_file(f)
-                meta = reader.schema.metadata or {}
-                if meta.get(_SIDECAR_VERSION_KEY) != _SIDECAR_VERSION_BYTES:
-                    return False
-                recorded = meta.get(_SIDECAR_SEGMENT_SIZE_KEY)
-                if recorded is None or int(recorded) != seg_file.stat().st_size:
-                    return False
-                table = reader.read_all()
-        except (OSError, ValueError, pa.ArrowInvalid):
-            return False  # unreadable / mismatched sidecar -> walk the body
-
-        records = list(
-            zip(
-                table.column("key").to_pylist(),
-                table.column("byte_offset").to_pylist(),
-                table.column("byte_length").to_pylist(),
-                table.column("size_bytes").to_pylist(),
-                table.column("offset").to_pylist(),
-                strict=True,  # columns of one table -> equal length
-            )
+        loaded = segment_index.read_sidecar(
+            self._layout.sidecar_path(segment_id), seg_file
         )
-        if not records:
-            return False  # nothing to install; let the body walk decide
-        raw = meta.get(_SIDECAR_RETENTION_KEY)
-        retention = raw.decode() if raw else "normal"
-        if retention not in _KNOWN_RETENTIONS:
-            retention = "normal"
+        if loaded is None:
+            return False
+        records, retention = loaded
         self._open_segment_mmap(segment_id, seg_file)
         self._install_segment_records(segment_id, seg_file, records, retention)
         return True
 
     def _write_segment_sidecar(
-        self, segment_id: int, records: Optional[list] = None
+        self, segment_id: int, records: Optional[List[IndexRecord]] = None
     ) -> None:
         """Persist a sealed segment's key -> byte-range index to ``seg_NNNN.idx``.
 
@@ -830,55 +559,19 @@ class ArrowFileBackend(CacheBackend):
         if records:
             self._write_sidecar_from_records(segment_id, records)
 
-    def _write_sidecar_from_records(self, segment_id: int, records: list) -> None:
-        """Write ``seg_NNNN.idx`` from already-computed index records, read at boot
-        instead of walking the body (biopb/biopb#300). Written atomically (tmp +
-        ``os.replace``) and best-effort: a failure (e.g. ENOSPC) only forfeits the
-        fast path for this one segment next boot, so it is logged and swallowed
-        rather than allowed to fail the write/close path.
+    def _write_sidecar_from_records(
+        self, segment_id: int, records: List[IndexRecord]
+    ) -> None:
+        """Write ``seg_NNNN.idx`` from already-computed index records, tagged with
+        the segment's retention class (see :func:`segment_index.write_sidecar`).
         """
-        if not records:
-            # Empty sealed segment: no sidecar. Boot walks/no-ops it -- harmless.
-            return
-        seg_file = self._segment_path(segment_id)
-        try:
-            st = seg_file.stat()
-        except OSError:
-            return
-
         pool_key = self._get_pool_key_for_segment(segment_id)
-        retention: RetentionClass = pool_key[0] if pool_key else "normal"
-        schema = _SIDECAR_SCHEMA.with_metadata(
-            {
-                _SIDECAR_VERSION_KEY: _SIDECAR_VERSION_BYTES,
-                _SIDECAR_SEGMENT_SIZE_KEY: str(st.st_size).encode(),
-                _SIDECAR_RETENTION_KEY: retention.encode(),
-            }
+        segment_index.write_sidecar(
+            self._layout.sidecar_path(segment_id),
+            self._segment_path(segment_id),
+            records,
+            pool_key[0] if pool_key else "normal",
         )
-        table = pa.Table.from_arrays(
-            [
-                pa.array([r[0] for r in records], type=pa.binary()),
-                pa.array([r[1] for r in records], type=pa.int64()),
-                pa.array([r[2] for r in records], type=pa.int64()),
-                pa.array([r[3] for r in records], type=pa.int64()),
-                pa.array([r[4] for r in records], type=pa.int64()),
-            ],
-            schema=schema,
-        )
-
-        idx_path = self._sidecar_path(segment_id)
-        tmp_path = idx_path.parent / (idx_path.name + ".tmp")
-        try:
-            with pa.OSFile(str(tmp_path), "wb") as sink:
-                with pa.ipc.new_file(sink, schema) as writer:
-                    writer.write_table(table)
-            os.replace(str(tmp_path), str(idx_path))
-        except OSError as e:
-            logger.warning(f"Could not persist cache sidecar {idx_path.name}: {e}")
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     def _create_segment_for_pool(
         self,
@@ -889,7 +582,7 @@ class ArrowFileBackend(CacheBackend):
         segment_id = self._next_segment_id
         self._next_segment_id += 1
 
-        self._segments_dir.mkdir(parents=True, exist_ok=True)
+        self._layout.segments_dir.mkdir(parents=True, exist_ok=True)
         segment_path = self._segment_path(segment_id)
 
         # Create writer.
@@ -1323,6 +1016,12 @@ class ArrowFileBackend(CacheBackend):
         (including hydrate-from-segment) -- so all that is left to do here is
         run ``compute_fn`` for an owned miss and wait for a PENDING entry
         (ours or another thread's) to become READY.
+
+        ``retention`` is read only when this call is the one that creates the
+        entry; a hit keeps the class the first writer declared.
+
+        Returns an entry in state READY with ref_count >= 1. The caller must
+        ``release`` it.
         """
         entry, is_owner = self.start_compute(key, retention)
 
@@ -1425,7 +1124,14 @@ class ArrowFileBackend(CacheBackend):
     def start_compute(
         self, key: bytes, retention: RetentionClass = "normal"
     ) -> Tuple[CacheEntry, bool]:
-        """Start compute phase - returns (entry, is_owner).
+        """Reserve the key without computing: returns (entry, is_owner).
+
+        The check-cache half of ``get_or_acquire``, split out for a caller that
+        already holds the data (``CacheManager.put``) rather than a
+        ``compute_fn``. ``is_owner=True`` means the returned entry is PENDING
+        and this caller MUST go on to ``complete_entry`` or ``fail_entry`` it --
+        anything else strands every reader of that key until
+        ``pending_timeout``.
 
         Every returned entry is acquired exactly once, on every path --
         ``get_or_acquire`` relies on this to avoid acquiring a second time.
@@ -1475,6 +1181,11 @@ class ArrowFileBackend(CacheBackend):
         by ``self._write_lock``, which readers never take. So a write that stalls
         (e.g. a full filesystem) blocks only future writes, never the read path;
         ``self._lock`` is taken only for short in-memory index mutations.
+
+        ``allow_deferred`` is whether the write may commit the entry from memory
+        before it lands on disk (see ``_enqueue_write``). ``CacheManager.put``
+        passes False: an upload has no backend copy to fall back to, so it must
+        not return until the bytes are on disk.
         """
         if self._skip_if_oversized(key, data, size_bytes):
             return
@@ -1899,7 +1610,7 @@ class ArrowFileBackend(CacheBackend):
                 self._forget_segment_mmap(segment_id)
 
             # Delete all segment files and their sidecar indexes
-            segments_dir = self._segments_dir
+            segments_dir = self._layout.segments_dir
             for seg_file in segments_dir.glob("seg_*.arrow"):
                 seg_file.unlink()
             for idx_file in segments_dir.glob("seg_*.idx"):

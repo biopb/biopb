@@ -272,7 +272,7 @@ class PrecacheWorker:
         if cache_manager is None:
             return False
         try:
-            st = cache_manager.backend.stats()
+            st = cache_manager.stats()
         except Exception:
             return False
         if st.max_bytes <= 0:

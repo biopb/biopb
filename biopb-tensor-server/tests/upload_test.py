@@ -247,7 +247,7 @@ class TestCachedSourceAdapter:
         entry = CacheManager.get_instance().backend._entries[chunk_id]
         assert entry.ref_count == 0
         assert entry.is_evictable()
-        assert CacheManager.get_instance().remove(chunk_id) is True
+        assert CacheManager.get_instance().backend.remove(chunk_id) is True
 
         CacheManager.reset()
 

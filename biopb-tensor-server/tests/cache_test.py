@@ -19,8 +19,6 @@ from biopb_tensor_server.cache import (
     EntryState,
 )
 from biopb_tensor_server.cache.file_backend import (
-    CACHE_KEY_FIELD,
-    SIDECAR_FORMAT_VERSION,
     SIZE_CLASS_BULK_THRESHOLD,
     SIZE_CLASS_TINY_THRESHOLD,
     ArrowFileBackend,
@@ -31,6 +29,10 @@ from biopb_tensor_server.cache.recovery import (
     K,
     ProcessLock,
     WriteAheadLog,
+)
+from biopb_tensor_server.cache.segment_index import (
+    CACHE_KEY_FIELD,
+    SIDECAR_FORMAT_VERSION,
 )
 from biopb_tensor_server.core.config import CacheConfig
 
@@ -385,7 +387,7 @@ class TestCacheManager:
         entry = manager.backend._entries[b"key1"]
         assert entry.ref_count == 0
         assert entry.is_evictable()
-        assert manager.remove(b"key1") is True
+        assert manager.backend.remove(b"key1") is True
         CacheManager.reset()
 
     def test_put_declines_an_existing_key(self, tmp_path):

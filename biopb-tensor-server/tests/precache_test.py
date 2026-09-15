@@ -621,7 +621,9 @@ def _located_all(server, cache_manager, source_ids):
     return True
 
 
-class _FakeBackend:
+class _FakeManager:
+    """Just the slice of CacheManager the headroom probe reads."""
+
     def __init__(self, total, mx):
         self._st = SimpleNamespace(total_bytes=total, max_bytes=mx)
 
@@ -634,16 +636,15 @@ class TestHeadroomProbe:
         from biopb_tensor_server.serving import precache as pc
 
         worker = PrecacheWorker(None, PrecacheConfig(backlog_high_water=0.8))
-        backend = _FakeBackend(total=0, mx=1000)
-        mgr = SimpleNamespace(backend=backend)
+        mgr = _FakeManager(total=0, mx=1000)
         monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: mgr)
 
         assert worker._has_headroom() is True  # empty
-        backend._st.total_bytes = 700  # below 0.8 * 1000
+        mgr._st.total_bytes = 700  # below 0.8 * 1000
         assert worker._has_headroom() is True
-        backend._st.total_bytes = 800  # at the mark -> not below
+        mgr._st.total_bytes = 800  # at the mark -> not below
         assert worker._has_headroom() is False
-        backend._st.total_bytes = 900  # over
+        mgr._st.total_bytes = 900  # over
         assert worker._has_headroom() is False
 
     def test_no_headroom_when_unbounded_or_missing(self, monkeypatch):
@@ -651,7 +652,7 @@ class TestHeadroomProbe:
 
         worker = PrecacheWorker(None, PrecacheConfig())
         # max_bytes <= 0 -> can't reason about fill, treat as no headroom.
-        mgr = SimpleNamespace(backend=_FakeBackend(total=0, mx=0))
+        mgr = _FakeManager(total=0, mx=0)
         monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: mgr)
         assert worker._has_headroom() is False
         # No cache at all.
