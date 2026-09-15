@@ -46,10 +46,10 @@ logic), which may expose multiple tensors (e.g., multi-field) from one source.
 
 The `biopb_tensor_server` package is organized into layered subpackages:
 
-- **`core/`** — foundational primitives and contracts: adapter ABCs, `config`
-  (the schema and its file I/O, nothing that reads a disk or a network),
-  the `axes` vocabulary + its `normalize` seam, `writable` (the upload half of
-  an adapter: progress, completion, disposal), and the live `source_registry`.
+- **`core/`** — foundational primitives and contracts: adapter ABCs, the
+  `claim()` discovery protocol, `config` (the schema and its file I/O, nothing
+  that reads a disk or a network), the `axes` vocabulary + its `normalize` seam,
+  and the live `source_registry`.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
   sidecar), `upload_manager`, `precache`, `renderer`, plus what those servers
   own directly: `metadata_db` (the DuckDB store whose `sources` / `rois` /
@@ -61,7 +61,9 @@ The `biopb_tensor_server` package is organized into layered subpackages:
   `adapters`; it names `serving`'s server and `metadata_db` only in type
   annotations, never importing them at runtime.
 - **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk
-  cache.
+  cache. A bare module name here is an adapter; an underscored one is shared
+  machinery (`_scale`, `_handle_reaper`, and `_writable` — the mixin two of the
+  adapters inherit for progress, completion and disposal).
 - Top level — the entry points: `cli`, `__main__`, and `logging_config`, which
   configures the `biopb_tensor_server` logger hierarchy for them.
 
@@ -86,7 +88,7 @@ in three collaborators it composes:
 |---|---|---|
 | `server.sources` | `SourceRegistry` |  The `source_id → SourceAdapter` map and adapter-lifecycle |
 | `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
-| `server.uploads` | `UploadManager` | The writable-server DoPut boundary: picks the upload kind by `array_id` prefix (`cache:`/`ome_zarr:`), registers what the adapter class builds, translates adapter errors to Flight errors. Progress and discard live on the adapter (`core.writable.WritableSource`), so a discarded upload is a registered tombstone, not a second record |
+| `server.uploads` | `UploadManager` | The writable-server DoPut boundary: picks the upload kind by `array_id` prefix (`cache:`/`ome_zarr:`), registers what the adapter class builds, translates adapter errors to Flight errors. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a registered tombstone, not a second record |
 
 ### Flight protocol (v2)
 

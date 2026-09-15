@@ -7,7 +7,7 @@ fused source+tensor adapter pattern used by OmeZarrAdapter, etc.
 - Metadata (shape, dtype, chunk_shape) stored in adapter instance
 - Chunk data stored in CacheManager keyed by chunk_id
 - When cache evicts chunks, adapter returns Flight error on read (source "gone")
-- Upload progress and disposal live on the adapter (``core.writable``); a
+- Upload progress and disposal live on the adapter (``adapters._writable``); a
   discarded adapter stays registered as a tombstone until reclaimed
 
 Registration flow (bypasses discovery): DoPut → ``create_upload`` →
@@ -32,6 +32,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
 from biopb_tensor_server.core.chunk import (
@@ -42,7 +43,6 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA
 from biopb_tensor_server.core.errors import UploadDiscardedError
-from biopb_tensor_server.core.writable import WritableSource
 
 if TYPE_CHECKING:
     from pathlib import Path

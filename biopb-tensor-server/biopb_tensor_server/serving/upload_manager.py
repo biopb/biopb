@@ -13,7 +13,7 @@ here is only what a boundary does:
   and hand over.
 
 Progress, completion and disposal are the adapter's own
-(:class:`~biopb_tensor_server.core.writable.WritableSource`), so there is no
+(:class:`~biopb_tensor_server.adapters._writable.WritableSource`), so there is no
 second registry to keep in step with ``SourceRegistry``: an upload's state is
 created with its adapter, lives as long as it is registered, and a discarded
 one stays registered as a tombstone until reclaimed.
@@ -33,17 +33,17 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkUpload
 
-from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
-from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.core.axes import noncanonical_order
-from biopb_tensor_server.core.errors import UploadDiscardedError, WriteNotSupportedError
-from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
-from biopb_tensor_server.core.writable import (
+from biopb_tensor_server.adapters._writable import (
     UploadStatus,
     WritableSource,
     unknown_upload_status,
     upload_of,
 )
+from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.core.axes import noncanonical_order
+from biopb_tensor_server.core.errors import UploadDiscardedError, WriteNotSupportedError
+from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 __all__ = ["UPLOAD_KINDS", "UploadManager", "UploadStatus"]
