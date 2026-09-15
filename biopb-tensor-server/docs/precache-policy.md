@@ -385,7 +385,7 @@ so:
   stopping rule rather than a separate knob.
 - **P2 selection restriction** — kept and widened to Z on the 2-D target (§5.3).
   It is the load-bearing one.
-- **P5 `allow_deferred=False`** — kept, unchanged and still needed.
+- **P5 `allow_deferred=False`** — moot. Deferred writes were removed (biopb/biopb#815 reverted), so every write is synchronous and there is nothing to opt out of.
 - **`compose=True` in precache** — moot. It existed to make a coarse warm also
   populate full resolution; the 2-D target is now the level clients read.
 
@@ -515,5 +515,3 @@ downscale?) needs eyes on real data and is not yet done.
 - §4.2 synthesis is bit-identical to a direct read at the same scale, on extents
   with and without remainders. Assert it *fails* under `area`, so the test
   records the coupling to §6 rather than silently passing if the method flips.
-- P5: a precache warm leaves `deferred_write_bytes` at zero while a concurrent
-  live read still defers.

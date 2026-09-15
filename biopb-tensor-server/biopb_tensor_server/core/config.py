@@ -555,17 +555,6 @@ class CacheConfig:
             "off."
         },
     )
-    file_deferred_write_mb: int = field(
-        default=0,
-        metadata={
-            "help": "EXPERIMENTAL. Bytes, in MiB, of cached chunks that may be "
-            "committed from memory and written to disk in the background, so a "
-            "cold read stops waiting for its own cache write. 0 (the default) "
-            "writes on the reading thread. Reaching the budget is not an error "
-            "and never blocks: that write goes back on the caller's thread. "
-            "Uploads are never deferred -- for them the cache is the only copy."
-        },
-    )
 
     def __post_init__(self):
         if isinstance(self.file_cache_dir, str):
