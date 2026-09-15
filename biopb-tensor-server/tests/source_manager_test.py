@@ -1,6 +1,7 @@
 """Regression tests for periodic SourceManager reconciliation."""
 
 import os
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -18,7 +19,6 @@ from biopb_tensor_server.sources.tree_scanner import (
     ScanSnapshot,
     _WalkContext,
 )
-from biopb_tensor_server.sources.watcher import WatcherEvent, WatcherEventType
 
 
 def _walk_ctx(*, prev_entry_states=None, prev_cloud_entry_states=None, next_state=None):
@@ -229,7 +229,6 @@ class TestOrphanClockSeam:
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={tmp_path / "data"},
             stability_window=0.0,
             probe_open_files=False,
@@ -295,36 +294,94 @@ class TestOrphanClockSeam:
         assert manager._initial_scan_done
 
 
+class TestRescanLoop:
+    """The rescan timer the manager runs itself (no watcher object)."""
+
+    @staticmethod
+    def _manager(server, monitored_dirs, **kwargs):
+        return _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs=monitored_dirs,
+            stability_window=0.0,
+            probe_open_files=False,
+            **kwargs,
+        )
+
+    def test_start_is_a_no_op_with_nothing_to_rescan(self, tmp_path):
+        """A static-only config has no tree to walk, so no thread is spawned."""
+        manager = self._manager(_FakeServer(), set())
+        manager.start()
+        assert manager.is_running() is False
+
+    def test_start_is_a_no_op_when_rescanning_is_off(self, tmp_path):
+        """`monitor_mode = "off"` reaches here as a non-positive interval; the
+        sources stay configured and the launcher scans them once itself."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0)
+        manager.start()
+        assert manager.is_running() is False
+
+    def test_the_loop_rescans_on_the_interval(self, tmp_path, monkeypatch):
+        """First tick immediately, then one per interval."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0.01)
+
+        rescans = threading.Semaphore(0)
+        monkeypatch.setattr(manager, "_handle_rescan", rescans.release)
+        try:
+            manager.start()
+            assert manager.is_running() is True
+            for _ in range(3):
+                assert rescans.acquire(timeout=5)
+        finally:
+            manager.stop(join_timeout=5)
+        assert manager.is_running() is False
+
+    def test_a_failing_rescan_does_not_kill_the_loop(self, tmp_path, monkeypatch):
+        """The next pass sees the same tree, so a failure is logged and retried."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0.01)
+
+        attempts = threading.Semaphore(0)
+
+        def boom():
+            attempts.release()
+            raise RuntimeError("scan blew up")
+
+        monkeypatch.setattr(manager, "_handle_rescan", boom)
+        try:
+            manager.start()
+            for _ in range(2):
+                assert attempts.acquire(timeout=5)
+        finally:
+            manager.stop(join_timeout=5)
+
+    def test_stop_does_not_wait_out_the_interval(self, tmp_path, monkeypatch):
+        """The loop waits on an Event, so stop() returns rather than sleeping off
+        a 30s interval -- which is what the shutdown budget depends on."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=300.0)
+
+        first = threading.Event()
+        monkeypatch.setattr(manager, "_handle_rescan", first.set)
+        manager.start()
+        assert first.wait(timeout=5)  # the immediate first tick ran
+
+        started = time.monotonic()
+        manager.stop(join_timeout=5)
+        assert time.monotonic() - started < 2.0
+        assert manager.is_running() is False
+
+
 class TestSourceManagerRegressions:
     def setup_method(self):
         _FlakyAdapter.calls = 0
-
-    def test_process_event_ignores_legacy_event_types(self, tmp_path):
-        monitored_dir = tmp_path / "monitored"
-        monitored_dir.mkdir()
-
-        server = _FakeServer()
-        state = DiscoveryState()
-        manager = _make_manager(
-            server,
-            registry=_FakeRegistry(),
-            discovery_state=state,
-            watcher=None,
-            monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
-        )
-
-        ignored_event = WatcherEvent(
-            event_type=WatcherEventType.CREATED,
-            path=monitored_dir / "ignored.dat",
-            is_directory=False,
-        )
-
-        manager._process_event(ignored_event)
-
-        assert state.claims == {}
-        assert server.registered == []
 
     def test_periodic_rescan_adds_and_removes_sources(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
@@ -338,7 +395,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -370,7 +426,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -412,7 +467,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -453,7 +507,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -487,7 +540,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -544,7 +596,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -573,29 +624,6 @@ class TestSourceManagerRegressions:
         assert manager._entry_states == previous_entry_states
         assert manager._skipped_stable_dirs == previous_skipped_dirs
 
-    def test_process_event_dispatches_rescan(self, tmp_path, monkeypatch):
-        monitored_dir = tmp_path / "monitored"
-        monitored_dir.mkdir()
-
-        server = _FakeServer()
-        state = DiscoveryState()
-        manager = _make_manager(
-            server,
-            registry=_FakeRegistry(),
-            discovery_state=state,
-            watcher=None,
-            monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
-        )
-
-        calls = []
-        monkeypatch.setattr(manager, "_handle_rescan", lambda: calls.append("rescan"))
-
-        manager._process_event(WatcherEvent(WatcherEventType.RESCAN, monitored_dir))
-
-        assert calls == ["rescan"]
-
     def test_aggressive_dir_pruning_can_skip_monitored_root(
         self, tmp_path, monkeypatch
     ):
@@ -610,7 +638,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -648,7 +675,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
             probe_open_files=False,
@@ -695,7 +721,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
             probe_open_files=False,
@@ -757,7 +782,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
             probe_open_files=False,
@@ -842,7 +866,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
             probe_open_files=False,
@@ -910,7 +933,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -947,7 +969,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_RegistryWithFailingAdapter(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -974,7 +995,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1019,7 +1039,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1044,7 +1063,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1080,7 +1098,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1117,7 +1134,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1158,7 +1174,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_ClosingRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1193,7 +1208,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1232,7 +1246,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1254,7 +1267,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_RegistryWithFlakyAdapter(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1297,7 +1309,6 @@ class TestSourceManagerRegressions:
             server,
             registry=_RegistryWithFlakyAdapter(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1340,7 +1351,6 @@ def _make_signature_manager(monitored_dirs):
         _FakeServer(),
         registry=_FakeRegistry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs=set(monitored_dirs),
         stability_window=0.0,
         probe_open_files=False,
@@ -1632,7 +1642,6 @@ class TestProgressiveDiscoveryFreshness:
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1699,7 +1708,7 @@ class TestProgressiveDiscoveryFreshness:
         assert fired == [True]
 
     def test_run_initial_scan_drives_the_bootstrap_scan(self, tmp_path):
-        # The launcher's public seam for the watcher-less path (biopb/biopb#277 C)
+        # The launcher's public seam for the rescan-less path
         # runs one full rescan: same effect as the internal _handle_rescan.
         server, manager = self._manager_with_source(tmp_path)
         fired = []
@@ -1747,7 +1756,6 @@ class TestProgressiveStreaming:
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
             probe_open_files=False,
@@ -1922,7 +1930,6 @@ class TestStaticCatalogSeeding:
         manager = create_source_manager(
             server=server,
             registry=_CatalogStubRegistry(),
-            watcher=None,
             static_sources=[static],
             metadata_db=db,
         )
@@ -1949,7 +1956,6 @@ class TestRescanCarryForwardPrefix:
             server=_FakeServer(),
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={tmp_path / "data"},
             stability_window=0.0,
             probe_open_files=False,

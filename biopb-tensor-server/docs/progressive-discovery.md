@@ -49,10 +49,9 @@ plumbing:
   isn't fully built — so the wire layer never assumed a complete catalog.
 
 **Background the scan.** The monitored bootstrap scan runs in the SourceManager's
-event-loop thread instead of synchronously before `mark_ready()`. The watcher fires
-its first rescan immediately (`initial_immediate=True`) rather than after the
-rescan interval. This also unblocks the launch-path HTTP sidecar and makes a
-startup `Ctrl+C` clean.
+event-loop thread instead of synchronously before `mark_ready()`. Its first rescan
+fires immediately rather than after the rescan interval. This also unblocks the
+launch-path HTTP sidecar and makes a startup `Ctrl+C` clean.
 
 **Option B — stream the first scan.** Backgrounding alone still makes the catalog
 appear in one batch at end-of-walk, because the reconcile computes a removal diff

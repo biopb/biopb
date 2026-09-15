@@ -1,7 +1,9 @@
 """Source lifecycle manager for the periodic catalog rescan runtime.
 
-Coordinates the periodic rescan watcher, discovery state, server catalog updates,
-and metadata database synchronization for monitored local directories.
+Owns the rescan timer, discovery state, server catalog updates, and metadata
+database synchronization for monitored local directories. Monitoring is
+timer-driven: every ``rescan_interval`` seconds the whole monitored tree is
+walked and diffed, so there are no per-path filesystem events to handle.
 """
 
 from __future__ import annotations
@@ -31,11 +33,6 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
 from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
-from biopb_tensor_server.sources.watcher import (
-    DirectoryWatcher,
-    WatcherEvent,
-    WatcherEventType,
-)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.metadata_db import MetadataDatabase
@@ -138,8 +135,8 @@ class SourceManager:
         server: TensorFlightServer,
         registry: AdapterRegistry,
         discovery_state: DiscoveryState,
-        watcher: Optional[DirectoryWatcher],
         monitored_dirs: Set[Path],
+        rescan_interval: float = 30.0,
         metadata_db: Optional[MetadataDatabase] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
@@ -151,89 +148,98 @@ class SourceManager:
         monitored_upstreams: Optional[List[SourceConfig]] = None,
         prune_unseen_days: int = 0,
     ):
+        # Collaborators. The registry is kept for ``add_local_source``'s own
+        # discovery walk; every confirmed-catalog mutation goes through the
+        # Reconciler built at the end of this method, which holds its own copy.
         self._server = server
-        # Kept, not just forwarded to the Reconciler: the orphan clock is driven
-        # from here, at the only point where the catalog is known complete.
-        self._metadata_db = metadata_db
-        self._prune_unseen_days = max(0, prune_unseen_days)
-        # Arms auto-prune, and nothing else reads it. Monotonic, not wall clock:
-        # an NTP correction must not be able to age the server into deleting.
-        self._started_at = time.monotonic()
-        # Kept for the runtime add_local_source discovery walk; the confirmed-
-        # catalog write path uses the Reconciler's own copy.
         self._registry = registry
-        self._watcher = watcher
+        self._metadata_db = metadata_db
+
+        # What is watched. Under a cloud root (config ``cloud=true``) dehydrated
+        # entries are admitted and registered as unresolved sources that resolve
+        # on first access. Upstreams are bare-host ``grpc://`` tensor servers
+        # whose catalog is re-listed and reconciled like a directory walk; a
+        # single-source ``grpc://host/<id>`` entry is not here, having nothing to
+        # re-list.
         self._monitored_dirs = monitored_dirs
-        # Resolved roots opted into cloud/synced-folder handling (config cloud=true).
-        # Under these, dehydrated entries are admitted and registered as unresolved
-        # sources that resolve lazily on first access (cloud-storage phase 2).
         self._cloud_roots: Set[Path] = cloud_roots or set()
-        # Monitored tensor-server (bare-host grpc://) upstreams: their catalog is
-        # periodically re-listed and reconciled like a directory walk
-        # (biopb/biopb#178). Single-source grpc://host/<id> entries are not here --
-        # there is nothing to re-list for one fixed source.
         self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
-        # Per-upstream re-list cadence (keyed by url), counted in rescan ticks (no
-        # wall-clock interval -- the rescan tick is the unit). A re-list runs every
-        # tick by default; when it finds the source set UNCHANGED the spacing
-        # doubles (a stable upstream is skipped for more ticks, up to
-        # _UPSTREAM_RELIST_MAX_TICKS, so we are not querying it every tick forever),
-        # and any change OR failure resets it to every tick -- so a new source / a
-        # recovering upstream is picked up within ~one tick, not after the full
-        # backoff. `countdown` ticks down to 0 (re-list due); `period` is the
-        # current spacing in ticks.
-        self._upstream_relist: Dict[str, Dict[str, int]] = {}
-        self._upstream_max_period: int = _UPSTREAM_RELIST_MAX_TICKS
-        # Upstreams (by url) whose last re-list failed -- a status signal (the fast
-        # retry itself is driven by the period reset above).
-        self._failed_upstreams: Set[str] = set()
-        # Last reported config error per upstream url, so a permanent
-        # misconfiguration is reported once rather than every re-list (#608).
-        self._upstream_config_errors: Dict[str, str] = {}
-        # Last reported unreachable failure per upstream url, as (when, message),
-        # so a sustained outage reports on a window instead of on every tick.
-        self._upstream_failures: Dict[str, Tuple[float, str]] = {}
+
+        # Scan tuning, and the filesystem signature walk it configures. The
+        # scanner is a pure producer: given the previous caches it returns a
+        # fresh ScanSnapshot, and this manager publishes, rolls back and
+        # partitions that snapshot.
         self._stability_window = stability_window
         self._probe_open_files = probe_open_files
         self._full_rescan_interval = full_rescan_interval
         self._stable_rescans_required = max(0, stable_rescans_required)
         self._aggressive_dir_pruning = aggressive_dir_pruning
-        # The filesystem signature walk (biopb/biopb#278 item B). A pure producer:
-        # given the previous caches it returns a fresh ScanSnapshot; this manager
-        # owns publishing / rollback / cloud partitioning of that snapshot.
         self._scanner = TreeScanner(
             stability_window=stability_window,
             stable_rescans_required=self._stable_rescans_required,
             aggressive_dir_pruning=aggressive_dir_pruning,
         )
 
-        # Thread management
+        # Scan caches: path -> EntryState (signature + stability counter +
+        # pending-scan flag). Cloud entries sit in their own partition because
+        # cloud subtrees are walked only on the force_full pass -- keeping them
+        # out of ``_entry_states`` is what holds every per-entry rescan loop to
+        # O(non-cloud). That partition is rebuilt only at the end of a successful
+        # force_full, so a failed one leaves the last good snapshot intact.
+        self._entry_states: Dict[str, EntryState] = {}
+        self._cloud_entry_states: Dict[str, EntryState] = {}
+        self._skipped_stable_dirs: Set[str] = set()
+        self._last_full_rescan_at: float = float("-inf")
+
+        # Per-upstream re-list cadence, keyed by url and counted in rescan ticks
+        # rather than wall clock: ``countdown`` ticks down to 0 (re-list due),
+        # ``period`` is the current spacing. An unchanged re-list doubles the
+        # period up to ``_upstream_max_period``; any change or failure resets it
+        # to every tick. The three failure maps are reporting state -- what was
+        # last said about an upstream, so a persistent fault is reported on a
+        # window instead of on every tick.
+        self._upstream_relist: Dict[str, Dict[str, int]] = {}
+        self._upstream_max_period: int = _UPSTREAM_RELIST_MAX_TICKS
+        self._failed_upstreams: Set[str] = set()
+        self._upstream_config_errors: Dict[str, str] = {}
+        self._upstream_failures: Dict[str, Tuple[float, str]] = {}
+
+        # Annotation orphan clock, driven from :meth:`_mark_catalog_complete`.
+        # Auto-prune arms only once the process has been up longer than the
+        # threshold it would delete on; monotonic, so an NTP correction cannot
+        # age the server into deleting.
+        self._prune_unseen_days = max(0, prune_unseen_days)
+        self._started_at = time.monotonic()
+
+        # The rescan loop: a bare timer on its own thread. ``_stop`` doubles as
+        # the loop's wait condition and its wake signal (the ``precache``
+        # worker's idiom), so :meth:`stop` returns at once instead of running
+        # out the current interval, and no separate running flag has to be kept
+        # in step with it. A ``rescan_interval`` of 0 or less means no loop at
+        # all (config ``monitor_mode = "off"``); the launcher then drives a
+        # single scan itself. A positive one is floored at 0.1s -- a config
+        # value below that is almost certainly a mistake, and without a floor
+        # it would drive back-to-back full tree walks.
+        self._rescan_interval = (
+            rescan_interval if rescan_interval <= 0 else max(0.1, rescan_interval)
+        )
+        self._next_rescan_at: float = 0.0
+        self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._running = False
-        # Background precache hook: called with a source_id when a source is
-        # committed *after* the initial scan completes. Gated on
-        # ``_initial_scan_done`` so the (possibly large) startup set is routed to
-        # the slow precache *backlog* instead of the prompt enqueue -- only
-        # sources discovered live (later rescans) warm promptly. See
-        # ``_commit_add_claim``.
-        self._on_source_committed: Optional[Callable[[str], None]] = None
-        # Flipped True at the end of the first successful full rescan. Under
-        # progressive discovery that scan runs in the event loop *after* start(),
-        # so this -- not "are we past start()" -- is the correct startup/runtime
-        # boundary for the precache gate.
+
+        # Startup protocol, and the precache routing gate it drives.
+        # ``_initial_scan_done`` flips at the end of the first successful full
+        # rescan -- which under progressive discovery runs in the event loop
+        # *after* start(), so it, not "are we past start()", is the
+        # startup/runtime boundary. Sources committed before it route to the slow
+        # precache backlog; after it, ``_on_source_committed`` prompt-enqueues
+        # them. ``_suppress_live_precache`` holds that backlog routing across the
+        # boot tick's upstream re-list, which the local walk in the same tick has
+        # already flipped the boundary for. Event-loop thread only, so plain
+        # flags are safe.
         self._initial_scan_done = False
-        # Set only for the duration of the boot-tick upstream re-list, when the
-        # local walk earlier in the *same* rescan already flipped
-        # ``_initial_scan_done`` True (see ``_handle_rescan``). It keeps the
-        # startup upstream mirror -- committed after that flip -- routed to the
-        # slow backlog instead of the prompt enqueue, exactly as the startup set
-        # is meant to be (the mirror is part of the startup catalog regardless of
-        # which half of the tick registers it). Event-loop thread only, so a plain
-        # flag is safe.
         self._suppress_live_precache = False
-        # Best-effort callback fired once, when the first full scan completes
-        # (from the event-loop thread). The launcher uses it to seed the precache
-        # backlog with the startup set at the moment the catalog is established.
+        self._on_source_committed: Optional[Callable[[str], None]] = None
         self._on_initial_scan_complete: Optional[Callable[[], None]] = None
 
         # Coarse mutex serializing a *whole* catalog-mutation pass. The periodic
@@ -244,30 +250,11 @@ class SourceManager:
         # Reconciler's fine-grained state RLock that the commit primitives take.
         self._catalog_lock = threading.Lock()
 
-        # Cached filesystem signatures for stability and change detection.
-        # path -> EntryState (signature + stability counter + pending-scan flag).
-        self._entry_states: Dict[str, EntryState] = {}
-        # Rescan bookkeeping for low-overhead subtree pruning.
-        self._skipped_stable_dirs: Set[str] = set()
-        self._last_full_rescan_at: float = float("-inf")
-        # Cloud-subtree entry partition. Cloud (synced-folder) subtrees are walked
-        # only on the hourly force_full pass; on the frequent incremental rescans
-        # they are skipped entirely. To keep that O(non-cloud), cloud entries live
-        # here -- rebuilt only at the end of a successful force_full -- instead of
-        # being re-materialized into ``_entry_states``/``next_state`` every cycle
-        # (which made every per-entry rescan loop O(whole cloud catalog) and
-        # stalled the Flight serving threads via the GIL). Same ``EntryState``
-        # shape as ``_entry_states`` (the stability fields inert -- see EntryState).
-        # Never mutated on a failed rescan, so the last good snapshot survives a
-        # force_full failure (no rollback variable needed).
-        self._cloud_entry_states: Dict[str, EntryState] = {}
-
-        # The confirmed-catalog writer (biopb/biopb#278 item B). Owns the live
-        # claim set + registration + the discovered/upstream diff; this manager
-        # feeds it scan results and delegates every catalog mutation to it. The
-        # injected seams (see Reconciler's docstring): ``entry_for`` reads this
-        # manager's scan-signature caches, ``notify_source_committed`` applies the
-        # precache routing gate this manager owns.
+        # The confirmed-catalog writer: owns the live claim set, registration and
+        # the discovered/upstream diff. This manager feeds it scan results and
+        # delegates every catalog mutation to it. Its injected seams read back
+        # into here -- ``entry_for`` for the scan caches above,
+        # ``notify_source_committed`` for the precache gate.
         self._reconciler = Reconciler(
             server=server,
             registry=registry,
@@ -281,30 +268,56 @@ class SourceManager:
         )
 
     def start(self) -> None:
-        """Start the event processing loop."""
-        if self._watcher is None:
-            return  # Static-only mode; no filesystem events to process
+        """Start the periodic rescan loop, if there is anything for it to do.
+
+        A no-op when rescanning is disabled (``rescan_interval <= 0``), or
+        neither a monitored directory nor a monitored upstream is configured;
+        callers check :meth:`is_running` afterward to tell.
+
+        The bootstrap scan runs in this loop, whose first tick fires
+        immediately. Until it completes, ``_initial_scan_done`` stays False so
+        its sources route to the precache backlog rather than the prompt
+        enqueue.
+        """
+        if self._rescan_interval <= 0:
+            return
+        if not self._monitored_dirs and not self._monitored_upstreams:
+            return
 
         if self._thread is not None and self._thread.is_alive():
             logger.warning("SourceManager already running")
             return
 
-        # The background bootstrap scan runs in this event loop (the watcher
-        # fires its first rescan immediately). Until that first scan completes,
-        # ``_initial_scan_done`` stays False so its sources route to the precache
-        # backlog rather than the prompt enqueue.
-        self._running = True
+        self._next_rescan_at = time.monotonic()
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._event_loop,
             daemon=True,
             name="SourceManager-EventLoop",
         )
         self._thread.start()
-        logger.info("SourceManager started")
+        logger.info(
+            "SourceManager started; rescanning every %.1fs", self._rescan_interval
+        )
 
-    # --- Startup-protocol seam (biopb/biopb#277 item C) -----------------------
-    # The launcher drives startup through these public methods instead of poking
-    # the private hook attributes / _handle_rescan / _initial_scan_done. Wiring
+    def run_bootstrap_fallback(self) -> None:
+        """Run the startup scan the caller must drive itself, when :meth:`start`
+        didn't (call only after checking :meth:`is_running` is False).
+
+        Centralizes the branch a launcher would otherwise have to re-derive from
+        ``monitored_dirs`` -- this manager already knows which case it is: a
+        monitored tree with rescanning off still needs one synchronous walk
+        (:meth:`run_initial_scan`); a static-only config has nothing to walk, so
+        the startup protocol is advanced directly (:meth:`complete_initial_scan`).
+        """
+        if self._monitored_dirs:
+            self.run_initial_scan()
+        else:
+            self.complete_initial_scan()
+
+    # --- Startup-protocol seam ------------------------------------------------
+    # The launcher drives startup through these public methods rather than the
+    # private hook attributes / _handle_rescan / _initial_scan_done. Wiring
     # mirrors the server's set_*_handler injection (see cli.py).
 
     def set_source_committed_hook(
@@ -334,9 +347,9 @@ class SourceManager:
         """Run the bootstrap scan synchronously (public seam for the launcher).
 
         Under progressive discovery the bootstrap scan normally runs in the
-        event loop after :meth:`start`. When no event loop will drive it -- the
-        watcher failed to start but monitored dirs exist -- the launcher calls
-        this to run one full rescan inline. Being the first pass, it force-fulls,
+        rescan loop after :meth:`start`. When no loop will drive it -- rescanning
+        is off but monitored dirs exist -- the launcher calls this to run one
+        full rescan inline. Being the first pass, it force-fulls,
         stamps freshness, flips the startup gate, and fires the completion hook,
         exactly as the background path would.
         """
@@ -399,10 +412,8 @@ class SourceManager:
 
         A static-only config (no monitored dirs) has no bootstrap scan, but the
         startup protocol must still complete: stamp catalog freshness, flip the
-        precache startup gate, and fire the first-scan-complete hook. Centralizes
-        the completion sequence the launcher previously open-coded against the
-        private members (biopb/biopb#277 item C). Idempotent: the hook fires only
-        on the transition to done.
+        precache startup gate, and fire the first-scan-complete hook. Idempotent:
+        the hook fires only on the transition to done.
         """
         self._mark_catalog_complete()
         if not self._initial_scan_done:
@@ -416,8 +427,8 @@ class SourceManager:
         Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
         can't be stat-ed (e.g. removed between commit and this call).
         """
-        # The Reconciler snapshots claims under its state lock (the watcher's
-        # event-loop thread adds/removes claims concurrently); we stat() outside
+        # The Reconciler snapshots claims under its state lock (the rescan
+        # thread adds/removes claims concurrently); we stat() outside
         # that lock (I/O).
         snapshot = self._reconciler.local_claim_paths()
         out: List[Tuple[str, float]] = []
@@ -438,11 +449,9 @@ class SourceManager:
         upstream re-list RPC (``_reconcile_one_upstream`` ->
         ``list_upstream_source_ids`` -> Flight ``list_flights``) and, being a
         daemon, does not need a clean join at process exit -- a long wait there
-        only burns the shutdown budget (biopb/biopb#300). Deeper cancellation of
-        that in-flight upstream RPC (reconciler/remote_tensor/client) is the
-        follow-up; it is intentionally not attempted here.
+        only burns the shutdown budget. That in-flight RPC is not cancelled.
         """
-        self._running = False
+        self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=join_timeout)
             self._thread = None
@@ -450,37 +459,22 @@ class SourceManager:
 
     def is_running(self) -> bool:
         """Check if the manager is actively processing events."""
-        return self._running and (self._thread is not None and self._thread.is_alive())
+        return self._thread is not None and self._thread.is_alive()
 
     def _event_loop(self) -> None:
-        """Process periodic rescan triggers from the watcher."""
-        while self._running:
+        """Run a rescan every ``rescan_interval`` seconds until stopped.
+
+        The next tick is scheduled from the moment the previous one *finished*,
+        so a rescan that outruns the interval does not immediately queue another.
+        A failed rescan is logged and the cadence continues; the next pass sees
+        the same tree and retries.
+        """
+        while not self._stop.wait(max(0.0, self._next_rescan_at - time.monotonic())):
             try:
-                events = self._watcher.get_events(timeout=0.5)
-
-                if events:
-                    for event in events:
-                        self._process_event(event)
-
-            except Exception as e:
-                logger.exception(f"Error processing events: {e}")
-
-            # Small sleep to prevent busy polling
-            time.sleep(0.1)
-
-    def _process_event(self, event: WatcherEvent) -> None:
-        """Handle a watcher event."""
-        try:
-            logger.debug(f"Processing event: {event.event_type.value} {event.path}")
-            if event.event_type == WatcherEventType.RESCAN:
                 self._handle_rescan()
-            else:
-                logger.debug(
-                    "Ignoring unsupported watcher event type: %s",
-                    event.event_type.value,
-                )
-        except Exception as e:
-            logger.exception(f"Error handling event {event}: {e}")
+            except Exception:
+                logger.exception("Rescan failed")
+            self._next_rescan_at = time.monotonic() + self._rescan_interval
 
     def _handle_rescan(self) -> None:
         """Run one periodic rescan: walk monitored dirs first, then re-list upstreams.
@@ -489,10 +483,7 @@ class SourceManager:
         re-list so a slow/large upstream (hundreds of mirrored sources, each a
         network round-trip) cannot delay the local catalog from appearing: the
         local walk streams its sources first and the upstream mirror fills in
-        behind it on the same tick. (biopb/biopb#178 introduced the re-list; this
-        ordering keeps it off the local catalog's critical path -- previously the
-        re-list ran first, so on the boot tick local sources surfaced only after
-        every upstream source had been registered, minutes later.)
+        behind it on the same tick.
 
         Precache routing subtlety: on the boot tick the local walk flips
         ``_initial_scan_done`` True *before* the upstream re-list runs, which
@@ -562,16 +553,16 @@ class SourceManager:
 
             rescan_succeeded = False
             try:
-                # Progressive population (Option B): on the *first* full scan,
-                # register each source the moment the walk claims it instead of
-                # batching every add into the end-of-walk reconcile, so the
-                # catalog grows within the walk. This is safe only for the first
-                # scan -- it starts empty and force-full, so there are no removals
-                # to diff and every claim is a pure add. The claim phase already
-                # applies the stability gate (path_filter), so deferred/unstable
-                # entries are never claimed and therefore never streamed; they
-                # are picked up by the next steady-state rescan. The end-of-walk
-                # reconcile below still runs and is idempotent for streamed adds.
+                # Progressive population: on the *first* full scan, register each
+                # source the moment the walk claims it rather than batching every
+                # add into the end-of-walk reconcile, so the catalog grows within
+                # the walk. Safe only for the first scan -- it starts empty and
+                # force-full, so there are no removals to diff and every claim is
+                # a pure add. The claim phase already applies the stability gate
+                # (path_filter), so deferred/unstable entries are never claimed
+                # and therefore never streamed; the next steady-state rescan
+                # picks them up. The end-of-walk reconcile below still runs and
+                # is idempotent for streamed adds.
                 stream_first_scan = force_full_rescan and not self._initial_scan_done
                 discovered_state = DiscoveryState()
                 if stream_first_scan:
@@ -579,14 +570,12 @@ class SourceManager:
                         self._reconciler._stream_first_scan_add
                     )
 
-                # Single traversal: the state walk above already visited every entry and
-                # recorded its (resolved path, is_directory) into next_state in DFS
-                # parent-first order. Drive the claim phase straight off that snapshot
-                # instead of re-walking the filesystem a second time — the duplicate walk
-                # was ~96% of the post-#61 rescan syscalls (biopb/biopb#56, item 4).
-                # skipped_dirs prunes the stable subtrees the state walk carried forward
-                # (their claims are preserved below), exactly as the old per-dir
-                # `if ... in skipped_dirs: continue` did for whole roots.
+                # Single traversal: the state walk above already visited every
+                # entry and recorded its (resolved path, is_directory) into
+                # next_state in DFS parent-first order, so the claim phase is
+                # driven straight off that snapshot rather than re-walking the
+                # filesystem. skipped_dirs prunes the stable subtrees the state
+                # walk carried forward; their claims are preserved below.
                 discovered_state = discover_sources_from_entries(
                     (
                         (path_str, entry.is_directory, entry.signature)
@@ -615,15 +604,14 @@ class SourceManager:
 
             if force_full_rescan and rescan_succeeded:
                 self._mark_catalog_complete()
-                # Partition the just-walked cloud entries out of _entry_states into
-                # the cloud partition. This runs only after the force_full claim +
-                # reconcile have already seen the full _entry_states (cloud
-                # included), so cloud sources reconcile normally here; afterwards
-                # _entry_states holds non-cloud only, so the frequent incremental
-                # rescans never iterate cloud entries (the GIL-stall fix). next_state
-                # is self._entry_states (set above), so popping trims it in place.
-                # Only on success -> a failed force_full leaves the previous
-                # _cloud_entry_states intact.
+                # Partition the just-walked cloud entries out of _entry_states.
+                # Runs only after the force_full claim + reconcile have seen the
+                # full _entry_states (cloud included), so cloud sources reconcile
+                # normally here; afterwards _entry_states holds non-cloud only and
+                # the frequent incremental rescans never iterate cloud entries.
+                # next_state is self._entry_states (set above), so popping trims
+                # it in place. Only on success -- a failed force_full leaves the
+                # previous _cloud_entry_states intact.
                 cloud_state: Dict[str, EntryState] = {}
                 for path_str, is_cloud in next_cloud.items():
                     if not is_cloud:
@@ -745,12 +733,11 @@ class SourceManager:
     def _should_scan_resolved(self, resolved_str: str) -> bool:
         """Stability gate for an entry whose resolved path string is already known.
 
-        The snapshot-driven discovery (biopb/biopb#56 item 4) iterates ``next_state``
-        keys, which ``TreeScanner._scan_tree_state`` already stored as resolved path strings, so
-        a per-entry ``Path.resolve()`` would be pure waste. This carries the
-        load-bearing ``pending_scan`` clear-on-pass side effect (the #53
-        subtree-pending prune gate depends on it) by mutating the cached
-        ``EntryState`` in place.
+        Discovery iterates ``next_state`` keys, which ``TreeScanner`` already
+        stored as resolved path strings, so a per-entry ``Path.resolve()`` would
+        be pure waste. Carries the load-bearing ``pending_scan`` clear-on-pass
+        side effect -- the subtree-pending prune gate depends on it -- by
+        mutating the cached ``EntryState`` in place.
         """
         if os.path.basename(resolved_str).startswith("."):
             return False
@@ -772,11 +759,10 @@ class SourceManager:
         # Archived dehydrated data is inherently stable (never mid-write), so admit
         # it immediately. The pending-scan clear side effect is preserved.
         #
-        # This bypass is also load-bearing for the cloud inode-backfill skip in
-        # TreeScanner._scan_tree_state (biopb/biopb#190): under cloud the entry signature
-        # degrades to a constant (0, 0), leaving the stability counter meaningless
-        # -- safe only because this early-return means that counter is never read
-        # for a cloud path. Removing the bypass would make that skip incorrect.
+        # Load-bearing for TreeScanner's cloud inode-backfill skip: under cloud
+        # the entry signature degrades to a constant (0, 0), leaving the
+        # stability counter meaningless -- safe only because this early return
+        # means that counter is never read for a cloud path.
         if self._is_under_cloud_root(resolved_str):
             entry.pending_scan = False
             return True
@@ -1378,7 +1364,6 @@ class SourceManager:
 def create_source_manager(
     server: TensorFlightServer,
     registry: AdapterRegistry,
-    watcher: Optional[DirectoryWatcher],
     monitored_sources: Optional[List[SourceConfig]] = None,
     static_sources: Optional[List[SourceConfig]] = None,
     metadata_db: Optional[MetadataDatabase] = None,
@@ -1389,43 +1374,52 @@ def create_source_manager(
     stable_rescans_required: int = 0,
     aggressive_dir_pruning: bool = False,
     prune_unseen_days: int = 0,
-    allow_empty: bool = False,
-) -> Optional[SourceManager]:
+    rescan_interval: float = 30.0,
+) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
-    Handles both static sources (explicit config, registered once) and
-    monitored sources (filesystem-discovered, kept live via watcher).
-    Both paths use the same DiscoveryState/callback machinery.
+    Handles both static sources (explicit config, registered once) and monitored
+    sources (filesystem-discovered, kept live by the rescan loop). Both paths use
+    the same DiscoveryState/callback machinery. Remote sources are never
+    filesystem-watched: a bare-host ``grpc://`` upstream is monitored through the
+    background catalog re-list, and any other remote source is registered
+    statically during initial discovery.
 
-    Remote sources:
-    - Are NOT monitored (no filesystem events)
-    - Are registered during initial discovery only
-    - Use credentials_config for authentication
+    Always returns a manager. An empty catalog is a valid runtime state --
+    sources arrive later through runtime add_source (napari drag-drop), DoPut
+    uploads, or a monitored dir that fills after startup -- so a config naming
+    no usable source yields an empty manager the launcher serves (health
+    SERVING, empty list_flights) rather than a refusal to boot.
 
     Args:
-        server: TensorFlightServer instance
-        registry: AdapterRegistry for adapter creation
-        watcher: DirectoryWatcher for filesystem events (None for static-only)
-        monitored_sources: SourceConfig entries with monitor=True
-        static_sources: Explicit SourceConfig entries (monitor=False)
-        metadata_db: MetadataDatabase to keep in sync as sources are added/removed
-            (None when the feature is disabled)
-        credentials_config: CredentialsConfig for remote storage authentication
-        allow_empty: When True, build and return an empty SourceManager instead of
-            None when there are no (valid) sources. An empty catalog is a valid
-            runtime state -- sources can arrive later via runtime add_source
-            (napari drag-drop), DoPut uploads, or a monitored dir that fills after
-            startup -- so the launcher serves it (health SERVING, empty
-            list_flights) rather than refusing to boot (biopb/biopb#515).
+        server: TensorFlightServer the sources are registered into.
+        registry: AdapterRegistry used for claim detection and adapter creation.
+        monitored_sources: SourceConfig entries with monitor=True.
+        static_sources: Explicit SourceConfig entries (monitor=False).
+        metadata_db: MetadataDatabase kept in sync as sources are added and
+            removed (None when the feature is disabled).
+        credentials_config: CredentialsConfig for remote storage authentication.
+        stability_window: Seconds an entry's signature must be unchanged before
+            it is eligible to be claimed.
+        probe_open_files: Whether to additionally probe a file for append before
+            claiming it.
+        full_rescan_interval: Seconds between full tree walks; the rescans in
+            between prune stable and cloud subtrees. <= 0 disables force-full.
+        stable_rescans_required: Consecutive unchanged rescans an entry needs on
+            top of the stability window.
+        aggressive_dir_pruning: Whether the scanner may skip a directory whose
+            own signature is unchanged without descending into it.
+        prune_unseen_days: Days of absence after which annotations for a missing
+            source are auto-pruned; 0 disables auto-prune.
+        rescan_interval: Seconds between rescans. <= 0 leaves the manager with
+            no rescan loop, so :meth:`SourceManager.start` no-ops and the caller
+            drives any scan itself (config ``monitor_mode = "off"``).
 
     Returns:
-        SourceManager if there are any sources (or allow_empty=True), None otherwise
+        A SourceManager, empty if no source is usable.
     """
     monitored_sources = monitored_sources or []
     static_sources = static_sources or []
-
-    if not monitored_sources and not static_sources and not allow_empty:
-        return None
 
     # A bare-host tensor-server upstream ("mirror everything") IS monitored -- its
     # catalog is re-listed/reconciled in the background (biopb/biopb#178) -- it just
@@ -1485,17 +1479,10 @@ def create_source_manager(
     ]
 
     # An unreachable monitored upstream contributes no static sources at startup
-    # (its bare-host expansion was skipped), but the re-list will populate it once
-    # it is reachable -- so it counts as "something to serve" and must not let the
-    # server hard-fail to start (#178: require monitor=true for bare-host recovery).
+    # (its bare-host expansion was skipped), but the re-list populates it once it
+    # is reachable -- so it counts as "something to serve" and the catalog is not
+    # reported as empty on its account.
     if not monitored_dirs and not static_sources and not monitored_upstreams:
-        if not allow_empty:
-            logger.warning("No valid sources to serve")
-            return None
-        # Empty is a valid runtime state (biopb/biopb#515): fall through and build
-        # an empty manager so the server serves an empty catalog and accepts
-        # sources added later (runtime add_source, DoPut, a monitored dir that
-        # fills after startup).
         logger.warning("No sources configured yet; serving an empty catalog")
 
     # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
@@ -1527,8 +1514,8 @@ def create_source_manager(
         server=server,
         registry=registry,
         discovery_state=discovery_state,
-        watcher=watcher,
         monitored_dirs=monitored_dirs,
+        rescan_interval=rescan_interval,
         metadata_db=metadata_db,
         credentials_config=credentials_config,
         stability_window=stability_window,
@@ -1587,8 +1574,8 @@ def create_source_manager(
         manager._reconciler._commit_add_claim(claim, catalog_url=source._catalog_url)
 
     # Monitored discovery is NOT run synchronously here: under progressive
-    # discovery the launcher starts the manager's event loop and the watcher
-    # fires the first rescan immediately, so the (possibly slow) bootstrap scan
+    # discovery the launcher starts the manager's rescan loop, whose first tick
+    # fires immediately, so the (possibly slow) bootstrap scan
     # happens in the background while the server already reports SERVING. A
     # static-only config (no monitored_dirs) has nothing to scan -- the launcher
     # drives the first-scan-complete path directly so it still reports a

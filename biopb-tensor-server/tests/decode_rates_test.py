@@ -468,10 +468,10 @@ class TestTheStartupWiring:
         from biopb_tensor_server import cli
 
         CacheManager.reset()
-        server, source_manager, watcher, precache = cli._setup_flight_server(
+        server, source_manager, precache = cli._setup_flight_server(
             cli.load_config(config_path), port=0, config_path=config_path
         )
-        for stoppable in (watcher, precache, source_manager):
+        for stoppable in (precache, source_manager):
             if stoppable is not None:
                 stoppable.stop()
         return server

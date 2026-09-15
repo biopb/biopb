@@ -572,7 +572,6 @@ def _make_manager(server, cloud_roots=None, monitored=None):
         metadata_db=server._metadata_db,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs=monitored or set(),
         cloud_roots=cloud_roots or set(),
     )
@@ -751,7 +750,7 @@ class TestPrecacheSkipsUnresolved:
 
 
 # --------------------------------------------------------------------------- #
-# Cloud rescan gating (the watcher path)
+# Cloud rescan gating (the periodic rescan path)
 # --------------------------------------------------------------------------- #
 
 

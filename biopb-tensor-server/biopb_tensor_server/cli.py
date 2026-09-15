@@ -50,7 +50,6 @@ from biopb_tensor_server.serving.http_server import run as run_http_server
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 from biopb_tensor_server.sources.source_manager import create_source_manager
-from biopb_tensor_server.sources.watcher import get_watcher
 
 app = typer.Typer(
     name="biopb-tensor-server",
@@ -258,9 +257,7 @@ def _install_sigterm_handler() -> None:
 _FLIGHT_DRAIN_TIMEOUT_S = 3.0
 
 
-def _graceful_shutdown(
-    source_manager, watcher, flight_server, precache_worker=None
-) -> None:
+def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> None:
     """Best-effort orderly shutdown -- release the cache lock first, never hang.
 
     Step ORDER is load-bearing for clean restarts (biopb/biopb#300). ``restart``
@@ -292,9 +289,9 @@ def _graceful_shutdown(
        in-flight ``do_get`` may still touch an mmap, so closing it could segfault,
        and the essential work (lock + WAL) already happened in step 2. ``close()``'s
        own lock-release is then a harmless no-op (already released).
-    5. Stop the source manager (short join) and watcher last -- neither touches the
-       chunk cache and the lock is already gone, so a long join has no value; a
-       short bound keeps a blocked upstream re-list RPC from eating the budget.
+    5. Stop the source manager last (short join) -- it does not touch the chunk
+       cache and the lock is already gone, so a long join has no value; a short
+       bound keeps a blocked upstream re-list RPC from eating the budget.
 
     Each step is isolated so a failure in one still lets the others run.
     """
@@ -362,7 +359,6 @@ def _graceful_shutdown(
             "source manager",
             lambda: source_manager and source_manager.stop(join_timeout=1),
         ),
-        ("watcher", lambda: watcher and watcher.stop()),
     ):
         try:
             action()
@@ -435,8 +431,8 @@ def _resolve_serve_sources(
                 to_expand.append(s)
                 continue
             if not local_path.exists():
-                # Not-yet-mounted dir: skip the (crashing) expansion. The watcher
-                # and rescan pick it up when it appears (the runtime self-heals).
+                # Not-yet-mounted dir: skip the (crashing) expansion. The
+                # periodic rescan picks it up when it appears (self-healing).
                 logger.warning(
                     "Monitored path does not exist yet; will start monitoring "
                     "when it appears: %s",
@@ -786,7 +782,7 @@ def _setup_flight_server(
             persistent catalog, so two servers on two configs get two files.
 
     Returns:
-        Tuple of (flight_server, source_manager, watcher, precache_worker)
+        Tuple of (flight_server, source_manager, precache_worker)
 
     Raises:
         typer.Exit: If no sources configured or no sources loaded successfully
@@ -953,32 +949,20 @@ def _setup_flight_server(
             _tls_material.fingerprint(_tls_material.leaf_pem(tls_cert_chain)),
         )
 
-    # Set up watcher for monitored sources (None for static-only configs)
-    watcher = None
-    source_manager = None
-    monitored_dirs = set()
-    if monitored_sources:
-        try:
-            monitored_dirs = {
-                ms.local_path
-                for ms in monitored_sources
-                if not ms.is_remote and ms.local_path
-            }
-            if server_config.monitor_mode != "off":
-                watcher = get_watcher(
-                    watcher_type=server_config.monitor_mode,
-                    directories=monitored_dirs,
-                    poll_interval=server_config.rescan_interval,
-                    debounce_window=1.5,
-                )
-        except Exception as e:
-            console.print(f"[red]Failed to create watcher: {e}[/red]")
+    # Monitored local directories, and whether they are rescanned at all.
+    # `monitor_mode = "off"` keeps the sources but drops the periodic loop, so
+    # they are scanned once at startup and never again.
+    monitored_dirs = {
+        ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
+    }
+    rescan_interval = (
+        0.0 if server_config.monitor_mode == "off" else server_config.rescan_interval
+    )
 
     # Register all sources (both static and monitored) through unified discovery
     source_manager = create_source_manager(
         server=server,
         registry=registry,
-        watcher=watcher,
         monitored_sources=monitored_sources,
         static_sources=static_sources,
         metadata_db=metadata_db,
@@ -989,22 +973,8 @@ def _setup_flight_server(
         stable_rescans_required=server_config.stable_rescans_required,
         aggressive_dir_pruning=server_config.aggressive_dir_pruning,
         prune_unseen_days=server_config.annotations.prune_unseen_days,
-        # An empty (or all-invalid) source set is a valid runtime state: build an
-        # empty manager and serve an empty catalog rather than refusing to boot
-        # (biopb/biopb#515).
-        allow_empty=True,
+        rescan_interval=rescan_interval,
     )
-
-    # With allow_empty=True an empty/all-invalid source set yields an empty manager
-    # (served as an empty catalog), so a None here no longer means "no sources" --
-    # it can only be a genuine construction failure. Guard it: the startup code
-    # below dereferences source_manager unconditionally (unlike _graceful_shutdown,
-    # which tolerates None), so fail cleanly rather than with an opaque
-    # AttributeError. This exit is inside serve()/launch()'s try, so the finally
-    # still releases the cache lock (biopb/biopb#515).
-    if source_manager is None:
-        console.print("[red]Failed to initialize the source manager[/red]")
-        raise typer.Exit(1)
 
     # Wire the runtime add_source handler (tensor-browser drag-drop): the server
     # holds no SourceManager reference, so inject the entrypoint that routes a
@@ -1053,16 +1023,13 @@ def _setup_flight_server(
         server.set_full_scan_in_progress(True)
 
     background_scan_running = False
-    if watcher and source_manager:
-        try:
-            watcher.start(monitored_dirs)
-            source_manager.start()
-            background_scan_running = True
+    try:
+        source_manager.start()
+        background_scan_running = source_manager.is_running()
+        if background_scan_running:
             console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
-        except Exception as e:
-            console.print(f"[red]Failed to start monitoring: {e}[/red]")
-            watcher.stop()
-            watcher = None
+    except Exception as e:
+        console.print(f"[red]Failed to start monitoring: {e}[/red]")
 
     if precache_worker is not None:
         precache_worker.start()
@@ -1075,21 +1042,15 @@ def _setup_flight_server(
     server.mark_ready()
 
     if not background_scan_running:
-        # No event loop will drive the bootstrap scan. Two cases:
-        #  - monitored dirs but the watcher failed to start: scan synchronously
-        #    now so those sources are still registered (the pre-progressive
-        #    behavior for watcher-less setups); run_initial_scan also stamps
-        #    freshness, flips the startup gate, and seeds the backlog.
-        #  - static-only config (no monitored dirs, nothing to scan): advance the
-        #    completion protocol directly so it still reports a timestamp and seeds.
-        if monitored_dirs:
-            source_manager.run_initial_scan()
-        else:
-            source_manager.complete_initial_scan()
+        # No rescan loop is driving the bootstrap scan (rescanning is off, the
+        # loop failed to start, or there was nothing to monitor). The manager
+        # knows which fallback that calls for -- a synchronous scan, or just
+        # advancing the completion protocol for a static-only config.
+        source_manager.run_bootstrap_fallback()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 
-    return server, source_manager, watcher, precache_worker
+    return server, source_manager, precache_worker
 
 
 def _create_source_adapter(source: SourceConfig, registry=None):
@@ -1265,9 +1226,9 @@ def serve(
     # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
     tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
 
-    server = source_manager = watcher = precache_worker = None
+    server = source_manager = precache_worker = None
     try:
-        server, source_manager, watcher, precache_worker = _setup_flight_server(
+        server, source_manager, precache_worker = _setup_flight_server(
             server_config,
             host=host,
             port=port,
@@ -1301,7 +1262,7 @@ def serve(
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
-        _graceful_shutdown(source_manager, watcher, server, precache_worker)
+        _graceful_shutdown(source_manager, server, precache_worker)
 
 
 def _unreadable_trust_anchors(server_config) -> List[str]:
@@ -1929,9 +1890,9 @@ def launch(
     # `finally` rather than an except block regardless.
     tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
 
-    flight_server = source_manager = watcher = precache_worker = None
+    flight_server = source_manager = precache_worker = None
     try:
-        flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
+        flight_server, source_manager, precache_worker = _setup_flight_server(
             server_config,
             host=host,
             port=port,
@@ -2029,7 +1990,7 @@ def launch(
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
-        _graceful_shutdown(source_manager, watcher, flight_server, precache_worker)
+        _graceful_shutdown(source_manager, flight_server, precache_worker)
 
     try:
         from biopb_tensor_server import __version__
