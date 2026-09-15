@@ -209,9 +209,7 @@ class TestWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             # 8192 -> scale 4 in X/Y, so the warmed chunks are scaled chunks.
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
@@ -266,9 +264,7 @@ class TestWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -303,9 +299,7 @@ class TestWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -334,21 +328,17 @@ class TestWarming:
             CacheManager.get_instance().close()
             CacheManager.reset()
 
-    def test_memory_backend_is_noop(self, tmp_path):
+    def test_no_cache_manager_is_noop(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
         try:
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker._process_source("warm-src")
 
-            # File-backend gate: nothing computed on a memory backend.
-            stats = CacheManager.get_instance().stats()
-            assert stats.misses == 0
-            assert stats.total_entries == 0
+            # Cache gate: nothing to warm into without a configured CacheManager.
+            assert worker._process_source("warm-src") is False
+            assert CacheManager.get_instance() is None
         finally:
             server.shutdown()
             CacheManager.reset()
@@ -513,9 +503,7 @@ class TestPreemptionAndLifecycle:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             arr = zarr.open_array(
                 str(tmp_path / "a.zarr"),
@@ -792,9 +780,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
     def test_backlog_warms_existing_sources(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
@@ -973,9 +959,7 @@ class TestSkipNativePyramid:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         server = TensorFlightServer("grpc://localhost:0")
         try:
             adapter = self._ome_adapter(multires_ome_zarr)
@@ -1008,9 +992,7 @@ class TestSkipUnscaledCoarsestLevel:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
     def _warm_one_tensor(self, tmp_path, shape, labels, chunks=None):
         """Run one tensor through the worker; return the cache's miss count."""

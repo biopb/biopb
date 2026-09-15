@@ -203,7 +203,7 @@ if not isinstance(data, dict):
 # (biopb/biopb#604), and `biopb control start` passes it down. Writing it would
 # only earn a "no longer read" warning on every startup.
 data.setdefault("server", {"aggressive_dir_pruning": True})
-data.setdefault("cache", {"backend": "file", "file_max_total_gb": 32})
+data.setdefault("cache", {"file_max_total_gb": 32})
 md = data.pop("metadata_db", None)
 if isinstance(md, dict):
     if md.get("enabled", True):

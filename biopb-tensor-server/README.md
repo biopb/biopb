@@ -136,7 +136,6 @@ You can create a custom config file to fine-tune server behavior, e.g. specifyin
 {
   "server": { "log_level": "INFO" },
   "cache": {
-    "backend": "file",
     "file_max_segment_mb": 256,
     "file_max_total_gb": 128
   },

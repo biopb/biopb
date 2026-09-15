@@ -15,8 +15,6 @@ from biopb_tensor_server.cache import (
     ArrowFileBackend,
     ArrowFileConfig,
     CacheManager,
-    MemoryCacheBackend,
-    MemoryCacheConfig,
 )
 from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
 from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
@@ -151,19 +149,6 @@ class TestClassSurvivesRestart:
         reopened.close()
 
 
-class TestMemoryBackend:
-    """No pooling there -- eviction is per-entry -- so only "pinned" bites."""
-
-    def test_pinned_entries_are_not_evicted(self):
-        backend = MemoryCacheBackend(MemoryCacheConfig(max_entries=4, max_bytes=4 * 32))
-        _store(backend, b"pin", [0] * 32, "pinned", 32)
-        for i in range(8):
-            _store(backend, f"k{i}".encode(), [i] * 32, "normal", 32)
-
-        assert b"pin" in backend._entries
-        assert backend.stats().evictions > 0
-
-
 class TestDeclarationAtTheReadSeam:
     """Who decides the class, at the one call every cached chunk goes through.
 
@@ -193,7 +178,7 @@ class TestDeclarationAtTheReadSeam:
 
     @pytest.fixture
     def manager(self, cache_dir):
-        mgr = CacheManager(CacheConfig(backend="file", file_cache_dir=cache_dir))
+        mgr = CacheManager(CacheConfig(file_cache_dir=cache_dir))
         yield mgr
         mgr.close()
 

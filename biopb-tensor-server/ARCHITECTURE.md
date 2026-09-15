@@ -216,16 +216,10 @@ justified by open cost.
 
 ## Chunk caching / transcoding
 
-`CacheManager` provides a pluggable cache layer between `DoGet` and the adapter.
-Two implementations:
-
-- In-process LRU memory cache (`OrderedDict`-based, in
-  `cache/memory_backend.py`).
-- Persisted file cache transcoding chunk data to Flight IPC format
-  (`cache/file_backend.py`).
-
-The file cache is _strongly_ preferred: it serves a localhost client over an
-mmap fast path, bypassing the round trip through a socket. See
+`CacheManager` sits between `DoGet` and the adapter, backed by a persisted file
+cache transcoding chunk data to Flight IPC format (`cache/file_backend.py`). It
+serves a localhost client over an mmap fast path, bypassing the round trip
+through a socket. See
 **[../docs/localhost-fast-path.md](../docs/localhost-fast-path.md)**.
 
 ---
@@ -333,9 +327,9 @@ and *where to expose it* is the launch command.
 
 **Flight server (`_setup_flight_server`)**
 
-4. Initialize the chunk cache. A `file` backend degrades to memory when the
-   cache dir cannot be mmapped safely (network mount, cloud-synced folder) or
-   isn't writable — the localhost fast path goes with it, but the server serves.
+4. Initialize the chunk cache. The server refuses to start when the cache dir
+   cannot be mmapped safely (network mount, cloud-synced folder) or isn't
+   writable — the on-disk cache is required infrastructure, not optional.
 5. Resolve config sources into *static* and *monitored* sets, and build the
    metadata DB (mandatory — it backs `query_sources`). An empty catalog is a
    valid state and boots: sources can still arrive via `add_source`, DoPut, or a

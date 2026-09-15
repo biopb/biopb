@@ -141,7 +141,6 @@ def test_installer_default_config_validates(validator):
     base = {
         "server": {"log_level": "INFO", "aggressive_dir_pruning": True},
         "cache": {
-            "backend": "file",
             "file_max_segment_mb": 256,
             "file_max_total_gb": 32,
         },
@@ -161,7 +160,7 @@ def test_installer_default_config_validates(validator):
         {"precache": {"backlog_high_water": 1.0}},  # boundary (max)
         {"metadata_db": {"query_timeout_ms": 1}},  # boundary (min)
         {"server": {"log_level": "info"}},  # case-insensitive enum stays lenient
-        {"cache": {"backend": "memory"}},
+        {"cache": {"file_max_segment_mb": 64}},
         {"sources": [{"url": "/d", "type": "ome-zarr"}]},
         {"server": {"future_unknown_knob": 7}},  # additionalProperties: true
         # Removed [compute] section: tolerated by the schema (root
@@ -177,7 +176,6 @@ def test_accepts_valid(validator, cfg):
     "cfg",
     [
         {"metadata_db": {"query_timeout_ms": 0}},
-        {"cache": {"backend": "bogus"}},
         {"pyramid": {"downscale_factor": 1}},  # silently single-level before
         {"pyramid": {"downscale_factor": 0}},  # ZeroDivisionError before
         {"pyramid": {"pixel_budget_cubic_root": 0}},  # infinite loop before

@@ -171,7 +171,6 @@ def _one_cell(path, open_adapter, descriptor, scale, method, cold, rounds):
         cache_dir = tempfile.mkdtemp(prefix="planebench-")
         cache = CacheManager(
             CacheConfig(
-                backend="file",
                 file_cache_dir=Path(cache_dir),
                 file_max_total_bytes=16 * 1024**3,
             )

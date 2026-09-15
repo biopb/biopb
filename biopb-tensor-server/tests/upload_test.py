@@ -64,7 +64,7 @@ def writable_server(tmp_path):
     from biopb_tensor_server.serving.server import TensorFlightServer
 
     CacheManager.reset()
-    CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=512))
+    CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     server = TensorFlightServer(
         location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
     )
@@ -190,10 +190,10 @@ class TestCachedSourceAdapter:
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
 
-    def test_write_chunk(self):
+    def test_write_chunk(self, tmp_path):
         """write_chunk stores data in cache."""
         CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
+        config = CacheConfig(file_cache_dir=tmp_path / "cache")
         CacheManager.initialize(config)
 
         adapter = CachedSourceAdapter(
@@ -223,7 +223,7 @@ class TestCachedSourceAdapter:
 
         CacheManager.reset()
 
-    def test_write_chunk_leaves_no_cache_reference(self):
+    def test_write_chunk_leaves_no_cache_reference(self, tmp_path):
         """An uploaded chunk is not pinned in memory (biopb/biopb#545).
 
         write_chunk_arrow used to drive start_compute/complete_entry itself and
@@ -232,7 +232,7 @@ class TestCachedSourceAdapter:
         bounded by the *disk* cache budget.
         """
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
         adapter = CachedSourceAdapter(
             source_id="test",
@@ -251,17 +251,16 @@ class TestCachedSourceAdapter:
 
         CacheManager.reset()
 
-    def test_resolve_chunk_data_memory_backend(self):
-        """Regression test: resolve_chunk_data must work for memory-backed CachedSourceAdapter.
+    def test_resolve_chunk_data_for_cache_backed_adapter(self, tmp_path):
+        """Regression test: resolve_chunk_data must work for CachedSourceAdapter.
 
-        Bug: Base class resolve_chunk_data only caches for scaled chunks or ArrowFileBackend.
         CachedSourceAdapter has no backend data source - all data is in cache.
         Without override, retrieval would call get_data() which raises error.
 
         This tests the resolve_chunk_data override in CachedSourceAdapter.
         """
         CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
+        config = CacheConfig(file_cache_dir=tmp_path / "cache")
         CacheManager.initialize(config)
 
         adapter = CachedSourceAdapter(
@@ -334,10 +333,10 @@ class TestCachedSourceAdapter:
         assert planned, "a read plan with no endpoints would pass vacuously"
         assert all(chunk_id in written for chunk_id in planned)
 
-    def test_write_chunk_arbitrary_bounds(self):
+    def test_write_chunk_arbitrary_bounds(self, tmp_path):
         """Cache sources accept arbitrary chunk bounds."""
         CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
+        config = CacheConfig(file_cache_dir=tmp_path / "cache")
         CacheManager.initialize(config)
 
         adapter = CachedSourceAdapter(
@@ -359,13 +358,13 @@ class TestCachedSourceAdapter:
         _read_cached_batch(CacheManager.get_instance(), chunk_id)
         CacheManager.reset()
 
-    def test_write_chunk_arrow_rejects_list_wrapper(self):
+    def test_write_chunk_arrow_rejects_list_wrapper(self, tmp_path):
         # The binary chunk schema stores the flat value buffer, and the upload
         # dtype is derived from the primitive Arrow field type; a list<T> wrapper
         # would corrupt both (buffer[1] is offsets, to_pandas_dtype() is wrong).
         # write_chunk_arrow must refuse it rather than silently mis-store.
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         adapter = CachedSourceAdapter(
             source_id="t", shape=[4], dtype="int16", chunk_shape=[4]
         )
@@ -393,7 +392,6 @@ class TestCachedSourceAdapter:
         cache_dir = tempfile.mkdtemp(prefix="test-cached-source-")
         try:
             config = CacheConfig(
-                backend="file",
                 file_cache_dir=Path(cache_dir),
                 file_max_total_bytes=100 * 1024 * 1024,  # 100MB
             )
@@ -455,9 +453,7 @@ class TestScaledReads:
     @pytest.fixture
     def cache(self, tmp_path):
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         yield CacheManager.get_instance()
         CacheManager.reset()
 
@@ -850,13 +846,13 @@ class TestServerDoPutHandler:
         with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
             server.uploads.create_source(req_desc)
 
-    def test_create_source_action_round_trip(self):
+    def test_create_source_action_round_trip(self, tmp_path):
         """Live client create_source should return the server-assigned source_id."""
         from biopb.tensor import TensorFlightClient
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
+        config = CacheConfig(file_cache_dir=tmp_path / "cache")
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
@@ -1077,12 +1073,12 @@ class TestDoPutErrorTranslation:
 class TestChunkUpload:
     """Tests for chunk upload handling."""
 
-    def test_upload_chunk_cache_backed(self):
+    def test_upload_chunk_cache_backed(self, tmp_path):
         """Upload chunk to cache-backed source."""
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
+        config = CacheConfig(file_cache_dir=tmp_path / "cache")
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
@@ -1124,12 +1120,12 @@ class TestChunkUpload:
 
         CacheManager.reset()
 
-    def test_upload_chunk_cache_backed_preserves_logical_shape(self):
+    def test_upload_chunk_cache_backed_preserves_logical_shape(self, tmp_path):
         """Cache-backed uploads must store shape metadata for reconstruction."""
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
+        config = CacheConfig(file_cache_dir=tmp_path / "cache")
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
@@ -1210,7 +1206,7 @@ class TestOmeZarrChunkAlignment:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             CacheManager.reset()
-            config = CacheConfig(backend="memory", memory_max_entries=10)
+            config = CacheConfig(file_cache_dir=Path(tmpdir) / "cache")
             CacheManager.initialize(config)
 
             server = TensorFlightServer(
@@ -1347,11 +1343,11 @@ class TestCachedSourceContentVersion:
             content_version=cv,
         )
 
-    def test_versioned_write_read_roundtrip(self):
+    def test_versioned_write_read_roundtrip(self, tmp_path):
         from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             cv = b"gen:1"
             adapter = self._adapter(cv)
@@ -1375,11 +1371,11 @@ class TestCachedSourceContentVersion:
         finally:
             CacheManager.reset()
 
-    def test_reupload_new_generation_serves_fresh_data(self):
+    def test_reupload_new_generation_serves_fresh_data(self, tmp_path):
         from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=50))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
             old = np.zeros((4, 4), dtype=np.uint8)
@@ -1405,11 +1401,11 @@ class TestCachedSourceContentVersion:
         finally:
             CacheManager.reset()
 
-    def test_unversioned_adapter_is_legacy(self):
+    def test_unversioned_adapter_is_legacy(self, tmp_path):
         from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             adapter = CachedSourceAdapter(
                 source_id="cache_legacy",

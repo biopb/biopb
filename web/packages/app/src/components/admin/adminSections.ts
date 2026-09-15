@@ -64,13 +64,14 @@ export const ADMIN_NAV: AdminNavItem[] = [
     id: "cache",
     label: "Cache",
     description:
-      "In-memory and on-disk caching of decoded image chunks. Larger limits keep " +
-      "more data warm at the cost of RAM and disk.",
+      "On-disk caching of decoded image chunks. Larger limits keep more data " +
+      "warm at the cost of disk.",
     kind: "fields",
     section: "cache",
-    // On-disk keys (config-schema maps the dataclass's memory_max_bytes →
-    // cache.max_bytes); commonFields must match the schema, not the dataclass.
-    commonFields: ["backend", "max_bytes", "file_max_total_gb"],
+    // On-disk keys (config-schema maps the dataclass's file_max_total_bytes →
+    // cache.file_max_total_gb); commonFields must match the schema, not the
+    // dataclass.
+    commonFields: ["file_max_segment_mb", "file_max_total_gb"],
   },
   {
     id: "pyramid",

@@ -131,24 +131,18 @@ def bench_real_server(
         }
         (zarr_path / ".zattrs").write_text(json.dumps(ome))
 
-        # Setup cache
+        # Setup cache. No CacheManager at all is the "no caching" arm --
+        # resolve_chunk_data skips caching whenever cache_manager is None.
         if use_file_cache:
             CacheManager.initialize(
                 CacheConfig(
-                    backend="file",
                     file_cache_dir=Path(tmpdir) / "fcache",
                     file_max_segment_bytes=256 * 1024 * 1024,
                     file_max_total_bytes=512 * 1024 * 1024,
                 )
             )
         else:
-            CacheManager.initialize(
-                CacheConfig(
-                    backend="memory",
-                    memory_max_entries=0,  # No caching for raw reads
-                    memory_max_bytes=0,
-                )
-            )
+            CacheManager.reset()
 
         grp = zarr.open_group(zarr_path, mode="r")
         level_arr = grp["0"]

@@ -8,9 +8,9 @@ from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.serving.server import TensorFlightServer
 
 
-def test_cache_stats_action_returns_stats():
+def test_cache_stats_action_returns_stats(tmp_path):
     """do_action('cache_stats') returns the backend's CacheStats as JSON."""
-    CacheManager.initialize(CacheConfig(backend="memory"))
+    CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     try:
         server = TensorFlightServer("grpc://localhost:0")
         (raw,) = list(server.do_action(None, flight.Action("cache_stats", b"")))

@@ -16,6 +16,7 @@ these tests measure full request path:
 
 import concurrent.futures
 import random
+import tempfile
 import threading
 import time
 
@@ -86,7 +87,9 @@ def _create_server_with_sources(n_sources: int):
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
 
-    CacheManager.initialize(CacheConfig(backend="memory"))
+    CacheManager.initialize(
+        CacheConfig(file_cache_dir=tempfile.mkdtemp(prefix="biopb-bench-cache-"))
+    )
 
     port = random.randint(8900, 8999)
     location = f"grpc://127.0.0.1:{port}"
@@ -140,7 +143,9 @@ def server_with_metadata_db():
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
 
-    CacheManager.initialize(CacheConfig(backend="memory"))
+    CacheManager.initialize(
+        CacheConfig(file_cache_dir=tempfile.mkdtemp(prefix="biopb-bench-cache-"))
+    )
 
     port = random.randint(8900, 8999)
     location = f"grpc://127.0.0.1:{port}"

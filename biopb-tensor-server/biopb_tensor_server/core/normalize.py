@@ -85,11 +85,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.axes import canonical_permutation
-from biopb_tensor_server.core.chunk import (
-    ChunkEndpoint,
-    cache_key_for_chunk_id,
-    is_scaled_chunk,
-)
+from biopb_tensor_server.core.chunk import ChunkEndpoint, cache_key_for_chunk_id
 from biopb_tensor_server.core.chunk_batch import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 
@@ -526,16 +522,11 @@ class NormalizingAdapter(TensorAdapter):
         loop to transpose them. Existing segments predate the transpose, which is
         what ``CACHE_FILE_FORMAT_VERSION`` is bumped for.
         """
-        from biopb_tensor_server.cache import ArrowFileBackend
-
         perm = self.perm
         if perm is None:
             return self._inner.resolve_chunk_data(chunk_id, cache_manager)
 
-        should_cache = cache_manager is not None and (
-            is_scaled_chunk(chunk_id)
-            or isinstance(cache_manager.backend, ArrowFileBackend)
-        )
+        should_cache = cache_manager is not None
 
         def compute_fn():
             batch = self._inner.resolve_chunk_data(chunk_id, None)

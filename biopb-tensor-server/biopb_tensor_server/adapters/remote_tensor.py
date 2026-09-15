@@ -61,7 +61,6 @@ from biopb_tensor_server.core.chunk import (
     encode_chunk_id,
     encode_proxy_envelope,
     is_proxy_envelope,
-    is_scaled_chunk,
     peel_proxy_envelope,
 )
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
@@ -1026,15 +1025,10 @@ class RemoteTensorAdapter(TensorAdapter):
         (stale pre-upgrade) chunk_id and a version-stale envelope, before
         anything is forwarded.
         """
-        from biopb_tensor_server.cache import ArrowFileBackend
-
         self.check_chunk_version(chunk_id)
         _route, _held_version, inner = peel_proxy_envelope(chunk_id)
 
-        should_cache = cache_manager is not None and (
-            is_scaled_chunk(inner)
-            or isinstance(cache_manager.backend, ArrowFileBackend)
-        )
+        should_cache = cache_manager is not None
 
         def compute_fn():
             # Forward the upstream chunk_id VERBATIM (the opaque inner); the upstream

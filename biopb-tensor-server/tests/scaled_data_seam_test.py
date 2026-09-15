@@ -668,9 +668,7 @@ class TestCacheSourcedUnits:
         for full-resolution work, and sourcing it this way leaves that work's
         pages resident."""
         adapter, reads = counted
-        manager = CacheManager(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        manager = CacheManager(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             assert manager.source_scaled_reads is True
             _set_grid(monkeypatch, adapter, (16, 16))
@@ -688,7 +686,6 @@ class TestCacheSourcedUnits:
         adapter, reads = counted
         manager = CacheManager(
             CacheConfig(
-                backend="file",
                 file_cache_dir=tmp_path / "cache",
                 source_scaled_reads=False,
             )
@@ -718,25 +715,6 @@ class TestCacheSourcedUnits:
 
         assert len(reads) > 1
         assert np.array_equal(out, expected)
-
-    def test_the_memory_backend_leaves_nothing_to_source_from(
-        self, counted, monkeypatch, tmp_path
-    ):
-        """Documented, not incidental: `resolve_chunk_data` caches unscaled
-        chunks only on the file backend, so a level-0 read against the memory
-        backend stores nothing and the probe costs one index lookup."""
-        adapter, reads = counted
-        manager = CacheManager(CacheConfig(backend="memory", source_scaled_reads=True))
-        try:
-            _set_grid(monkeypatch, adapter, (16, 16))
-            self._warm_level_zero(adapter, manager)
-            reads.clear()
-
-            adapter.get_scaled_data(_bounds((0, 0), (64, 64)), (4, 4), "area", manager)
-
-            assert len(reads) > 1
-        finally:
-            manager.close()
 
 
 class TestBorrowedUnits:

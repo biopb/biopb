@@ -154,22 +154,6 @@ def _default_file_cache_dir() -> Path:
 DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
 
 
-def _default_cache_backend() -> str:
-    """Default cache backend when a config doesn't specify one.
-
-    Always "file". The file backend caches *decoded* chunks as Arrow IPC
-    segments, so repeat reads skip re-decoding the raw format -- and decoding
-    TIFF/CZI/etc. is typically slower than an Arrow IPC read-back. It also
-    persists across restarts and powers the localhost cache-file fast path
-    (issue #9). Windows is safe now that the backend copies batches off the
-    segment mmap so eviction can unlink (copy-on-read, biopb/biopb#5). The
-    localhost cache-file *handoff* stays POSIX-only (a client's cross-process
-    mmap still blocks unlink on Windows), but that is a client-side gate,
-    independent of the server's choice of backend.
-    """
-    return "file"
-
-
 # --- Declarative config validation (biopb/biopb#34) ---------------------------
 #
 # Out-of-range / bad-enum values used to be accepted silently and blow up later:
@@ -214,9 +198,6 @@ _REDUCTION_METHODS = {
 # biopb._config_constraints so biopb-mcp validates the same knobs identically.
 _CONSTRAINTS = {
     "CacheConfig": {
-        "backend": _Enum({"memory", "file"}),
-        "memory_max_entries": _Range(min=1),
-        "memory_max_bytes": _Range(min=1),
         "file_max_segment_bytes": _Range(min=1),
         "file_max_total_bytes": _Range(min=1),
         # 0 is the off switch (measure, classify nothing); negative would be a
@@ -532,26 +513,11 @@ class CacheConfig:
 
     Per-field help lives in each field's ``metadata["help"]`` (read by the config
     JSON Schema). Note the on-disk key names differ for the size fields
-    (``memory_max_bytes`` -> ``max_bytes``, ``file_max_segment_bytes`` ->
-    ``file_max_segment_mb``, ``file_max_total_bytes`` -> ``file_max_total_gb``);
-    the help is phrased for the on-disk form the editor shows.
+    (``file_max_segment_bytes`` -> ``file_max_segment_mb``, ``file_max_total_bytes``
+    -> ``file_max_total_gb``); the help is phrased for the on-disk form the
+    editor shows.
     """
 
-    backend: str = field(
-        default_factory=_default_cache_backend,
-        metadata={
-            "help": "Chunk cache backend: 'memory' (in-process only) or 'file' "
-            "(adds an on-disk cache)."
-        },
-    )
-    memory_max_entries: int = field(
-        default=1024,
-        metadata={"help": "Maximum number of decoded chunks kept in memory."},
-    )
-    memory_max_bytes: int = field(
-        default=512 * 1024 * 1024,  # 512 MB
-        metadata={"help": "Maximum total bytes of decoded chunks kept in memory."},
-    )
     file_cache_dir: Path = field(
         default=DEFAULT_FILE_CACHE_DIR,
         metadata={"help": "Directory for the on-disk chunk cache (file backend)."},
@@ -1232,12 +1198,12 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
     """Warn for unrecognized config sections / keys before they silently drop.
 
     An unknown key is otherwise dropped and the default used with no signal --
-    the classic trap is ``[cache] memory_max_entries`` (the dataclass field
-    name) where the parser reads ``max_entries``, so a 1-entry cache silently
-    stays at the 1024/512MB default. Value validation (range/enum) lives in the
-    dataclasses; this only flags *keys the parser never reads*. The known-key
-    set is the config JSON Schema's property lists (see :func:`_known_config_keys`).
-    Warn-only.
+    the classic trap is ``[cache] file_max_segment_bytes`` (the dataclass field
+    name) where the parser reads ``file_max_segment_mb``, so an oversized-segment
+    tweak silently stays at the 64MB default. Value validation (range/enum)
+    lives in the dataclasses; this only flags *keys the parser never reads*. The
+    known-key set is the config JSON Schema's property lists (see
+    :func:`_known_config_keys`). Warn-only.
     """
     if not isinstance(data, dict):
         return
@@ -1400,8 +1366,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     forwards only the keys actually present in ``data`` (via :func:`_carry`) and
     lets each dataclass fill the rest, so a default is never declared twice
     (biopb/biopb#277 item A). What stays here is the wire<->dataclass mapping the
-    dataclasses cannot express: on-disk key aliases (``cache.max_entries`` ->
-    ``memory_max_entries``), unit scaling (``*_mb``/``*_gb`` -> ``*_bytes``),
+    dataclasses cannot express: on-disk key aliases (``cache.file_max_segment_mb``
+    -> ``file_max_segment_bytes``), unit scaling (``*_mb``/``*_gb`` -> ``*_bytes``),
     legacy back-compat keys (``watcher_type``, ``poll_interval``, the ``[precache]``
     pyramid knobs, source ``path``), and per-field coercions.
 
@@ -1453,14 +1419,11 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     if write_dir_str:
         server_kwargs["write_dir"] = Path(write_dir_str)
 
-    # Parse cache settings. The wire form of four fields diverges from the
-    # dataclass (aliases + MB/GB->bytes scaling); everything else is a direct
-    # carry. Mapping mirrors config_schema._ONDISK_OVERRIDES.
+    # Parse cache settings. The wire form of two fields diverges from the
+    # dataclass (MB/GB->bytes scaling); everything else is a direct carry.
+    # Mapping mirrors config_schema._ONDISK_OVERRIDES.
     cache_data = data.get("cache", {})
     cache_kwargs: Dict[str, Any] = {}
-    _carry(cache_kwargs, "backend", cache_data)
-    _carry(cache_kwargs, "memory_max_entries", cache_data, "max_entries")
-    _carry(cache_kwargs, "memory_max_bytes", cache_data, "max_bytes")
     _carry(
         cache_kwargs,
         "file_max_segment_bytes",
@@ -1695,10 +1658,11 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     from biopb_tensor_server.core.config_schema import ondisk_location
 
     # The checker reports dataclass-field paths; the endpoint needs the on-disk
-    # ones (CacheConfig.memory_max_entries lives at [cache] max_entries), so the
-    # section/key is remapped before it leaves -- in the message too, whose
-    # `field=...` lead-in would otherwise name the internal field the on-disk path
-    # doesn't (e.g. path [cache] max_entries with "memory_max_entries=...").
+    # ones (CacheConfig.file_max_segment_bytes lives at [cache]
+    # file_max_segment_mb), so the section/key is remapped before it leaves --
+    # in the message too, whose `field=...` lead-in would otherwise name the
+    # internal field the on-disk path doesn't (e.g. path [cache]
+    # file_max_segment_mb with "file_max_segment_bytes=...").
     problems: List[Dict[str, Any]] = []
     for problem in _config_problems(cfg):
         section, key = problem.path

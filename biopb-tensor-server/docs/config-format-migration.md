@@ -142,8 +142,8 @@ See `tensor-server-admin-endpoint.md`.
 ## Gotchas
 
 - **One source of truth for the key set.** `config._warn_unknown_config_keys`
-  (the unknown-key warning, #234 — catches e.g. `[cache] memory_max_entries`
-  instead of `max_entries`) derives its known-section / known-key sets by walking
+  (the unknown-key warning, #234 — catches e.g. `[cache] file_max_segment_bytes`
+  instead of `file_max_segment_mb`) derives its known-section / known-key sets by walking
   `build_config_schema()`'s properties (`config_schema.known_config_keys`); the old
   hardcoded `_KNOWN_*` tables were deleted. The schema is the single source for the
   key set too. An unknown key stays **warn-and-ignore** — like a bad *value*,
@@ -181,7 +181,7 @@ need to read an old file by eye.
 host = "127.0.0.1"
 port = 9000
 [cache]
-backend = "memory"
+file_max_total_gb = 8
 [[sources]]
 type = "zarr"
 url = "/data/a.zarr"
@@ -189,7 +189,7 @@ url = "/data/a.zarr"
 
 ```json
 {
-  "cache": { "backend": "memory" },
+  "cache": { "file_max_total_gb": 8 },
   "sources": [
     { "type": "zarr", "url": "/data/a.zarr" }
   ]

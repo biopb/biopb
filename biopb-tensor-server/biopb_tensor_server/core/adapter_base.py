@@ -1161,8 +1161,8 @@ class TensorAdapter(SourceAdapter):
         """Resolve chunk data, handling scaled chunks and backend caching.
 
         The default implementation reads raw chunk data with ``self.get_data()``.
-        Scaled chunks are always cacheable when a CacheManager is available.
-        With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
+        Every chunk -- scaled or raw -- is cached by chunk_id whenever a
+        CacheManager is available.
 
         What a stored chunk costs to produce again (:meth:`_retention_for_chunk`)
         is declared from the chunk when it is scaled, and measured when it is
@@ -1180,17 +1180,13 @@ class TensorAdapter(SourceAdapter):
                 :meth:`check_chunk_version`, called first, before any bytes
                 are read.
         """
-        from biopb_tensor_server.cache import ArrowFileBackend
-
         self.check_chunk_version(chunk_id)
         array_id, bounds = decode_chunk_id(chunk_id)
 
         # Check if scaled chunk (has extra bytes after bounds encoding)
         is_scaled_chunk_flag = is_scaled_chunk(chunk_id)
 
-        should_cache = cache_manager is not None and (
-            is_scaled_chunk_flag or isinstance(cache_manager.backend, ArrowFileBackend)
-        )
+        should_cache = cache_manager is not None
 
         logger.debug(
             f"resolve_chunk_data: array_id={array_id}, scaled={is_scaled_chunk_flag}, "

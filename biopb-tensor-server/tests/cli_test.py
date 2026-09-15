@@ -240,7 +240,7 @@ def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
     crash (and could falsely block a concurrent same-user start).
     """
     cache_dir = tmp_path / "cache"
-    config = CacheConfig(backend="file", file_cache_dir=cache_dir)
+    config = CacheConfig(file_cache_dir=cache_dir)
     CacheManager.initialize(config)
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)  # held while server "runs"
@@ -260,7 +260,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
     raising source_manager.stop() must not keep the lock from being released.
     """
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)
 
@@ -309,7 +309,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
     import time
 
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)
 
@@ -348,7 +348,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
 def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     """End-to-end: serve()'s shutdown path releases the cache lock."""
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)
 
@@ -379,7 +379,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
     the finally releases the lock on every exit path, not just a clean return.
     """
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)  # held once cache init ran
 
@@ -405,21 +405,20 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
             mgr.close()
 
 
-def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
-    """A file cache configured on network/cloud storage demotes to memory.
+def test_file_cache_on_network_dir_refuses_to_start(tmp_path, monkeypatch):
+    """A file cache configured on network/cloud storage refuses to start.
 
     The Arrow file backend mmaps its segments and assumes local-POSIX semantics;
     on NFS/CIFS an evicted-but-mapped segment can SIGBUS/ESTALE, and a cloud
     Files-On-Demand folder recalls a dehydrated segment on mmap read
-    (biopb/biopb#571 follow-up). The launcher classifies the cache dir at startup
-    and, on a positive network/cloud signal, initializes the memory backend
-    instead -- which also disables the localhost fast path (a memory backend
-    never locates a chunk).
+    (biopb/biopb#571 follow-up). The launcher classifies the cache dir at
+    startup and, on a positive network/cloud signal, exits rather than serve
+    unsafe reads -- the on-disk cache is required infrastructure, not an
+    optional accelerator with a fallback.
     """
     import json
 
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 
     cache_dir = tmp_path / "cache"  # a real local dir...
     config_path = tmp_path / "biopb.json"
@@ -427,7 +426,7 @@ def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "cache": {"file_cache_dir": str(cache_dir)},
                 "sources": [],
             }
         )
@@ -439,18 +438,13 @@ def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
 
     config = cli.load_config(config_path)
     CacheManager.reset()
-    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
-        mgr = CacheManager.get_instance()
-        assert not isinstance(mgr.backend, ArrowFileBackend)  # demoted to memory
-        # The file cache dir was never created (backend never touched disk).
+        with pytest.raises(typer.Exit) as exc:
+            cli._setup_flight_server(config, port=0)
+        assert exc.value.exit_code == 1
+        # The cache dir was never created (the server exited before touching disk).
         assert not cache_dir.exists()
     finally:
-        if precache_worker is not None:
-            precache_worker.stop()
-        if source_manager is not None:
-            source_manager.stop(join_timeout=1)
-        server.shutdown()
         CacheManager.reset()
 
 
@@ -467,7 +461,7 @@ def test_file_cache_on_local_dir_stays_file(tmp_path):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "cache": {"file_cache_dir": str(cache_dir)},
                 "sources": [],
             }
         )
@@ -507,7 +501,7 @@ def test_setup_empty_sources_serves_empty_catalog(tmp_path):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "memory"},
+                "cache": {"file_cache_dir": str(tmp_path / "cache")},
                 "sources": [],
             }
         )
@@ -678,7 +672,7 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "memory"},
+                "cache": {"file_cache_dir": str(tmp_path / "cache")},
                 "sources": [
                     {
                         "type": "zarr",

@@ -149,7 +149,6 @@ def cache(tmp_path):
     """
     manager = CacheManager(
         CacheConfig(
-            backend="file",
             file_cache_dir=tmp_path / "cache",
             source_scaled_reads=True,
         )

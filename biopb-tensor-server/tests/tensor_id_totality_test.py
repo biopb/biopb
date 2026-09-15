@@ -248,7 +248,7 @@ class TestAdapterLookupFallback:
             "reason": "unknown_source",
         }
 
-    def test_chunk_locate_unregistered_source_is_terminal_with_code(self):
+    def test_chunk_locate_unregistered_source_is_terminal_with_code(self, tmp_path):
         # Same fallthrough on the cache-file locate path (finding #3).
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.core.chunk import encode_chunk_id
@@ -256,7 +256,7 @@ class TestAdapterLookupFallback:
 
         # _handle_chunk_locate short-circuits to {"available": False} when no cache
         # manager exists, so give it one to reach the adapter-is-None fallthrough.
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             server = TensorFlightServer("grpc://localhost:0")
             chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))

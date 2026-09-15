@@ -189,7 +189,7 @@ def _write_plane_config(root: Path) -> Path:
                 "sources": [],
                 "writable": True,
                 "write_dir": str(root / "write"),
-                "cache": {"backend": "file", "file_cache_dir": str(root / "cache")},
+                "cache": {"file_cache_dir": str(root / "cache")},
             }
         ),
         encoding="utf-8",

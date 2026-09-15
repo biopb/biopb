@@ -251,21 +251,28 @@ class TestAdvisoryReductionCacheKey:
             arr[:] = np.arange(64 * 64, dtype="uint16").reshape(64, 64)
 
             adapter = ZarrAdapter(arr, "test-array", ["y", "x"])
-            cache_manager = CacheManager(CacheConfig(backend="memory"))
+            cache_manager = CacheManager(
+                CacheConfig(file_cache_dir=os.path.join(tmpdir, "cache"))
+            )
+            try:
+                bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
+                scaled_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4))
 
-            bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
-            scaled_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4))
+                first = adapter.resolve_chunk_data(scaled_id, cache_manager)
+                stats = cache_manager.stats()
+                assert stats.misses == 1
 
-            first = adapter.resolve_chunk_data(scaled_id, cache_manager)
-            stats = cache_manager.stats()
-            assert stats.misses == 1
+                second = adapter.resolve_chunk_data(scaled_id, cache_manager)
+                stats = cache_manager.stats()
+                assert stats.misses == 1
+                assert stats.hits == 1
 
-            second = adapter.resolve_chunk_data(scaled_id, cache_manager)
-            stats = cache_manager.stats()
-            assert stats.misses == 1
-            assert stats.hits == 1
-
-            assert first.column("data").to_pylist() == second.column("data").to_pylist()
+                assert (
+                    first.column("data").to_pylist()
+                    == second.column("data").to_pylist()
+                )
+            finally:
+                cache_manager.close()
 
 
 class TestGetScaledReadPlan:

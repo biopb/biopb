@@ -45,9 +45,7 @@ def _setup():
     )
     z[:] = arr
     CacheManager.reset()
-    CacheManager.initialize(
-        CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
-    )
+    CacheManager.initialize(CacheConfig(file_cache_dir=str(Path(tmp) / "cache")))
     server = TensorFlightServer("grpc://localhost:0")
     server.register_source(
         "d", ZarrAdapter(zarr.open_array(zpath, mode="r"), "d", ["z", "y", "x"])
