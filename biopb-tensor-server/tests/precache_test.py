@@ -1503,15 +1503,16 @@ class TestAdvertisedPyramidDescriptor:
 
     def _flight_info(self, server, source_id, tensor_id=""):
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import FlightCmd, TensorReadOption
+        from biopb.tensor.descriptor_pb2 import FlightRequest, TensorReadOption
 
-        cmd = FlightCmd(
-            source_id=source_id,
+        req = FlightRequest(
             # Pyramid advertisement is opt-in (biopb/biopb#563); this class asserts
             # get_flight_info fills it, so request it.
-            tensor_read=TensorReadOption(tensor_id=tensor_id, with_pyramid=True),
+            tensor_read=TensorReadOption(
+                array_id=tensor_id or source_id, with_pyramid=True
+            ),
         )
-        desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        desc = flight.FlightDescriptor.for_command(req.SerializeToString())
         return server.get_flight_info(None, desc)
 
     def _descriptor(self, info):
@@ -1585,16 +1586,18 @@ class TestAdvertisedPyramidDescriptor:
         finally:
             server.shutdown()
 
-    def test_list_flights_leaves_pyramid_empty(self, tmp_path):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+    def test_the_catalog_leaves_pyramid_empty(self, tmp_path):
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, descriptors_from_rows
 
         server = TensorFlightServer("grpc://localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
-            infos = list(server.list_flights(None, b""))
-            assert infos
-            src = DataSourceDescriptor.FromString(infos[0].descriptor.command)
-            assert all(len(t.pyramid) == 0 for t in src.tensors)
+            rows = server._metadata_db.query(
+                f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
+            ).to_pylist()
+            descs = descriptors_from_rows(rows)
+            assert descs
+            assert all(len(t.pyramid) == 0 for d in descs for t in d.tensors)
         finally:
             server.shutdown()
 
@@ -1605,13 +1608,10 @@ class TestAdvertisedPyramidDescriptor:
 
     def _flight_info_opt(self, server, read_opt):
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import FlightCmd
+        from biopb.tensor.descriptor_pb2 import FlightRequest
 
-        cmd = FlightCmd(
-            source_id=read_opt.tensor_id.split("/", 1)[0],
-            tensor_read=read_opt,
-        )
-        desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        req = FlightRequest(tensor_read=read_opt)
+        desc = flight.FlightDescriptor.for_command(req.SerializeToString())
         return server.get_flight_info(None, desc)
 
     def test_pyramid_advertisement_is_opt_in(self, tmp_path):
@@ -1623,12 +1623,12 @@ class TestAdvertisedPyramidDescriptor:
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             bare = self._descriptor(
-                self._flight_info_opt(server, TensorReadOption(tensor_id="big"))
+                self._flight_info_opt(server, TensorReadOption(array_id="big"))
             )
             assert len(bare.pyramid) == 0
             asked = self._descriptor(
                 self._flight_info_opt(
-                    server, TensorReadOption(tensor_id="big", with_pyramid=True)
+                    server, TensorReadOption(array_id="big", with_pyramid=True)
                 )
             )
             assert len(asked.pyramid) >= 2
@@ -1643,7 +1643,7 @@ class TestAdvertisedPyramidDescriptor:
         server = TensorFlightServer("grpc://localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
-            info = self._flight_info_opt(server, TensorReadOption(tensor_id="big"))
+            info = self._flight_info_opt(server, TensorReadOption(array_id="big"))
             assert len(info.endpoints) >= 1
         finally:
             server.shutdown()
@@ -1659,7 +1659,7 @@ class TestAdvertisedPyramidDescriptor:
             info = self._flight_info_opt(
                 server,
                 TensorReadOption(
-                    tensor_id="big", with_read_plan=False, with_pyramid=True
+                    array_id="big", with_read_plan=False, with_pyramid=True
                 ),
             )
             assert len(info.endpoints) == 0

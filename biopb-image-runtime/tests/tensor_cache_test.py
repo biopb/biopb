@@ -177,7 +177,7 @@ def test_embedded_cache_rejects_non_uniform_chunks(
 
 
 def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCache):
-    """A result carries a per-source token; reads need it and it isn't enumerable."""
+    """A result carries a per-source token; reads need it, the catalog does not."""
     import pyarrow.flight as flight
 
     data = np.arange(16, dtype=np.float32).reshape(4, 4)
@@ -198,10 +198,11 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     with pytest.raises(flight.FlightError):
         TensorFlightClient.tensor_from_pb(no_token).compute()
 
-    # The token-protected source is not enumerable via list_flights.
+    # The catalog is public: the result is listed (by anyone reaching the
+    # server), and its pixels are what the token gates.
     location = served_embedded_cache._external_location
     listed = TensorFlightClient(location).list_sources()
-    assert source_id not in listed
+    assert source_id in listed
 
 
 def test_discard_refuses_later_writes_with_the_reason(

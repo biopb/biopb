@@ -23,7 +23,7 @@ option java_package = "biopb.tensor";
 // AUTHORITATIVE; when both are present they MUST be consistent.
 //
 // INVARIANTS every producer/consumer upholds:
-//   * For a given tensor the array_id is IDENTICAL across ListFlights
+//   * For a given tensor the array_id is IDENTICAL across the catalog
 //     (DataSourceDescriptor.tensors[].array_id), GetFlightInfo (the response
 //     TensorDescriptor.array_id), and the adapter's own tensor descriptor --
 //     always the full source_id[/field] form.
@@ -48,7 +48,7 @@ option java_package = "biopb.tensor";
 message TensorDescriptor {
   // Globally-unique tensor identifier and primary key (see the tensor identity
   // policy above). Constructed as source_id (single-tensor) or source_id/field
-  // (multi-tensor). Same value as TensorReadOption.tensor_id.
+  // (multi-tensor). Same value as TensorReadOption.array_id.
   string array_id = 1;
 
   // Maps dimension index to semantic label (e.g., ["z", "y", "x"])
@@ -68,7 +68,7 @@ message TensorDescriptor {
   // tensor adapter first: the grid depends on facts that exist only once a
   // specific tensor/scene is bound (its backing chunk layout, its dimension
   // labels, format layout rules, the native pyramid level, the request scale),
-  // so a source-level listing cannot own it. ListFlights and
+  // so a source-level listing cannot own it. The catalog and
   // DataSourceDescriptor.tensors therefore carry it EMPTY -- like pyramid and
   // physical_scale -- and an empty grid is not a usable fallback: a client that
   // needs one for Dask construction, tiling or prefetching must describe the
@@ -112,7 +112,7 @@ message TensorDescriptor {
   // native (precomputed) pyramids are honored and the precache worker and
   // client request the same scales. Level 0 is full resolution
   // (scale_hint all 1s). A client reads each level via the normal scale_hint
-  // read path. Populated only by GetFlightInfo (left empty in ListFlights,
+  // read path. Populated only by GetFlightInfo (left empty in the catalog,
   // like metadata_json); empty also means "old server / decide client-side".
   repeated PyramidLevel pyramid = 10;
 
@@ -121,7 +121,7 @@ message TensorDescriptor {
   // along dimension i, in the unit given by physical_unit[i]. 0.0 means
   // "unknown" for that dimension. This is the ~200-byte summary consumers need
   // for display scale, so the common case avoids fetching the full OME tree.
-  // Populated by GetFlightInfo (left empty in ListFlights, like pyramid /
+  // Populated by GetFlightInfo (left empty in the catalog, like pyramid /
   // metadata_json); empty also means "old server / no physical scale -> the
   // full OME (metadata_json) remains the authoritative source".
   repeated double physical_scale = 11;
@@ -191,43 +191,20 @@ message SliceHint {
   repeated int64 stop = 2;
 }
 
-// ListFlights filtering criteria. Empty (or absent) means "every source",
-// which is what an old client sends and what every server before this field
-// returned.
-message TensorCriteria {
-  reserved 1 to 10; // Future: prefix, dtype_filter, shape_range, etc.
-
-  // Restrict the listing to the one source with this id.
-  //
-  // Addressing, not browsing: the caller already holds the id, so this asks
-  // the catalog a WHERE rather than reading it whole and discarding the rest.
-  // It does NOT widen what is enumerable -- a source absent from the listing
-  // is absent here too, and the safety cap is simply not reached by a
-  // single-row answer.
-  string source_id = 11;
-}
-
-// Placeholder for future write options
-// Currently empty - server uses defaults
-message TensorWriteOptions {
-  reserved 1 to 10; // Future: transaction_id, atomic, overwrite_policy, etc.
-}
-
-// SQL query against server's metadata database.
-// Used in FlightCmd.metadata_query branch.
-message MetadataQueryOption {
+// A read-only SQL query against the server's public catalog (the `catalog`
+// flight), carried in a TensorTicket so DoGet answers it in one call.
+message CatalogQuery {
   // SQL query string (e.g., "SELECT source_id FROM sources WHERE source_type='ome-zarr'")
   string sql = 1;
 }
 
-// Tensor read request within a data source.
+// Tensor read request: the `data` flight's GetFlightInfo command.
 // Flattened structure - no nested messages for read options.
-// Used in FlightCmd.tensor_read branch.
 message TensorReadOption {
-  // Which tensor to read -- can be either: the globally-unique array_id, a bare field name,
-  // or unset/empty (means "the source's default (first) tensor").
-  // Resolved server-side (#44).
-  string tensor_id = 1;
+  // Which tensor to read: its globally-unique array_id ("source_id" or
+  // "source_id/field", per the identity policy at the top of this file). A bare
+  // source_id selects the source's default (first) tensor (#44).
+  string array_id = 1;
 
   // Optional sub-region to read
   SliceHint slice_hint = 2;
@@ -270,26 +247,23 @@ message TensorReadOption {
   reserved "compact_grid_ok";
 }
 
-// Client command for GetFlightInfo requests.
-// Server dispatches based on source_id:
-// - "__metadata_query__" -> MetadataQueryOption branch (SQL query)
-// - Any other value -> TensorReadOption branch (tensor read)
-message FlightCmd {
-  // Which data source (flight identifier), globally unique among sources and
-  // slash-free, or "__metadata_query__" for SQL queries. A derived projection
-  // of the tensor's array_id (the prefix before the first '/'), carried here as
-  // a routing convenience; array_id is authoritative (see the identity policy
-  // at the top of this file).
-  string source_id = 1;
-
-  oneof command {
-    TensorReadOption tensor_read = 2;
-    MetadataQueryOption metadata_query = 3;
+// The GetFlightInfo command. Dispatch is the oneof arm, nothing else: a
+// tensor read plans chunk endpoints for one tensor (private data, authorized
+// on the tensor's source). The catalog needs no command here -- a table is
+// addressed by a path descriptor, and an arbitrary query rides the DoGet
+// ticket (CatalogQuery in TensorTicket).
+//
+// Tags start at 11 so a request from a protocol-1 client (the retired
+// `FlightCmd`, tags 1-3) never parses into a set arm here; the wrapper is
+// that firewall, which is why it stays even with one arm.
+message FlightRequest {
+  oneof request {
+    TensorReadOption tensor_read = 11;
   }
 }
 
 // Describes a data source containing one or more tensors.
-// Used in ListFlights response to provide full tensor metadata upfront.
+// Carried as a `sources` catalog row; the SDK rebuilds it from the row.
 // Enables multifield support where tensors within a source have different shapes.
 message DataSourceDescriptor {
   // Unique identifier for the data source (flight identifier)

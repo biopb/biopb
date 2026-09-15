@@ -223,11 +223,10 @@ class TestPersistence:
         try:
             db.save_decode_rates({"fast": (800.0, 12), "slow": (90.0, 3)})
 
-            info = db.handle_query(
+            table = db.query(
                 "SELECT array_id, samples FROM decode_rates "
                 "WHERE mbps > 500 ORDER BY array_id"
             )
-            table = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
 
             assert table.to_pydict() == {"array_id": ["fast"], "samples": [12]}
         finally:

@@ -37,7 +37,7 @@ Security Model:
 Usage:
     db = MetadataDatabase()
     db.sync_source_added(source_id, adapter)
-    flight_info = db.handle_query("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+    table = db.query("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
 """
 
 from __future__ import annotations
@@ -45,7 +45,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
 import threading
 import time
 import uuid
@@ -68,10 +67,8 @@ from typing import (
 import duckdb
 import numpy as np
 import pyarrow as pa
-import pyarrow.flight as flight
 from biopb.image.annotation_pb2 import RoiAnnotation, RoiConflict
 from biopb.image.roi_pb2 import ROI
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from google.protobuf import json_format
 
 from biopb_tensor_server.core.errors import AnnotationStoreError
@@ -545,56 +542,22 @@ class MetadataDatabase:
     Example:
         db = MetadataDatabase()
         db.sync_source_added('plate-001', adapter)
-        info = db.handle_query("SELECT source_id FROM sources WHERE dtype='uint16'")
+        table = db.query("SELECT source_id FROM sources WHERE dtype='uint16'")
     """
 
-    # Forbidden SQL keywords (write operations, table manipulation)
-    FORBIDDEN_KEYWORDS: Set[str] = {
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "DROP",
-        "CREATE",
-        "ALTER",
-        "TRUNCATE",
-        "EXECUTE",
-        "GRANT",
-        "REVOKE",
-        "COPY",
-        "EXPORT",
-        "IMPORT",
-        "LOAD",
-    }
+    # The public catalog: what the ``catalog`` flight lists and SQL may read.
+    # ``rois`` is deliberately absent -- annotations are private data, gated
+    # per source on the ``roi`` flight, and a query has no source to authorize
+    # against (biopb/biopb#1010). Enforced on DuckDB's own parse of the
+    # statement (``_validate_query``), never on the SQL text.
+    ALLOWED_TABLES: Set[str] = {"sources", "decode_rates"}
 
-    # Match forbidden keywords only as whole words. A plain substring test
-    # rejects legitimate queries where the keyword appears inside an identifier
-    # or string literal (e.g. `LIKE '%/uploads/%'` contains LOAD, `%update%`
-    # contains UPDATE). The real defense against file/network access is
-    # enable_external_access=False on the connection; this is defense in depth.
-    FORBIDDEN_KEYWORD_PATTERN = re.compile(
-        r"\b(" + "|".join(sorted(FORBIDDEN_KEYWORDS)) + r")\b"
-    )
-
-    # The tables a query may reference when everything is enabled;
-    # ``allowed_tables`` on the instance is what is actually enforced, and drops
-    # ``rois`` when the annotation actions are off. ``rois`` is readable here
-    # as an ANALYSIS affordance (count labels, join against sources, find
-    # annotations overlapping a region); the viewer never composes SQL -- it
-    # calls list_rois(), which builds parameterized SQL itself. ``decode_rates``
-    # is read the same way, and is the whole client surface for it -- there is
-    # no action, because a table an operator wants to sort and threshold is
-    # better asked in SQL than in a bespoke RPC. Writes stay off this surface
-    # entirely: FORBIDDEN_KEYWORDS still rejects INSERT/UPDATE/DELETE.
-    ALLOWED_TABLES: Set[str] = {"sources", "rois", "decode_rates"}
-
-    # Pattern for detecting table references in SQL
-    TABLE_REFERENCE_PATTERN = re.compile(
-        r"\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)"
-        r"|\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)"
-        r"|\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)"
-        r"|\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-        re.IGNORECASE,
-    )
+    # Table-valued functions a query may use. ``unnest`` is the documented
+    # per-tensor idiom (``FROM sources, UNNEST(tensors)``); the rest generate
+    # rows from nothing. Everything else -- above all the file and network
+    # readers -- is refused here, and ``enable_external_access=false`` on the
+    # connection is the second wall behind that.
+    ALLOWED_TABLE_FUNCTIONS: Set[str] = {"unnest", "range", "generate_series"}
 
     def __init__(
         self,
@@ -627,8 +590,6 @@ class MetadataDatabase:
         )
 
         # Pending query results for DoGet (stored by ticket)
-        self._pending_results: Dict[str, pa.Table] = {}
-        self._pending_results_lock = threading.Lock()
 
     def _get_connection(self) -> duckdb.DuckDBPyConnection:
         """Lazy initialization of DuckDB connection.
@@ -1017,94 +978,133 @@ class MetadataDatabase:
         )
 
     def _validate_query(self, sql: str) -> None:
-        """Validate SQL query for security.
+        """Refuse anything but one SELECT over the public tables.
+
+        Walks DuckDB's own parse of the statement (``json_serialize_sql``), so
+        a quoted or schema-qualified name, a comma join, a CTE, a subquery or a
+        DESCRIBE all resolve to the tables they actually read; a regex over
+        the text cannot see those. The serializer refuses every non-SELECT and
+        every multi-statement string, which is what keeps this surface
+        read-only.
 
         Raises:
-            ValueError: If query contains forbidden keywords or references disallowed tables
+            ValueError: not a single SELECT, or a table / table function
+                outside the allowlists.
         """
-        # Strip single-quoted string literals before scanning so keywords that
-        # appear *inside* a literal (e.g. `LIKE '%update%'`) aren't mistaken for
-        # SQL keywords or table names. '' is DuckDB's escaped single quote.
-        literal_free = re.sub(r"'(?:''|[^'])*'", "''", sql)
-        normalized = literal_free.upper()
-
-        # Check for forbidden keywords (whole-word match, see pattern above)
-        match = self.FORBIDDEN_KEYWORD_PATTERN.search(normalized)
-        if match:
+        try:
+            ast = json.loads(
+                self._get_cursor()
+                .execute("SELECT json_serialize_sql(?)", [sql])
+                .fetchone()[0]
+            )
+        except duckdb.Error as e:
+            raise ValueError(f"SQL query could not be parsed: {e}")
+        if ast.get("error"):
             raise ValueError(
-                f"SQL query contains forbidden keyword: {match.group(1)}. "
-                f"Only SELECT queries are allowed."
+                f"SQL query contains a forbidden keyword or statement "
+                f"({ast.get('error_message')}). Only one SELECT query is allowed."
             )
 
-        # Check for table references
-        table_refs = self.TABLE_REFERENCE_PATTERN.findall(literal_free)
-        referenced_tables = set()
-        for match in table_refs:
-            for table_name in match:
-                if table_name:
-                    referenced_tables.add(table_name.lower())
+        tables: Set[Tuple[str, str]] = set()
+        functions: Set[str] = set()
+        ctes: Set[str] = set()
+        refused: List[str] = []
 
-        # Only allow references to permitted tables
-        for table in referenced_tables:
-            if table not in self.allowed_tables:
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                kind = node.get("type")
+                if kind == "BASE_TABLE":
+                    tables.add(
+                        (
+                            str(node.get("table_name", "")).lower(),
+                            str(node.get("schema_name", "")).lower(),
+                        )
+                    )
+                elif kind == "TABLE_FUNCTION":
+                    functions.add(
+                        str(node.get("function", {}).get("function_name", "")).lower()
+                    )
+                elif kind == "SHOW_REF":
+                    # DESCRIBE / SUMMARIZE / SHOW: schema and statistics of
+                    # whatever it names, which may be a private table.
+                    refused.append("SHOW/DESCRIBE/SUMMARIZE")
+                for key, value in node.items():
+                    if key == "cte_map":
+                        for entry in value.get("map", []):
+                            ctes.add(str(entry.get("key", "")).lower())
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(ast)
+        if refused:
+            raise ValueError(
+                f"SQL query uses {refused[0]}, which is not available here. "
+                f"Accessible here: {', '.join(sorted(self.allowed_tables))}."
+            )
+        for table, schema in sorted(tables):
+            if table in ctes and not schema:
+                continue
+            if schema not in ("", "main") or table not in self.allowed_tables:
                 raise ValueError(
                     f"SQL query references disallowed table: {table}. "
                     f"Accessible here: {', '.join(sorted(self.allowed_tables))}."
                 )
+        for fn in sorted(functions):
+            if fn not in self.ALLOWED_TABLE_FUNCTIONS:
+                raise ValueError(
+                    f"SQL query uses disallowed table function: {fn}. "
+                    f"Allowed: {', '.join(sorted(self.ALLOWED_TABLE_FUNCTIONS))}."
+                )
 
-    def handle_query(self, sql: str) -> flight.FlightInfo:
-        """Execute a safe SQL query and return FlightInfo.
+    def table_schema(self, table: str) -> pa.Schema:
+        """The Arrow schema of one public table (what ListFlights advertises)."""
+        if table not in self.allowed_tables:
+            raise ValueError(
+                f"unknown catalog table: {table}. "
+                f"Accessible here: {', '.join(sorted(self.allowed_tables))}."
+            )
+        return (
+            self._get_cursor().execute(f"SELECT * FROM {table} LIMIT 0").arrow().schema
+        )
 
-        The actual query results are stored internally and retrieved via DoGet
-        using a ticket that references this query.
+    def query(self, sql: str) -> pa.Table:
+        """Execute a safe SQL query; the result is what DoGet streams.
 
-        Uses cursor() for thread-safe concurrent reads without locking.
-
-        Args:
-            sql: SQL query against the sources table
-
-        Returns:
-            FlightInfo with schema and endpoint for DoGet retrieval
+        Truncation is signaled on the table's schema metadata, which Flight
+        carries with the stream (``truncated`` / ``total_rows`` /
+        ``returned_rows``; ``total_sources`` is the catalog size, informational
+        only). Uses cursor() for thread-safe concurrent reads without locking.
 
         Raises:
             ValueError: If query is invalid or violates security rules
         """
         self._validate_query(sql)
 
-        # Use cursor for thread-safe read (no lock needed for SELECT)
         cursor = self._get_cursor()
-
         start_time = time.time()
         try:
-            # Execute query via cursor - thread-safe, no lock
-            result = cursor.execute(sql)
-            arrow_table = result.to_arrow_table()
-
+            arrow_table = cursor.execute(sql).to_arrow_table()
             # Catalog size: context for a caller sizing the browse surface. NOT
             # a truncation denominator -- the query may count something else
-            # entirely (a filtered subset, or the `rois` table), which is exactly
+            # entirely (a filtered subset, or another table), which is exactly
             # how "3 of 100 matched" got reported as "97 rows were dropped".
             total_sources = cursor.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
-
             elapsed_ms = (time.time() - start_time) * 1000
             logger.debug(f"Query executed in {elapsed_ms:.1f}ms: {sql[:100]}...")
-
-            # Check timeout
             if elapsed_ms > self._query_timeout_ms:
                 logger.warning(
                     f"Query exceeded timeout threshold: {elapsed_ms:.1f}ms > {self._query_timeout_ms}ms"
                 )
-
         except duckdb.Error as e:
             logger.error(f"Query failed: {e}")
             raise ValueError(f"SQL query failed: {e}")
 
-        # Apply truncation if needed. The pre-slice row count is the query's own
-        # full size, so truncation is known EXACTLY here and never has to be
-        # inferred downstream by comparing against a count of something else.
+        # The pre-slice row count is the query's own full size, so truncation
+        # is known EXACTLY here and never inferred by comparing counts.
         total_rows = arrow_table.num_rows
         truncated = total_rows > self._max_query_results
-
         if truncated:
             arrow_table = arrow_table.slice(0, self._max_query_results)
             logger.warning(
@@ -1112,59 +1112,15 @@ class MetadataDatabase:
             )
         returned_rows = arrow_table.num_rows
 
-        # Build schema metadata for truncation signaling
-        metadata = {
-            # Authoritative, server-computed: only the server knows the pre-cap
-            # size. Same key and spelling ListFlights already uses, so a consumer
-            # reads truncation the same way from both surfaces.
-            b"truncated": str(truncated).encode(),
-            # This query's own row counts -- the honest truncation pair.
-            b"total_rows": str(total_rows).encode(),
-            b"returned_rows": str(returned_rows).encode(),
-            # Catalog size, and the row count under its legacy name. Kept so an
-            # older consumer keeps working; `total_sources` is informational and
-            # must not be differenced against `returned_sources`.
-            b"total_sources": str(total_sources).encode(),
-            b"returned_sources": str(returned_rows).encode(),
-            b"query_elapsed_ms": str(int(elapsed_ms)).encode(),
-        }
-        # Tag the TABLE, not just the FlightInfo schema. DoGet streams this very
-        # table, and Flight carries a schema's custom metadata with it, so
-        # tagging here reaches both kinds of caller: the ones that read the keys
-        # off the FlightInfo, and the ones that read them off the result they
-        # got from the stream (the sidecar's /api/sources/query).
-        arrow_table = arrow_table.replace_schema_metadata(metadata)
-        schema = arrow_table.schema
-
-        # Store result for DoGet retrieval
-        ticket_id = f"metadata-query-{time.time_ns()}"
-        with self._pending_results_lock:
-            self._pending_results[ticket_id] = arrow_table
-
-        # Create ticket and endpoint
-        ticket = flight.Ticket(ticket_id.encode())
-        endpoint = flight.FlightEndpoint(ticket=ticket, locations=[])
-
-        return flight.FlightInfo(
-            schema=schema,
-            descriptor=flight.FlightDescriptor.for_command(b""),
-            endpoints=[endpoint],
-            total_records=-1,
-            total_bytes=-1,
+        return arrow_table.replace_schema_metadata(
+            {
+                b"truncated": str(truncated).encode(),
+                b"total_rows": str(total_rows).encode(),
+                b"returned_rows": str(returned_rows).encode(),
+                b"total_sources": str(total_sources).encode(),
+                b"query_elapsed_ms": str(int(elapsed_ms)).encode(),
+            }
         )
-
-    def get_pending_result(self, ticket_id: str) -> Optional[pa.Table]:
-        """Retrieve pending query result for DoGet.
-
-        Args:
-            ticket_id: Ticket identifier from FlightEndpoint
-
-        Returns:
-            Arrow Table with query results, or None if not found
-        """
-        with self._pending_results_lock:
-            result = self._pending_results.pop(ticket_id, None)
-        return result
 
     def sync_source_added(self, source_id: str, adapter: SourceAdapter) -> None:
         """Sync a source to the metadata database (INSERT OR REPLACE upsert).
@@ -1454,97 +1410,6 @@ class MetadataDatabase:
             )
             return None
         return parsed if isinstance(parsed, dict) else None
-
-    def list_source_descriptors(
-        self, limit: Optional[int] = None, source_id: Optional[str] = None
-    ) -> Tuple[List[DataSourceDescriptor], int]:
-        """Rebuild the lean ListFlights descriptors from the catalog.
-
-        The DuckDB-backed equivalent of iterating adapters and calling
-        ``get_source_descriptor()``. Serving ``ListFlights`` from here makes the
-        catalog the single source of truth for browsing, so ``list_sources`` and
-        ``query_sources`` cannot drift (biopb/biopb#265).
-
-        Only the cheap/structural fields the lean descriptor carries are
-        reconstructed: per-tensor ``array_id``/``dim_labels``/``shape``/``dtype``
-        from the ``tensors`` STRUCT[] (biopb/biopb#224). ``chunk_shape`` is left
-        empty here and on every ListFlights entry -- the transfer grid belongs to
-        the tensor-bound adapter, and ``GetFlightInfo`` is where it is answered
-        (biopb/biopb#812). ``metadata_json`` is likewise left empty (filled by
-        ``GetFlightInfo``), exactly like the adapter path. ``data_resident`` is the stored snapshot -- the
-        field is advisory/volatile by contract (the authoritative gate is a fresh
-        ``adapter.is_resident()``), so a point-in-time value is acceptable here.
-
-        Uses ``cursor()`` for a thread-safe read (no lock). The full count is
-        carried by a ``COUNT(*) OVER ()`` window in the SAME statement as the
-        rows (window functions run before ``LIMIT``), so ``total`` and the
-        clipped rows come from one consistent snapshot -- a separate
-        ``SELECT COUNT(*)`` could race a concurrent upload and report
-        ``returned > total``.
-
-        Args:
-            limit: Max rows to return (the ListFlights safety cap). ``None`` =
-                no cap.
-            source_id: Restrict to this one source. ``None`` = the whole
-                catalog. A filtered read answers an *address*, so ``total``
-                counts the matching rows (0 or 1) rather than the catalog --
-                which is what makes a single-source lookup incapable of
-                reporting truncation, since one row is never clipped by a cap.
-
-        Returns:
-            ``(descriptors, total)`` where ``total`` is the row count matching
-            the filter before ``limit`` (so the caller can signal truncation
-            when ``limit`` clips it).
-        """
-        cursor = self._get_cursor()
-
-        if source_id is not None:
-            # A single-row address: never clipped by ``limit``, so the window
-            # function that exists only to report truncation is dead weight
-            # here -- ``total`` is just how many rows matched (0 or 1).
-            sql = (
-                "SELECT source_id, source_url, source_type, data_resident, tensors "
-                "FROM sources WHERE source_id = ?"
-            )
-            rows = cursor.execute(sql, [source_id]).fetchall()
-            total = len(rows)
-        else:
-            sql = (
-                "SELECT source_id, source_url, source_type, data_resident, tensors, "
-                "COUNT(*) OVER () AS total_count "
-                "FROM sources ORDER BY source_id"
-            )
-            params: list = []
-            if limit is not None:
-                sql += " LIMIT ?"
-                params.append(limit)
-            rows = cursor.execute(sql, params).fetchall()
-            # COUNT(*) OVER () is identical on every row; no rows -> empty catalog.
-            total = rows[0][-1] if rows else 0
-            rows = [row[:-1] for row in rows]
-
-        descriptors: List[DataSourceDescriptor] = []
-        for source_id, source_url, source_type, data_resident, tensors in rows:
-            tensor_descs = [
-                TensorDescriptor(
-                    array_id=t["array_id"],
-                    dim_labels=t["dim_labels"] or [],
-                    shape=t["shape"] or [],
-                    dtype=t["dtype"] or "",
-                )
-                for t in (tensors or [])
-            ]
-            descriptors.append(
-                DataSourceDescriptor(
-                    source_id=source_id,
-                    source_url=source_url or "",
-                    source_type=source_type or "",
-                    tensors=tensor_descs,
-                    metadata_json="",  # lean; filled by GetFlightInfo
-                    data_resident=bool(data_resident),
-                )
-            )
-        return descriptors, total
 
     def sync_source_removed(self, source_id: str) -> None:
         """Remove a source from the metadata database.

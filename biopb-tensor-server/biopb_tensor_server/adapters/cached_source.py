@@ -177,7 +177,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         self.source_id = source_id
         # Optional per-source capability token. When set, the Flight server
         # requires callers to present a matching Bearer token to read this
-        # source (see TensorFlightServer._authorize_source). None = no per-source
+        # source (see TensorFlightServer._authorize). None = no per-source
         # gate (falls back to the server-wide token, if any).
         self._capability_token: Optional[str] = None
         self._shape = tuple(shape)

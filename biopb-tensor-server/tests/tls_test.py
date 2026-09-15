@@ -122,8 +122,14 @@ def test_trusting_client_reads_over_tls(simple_zarr_array):
         client = flight.FlightClient(
             f"grpc+tls://localhost:{server.port}", tls_root_certs=cert_pem
         )
-        flights = list(client.list_flights())
-        assert any(b"img" in fi.descriptor.command for fi in flights)
+        # The catalog flight: DoGet the advertised `sources` ticket.
+        sources = next(
+            fi
+            for fi in client.list_flights()
+            if list(fi.descriptor.path) == [b"sources"]
+        )
+        table = client.do_get(sources.endpoints[0].ticket).read_all()
+        assert "img" in table.column("source_id").to_pylist()
         client.close()
     finally:
         server.shutdown()
@@ -548,7 +554,9 @@ def test_override_hostname_is_what_makes_a_mismatched_cert_connect(simple_zarr_a
         overridden = flight.FlightClient(
             loc, tls_root_certs=cert_pem, override_hostname="wrong.example"
         )
-        assert any(b"img" in fi.descriptor.command for fi in overridden.list_flights())
+        assert any(
+            list(fi.descriptor.path) == [b"sources"] for fi in overridden.list_flights()
+        )
         overridden.close()
 
         # A name the cert does *not* carry still fails: this substitutes the name

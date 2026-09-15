@@ -23,7 +23,7 @@ import json
 import numpy as np
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor.descriptor_pb2 import FlightCmd, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import FlightRequest, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.adapter_base import TensorAdapter
@@ -419,11 +419,11 @@ class TestEmdTotality:
 # 5. End-to-end at the Flight verb: get_flight_info maps the miss correctly
 # --------------------------------------------------------------------------- #
 def _flight_info_for(server, source_id, tensor_id):
-    cmd = FlightCmd(source_id=source_id)
-    cmd.tensor_read.tensor_id = tensor_id
-    descriptor = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-    # Sources carry no capability token here, so _authorize_source never touches
-    # the (None) context -- call the verb directly, no socket needed.
+    req = FlightRequest()
+    req.tensor_read.array_id = tensor_id or source_id
+    descriptor = flight.FlightDescriptor.for_command(req.SerializeToString())
+    # No server token and no capability token here, so _authorize never
+    # touches the (None) context -- call the verb directly, no socket needed.
     return server.get_flight_info(None, descriptor)
 
 

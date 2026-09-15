@@ -3,12 +3,13 @@
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiConflict,
-    RoiDeleteRequest,
     RoiDeleteResult,
-    RoiListRequest,
     RoiListResult,
-    RoiPutRequest,
+    RoiPruneRequest,
+    RoiPruneResult,
     RoiPutResult,
+    RoiSetInfo,
+    RoiUnseen,
 )
 from biopb.image.bindata_pb2 import BinData
 from biopb.image.detection_request_pb2 import DetectionRequest

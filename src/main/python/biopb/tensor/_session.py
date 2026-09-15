@@ -24,14 +24,26 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
+from biopb.image._roi_rows import (
+    ROI_ID_SCHEMA,
+    ROI_ROW_SCHEMA,
+    roi_ids_to_table,
+    rois_to_table,
+    table_to_rois,
+)
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
-    RoiDeleteRequest,
     RoiDeleteResult,
-    RoiListRequest,
     RoiListResult,
-    RoiPutRequest,
+    RoiPruneRequest,
+    RoiPruneResult,
     RoiPutResult,
+    RoiSetInfo,
+)
+from biopb.tensor._catalog_rows import (
+    SOURCE_ROW_COLUMNS,
+    descriptor_from_row,
+    sql_literal,
 )
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
@@ -45,22 +57,28 @@ from biopb.tensor.descriptor_pb2 import (
     AddSourceRequest,
     AddSourceResult,
     AddSourceStreamMessage,
+    CatalogQuery,
     DataSourceDescriptor,
-    FlightCmd,
-    MetadataQueryOption,
+    FlightRequest,
     RemoveSourceRequest,
     RemoveSourceResult,
     ResolveProgress,
     ResolveStreamMessage,
     SliceHint,
-    TensorCriteria,
     TensorDescriptor,
     TensorReadOption,
     WarmProgress,
     WarmStreamMessage,
 )
 from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
-from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+from biopb.tensor.ticket_pb2 import (
+    ChunkBounds,
+    PutCommand,
+    RoiDelete,
+    RoiPut,
+    RoiRead,
+    TensorTicket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +100,7 @@ class _ClientState:
     whose ``shape`` is the sliced/downsampled one.
     """
 
-    client: flight.FlightClient
+    raw_client: flight.FlightClient
     call_options: flight.FlightCallOptions
     location: str
     token: Optional[str]
@@ -94,6 +112,31 @@ class _ClientState:
     tls_trust: Optional[TlsTrust] = None
     sources: Dict[str, DataSourceDescriptor] = field(default_factory=dict)
     descriptors: Dict[str, TensorDescriptor] = field(default_factory=dict)
+    # Set once the server's Flight protocol shape has been checked (or when
+    # the check is bypassed, e.g. for a test double).
+    protocol_checked: bool = False
+
+    @property
+    def client(self) -> flight.FlightClient:
+        """The connection, checked once against the server's protocol shape.
+
+        The first use of a client runs one ``health`` action and reads the
+        server's ``protocol``. A server that speaks another shape (or none --
+        a pre-v2 server has no key) is refused here with an actionable message
+        rather than letting a ``FlightRequest`` reach a server that will parse
+        it as something else and answer with a confusing error.
+        """
+        if not self.protocol_checked:
+            _check_flight_protocol(self.raw_client, self.call_options, self.location)
+            self.protocol_checked = True
+        return self.raw_client
+
+    @client.setter
+    def client(self, value: flight.FlightClient) -> None:
+        """A connection handed in directly is taken as already checked -- this
+        is how tests inject a double, and a double has no health to probe."""
+        self.raw_client = value
+        self.protocol_checked = True
 
     def cache_descriptor(self, desc: TensorDescriptor) -> None:
         """Store the structural part of ``desc`` under its array_id.
@@ -293,6 +336,40 @@ def _parse_version(version_str: str) -> Tuple[int, int, int]:
     return (major, minor, patch)
 
 
+def _check_flight_protocol(
+    client: flight.FlightClient, call_options: flight.FlightCallOptions, location: str
+) -> None:
+    """Refuse a server whose Flight protocol shape is not this SDK's.
+
+    Reads the ``protocol`` key the ``health`` action reports. A server without
+    the key predates it and speaks v1 (sentinel-routed descriptors,
+    prefix-sniffed tickets), which this SDK no longer does. An unreachable
+    server is not this check's concern: its error propagates as it always did.
+    """
+    from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
+
+    try:
+        results = client.do_action(flight.Action("health", b""), options=call_options)
+        body = next(iter(results), None)
+    except flight.FlightUnauthenticatedError:
+        # A capability-token holder cannot read the catalog tier, which health
+        # is on; the private call it is about to make authorizes itself.
+        return
+    if body is None:
+        return  # not a biopb server at all; let the first real call say so
+    try:
+        server_ver = int(json.loads(body.body.to_pybytes()).get("protocol", 1))
+    except (ValueError, TypeError, AttributeError):
+        server_ver = 1
+    if server_ver != FLIGHT_PROTOCOL_VERSION:
+        stale = "server" if server_ver < FLIGHT_PROTOCOL_VERSION else "client"
+        raise RuntimeError(
+            f"Incompatible biopb Flight protocol: the server at {location} speaks "
+            f"v{server_ver}, this client speaks v{FLIGHT_PROTOCOL_VERSION}. "
+            f"Upgrade the {stale} so both sides match."
+        )
+
+
 def _check_wire_protocol(schema: pa.Schema) -> None:
     """Fail fast if the server's chunk wire-protocol version is incompatible.
 
@@ -344,14 +421,12 @@ def _unresolved_source_error(source_id: str) -> ValueError:
 
 
 def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
-    """Split a tensor's globally-unique ``array_id`` into the
-    ``(routing source_id, request tensor_id)`` pair the Flight RPCs use.
+    """Split a tensor's globally-unique ``array_id`` into ``(source_id,
+    array_id-or-None)``.
 
     A tensor is identified by its ``array_id`` ALONE (see the policy at the top
-    of ``proto/biopb/tensor/descriptor.proto``); ``source_id`` is just the
-    slash-free prefix carried on the wire as a routing convenience.
-
-    A bare id (no '/') yields ``tensor_id=None`` -- the server's documented
+    of ``proto/biopb/tensor/descriptor.proto``); ``source_id`` is its slash-free
+    prefix. A bare id (no '/') yields ``None`` -- the server's documented
     "default (first) tensor" request (#44). Whether a bare *multi*-tensor id is
     acceptable is the caller's policy, not this function's: see
     :meth:`CatalogClient._resolve_descriptor`, which refuses it (#75), versus
@@ -362,23 +437,16 @@ def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     return array_id, None
 
 
-def _tensor_read_cmd(array_id: str, read_opt: TensorReadOption) -> FlightCmd:
-    """Address ``read_opt`` at ``array_id`` and wrap it in a routable ``FlightCmd``.
+def _tensor_read_cmd(array_id: str, read_opt: TensorReadOption) -> FlightRequest:
+    """Address ``read_opt`` at ``array_id`` as the ``data`` flight's request."""
+    read_opt.array_id = array_id
+    return FlightRequest(tensor_read=read_opt)
 
-    The single place the identity policy's two wire fields are derived from the
-    one authoritative id: ``FlightCmd.source_id`` is the slash-free routing
-    prefix, ``TensorReadOption.tensor_id`` the full array_id that the server
-    reduces back to a within-source field.
 
-    A bare source_id leaves ``tensor_id`` empty rather than echoing the
-    source_id: that is the server's default-tensor path (#44), which every
-    adapter resolves, whereas a field named after the source is one a
-    multi-tensor adapter would have to invent.
-    """
-    source_id, tensor_id = _split_array_id(array_id)
-    if tensor_id is not None:
-        read_opt.tensor_id = tensor_id
-    return FlightCmd(source_id=source_id, tensor_read=read_opt)
+def _catalog_ticket(sql: str) -> flight.Ticket:
+    """A DoGet ticket that runs ``sql`` on the ``catalog`` flight."""
+    ticket = TensorTicket(catalog_query=CatalogQuery(sql=sql))
+    return flight.Ticket(ticket.SerializeToString())
 
 
 class CatalogClient:
@@ -392,51 +460,29 @@ class CatalogClient:
     def __init__(self, state: "_ClientState"):
         self._state = state
 
+    _SOURCES_SQL = f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
+
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
         """Backs TensorFlightClient.list_sources; see that method for the full
         documentation."""
+        table = self._query_table(self._SOURCES_SQL + " ORDER BY source_id")
         source_descriptors = {}
-        truncated = False
-        total_sources = None
-
-        for info in self._state.client.list_flights(options=self._state.call_options):
-            source_desc = DataSourceDescriptor.FromString(info.descriptor.command)
+        for row in table.to_pylist():
+            source_desc = descriptor_from_row(row)
             source_descriptors[source_desc.source_id] = source_desc
             self._cache_tensors(source_desc)
-
-            # Check schema metadata for truncation info
-            if info.schema.metadata:
-                truncated_bytes = info.schema.metadata.get(b"truncated")
-                if truncated_bytes:
-                    truncated = truncated_bytes.decode() == "True"
-                total_sources_bytes = info.schema.metadata.get(b"total_sources")
-                if total_sources_bytes:
-                    total_sources = int(total_sources_bytes.decode())
-
         self._state.sources = source_descriptors
-
-        if truncated and total_sources:
-            logger.warning(
-                f"list_sources: returned {len(source_descriptors)} of {total_sources} sources (truncated)"
-            )
-        else:
-            logger.info(f"list_sources: returned {len(source_descriptors)} sources")
-
+        logger.info(f"list_sources: returned {len(source_descriptors)} sources")
         return source_descriptors
 
     def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
         """Backs TensorFlightClient.get_source; see that method for the full
         documentation."""
-        criteria = TensorCriteria(source_id=source_id).SerializeToString()
-        for info in self._state.client.list_flights(
-            criteria, options=self._state.call_options
-        ):
-            source_desc = DataSourceDescriptor.FromString(info.descriptor.command)
-            if source_desc.source_id != source_id:
-                # A server predating the criteria field ignores it and streams
-                # the whole catalog. Filtering here keeps this correct against
-                # one -- slowly, but never wrongly.
-                continue
+        table = self._query_table(
+            f"{self._SOURCES_SQL} WHERE source_id = {sql_literal(source_id)}"
+        )
+        for row in table.to_pylist():
+            source_desc = descriptor_from_row(row)
             self._cache_tensors(source_desc)
             # Deliberately not written to ``self._state.sources``: that map is
             # the last *listing*, and callers read its size and membership as
@@ -458,53 +504,34 @@ class CatalogClient:
                 "expected 'pandas', 'arrow', or 'records'"
             )
 
-        cmd = FlightCmd(
-            source_id="__metadata_query__",
-            metadata_query=MetadataQueryOption(sql=sql),
+        return self._format_query_result(self._query_table(sql), format)
+
+    def _query_table(self, sql: str) -> pa.Table:
+        """One DoGet on the ``catalog`` flight: the ticket carries the SQL, the
+        stream's schema metadata carries the truncation flags."""
+        reader = self._state.client.do_get(
+            _catalog_ticket(sql), options=self._state.call_options
         )
-        descriptor = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._state.client.get_flight_info(
-            descriptor, options=self._state.call_options
-        )
+        table = reader.read_all()
 
         # Truncation comes from the server's flag, not from differencing counts:
         # `total_sources` is the catalog size, so a filtered query (or one
         # against another catalog table) legitimately returns fewer rows without
-        # anything having been dropped. Older servers send no flag; fall back.
-        metadata = info.schema.metadata or {}
-        flag = metadata.get(b"truncated")
-        returned = metadata.get(b"returned_rows") or metadata.get(b"returned_sources")
-        total = metadata.get(b"total_rows")
+        # anything having been dropped.
+        metadata = table.schema.metadata or {}
+        returned = metadata.get(b"returned_rows")
         if returned:
             returned_count = int(returned.decode())
-            if flag is not None:
-                truncated = flag.decode() == "True"
-            else:
-                legacy_total = metadata.get(b"total_sources")
-                truncated = bool(legacy_total) and returned_count < int(
-                    legacy_total.decode()
-                )
-            if truncated:
-                total_count = int(total.decode()) if total else None
+            if metadata.get(b"truncated", b"").decode() == "True":
+                total = metadata.get(b"total_rows")
                 logger.info(
                     "query_sources: returned %s of %s rows (truncated)",
                     returned_count,
-                    total_count if total_count is not None else "?",
+                    int(total.decode()) if total else "?",
                 )
             else:
-                logger.info("query_sources: returned %s rows", returned_count)
-
-        # Fetch results via DoGet
-        if info.endpoints:
-            reader = self._state.client.do_get(
-                info.endpoints[0].ticket, options=self._state.call_options
-            )
-            table = reader.read_all()
-        else:
-            # Empty result
-            table = info.schema.empty_table()
-
-        return self._format_query_result(table, format)
+                logger.debug("query_sources: returned %s rows", returned_count)
+        return table
 
     @staticmethod
     def _format_query_result(table: pa.Table, format: str):  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
@@ -716,17 +743,24 @@ class CatalogClient:
         never silently defaulted (#75).
 
         The probe is last because it is the only step that always costs a round
-        trip; it also covers a source sitting beyond the (truncatable)
-        ``list_sources()`` cap, which the catalog step cannot see.
+        trip; it is also the only step open to a capability-token holder, who
+        may read the source but not browse the catalog.
         """
         desc = self._state.descriptors.get(array_id)
         if desc is not None:
             return desc
 
         source_id, tensor_id = _split_array_id(array_id)
-        if source_id not in self._state.sources:
-            self.list_sources()
         source_desc = self._state.sources.get(source_id)
+        if source_desc is None:
+            try:
+                source_desc = self.get_source(source_id)
+            except flight.FlightError:
+                # No catalog to ask (a capability token reads one source's
+                # pixels, not the catalog; an embedded server may have none):
+                # the per-tensor probe below is the private path, and its
+                # error is the one worth reporting.
+                source_desc = None
 
         if source_desc is not None:
             if not source_desc.tensors:
@@ -918,54 +952,82 @@ class CatalogClient:
             )
         return result
 
+    def _do_action_one_result(
+        self, action: flight.Action, *, unavailable_hint: str
+    ) -> bytes:
+        """Run a single-result ``do_action``, with the same "old server"
+        remap :meth:`_iter_action_messages` gives the streaming actions.
+
+        *unavailable_hint* is the feature-specific lead-in for the "Unknown
+        action" case (e.g. "Source removal is unavailable"); a genuinely empty
+        result stream (a server that never sends one) raises a plain
+        ``RuntimeError`` naming the action.
+        """
+        try:
+            results = self._state.client.do_action(
+                action, options=self._state.call_options
+            )
+            result = next(results)
+        except flight.FlightError as exc:
+            if "Unknown action" in str(exc):
+                raise RuntimeError(
+                    f"{unavailable_hint}: the tensor server is too old to "
+                    f"support the '{action.type}' action. Upgrade the server."
+                ) from exc
+            raise
+        except StopIteration as exc:
+            raise RuntimeError(f"{action.type} returned no result") from exc
+        return result.body.to_pybytes()
+
     def remove_source(self, root_url: str) -> "RemoveSourceResult":
         """Backs TensorFlightClient.remove_source; see that method for the full
         documentation."""
         req = RemoveSourceRequest(root_url=root_url)
         action = flight.Action("remove_source", req.SerializeToString())
-        try:
-            results = self._state.client.do_action(
-                action, options=self._state.call_options
-            )
-            result_bytes = next(results)
-        except flight.FlightError as exc:
-            if "Unknown action" in str(exc):
-                raise RuntimeError(
-                    "Source removal is unavailable: the tensor server is too old "
-                    "to support the 'remove_source' action. Upgrade the server."
-                ) from exc
-            raise
-        except StopIteration as exc:
-            raise RuntimeError(
-                f"remove_source('{root_url}') returned no result"
-            ) from exc
-        return RemoveSourceResult.FromString(result_bytes.body.to_pybytes())
+        result_bytes = self._do_action_one_result(
+            action, unavailable_hint="Source removal is unavailable"
+        )
+        return RemoveSourceResult.FromString(result_bytes)
 
     # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
 
-    def _roi_action(self, name: str, req) -> bytes:
-        """One-shot DoAction round trip shared by the three ROI verbs."""
-        action = flight.Action(name, req.SerializeToString())
-        try:
-            results = self._state.client.do_action(
-                action, options=self._state.call_options
-            )
-            result_bytes = next(results)
-        except flight.FlightError as exc:
-            if "Unknown action" in str(exc):
-                raise RuntimeError(
-                    "ROI annotations are unavailable: the tensor server is too "
-                    f"old to support the '{name}' action. Upgrade the server."
-                ) from exc
-            raise
-        except StopIteration as exc:
-            raise RuntimeError(f"{name} returned no result") from exc
-        return result_bytes.body.to_pybytes()
-
     def list_rois(self, array_id: str, set_name: str = "") -> "RoiListResult":
         """Backs TensorFlightClient.list_rois; see that method."""
-        req = RoiListRequest(array_id=array_id, set_name=set_name)
-        return RoiListResult.FromString(self._roi_action("roi_list", req))
+        ticket = TensorTicket(roi_read=RoiRead(array_id=array_id, set_name=set_name))
+        reader = self._state.client.do_get(
+            flight.Ticket(ticket.SerializeToString()), options=self._state.call_options
+        )
+        table = reader.read_all()
+        metadata = table.schema.metadata or {}
+        sets = [
+            RoiSetInfo(
+                set_name=entry["set_name"],
+                count=int(entry["count"]),
+                reserved=bool(entry.get("reserved")),
+            )
+            for entry in json.loads(metadata.get(b"sets", b"[]"))
+        ]
+        return RoiListResult(
+            rois=table_to_rois(table),
+            truncated=metadata.get(b"truncated", b"").decode() == "True",
+            sets=sets,
+        )
+
+    def _roi_put_stream(self, cmd: PutCommand, table: pa.Table) -> bytes:
+        """One DoPut on the ``roi`` flight: the command in the descriptor, the
+        rows in the stream, the structured reply in the put's app_metadata."""
+        descriptor = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        writer, reader = self._state.client.do_put(
+            descriptor, table.schema, options=self._state.call_options
+        )
+        with writer:
+            if table.num_rows:
+                writer.write_table(table)
+            writer.done_writing()
+            reply = reader.read()
+        if reply is None:
+            raise RuntimeError("the server acknowledged the ROI put with no result")
+        return reply.to_pybytes()
 
     def put_rois(
         self,
@@ -975,8 +1037,9 @@ class CatalogClient:
         check_rev: bool = False,
     ) -> "RoiPutResult":
         """Backs TensorFlightClient.put_rois; see that method."""
-        req = RoiPutRequest(array_id=array_id, rois=rois, check_rev=check_rev)
-        return RoiPutResult.FromString(self._roi_action("roi_put", req))
+        cmd = PutCommand(roi_put=RoiPut(array_id=array_id, check_rev=check_rev))
+        table = rois_to_table(rois) if rois else ROI_ROW_SCHEMA.empty_table()
+        return RoiPutResult.FromString(self._roi_put_stream(cmd, table))
 
     def delete_rois(
         self,
@@ -985,10 +1048,18 @@ class CatalogClient:
         set_name: str = "",
     ) -> "RoiDeleteResult":
         """Backs TensorFlightClient.delete_rois; see that method."""
-        req = RoiDeleteRequest(
-            array_id=array_id, roi_ids=list(roi_ids), set_name=set_name
+        cmd = PutCommand(roi_delete=RoiDelete(array_id=array_id, set_name=set_name))
+        table = roi_ids_to_table(roi_ids) if roi_ids else ROI_ID_SCHEMA.empty_table()
+        return RoiDeleteResult.FromString(self._roi_put_stream(cmd, table))
+
+    def prune_rois(self, unseen_days: int, *, apply: bool = False) -> "RoiPruneResult":
+        """Backs TensorFlightClient.prune_rois; see that method."""
+        req = RoiPruneRequest(unseen_days=unseen_days, apply=apply)
+        action = flight.Action("roi_prune", req.SerializeToString())
+        result_bytes = self._do_action_one_result(
+            action, unavailable_hint="ROI pruning is unavailable"
         )
-        return RoiDeleteResult.FromString(self._roi_action("roi_delete", req))
+        return RoiPruneResult.FromString(result_bytes)
 
 
 class ChunkFetcher:

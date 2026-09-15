@@ -85,6 +85,12 @@ def client(writable_server):
     client.close()
 
 
+def _catalog_ids(db):
+    return {
+        r["source_id"] for r in db.query("SELECT source_id FROM sources").to_pylist()
+    }
+
+
 class TestCachedSourceAdapter:
     """Tests for CachedSourceAdapter."""
 
@@ -798,8 +804,7 @@ class TestServerDoPutHandler:
             response_desc = server.uploads.create_source(req_desc)
 
             # The durable upload appears in the catalog.
-            descriptors, _ = db.list_source_descriptors()
-            assert response_desc.array_id in {d.source_id for d in descriptors}
+            assert response_desc.array_id in _catalog_ids(db)
 
     def test_cache_upload_not_synced_but_readable_by_id(self):
         """Ephemeral cache-backed uploads are NOT catalogued (no removal hook ->
@@ -820,8 +825,7 @@ class TestServerDoPutHandler:
         response_desc = server.uploads.create_source(req_desc)
 
         # Not enumerable via the catalog...
-        descriptors, _ = db.list_source_descriptors()
-        assert response_desc.array_id not in {d.source_id for d in descriptors}
+        assert response_desc.array_id not in _catalog_ids(db)
         # ...but still registered and readable by its returned id.
         assert isinstance(
             server.sources.get(response_desc.array_id), CachedSourceAdapter
@@ -879,14 +883,14 @@ class TestServerDoPutHandler:
 
 
 class TestDoPutErrorTranslation:
-    """A create-source failure on the DoPut path must surface as itself, not be
-    swallowed by command discrimination and mis-reported (biopb/biopb#354).
+    """A create-source failure must surface as itself (biopb/biopb#354).
 
-    The historical do_put used *parse-success + no-exception* as its command
-    discriminator, so a genuine create error raised after a good TensorDescriptor
-    parse fell through to the ChunkUpload branch and the client saw a misleading
-    "Invalid upload command". These tests drive both the do_put wire path and the
-    equivalent create_source Flight action.
+    A source is created by the ``create_source`` action only; DoPut takes a
+    ``PutCommand`` and refuses anything else up front, so the historical
+    parse-and-guess discrimination (which mis-reported a genuine create error
+    as "Invalid upload command") has no path left. ``_do_put`` here is the
+    action, kept under its old name so each error case is still checked on
+    both entry points.
     """
 
     class _MockWriter:
@@ -907,8 +911,18 @@ class TestDoPutErrorTranslation:
         )
 
     def _do_put(self, server, req_desc):
+        action = flight.Action("create_source", req_desc.SerializeToString())
+        return list(server.do_action(None, action))
+
+    def test_do_put_refuses_a_bare_descriptor(self):
+        """The old create-over-DoPut wire shape is refused, not guessed at."""
+        server = self._server()
+        req_desc = TensorDescriptor(
+            array_id="cache:ok", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+        )
         descriptor = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
-        server.do_put(None, descriptor, None, self._MockWriter())
+        with pytest.raises(flight.FlightServerError, match="PutCommand"):
+            server.do_put(None, descriptor, None, self._MockWriter())
 
     def _create_source_action(self, server, req_desc):
         action = flight.Action("create_source", req_desc.SerializeToString())
@@ -1025,12 +1039,8 @@ class TestDoPutErrorTranslation:
                 dtype="uint8",
                 chunk_shape=[5, 5],
             )
-            writer = self._MockWriter()
-            descriptor = flight.FlightDescriptor.for_command(good.SerializeToString())
-            server.do_put(None, descriptor, None, writer)
-
-            assert len(writer.written) == 1
-            response = TensorDescriptor.FromString(writer.written[0])
+            (written,) = self._do_put(server, good)
+            response = TensorDescriptor.FromString(bytes(written))
             assert response.array_id.startswith("ome_zarr_")
 
     def test_do_put_non_object_metadata_json_surfaces_real_error(self):
@@ -1058,12 +1068,9 @@ class TestDoPutErrorTranslation:
         req_desc = TensorDescriptor(
             array_id="cache:ok", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
         )
-        writer = self._MockWriter()
-        descriptor = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
-        server.do_put(None, descriptor, None, writer)
+        (written,) = self._do_put(server, req_desc)
 
-        assert len(writer.written) == 1
-        response = TensorDescriptor.FromString(writer.written[0])
+        response = TensorDescriptor.FromString(bytes(written))
         assert response.array_id.startswith("cache_")
 
 
@@ -1935,3 +1942,27 @@ class TestDiscard:
         writable_server.uploads.discard(source_id, "x")
 
         assert "updated_at" not in client.get_upload_status(source_id)
+
+
+def test_a_durable_upload_lands_in_a_server_owned_catalog():
+    """A server built without a catalog owns one, and the upload path syncs a
+    durable upload into it like any other registration -- so list_sources
+    sees it."""
+    from biopb_tensor_server.serving.server import TensorFlightServer
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        server = TensorFlightServer(
+            location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
+        )
+        try:
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:owned",
+                shape=[8, 8],
+                dtype="uint8",
+                chunk_shape=[4, 4],
+                dim_labels=["y", "x"],
+            )
+            response_desc = server.uploads.create_source(req_desc)
+            assert response_desc.array_id in _catalog_ids(server._metadata_db)
+        finally:
+            server.shutdown()

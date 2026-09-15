@@ -22,3 +22,15 @@ TENSOR_WIRE_PROTOCOL_VERSION = 2
 # Schema-metadata key carrying the server's protocol version, set on the chunk
 # schema and the GetFlightInfo schema. Stored as a UTF-8 string on the wire.
 WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
+
+# The Flight protocol shape -- which descriptors, tickets and put commands the
+# server understands. Distinct from the chunk encoding above: this one is
+# reported by the ``health`` action (``protocol``) and checked by the SDK before
+# its first Flight call, so a shape mismatch fails with an actionable message
+# instead of a parse error from the wrong proto.
+#
+# - ``v1`` -- ``FlightCmd`` with a sentinel ``source_id``, prefix-sniffed tickets,
+#   ROI annotations over DoAction (retired).
+# - ``v2`` -- ``FlightRequest`` / ``TensorTicket`` / ``PutCommand`` oneofs; the
+#   catalog is SQL over DoGet, ROI annotations ride DoGet / DoPut.
+FLIGHT_PROTOCOL_VERSION = 2

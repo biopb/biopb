@@ -524,8 +524,8 @@ def test_setup_empty_sources_serves_empty_catalog(tmp_path):
         assert health["status"] == "SERVING"
         assert health["source_count"] == 0
 
-        # And the empty catalog lists no flights.
-        assert list(server.list_flights(None, None)) == []
+        # And the catalog holds no sources.
+        assert server._metadata_db.query("SELECT source_id FROM sources").num_rows == 0
     finally:
         if precache_worker is not None:
             precache_worker.stop()

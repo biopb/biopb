@@ -231,9 +231,9 @@ class SourceAdapter(ABC):
 
     # Optional per-source capability token. When set, the Flight server requires
     # callers to present a matching Bearer token to read this source (see
-    # ``TensorFlightServer._authorize_source``). None = no per-source gate (falls
-    # back to the server-wide token). Only the result-cache and remote-proxy
-    # adapters set it; the base default keeps the ``capability_token`` property
+    # ``TensorFlightServer._authorize``). None = no per-source gate (falls
+    # back to the server-wide token). Only the result-cache adapter sets it;
+    # the base default keeps the ``capability_token`` property
     # total for every other adapter.
     _capability_token: Optional[str] = None
 
@@ -291,10 +291,9 @@ class SourceAdapter(ABC):
     def capability_token(self) -> Optional[str]:
         """Per-source capability token, or None for the server-wide auth fallback.
 
-        When set, the Flight server requires a matching Bearer token to read this
-        source (``TensorFlightServer._authorize_source``) and drops it from
-        ``list_flights`` (knowing the source_id must not be enough to enumerate
-        it). The result-cache and remote-proxy adapters set it -- either from
+        When set, the Flight server requires a matching Bearer token to read
+        this source's pixels and annotations (``TensorFlightServer._authorize``);
+        the catalog row stays public. The result-cache adapter sets it -- either from
         inside the adapter or, for an externally-granted capability (the embedded
         tensor cache mints a per-result token), through the setter below. Assign
         via this property, never the backing ``_capability_token`` field: the

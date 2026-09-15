@@ -19,14 +19,12 @@ Note: Server components have been moved to the biopb-tensor-server package.
 
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
-    FlightCmd,
-    MetadataQueryOption,
+    CatalogQuery,
+    FlightRequest,
     ResolveProgress,
     SliceHint,
-    TensorCriteria,
     TensorDescriptor,
     TensorReadOption,
-    TensorWriteOptions,
     WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
@@ -59,11 +57,9 @@ __all__ = [
     "ChunkBounds",
     "TensorDescriptor",
     "SliceHint",
-    "TensorCriteria",
-    "TensorWriteOptions",
-    "FlightCmd",
+    "FlightRequest",
     "TensorReadOption",
-    "MetadataQueryOption",
+    "CatalogQuery",
     "ResolveProgress",
     "WarmProgress",
     "SerializedTensor",

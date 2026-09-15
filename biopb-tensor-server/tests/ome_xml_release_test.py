@@ -260,10 +260,10 @@ def test_resync_after_release_still_writes_the_same_row(registered):
     assert db.get_metadata_json("perplane") == first
 
 
-def test_registering_without_a_catalog_releases_nothing(per_plane_tiff):
-    # The embedded image-base cache builds its TensorFlightServer with
-    # metadata_db=None; a source registered there has nowhere else for its
-    # metadata to live, so nothing may be dropped out from under it.
+def test_registering_on_a_bare_server_releases_into_its_own_catalog(per_plane_tiff):
+    # A server built with metadata_db=None (the embedded image-base cache)
+    # owns an in-memory catalog and syncs every registration into it, so the
+    # metadata has somewhere to live and the XML can go.
     from biopb_tensor_server import TensorFlightServer
 
     adapter = OmeTiffAdapter(per_plane_tiff, "perplane")
@@ -271,8 +271,8 @@ def test_registering_without_a_catalog_releases_nothing(per_plane_tiff):
     server = TensorFlightServer(location="grpc://localhost:0", writable=False)
     try:
         server.register_source("perplane", adapter)
-        assert adapter._raw_ome_xml
-        assert adapter._raw_ome_xml_released is False
+        assert adapter._raw_ome_xml_released is True
+        assert server._metadata_db.get_metadata_json("perplane")
     finally:
         server.shutdown()
 

@@ -100,7 +100,7 @@ def _serve(server):
     return t
 
 
-def _db_upstream(zarr_path, source_ids, max_list_flights_results=None):
+def _db_upstream(zarr_path, source_ids):
     """An upstream with a populated metadata DB (so query_sources is complete).
 
     Returns ``(upstream, register, unregister)``; register/unregister keep the
@@ -113,10 +113,7 @@ def _db_upstream(zarr_path, source_ids, max_list_flights_results=None):
 
     arr = zarr.open_array(zarr_path, mode="r")
     db = MetadataDatabase()
-    kwargs = {}
-    if max_list_flights_results is not None:
-        kwargs["max_list_flights_results"] = max_list_flights_results
-    upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db, **kwargs)
+    upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db)
 
     def register(sid):
         adapter = ZarrAdapter(arr, sid, ["y", "x"])
@@ -206,7 +203,7 @@ class TestRemoteTensorProxy:
         import zarr
         from biopb.tensor import TensorFlightClient
         from biopb.tensor.descriptor_pb2 import (
-            FlightCmd,
+            FlightRequest,
             SliceHint,
             TensorDescriptor,
             TensorReadOption,
@@ -238,8 +235,8 @@ class TestRemoteTensorProxy:
                     # its native grid because it is already below the endpoint
                     # parallelism floor.
                     sl = SliceHint(start=[1, 0, 0], stop=[2, 40, 50])
-                    read_opt = TensorReadOption(tensor_id="hpc__aics", slice_hint=sl)
-                    cmd = FlightCmd(source_id="hpc__aics", tensor_read=read_opt)
+                    read_opt = TensorReadOption(array_id="hpc__aics", slice_hint=sl)
+                    cmd = FlightRequest(tensor_read=read_opt)
                     fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
                     info = pc._client.get_flight_info(fd, options=pc._call_options)
                     desc = TensorDescriptor.FromString(info.descriptor.command)
@@ -393,7 +390,7 @@ class TestRemoteTensorProxy:
                     indexed_at="2026-07-19 00:00:00",
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(tensor_id="hpc__aics", with_pyramid=True)
+                    TensorReadOption(array_id="hpc__aics", with_pyramid=True)
                 )
 
                 assert plan is not None
@@ -461,7 +458,7 @@ class TestRemoteTensorProxy:
                     data_resident=True,
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(tensor_id="hpc__ome", with_pyramid=True)
+                    TensorReadOption(array_id="hpc__ome", with_pyramid=True)
                 )
 
                 assert plan is not None
@@ -519,7 +516,7 @@ class TestRemoteTensorProxy:
                     data_resident=True,
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(tensor_id="hpc__ome", with_read_plan=False)
+                    TensorReadOption(array_id="hpc__ome", with_read_plan=False)
                 )
 
                 assert plan is not None
@@ -560,7 +557,7 @@ class TestRemoteTensorProxy:
         with caplog.at_level(
             logging.DEBUG, logger="biopb_tensor_server.adapters.remote_tensor"
         ):
-            plan = adapter.forward_flight_info(TensorReadOption(tensor_id="hpc__aics"))
+            plan = adapter.forward_flight_info(TensorReadOption(array_id="hpc__aics"))
         assert plan is None
         recs = [r for r in caplog.records if r.name.endswith("remote_tensor")]
         assert any("RPC failed" in r.getMessage() for r in recs)
@@ -611,7 +608,7 @@ class TestRemoteTensorProxy:
         with caplog.at_level(
             logging.DEBUG, logger="biopb_tensor_server.adapters.remote_tensor"
         ):
-            plan = adapter.forward_flight_info(TensorReadOption(tensor_id="hpc__aics"))
+            plan = adapter.forward_flight_info(TensorReadOption(array_id="hpc__aics"))
         assert plan is None
         recs = [r for r in caplog.records if r.name.endswith("remote_tensor")]
         assert any(
@@ -700,28 +697,16 @@ class TestBareHostExpansion:
         finally:
             upstream.shutdown()
 
-    def test_expansion_complete_despite_list_flights_truncation(
-        self, simple_zarr_array
-    ):
-        """list_sources() is capped (max_list_flights_results), but the bare-host
-        expansion must mirror EVERY upstream source via the complete server-side
-        catalog -- otherwise a large upstream is silently under-mirrored."""
-        from biopb.tensor import TensorFlightClient
+    def test_expansion_mirrors_every_upstream_source(self, simple_zarr_array):
+        """The bare-host expansion mirrors EVERY upstream source via the
+        server-side catalog -- otherwise a large upstream is silently
+        under-mirrored."""
         from biopb_tensor_server.core.config import SourceConfig, discover_sources
 
         zarr_path, _, _ = simple_zarr_array
-        # cap list_flights at 1 while registering 3 sources
-        upstream, _, _ = _db_upstream(
-            zarr_path, ["a", "b", "c"], max_list_flights_results=1
-        )
+        upstream, _, _ = _db_upstream(zarr_path, ["a", "b", "c"])
         _serve(upstream)
         try:
-            # sanity: the capped list_sources IS truncated to 1...
-            probe = TensorFlightClient(f"grpc://localhost:{upstream.port}")
-            assert len(probe.list_sources()) == 1
-            probe.close()
-
-            # ...but the expansion mirrors all 3 (via the complete SQL catalog)
             expanded = discover_sources(
                 SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
             )
@@ -1089,16 +1074,16 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
-    """No fallback: a reachable upstream whose metadata DB is absent yields {}
-    (best-effort) -- the source still mirrors/serves, only metadata is empty."""
+def test_get_metadata_mirrors_a_bare_upstreams_own_catalog(simple_zarr_array):
+    """Every server has a catalog: an upstream built without one keeps its own
+    in-memory catalog in step with its registry, so the mirror sees metadata."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = TensorFlightServer("grpc://localhost:0")  # no metadata_db
+    upstream = TensorFlightServer("grpc://localhost:0")  # server-owned catalog
     upstream.register_source("img", _meta_zarr_cls()(arr, "img", ["y", "x"]))
     _serve(upstream)
     try:
@@ -1108,7 +1093,7 @@ def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
             upstream_source_id="img",
         )
         assert adapter.list_tensor_descriptors()  # reachable -> mirrored
-        assert adapter.get_metadata() == {}  # query fails -> graceful empty
+        assert adapter.get_metadata() == {"ome": {"channel": "DAPI"}}
     finally:
         upstream.shutdown()
 
@@ -1196,7 +1181,7 @@ def test_server_get_flight_info_uses_proxy_forward():
 
     import zarr
     from biopb.tensor.descriptor_pb2 import (
-        FlightCmd,
+        FlightRequest,
         TensorDescriptor,
         TensorReadOption,
     )
@@ -1226,15 +1211,14 @@ def test_server_get_flight_info_uses_proxy_forward():
             )
             _serve(proxy)
             try:
-                cmd = FlightCmd(
-                    source_id="hpc__ome",
+                cmd = FlightRequest(
                     tensor_read=TensorReadOption(
-                        tensor_id="hpc__ome", with_pyramid=True
+                        array_id="hpc__ome", with_pyramid=True
                     ),
                 )
                 fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-                # Direct server-method call (no client): the proxy source carries no
-                # token, so _authorize_source is a no-op and context can be None.
+                # Direct server-method call (no client): no server token and no
+                # capability token, so _authorize passes with a None context.
                 info = proxy.get_flight_info(None, fd)
 
                 out = TensorDescriptor.FromString(info.descriptor.command)
@@ -1256,7 +1240,7 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
     unparseable), server.get_flight_info falls through to the local planner and
     still returns a best-effort plan -- the branch degrades, it does not raise."""
     import zarr
-    from biopb.tensor.descriptor_pb2 import FlightCmd, TensorReadOption
+    from biopb.tensor.descriptor_pb2 import FlightRequest, TensorReadOption
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
     from pyarrow import flight
@@ -1292,9 +1276,8 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
         proxy.register_source("lab__img", adapter)
         _serve(proxy)
         try:
-            cmd = FlightCmd(
-                source_id="lab__img",
-                tensor_read=TensorReadOption(tensor_id="lab__img"),
+            cmd = FlightRequest(
+                tensor_read=TensorReadOption(array_id="lab__img"),
             )
             fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
             info = proxy.get_flight_info(None, fd)  # must not raise

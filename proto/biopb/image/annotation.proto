@@ -77,21 +77,6 @@ message RoiAnnotation {
   int64 updated_at_unix_ms = 11;
 }
 
-// Body of the "roi_put" action: create-or-update a batch, applied in one
-// transaction.
-message RoiPutRequest {
-  // The tensor every annotation in this batch belongs to (unversioned array_id).
-  // Each RoiAnnotation.array_id must match it or be empty.
-  string array_id = 1;
-
-  repeated RoiAnnotation rois = 2;
-
-  // Optimistic concurrency. When true, an annotation whose `rev` differs from
-  // the stored one is reported in RoiPutResult.conflicts and NOT applied; the
-  // rest of the batch still lands. When false, last writer wins.
-  bool check_rev = 3;
-}
-
 // One annotation that lost a conditional write.
 message RoiConflict {
   string roi_id = 1;
@@ -107,19 +92,6 @@ message RoiPutResult {
   repeated RoiConflict conflicts = 2;
 }
 
-// Body of the "roi_list" action.
-//
-// There is no plane or bbox filter: a client filters the resident set in
-// memory. Analytic slicing is the SQL surface's job (the `rois` table is
-// readable via query_sources).
-message RoiListRequest {
-  string array_id = 1;
-
-  // Restrict to one layer, and the only way to read a reserved ("@") set.
-  // Empty -> the tensor's client-owned sets.
-  string set_name = 2;
-}
-
 // One annotation layer on a tensor, for a client listing what is there.
 message RoiSetInfo {
   string set_name = 1;
@@ -128,8 +100,8 @@ message RoiSetInfo {
   int64 count = 2;
 
   // The server owns this set: it is rebuilt from the source file on every
-  // registration, is read-only to clients, and `rois` does not carry it unless
-  // RoiListRequest named it.
+  // registration, is read-only to clients, and a read does not carry it unless
+  // the RoiRead named it.
   bool reserved = 3;
 }
 
@@ -144,18 +116,32 @@ message RoiListResult {
   repeated RoiSetInfo sets = 3;
 }
 
-// Body of the "roi_delete" action. Deletes `roi_ids` when given; otherwise
-// deletes every annotation on `array_id` in `set_name` (or every annotation on
-// the tensor when `set_name` is empty too).
-message RoiDeleteRequest {
-  string array_id = 1;
-
-  repeated string roi_ids = 2;
-
-  string set_name = 3;
-}
-
 message RoiDeleteResult {
   // The ids actually removed (an id that was not there is simply absent).
   repeated string deleted = 1;
+}
+
+// Body of the "roi_prune" action: annotations whose source the catalog has not
+// seen for `unseen_days`. Orphans have no live source to authorize against, so
+// this is a server-token (catalog-tier) action, reporting unless `apply`.
+message RoiPruneRequest {
+  int32 unseen_days = 1;
+  bool apply = 2;
+}
+
+// One tensor's annotations whose source the catalog has not seen.
+message RoiUnseen {
+  string array_id = 1;
+  // Catalog name of the image when last seen; empty when it was never seen.
+  string source_url = 2;
+  // Client-owned annotations on the tensor (reserved sets are never pruned).
+  int64 count = 3;
+  // 0 when the source was never seen (the rows' created_at stood in).
+  int64 last_seen_at_unix_ms = 4;
+}
+
+message RoiPruneResult {
+  repeated RoiUnseen unseen = 1;
+  // How many annotations were deleted; 0 on a report-only call.
+  int32 deleted = 2;
 }

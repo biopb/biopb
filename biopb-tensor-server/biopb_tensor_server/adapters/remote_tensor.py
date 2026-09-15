@@ -40,8 +40,9 @@ from urllib.parse import urlsplit
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.tensor._catalog_rows import sql_literal
 from biopb.tensor.descriptor_pb2 import (
-    FlightCmd,
+    FlightRequest,
     TensorDescriptor,
     TensorReadOption,
 )
@@ -207,14 +208,14 @@ def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
     another package's private state to recover a value that was in scope
     (biopb/biopb#529).
 
-    Enumerating a catalog with ``list_sources()`` is **unsafe**: it is capped at
-    the server's ``max_list_flights_results``, so a large upstream is silently
-    truncated -- mirroring it would drop sources, and reconciling against a
-    truncated list would spuriously *remove* the ones past the cap. Use the
-    server-side DuckDB catalog instead (``query_sources`` -- complete, not
-    truncated; the canonical browse surface, biopb/biopb#225). Fall back to the
-    capped ``list_sources()`` only when the upstream has no metadata DB, and flag
-    the result ``complete=False`` so a caller (e.g. the monitor re-list) can avoid
+    Enumerating a catalog with ``list_sources()`` is **unsafe**: it is one
+    catalog query capped at the server's ``max_query_results``, so a large
+    upstream is silently truncated -- mirroring it would drop sources, and
+    reconciling against a truncated list would spuriously *remove* the ones
+    past the cap. Query the ids alone instead (``query_sources`` on one narrow
+    column, the canonical browse surface, biopb/biopb#225). Fall back to
+    ``list_sources()`` only when the query fails, and flag the result
+    ``complete=False`` so a caller (e.g. the monitor re-list) can avoid
     destructive reconciliation on a partial list.
     """
     try:
@@ -365,7 +366,7 @@ class RemoteTensorAdapter(TensorAdapter):
         self._upstream_source_id = upstream_source_id
         self._credentials = credentials or UpstreamCredentials(token=token)
         # Per-source capability token for the LOCAL server's auth (server reads
-        # adapter.capability_token in _authorize_source). Proxied sources inherit
+        # adapter.capability_token in _authorize). Proxied sources inherit
         # server-wide auth, so leave it unset.
         self._capability_token: Optional[str] = None
 
@@ -627,8 +628,10 @@ class RemoteTensorAdapter(TensorAdapter):
         if self._metadata_cache is not None:
             return self._metadata_cache
 
-        escaped = self._upstream_source_id.replace("'", "''")
-        sql = f"SELECT metadata_json FROM sources WHERE source_id = '{escaped}'"
+        sql = (
+            "SELECT metadata_json FROM sources WHERE source_id = "
+            f"{sql_literal(self._upstream_source_id)}"
+        )
         try:
             rows = self.client.query_sources(sql, format="records")
         except Exception as exc:
@@ -652,10 +655,10 @@ class RemoteTensorAdapter(TensorAdapter):
 
         Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
         by scanning the upstream's whole ``list_sources()`` catalog: that call is
-        *capped* (``max_list_flights_results``), so for a large upstream this
-        source could be truncated out of it -- and it would re-fetch the entire
-        catalog on every ListFlights, an O(N^2) cost. A single source's
-        descriptor has no such cap.
+        *capped* (``max_query_results``), so for a large upstream this source
+        could be truncated out of it -- and it would re-fetch the entire catalog
+        on every listing, an O(N^2) cost. A single source's descriptor has no
+        such cap.
 
         Catalog surface: an **unreachable** (or upstream-unresolved) source
         degrades to ``[]`` (an empty placeholder row) rather than raising, so the
@@ -937,7 +940,7 @@ class RemoteTensorAdapter(TensorAdapter):
         """
         upstream_array_id = self._to_upstream_array_id(self.array_id)
         up_read_opt = TensorReadOption(
-            tensor_id=upstream_array_id,
+            array_id=upstream_array_id,
             with_metadata=False,
             with_pyramid=read_opt.with_pyramid,
         )
@@ -951,14 +954,8 @@ class RemoteTensorAdapter(TensorAdapter):
             up_read_opt.scale_hint[:] = list(read_opt.scale_hint)
         if read_opt.reduction_method:
             up_read_opt.reduction_method = read_opt.reduction_method
-        # FlightCmd.source_id is the slash-free array_id prefix (identity policy);
-        # tensor_id carries the full array_id, which the upstream reduces to the
-        # within-source field -- so this works for a multi-tensor source too.
-        cmd = FlightCmd(
-            source_id=upstream_array_id.split("/", 1)[0],
-            tensor_read=up_read_opt,
-        )
-        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        req = FlightRequest(tensor_read=up_read_opt)
+        flight_desc = flight.FlightDescriptor.for_command(req.SerializeToString())
         return self.client._client.get_flight_info(
             flight_desc, options=self.client._call_options
         )

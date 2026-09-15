@@ -196,7 +196,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
 
         // Build TensorReadOption with flattened fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setTensorId(tensorId);
+                .setArrayId(tensorId == null || tensorId.isEmpty() ? sourceId : tensorId);
 
         if (sliceHint != null) {
             readBuilder.setSliceHint(sliceHint);
@@ -210,8 +210,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             readBuilder.setReductionMethod(reductionMethod);
         }
 
-        FlightCmd cmd = FlightCmd.newBuilder()
-                .setSourceId(sourceId)
+        FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(readBuilder.build())
                 .build();
 

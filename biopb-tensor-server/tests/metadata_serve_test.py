@@ -111,28 +111,27 @@ def test_serve_null_row_yields_empty_metadata_no_adapter_recompute(simple_zarr_a
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_serve_without_metadata_db_raises(simple_zarr_array):
-    """A metadata request against a DB-less server (the embedded image-base cache)
-    fails closed -- there is no catalog to read and no adapter fallback."""
+def test_a_bare_server_serves_metadata_from_its_own_catalog(simple_zarr_array):
+    """A server built without a catalog (the embedded image-base cache) owns an
+    in-memory one and syncs registrations into it: metadata is computed once,
+    at registration, and served from the catalog like everywhere else."""
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
-    from pyarrow import flight
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     _MetaZarr = _meta_zarr_cls()
 
-    server = TensorFlightServer("grpc://localhost:0")  # no metadata_db
+    server = TensorFlightServer("grpc://localhost:0")  # server-owned catalog
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
     server.register_source("img", adapter)
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
-        # GetFlightInfo(with_metadata) fails closed -> FlightInternalError
-        with pytest.raises(flight.FlightInternalError, match="no metadata catalog"):
-            client.get_descriptor("img", with_metadata=True)
-        assert adapter.get_metadata_calls == 0  # never recomputed
+        assert client.get_source_metadata("img") == {"ome": {"channel": "GFP"}}
+        client.get_descriptor("img", with_metadata=True)
+        assert adapter.get_metadata_calls == 1  # once, at registration
         client.close()
     finally:
         server.shutdown()

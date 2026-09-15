@@ -2,14 +2,33 @@ syntax = "proto3";
 
 package biopb.tensor;
 
+import "biopb/tensor/descriptor.proto";
+
 option java_multiple_files = true;
 option java_package = "biopb.tensor";
 
-// Encoded into FlightEndpoint.ticket bytes
-// Opaque chunk identifier - server determines encoding based on backend
+// Encoded into FlightEndpoint.ticket bytes; what DoGet serves is the oneof arm.
 message TensorTicket {
-  // Backend-specific chunk identifier
-  bytes chunk_id = 1;
+  oneof payload {
+    // One pixel chunk of the `data` flight. Opaque, server-minted: the client
+    // echoes it back and never decodes it (the encoding is the server's own).
+    bytes chunk_id = 1;
+    // One read of the public `catalog` flight. The ticket carries the SQL
+    // itself, so a client may skip GetFlightInfo and DoGet in one call.
+    CatalogQuery catalog_query = 2;
+    // One tensor's annotation set from the `roi` flight (private data).
+    RoiRead roi_read = 3;
+  }
+}
+
+// A tensor's annotations, as rows of the ROI row schema (biopb.image). The
+// stream's schema metadata carries `truncated` and the tensor's `sets` (JSON).
+message RoiRead {
+  // Unversioned array_id of the annotated tensor.
+  string array_id = 1;
+  // Restrict to one layer, and the only way to read a reserved ("@") set.
+  // Empty -> the tensor's client-owned sets.
+  string set_name = 2;
 }
 
 // Encoded into FlightEndpoint.app_metadata bytes
@@ -21,11 +40,44 @@ message ChunkBounds {
   repeated int64 stop = 2;
 }
 
+// FlightDescriptor.command bytes of a DoPut; what the stream carries is the
+// oneof arm. A source is created by the `create_source` action, not here.
+message PutCommand {
+  oneof command {
+    // The stream is one pixel chunk (writable servers only).
+    ChunkUpload chunk = 1;
+    // The stream is annotations in the ROI row schema; the reply is a
+    // biopb.image.RoiPutResult in the put's app_metadata.
+    RoiPut roi_put = 2;
+    // The stream is one `roi_id` column, or empty; the reply is a
+    // biopb.image.RoiDeleteResult in the put's app_metadata.
+    RoiDelete roi_delete = 3;
+  }
+}
+
 // Wrapper for chunk upload DoPut
-// FlightDescriptor.command bytes for uploading chunk data
 message ChunkUpload {
   // Source identifier (e.g., "cache_abc123" or "ome_zarr_def456")
   string source_id = 1;
   // Chunk bounds (start/stop coordinates)
   ChunkBounds bounds = 2;
+}
+
+// Create-or-update a batch of annotations, applied in one transaction.
+message RoiPut {
+  // The tensor every annotation in this batch belongs to (unversioned
+  // array_id). Each row's array_id must match it or be empty.
+  string array_id = 1;
+  // Optimistic concurrency. When true, an annotation whose `rev` differs from
+  // the stored one is reported as a conflict and NOT applied; the rest of the
+  // batch still lands. When false, last writer wins.
+  bool check_rev = 2;
+}
+
+// Delete the streamed `roi_id`s; with an empty stream, every annotation on
+// `array_id` in `set_name` (or every annotation on the tensor when `set_name`
+// is empty too).
+message RoiDelete {
+  string array_id = 1;
+  string set_name = 2;
 }

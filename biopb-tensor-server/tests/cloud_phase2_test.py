@@ -1122,6 +1122,9 @@ class _Ctx:
             return False
         return self.calls > self._cancel_after
 
+    def get_middleware(self, name):
+        return None  # no bearer presented; the servers here have no token
+
 
 class TestWarmAction:
     """The dedicated streaming `warm` do_action: server-side hydrate-ahead. It
