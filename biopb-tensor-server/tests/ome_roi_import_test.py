@@ -14,13 +14,13 @@ import math
 import pytest
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
-from biopb_tensor_server.core.adapter_base import SourceAdapter
-from biopb_tensor_server.core.ome_rois import (
+from biopb_tensor_server.adapters._ome_rois import (
     OME_SET_NAME,
     imported_annotations,
     tensors_by_field,
     tensors_by_image_order,
 )
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 SOURCE_ID = "ometiff_a1b2c3"

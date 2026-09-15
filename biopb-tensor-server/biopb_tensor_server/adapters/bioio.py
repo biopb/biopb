@@ -39,6 +39,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters._handle_reaper import (
     IdleHandleReaper,
 )
+from biopb_tensor_server.adapters._ome_rois import (
+    imported_annotations,
+    tensors_by_image_order,
+)
 from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.chunk import (
@@ -49,10 +53,6 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
-from biopb_tensor_server.core.ome_rois import (
-    imported_annotations,
-    tensors_by_image_order,
-)
 
 logger = logging.getLogger(__name__)
 

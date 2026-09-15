@@ -62,8 +62,9 @@ The `biopb_tensor_server` package is organized into layered subpackages:
   annotations, never importing them at runtime.
 - **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk
   cache. A bare module name here is an adapter; an underscored one is shared
-  machinery (`_scale`, `_handle_reaper`, and `_writable` — the mixin two of the
-  adapters inherit for progress, completion and disposal).
+  machinery: `_scale` and `_ome_rois` (format metadata in, common representation
+  out), `_handle_reaper`, and `_writable` — the mixin two of the adapters
+  inherit for progress, completion and disposal.
 - Top level — the entry points: `cli`, `__main__`, and `logging_config`, which
   configures the `biopb_tensor_server` logger hierarchy for them.
 
