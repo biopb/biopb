@@ -569,7 +569,7 @@ class TestCacheSourcedUnits:
         adapter, reads = counted
         _set_grid(monkeypatch, adapter, (16, 16))
         chunk_ids = self._warm_level_zero(adapter, cache)
-        cache.remove(cache_key_for_chunk_id(chunk_ids[-1]))
+        cache.backend.remove(cache_key_for_chunk_id(chunk_ids[-1]))
         bounds = _bounds((0, 0), (64, 64))
         expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
         reads.clear()

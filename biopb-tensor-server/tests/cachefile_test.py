@@ -28,9 +28,11 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.cache.file_backend import (
+from biopb_tensor_server.cache.bootstrap import (
     CACHE_FILE_FORMAT_VERSION,
     FORMAT_VERSION_MARKER,
+)
+from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,
     ArrowFileConfig,
     ChunkLocation,
@@ -593,7 +595,7 @@ class TestFormatVersionEnforcement:
             (Path(d) / FORMAT_VERSION_MARKER).write_text(
                 f"{CACHE_FILE_FORMAT_VERSION + 1}\n"
             )
-            with patch("biopb_tensor_server.cache.file_backend.shutil.rmtree"):
+            with patch("biopb_tensor_server.cache.bootstrap.shutil.rmtree"):
                 with pytest.raises(RuntimeError, match="survived the wipe"):
                     ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
 

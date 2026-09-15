@@ -12,13 +12,14 @@ from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
 
-from biopb_tensor_server.cache.base import (
+from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
+from biopb_tensor_server.cache.recovery import RecoveryStatus
+from biopb_tensor_server.cache.types import (
     CacheEntry,
     CacheStats,
     ChunkLocation,
     RetentionClass,
 )
-from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.retention import DecodeRates, set_active_decode_rates
 
@@ -78,11 +79,6 @@ class CacheManager:
         return cls._instance
 
     @classmethod
-    def is_initialized(cls) -> bool:
-        """Check if initialized."""
-        return cls._instance is not None
-
-    @classmethod
     def reset(cls) -> None:
         """Reset singleton (for testing)."""
         with cls._init_lock:
@@ -92,7 +88,16 @@ class CacheManager:
 
     @property
     def backend(self) -> ArrowFileBackend:
-        """Get the underlying backend."""
+        """The storage backend, for operations this manager does not own.
+
+        Not a leak -- the split is deliberate. This class owns the singleton,
+        the ``CacheConfig`` translation, the decode-rate table and the
+        reserve/commit dance in :meth:`put`; the backend owns storage. The
+        methods below are here because they are the cache API a chunk request
+        needs, not because the manager is meant to mirror the backend. Anything
+        else (``remove``, ``flush_deferred_writes``, the index internals a test
+        asserts on) is reached through here on purpose.
+        """
         return self._backend
 
     def get_or_acquire(
@@ -197,10 +202,6 @@ class CacheManager:
         """Release reference to entry after use."""
         return self._backend.release(key)
 
-    def remove(self, key: bytes) -> bool:
-        """Remove entry (only if evictable)."""
-        return self._backend.remove(key)
-
     def await_deferred_write(self, key: bytes, timeout: float = 5.0) -> bool:
         """Wait for one key's deferred write. True if nothing is owed.
 
@@ -223,6 +224,15 @@ class CacheManager:
     def stats(self) -> CacheStats:
         """Get cache statistics."""
         return self._backend.stats()
+
+    def get_recovery_status(self) -> Optional[RecoveryStatus]:
+        """What the boot path recovered, or None if it was a clean start.
+
+        Populated during ``__init__`` and immutable after, so a caller reporting
+        it at startup (``cli.py``) reads it here rather than reaching past the
+        manager for it.
+        """
+        return self._backend.get_recovery_status()
 
     def release_process_lock(self) -> None:
         """Release the cross-process cache lock + clear the WAL, handles left open.

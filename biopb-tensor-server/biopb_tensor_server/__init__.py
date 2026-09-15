@@ -68,7 +68,6 @@ except ImportError:
     AicsImageIoAdapter = None  # type: ignore
 
 from biopb_tensor_server.cache import (
-    CacheBackend,
     CacheEntry,
     CacheManager,
     CacheStats,
@@ -126,7 +125,6 @@ __all__ = [
     "MicroManagerLegacyAdapter",
     "OmeZarrAdapter",
     "CacheManager",
-    "CacheBackend",
     "CacheEntry",
     "CacheStats",
     "EntryState",

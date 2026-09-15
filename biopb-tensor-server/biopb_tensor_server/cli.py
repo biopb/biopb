@@ -831,7 +831,7 @@ def _setup_flight_server(
         f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
     )
     # Check for recovery status. CacheManager is always file-backed now.
-    recovery_status = manager.backend.get_recovery_status()
+    recovery_status = manager.get_recovery_status()
     if recovery_status:
         console.print(
             "[yellow]Cache recovery completed:[/yellow] "

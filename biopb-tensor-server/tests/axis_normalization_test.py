@@ -559,7 +559,7 @@ class TestNormalizedCaching:
 
     def test_format_version_was_bumped_for_the_transpose(self):
         from biopb.tensor._pool import _CACHEFILE_SUPPORTED_FORMAT
-        from biopb_tensor_server.cache.file_backend import CACHE_FILE_FORMAT_VERSION
+        from biopb_tensor_server.cache.bootstrap import CACHE_FILE_FORMAT_VERSION
 
         assert CACHE_FILE_FORMAT_VERSION >= 2
         # The layout did not change, so this client parses the new version; an
