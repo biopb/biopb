@@ -283,6 +283,11 @@ class ArrowFileBackend(CacheBackend):
 
         # Pool tracking: (schema_key, size_class) -> segment_id for open segments
         self._open_pools: Dict[Tuple[RetentionClass, SizeClass], int] = {}
+        # Reverse index: segment_id -> its pool key, for O(1) lookup instead of
+        # scanning every pool (mirrors why _segment_keys exists for _metadata).
+        # A segment's pool key is fixed at creation and only cleared on
+        # eviction; set in _create_segment_for_pool / _install_segment_records.
+        self._segment_pool_key: Dict[int, Tuple[RetentionClass, SizeClass]] = {}
 
         # Statistics
         self._hits: int = 0
@@ -775,6 +780,7 @@ class ArrowFileBackend(CacheBackend):
 
         pool_key = (retention, _get_size_class(records[-1][3]))
         pool_queue = self._get_or_create_pool_queue(pool_key)
+        self._segment_pool_key[segment_id] = pool_key
         # Oldest at the tail: a rebuilt segment predates this session's writes.
         pool_queue.queue.append(segment_id)
         pool_queue.segments[segment_id] = SieveKSegmentInfo(
@@ -951,6 +957,7 @@ class ArrowFileBackend(CacheBackend):
         self._pool_sinks[segment_id] = sink
         self._pool_paths[segment_id] = segment_path
         self._open_pools[pool_key] = segment_id
+        self._segment_pool_key[segment_id] = pool_key
 
         return segment_id
 
@@ -1061,11 +1068,13 @@ class ArrowFileBackend(CacheBackend):
     def _get_pool_key_for_segment(
         self, segment_id: int
     ) -> Optional[Tuple[RetentionClass, SizeClass]]:
-        """Get the pool key for a given segment ID."""
-        for pool_key, pool in self._pool_queues.items():
-            if segment_id in pool.segments:
-                return pool_key
-        return None
+        """Get the pool key for a given segment ID.
+
+        O(1) via ``_segment_pool_key`` -- a segment's pool is fixed at
+        creation, so this used to scan every pool on every cache hit
+        (``_update_segment_frequency`` and ``_segment_info`` both call it).
+        """
+        return self._segment_pool_key.get(segment_id)
 
     def _segment_is_evictable(self, segment_id: int) -> bool:
         """True if no entry in this segment is currently referenced."""
@@ -1082,6 +1091,7 @@ class ArrowFileBackend(CacheBackend):
             # Also remove from in-memory entries if present
             self._entries.pop(key, None)
         self._segment_keys.pop(segment_id, None)
+        self._segment_pool_key.pop(segment_id, None)
 
         # Close any open writer (and its sink) for this segment
         self._close_writer(segment_id)
@@ -1398,43 +1408,16 @@ class ArrowFileBackend(CacheBackend):
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
         retention: RetentionClass = "normal",
     ) -> CacheEntry:
-        """Get existing entry or create pending and compute."""
-        is_owner = False
-        with self._lock:
-            entry = self._entries.get(key)
+        """Get existing entry or create pending and compute.
 
-            if entry is not None:
-                if entry.state == EntryState.READY:
-                    # Ready entry - acquire and return
-                    entry.acquire()
-                    self._hits += 1
-                    # Update segment frequency if entry is from a segment
-                    entry_info = self._metadata.get(key)
-                    if entry_info:
-                        self._update_segment_frequency(entry_info.segment_id)
-                    return entry
+        Delegates the READY/PENDING/hydrate/miss dispatch to ``start_compute``,
+        which leaves the returned entry acquired exactly once on every path
+        (including hydrate-from-segment) -- so all that is left to do here is
+        run ``compute_fn`` for an owned miss and wait for a PENDING entry
+        (ours or another thread's) to become READY.
+        """
+        entry, is_owner = self.start_compute(key, retention)
 
-                if entry.state == EntryState.PENDING:
-                    # Pending - wait outside lock (another thread is computing)
-                    self._pending_waits += 1
-
-            else:
-                hydrated = self._hydrate_from_segment(key)
-                if hydrated is not None:
-                    self._hits += 1
-                    return hydrated
-
-                # No entry - create pending, we own the computation
-                entry = CacheEntry(
-                    state=EntryState.PENDING,
-                    created_at=time.time(),
-                    retention=retention,
-                )
-                self._entries[key] = entry
-                self._misses += 1
-                is_owner = True
-
-        # If we created the pending entry, we must compute
         if is_owner:
             try:
                 data, size_bytes = compute_fn()
@@ -1443,16 +1426,12 @@ class ArrowFileBackend(CacheBackend):
                 self.fail_entry(key, e)
                 raise
 
-        # If pending (either waiting on another thread or we just completed), wait
         if entry.state == EntryState.PENDING and not entry.wait_ready(
             self._config.pending_timeout
         ):
             raise TimeoutError("Cache computation timed out for key")
 
-        # Now acquire and return
-        with self._lock:
-            entry.acquire()
-            return entry
+        return entry
 
     def contains(self, key: bytes) -> bool:
         with self._lock:
@@ -1470,11 +1449,35 @@ class ArrowFileBackend(CacheBackend):
                 return self._hydrate_from_segment(key, touch=touch)
             if entry.state != EntryState.READY:
                 return None
-            entry.acquire()
+            return self._acquire_ready_entry(entry, key, count_hit=False, touch=touch)
+
+    def _acquire_ready_entry(
+        self, entry: CacheEntry, key: bytes, *, count_hit: bool, touch: bool = True
+    ) -> CacheEntry:
+        """Acquire a READY entry, crediting a hit and/or touching its segment.
+
+        Shared by every READY-entry path (``start_compute``, ``try_acquire``):
+        a ``try_acquire`` probe does not count as a hit (see
+        ``_hydrate_from_segment``) but still touches the segment when
+        ``touch``; every other caller counts the hit. Caller holds ``_lock``.
+        """
+        entry.acquire()
+        if count_hit:
+            self._hits += 1
+        if touch:
             entry_info = self._metadata.get(key)
-            if entry_info and touch:
+            if entry_info:
                 self._update_segment_frequency(entry_info.segment_id)
-            return entry
+        return entry
+
+    def _hydrate_hit(self, key: bytes) -> Optional[CacheEntry]:
+        """``_hydrate_from_segment`` plus the hit credit every caller but the
+        ``try_acquire`` probe wants. Caller holds ``_lock``.
+        """
+        hydrated = self._hydrate_from_segment(key)
+        if hydrated is not None:
+            self._hits += 1
+        return hydrated
 
     def _hydrate_from_segment(
         self, key: bytes, touch: bool = True
@@ -1517,19 +1520,20 @@ class ArrowFileBackend(CacheBackend):
     def start_compute(
         self, key: bytes, retention: RetentionClass = "normal"
     ) -> Tuple[CacheEntry, bool]:
-        """Start compute phase - returns (entry, is_owner)."""
+        """Start compute phase - returns (entry, is_owner).
+
+        Every returned entry is acquired exactly once, on every path --
+        ``get_or_acquire`` relies on this to avoid acquiring a second time.
+        """
         with self._lock:
             entry = self._entries.get(key)
 
             if entry is not None:
                 if entry.state == EntryState.READY:
-                    entry.acquire()
-                    self._hits += 1
-                    # Update segment frequency if entry is from a segment
-                    entry_info = self._metadata.get(key)
-                    if entry_info:
-                        self._update_segment_frequency(entry_info.segment_id)
-                    return entry, False
+                    return (
+                        self._acquire_ready_entry(entry, key, count_hit=True),
+                        False,
+                    )
 
                 if entry.state == EntryState.PENDING:
                     # Someone else computing - acquire and wait
@@ -1537,9 +1541,8 @@ class ArrowFileBackend(CacheBackend):
                     self._pending_waits += 1
                     return entry, False
 
-            hydrated = self._hydrate_from_segment(key)
+            hydrated = self._hydrate_hit(key)
             if hydrated is not None:
-                self._hits += 1
                 return hydrated, False
 
             # No entry - create pending, we own computation
@@ -1668,11 +1671,12 @@ class ArrowFileBackend(CacheBackend):
                     # bytes are harmless slack in the segment.
                     return
 
+                now = time.time()
                 seg_info = pool_queue.segments.get(segment_id)
                 if seg_info:
                     seg_info.size_bytes += size_bytes
                     seg_info.entry_count += 1
-                    seg_info.last_access_time = time.time()
+                    seg_info.last_access_time = now
 
                 self._index_entry(
                     key,
@@ -1687,8 +1691,8 @@ class ArrowFileBackend(CacheBackend):
                         # the eviction budget and size class below, which is
                         # in-session state a walk never reconstructs.
                         size_bytes=estimate_batch_bytes(data),
-                        created_at=time.time(),
-                        last_access_time=time.time(),
+                        created_at=now,
+                        last_access_time=now,
                         byte_offset=byte_offset,
                         byte_length=byte_length,
                     ),
@@ -1977,6 +1981,7 @@ class ArrowFileBackend(CacheBackend):
             self._pool_queues.clear()
             self._metadata.clear()
             self._segment_keys.clear()
+            self._segment_pool_key.clear()
             self._entries.clear()
 
             # Clear WAL
@@ -2142,4 +2147,5 @@ class ArrowFileBackend(CacheBackend):
             self._entries.clear()
             self._metadata.clear()
             self._segment_keys.clear()
+            self._segment_pool_key.clear()
             self._pool_queues.clear()
