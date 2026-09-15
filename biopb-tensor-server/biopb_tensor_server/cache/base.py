@@ -1,15 +1,15 @@
-"""Thread-safe cache backend interface with future/promise pattern.
+"""Cache value types and the future/promise concurrency protocol.
 
 Designed for Arrow Flight servers where multiple threads may request
 the same virtual chunk simultaneously. The future/promise pattern ensures
-only one thread computes while others wait.
-
-Reference counting prevents eviction of entries being actively served.
+only one thread computes while others wait, and reference counting prevents
+eviction of entries being actively served. ``ArrowFileBackend`` (see
+``file_backend.py``) is the sole implementation of the protocol and owns
+everything else -- storage, eviction, recovery.
 """
 
 from __future__ import annotations
 
-import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -17,8 +17,6 @@ from enum import Enum
 from typing import Callable, Dict, Literal, Optional, Tuple
 
 import pyarrow as pa
-
-logger = logging.getLogger(__name__)
 
 # Chunk splitting threshold - 64MB for parallel Flight transfers
 # (Arrow IPC can handle larger, but we split for throughput optimization)
@@ -55,9 +53,9 @@ def estimate_batch_bytes(batch: pa.RecordBatch) -> int:
 class ChunkLocation:
     """On-disk location of a cached chunk's Arrow IPC message.
 
-    Returned by :meth:`CacheBackend.locate_entry` for the localhost cache-file
-    handoff (issue #9): a client on the same host mmaps ``segment_path`` and
-    reads the single record-batch message at
+    Returned by :meth:`ArrowFileBackend.locate_entry` for the localhost
+    cache-file handoff (issue #9): a client on the same host mmaps
+    ``segment_path`` and reads the single record-batch message at
     ``[byte_offset, byte_offset + byte_length)``. ``generation_id`` is the
     segment file's inode at locate time, so a client can detect a segment that
     was evicted and recreated at the same path.
@@ -175,15 +173,14 @@ class CacheStats:
 
 
 class CacheBackend(ABC):
-    """Thread-safe cache backend with future/promise pattern.
+    """The future/promise contract a cache backend fulfills.
 
-    All implementations must support:
-    - Pending entries for compute-once semantics
-    - Reference counting to prevent eviction of active entries
-    - Thread-safe operations
-
-    The key method is get_or_acquire() which implements the future/promise
-    pattern for safe concurrent access.
+    ``ArrowFileBackend`` is the only implementation -- the in-memory backend
+    this once abstracted over has been retired. What remains here is not a
+    swappable-storage interface; it is the documented concurrency protocol for
+    compute-once, wait-if-pending, reference-counted access, kept separate
+    from ``ArrowFileBackend``'s own (much larger) surface of storage,
+    eviction, and recovery operations.
     """
 
     @abstractmethod
@@ -276,103 +273,3 @@ class CacheBackend(ABC):
         Returns:
             New reference count
         """
-
-    @abstractmethod
-    def remove(self, key: bytes) -> bool:
-        """Remove entry (only if ref_count <= 0).
-
-        Args:
-            key: Cache key bytes
-
-        Returns:
-            True if removed, False if not found or has references
-        """
-
-    @abstractmethod
-    def clear(self) -> None:
-        """Clear all evictable entries (ref_count <= 0)."""
-
-    @abstractmethod
-    def stats(self) -> CacheStats:
-        """Return current cache statistics."""
-
-    @abstractmethod
-    def close(self) -> None:
-        """Close backend and release resources."""
-
-    def release_process_lock(self) -> None:  # noqa: B027 - concrete no-op default, not abstract
-        """Release the cross-process cache lock (+ WAL) without closing handles.
-
-        The graceful-shutdown fast path (biopb/biopb#300): release the lock
-        *first*, cheaply and upstream-independently, while segment writers/mmaps
-        stay open for any still-draining reads. No-op by default; the file
-        backend overrides it.
-        """
-
-    @abstractmethod
-    def contains(self, key: bytes) -> bool:
-        """Whether *key* is cached and servable without computing it.
-
-        A peek: takes no reference and reads no data, so it is a decision input
-        and never a promise -- an entry may be evicted between this and the
-        :meth:`try_acquire` that acts on it, and a caller must handle that miss.
-        Cheap by contract (an index lookup), because the scaled read probes every
-        full-resolution chunk under an extent before deciding how to source it.
-        """
-
-    @abstractmethod
-    def try_acquire(self, key: bytes, touch: bool = True) -> Optional[CacheEntry]:
-        """The acquired entry for *key* if it is already cached, else None.
-
-        :meth:`get_or_acquire` without the compute half, for a caller that has
-        its own way to produce the bytes and wants the cache only if the answer
-        is already there. Acquired on the way out, so the caller must
-        :meth:`release` exactly as after ``get_or_acquire``.
-
-        A PENDING entry is a miss, not a wait: the caller can compute it itself,
-        and joining another reader's decode would trade a bounded read for an
-        unbounded block. Nothing is counted as a hit or a miss either -- a probe
-        is not a chunk request.
-
-        ``touch=False`` reads without telling the eviction policy anything: no
-        recency bump, no frequency credit, no pool hit, and no accounting-driven
-        maintenance. One coarse scaled read covers every full-resolution chunk
-        under its extent, so crediting them all would let a zoomed-out read
-        decide what stays cached.
-        """
-
-    def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
-        """Return the on-disk location of a cached chunk, or None.
-
-        Backs the localhost cache-file handoff (issue #9), where a same-host
-        client mmaps the segment instead of streaming the chunk over do_get.
-        Declared here -- rather than sniffed with ``getattr`` -- because the
-        manager drives it on every backend; a backend with nothing to locate
-        inherits this None default. None means "fall back to do_get", the
-        designed floor of the whole path.
-        """
-        return None
-
-    def _skip_if_oversized(
-        self, key: bytes, data: pa.RecordBatch, size_bytes: int
-    ) -> bool:
-        """Handle a chunk too large to cache; True if the caller should stop.
-
-        An oversized chunk is still handed to the threads waiting on it -- the
-        entry goes READY in memory -- it just is not stored. Relies on the
-        ``_lock`` / ``_entries`` / ``_oversized_skips`` state a concrete backend
-        supplies.
-        """
-        if size_bytes <= MAX_ARROW_BATCH_BYTES:
-            return False
-        self._oversized_skips += 1
-        logger.warning(
-            "Skipping cache for oversized chunk: %d bytes > %d",
-            size_bytes,
-            MAX_ARROW_BATCH_BYTES,
-        )
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is not None and entry.state == EntryState.PENDING:
-                entry.set_ready(data, size_bytes)
-        return True

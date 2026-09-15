@@ -13,7 +13,6 @@ from typing import Callable, Optional, Tuple
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
-    CacheBackend,
     CacheEntry,
     CacheStats,
     ChunkLocation,
@@ -92,7 +91,7 @@ class CacheManager:
             cls._instance = None
 
     @property
-    def backend(self) -> CacheBackend:
+    def backend(self) -> ArrowFileBackend:
         """Get the underlying backend."""
         return self._backend
 
@@ -122,16 +121,16 @@ class CacheManager:
     def contains(self, key: bytes) -> bool:
         """Whether *key* is cached and servable without computing it.
 
-        See :meth:`CacheBackend.contains`: a peek, not a promise.
+        See :meth:`ArrowFileBackend.contains`: a peek, not a promise.
         """
         return self._backend.contains(key)
 
     def try_acquire(self, key: bytes, touch: bool = True) -> Optional[CacheEntry]:
         """The acquired entry for *key*, or None when it is not already cached.
 
-        See :meth:`CacheBackend.try_acquire`. Release it as you would an entry
-        from :meth:`get_or_acquire`; ``touch=False`` keeps the read out of the
-        eviction policy.
+        See :meth:`ArrowFileBackend.try_acquire`. Release it as you would an
+        entry from :meth:`get_or_acquire`; ``touch=False`` keeps the read out
+        of the eviction policy.
         """
         return self._backend.try_acquire(key, touch=touch)
 

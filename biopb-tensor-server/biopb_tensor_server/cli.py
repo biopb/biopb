@@ -29,7 +29,6 @@ from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
 from biopb_tensor_server.adapters._handle_reaper import set_handle_reaper_ttl
 from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.core.config import (
     ServerConfig,
     SourceConfig,
@@ -832,7 +831,6 @@ def _setup_flight_server(
         f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
     )
     # Check for recovery status. CacheManager is always file-backed now.
-    assert isinstance(manager.backend, ArrowFileBackend)
     recovery_status = manager.backend.get_recovery_status()
     if recovery_status:
         console.print(

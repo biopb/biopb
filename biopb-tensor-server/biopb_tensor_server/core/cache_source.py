@@ -70,7 +70,7 @@ def _acquired_chunk_view(
     ``touch=False``: these reads stand in for one the adapter could do itself,
     and one coarse extent covers every chunk of the source -- crediting them all
     would let a zoomed-out read decide what stays cached
-    (:meth:`CacheBackend.try_acquire`).
+    (:meth:`ArrowFileBackend.try_acquire`).
 
     None where the entry went between the probe and here, or where its stored
     shape or dtype is not the one this extent expects -- a stale key collision,

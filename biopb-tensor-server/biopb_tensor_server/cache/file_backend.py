@@ -23,6 +23,7 @@ import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
     EVICTION_RANK,
+    MAX_ARROW_BATCH_BYTES,
     CacheBackend,
     CacheEntry,
     CacheStats,
@@ -1576,6 +1577,28 @@ class ArrowFileBackend(CacheBackend):
         if allow_deferred and self._enqueue_write(key, data, size_bytes):
             return
         self._persist_entry(key, data, size_bytes)
+
+    def _skip_if_oversized(
+        self, key: bytes, data: pa.RecordBatch, size_bytes: int
+    ) -> bool:
+        """Handle a chunk too large to cache; True if the caller should stop.
+
+        An oversized chunk is still handed to the threads waiting on it -- the
+        entry goes READY in memory -- it just is not stored.
+        """
+        if size_bytes <= MAX_ARROW_BATCH_BYTES:
+            return False
+        self._oversized_skips += 1
+        logger.warning(
+            "Skipping cache for oversized chunk: %d bytes > %d",
+            size_bytes,
+            MAX_ARROW_BATCH_BYTES,
+        )
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry.state == EntryState.PENDING:
+                entry.set_ready(data, size_bytes)
+        return True
 
     def _persist_entry(
         self,
