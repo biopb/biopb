@@ -865,14 +865,6 @@ def compute_warm_targets(
     ]
 
 
-# 256 MiB, per warm level. Not sized to make a catalog fit -- at a few hundred
-# tensors nothing in the hundreds of MiB does, and the backlog high-water gate is
-# what stops a full cache. What it bounds is one tensor eating the cache, and
-# above the first plane it buys *scrub headroom*: at this value a 200-plane
-# confocal keeps 128 of its Z planes rather than 32, so paging through the stack
-# stays warm instead of only the opening slab.
-PRECACHE_WARM_BUDGET_BYTES = 256 * 1024 * 1024
-
 # Order in which selection axes give up extent when a level is over budget.
 # Unnamed axes (a plate's POS, a sequence's `i`) go first and are not in this
 # tuple -- they are independent acquisitions like T, and a viewer opens on one.
@@ -888,8 +880,8 @@ def compute_warm_selection(
     dim_labels,
     scale_hint: Sequence[int],
     itemsize: int,
+    budget_bytes: int,
     volumetric: bool = False,
-    budget_bytes: int = PRECACHE_WARM_BUDGET_BYTES,
 ) -> Tuple[List[int], List[int]]:
     """``(start, stop)`` in full-resolution coords for the part worth warming.
 

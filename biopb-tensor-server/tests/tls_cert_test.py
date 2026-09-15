@@ -37,7 +37,7 @@ def _isolate_state(tmp_path, monkeypatch):
 
 
 def test_collect_san_includes_loopback():
-    from biopb_tensor_server.core.tls import collect_san_hosts
+    from biopb_tensor_server.serving.tls import collect_san_hosts
 
     dns, ips = collect_san_hosts()
     assert "localhost" in dns
@@ -46,7 +46,7 @@ def test_collect_san_includes_loopback():
 
 def test_host_identity_is_resolved_once_per_process():
     """The SAN probes are cached: a stalling resolver is paid for once, not per cert."""
-    from biopb_tensor_server.core import tls as tls_mod
+    from biopb_tensor_server.serving import tls as tls_mod
 
     tls_mod._host_identity.cache_clear()
     assert tls_mod._host_identity.cache_info().misses == 0
@@ -57,7 +57,7 @@ def test_host_identity_is_resolved_once_per_process():
 
 def test_collect_san_hosts_returns_a_fresh_list_each_call():
     """The cached value is shared, so callers must not be able to mutate it."""
-    from biopb_tensor_server.core.tls import collect_san_hosts
+    from biopb_tensor_server.serving.tls import collect_san_hosts
 
     dns, _ = collect_san_hosts()
     dns.append("mutated.example")
@@ -67,7 +67,7 @@ def test_collect_san_hosts_returns_a_fresh_list_each_call():
 
 def test_a_stalling_name_probe_is_abandoned_not_awaited(monkeypatch):
     """A wedged resolver must cost a bounded blip, not block server startup."""
-    from biopb_tensor_server.core import tls as tls_mod
+    from biopb_tensor_server.serving import tls as tls_mod
 
     monkeypatch.setattr(tls_mod, "_NAME_PROBE_TIMEOUT_S", 0.1)
     started = threading.Event()
@@ -84,7 +84,7 @@ def test_a_stalling_name_probe_is_abandoned_not_awaited(monkeypatch):
 
 
 def test_generated_cert_is_self_signed_with_sans():
-    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from biopb_tensor_server.serving.tls import generate_self_signed_cert
     from cryptography import x509
 
     cert_pem, key_pem = generate_self_signed_cert(
@@ -106,7 +106,7 @@ def test_generated_cert_is_self_signed_with_sans():
 
 def test_generated_cert_is_an_end_entity_server_cert():
     """BasicConstraints/KeyUsage/EKU, so a strict TLS stack accepts the leaf."""
-    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from biopb_tensor_server.serving.tls import generate_self_signed_cert
     from cryptography import x509
 
     cert_pem, _ = generate_self_signed_cert(["localhost"], ["127.0.0.1"])
@@ -121,7 +121,7 @@ def test_generated_cert_is_an_end_entity_server_cert():
 
 
 def test_validity_span_matches_the_documented_days():
-    from biopb_tensor_server.core import tls as tls_mod
+    from biopb_tensor_server.serving import tls as tls_mod
     from cryptography import x509
 
     cert_pem, _ = tls_mod.generate_self_signed_cert(["localhost"], [], days=10)
@@ -137,7 +137,7 @@ def test_leaf_pem_takes_the_first_certificate_of_a_chain():
     the fingerprint a client verifies and `PEM_cert_to_DER_cert` want exactly one
     certificate (biopb/biopb#916).
     """
-    from biopb_tensor_server.core import tls as tls_mod
+    from biopb_tensor_server.serving import tls as tls_mod
 
     leaf, _ = tls_mod.generate_self_signed_cert(["localhost"], [])
     issuer, _ = tls_mod.generate_self_signed_cert(["Example Issuing CA"], [])
@@ -158,7 +158,7 @@ def test_expiry_warning_fires_only_near_the_end_of_the_span():
     that is already expired -- the state an operator reaches by leaving a cert in
     place for its full validity.
     """
-    from biopb_tensor_server.core import tls as tls_mod
+    from biopb_tensor_server.serving import tls as tls_mod
 
     fresh, _ = tls_mod.generate_self_signed_cert(["localhost"], [])
     assert tls_mod.cert_expiry_warning(fresh) is None
@@ -172,7 +172,7 @@ def test_expiry_warning_fires_only_near_the_end_of_the_span():
 
 def test_expiry_warning_is_advisory_not_fatal():
     """Unreadable material must not take down the TLS path it only annotates."""
-    from biopb_tensor_server.core.tls import cert_expiry_warning
+    from biopb_tensor_server.serving.tls import cert_expiry_warning
 
     assert cert_expiry_warning(b"not a certificate") is None
 
@@ -181,7 +181,7 @@ def test_cert_init_reports_an_expired_cert_it_reuses(monkeypatch):
     """The one command an operator runs to inspect the cert has to say it is dead."""
     from biopb._locations import tls_server_cert, tls_server_key
     from biopb_tensor_server.cli import app
-    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from biopb_tensor_server.serving.tls import generate_self_signed_cert
 
     cert_pem, key_pem = generate_self_signed_cert(["localhost"], ["127.0.0.1"], days=0)
     tls_server_cert().parent.mkdir(parents=True, exist_ok=True)
@@ -199,7 +199,7 @@ def test_serve_tls_warns_on_an_expired_byo_cert(tmp_path, capsys):
     import sys
 
     from biopb_tensor_server.cli import _resolve_tls_material
-    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from biopb_tensor_server.serving.tls import generate_self_signed_cert
 
     cert_pem, key_pem = generate_self_signed_cert(["localhost"], [], days=0)
     cf, kf = tmp_path / "c.pem", tmp_path / "k.pem"
@@ -220,7 +220,7 @@ def test_serve_tls_warns_on_an_expired_byo_cert(tmp_path, capsys):
 
 
 def test_split_san_values_partitions_names_and_ips():
-    from biopb_tensor_server.core.tls import split_san_values
+    from biopb_tensor_server.serving.tls import split_san_values
 
     dns, ips = split_san_values(["lab.example", " 10.0.0.5 ", "::1", "", "vpn-host"])
     assert dns == ["lab.example", "vpn-host"]
@@ -229,7 +229,7 @@ def test_split_san_values_partitions_names_and_ips():
 
 def test_extra_sans_land_in_the_generated_cert():
     """`--san` covers a name this host cannot discover about itself."""
-    from biopb_tensor_server.core.tls import ensure_server_cert
+    from biopb_tensor_server.serving.tls import ensure_server_cert
     from cryptography import x509
 
     cert_pem, _ = ensure_server_cert(extra_sans=["vpn.lab.example", "10.8.0.4"])
@@ -243,7 +243,7 @@ def test_extra_sans_land_in_the_generated_cert():
 
 
 def test_extra_sans_ignored_when_reusing_an_existing_cert():
-    from biopb_tensor_server.core.tls import ensure_server_cert
+    from biopb_tensor_server.serving.tls import ensure_server_cert
     from cryptography import x509
 
     first, _ = ensure_server_cert()
@@ -277,7 +277,7 @@ def test_cert_init_san_requires_force_to_widen():
 
 def test_ensure_server_cert_generates_then_reuses():
     from biopb._locations import tls_server_cert, tls_server_key
-    from biopb_tensor_server.core.tls import ensure_server_cert
+    from biopb_tensor_server.serving.tls import ensure_server_cert
 
     assert not tls_server_cert().exists()
     cert1, key1 = ensure_server_cert()
@@ -292,7 +292,7 @@ def test_ensure_server_cert_generates_then_reuses():
 
 
 def test_ensure_regenerate_mints_new_cert():
-    from biopb_tensor_server.core.tls import cert_fingerprint, ensure_server_cert
+    from biopb_tensor_server.serving.tls import cert_fingerprint, ensure_server_cert
 
     cert1, _ = ensure_server_cert()
     cert2, _ = ensure_server_cert(regenerate=True)
@@ -308,7 +308,7 @@ def test_generate_without_cryptography_raises_actionable(monkeypatch):
     """
     import sys
 
-    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from biopb_tensor_server.serving.tls import generate_self_signed_cert
 
     monkeypatch.setitem(sys.modules, "cryptography", None)
     with pytest.raises(RuntimeError, match=r"biopb-tensor-server\[tls\]"):
@@ -345,7 +345,7 @@ def test_byo_cert_needs_no_cryptography(tmp_path, monkeypatch):
     import sys
 
     from biopb_tensor_server.cli import _resolve_tls_material
-    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from biopb_tensor_server.serving.tls import generate_self_signed_cert
 
     cert_pem, key_pem = generate_self_signed_cert(["localhost"], ["127.0.0.1"])
     cf, kf = tmp_path / "c.pem", tmp_path / "k.pem"
@@ -366,7 +366,7 @@ def test_byo_material_is_validated_by_opening_it(tmp_path):
     """
     import typer
     from biopb_tensor_server.cli import _resolve_tls_material
-    from biopb_tensor_server.core.tls import generate_self_signed_cert
+    from biopb_tensor_server.serving.tls import generate_self_signed_cert
 
     cert_pem, key_pem = generate_self_signed_cert(["localhost"], [])
     cf, kf = tmp_path / "c.pem", tmp_path / "k.pem"
@@ -391,7 +391,7 @@ def test_cert_init_generates_and_prints_fingerprint():
     """The full digest is printed, colon-grouped and unwrapped (copy-pasteable)."""
     from biopb._locations import tls_server_cert
     from biopb_tensor_server.cli import app
-    from biopb_tensor_server.core.tls import cert_fingerprint, format_fingerprint
+    from biopb_tensor_server.serving.tls import cert_fingerprint, format_fingerprint
 
     result = CliRunner().invoke(app, ["cert", "init"])
     assert result.exit_code == 0, result.output
@@ -474,7 +474,7 @@ def test_generated_cert_serves_and_tofu_client_reads(simple_zarr_array):
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.core.tls import ensure_server_cert
+    from biopb_tensor_server.serving.tls import ensure_server_cert
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")

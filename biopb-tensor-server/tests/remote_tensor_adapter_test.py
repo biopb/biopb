@@ -109,7 +109,7 @@ def _db_upstream(zarr_path, source_ids):
     """
     import zarr
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     arr = zarr.open_array(zarr_path, mode="r")
     db = MetadataDatabase()
@@ -663,7 +663,8 @@ class TestBareHostExpansion:
 
     def test_expansion_mirrors_all_sources_namespaced(self, simple_zarr_array):
         from biopb_tensor_server import TensorFlightServer
-        from biopb_tensor_server.core.config import SourceConfig, discover_sources
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.sources.resolve import discover_sources
 
         zarr_path, shape, _ = simple_zarr_array
         upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
@@ -701,7 +702,8 @@ class TestBareHostExpansion:
         """The bare-host expansion mirrors EVERY upstream source via the
         server-side catalog -- otherwise a large upstream is silently
         under-mirrored."""
-        from biopb_tensor_server.core.config import SourceConfig, discover_sources
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.sources.resolve import discover_sources
 
         zarr_path, _, _ = simple_zarr_array
         upstream, _, _ = _db_upstream(zarr_path, ["a", "b", "c"])
@@ -942,7 +944,7 @@ def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkey
     pool, so it has to carry the same anchor -- else a grpcs:// upstream with a
     configured CA would still be TOFU-pinned at expansion time."""
     import biopb.tensor as bt
-    from biopb_tensor_server.core.config import discover_sources
+    from biopb_tensor_server.sources.resolve import discover_sources
 
     seen = {}
 
@@ -955,7 +957,7 @@ def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkey
 
     monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
     monkeypatch.setattr(
-        "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
+        "biopb_tensor_server.sources.resolve.list_upstream_source_ids",
         lambda client, location: ([], True),
     )
     discover_sources(
@@ -995,7 +997,7 @@ def _upstream_with_metadata(zarr_path):
     """An upstream server whose metadata DB holds one source ('img') with metadata."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     arr = zarr.open_array(zarr_path, mode="r")
     db = MetadataDatabase()  # in-memory, enabled
@@ -1041,7 +1043,7 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     upstream = _upstream_with_metadata(zarr_path)
@@ -1462,7 +1464,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
     from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
@@ -2483,7 +2485,8 @@ def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeyp
     losing the diagnosis exactly when it matters (biopb/biopb#529).
     """
     import biopb.tensor as biopb_tensor
-    from biopb_tensor_server.core.config import SourceConfig, _discover_tensor_server
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.sources.resolve import _discover_tensor_server
 
     class _BrokenClient:
         def __init__(self, *_a, **_k):
@@ -2515,7 +2518,7 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
     from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
@@ -2644,7 +2647,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
     from biopb_tensor_server.sources.source_manager import SourceManager
 
     up_db = MetadataDatabase()
@@ -2733,7 +2736,8 @@ def _register_static_proxy(url, alias):
     """
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.core.config import SourceConfig, discover_sources
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.sources.resolve import discover_sources
     from biopb_tensor_server.sources.source_manager import create_source_manager
 
     expanded = discover_sources(SourceConfig(url=url, alias=alias))

@@ -208,7 +208,7 @@ def _tensor_line_level(line: str) -> Optional[str]:
     """Level of a data-plane log line, or None if it has none.
 
     tensor-server.log carries the server's own format (DEFAULT_LOG_FORMAT in
-    biopb_tensor_server.core.logging_config): `[2026-06-12 10:00:00] WARNING
+    biopb_tensor_server.logging_config): `[2026-06-12 10:00:00] WARNING
     biopb_tensor_server.x: msg`. Returns None for the supervisor's `--- control:
     starting data plane ---` banners, blank lines, native gRPC/Arrow stdout, and
     traceback continuations — all of which _filter_lines carries forward.

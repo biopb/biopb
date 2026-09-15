@@ -9,7 +9,7 @@ Measures performance for:
 import concurrent.futures
 
 import pytest
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 
 class MockAdapter:

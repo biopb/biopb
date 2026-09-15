@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.core.config import SourceConfig, _reroot_catalog_url
+from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     ClaimContext,
@@ -32,10 +32,11 @@ from biopb_tensor_server.core.discovery import (
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
+from biopb_tensor_server.sources.resolve import _reroot_catalog_url
 from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
     from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
@@ -1569,7 +1570,7 @@ def create_source_manager(
             unresolved=bool(source.cloud),
         )
         # source._catalog_url is the alias-derived display tree-root for a local
-        # source (config.resolve_all_sources), or None. Threaded as the descriptor's
+        # source (resolve.resolve_all_sources), or None. Threaded as the descriptor's
         # source_url override, exactly like the drag-drop re-rooting path.
         manager._reconciler._commit_add_claim(claim, catalog_url=source._catalog_url)
 

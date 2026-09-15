@@ -7,7 +7,7 @@ import typer
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.recovery import ProcessLock
 from biopb_tensor_server.core.config import CacheConfig
-from biopb_tensor_server.core.tls import cert_fingerprint
+from biopb_tensor_server.serving.tls import cert_fingerprint
 
 
 def _cache_lock_is_free(lock_path: Path) -> bool:

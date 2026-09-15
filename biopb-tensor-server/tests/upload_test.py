@@ -779,7 +779,7 @@ class TestServerDoPutHandler:
     def test_ome_zarr_upload_synced_to_catalog(self):
         """File-backed (durable) uploads are added to the catalog so they are
         discoverable via list_sources/query_sources (biopb/biopb#265)."""
-        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -805,7 +805,7 @@ class TestServerDoPutHandler:
     def test_cache_upload_not_synced_but_readable_by_id(self):
         """Ephemeral cache-backed uploads are NOT catalogued (no removal hook ->
         the row would dangle), but stay readable by their returned id."""
-        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         db = MetadataDatabase()

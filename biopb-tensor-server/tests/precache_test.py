@@ -1230,6 +1230,10 @@ class TestWarmSelection:
             compute_warm_selection,
             compute_warm_targets,
         )
+        from biopb_tensor_server.core.config import PrecacheConfig
+
+        # the shipped default, which is the bound this policy rests on
+        budget = PrecacheConfig().warm_budget_bytes
 
         shape, labels = [20, 8000, 8000], ["z", "y", "x"]
         targets = compute_warm_targets(shape, labels)
@@ -1240,12 +1244,11 @@ class TestWarmSelection:
             labels,
             targets[0].scale_hint,
             itemsize=4,
+            budget_bytes=budget,
             volumetric=targets[0].volumetric,
         )
         assert stop[0] - start[0] < 20  # Z narrowed rather than exempt
-        assert self._level_bytes(shape, targets[0].scale_hint, start, stop) <= (
-            256 * self.MIB
-        )
+        assert self._level_bytes(shape, targets[0].scale_hint, start, stop) <= budget
 
     def test_a_3d_target_is_volumetric_even_when_it_did_not_scale_z(self):
         """Provenance, not "did Z change" -- which is why the flag cannot be
