@@ -25,11 +25,7 @@ from biopb_tensor_server.cache.file_backend import (
     ArrowFileConfig,
     _get_size_class,
 )
-from biopb_tensor_server.cache.recovery import (
-    K,
-    ProcessLock,
-    WriteAheadLog,
-)
+from biopb_tensor_server.cache.recovery import K, ProcessLock
 from biopb_tensor_server.cache.segment_index import (
     CACHE_KEY_FIELD,
     SIDECAR_FORMAT_VERSION,
@@ -879,8 +875,8 @@ def _simulate_crash(backend):
     """Release a backend's OS file handles the way a dying process would.
 
     A real crash makes the OS reclaim every open handle -- writers, sinks, mmaps,
-    and the cache lock's descriptor -- while leaving the on-disk owner record and
-    WAL behind (no clean shutdown). The test process stays alive, so we drop those
+    and the cache lock's descriptor -- while leaving the on-disk owner record
+    behind (no clean shutdown). The test process stays alive, so we drop those
     handles explicitly; on Windows a lingering handle also blocks the segment files
     from being deleted (issue #5). Deliberately does NOT call backend.close() or
     ProcessLock.release(), either of which would clean up and thus erase the crash
@@ -962,7 +958,7 @@ class TestArrowFileBackendRecovery:
 
         A dying process releases the OS lock (the kernel closes its fd) but
         cannot remove its record, so the next owner acquires successfully *and*
-        finds the marker -- which is precisely the case WAL recovery is for.
+        finds the marker -- which is precisely the case recovery is for.
         """
         cache_dir = self._make_temp_cache_dir()
         lock_path = cache_dir / "lock"
@@ -1035,25 +1031,6 @@ class TestArrowFileBackendRecovery:
 
         shutil.rmtree(cache_dir)
 
-    def test_wal_pending_detection(self):
-        """WAL detects pending writes."""
-        cache_dir = self._make_temp_cache_dir()
-        wal_path = cache_dir / "wal.json"
-
-        wal = WriteAheadLog(wal_path)
-        wal.log_pending(b"test_key")
-
-        # Pending key should be tracked
-        pending = wal.get_pending_keys()
-        assert b"test_key" in pending
-        assert wal.has_pending() is True
-
-        wal.log_committed(b"test_key")
-        assert wal.has_pending() is False
-
-        wal.clear()
-        shutil.rmtree(cache_dir)
-
     def test_recovery_after_simulated_crash(self):
         """Valid entries survive after simulated crash."""
         cache_dir = self._make_temp_cache_dir()
@@ -1084,42 +1061,42 @@ class TestArrowFileBackendRecovery:
         backend2.close()
         shutil.rmtree(cache_dir)
 
-    def test_stale_lock_triggers_recovery_without_wal_entries(self):
-        """An unclean exit alone (no WAL entries) triggers recovery on restart."""
+    def test_stale_lock_triggers_recovery(self):
+        """An unclean exit triggers recovery on restart.
+
+        The only trigger there is, since the write-ahead log was removed: a
+        clean shutdown releases the lock, so a stale one means the last owner
+        did not get there.
+        """
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
 
-        # First instance: write a complete entry (WAL is cleared after commit)
         backend1 = ArrowFileBackend(config)
-        entry1, _ = backend1.start_compute(b"key1")
-        data = self._make_data([1, 2, 3])
-        backend1.complete_entry(b"key1", data, 24)
+        backend1.start_compute(b"key1")
+        backend1.complete_entry(b"key1", self._make_data([1, 2, 3]), 24)
         backend1.release(b"key1")
 
         # Crash: the lock's descriptor goes, its owner record stays behind.
         _simulate_crash(backend1)
 
-        # Verify WAL has no pending entries (so recovery must be triggered by
-        # the leftover owner record alone)
-        from biopb_tensor_server.cache.recovery import WriteAheadLog
-
-        wal = WriteAheadLog(cache_dir / "wal.json")
-        assert not wal.has_pending(), "Test requires no pending WAL entries"
-
-        # Reinitialize: recovery should trigger due to stale lock
         backend2 = ArrowFileBackend(config)
-        assert backend2.get_recovery_status() is not None, (
-            "Recovery should be triggered by stale lock even without pending WAL entries"
-        )
+        status = backend2.get_recovery_status()
+        assert status is not None, "a stale lock must trigger recovery"
+        # A complete write is not a lost one: nothing was torn.
+        assert status.lost_entries == 0
 
         backend2.close()
         shutil.rmtree(cache_dir)
 
-    def test_pending_write_is_discarded_on_recovery(self):
-        """An interrupted write (logged pending, never committed) is dropped on
-        recovery and never served as a torn cache hit -- the WAL's whole purpose,
-        and the crash-safety property that must hold without a clean shutdown
-        (#138 item 2). A committed entry alongside it must still survive.
+    def test_interrupted_write_is_discarded_on_recovery(self):
+        """A write cut off mid-message is dropped on recovery and never served
+        as a torn cache hit -- the crash-safety property that must hold without a
+        clean shutdown (#138 item 2). A committed entry alongside it survives,
+        and recovery reports the loss.
+
+        The interrupted write is simulated on disk, as the head of a message
+        whose body never landed, rather than by faking a bookkeeping record: the
+        boot walk is what detects it, so that is what the test has to feed.
         """
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
@@ -1129,29 +1106,60 @@ class TestArrowFileBackendRecovery:
         backend1.start_compute(b"key_good")
         backend1.complete_entry(b"key_good", self._make_data([1, 2, 3]), 24)
         backend1.release(b"key_good")
-        # An in-flight write: pending in the WAL with no committed segment -- the
-        # on-disk shape of a crash mid-complete_entry (after log_pending, before
-        # log_committed).
-        backend1._wal.log_pending(b"key_bad")
+        segment = backend1._segment_path(backend1._metadata[b"key_good"].segment_id)
 
-        # Crash without clean shutdown: the OS frees the lock descriptor so a
-        # fresh instance can reclaim it, and recovery is driven by the pending
-        # WAL entry (the lock file and owner record stay -- no crash unlinks them).
+        # Crash without clean shutdown: the OS frees the lock descriptor, the
+        # owner record stays (no crash unlinks it).
         _simulate_crash(backend1)
 
+        # ... with a write that had started when the power went: a message
+        # header with no body behind it.
+        with open(segment, "ab") as handle:
+            handle.write(b"\xff\xff\xff\xff\x80\x00\x00\x00" + b"\x00" * 16)
+
         backend2 = ArrowFileBackend(config)
-        # Recovery ran (driven by the pending WAL entry) and purged the in-flight
-        # write: the pending marker is gone, so the key is "lost" per _recover().
-        assert backend2.get_recovery_status() is not None, "recovery must run"
-        assert not backend2._wal.has_pending(), "pending write must be purged"
+        status = backend2.get_recovery_status()
+        assert status is not None, "recovery must run"
+        assert status.lost_entries == 1, "the partial write must be reported lost"
 
         good, good_owner = backend2.start_compute(b"key_good")
         assert good_owner is False, "committed entry must survive as a cache hit"
         assert good.state == EntryState.READY
-        # The interrupted key was lost: the caller becomes the owner (must
-        # recompute) rather than getting a torn/partial hit.
+        # Nothing torn is ever served: the slack bytes index no entry at all.
         _bad, bad_owner = backend2.start_compute(b"key_bad")
         assert bad_owner is True, "interrupted write must be recomputed, not served"
+
+        backend2.close()
+        shutil.rmtree(cache_dir)
+
+    def test_torn_first_batch_is_dropped_and_still_counted(self):
+        """A segment whose only batch was cut off holds nothing recoverable, so
+        the boot drops it -- but the write it cost is still one lost entry. This
+        is every crash that lands on the first write after a rotation, so the
+        count must not depend on the segment surviving.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+
+        backend1 = ArrowFileBackend(config)
+        backend1.start_compute(b"key")
+        backend1.complete_entry(b"key", self._make_data([1, 2, 3]), 24)
+        backend1.release(b"key")
+        info = backend1._metadata[b"key"]
+        segment = backend1._segment_path(info.segment_id)
+        _simulate_crash(backend1)
+
+        # Cut the first batch's body short: schema message intact, then a
+        # message that never finished landing.
+        with open(segment, "r+b") as handle:
+            handle.truncate(info.byte_offset + info.byte_length - 5)
+
+        backend2 = ArrowFileBackend(config)
+        status = backend2.get_recovery_status()
+        assert status is not None, "recovery must run"
+        assert status.lost_entries == 1, "the torn first batch must be counted"
+        assert status.recovered_entries == 0
+        assert not segment.exists(), "a segment that can serve nothing is dropped"
 
         backend2.close()
         shutil.rmtree(cache_dir)

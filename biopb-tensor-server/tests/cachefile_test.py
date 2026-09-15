@@ -275,8 +275,8 @@ class TestLocateEntry:
         seg_file = Path(file_backend.locate_entry(b"m0").segment_path)
         walked = {
             key: (byte_offset, byte_length)
-            for key, byte_offset, byte_length, _, _ in file_backend._scan_segment_records(
-                seg_file
+            for key, byte_offset, byte_length, _, _ in (
+                file_backend._scan_segment_records(seg_file).records
             )
         }
         for key in arrs:
@@ -490,7 +490,7 @@ class TestFormatVersionEnforcement:
     Segments written under an incompatible version must be dropped at boot rather
     than indexed and served (mis-decoded / stale). Covers: the marker is stamped
     on init; a matching marker preserves the cache across restart; and a missing
-    (pre-enforcement), mismatched, or torn marker wipes the segments + WAL.
+    (pre-enforcement), mismatched, or torn marker wipes the segments.
     """
 
     CFG = {"max_segment_bytes": 8 * 1024 * 1024, "max_total_bytes": 256 * 1024 * 1024}

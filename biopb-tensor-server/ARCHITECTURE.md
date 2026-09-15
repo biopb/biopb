@@ -367,11 +367,11 @@ Runs from `launch`'s `finally`, once the blocking uvicorn call returns. A
 `restart` force-kills the process after a bounded graceful window.
 
 1. Stop the precache worker — no new warm writes.
-2. Release the file-cache process lock and clear the WAL **immediately**. Cheap
+2. Release the file-cache process lock **immediately**. Cheap
    and upstream-independent, so after this even a mid-teardown SIGKILL leaves no
    stale lock for the next boot to crash-recover. Segment writers/mmaps are left
    **open** — closing them here would race the in-flight `do_get` reads step 3
-   has not drained yet — and an early WAL clear is safe because index rebuild
+   has not drained yet — and releasing early is safe because index rebuild
    tolerates a torn tail.
 3. Drain the Flight server, **bounded**. `FlightServerBase.shutdown()` takes no
    timeout and can block forever on a stream gated by a dead upstream, so it

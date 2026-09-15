@@ -22,11 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
-from biopb_tensor_server.cache.recovery import (
-    ProcessLock,
-    RecoveryStatus,
-    WriteAheadLog,
-)
+from biopb_tensor_server.cache.recovery import ProcessLock, RecoveryStatus
 
 __all__ = [
     "CACHE_FILE_FORMAT_VERSION",
@@ -34,7 +30,7 @@ __all__ = [
     "CacheLayout",
     "acquire_cache_dir",
     "enforce_format_version",
-    "recover",
+    "recovery_status",
 ]
 
 logger = logging.getLogger(__name__)
@@ -49,7 +45,7 @@ logger = logging.getLogger(__name__)
 CACHE_FILE_FORMAT_VERSION = 2
 
 # Name of the on-disk marker file (in the cache root, beside ``lock`` and
-# ``wal.json``) recording the CACHE_FILE_FORMAT_VERSION the segments were written
+# ``lock``) recording the CACHE_FILE_FORMAT_VERSION the segments were written
 # under. ``enforce_format_version`` reads it at init and wipes the cache when it
 # is missing or mismatched, so a segment-layout / key-composition change can't
 # silently reuse incompatible on-disk segments.
@@ -73,7 +69,12 @@ class CacheLayout:
         return self.cache_dir / "segments"
 
     @property
-    def wal_path(self) -> Path:
+    def legacy_wal_path(self) -> Path:
+        """A write-ahead log left by a build before it was removed.
+
+        Nothing reads it. Boot unlinks it so an upgraded cache dir does not keep
+        a file that no longer means anything.
+        """
         return self.cache_dir / "wal.json"
 
     @property
@@ -115,6 +116,12 @@ def acquire_cache_dir(layout: CacheLayout) -> Tuple[ProcessLock, bool]:
     except OSError:
         pass
 
+    # Drop a write-ahead log left by an older build; nothing reads it now.
+    try:
+        layout.legacy_wal_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
     process_lock = ProcessLock(layout.lock_path)
     if not process_lock.acquire():
         raise RuntimeError(
@@ -142,10 +149,10 @@ def enforce_format_version(layout: CacheLayout) -> bool:
     drops them before the index rebuild. A cache dir with segments but no marker
     counts as a mismatch.
 
-    Must run while the process lock is held and before WAL init / recovery /
-    index rebuild read the segments. Returns True iff a (re)stamp happened
-    (marker missing or mismatched), in which case the segments and WAL were
-    just wiped and there is nothing to recover.
+    Must run while the process lock is held and before recovery / index rebuild
+    read the segments. Returns True iff a (re)stamp happened (marker missing or
+    mismatched), in which case the segments were just wiped and there is nothing
+    to recover.
     """
     try:
         on_disk: Optional[int] = int(layout.marker_path.read_text().strip())
@@ -169,7 +176,7 @@ def enforce_format_version(layout: CacheLayout) -> bool:
 
 
 def _wipe_cache_contents(layout: CacheLayout, stale_version: Optional[int]) -> None:
-    """Delete the version-sensitive on-disk state (segments + WAL), leaving
+    """Delete the version-sensitive on-disk state (the segments), leaving
     the held process lock and marker in place, and recreate an empty
     ``segments`` dir. Logs loudly only when data was actually discarded (a
     fresh dir wipe is a silent no-op). Runs before any mmap is opened, so no
@@ -181,10 +188,7 @@ def _wipe_cache_contents(layout: CacheLayout, stale_version: Optional[int]) -> N
     holds.
     """
     segments_dir = layout.segments_dir
-    wal_path = layout.wal_path
-    had_data = (segments_dir.exists() and any(segments_dir.iterdir())) or (
-        wal_path.exists()
-    )
+    had_data = segments_dir.exists() and any(segments_dir.iterdir())
     if had_data:
         logger.warning(
             "Cache format-version mismatch (on-disk=%s, code=%d): discarding "
@@ -196,11 +200,6 @@ def _wipe_cache_contents(layout: CacheLayout, stale_version: Optional[int]) -> N
 
     shutil.rmtree(segments_dir, ignore_errors=True)
     segments_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        wal_path.unlink()
-    except OSError:
-        pass
-
     leftover = sorted(segments_dir.glob("seg_*.arrow"))
     if leftover:
         # The caller releases the process lock on the way out, so an aborted
@@ -213,25 +212,25 @@ def _wipe_cache_contents(layout: CacheLayout, stale_version: Optional[int]) -> N
         )
 
 
-def recover(wal: WriteAheadLog, layout: CacheLayout) -> RecoveryStatus:
-    """Recover from crash: drop incomplete writes recorded in the WAL.
+def recovery_status(
+    layout: CacheLayout, recovered_entries: int, lost_entries: int
+) -> RecoveryStatus:
+    """Summarize what an unclean restart found, once the index is rebuilt.
 
-    Does NOT read segment bodies (biopb/biopb#300). Takes the recovered byte
-    total from the segment files' on-disk sizes (a ``stat``, no read) and leaves
-    ``recovered_entries`` at 0 for the caller to backfill from the rebuilt
-    index, which is the walk that had to happen anyway.
+    Both counts come from the rebuild rather than from a log kept during normal
+    operation: ``recovered_entries`` is what the index actually holds, and
+    ``lost_entries`` is the number of segments whose tail was torn -- a write
+    interrupted mid-``write_batch``, which is the only way a synchronous write
+    can fail to survive.
+
+    That is strictly better than the write-ahead log this replaced
+    (biopb/biopb#815 era), which cost ~167 us on *every* cached chunk -- 47% of
+    the write -- to report a number that could only ever be 0 or 1, and got it
+    wrong in the window between ``sink.flush()`` and its own commit record,
+    where a successful write was still counted as lost.
+
+    Byte total is the segment files' on-disk footprint (a ``stat``, no read).
     """
-    lost_entries = 0
-
-    # Clear WAL - pending (incomplete) writes never reached a segment, so lost.
-    for key in wal.get_pending_keys():
-        lost_entries += 1
-        logger.warning(f"Cache recovery: lost pending write for key {key.hex()}")
-    wal.clear()
-
-    # Recovered byte total from file sizes -- no segment read (issue #300).
-    # (This is the on-disk footprint; corrupt segments are dropped, and any
-    # read errors are surfaced, by the rebuild pass that follows.)
     recovered_bytes = 0
     for seg_file in layout.segments_dir.glob("seg_*.arrow"):
         try:
@@ -239,8 +238,15 @@ def recover(wal: WriteAheadLog, layout: CacheLayout) -> RecoveryStatus:
         except OSError:
             pass
 
+    if lost_entries:
+        logger.warning(
+            "Cache recovery: %d segment(s) ended in a partial write; those "
+            "entries were dropped and will be recomputed on demand.",
+            lost_entries,
+        )
+
     return RecoveryStatus(
-        recovered_entries=0,  # backfilled from the rebuilt index by the caller
+        recovered_entries=recovered_entries,
         lost_entries=lost_entries,
         recovered_bytes=recovered_bytes,
         lost_bytes=0,

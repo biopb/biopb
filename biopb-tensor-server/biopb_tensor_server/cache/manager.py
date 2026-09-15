@@ -217,7 +217,7 @@ class CacheManager:
         return self._backend.get_recovery_status()
 
     def release_process_lock(self) -> None:
-        """Release the cross-process cache lock + clear the WAL, handles left open.
+        """Release the cross-process cache lock, handles left open.
 
         Delegates to the backend's fast graceful-shutdown path. Callers guard
         the singleton for ``None`` themselves (``CacheManager.get_instance()``).

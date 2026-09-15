@@ -10,7 +10,7 @@ Modules:
     - file_backend: the live, lock-disciplined serving backend
     - bootstrap: the cache directory's layout and its single-threaded boot path
     - segment_index: the on-disk ``.arrow`` / ``.idx`` formats
-    - recovery: WAL, process lock, and the Sieve-K pool bookkeeping
+    - recovery: process lock, recovery status, and Sieve-K pool bookkeeping
 
 Exports:
     - CacheManager: Singleton manager for cache operations
