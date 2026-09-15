@@ -3277,7 +3277,7 @@ class TestVolumeStaysWithinTheBudget:
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestSingleSourceIsNotCappedByTheListing:
-    """A source past ``max_list_flights_results`` is unbrowsable but readable.
+    """A source past the listing's row cap is unbrowsable but readable.
 
     Real Flight server, real sidecar. `/api/sources/{id}` used to look the id up
     in the listing, so it inherited the browse cap and answered 404 for a source
@@ -3288,9 +3288,12 @@ class TestSingleSourceIsNotCappedByTheListing:
     def _setup(self, tmp_path):
         import zarr
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
-        # Cap of 1 against 3 sources: "c" sorts last, so it is the one clipped.
-        server = TensorFlightServer("grpc://127.0.0.1:0", max_list_flights_results=1)
+        # Query cap of 1 against 3 sources: "c" sorts last, so it is the one
+        # clipped from the listing (which is a catalog query).
+        db = MetadataDatabase(max_query_results=1)
+        server = TensorFlightServer("grpc://127.0.0.1:0", metadata_db=db)
         for sid in ("a", "b", "c"):
             z = zarr.open_array(
                 str(tmp_path / f"{sid}.zarr"),
@@ -3300,7 +3303,8 @@ class TestSingleSourceIsNotCappedByTheListing:
                 dtype="uint16",
             )
             z[:] = 7
-            server.register_source(sid, ZarrAdapter(z, sid, ["y", "x"]))
+            adapter = server.register_source(sid, ZarrAdapter(z, sid, ["y", "x"]))
+            db.sync_source_added(sid, adapter)
 
         t = threading.Thread(target=server.serve, daemon=True)
         t.start()

@@ -442,11 +442,9 @@ class TestMultifieldServerClient:
         """The SerializedTensor endpoint-fetch fallback must derive source_id
         from a multi-tensor qualified array_id ("source_id/field").
 
-        Regression for the identity-policy alignment: previously it set the
-        FlightCmd source_id to the *whole* array_id, so for "mf-fetch/pos_1" the
-        server looked up source "mf-fetch/pos_1" and failed. It must split on the
-        first "/" -> source "mf-fetch", and the server reduces the tensor_id to
-        the "pos_1" field.
+        Regression for the identity-policy alignment: the request carries the
+        *whole* array_id "mf-fetch/pos_1", and the server splits on the first
+        "/" -> source "mf-fetch", field "pos_1".
         """
         from biopb.tensor.client import _fetch_endpoints_via_get_flight_info
         from biopb.tensor.serialized_pb2 import SerializedTensor

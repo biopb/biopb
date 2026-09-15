@@ -51,7 +51,7 @@ from typing import Any, Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
 import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
-from biopb.image.annotation_pb2 import RoiPutRequest
+from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
@@ -1980,19 +1980,20 @@ async def put_rois(array_id: str, request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="Body must be a JSON object")
 
-    req = RoiPutRequest()
+    # No bool() coercion: bool("false") is True, so a client sending the
+    # string would silently get conditional writes ON. Refuse a non-bool as a
+    # 422 instead.
+    check_rev = body.get("check_rev", body.get("checkRev", False))
+    if not isinstance(check_rev, bool):
+        raise HTTPException(status_code=422, detail="check_rev must be a boolean")
+    raw_rois = body.get("rois", [])
+    if not isinstance(raw_rois, list):
+        raise HTTPException(status_code=422, detail="rois must be a list")
+    rois = []
     try:
-        json_format.ParseDict(
-            {
-                "rois": body.get("rois", []),
-                # No bool() coercion: bool("false") is True, so a client
-                # sending the string would silently get conditional writes ON.
-                # Let ParseDict refuse a non-bool as a 422 instead.
-                "checkRev": body.get("check_rev", body.get("checkRev", False)),
-            },
-            req,
-        )
-    except json_format.ParseError as exc:
+        for item in raw_rois:
+            rois.append(json_format.ParseDict(item, RoiAnnotation()))
+    except (json_format.ParseError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=f"Invalid annotation: {exc}")
 
     # Strip the version from the BODY too, not just the path. Responses carry
@@ -2001,14 +2002,14 @@ async def put_rois(array_id: str, request: Request) -> JSONResponse:
     # them straight back -- and the store, which only ever sees bare ids, would
     # reject them as a mismatched tensor. The sidecar owns this translation at
     # every boundary it has: path in, body in, body out.
-    for roi in req.rois:
+    for roi in rois:
         if roi.array_id:
             roi.array_id = _split_array_version(roi.array_id)[0]
 
     try:
         client = await run_in_threadpool(ctx.get_client)
         result = await run_in_threadpool(
-            partial(client.put_rois, bare_id, list(req.rois), check_rev=req.check_rev)
+            partial(client.put_rois, bare_id, rois, check_rev=check_rev)
         )
     except HTTPException:
         raise

@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
 
-import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
@@ -219,43 +218,80 @@ public class TensorFlightClient implements AutoCloseable {
      */
     public Map<String, DataSourceDescriptor> listSources() throws IOException {
         Map<String, DataSourceDescriptor> result = new HashMap<>();
-        boolean truncated = false;
-        long totalSources = 0;
-
-        for (FlightInfo info : client.listFlights(Criteria.ALL, authOption)) {
-            DataSourceDescriptor sourceDesc = DataSourceDescriptor.parseFrom(
-                    info.getDescriptor().getCommand());
-            result.put(sourceDesc.getSourceId(), sourceDesc);
-            // Cache tensor descriptors for quick lookup
-            for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
-                descriptors.put(tensorDesc.getArrayId(), tensorDesc);
-            }
-
-            // Check schema metadata for truncation info
-            java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
-            if (schemaOpt.isPresent()) {
-                Map<String, String> metadata = schemaOpt.get().getCustomMetadata();
-                if (metadata != null) {
-                    String truncatedStr = metadata.get("truncated");
-                    if (truncatedStr != null) {
-                        truncated = Boolean.parseBoolean(truncatedStr);
-                    }
-                    String totalStr = metadata.get("total_sources");
-                    if (totalStr != null) {
-                        totalSources = Long.parseLong(totalStr);
-                    }
+        try (VectorSchemaRoot root = querySources(
+                "SELECT source_id, source_url, source_type, data_resident, tensors "
+                        + "FROM sources ORDER BY source_id")) {
+            for (DataSourceDescriptor sourceDesc : descriptorsFromRows(root)) {
+                result.put(sourceDesc.getSourceId(), sourceDesc);
+                for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
+                    descriptors.put(tensorDesc.getArrayId(), tensorDesc);
                 }
             }
         }
         sources.putAll(result);
-
-        if (truncated && totalSources > result.size()) {
-            LOGGER.warning("listSources: returned " + result.size() + " of " + totalSources + " sources (truncated)");
-        } else {
-            LOGGER.info("listSources: returned " + result.size() + " sources");
-        }
-
+        LOGGER.info("listSources: returned " + result.size() + " sources");
         return result;
+    }
+
+    /**
+     * Rebuild lean {@link DataSourceDescriptor}s from {@code sources} catalog rows.
+     *
+     * <p>Structural only: per-tensor array_id / dim_labels / shape / dtype from the
+     * {@code tensors} LIST&lt;STRUCT&gt; column. The transfer chunk_shape belongs to the
+     * tensor-bound adapter and is answered by GetFlightInfo (biopb/biopb#812).
+     */
+    static List<DataSourceDescriptor> descriptorsFromRows(VectorSchemaRoot root) {
+        List<DataSourceDescriptor> out = new ArrayList<>();
+        FieldVector sourceIds = root.getVector("source_id");
+        FieldVector urls = root.getVector("source_url");
+        FieldVector types = root.getVector("source_type");
+        FieldVector resident = root.getVector("data_resident");
+        FieldVector tensors = root.getVector("tensors");
+        for (int i = 0; i < root.getRowCount(); i++) {
+            DataSourceDescriptor.Builder desc = DataSourceDescriptor.newBuilder()
+                    .setSourceId(text(sourceIds, i))
+                    .setSourceUrl(text(urls, i))
+                    .setSourceType(text(types, i))
+                    .setMetadataJson("");
+            Object res = resident == null || resident.isNull(i) ? null : resident.getObject(i);
+            if (res instanceof Boolean) {
+                desc.setDataResident((Boolean) res);
+            }
+            Object list = tensors == null || tensors.isNull(i) ? null : tensors.getObject(i);
+            if (list instanceof List) {
+                for (Object entry : (List<?>) list) {
+                    if (!(entry instanceof Map)) {
+                        continue;
+                    }
+                    Map<?, ?> t = (Map<?, ?>) entry;
+                    TensorDescriptor.Builder td = TensorDescriptor.newBuilder()
+                            .setArrayId(String.valueOf(t.get("array_id")))
+                            .setDtype(t.get("dtype") == null ? "" : String.valueOf(t.get("dtype")));
+                    Object labels = t.get("dim_labels");
+                    if (labels instanceof List) {
+                        for (Object l : (List<?>) labels) {
+                            td.addDimLabels(String.valueOf(l));
+                        }
+                    }
+                    Object shape = t.get("shape");
+                    if (shape instanceof List) {
+                        for (Object d : (List<?>) shape) {
+                            td.addShape(((Number) d).longValue());
+                        }
+                    }
+                    desc.addTensors(td.build());
+                }
+            }
+            out.add(desc.build());
+        }
+        return out;
+    }
+
+    private static String text(FieldVector vector, int index) {
+        if (vector == null || vector.isNull(index)) {
+            return "";
+        }
+        return String.valueOf(vector.getObject(index));
     }
 
     /**
@@ -284,51 +320,42 @@ public class TensorFlightClient implements AutoCloseable {
      *                     </pre>
      */
     public VectorSchemaRoot querySources(String sql) throws IOException {
-        FlightCmd cmd = FlightCmd.newBuilder()
-                .setSourceId("__metadata_query__")
-                .setMetadataQuery(MetadataQueryOption.newBuilder()
-                        .setSql(sql)
-                        .build())
+        // One DoGet on the `catalog` flight: the ticket carries the SQL itself.
+        TensorTicket ticket = TensorTicket.newBuilder()
+                .setCatalogQuery(CatalogQuery.newBuilder().setSql(sql).build())
                 .build();
+        Schema schema;
+        List<ArrowRecordBatch> batches = new ArrayList<>();
+        try (FlightStream stream = client.getStream(new Ticket(ticket.toByteArray()), authOption)) {
+            schema = stream.getSchema();
 
-        FlightInfo info = client.getInfo(
-                FlightDescriptor.command(cmd.toByteArray()), authOption);
-
-        // Check schema metadata for truncation
-        java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
-        if (schemaOpt.isPresent()) {
-            Map<String, String> metadata = schemaOpt.get().getCustomMetadata();
-            if (metadata != null && metadata.containsKey("total_sources")) {
-                long total = Long.parseLong(metadata.get("total_sources"));
-                String returnedStr = metadata.get("returned_sources");
-                long returned = returnedStr != null ? Long.parseLong(returnedStr) : info.getEndpoints().size();
-                if (returned < total) {
-                    LOGGER.info("querySources: result truncated, returned " + returned + " of " + total + " sources");
+            // Truncation is the server's own flag on the stream's schema metadata.
+            Map<String, String> metadata = schema.getCustomMetadata();
+            if (metadata != null && metadata.containsKey("returned_rows")) {
+                String returned = metadata.get("returned_rows");
+                if (Boolean.parseBoolean(metadata.get("truncated"))) {
+                    LOGGER.info("querySources: result truncated, returned " + returned
+                            + " of " + metadata.get("total_rows") + " rows");
                 } else {
-                    LOGGER.info("querySources: returned " + returned + " sources");
+                    LOGGER.info("querySources: returned " + returned + " rows");
                 }
             }
-        }
 
-        // Fetch results via doGet
-        if (info.getEndpoints().isEmpty()) {
-            // Empty result - return empty table
-            Schema schema = info.getSchema();
-            VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
-            root.setRowCount(0);
-            return root;
-        }
-
-        FlightStream stream = client.getStream(
-                info.getEndpoints().get(0).getTicket(), authOption);
-
-        // Materialize all batches using ArrowRecordBatch (Arrow 18 API)
-        List<ArrowRecordBatch> batches = new ArrayList<>();
-        Schema schema = info.getSchema();
-        while (stream.next()) {
-            VectorUnloader unloader = new VectorUnloader(stream.getRoot());
-            ArrowRecordBatch batch = unloader.getRecordBatch().cloneWithTransfer(allocator);
-            batches.add(batch);
+            // Materialize all batches using ArrowRecordBatch (Arrow 18 API); the
+            // stream (and its root) is released here, the clones are ours.
+            while (stream.next()) {
+                VectorUnloader unloader = new VectorUnloader(stream.getRoot());
+                ArrowRecordBatch batch = unloader.getRecordBatch().cloneWithTransfer(allocator);
+                batches.add(batch);
+            }
+        } catch (Exception e) {
+            for (ArrowRecordBatch batch : batches) {
+                batch.close();
+            }
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw new IOException("querySources failed: " + e.getMessage(), e);
         }
 
         if (batches.isEmpty()) {
@@ -413,10 +440,9 @@ public class TensorFlightClient implements AutoCloseable {
         // {"type": ..., "dim_label": [...], "metadata": {...}}; we return the
         // inner "metadata" map.
         TensorDescriptor firstTensor = sourceDesc.getTensorsList().get(0);
-        FlightCmd cmd = FlightCmd.newBuilder()
-                .setSourceId(sourceId)
+        FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(TensorReadOption.newBuilder()
-                        .setTensorId(firstTensor.getArrayId())
+                        .setArrayId(firstTensor.getArrayId())
                         .setWithMetadata(true)
                         .build())
                 .build();
@@ -894,7 +920,7 @@ public class TensorFlightClient implements AutoCloseable {
 
         // Build TensorReadOption from descriptor's fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setTensorId(descriptor.getArrayId())
+                .setArrayId(descriptor.getArrayId())
                 .setWithMetadata(false);
 
         if (descriptor.hasSliceHint()) {
@@ -907,12 +933,7 @@ public class TensorFlightClient implements AutoCloseable {
             readBuilder.setReductionMethod(descriptor.getReductionMethod());
         }
 
-        // Build FlightCmd. Per the tensor identity policy, the descriptor's
-        // array_id is "source_id" or "source_id/field"; the FlightCmd source_id
-        // is the slash-free prefix (the tensor_id above carries the full
-        // array_id, which the server reduces to the within-source field).
-        FlightCmd cmd = FlightCmd.newBuilder()
-                .setSourceId(sourceIdFromArrayId(descriptor.getArrayId()))
+        FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(readBuilder.build())
                 .build();
 
@@ -1320,7 +1341,7 @@ public class TensorFlightClient implements AutoCloseable {
 
         // Build TensorReadOption with flattened fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setTensorId(tensorId)
+                .setArrayId(tensorId)
                 .setWithMetadata(false);
 
         if (sliceHint != null) {
@@ -1335,8 +1356,7 @@ public class TensorFlightClient implements AutoCloseable {
             readBuilder.setReductionMethod(normalizedReductionMethod);
         }
 
-        FlightCmd cmd = FlightCmd.newBuilder()
-                .setSourceId(sourceId)
+        FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(readBuilder.build())
                 .build();
         FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
@@ -1650,12 +1670,9 @@ public class TensorFlightClient implements AutoCloseable {
      */
     private TensorDescriptor fetchTensorDescriptor(String sourceId, String tensorId) {
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setWithMetadata(true);
-        if (tensorId != null && !tensorId.equals(sourceId)) {
-            readBuilder.setTensorId(tensorId);
-        }
-        FlightCmd cmd = FlightCmd.newBuilder()
-                .setSourceId(sourceId)
+                .setWithMetadata(true)
+                .setArrayId(tensorId == null || tensorId.isEmpty() ? sourceId : tensorId);
+        FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(readBuilder.build())
                 .build();
         FlightInfo info;

@@ -202,7 +202,7 @@ human-chosen stand-in for the endpoint.
 The contract that follows: **an alias is part of the data's identity, not a
 display label.** Renaming one re-keys every source mirrored from that upstream —
 cached chunks orphan (their `route` changed) and ROI annotations detach from
-their `source_id`, going invisible to `roi_list` and ageing toward
+their `source_id`, going invisible to a `roi` read and ageing toward
 `prune_unseen_days`. Two corollaries:
 
 - A lone upstream with no alias keeps verbatim ids, so *adding* an alias later is

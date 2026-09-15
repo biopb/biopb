@@ -18,7 +18,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from biopb.tensor.descriptor_pb2 import (
-    DataSourceDescriptor,
     TensorDescriptor,
     TensorReadOption,
 )
@@ -282,7 +281,7 @@ def test_source_level_descriptor_binds_the_default_scene():
 # --- the wire: ListFlights lean, GetFlightInfo authoritative -----------------
 
 
-def test_list_flights_is_structural_and_get_flight_info_carries_the_grid(
+def test_the_catalog_is_structural_and_get_flight_info_carries_the_grid(
     multires_ome_zarr,
 ):
     """End to end through the server, on one source, both surfaces.
@@ -300,15 +299,18 @@ def test_list_flights_is_structural_and_get_flight_info_carries_the_grid(
     server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
     server.sources.replace({"oz": adapter})
 
-    (info,) = list(server.list_flights(None, b""))
-    listed = DataSourceDescriptor.FromString(info.descriptor.command)
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, descriptors_from_rows
+
+    (listed,) = descriptors_from_rows(
+        db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
+    )
     (entry,) = listed.tensors
     assert list(entry.shape)
     assert list(entry.chunk_shape) == []
 
     tensor_adapter = adapter.get_tensor_adapter(entry.array_id)
     plan = tensor_adapter.plan_flight_info(
-        TensorReadOption(tensor_id=entry.array_id), PyramidConfig()
+        TensorReadOption(array_id=entry.array_id), PyramidConfig()
     )
     grid = list(plan.descriptor.chunk_shape)
     assert grid == list(tensor_adapter.get_transfer_chunk_size())
@@ -316,14 +318,18 @@ def test_list_flights_is_structural_and_get_flight_info_carries_the_grid(
 
 
 def test_catalog_round_trip_never_reintroduces_a_grid(multires_ome_zarr):
-    """query_sources / list_source_descriptors answer structure, nothing more."""
+    """query_sources answers structure, nothing more."""
     adapter = OmeZarrAdapter.create_from_config(
         SourceConfig(url=multires_ome_zarr[0], type="ome-zarr", source_id="oz")
     )
     db = MetadataDatabase()
     db.sync_source_added("oz", adapter)
 
-    descriptors, _ = db.list_source_descriptors()
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, descriptors_from_rows
+
+    descriptors = descriptors_from_rows(
+        db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
+    )
     (entry,) = descriptors[0].tensors
     assert list(entry.shape)
     assert list(entry.chunk_shape) == []

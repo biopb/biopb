@@ -18,8 +18,9 @@ import json
 import pickle
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import dask
 import typer
@@ -313,9 +314,8 @@ def prune_annotations(
 ):
     """Clear annotations whose source the server has not seen in a while.
 
-    Needs nothing the server does not already expose: ``rois`` is queryable
-    through the SQL surface and ``roi_delete`` takes explicit ids, so this is
-    two ordinary client calls against a *running* server.
+    One ``roi_prune`` action against a *running* server: report first, then
+    the same predicate with ``apply``.
 
     The server's own ``annotations.prune_unseen_days`` is off by default and,
     when on, will not fire until the server has been up for the whole threshold.
@@ -331,20 +331,10 @@ def prune_annotations(
     """
     client, endpoint = _connect(server, token, cache_bytes)
     try:
-        # `days` is an int from typer, so the interval cannot carry SQL.
-        rows = client.query_sources(
-            "SELECT array_id, source_url, roi_id, label, last_seen_at FROM rois "
-            f"WHERE COALESCE(last_seen_at, created_at) < now() - INTERVAL {days} DAY "
-            "ORDER BY last_seen_at, array_id",
-            format="records",
-        )
-        if not rows:
+        report = client.prune_rois(days, apply=False)
+        if not report.unseen:
             console.print(f"[green]Nothing unseen for {days} days.[/green]")
             return
-
-        by_tensor: Dict[str, List[dict]] = {}
-        for row in rows:
-            by_tensor.setdefault(row["array_id"], []).append(row)
 
         table = Table(
             title=f"Annotations whose source has not been seen in {days} days"
@@ -353,32 +343,36 @@ def prune_annotations(
         table.add_column("Last seen", style="magenta")
         table.add_column("Image")
         table.add_column("Tensor", style="dim")
-        for array_id, group in by_tensor.items():
-            seen = group[0]["last_seen_at"]
+        total = 0
+        for group in report.unseen:
+            total += group.count
+            seen = (
+                datetime.fromtimestamp(group.last_seen_at_unix_ms / 1000).strftime(
+                    "%Y-%m-%d"
+                )
+                if group.last_seen_at_unix_ms
+                else "never"
+            )
             table.add_row(
-                str(len(group)),
-                seen.strftime("%Y-%m-%d") if seen else "never",
-                # NULL means the source was never in the catalog while these
+                str(group.count),
+                seen,
+                # Empty means the source was never in the catalog while these
                 # were written, so there is no name to give the image.
-                str(group[0]["source_url"] or "[red]unknown[/red]"),
-                array_id,
+                group.source_url or "[red]unknown[/red]",
+                group.array_id,
             )
         console.print(table)
 
         if not apply:
             console.print(
-                f"\n[yellow]{len(rows)} annotation(s) would be deleted. "
+                f"\n[yellow]{total} annotation(s) would be deleted. "
                 f"Re-run with --apply to do it.[/yellow]"
             )
             return
 
-        # By explicit id, per tensor: a re-drawn ROI gets a new id, so a delete
-        # issued from this report can only ever remove what the report listed.
-        removed = 0
-        for array_id, group in by_tensor.items():
-            removed += len(
-                client.delete_rois(array_id, [r["roi_id"] for r in group]).deleted
-            )
+        # The server deletes by the same predicate it reported on, so what
+        # was shown is what goes.
+        removed = client.prune_rois(days, apply=True).deleted
         console.print(f"[red]Deleted {removed} annotation(s).[/red]")
     except typer.Exit:
         raise

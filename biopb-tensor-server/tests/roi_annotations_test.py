@@ -17,7 +17,7 @@ import duckdb
 import pyarrow.flight as flight
 import pytest
 from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
-from biopb.image.annotation_pb2 import RoiAnnotation, RoiPutRequest
+from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core import metadata_db
 from biopb_tensor_server.core.errors import AnnotationStoreError
@@ -378,19 +378,15 @@ class TestStore:
         db.put_rois("zarr_a1b2c3/Image:1", [_annotation()])
         assert len(db.list_rois(ARRAY_ID)[0]) == 1
 
-    def test_rois_are_readable_on_the_sql_surface(self):
+    def test_rois_are_not_on_the_sql_surface(self):
+        """Annotations are private data, gated per source on the roi flight;
+        the public catalog query has no source to authorize against
+        (biopb/biopb#1010)."""
         db = MetadataDatabase()
-        db.put_rois(
-            ARRAY_ID, [_annotation(label="mitotic"), _annotation(label="mitotic")]
-        )
-        db.put_rois(ARRAY_ID, [_annotation(label="interphase")])
-
-        info = db.handle_query(
-            "SELECT label, count(*) AS n FROM rois GROUP BY label ORDER BY label"
-        )
-        ticket = info.endpoints[0].ticket.ticket.decode()
-        table = db.get_pending_result(ticket)
-        assert table.to_pydict() == {"label": ["interphase", "mitotic"], "n": [1, 2]}
+        db.put_rois(ARRAY_ID, [_annotation(label="mitotic")])
+        with pytest.raises(ValueError, match="disallowed table: rois"):
+            db.query("SELECT label FROM rois")
+        assert "rois" not in db.allowed_tables
 
     def test_a_filtered_query_is_not_reported_as_truncated(self):
         """Truncation is the server's own flag, not a difference of counts.
@@ -407,24 +403,24 @@ class TestStore:
 
         for sql in (
             "SELECT source_id FROM sources WHERE source_id = 'zarr_1'",
-            "SELECT roi_id FROM rois",
-            "SELECT roi_id FROM rois WHERE label = 'nothing-matches'",
+            "SELECT source_id FROM sources WHERE source_id = 'nothing-matches'",
+            "SELECT array_id FROM decode_rates",
         ):
-            md = db.handle_query(sql).schema.metadata
+            md = db.query(sql).schema.metadata
             assert md[b"truncated"] == b"False", sql
 
     def test_a_real_truncation_is_reported(self):
         db = MetadataDatabase(max_query_results=5)
         for i in range(12):
             _register_source(db, f"zarr_{i}", f"/data/{i}.zarr")
-        md = db.handle_query("SELECT source_id FROM sources").schema.metadata
+        md = db.query("SELECT source_id FROM sources").schema.metadata
         assert md[b"truncated"] == b"True"
         assert (md[b"total_rows"], md[b"returned_rows"]) == (b"12", b"5")
 
     def test_sql_surface_stays_read_only(self):
         db = MetadataDatabase()
         with pytest.raises(ValueError, match="forbidden keyword"):
-            db.handle_query("DELETE FROM rois")
+            db.query("DELETE FROM sources")
 
     def test_source_url_is_captured_for_a_registered_source(self, tmp_path):
         """The orphan-report anchor: array_id is a hash and cannot be inverted."""
@@ -674,7 +670,7 @@ class TestBatchAtomicity:
 
 
 class TestFlightActions:
-    """One full server -> client gRPC round-trip over the three actions."""
+    """One full server -> client gRPC round-trip over the roi flight."""
 
     def test_round_trip(self):
         from biopb.tensor import TensorFlightClient
@@ -688,7 +684,7 @@ class TestFlightActions:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            assert "roi_put" in {a.type for a in client._state.client.list_actions()}
+            assert "roi_prune" in {a.type for a in client._state.client.list_actions()}
 
             put = client.put_rois(ARRAY_ID, [_annotation(label="nucleus")])
             assert len(put.stored) == 1 and put.stored[0].rev == 1
@@ -999,7 +995,7 @@ class TestPositionalPlanePin:
         # The sidecar maps a ParseError to 422, so this is the client-facing
         # rejection: no route needs its own guard.
         with pytest.raises(json_format.ParseError):
-            json_format.ParseDict({"rois": [{"plane": {"-1": "0"}}]}, RoiPutRequest())
+            json_format.ParseDict({"plane": {"-1": "0"}}, RoiAnnotation())
 
     def test_a_negative_index_cannot_be_built_either(self):
         # Unsigned on both halves. A negative index is not harmless nonsense:
@@ -1010,7 +1006,7 @@ class TestPositionalPlanePin:
 
     def test_a_negative_index_over_the_wire_is_a_422(self):
         with pytest.raises(json_format.ParseError):
-            json_format.ParseDict({"rois": [{"plane": {"0": "-5"}}]}, RoiPutRequest())
+            json_format.ParseDict({"plane": {"0": "-5"}}, RoiAnnotation())
 
     def test_an_out_of_range_axis_is_accepted_and_simply_matches_nothing(self):
         # The write path binds no tensor, so it has no rank to check against.
@@ -1804,6 +1800,9 @@ class TestDisabledAnnotationsTouchNothing:
             db._validate_query("SELECT * FROM rois")
         db._validate_query("SELECT * FROM sources")
 
-    def test_rois_stays_queryable_when_enabled(self):
+    def test_rois_is_never_queryable(self):
+        # Enabled or not: annotations are private data on the roi flight, and
+        # a query has no source to authorize against (biopb/biopb#1010).
         db = MetadataDatabase()
-        db._validate_query("SELECT count(*) FROM rois")
+        with pytest.raises(ValueError, match="disallowed table: rois"):
+            db._validate_query("SELECT count(*) FROM rois")

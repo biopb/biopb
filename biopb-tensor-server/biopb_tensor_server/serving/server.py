@@ -3,12 +3,20 @@
 This module implements a Flight server that exposes chunked multi-dimensional
 arrays through the source/tensor adapter interface.
 
-The server supports:
-- ListFlights: Browse available tensors
-- GetFlightInfo: Get tensor metadata and chunk endpoints
-- DoGet: Fetch individual chunk data
-- DoPut: Upload data (when writable mode enabled)
-- Metadata queries: SQL queries against source catalog (via DuckDB)
+Three flights, and the dispatch is always a proto oneof (never a sentinel
+or a byte-prefix sniff):
+
+- ``catalog`` -- the public DuckDB catalog. ListFlights advertises one flight
+  per table with its schema; GetFlightInfo / DoGet take a ``CatalogQuery``.
+  Gated by the server-wide token.
+- ``data`` -- pixels. GetFlightInfo takes a ``TensorReadOption`` and plans
+  chunk endpoints; DoGet serves one ``chunk_id``; DoPut takes a
+  ``ChunkUpload`` (writable servers). Private: gated per source.
+- ``roi`` -- annotations. DoGet serves one tensor's set as ROI rows; DoPut
+  takes a ``RoiPut`` / ``RoiDelete``. Private: gated per source.
+
+Custom actions (``list_actions``) cover health, uploads, cache locate, cloud
+resolve / warm, runtime source add / remove, and annotation pruning.
 """
 
 import json
@@ -16,37 +24,42 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as flight
-from biopb.image.annotation_pb2 import (
-    RoiDeleteRequest,
-    RoiDeleteResult,
-    RoiListRequest,
-    RoiListResult,
-    RoiPutRequest,
-    RoiPutResult,
-    RoiSetInfo,
+from biopb.image._roi_rows import (
+    rois_to_table,
+    table_to_roi_ids,
+    table_to_rois,
 )
+from biopb.image.annotation_pb2 import (
+    RoiDeleteResult,
+    RoiPruneRequest,
+    RoiPruneResult,
+    RoiPutResult,
+    RoiUnseen,
+)
+from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
     AddSourceResult,
     AddSourceStreamMessage,
-    FlightCmd,
+    CatalogQuery,
+    FlightRequest,
     RemoveSourceRequest,
     RemoveSourceResult,
     ResolveProgress,
     ResolveStreamMessage,
-    TensorCriteria,
     TensorDescriptor,
     WarmProgress,
     WarmStreamMessage,
 )
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
-from google.protobuf.message import DecodeError
+from biopb.tensor.ticket_pb2 import ChunkBounds, PutCommand, TensorTicket
+from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.core.activity import ActivityTracker
@@ -71,7 +84,6 @@ from biopb_tensor_server.core.metadata_db import (
 )
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
-from biopb_tensor_server.core.writable import upload_of
 from biopb_tensor_server.serving.upload_manager import UploadManager
 
 logger = logging.getLogger(__name__)
@@ -184,7 +196,7 @@ class _AuthMiddleware(flight.ServerMiddleware):
     """Per-call middleware that carries the caller's presented Bearer token.
 
     Handlers retrieve it via ``context.get_middleware("auth")`` to enforce
-    per-source capability tokens (see ``_authorize_source``).
+    the two-tier token check (see ``TensorFlightServer._authorize``).
     """
 
     def __init__(self, token: Optional[str]) -> None:
@@ -198,16 +210,17 @@ class _AuthMiddleware(flight.ServerMiddleware):
 
 
 class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
-    """Validate the server-wide Bearer token and expose the presented token.
+    """Capture the caller's presented Bearer token for the handlers.
+
+    Deliberately decides nothing: which token a call needs depends on what it
+    is about -- the server-wide token for the public catalog, a source's own
+    capability token for its pixels and annotations -- and only the handler
+    knows that (``TensorFlightServer._authorize``). A factory that rejected
+    every non-server bearer up front would lock a capability holder out of the
+    one source it may read (biopb/biopb#1010).
 
     Header value must be exactly ``Bearer <token>`` (case-sensitive).
-    When *token* is ``None`` or empty the server-wide check is disabled (the
-    factory becomes a no-op for it), but the presented token is still captured
-    so per-source capability tokens can be enforced in the handlers.
     """
-
-    def __init__(self, token: Optional[str]) -> None:
-        self._expected = f"Bearer {token}" if token else None
 
     def start_call(
         self,
@@ -217,10 +230,17 @@ class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
         # Header values are lists; gRPC lowercases header names.
         values: List[str] = headers.get("authorization", [])
         bearer = values[0] if values else ""
-        if self._expected is not None and bearer != self._expected:
-            raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
         provided = bearer[len("Bearer ") :] if bearer.startswith("Bearer ") else None
         return _AuthMiddleware(provided)
+
+
+def _split_array_id(array_id: str) -> Tuple[str, str]:
+    """``(source_id, array_id-or-empty)`` for a request id: the slash-free
+    prefix routes, and a bare source_id leaves the tensor part empty (the
+    default-tensor request)."""
+    if "/" in array_id:
+        return array_id.split("/", 1)[0], array_id
+    return array_id, ""
 
 
 def _roi_source_id(array_id: str) -> str:
@@ -281,7 +301,6 @@ class TensorFlightServer(flight.FlightServerBase):
         write_dir: Optional[Path] = None,
         metadata_db: Optional[MetadataDatabase] = None,
         annotations_enabled: bool = True,
-        max_list_flights_results: int = 100000,
         grpc_max_message_size: Optional[int] = None,
         pyramid_config: Optional[PyramidConfig] = None,
         tls_cert_chain: Optional[bytes] = None,
@@ -292,15 +311,17 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Args:
             location: Server location (e.g., 'grpc://0.0.0.0:8815')
-            token: Bearer token required on every call.  ``None`` disables auth.
+            token: The server-wide Bearer token (the catalog tier, and the
+                fallback for every source without a capability token of its
+                own). ``None`` disables it.
             writable: Enable write mode for source creation and data upload
             write_dir: Directory for zarr-backed uploaded sources (required if writable)
-            metadata_db: MetadataDatabase instance for source filtering queries (optional)
-            annotations_enabled: Serve the ROI annotation actions. Not tied to
+            metadata_db: The catalog. ``None`` (embedded / test servers) makes
+                an in-memory one the server keeps in step with its registry.
+            annotations_enabled: Serve the ``roi`` flight. Not tied to
                 ``writable``: an annotation writes no pixels, so the token is its
                 boundary. This is the switch for a deployment that wants a
                 strictly read-only catalog.
-            max_list_flights_results: Safety cap on list_flights() returned sources
             grpc_max_message_size: gRPC max message size in bytes (default: 16MB)
             tls_cert_chain: PEM-encoded server certificate chain. When supplied
                 together with ``tls_private_key`` the server serves TLS: the
@@ -329,13 +350,23 @@ class TensorFlightServer(flight.FlightServerBase):
             location = f"{location}{separator}grpc.max_send_message_size={grpc_max_message_size}&grpc.max_receive_message_size={grpc_max_message_size}"
 
         middleware = kwargs.pop("middleware", {})
-        middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
+        middleware.setdefault("auth", BearerAuthMiddlewareFactory())
         super().__init__(location, middleware=middleware, **kwargs)
         self.sources = SourceRegistry()
         self._writable = writable
-        self._metadata_db: Optional[MetadataDatabase] = metadata_db
+        # Every server has a catalog: it is the browse surface (the `catalog`
+        # flight). A caller that brings its own (the CLI's SourceManager)
+        # syncs it itself; one the server made for itself is kept in step by
+        # register_source / swap_source / unregister_source.
+        self._owns_catalog = metadata_db is None
+        self._metadata_db: Optional[MetadataDatabase] = (
+            metadata_db if metadata_db is not None else MetadataDatabase()
+        )
         self._annotations_enabled = annotations_enabled
-        self._max_list_flights_results = max_list_flights_results
+        # The server-wide token: what the public catalog tier requires, and
+        # what a private source without a capability token of its own falls
+        # back to. None disables it (local mode).
+        self._server_token: Optional[str] = token or None
         # Authoritative resolution-pyramid knobs. Used to advertise
         # TensorDescriptor.pyramid in get_flight_info (computed levels) and shared
         # with the precache worker so the warmed scales can't drift from the
@@ -461,7 +492,9 @@ class TensorFlightServer(flight.FlightServerBase):
         non-canonical axis order on the way in (biopb/biopb#596), so a caller
         that keeps using the adapter afterwards must use the returned one.
         """
-        return self.sources.register(source_id, adapter)
+        registered = self.sources.register(source_id, adapter)
+        self._catalog_sync_added(source_id, registered)
+        return registered
 
     def swap_source(
         self, source_id: str, adapter: SourceAdapter
@@ -473,11 +506,28 @@ class TensorFlightServer(flight.FlightServerBase):
         rebuilt against the current bytes. The displaced adapter is left open
         for the caller to close once in-flight reads have drained.
         """
-        return self.sources.swap(source_id, adapter)
+        registered, displaced = self.sources.swap(source_id, adapter)
+        self._catalog_sync_added(source_id, registered)
+        return registered, displaced
+
+    def _catalog_sync_added(self, source_id: str, adapter: SourceAdapter) -> None:
+        """Keep a server-owned catalog in step with the registry (best-effort:
+        a catalog write must not fail a registration)."""
+        if not self._owns_catalog:
+            return
+        try:
+            self._metadata_db.sync_source_added(source_id, adapter)
+        except Exception as e:  # noqa: BLE001 -- catalog is advisory here
+            logger.warning(f"catalog sync failed for {source_id}: {e}")
 
     def unregister_source(self, source_id: str) -> None:
         """Unregister a data source (its upload state, if any, goes with it)."""
         self.sources.unregister(source_id)
+        if self._owns_catalog:
+            try:
+                self._metadata_db.sync_source_removed(source_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"catalog sync failed for {source_id}: {e}")
 
     def shutdown(self) -> None:
         """Release source-adapter resources, then shut down the Flight server.
@@ -490,39 +540,65 @@ class TensorFlightServer(flight.FlightServerBase):
         self.sources.close_all()
         super().shutdown()
 
-    def _authorize_source(
-        self, context: flight.ServerCallContext, source_id: str
+    def _presented_token(self, context: flight.ServerCallContext) -> Optional[str]:
+        # In-process callers (tests, the embedded runtime) pass no context.
+        mw = context.get_middleware("auth") if context is not None else None
+        return getattr(mw, "token", None) if mw is not None else None
+
+    def _authorize(
+        self, context: flight.ServerCallContext, source_id: Optional[str] = None
     ) -> None:
-        """Enforce a per-source capability token when the source carries one.
+        """The two-tier token check every handler runs first.
 
-        Sources created with a ``token`` attribute (e.g. embedded result caches)
-        are readable only by callers presenting the matching Bearer token. This
-        binds the result to the requester that received its ``SerializedTensor``,
-        without relying on the server-wide token.
+        - **Catalog tier** (``source_id`` None): the public surface -- the
+          catalog flights and SQL, health, cache stats, uploads, runtime
+          source add / remove, pruning. Requires the server-wide token when one
+          is configured; open otherwise (local mode).
+        - **Private tier** (a ``source_id``): pixels and annotations of one
+          source. A source carrying a capability token (an embedded result
+          cache) is readable by that token alone, whatever the server-wide
+          token is; any other source falls back to the catalog tier's rule.
 
-        Sources without a token fall back to the server-wide auth performed by
-        ``BearerAuthMiddlewareFactory``, so this is backward compatible with the
-        standalone tensor server.
+        A private source may still be *catalogued* -- knowing a source_id is
+        allowed, reading its pixels and annotations is what the token gates.
         """
-        adapter = self.sources.get(source_id)
-        expected = adapter.capability_token if adapter is not None else None
-        if not expected:
-            return
-        mw = context.get_middleware("auth")
-        provided = getattr(mw, "token", None) if mw is not None else None
-        if provided != expected:
-            raise flight.FlightUnauthenticatedError("Invalid or missing source token")
+        provided = self._presented_token(context)
+        if source_id is not None:
+            adapter = self.sources.get(source_id)
+            expected = adapter.capability_token if adapter is not None else None
+            if expected:
+                if provided != expected:
+                    raise flight.FlightUnauthenticatedError(
+                        "Invalid or missing source token"
+                    )
+                return
+        if self._server_token is not None and provided != self._server_token:
+            raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
+
+    @staticmethod
+    def _parse(msg: Message, data: bytes, what: str) -> Message:
+        """Decode a wire message, or refuse the call with the reason.
+
+        The oneof arm is the dispatch, so a payload that decodes but sets no
+        arm is refused here too -- that is what a protocol-1 client's request
+        or bare ticket looks like, and the message says so.
+        """
+        try:
+            msg.ParseFromString(data)
+        except DecodeError as exc:
+            raise flight.FlightServerError(
+                f"{what} is not a {type(msg).__name__}: {exc}"
+            )
+        if not msg.ListFields():
+            raise flight.FlightServerError(
+                f"{what} names nothing: expected a {type(msg).__name__} with one arm "
+                f"set (this server speaks Flight protocol v{FLIGHT_PROTOCOL_VERSION})"
+            )
+        return msg
 
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
-        """Parse a TensorTicket from a Flight Ticket.
-
-        Args:
-            ticket: Flight ticket with ticket bytes
-
-        Returns:
-            Parsed TensorTicket
-        """
-        return TensorTicket.FromString(ticket.ticket)
+        """Parse a TensorTicket from a Flight Ticket."""
+        return self._parse(TensorTicket(), ticket.ticket, "ticket")
 
     def _encode_metadata(self, bounds: ChunkBounds) -> bytes:
         """Encode ChunkBounds to bytes for app_metadata.
@@ -554,6 +630,37 @@ class TensorFlightServer(flight.FlightServerBase):
         if not tensor_id or tensor_id == source_id:
             return None
         return strip_source_prefix(source_id, tensor_id)
+
+    def _catalog_flight_info(self, query: CatalogQuery) -> flight.FlightInfo:
+        """Schema-first answer for a catalog query: the result's schema and a
+        ticket carrying the SQL itself, so nothing is parked server-side
+        between this call and the DoGet."""
+        if self._metadata_db is None:
+            # The CLI always attaches a metadata DB (mandatory,
+            # biopb/biopb#225); reaching here means this server was
+            # constructed without one (an embedded/test instance).
+            raise flight.FlightServerError(
+                "This server has no metadata database attached, so SQL "
+                "queries are unavailable."
+            )
+        try:
+            schema = self._metadata_db.query_schema(query.sql)
+        except ValueError as e:
+            raise flight.FlightServerError(f"Catalog query failed: {e}") from e
+        ticket = TensorTicket(catalog_query=query)
+        return flight.FlightInfo(
+            schema=schema,
+            descriptor=flight.FlightDescriptor.for_command(
+                FlightRequest(catalog_query=query).SerializeToString()
+            ),
+            endpoints=[
+                flight.FlightEndpoint(
+                    ticket=flight.Ticket(ticket.SerializeToString()), locations=[]
+                )
+            ],
+            total_records=-1,
+            total_bytes=-1,
+        )
 
     def _get_adapter_for_tensor(
         self, source_id: str, tensor_id: str
@@ -643,22 +750,13 @@ class TensorFlightServer(flight.FlightServerBase):
             )
         return adapter
 
-    def _handle_roi_action(
-        self, action_type: str, body: bytes, context: flight.ServerCallContext
-    ) -> bytes:
-        """Serve one of the three annotation actions.
+    def _require_annotations(self) -> MetadataDatabase:
+        """The store behind the ``roi`` flight, or the refusal.
 
-        DoAction rather than DoGet/DoPut on purpose (docs/roi-annotations.md):
-        an ROI read is a bounded whole-set fetch, not the unbounded query that
-        earns ``__metadata_query__`` its ticket and Arrow stream, and a write is
-        a small structured command with a structured reply -- DoPut's only
-        response channel is a single app-metadata blob, and it is gated on
-        ``--writable``, which annotations deliberately are not (they write no
-        pixels; the token is the boundary).
+        Unavailable vs. ServerError is load-bearing for the HTTP sidecar: it
+        maps the former to 501 (this server does not offer the feature) and the
+        latter to 422 (your request was rejected).
         """
-        # Unavailable vs. ServerError is load-bearing for the HTTP sidecar: it
-        # maps the former to 501 (this server does not offer the feature) and the
-        # latter to 422 (your request was rejected).
         if self._metadata_db is None:
             raise flight.FlightUnavailableError(
                 "This server has no metadata database attached, so ROI "
@@ -668,55 +766,40 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightUnavailableError(
                 "ROI annotations are disabled on this server"
             )
+        return self._metadata_db
 
-        try:
-            if action_type == "roi_list":
-                req = RoiListRequest.FromString(body)
-                self._authorize_source(context, _roi_source_id(req.array_id))
-                rois, truncated = self._metadata_db.list_rois(
-                    req.array_id, req.set_name
-                )
-                sets = [
-                    RoiSetInfo(
-                        set_name=name, count=count, reserved=is_reserved_set(name)
-                    )
-                    for name, count in self._metadata_db.list_roi_sets(req.array_id)
-                ]
-                return RoiListResult(
-                    rois=rois, truncated=truncated, sets=sets
-                ).SerializeToString()
+    def _handle_roi_prune(self, req: RoiPruneRequest) -> bytes:
+        """Report, and with ``apply`` delete, annotations whose source is gone.
 
-            if action_type == "roi_put":
-                req = RoiPutRequest.FromString(body)
-                self._authorize_source(context, _roi_source_id(req.array_id))
-                stored, conflicts = self._metadata_db.put_rois(
-                    req.array_id, list(req.rois), check_rev=req.check_rev
-                )
-                return RoiPutResult(
-                    stored=stored, conflicts=conflicts
-                ).SerializeToString()
-
-            req = RoiDeleteRequest.FromString(body)
-            self._authorize_source(context, _roi_source_id(req.array_id))
-            deleted = self._metadata_db.delete_rois(
-                req.array_id, req.roi_ids, req.set_name
+        Orphans have no live source to authorize against, which is why this is
+        a catalog-tier action rather than a ``roi`` flight verb. The report
+        and the delete share the store's one predicate, so what was shown is
+        what goes.
+        """
+        db = self._require_annotations()
+        if req.unseen_days <= 0:
+            raise flight.FlightServerError("roi_prune: unseen_days must be positive")
+        before = datetime.now(timezone.utc) - timedelta(days=req.unseen_days)
+        unseen = [
+            RoiUnseen(
+                array_id=u.array_id,
+                source_url=u.source_url or "",
+                count=u.count,
+                last_seen_at_unix_ms=(
+                    int(u.last_seen_at.timestamp() * 1000) if u.last_seen_at else 0
+                ),
             )
-            return RoiDeleteResult(deleted=deleted).SerializeToString()
-        except ValueError as e:
-            # Rejected geometry, a mismatched array_id, a breached cap: all are
-            # the caller's problem, so surface the reason instead of a bare
-            # internal error.
-            raise flight.FlightServerError(str(e))
+            for u in db.unseen_rois(before)
+        ]
+        deleted = db.prune_unseen(before) if req.apply and unseen else 0
+        return RoiPruneResult(unseen=unseen, deleted=deleted).SerializeToString()
 
     def list_actions(
         self,
         context: flight.ServerCallContext,
     ) -> List[flight.ActionType]:
-        """List available actions on this server.
-
-        Returns:
-            List of ActionType objects describing available actions.
-        """
+        """List available actions on this server."""
+        self._authorize(context)
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType(
@@ -742,9 +825,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "remove_source",
                 "Deregister a drag-dropped (dnd://) source branch at runtime",
             ),
-            flight.ActionType("roi_list", "List a tensor's ROI annotations"),
-            flight.ActionType("roi_put", "Create or update ROI annotations"),
-            flight.ActionType("roi_delete", "Delete ROI annotations"),
+            flight.ActionType(
+                "roi_prune",
+                "Report (or with apply, delete) annotations whose source is gone",
+            ),
         ]
 
     def do_action(
@@ -761,6 +845,11 @@ class TensorFlightServer(flight.FlightServerBase):
         Yields:
             Result bytes (JSON-encoded for health action)
         """
+        if action.type in ("chunk_locate", "resolve", "warm"):
+            pass  # private tier: authorized below, once the source is known
+        else:
+            self._authorize(context)
+
         if action.type == "health":
             uptime_seconds = int(time.time() - self._start_time)
             with self._scan_status_lock:
@@ -768,6 +857,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 last_full_scan_at = self._last_full_scan_at
             health_status = {
                 "status": "SERVING" if self._ready.is_set() else "STARTING",
+                # The Flight protocol shape this server speaks; the SDK checks
+                # it before its first call. A server without the key is v1.
+                "protocol": FLIGHT_PROTOCOL_VERSION,
                 "source_count": len(self.sources),
                 "metadata_db_enabled": self._metadata_db is not None,
                 "writable": self._writable,
@@ -810,8 +902,10 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "chunk_locate":
             ticket_bytes = action.body.to_pybytes()
             ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
+            if ticket.WhichOneof("payload") != "chunk_id":
+                raise flight.FlightServerError("chunk_locate takes a chunk ticket")
             source_id = routing_array_id(ticket.chunk_id).split("/")[0]
-            self._authorize_source(context, source_id)
+            self._authorize(context, source_id)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
             from dataclasses import asdict
@@ -823,11 +917,11 @@ class TensorFlightServer(flight.FlightServerBase):
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
         elif action.type == "resolve":
             source_id = action.body.to_pybytes().decode("utf-8")
-            self._authorize_source(context, source_id)
+            self._authorize(context, source_id)
             yield from self._handle_resolve(source_id)
         elif action.type == "warm":
             source_id = action.body.to_pybytes().decode("utf-8")
-            self._authorize_source(context, source_id)
+            self._authorize(context, source_id)
             yield from self._handle_warm(source_id, context)
         elif action.type == "add_source":
             req = AddSourceRequest.FromString(action.body.to_pybytes())
@@ -835,10 +929,9 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "remove_source":
             req = RemoveSourceRequest.FromString(action.body.to_pybytes())
             yield self._handle_remove_source(req)
-        elif action.type in ("roi_list", "roi_put", "roi_delete"):
-            yield self._handle_roi_action(
-                action.type, action.body.to_pybytes(), context
-            )
+        elif action.type == "roi_prune":
+            req = RoiPruneRequest.FromString(action.body.to_pybytes())
+            yield self._handle_roi_prune(req)
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -1168,279 +1261,79 @@ class TensorFlightServer(flight.FlightServerBase):
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes
     ) -> Iterator[flight.FlightInfo]:
-        """List all available data sources.
+        """Advertise the public catalog: one flight per queryable table.
 
-        Each flight represents a data source (which may contain multiple tensors).
-
-        Results are capped at `max_list_flights_results` for safety. Truncation
-        is signaled via schema metadata on all returned FlightInfos.
-
-        Served from the DuckDB catalog when a metadata DB is present, so the
-        browse surface cannot drift from ``query_sources`` (biopb/biopb#265); an
-        embedded/test server built without a DB (``metadata_db=None``) falls back
-        to iterating adapters.
-
-        A ``TensorCriteria`` naming a ``source_id`` narrows this to that one
-        source. That is addressing, not browsing: it asks the catalog a WHERE
-        instead of reading it whole so the caller can discard all but one row,
-        and it widens nothing -- a source this listing would not show is still
-        not shown, on either path.
-
-        Args:
-            context: Server call context
-            criteria: serialized ``TensorCriteria``; empty = no filter, which is
-                what every client before the field sent.
-
-        Yields:
-            FlightInfo for each registered data source (up to max_list_flights_results)
+        Each carries the table's real Arrow schema and one endpoint whose
+        ticket is ``SELECT * FROM <table>``, so a stock Flight client can list,
+        see the columns, and DoGet the whole catalog without a biopb proto.
+        Browsing *sources* is a catalog query too (the SDK's ``list_sources``);
+        the pixels and annotations of one source are not listable, they are
+        addressed. A server without a catalog advertises nothing.
         """
-        source_id = self._criteria_source_id(criteria)
-        if self._metadata_db is not None:
-            yield from self._list_flights_from_catalog(source_id)
-        else:
-            yield from self._list_flights_from_adapters(source_id)
-
-    @staticmethod
-    def _criteria_source_id(criteria: bytes) -> Optional[str]:
-        """The one source ``criteria`` asks for, or None for the whole listing.
-
-        Unparseable criteria is refused rather than ignored: silently dropping a
-        filter answers a request for one source with the entire catalog, which
-        is the opposite of what was asked and looks like a working call.
-        """
-        if not criteria:
-            return None
-        try:
-            parsed = TensorCriteria.FromString(criteria)
-        except DecodeError as exc:
-            raise flight.FlightServerError(
-                f"ListFlights criteria is not a TensorCriteria: {exc}"
-            ) from exc
-        return parsed.source_id or None
-
-    def _list_flights_from_catalog(
-        self, source_id: Optional[str] = None
-    ) -> Iterator[flight.FlightInfo]:
-        """Build ListFlights results from the DuckDB catalog (the default path).
-
-        One SQL read replaces the per-adapter ``get_source_descriptor()`` calls.
-        Token-protected sources never appear here: the only ones that exist live
-        in the embedded image-base server, which runs with ``metadata_db=None``
-        and therefore takes the adapter fallback instead -- so the DuckDB path
-        has no tokened source to leak (biopb/biopb#265).
-
-        ``source_id`` narrows the SQL to one row. It reaches a source the
-        unfiltered read would have clipped at the cap, which is the point: the
-        cap bounds a *browse*, and an addressed lookup was never the thing it
-        was protecting against.
-        """
-        max_sources = self._max_list_flights_results
-        descriptors, total_sources = self._metadata_db.list_source_descriptors(
-            limit=max_sources, source_id=source_id
-        )
-        returned_count = len(descriptors)
-        truncated = total_sources > returned_count
-
-        if truncated:
-            logger.warning(
-                f"list_flights truncated: returning {returned_count} of {total_sources} sources"
-            )
-
-        base_metadata = {
-            b"total_sources": str(total_sources).encode(),
-            b"max_sources": str(max_sources).encode(),
-            b"returned_sources": str(returned_count).encode(),
-            b"truncated": str(truncated).encode(),
-        }
-
-        for source_desc in descriptors:
-            schema = pa.schema([], metadata=base_metadata)
-            flight_descriptor = flight.FlightDescriptor.for_command(
-                source_desc.SerializeToString()
-            )
-            endpoint = flight.FlightEndpoint(
-                ticket=flight.Ticket(b""),  # Empty ticket for listing
-                locations=[],
-            )
+        self._authorize(context)
+        if self._metadata_db is None:
+            return
+        for table in sorted(self._metadata_db.allowed_tables):
+            sql = f"SELECT * FROM {table}"
+            ticket = TensorTicket(catalog_query=CatalogQuery(sql=sql))
             yield flight.FlightInfo(
-                schema=schema,
-                descriptor=flight_descriptor,
-                endpoints=[endpoint],
+                schema=self._metadata_db.table_schema(table),
+                descriptor=flight.FlightDescriptor.for_path(table),
+                endpoints=[
+                    flight.FlightEndpoint(
+                        ticket=flight.Ticket(ticket.SerializeToString()),
+                        locations=[],
+                    )
+                ],
                 total_records=-1,
                 total_bytes=-1,
-            )
-
-    def _list_flights_from_adapters(
-        self, source_id: Optional[str] = None
-    ) -> Iterator[flight.FlightInfo]:
-        """List sources by iterating adapters (fallback when no metadata DB).
-
-        Used by embedded/test servers built with ``metadata_db=None`` (e.g. the
-        image-base result-cache server). Honors per-source capability tokens by
-        skipping token-protected sources from enumeration.
-
-        ``source_id`` narrows the lookup to that one entry *before* the token
-        check, never around it: this is the path where tokened sources actually
-        live, and naming one must not be a way to read what enumerating it
-        would refuse.
-        """
-        if source_id is not None:
-            adapter = self.sources.get(source_id)
-            source_items = [(source_id, adapter)] if adapter is not None else []
-        else:
-            source_items = self.sources.snapshot()
-        total_sources = len(source_items)
-        max_sources = self._max_list_flights_results
-        returned_count = min(total_sources, max_sources)
-        truncated = total_sources > max_sources
-
-        if truncated:
-            logger.warning(
-                f"list_flights truncated: returning {max_sources} of {total_sources} sources"
-            )
-
-        # Build base schema metadata for truncation signaling
-        base_metadata = {
-            b"total_sources": str(total_sources).encode(),
-            b"max_sources": str(max_sources).encode(),
-            b"returned_sources": str(returned_count).encode(),
-            b"truncated": str(truncated).encode(),
-        }
-
-        count = 0
-        skipped = 0
-        for item_id, adapter in source_items:
-            if count >= max_sources:
-                break
-
-            # Token-protected sources (per-source capabilities) are not
-            # enumerable: knowing the source_id must not be enough to list them.
-            if adapter.capability_token:
-                continue
-
-            # A discarded upload is registered only as a tombstone, for the
-            # writer still unwinding onto it; it is not a source to offer.
-            upload = upload_of(adapter)
-            if upload is not None and upload.is_discarded:
-                continue
-
-            # Building a source's descriptor can fail (e.g. an aicsimageio
-            # source whose scene-switching fallback raises). A single bad source
-            # must not abort the whole listing, so skip it and continue — the
-            # FlightInfo is built fully inside the try and only yielded on
-            # success, so a partial flight is never emitted.
-            try:
-                source_desc = adapter.get_source_descriptor()
-
-                # Build schema with truncation metadata
-                schema = pa.schema([], metadata=base_metadata)
-
-                # Create a FlightDescriptor for this source
-                flight_descriptor = flight.FlightDescriptor.for_command(
-                    source_desc.SerializeToString()
-                )
-
-                # Create a single endpoint for listing (no specific tensor selected)
-                endpoint = flight.FlightEndpoint(
-                    ticket=flight.Ticket(b""),  # Empty ticket for listing
-                    locations=[],
-                )
-
-                info = flight.FlightInfo(
-                    schema=schema,
-                    descriptor=flight_descriptor,
-                    endpoints=[endpoint],
-                    total_records=-1,
-                    total_bytes=-1,
-                )
-            except Exception as e:
-                logger.exception(
-                    f"list_flights: skipping source {item_id} due to "
-                    f"descriptor build failure: {e}",
-                )
-                skipped += 1
-                continue
-
-            yield info
-            count += 1
-
-        if skipped:
-            logger.warning(
-                f"list_flights: skipped {skipped} source(s) that failed to build descriptors"
             )
 
     def get_flight_info(
         self, context: flight.ServerCallContext, descriptor: flight.FlightDescriptor
     ) -> flight.FlightInfo:
-        """Get metadata and chunk endpoints for a tensor.
+        """Plan a read: the request's oneof arm says of what.
 
-        Args:
-            context: Server call context
-            descriptor: Flight descriptor with FlightCmd
-
-        Returns:
-            FlightInfo with schema and chunk endpoints
+        A ``catalog_query`` answers with the result's schema and a ticket
+        carrying the same SQL (public tier). A ``tensor_read`` binds one
+        tensor and plans its chunk endpoints (private tier, authorized on the
+        tensor's source). A path descriptor names a catalog table.
         """
         import json
 
-        cmd = FlightCmd.FromString(descriptor.command)
-
-        # Dispatch based on source_id
-        if cmd.source_id == "__metadata_query__":
-            # Metadata SQL query branch
-            if cmd.HasField("metadata_query"):
-                sql = cmd.metadata_query.sql
-                logger.debug(f"get_flight_info: metadata_query sql={sql[:100]}...")
-                if self._metadata_db is None:
-                    # The CLI always attaches a metadata DB (mandatory,
-                    # biopb/biopb#225); reaching here means this server was
-                    # constructed without one (an embedded/test instance).
-                    raise flight.FlightServerError(
-                        "This server has no metadata database attached, so SQL "
-                        "queries are unavailable."
-                    )
-                try:
-                    return self._metadata_db.handle_query(sql)
-                except ValueError as e:
-                    # Query validation or execution failure
-                    raise flight.FlightInternalError(
-                        f"Metadata query failed: {e}"
-                    ) from e
-            else:
-                raise flight.FlightServerError(
-                    "Metadata query source_id but no MetadataQueryOption"
-                )
-
-        # Tensor read branch
-        if not cmd.HasField("tensor_read"):
-            raise flight.FlightServerError(
-                f"Tensor read source_id '{cmd.source_id}' but no TensorReadOption"
+        if descriptor.descriptor_type == flight.DescriptorType.PATH:
+            self._authorize(context)
+            table = "/".join(
+                part.decode() if isinstance(part, bytes) else part
+                for part in descriptor.path
             )
+            return self._catalog_flight_info(CatalogQuery(sql=f"SELECT * FROM {table}"))
 
-        read_opt = cmd.tensor_read
-        source_id = cmd.source_id
-        tensor_id = read_opt.tensor_id
+        req = self._parse(FlightRequest(), descriptor.command, "GetFlightInfo command")
+        if req.WhichOneof("request") == "catalog_query":
+            self._authorize(context)
+            return self._catalog_flight_info(req.catalog_query)
 
-        self._authorize_source(context, source_id)
+        read_opt = req.tensor_read
+        source_id, tensor_id = _split_array_id(read_opt.array_id)
+        if not source_id:
+            raise flight.FlightServerError("tensor_read: array_id is required")
 
-        # Reduce the request tensor_id to the within-source field -- or None =
+        self._authorize(context, source_id)
+
+        # Reduce the request array_id to the within-source field -- or None =
         # "the source's default (first) tensor" (identity policy: array_id is
-        # source_id or source_id/field). Both a falsy tensor_id (proto3 default
-        # "") and a bare source_id reduce to None. The wire descriptor still
-        # reports the full array_id, carried by get_tensor_descriptor().
+        # source_id or source_id/field). The wire descriptor still reports the
+        # full array_id, carried by get_tensor_descriptor().
         field = self._field_within_source(source_id, tensor_id)
 
         # Substitute the source's default (first) tensor for every no-field
-        # request -- empty tensor_id *and* a bare source_id, both -> field None
-        # (#44). get_flight_info / get_source / get_physical_scale are documented
-        # to accept no tensor_id; forwarding None to a multi-tensor adapter's
-        # get_tensor_adapter would otherwise select a bogus field (a bioio scene
-        # lookup on None, OME-Zarr HCS field parsing crashing on None.split), so
-        # honor the documented default in this one chokepoint rather than at every
-        # adapter call site. The first descriptor's array_id is the same default
-        # the client's own get_tensor path resolves to; re-reducing it yields the
-        # sole tensor's field (None for a single-tensor source, whose array_id ==
-        # source_id, so the base still returns self).
+        # request (#44). get_flight_info / get_source / get_physical_scale are
+        # documented to accept a bare source_id; forwarding None to a
+        # multi-tensor adapter's get_tensor_adapter would otherwise select a
+        # bogus field (a bioio scene lookup on None, OME-Zarr HCS field parsing
+        # crashing on None.split), so honor the documented default in this one
+        # chokepoint rather than at every adapter call site.
         if field is None:
             default_adapter = self.sources.get(source_id)
             if default_adapter is not None:
@@ -1582,39 +1475,34 @@ class TensorFlightServer(flight.FlightServerBase):
     def do_get(
         self, context: flight.ServerCallContext, ticket: flight.Ticket
     ) -> flight.FlightDataStream:
-        """Fetch a chunk's data or metadata query result.
+        """Serve what the ticket's oneof arm names: a catalog query result,
+        one tensor's annotation set, or one pixel chunk."""
+        tensor_ticket = self._parse_ticket(ticket)
+        arm = tensor_ticket.WhichOneof("payload")
 
-        Args:
-            context: Server call context
-            ticket: Flight ticket with TensorTicket or metadata query ID
-
-        Returns:
-            FlightDataStream with the chunk data or query result
-        """
-        # Check for metadata query result by checking the ticket prefix
-        ticket_bytes = ticket.ticket
-        metadata_prefix = b"metadata-query-"
-        if ticket_bytes.startswith(metadata_prefix):
-            ticket_id = ticket_bytes.decode()
-            logger.debug(f"do_get: metadata query result ticket={ticket_id}")
+        if arm == "catalog_query":
+            self._authorize(context)
             if self._metadata_db is None:
-                raise flight.FlightInternalError("Metadata database not enabled")
-            result = self._metadata_db.get_pending_result(ticket_id)
-            if result is None:
-                # Internal error: pending result should exist if ticket was valid
-                raise flight.FlightInternalError(
-                    f"Metadata query result not found: {ticket_id}"
+                raise flight.FlightServerError(
+                    "This server has no metadata database attached, so SQL "
+                    "queries are unavailable."
                 )
-            return flight.RecordBatchStream(result)
+            try:
+                table = self._metadata_db.query(tensor_ticket.catalog_query.sql)
+            except ValueError as e:
+                raise flight.FlightServerError(f"Catalog query failed: {e}") from e
+            return flight.RecordBatchStream(table)
+
+        if arm == "roi_read":
+            return self._roi_read_stream(context, tensor_ticket.roi_read)
 
         # Heavy chunk-read path: track it as in-flight so the background
         # precache worker stays idle while real reads are happening.
         with self.activity.serving_request():
-            tensor_ticket = self._parse_ticket(ticket)
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
             source_id = routing_array_id(tensor_ticket.chunk_id).split("/")[0]
-            self._authorize_source(context, source_id)
+            self._authorize(context, source_id)
 
             adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
 
@@ -1647,6 +1535,30 @@ class TensorFlightServer(flight.FlightServerBase):
                 record_batch.schema, [record_batch]
             )
             return flight.RecordBatchStream(reader)
+
+    def _roi_read_stream(
+        self, context: flight.ServerCallContext, req
+    ) -> flight.FlightDataStream:
+        """One tensor's annotations as ROI rows; ``truncated`` and the tensor's
+        ``sets`` (JSON) ride the stream's schema metadata."""
+        db = self._require_annotations()
+        try:
+            self._authorize(context, _roi_source_id(req.array_id))
+            rois, truncated = db.list_rois(req.array_id, req.set_name)
+            sets = [
+                {"set_name": name, "count": count, "reserved": is_reserved_set(name)}
+                for name, count in db.list_roi_sets(req.array_id)
+            ]
+        except ValueError as e:
+            raise flight.FlightServerError(str(e))
+        table = rois_to_table(
+            rois,
+            {
+                b"truncated": str(truncated).encode(),
+                b"sets": json.dumps(sets).encode(),
+            },
+        )
+        return flight.RecordBatchStream(table)
 
     def _handle_chunk_locate(self, chunk_id: bytes) -> str:
         """Locate a cached chunk on disk for the localhost cache-file handoff.
@@ -1736,54 +1648,40 @@ class TensorFlightServer(flight.FlightServerBase):
         reader: flight.MetadataRecordBatchReader,
         writer: flight.FlightMetadataWriter,
     ) -> None:
-        """Handle source creation and chunk upload.
+        """Take what the command's oneof arm names: a pixel chunk, or an
+        annotation put / delete. Each arm gates itself: pixels need a writable
+        server, annotations need the store; both authorize on the source."""
+        cmd = self._parse(PutCommand(), descriptor.command, "DoPut command")
+        arm = cmd.WhichOneof("command")
 
-        Args:
-            context: Server call context
-            descriptor: Flight descriptor with command bytes
-            reader: Flight data stream reader
-            writer: Flight metadata writer for responses
-
-        Raises:
-            FlightUnauthenticatedError: If server not in write mode
-            FlightServerError: If source/chunk creation fails
-        """
-        if not self._writable:
-            raise flight.FlightUnauthenticatedError("Server not in write mode")
-
-        command = descriptor.command
-
-        # Discriminate the command *first*, then run the handler outside the
-        # discriminating try. Both TensorDescriptor and ChunkUpload are lenient
-        # protobufs (parse rarely raises), so the real discriminator is the
-        # shape/dtype check -- a populated shape+dtype means a source creation,
-        # anything else is a chunk upload. Deciding the branch before
-        # invoking the handler keeps a genuine create/write failure (bad prefix,
-        # missing write_dir, malformed metadata_json) surfacing as itself instead
-        # of being swallowed and mis-reported as "Invalid upload command"
-        # (biopb/biopb#354).
-        req_desc: Optional[TensorDescriptor] = None
-        try:
-            candidate = TensorDescriptor.FromString(command)
-            if candidate.shape and candidate.dtype:
-                req_desc = candidate
-        except Exception:
-            req_desc = None
-
-        if req_desc is not None:
-            # Source creation -- handler runs outside the try, so its errors propagate.
-            writer.write(self.uploads.create_source(req_desc).SerializeToString())
+        if arm == "chunk":
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+            self._authorize(context, cmd.chunk.source_id)
+            self.uploads.write_chunk(cmd.chunk, reader)
             return
 
-        # Chunk upload. Only the *parse* is guarded here (a command that is
-        # neither a source descriptor nor a decodable ChunkUpload is genuinely
-        # malformed); write_chunk runs outside so its own FlightServerError
-        # translation is preserved verbatim.
+        db = self._require_annotations()
         try:
-            upload = ChunkUpload.FromString(command)
-        except Exception as e:
-            raise flight.FlightServerError(f"Invalid upload command: {e}")
-        self.uploads.write_chunk(upload, reader)
+            if arm == "roi_put":
+                self._authorize(context, _roi_source_id(cmd.roi_put.array_id))
+                rois = table_to_rois(reader.read_all())
+                stored, conflicts = db.put_rois(
+                    cmd.roi_put.array_id, rois, check_rev=cmd.roi_put.check_rev
+                )
+                reply = RoiPutResult(stored=stored, conflicts=conflicts)
+            else:
+                self._authorize(context, _roi_source_id(cmd.roi_delete.array_id))
+                roi_ids = table_to_roi_ids(reader.read_all())
+                deleted = db.delete_rois(
+                    cmd.roi_delete.array_id, roi_ids, cmd.roi_delete.set_name
+                )
+                reply = RoiDeleteResult(deleted=deleted)
+        except ValueError as e:
+            # Rejected geometry, a mismatched array_id, a breached cap, a stream
+            # not in the row schema: the caller's problem, so say which.
+            raise flight.FlightServerError(str(e))
+        writer.write(reply.SerializeToString())
 
 
 def serve(

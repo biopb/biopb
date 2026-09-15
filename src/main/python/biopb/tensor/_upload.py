@@ -27,7 +27,7 @@ from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, PutCommand
 
 if TYPE_CHECKING:  # import-time cycle-free; _session never imports this module
     from biopb.tensor._session import _ClientState
@@ -48,8 +48,8 @@ def _put_chunk(
     :meth:`UploadSession.upload_chunk` and a target that has been unpickled in a
     dask worker with no session to hand.
     """
-    upload = ChunkUpload(source_id=source_id, bounds=bounds)
-    desc = flight.FlightDescriptor.for_command(upload.SerializeToString())
+    cmd = PutCommand(chunk=ChunkUpload(source_id=source_id, bounds=bounds))
+    desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     schema = pa.schema([pa.field("data", pa.from_numpy_dtype(data.dtype))])
 
     writer, reader = client.do_put(desc, schema, options=call_options)

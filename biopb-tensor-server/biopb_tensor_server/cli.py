@@ -916,7 +916,6 @@ def _setup_flight_server(
     console.print(
         "[green]Metadata database initialized:[/green] "
         f"max_query_results={server_config.metadata_db.max_query_results}, "
-        f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
         f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}, "
         f"catalog={metadata_db.store_path or 'in-memory (not persisted)'}"
     )
@@ -931,7 +930,6 @@ def _setup_flight_server(
         write_dir=write_dir,
         metadata_db=metadata_db,
         annotations_enabled=server_config.annotations.enabled,
-        max_list_flights_results=server_config.metadata_db.max_list_flights_results,
         grpc_max_message_size=80 * 1024 * 1024,
         pyramid_config=server_config.pyramid,
         tls_cert_chain=tls_cert_chain,
@@ -1445,9 +1443,8 @@ def prune_annotations(
     """Report, and optionally delete, annotations whose image is gone.
 
     The offline counterpart to ``biopb tensor prune-annotations``, which does
-    the same job against a *running* server with two ordinary client calls
-    (``rois`` is queryable through the SQL surface and ``roi_delete`` takes
-    explicit ids). Prefer that one; this is for when there is no server to dial.
+    the same job against a *running* server through the ``roi_prune`` action.
+    Prefer that one; this is for when there is no server to dial.
 
     **The server must be stopped.** DuckDB takes an exclusive lock on the
     catalog for readers as well as writers, so nothing can read the file while

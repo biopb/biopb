@@ -60,7 +60,7 @@ nothing in the design still argues for DuckDB over a plain dict. Row-per-ROI is
 what makes the premise pay off — `WHERE label = 'mitotic'`, per-field object
 counts, a bbox overlap, a join against `sources` — and at the cap here the row
 count is trivial. What set-per-row wins is atomicity of a whole layer; row-per-ROI
-gets that back from `set_name` plus a batched `roi_put` applied in one real
+gets that back from `set_name` plus a batched put applied in one real
 transaction (see below — the write lock alone does not provide that). Per-set attributes (display colour, visibility) have no table yet on
 purpose — they are client display state today, and a `roi_sets` table is additive
 if they ever need to be shared.
@@ -392,20 +392,22 @@ message RoiAnnotation {
   int64 updated_at_unix_ms = 11;
 }
 
-message RoiPutRequest  { string array_id = 1; repeated RoiAnnotation rois = 2; bool check_rev = 3; }
 message RoiConflict    { string roi_id = 1; int64 stored_rev = 2; }
 message RoiPutResult   { repeated RoiAnnotation stored = 1; repeated RoiConflict conflicts = 2; }
-message RoiDeleteRequest { string array_id = 1; repeated string roi_ids = 2; string set_name = 3; }
 message RoiDeleteResult  { repeated string deleted = 1; }
 
-message RoiListRequest { string array_id = 1; string set_name = 2; }
 message RoiSetInfo     { string set_name = 1; int64 count = 2; bool reserved = 3; }
 message RoiListResult  { repeated RoiAnnotation rois = 1; bool truncated = 2;
                          repeated RoiSetInfo sets = 3; }
+
+// biopb/tensor/ticket.proto -- the roi flight's addresses
+message RoiRead   { string array_id = 1; string set_name = 2; }   // TensorTicket.roi_read
+message RoiPut    { string array_id = 1; bool check_rev = 2; }    // PutCommand.roi_put
+message RoiDelete { string array_id = 1; string set_name = 2; }   // PutCommand.roi_delete
 ```
 
-`RoiListRequest` takes no plane or bbox filter: the client filters the resident
-set in memory.
+A read takes no plane or bbox filter: the client filters the resident set in
+memory.
 
 `set_name` scopes the read. Empty returns the tensor's client-owned sets; a
 reserved set comes back only when named. An import is not bounded by the write
@@ -425,33 +427,30 @@ this is worth having from the start; a client that does not care leaves
 
 ## API surfaces
 
-**Flight actions** (`server.do_action`, listed in `list_actions`) — the
-authoritative surface, because the HTTP sidecar is a separate client that reaches
-the server over gRPC and cannot touch the DuckDB catalog directly:
+**The `roi` flight** — the authoritative surface, because the HTTP sidecar is a
+separate client that reaches the server over gRPC and cannot touch the DuckDB
+catalog directly:
 
-| Action | Body | Result |
-|---|---|---|
-| `roi_put` | `RoiPutRequest` | `RoiPutResult` |
-| `roi_list` | `RoiListRequest` | `RoiListResult` |
-| `roi_delete` | `RoiDeleteRequest` | `RoiDeleteResult` |
+| Verb | Wire | Stream | Reply |
+|---|---|---|---|
+| DoGet | `TensorTicket.roi_read {array_id, set_name}` | ROI rows | `truncated` + `sets` (JSON) in the stream's schema metadata |
+| DoPut | `PutCommand.roi_put {array_id, check_rev}` | ROI rows | `RoiPutResult` in the put's app_metadata |
+| DoPut | `PutCommand.roi_delete {array_id, set_name}` | one `roi_id` column, or empty | `RoiDeleteResult` in the put's app_metadata |
 
-**Why DoAction and not DoGet/DoPut.** The catalog's other read surface
-(`__metadata_query__`) goes over DoGet because it answers an arbitrary *query*
-whose result set is unbounded — that is what earns the ticket, the Arrow stream
-and the backpressure. ROI reads are not a query: the request is "the annotation
-set for this tensor", the answer is bounded by the per-tensor cap, and the client
-wants the whole thing. A ticket + record-batch stream for a few hundred rows is
-ceremony that buys nothing, and it splits authorization across two calls
-(GetFlightInfo mints a ticket that then travels on its own) where DoAction
-authorizes the one call that does the work. Writes are small structured commands
-with a structured reply (`stored` + `conflicts`), which is DoAction's shape;
-DoPut's only response channel is a single app-metadata blob, and it is gated on
-`--writable`, which annotations deliberately are not.
+One row schema in both directions (`biopb.image._roi_rows.ROI_ROW_SCHEMA`):
+what the server streams on a read is what it accepts on a write, with the
+geometry as `biopb.image.ROI` proto3 JSON text — the same form the catalog
+stores. The SDK's `list_rois` / `put_rois` / `delete_rois` rebuild the
+`RoiListResult` / `RoiPutResult` / `RoiDeleteResult` messages from that.
 
-**What would flip this to DoPut/DoGet** is bulk object import — ruled out in
-Non-goals, and this is one of the things that decision buys.
+**Why a flight and not the SQL surface.** Annotations are private data: a read
+or write names one tensor, so it is authorized on that tensor's source exactly
+like a pixel read (biopb/biopb#1010). A SQL query names no source, so `rois`
+is not in `ALLOWED_TABLES`. Orphans — rows whose source is gone — are the one
+thing no tensor can authorize, and they are handled by the catalog-tier
+`roi_prune` action instead.
 
-Each calls `self._authorize_source(context, array_id.split("/")[0])` first, like
+Each calls `self._authorize(context, array_id.split("/")[0])` first, like
 `chunk_locate`. A feature-level refusal (annotations disabled, or a server with
 no metadata DB) raises `FlightUnavailableError`; a rejected request (bad
 geometry, mismatched array_id, cap breached) raises `FlightServerError`. That
@@ -701,12 +700,12 @@ never) rather than a claim about the world. `prune_unseen(before)` applies it an
 Both are exposed on demand, because the automatic path is off by default and,
 when on, will not fire until the server has been up for the whole threshold.
 
-**`biopb tensor prune-annotations --days N`** is the one to reach for. It needs
-nothing the server does not already expose: `rois` is in `ALLOWED_TABLES`, so
-the SQL surface reads it, and `roi_delete` takes explicit ids — two ordinary
-client calls against a *running* server, through the usual `_data_plane`
-endpoint and credential resolution. Deleting by id, per tensor, means a delete
-issued from a report can only ever remove what the report listed.
+**`biopb tensor prune-annotations --days N`** is the one to reach for: the
+`roi_prune` action against a *running* server, through the usual `_data_plane`
+endpoint and credential resolution. It reports first and deletes with `apply`
+by the same predicate, so what was shown is what goes. Orphans have no live
+source to authorize against, which is why this is a server-token action rather
+than a `roi` flight verb.
 
 **`biopb-tensor-server prune-annotations <config> --days N`** is the same thing
 against the file, for when there is no server to dial. It **requires the server

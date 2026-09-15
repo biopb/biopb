@@ -102,12 +102,12 @@ there and is **not** a usable grid. The transfer grid belongs to the tensor the
 server binds to serve a read, so ask `/api/tile_info/{array_id}` for it
 (biopb/biopb#812).
 
-**`/api/sources/{id}` is a single-row lookup** (`ListFlights` carrying a
-`TensorCriteria.source_id`), so it is not bounded by
-`max_list_flights_results` — a source past that cap has a descriptor here but
-no entry on `/api/sources` (biopb/biopb#1006). It shows no more than the
-listing: a token-protected source is declined here too, and a `cache:` upload
-has no catalog row at all (biopb/biopb#265) — reach one through
+**`/api/sources/{id}` is a single-row lookup** (a catalog query with a
+`WHERE source_id`), so it is not bounded by the listing's row cap — a source
+past that cap has a descriptor here but no entry on `/api/sources`
+(biopb/biopb#1006). The catalog is public: a token-protected source is listed
+too (the token gates its pixels), but a `cache:` upload has no catalog row at
+all (biopb/biopb#265) — reach one through
 `/api/tile_info/{array_id}`.
 
 ## Tile endpoints

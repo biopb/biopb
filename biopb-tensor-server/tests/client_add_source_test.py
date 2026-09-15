@@ -41,7 +41,12 @@ def _bare_client():
     # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)
     state = _ClientState(
-        client=None, call_options=None, location="", token=None, cache_bytes=0
+        raw_client=None,
+        call_options=None,
+        location="",
+        token=None,
+        cache_bytes=0,
+        protocol_checked=True,
     )
     client._state = state
     client._catalog = CatalogClient(state)

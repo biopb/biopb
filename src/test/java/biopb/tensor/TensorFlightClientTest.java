@@ -11,7 +11,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
@@ -548,7 +547,7 @@ public class TensorFlightClientTest {
         private final Map<String, AtomicInteger> chunkRequests;
         private final Map<String, List<Map<String, Object>>> uploadStatusSequences;
         private final Map<String, AtomicInteger> uploadStatusCalls;
-        private volatile FlightCmd lastCmd;
+        private volatile FlightRequest lastCmd;
 
         TensorTestProducer(BufferAllocator allocator) {
             this.allocator = allocator;
@@ -619,35 +618,18 @@ public class TensorFlightClientTest {
         }
 
         @Override
-        public void listFlights(
-                FlightProducer.CallContext context,
-                Criteria criteria,
-                FlightProducer.StreamListener<FlightInfo> listener) {
-
-            // Return DataSourceDescriptor in list_flights
-            listener.onNext(new FlightInfo(
-                    schema,
-                    FlightDescriptor.command(sourceDescriptor.toByteArray()),
-                    Collections.singletonList(new FlightEndpoint(new Ticket(new byte[0]))),
-                    -1,
-                    -1));
-            listener.onCompleted();
-        }
-
-        @Override
         public FlightInfo getFlightInfo(FlightProducer.CallContext context, FlightDescriptor descriptor) {
-            FlightCmd cmd = parseCmd(descriptor.getCommand());
+            FlightRequest cmd = parseCmd(descriptor.getCommand());
             lastCmd = cmd;
             TensorReadOption readOpt = cmd.hasTensorRead()
                     ? cmd.getTensorRead()
                     : null;
 
-            // Validate source and tensor
-            if (!cmd.getSourceId().equals("test-source")) {
-                throw new IllegalArgumentException("Source not found: " + cmd.getSourceId());
-            }
-            if (readOpt == null || !readOpt.getTensorId().equals("test-tensor")) {
-                throw new IllegalArgumentException("Tensor not found: " + (readOpt != null ? readOpt.getTensorId() : "null"));
+            // Validate the tensor: "test-tensor" is the sole tensor of "test-source".
+            if (readOpt == null
+                    || !(readOpt.getArrayId().equals("test-tensor")
+                            || readOpt.getArrayId().equals("test-source"))) {
+                throw new IllegalArgumentException("Tensor not found: " + (readOpt != null ? readOpt.getArrayId() : "null"));
             }
 
             // Handle scaled reads
@@ -738,6 +720,16 @@ public class TensorFlightClientTest {
                 FlightProducer.ServerStreamListener listener) {
 
             TensorTicket tensorTicket = parseTicket(ticket.getBytes());
+            if (tensorTicket.hasCatalogQuery()) {
+                // The `catalog` flight: one `sources` row, as the server's DuckDB
+                // would stream it (tensors is a LIST<STRUCT>).
+                try (VectorSchemaRoot root = catalogRoot()) {
+                    listener.start(root);
+                    listener.putNext();
+                    listener.completed();
+                }
+                return;
+            }
             String chunkIdStr = tensorTicket.getChunkId().toString(StandardCharsets.UTF_8);
             chunkRequests.computeIfAbsent(chunkIdStr, ignored -> new AtomicInteger()).incrementAndGet();
             float[] values = chunkData.get(chunkIdStr);
@@ -772,6 +764,56 @@ public class TensorFlightClientTest {
                 listener.putNext();
                 listener.completed();
             }
+        }
+
+        private VectorSchemaRoot catalogRoot() {
+            Field arrayId = new Field("array_id", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+            Field dimLabels = new Field("dim_labels", FieldType.nullable(ArrowType.List.INSTANCE),
+                    Collections.singletonList(new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null)));
+            Field shape = new Field("shape", FieldType.nullable(ArrowType.List.INSTANCE),
+                    Collections.singletonList(new Field("item", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+            Field dtype = new Field("dtype", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+            Field tensorStruct = new Field("item", FieldType.nullable(ArrowType.Struct.INSTANCE),
+                    Arrays.asList(arrayId, dimLabels, shape, dtype));
+            Schema catalogSchema = new Schema(Arrays.asList(
+                    new Field("source_id", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
+                    new Field("source_url", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
+                    new Field("source_type", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
+                    new Field("data_resident", FieldType.nullable(ArrowType.Bool.INSTANCE), null),
+                    new Field("tensors", FieldType.nullable(ArrowType.List.INSTANCE),
+                            Collections.singletonList(tensorStruct))));
+            VectorSchemaRoot root = VectorSchemaRoot.create(catalogSchema, allocator);
+            root.allocateNew();
+            ((org.apache.arrow.vector.VarCharVector) root.getVector("source_id"))
+                    .setSafe(0, "test-source".getBytes(StandardCharsets.UTF_8));
+            ((org.apache.arrow.vector.VarCharVector) root.getVector("source_url"))
+                    .setSafe(0, "mock://test".getBytes(StandardCharsets.UTF_8));
+            ((org.apache.arrow.vector.VarCharVector) root.getVector("source_type"))
+                    .setSafe(0, "mock".getBytes(StandardCharsets.UTF_8));
+            ((org.apache.arrow.vector.BitVector) root.getVector("data_resident")).setSafe(0, 1);
+            ListVector tensors = (ListVector) root.getVector("tensors");
+            UnionListWriter writer = tensors.getWriter();
+            writer.setPosition(0);
+            writer.startList();
+            org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter sw = writer.struct();
+            sw.start();
+            sw.varChar("array_id").writeVarChar("test-tensor");
+            org.apache.arrow.vector.complex.writer.BaseWriter.ListWriter labels = sw.list("dim_labels");
+            labels.startList();
+            labels.varChar().writeVarChar("y");
+            labels.varChar().writeVarChar("x");
+            labels.endList();
+            org.apache.arrow.vector.complex.writer.BaseWriter.ListWriter shapeW = sw.list("shape");
+            shapeW.startList();
+            shapeW.bigInt().writeBigInt(4);
+            shapeW.bigInt().writeBigInt(4);
+            shapeW.endList();
+            sw.varChar("dtype").writeVarChar("float32");
+            sw.end();
+            writer.endList();
+            tensors.setValueCount(1);
+            root.setRowCount(1);
+            return root;
         }
 
         private List<FlightEndpoint> baseEndpoints() {
@@ -823,11 +865,11 @@ public class TensorFlightClientTest {
             return new org.apache.arrow.vector.types.pojo.Schema(Arrays.asList(dataField, dtypeField));
         }
 
-        private static FlightCmd parseCmd(byte[] bytes) {
+        private static FlightRequest parseCmd(byte[] bytes) {
             try {
-                return FlightCmd.parseFrom(bytes);
+                return FlightRequest.parseFrom(bytes);
             } catch (IOException e) {
-                throw new IllegalStateException("Failed to parse FlightCmd", e);
+                throw new IllegalStateException("Failed to parse FlightRequest", e);
             }
         }
 

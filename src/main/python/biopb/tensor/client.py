@@ -32,6 +32,7 @@ from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiDeleteResult,
     RoiListResult,
+    RoiPruneResult,
     RoiPutResult,
 )
 from biopb.tensor._pool import (
@@ -209,7 +210,7 @@ class TensorFlightClient:
         # The collaborators (#278 item C) read/write it; this facade exposes the
         # caches back-compatibly via the _sources/_descriptors properties below.
         self._state = _ClientState(
-            client=self._client,
+            raw_client=self._client,
             call_options=self._call_options,
             location=self._location,
             token=self._token,
@@ -252,10 +253,9 @@ class TensorFlightClient:
             :meth:`get_descriptor` for the grid of a specific tensor
             (biopb/biopb#812).
 
-        Note:
-            Results may be truncated if server has max_list_flights_results configured.
-            Check schema metadata for truncation info (truncated=True indicates
-            more sources exist on server than were returned).
+        Backed by one catalog query (``SELECT ... FROM sources``), so it is
+        subject to the server's query row cap like :meth:`query_sources`; a
+        very large catalog is better browsed with a narrower query.
         """
         return self._catalog.list_sources()
 
@@ -268,13 +268,10 @@ class TensorFlightClient:
         instead of streaming the catalog for the caller to search. Use this
         whenever the id is already known; use ``list_sources`` to browse.
 
-        Because it does not go through the listing, it is **not** subject to
-        ``max_list_flights_results`` -- a source sitting past that cap has a
-        descriptor here even though it has no entry there.
-
-        It does not widen what is visible. A source the listing declines to
-        show -- one carrying a per-source capability token -- is declined here
-        too; knowing its id is not authority to read it.
+        The catalog is public: a source whose pixels need a capability token
+        still has its descriptor here. Knowing its id is not authority to read
+        it -- that is what the token gates, on :meth:`get_tensor` and
+        :meth:`list_rois`.
 
         Args:
             source_id: The source's id, e.g. ``"zarr_a3f2"``. This is a *source*
@@ -646,9 +643,8 @@ class TensorFlightClient:
         """Fetch a tensor's ROI annotations.
 
         There is no plane or bbox filter: a client hit-tests and re-renders
-        from the resident set. For analytic slicing -- counts per label,
-        annotations overlapping a region, a join against the catalog -- query
-        the ``rois`` table with :meth:`query_sources`.
+        from the resident set. Annotations are private data, gated by the
+        tensor's source like its pixels, so they are not on the SQL surface.
 
         Args:
             array_id: Unversioned array_id of the tensor.
@@ -661,8 +657,7 @@ class TensorFlightClient:
             ``rois`` covers.
 
         Raises:
-            flight.FlightServerError: annotations disabled, or no metadata DB.
-            RuntimeError: the server predates the ``roi_list`` action.
+            flight.FlightUnavailableError: annotations disabled, or no metadata DB.
         """
         return self._catalog.list_rois(array_id, set_name)
 
@@ -701,7 +696,6 @@ class TensorFlightClient:
         Raises:
             flight.FlightServerError: rejected geometry, a mismatched array_id,
                 or the per-tensor cap would be breached.
-            RuntimeError: the server predates the ``roi_put`` action.
         """
         return self._catalog.put_rois(array_id, rois, check_rev=check_rev)
 
@@ -721,6 +715,18 @@ class TensorFlightClient:
             ``RoiDeleteResult.deleted`` -- the ids actually removed.
         """
         return self._catalog.delete_rois(array_id, roi_ids, set_name)
+
+    def prune_rois(self, unseen_days: int, *, apply: bool = False) -> RoiPruneResult:
+        """Report, and with ``apply`` delete, annotations whose image is gone.
+
+        An annotation is unseen when the catalog has not held its source for
+        ``unseen_days`` (a row whose source never appeared counts from its
+        creation). Reserved, server-owned sets are never pruned. Grouped per
+        tensor in ``unseen``; ``deleted`` is the row count removed, 0 on a
+        report. Requires the server-wide token: orphans have no source to
+        authorize against.
+        """
+        return self._catalog.prune_rois(unseen_days, apply=apply)
 
     # ---- Reads (delegated to ChunkFetcher) ----
 

@@ -75,17 +75,31 @@ in three collaborators it composes:
 | `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
 | `server.uploads` | `UploadManager` | The writable-server DoPut boundary: picks the upload kind by `array_id` prefix (`cache:`/`ome_zarr:`), registers what the adapter class builds, translates adapter errors to Flight errors. Progress and discard live on the adapter (`core.writable.WritableSource`), so a discarded upload is a registered tombstone, not a second record |
 
-### Flight methods
+### Flight protocol (v2)
 
-| Method | Description |
-|--------|-------------|
-| `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto. Lean: each `TensorDescriptor` is the **structural** entry (`array_id`/`dim_labels`/`shape`/`dtype`) and leaves `chunk_shape`, `pyramid` and `metadata_json` empty |
-| `GetFlightInfo` | Returns query ticket for real data (pixel or metadata). Pixel data request respects `TensorReadOptions` and optionally fills `TensorDescriptor.pyramid` or `metadata_json` when asked |
-| `DoGet` | Fetches data by ticket, either a single pixel chunk or metadata query results; returns a `RecordBatch` stream |
+Three flights. Every verb dispatches on a proto **oneof** -- never a sentinel
+id or a byte-prefix sniff -- and the arm names the flight:
 
-Custom `do_action` verbs extend these: `health`, `create_source`,
+| Flight | Data | GetFlightInfo | DoGet ticket | DoPut command |
+|---|---|---|---|---|
+| `catalog` | public: the DuckDB tables (`sources`, `decode_rates`) | `FlightRequest.catalog_query` -> result schema + a ticket carrying the SQL | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
+| `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted) | `PutCommand.chunk` (writable servers) |
+| `roi` | private: annotations | -- | `TensorTicket.roi_read` -> ROI rows (`biopb.image._roi_rows`), `sets` + `truncated` in schema metadata | `PutCommand.roi_put` / `roi_delete`, reply in the put's app_metadata |
+
+`ListFlights` advertises the catalog only: one flight per table by path, with
+its real Arrow schema and a `SELECT * FROM <table>` ticket, so a stock Flight
+client can browse without a biopb proto. Sources are catalog rows (the SDK's
+`list_sources` is a query); a source's pixels and annotations are addressed,
+not listed.
+
+**Two token tiers** (`_authorize`): the catalog tier requires the server-wide
+token when one is configured; the private tiers require a source's capability
+token when the adapter carries one, else the server-wide token. A private
+source may still be catalogued -- the token gates reading, not knowing.
+
+Custom `do_action` verbs: `health` (reports `protocol`), `create_source`,
 `upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
-`remove_source` (below), and `roi_list` / `roi_put` / `roi_delete`.
+`remove_source` (below), and `roi_prune`.
 
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 
@@ -267,15 +281,16 @@ filesystem at runtime — the wire entrypoint behind the tensor-browser's
 drag-and-drop. It routes the dropped path through the same claim → adapter →
 catalog pipeline the watcher uses, so a folder may register several sources.
 
-### ROI annotations (`roi_list` / `roi_put` / `roi_delete`)
+### ROI annotations (the `roi` flight)
 
 User-drawn 2-D ROIs live in a `rois` table in the same DuckDB catalog as
 `sources`, one row per ROI, anchored on the unversioned `array_id`. They are a
 sibling table, not a field inside a source row: `sources.metadata_json` is
-adapter-produced and rewritten on every re-registration. The table is readable on
-the SQL surface (`query_sources`) for analysis; every write goes through the
-three actions. In-memory like the rest of the catalog, so annotations do not yet
-survive a restart.
+adapter-produced and rewritten on every re-registration. The table is private
+data -- read over DoGet and written over DoPut, authorized per source like
+pixels -- and is deliberately not on the SQL surface (biopb/biopb#1010).
+Orphans (annotations whose source is gone) are reported and pruned by the
+`roi_prune` action.
 
 See **[docs/roi-annotations.md](docs/roi-annotations.md)**.
 

@@ -365,9 +365,13 @@ def _start_embedded_tensor_cache(
     # Read-only over Flight: results are written in-process (adapter.write_chunk),
     # so the Flight write path (do_put / create_source) is pure attack surface here.
     # Read-back is gated by per-source capability tokens (adapter.capability_token).
+    # The server's own in-memory catalog is the browse surface (the `catalog`
+    # flight): a result is listable by anyone who can reach the server,
+    # readable only by the holder of its token.
     tensor_server = TensorFlightServer(
         location,
         writable=False,
+        annotations_enabled=False,
     )
 
     # This embedded server is a *bypass* of the normal tensor-server lifecycle:

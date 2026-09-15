@@ -254,7 +254,6 @@ _CONSTRAINTS = {
     },
     "MetadataDbConfig": {
         "max_query_results": _Range(min=1),
-        "max_list_flights_results": _Range(min=1),
         "query_timeout_ms": _Range(min=1),
     },
     "ServerConfig": {
@@ -767,10 +766,6 @@ class MetadataDbConfig:
         default=100000,
         metadata={"help": "Safety cap on rows returned by a catalog SQL query."},
     )
-    max_list_flights_results: int = field(
-        default=100000,
-        metadata={"help": "Safety cap on sources returned by ListFlights."},
-    )
     query_timeout_ms: int = field(
         default=30000,
         metadata={"help": "Catalog SQL query timeout (milliseconds)."},
@@ -820,8 +815,8 @@ class CatalogConfig:
 class AnnotationsConfig:
     """User-drawn ROI annotations (biopb-tensor-server/docs/roi-annotations.md).
 
-    Annotations live in the DuckDB catalog next to ``sources`` and are served by
-    the ``roi_list`` / ``roi_put`` / ``roi_delete`` Flight actions. They are NOT
+    Annotations live in the DuckDB catalog next to ``sources`` and are served
+    on the ``roi`` flight (DoGet / DoPut, authorized per source). They are NOT
     tied to ``writable``: an annotation writes no pixels, so the token is its
     boundary and ``enabled`` is the switch for a deployment that wants a strictly
     read-only catalog.
@@ -837,8 +832,8 @@ class AnnotationsConfig:
     enabled: bool = field(
         default=True,
         metadata={
-            "help": "Serve the ROI annotation actions (roi_list / roi_put / "
-            "roi_delete). Off makes the catalog strictly read-only -- the "
+            "help": "Serve the roi flight (annotation reads and writes). Off "
+            "makes the catalog strictly read-only -- the "
             "token says who may read, this says whether anyone may write. It "
             "does not stop the catalog being persisted: `persist` decides that."
         },
@@ -1577,7 +1572,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
             )
     metadata_db_kwargs: Dict[str, Any] = {}
     _carry(metadata_db_kwargs, "max_query_results", metadata_db_data)
-    _carry(metadata_db_kwargs, "max_list_flights_results", metadata_db_data)
     _carry(metadata_db_kwargs, "query_timeout_ms", metadata_db_data)
     metadata_db_config = MetadataDbConfig(**metadata_db_kwargs)
 

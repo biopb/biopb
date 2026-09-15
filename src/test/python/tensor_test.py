@@ -314,7 +314,12 @@ class TestQuerySourcesFormat:
         client = TensorFlightClient.__new__(TensorFlightClient)
         client._catalog = CatalogClient(
             _ClientState(
-                client=None, call_options=None, location="", token=None, cache_bytes=0
+                raw_client=None,
+                call_options=None,
+                location="",
+                token=None,
+                cache_bytes=0,
+                protocol_checked=True,
             )
         )
         with pytest.raises(ValueError, match="unknown format"):
@@ -339,7 +344,12 @@ class TestGetPhysicalScale:
 
         client = TensorFlightClient.__new__(TensorFlightClient)
         state = _ClientState(
-            client=None, call_options=None, location="", token=None, cache_bytes=0
+            raw_client=None,
+            call_options=None,
+            location="",
+            token=None,
+            cache_bytes=0,
+            protocol_checked=True,
         )
         client._state = state
         client._catalog = CatalogClient(state)
@@ -430,12 +440,17 @@ class TestGetDescriptorFieldMasks:
     @staticmethod
     def _client_capturing_read_opt():
         # Build without __init__ (no connection); mock the flight client so we can
-        # decode the FlightCmd the descriptor probe puts on the wire.
+        # decode the FlightRequest the descriptor probe puts on the wire.
         from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
 
         client = TensorFlightClient.__new__(TensorFlightClient)
         state = _ClientState(
-            client=Mock(), call_options=None, location="", token=None, cache_bytes=0
+            raw_client=Mock(),
+            call_options=None,
+            location="",
+            token=None,
+            cache_bytes=0,
+            protocol_checked=True,
         )
         # get_flight_info returns a FlightInfo whose descriptor.command is a
         # serialized TensorDescriptor (what _fetch_tensor_descriptor parses back).
@@ -451,10 +466,10 @@ class TestGetDescriptorFieldMasks:
 
     @staticmethod
     def _sent_read_opt(state):
-        from biopb.tensor.descriptor_pb2 import FlightCmd
+        from biopb.tensor.descriptor_pb2 import FlightRequest
 
         fd = state.client.get_flight_info.call_args.args[0]
-        return FlightCmd.FromString(fd.command).tensor_read
+        return FlightRequest.FromString(fd.command).tensor_read
 
     def test_defaults_are_describe_shaped(self):
         client, state = self._client_capturing_read_opt()
@@ -486,7 +501,12 @@ class TestDescriptorCacheStaysStructural:
 
         client = TensorFlightClient.__new__(TensorFlightClient)
         state = _ClientState(
-            client=Mock(), call_options=None, location="", token=None, cache_bytes=0
+            raw_client=Mock(),
+            call_options=None,
+            location="",
+            token=None,
+            cache_bytes=0,
+            protocol_checked=True,
         )
         info = Mock()
         info.descriptor.command = response.SerializeToString()
