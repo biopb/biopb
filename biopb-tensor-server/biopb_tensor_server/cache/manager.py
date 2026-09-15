@@ -205,11 +205,9 @@ class CacheManager:
         """Wait for one key's deferred write. True if nothing is owed.
 
         For the caller that needs bytes on disk rather than data in hand -- the
-        localhost handoff, which answers with a segment byte range. Backends that
-        never defer answer True immediately.
+        localhost handoff, which answers with a segment byte range.
         """
-        waiter = getattr(self._backend, "flush_deferred_write", None)
-        return True if waiter is None else waiter(key, timeout)
+        return self._backend.flush_deferred_write(key, timeout)
 
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk ChunkLocation for a cached chunk, or None (issue #9).
