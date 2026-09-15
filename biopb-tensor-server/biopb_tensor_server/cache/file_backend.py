@@ -1665,10 +1665,12 @@ class ArrowFileBackend(CacheBackend):
 
         The entry goes READY before a byte reaches disk, so waiters and the
         caller are released immediately. That is safe for a *cache*: until the
-        write lands, ``locate_entry`` finds no byte range and the localhost
-        handoff falls back to do_get. It is NOT safe where the cache is the
-        only copy of the data -- see ``CacheManager.put``, which never comes
-        through here.
+        write lands, ``locate_entry`` finds no byte range, and the chunk_locate
+        handler (``server.py._handle_chunk_locate``) does not just accept that --
+        it calls ``CacheManager.await_deferred_write`` to block for the write
+        before answering, falling back to do_get only if that wait times out.
+        It is NOT safe where the cache is the only copy of the data -- see
+        ``CacheManager.put``, which never comes through here.
 
         Returning False on a full budget is the whole backpressure story: the
         caller writes its own entry inline and the queue stops growing. No
