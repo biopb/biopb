@@ -87,18 +87,11 @@ def _get_size_class(size_bytes: int) -> SizeClass:
 CACHE_KEY_FIELD = "__biopb_cache_key__"
 
 # On-disk segment format version for the localhost cache-file handoff (issue
-# #9). The client mmaps and parses segment messages directly, so the layout is
-# a cross-process contract. Bump this whenever the segment message layout or the
-# data/shape/dtype/cache_key encoding changes in a way an older client can't
-# parse; the server reports it in chunk_locate and a client declines the fast
+# #9). The server reports it in chunk_locate and a client declines the fast
 # path (falls back to do_get) for any version it doesn't understand.
 #
-# v2 (biopb/biopb#596): the segment *layout* is unchanged, but for a source whose
-# native axis order is not canonical the server now serves -- and therefore
-# caches -- the transposed array under the same chunk_id. A v1 segment holds the
-# pre-transpose bytes, so reusing it would serve axes in the wrong order, and the
-# localhost fast path would do so with the server no longer in the loop to
-# correct it. Wipe instead.
+# v2: biopb/biopb#596 implemented axis order normalization. A v1 segment holds the
+# pre-transpose bytes, so reusing it would serve axes in the wrong order.
 CACHE_FILE_FORMAT_VERSION = 2
 
 # Name of the on-disk marker file (in the cache root, beside ``lock`` and
@@ -108,28 +101,24 @@ CACHE_FILE_FORMAT_VERSION = 2
 # silently reuse incompatible on-disk segments. See _enforce_format_version.
 FORMAT_VERSION_MARKER = "format_version"
 
-# Per-segment sidecar index (biopb/biopb#300). Each sealed segment
-# ``seg_NNNN.arrow`` gets a ``seg_NNNN.idx`` written at seal time recording every
-# entry's key -> byte range, so boot restores the index from these small files
-# instead of faulting the whole on-disk cache (tens of GB on a caching proxy)
-# just to re-derive it. A sealed segment is immutable, so the sidecar needs no
-# manifest or generation counter: a boot trusts a sidecar iff its recorded
-# ``.arrow`` size matches the file on disk (a torn or mismatched sidecar falls
-# back to the body walk). Purely additive -- an older server ignores ``.idx``
-# (it globs ``.arrow``); a newer server on an old cache walks and backfills. The
-# tiny ``.idx`` bytes are deliberately NOT counted toward ``max_total_bytes``.
-# The retention class rides in the sidecar's schema metadata, not in the segment
-# body: the body layout is the contract the localhost client parses, and this is
-# server-side policy. Additive both ways, so neither version is bumped -- an old
-# server ignores the key, a new one defaults to "normal" on an old sidecar. A
-# SIDECAR_FORMAT_VERSION bump would reject every .idx for the walk #300 removed.
+# Per-segment sidecar index (biopb/biopb#300). Each sealed segment gets a
+# ``seg_NNNN.idx`` sidecar written at seal time, recording every entry's key ->
+# byte range, so boot restores the index from these small files instead of
+# faulting the whole on-disk cache. The retention class rides in the sidecar's
+# schema metadata.
+#
+# A sealed segment is immutable, so the sidecar needs no manifest or generation
+# counter: a boot trusts a sidecar iff its recorded ``.arrow`` size matches the
+# file on disk. The tiny ``.idx`` bytes are deliberately NOT counted toward
+# ``max_total_bytes``.
+#
+# The key travels as a real column (not schema-only): a sidecar is an Arrow
+# IPC FILE, so this is belt-and-suspenders, but it keeps the record self-describing.
 SIDECAR_FORMAT_VERSION = 1
 _SIDECAR_VERSION_KEY = b"biopb_sidecar_version"
 _SIDECAR_SEGMENT_SIZE_KEY = b"biopb_segment_size"
 _SIDECAR_RETENTION_KEY = b"biopb_retention"
 _SIDECAR_VERSION_BYTES = str(SIDECAR_FORMAT_VERSION).encode()
-# The key travels as a real column (not schema-only): a sidecar is an Arrow IPC
-# FILE, so this is belt-and-suspenders, but it keeps the record self-describing.
 _SIDECAR_SCHEMA = pa.schema(
     [
         pa.field("key", pa.binary()),
@@ -390,18 +379,10 @@ class ArrowFileBackend(CacheBackend):
         """Wipe the on-disk cache when its segment format version != code.
 
         ``CACHE_FILE_FORMAT_VERSION`` is the segment message layout / cache-key
-        encoding contract (see the constant). Segments written under one version
-        cannot be safely reused after a layout or key-composition change: the
-        boot rebuild would index them and the server would then serve mis-decoded
-        or mis-keyed (stale) chunks. A marker file records the version the
+        encoding contract (see the constant). A marker file records the version the
         on-disk segments were written under, and a missing or mismatched marker
-        drops them before the index rebuild.
-
-        A cache dir with segments but no marker counts as a mismatch. Discarding
-        a layout-compatible cache once is a safe, one-time re-fetch cost, whereas
-        serving incompatible bytes is a silent correctness bug -- so we err
-        toward wiping. Idempotent on a matching cache (returns False, no I/O
-        beyond the marker read).
+        drops them before the index rebuild. A cache dir with segments but no marker
+        counts as a mismatch.
 
         Must run while the process lock is held and before WAL init / recovery /
         index rebuild read the segments. Returns True iff a (re)stamp happened
@@ -409,6 +390,7 @@ class ArrowFileBackend(CacheBackend):
         just wiped and there is nothing to recover.
         """
         marker_path = self._config.cache_dir / FORMAT_VERSION_MARKER
+
         try:
             on_disk: Optional[int] = int(marker_path.read_text().strip())
         except (OSError, ValueError):
@@ -439,13 +421,7 @@ class ArrowFileBackend(CacheBackend):
         Fail-closed on a partial wipe: ``shutil.rmtree(ignore_errors=True)`` can
         leave files behind without surfacing an error -- an NFS unlink that
         returns ESTALE/EIO, a permission glitch, a handle another process still
-        holds. A surviving ``seg_*.arrow`` is exactly the incompatible segment
-        we came to drop, and the boot rebuild would re-index and serve it as if
-        current. So we verify the segments are gone and raise if any remain,
-        refusing to start rather than serving mis-decoded/stale chunks -- a dead
-        cache owner's lock is stale-reclaimable, an operator can clear the dir.
-        (A stray ``.idx`` sidecar is harmless -- the rebuild globs ``.arrow`` --
-        so the check targets bodies only.)
+        holds.
         """
         segments_dir = self._segments_dir
         wal_path = self._wal_path
@@ -482,14 +458,9 @@ class ArrowFileBackend(CacheBackend):
     def _recover(self) -> RecoveryStatus:
         """Recover from crash: drop incomplete writes recorded in the WAL.
 
-        The recovered-entry accounting is deliberately cheap and does NOT read
-        segment bodies (biopb/biopb#300). Iterating every record batch to count
-        entries and sum ``batch.nbytes`` faults the entire cache in from disk --
-        tens of GB on a caching-proxy server -- purely for one startup log line,
-        and it duplicates the walk ``_rebuild_index_from_segments()`` does next
-        anyway. So take the recovered byte total from the segment files' on-disk
-        sizes (a ``stat``, no read) and let ``_initialize`` backfill
-        ``recovered_entries`` from the rebuilt index.
+        Does NOT read segment bodies (biopb/biopb#300). Take the recovered byte total
+        from the segment files' on-disk sizes (a ``stat``, no read) and let
+        ``_initialize`` backfill ``recovered_entries`` from the rebuilt index.
         """
         lost_entries = 0
 
@@ -923,14 +894,13 @@ class ArrowFileBackend(CacheBackend):
 
         # Create writer.
         #
-        # INVARIANT (load-bearing for the localhost mmap fast path, Option C in
-        # biopb/biopb#571): no segment inode is ever truncated or shrunk while a
-        # client may have it mapped. A remote client hands out a zero-copy view
-        # onto this file's mapping, so it can fault (SIGBUS) at *any* point in
-        # that array's life if the bytes under the mapping vanish. This truncating
-        # "wb" open is safe only because `segment_id` is strictly monotonic
-        # (`_next_segment_id`, boot-initialized to max+1 and only incremented), so
-        # `segment_path` is always freshly allocated -- never an id a live mapping
+        # INVARIANT (load-bearing for the localhost mmap fast path): no segment inode
+        # is ever truncated or shrunk while a client may have it mapped. A remote
+        # client hands out a zero-copy view onto this file's mapping, so it can fault
+        # (SIGBUS) at *any* point in that array's life if the bytes under the mapping
+        # vanish. This truncating "wb" open is safe only because `segment_id` is strictly
+        # monotonic (`_next_segment_id`, boot-initialized to max+1 and only incremented),
+        # so `segment_path` is always freshly allocated -- never an id a live mapping
         # holds. Eviction *unlinks* segments (the inode survives to last close);
         # nothing ever truncates one in place. Do not add a "reuse a segment file"
         # or "truncate on repair" path without breaking that view contract first.
@@ -1178,13 +1148,13 @@ class ArrowFileBackend(CacheBackend):
     ) -> Optional[pa.RecordBatch]:
         """Read one cached chunk back out of its segment file.
 
-        Seeks straight to the entry's recorded byte range rather than walking
-        the IPC stream to reach it: an entry carries its range from birth since
-        #541, and the walk cost O(entries before it) per hit -- 0.3 ms into a
-        76-entry segment, 8.9 ms into a 3000-entry one, on every do_get hit
-        (``release`` drops the in-RAM mirror, so hits really do re-read). An
-        entry without a range, or a segment whose schema can't be read, falls
-        back to that walk.
+        The read is zero-copy on every platform including Windows: the
+        returned batch's buffers point straight into the segment mapping, and
+        a caller can keep it alive across eviction of that segment.
+
+        Serve the unified binary schema as-is (biopb/biopb#293); just strip
+        the internal cache-key column so the wire batch is the clean
+        [data, shape, dtype]. No binary->typed conversion.
         """
         entry_info = self._metadata.get(key)
         if entry_info is None:
@@ -1195,7 +1165,7 @@ class ArrowFileBackend(CacheBackend):
         if seg_info is not None and seg_info.mmap_released:
             self._reopen_segment_mmap(segment_id, seg_info)
         # A probe reads the bytes without crediting the segment; see
-        # CacheBackend.try_acquire for why. The cold-mmap sweep is driven off the
+        # ArrowFileBackend.try_acquire for why. The cold-mmap sweep is driven off the
         # same accounting: a read that declines to be credited must not schedule
         # it either, or a scaled read over a cache warmed minutes ago would walk
         # its own working set and munmap the segments the next unit reads.
@@ -1215,23 +1185,6 @@ class ArrowFileBackend(CacheBackend):
         if batch is None:
             return None
 
-        # The read is zero-copy on every platform now, Windows included: the
-        # returned batch's buffers point straight into the segment mapping, and
-        # a caller can keep it alive across eviction of that segment. Windows
-        # used to copy the whole batch off the mmap here (issue #5) because a
-        # live mapping blocks unlink with WinError 32 -- but that is only true
-        # while a *handle* is open. Every unlink path first closes the server's
-        # own pa.memory_map (``_forget_segment_mmap`` in ``_do_evict_segment`` /
-        # ``_drop_segment_files`` / ``clear``, all serialized with reads under
-        # ``_lock``); once no handle remains, DeleteFile removes the name at once
-        # and the still-mapped view keeps this batch's bytes valid -- POSIX
-        # delete-on-last-close semantics. The one dependency is that
-        # ``MemoryMappedFile.close()`` releases the handle while buffers retain
-        # the view, which holds on pyarrow >= 14 (the pinned floor); see #572
-        # and ``cachefile_test.TestZeroCopySurvivesUnlink``.
-        # Serve the unified binary schema as-is (biopb/biopb#293); just strip
-        # the internal cache-key column so the wire batch is the clean
-        # [data, shape, dtype]. No binary->typed conversion.
         return pa.RecordBatch.from_arrays(
             [batch.column("data"), batch.column("shape"), batch.column("dtype")],
             names=["data", "shape", "dtype"],
@@ -1242,17 +1195,11 @@ class ArrowFileBackend(CacheBackend):
     ) -> Optional[pa.RecordBatch]:
         """Decode the single record batch this entry points at.
 
-        Seeks straight to the entry's recorded byte range instead of walking the
-        IPC stream to reach it. Since biopb/biopb#541 an entry carries that range
-        from birth -- recorded at write time, restored at boot from the ``.idx``
-        sidecar or the segment walk -- and it is the same range ``locate_entry``
-        already hands to a localhost client. Walking cost O(entries before the
-        target) on *every* do_get hit, and hits really do re-read: ``release``
-        drops the redundant in-RAM mirror once a segment is mmap-readable.
-
-        Falls back to the walk when the entry has no range (the one case
-        ``_bracket_written_message`` can't derive: a failed schema-length read on
-        a segment's first append) or the segment's schema can't be read.
+        Seeks straight to the entry's recorded byte range rather than walking
+        the IPC stream to reach it: an entry carries its range from birth since
+        #541, and the walk cost O(entries before it) per hit -- 0.3 ms into a
+        76-entry segment, 8.9 ms into a 3000-entry one. An entry without a range,
+        or a segment whose schema can't be read, falls back to walk the segment.
         """
         if entry_info.byte_offset and entry_info.byte_length:
             schema = self._segment_schema(segment_id, mmap)
@@ -1717,12 +1664,11 @@ class ArrowFileBackend(CacheBackend):
         """Commit the entry from memory and queue its write. False = write now.
 
         The entry goes READY before a byte reaches disk, so waiters and the
-        caller are released immediately. That is safe for a *cache*: the batch
-        is correct in memory, and until the write lands ``locate_entry`` finds
-        no byte range and the localhost handoff falls back to do_get, which is
-        the same fallback it already takes for an entry with no recorded range.
-        It is NOT safe where the cache is the only copy of the data -- see
-        ``CacheManager.put``, which never comes through here.
+        caller are released immediately. That is safe for a *cache*: until the
+        write lands, ``locate_entry`` finds no byte range and the localhost
+        handoff falls back to do_get. It is NOT safe where the cache is the
+        only copy of the data -- see ``CacheManager.put``, which never comes
+        through here.
 
         Returning False on a full budget is the whole backpressure story: the
         caller writes its own entry inline and the queue stops growing. No
@@ -2013,10 +1959,9 @@ class ArrowFileBackend(CacheBackend):
     def release_process_lock(self, drain_timeout: float = 30.0) -> None:
         """Release the process lock + clear the WAL, leaving handles OPEN.
 
-        The graceful-shutdown fast path (biopb/biopb#300). This is the cheap,
-        upstream-independent half of :meth:`close`: it clears the WAL and drops
-        the cross-process lock so the next boot never sees a stale lock, but it
-        deliberately does NOT close segment writers/mmaps -- doing so mid-flight
+        This is the cheap, upstream-independent half of :meth:`close`: it clears
+        the WAL and drops the cross-process lock so the next boot never sees a
+        stale lock, but it does NOT close segment writers/mmaps. Doing so mid-flight
         would race any ``do_get`` reads still draining. Completed writes are
         already flushed to their segment files, and clearing the WAL early is
         safe because ``_rebuild_index_from_segments`` tolerates a torn tail
