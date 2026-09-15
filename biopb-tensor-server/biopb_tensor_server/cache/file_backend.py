@@ -4,7 +4,7 @@ Implements segmented storage with:
 - Mmap reads for near-memory-speed access
 - Segment-level LRU eviction
 - Crash recovery via WAL and process lock
-- Same future/promise pattern as MemoryCacheBackend
+- The CacheBackend future/promise pattern (see cache.base)
 """
 
 from __future__ import annotations
@@ -201,13 +201,11 @@ class ArrowFileBackend(CacheBackend):
         └── lock
 
     Key features:
-    1. Future/Promise: Same pattern as MemoryCacheBackend
+    1. Future/Promise: see cache.base.CacheBackend
     2. Mmap reads: OS page cache provides near-memory performance
     3. Segment-level eviction: Delete least-recently-used segment
     4. Crash recovery: WAL detects incomplete writes
     """
-
-    SUPPORTS_DEFERRED_WRITES = True
 
     def __init__(self, config: ArrowFileConfig):
         self._config = config

@@ -31,7 +31,6 @@ def embedded_cache(tmp_path: Path) -> EmbeddedTensorCache:
     CacheManager.reset()
     CacheManager.initialize(
         CacheConfig(
-            backend="file",
             file_cache_dir=tmp_path,
             file_max_total_bytes=128 * 1024 * 1024,
         )
@@ -58,7 +57,6 @@ def served_embedded_cache(tmp_path: Path):
     CacheManager.reset()
     CacheManager.initialize(
         CacheConfig(
-            backend="file",
             file_cache_dir=tmp_path,
             file_max_total_bytes=128 * 1024 * 1024,
         )

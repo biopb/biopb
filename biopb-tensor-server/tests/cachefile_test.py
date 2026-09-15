@@ -608,17 +608,6 @@ class TestFormatVersionEnforcement:
             shutil.rmtree(d, ignore_errors=True)
 
 
-class TestLocateViaManager:
-    def test_memory_backend_returns_none(self):
-        CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
-        try:
-            mgr = CacheManager.get_instance()
-            assert mgr.locate_entry(b"anything") is None
-        finally:
-            CacheManager.reset()
-
-
 # ==============================================================================
 # Server: chunk_locate action
 # ==============================================================================
@@ -637,7 +626,7 @@ class TestChunkLocateAction:
         finally:
             server.shutdown()
 
-    def test_locate_counts_as_flight_activity(self):
+    def test_locate_counts_as_flight_activity(self, tmp_path):
         """A locate is in-flight *while it runs*, so precache parks (#548).
 
         The fast path replaces do_get, so if the handler is untracked the server
@@ -646,7 +635,7 @@ class TestChunkLocateAction:
         """
         server = TensorFlightServer("grpc://localhost:0")
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             observed = []
 
@@ -674,7 +663,7 @@ class TestChunkLocateAction:
             CacheManager.reset()
             server.shutdown()
 
-    def test_locate_rejects_stale_chunk_id_before_consulting_cache(self):
+    def test_locate_rejects_stale_chunk_id_before_consulting_cache(self, tmp_path):
         """A cache HIT must not bypass the stale-chunk_id check (biopb/biopb#178).
 
         Before this, ``check_chunk_version`` only ran inside
@@ -687,7 +676,7 @@ class TestChunkLocateAction:
         """
         server = TensorFlightServer("grpc://localhost:0")
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             cache_manager = CacheManager.get_instance()
 
@@ -719,7 +708,9 @@ class TestChunkLocateAction:
             CacheManager.reset()
             server.shutdown()
 
-    def test_locate_rejects_non_envelope_chunk_id_before_consulting_cache(self):
+    def test_locate_rejects_non_envelope_chunk_id_before_consulting_cache(
+        self, tmp_path
+    ):
         """Same gap, on a real RemoteTensorAdapter: a stale pre-#178-W1 (bare,
         non-envelope) ticket must not be able to ride a persisted cache HIT
         past the proxy's own structural rejection (biopb/biopb#958 follow-up).
@@ -729,7 +720,7 @@ class TestChunkLocateAction:
 
         server = TensorFlightServer("grpc://localhost:0")
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             cache_manager = CacheManager.get_instance()
             proxy_adapter = RemoteTensorAdapter(
@@ -755,12 +746,12 @@ class TestChunkLocateAction:
             CacheManager.reset()
             server.shutdown()
 
-    def test_locate_releases_the_activity_slot_on_error(self):
+    def test_locate_releases_the_activity_slot_on_error(self, tmp_path):
         """A failing locate must not leak an in-flight count (precache would
         then never run again)."""
         server = TensorFlightServer("grpc://localhost:0")
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             # No source registered -> the adapter lookup raises straight out of
             # the tracked block.
@@ -1153,7 +1144,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1175,7 +1166,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1192,24 +1183,6 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_memory_backend_falls_back_but_data_correct(self):
-        import biopb.tensor._pool as cmod
-        from biopb.tensor.client import TensorFlightClient
-
-        tmp = tempfile.mkdtemp()
-        server, src = self._serve_zarr(tmp, CacheConfig(backend="memory"))
-        loc = f"grpc://localhost:{server.port}"
-        try:
-            cmod._cachefile_support.clear()
-            client = TensorFlightClient(loc, cache_bytes=0)
-            got = client.get_tensor("z").compute(scheduler="threads")
-            assert np.array_equal(got, src)
-            client.close()
-        finally:
-            server.shutdown()
-            CacheManager.reset()
-            shutil.rmtree(tmp, ignore_errors=True)
-
     def test_newer_segment_format_falls_back(self):
         """A server segment format newer than the client understands declines
         the fast path (and is memoized off), but data is still correct via do_get."""
@@ -1217,7 +1190,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1247,7 +1220,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, _src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1297,7 +1270,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, _src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1338,7 +1311,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1376,7 +1349,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1413,7 +1386,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1458,7 +1431,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1499,7 +1472,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:

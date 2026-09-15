@@ -608,12 +608,12 @@ class TestDoGetCacheHitRejectsStaleVersion:
     be handed back just because a lookup would technically succeed.
     """
 
-    def test_cached_entry_under_old_version_is_not_returned(self):
+    def test_cached_entry_under_old_version_is_not_returned(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             cache_manager = CacheManager.get_instance()
             adapter = _VersionedStubAdapter((10, 10), b"v1")

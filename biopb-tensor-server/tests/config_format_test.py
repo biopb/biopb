@@ -32,8 +32,7 @@ host = "127.0.0.1"
 port = 9000
 
 [cache]
-backend = "memory"
-max_bytes = 123456789
+file_max_segment_mb = 128
 
 [[sources]]
 type = "zarr"
@@ -42,7 +41,7 @@ url = "/data/a.zarr"
 
 _JSON = {
     "server": {"log_level": "DEBUG"},
-    "cache": {"backend": "memory", "max_bytes": 123456789},
+    "cache": {"file_max_segment_mb": 128},
     "sources": [
         {
             "type": "zarr",
@@ -54,8 +53,7 @@ _JSON = {
 
 def _assert_expected(cfg):
     assert cfg.log_level == "DEBUG"
-    assert cfg.cache.backend == "memory"
-    assert cfg.cache.memory_max_bytes == 123456789
+    assert cfg.cache.file_max_segment_bytes == 128 * 1024 * 1024
     assert len(cfg.sources) == 1
     src = cfg.sources[0]
     assert src.type == "zarr"

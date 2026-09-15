@@ -349,7 +349,7 @@ def test_write_server_config_writes_installer_defaults(tmp_path):
     cfg = _write_config(tmp_path / "biopb.json", "/data")
     assert cfg["sources"] == [{"url": "/data", "monitor": True}]
     assert cfg["server"] == {"aggressive_dir_pruning": True}
-    assert cfg["cache"]["backend"] == "file"
+    assert cfg["cache"]["file_max_total_gb"] == 32
 
 
 def test_write_server_config_monitor_is_a_string_comparison(tmp_path):
@@ -386,7 +386,7 @@ def test_write_server_config_keeps_the_users_tuning(tmp_path):
         json.dumps(
             {
                 "server": {"aggressive_dir_pruning": False},
-                "cache": {"backend": "memory", "file_max_total_gb": 4},
+                "cache": {"file_max_segment_mb": 128, "file_max_total_gb": 4},
                 "something_custom": {"kept": True},
                 "sources": [{"url": "/old", "monitor": True}],
             }
@@ -395,7 +395,7 @@ def test_write_server_config_keeps_the_users_tuning(tmp_path):
     cfg = _write_config(tmp_path / "new.json", "/new", prior=str(prior))
     assert cfg["sources"] == [{"url": "/new", "monitor": True}]
     assert cfg["server"] == {"aggressive_dir_pruning": False}
-    assert cfg["cache"] == {"backend": "memory", "file_max_total_gb": 4}
+    assert cfg["cache"] == {"file_max_segment_mb": 128, "file_max_total_gb": 4}
     assert cfg["something_custom"] == {"kept": True}
 
 

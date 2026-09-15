@@ -31,7 +31,6 @@ from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.core.config import (
-    CacheConfig,
     ServerConfig,
     SourceConfig,
     _read_config_file,
@@ -799,85 +798,54 @@ def _setup_flight_server(
     # before any source registers, so it fully takes effect (biopb/biopb#71).
     set_handle_reaper_ttl(server_config.handle_reaper_ttl)
 
-    # Initialize cache manager for virtual chunks
+    # Initialize cache manager for virtual chunks. The file cache mmaps its
+    # segments and assumes local-POSIX semantics (unlinked-but-mapped inodes
+    # stay alive, mapped pages never vanish). A network mount (NFS/CIFS) can
+    # SIGBUS/ESTALE a mapping to an evicted segment, and a cloud
+    # Files-On-Demand folder recalls a dehydrated segment on mmap read -- so
+    # classify the cache dir once and refuse to start rather than serve unsafe
+    # reads (biopb/biopb#571 follow-up). A cache dir that is not writable
+    # (e.g. read-only HPC scratch) fails the same way: the on-disk cache is
+    # required infrastructure now, not an optional accelerator with an
+    # in-memory fallback.
     cache_config = server_config.cache
-    if cache_config.backend == "memory":
-        CacheManager.initialize(cache_config)
+    unsafe = unsafe_cache_dir_reason(cache_config.file_cache_dir)
+    if unsafe:
         console.print(
-            "[green]Virtual chunk cache initialized:[/green] "
-            f"backend=memory, "
-            f"max_entries={cache_config.memory_max_entries}, "
-            f"max_bytes={cache_config.memory_max_bytes // (1024 * 1024)}MB"
+            f"[red]✗ File cache dir {cache_config.file_cache_dir} is on "
+            f"{unsafe}; the mmap-based file cache is unsafe there. Point "
+            "cache.file_cache_dir at a local POSIX filesystem.[/red]"
         )
-        console.print("[green]Raw chunk cache: OS page cache[/green]")
-    elif cache_config.backend == "file":
-
-        def _memory_fallback() -> CacheConfig:
-            return CacheConfig(
-                backend="memory",
-                memory_max_entries=cache_config.memory_max_entries,
-                memory_max_bytes=cache_config.memory_max_bytes,
-            )
-
-        # The file cache mmaps its segments and assumes local-POSIX semantics
-        # (unlinked-but-mapped inodes stay alive, mapped pages never vanish). A
-        # network mount (NFS/CIFS) can SIGBUS/ESTALE a mapping to an evicted
-        # segment, and a cloud Files-On-Demand folder recalls a dehydrated
-        # segment on mmap read -- so classify the cache dir once and fall back to
-        # memory rather than serve unsafe reads (biopb/biopb#571 follow-up). This
-        # also disables the localhost client fast path for free: a memory backend
-        # never locates a chunk, so clients use do_get.
-        unsafe = unsafe_cache_dir_reason(cache_config.file_cache_dir)
-        if unsafe:
-            console.print(
-                f"[yellow]File cache dir {cache_config.file_cache_dir} is on "
-                f"{unsafe}; the mmap-based file cache is unsafe there, falling "
-                f"back to in-memory cache.[/yellow]"
-            )
-            manager = CacheManager.initialize(_memory_fallback())
-        else:
-            try:
-                manager = CacheManager.initialize(cache_config)
-            except OSError as e:
-                # Cache dir not writable (e.g. read-only HPC scratch). Fall back
-                # to the in-memory backend so the server still starts; the
-                # localhost cache-file fast path (issue #9) is simply unavailable.
-                console.print(
-                    f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
-                    f"({e}); falling back to in-memory cache.[/yellow]"
-                )
-                manager = CacheManager.initialize(_memory_fallback())
-        if isinstance(manager.backend, ArrowFileBackend):
-            console.print(
-                "[green]Virtual chunk cache initialized:[/green] "
-                f"backend=file, "
-                f"cache_dir={cache_config.file_cache_dir}, "
-                f"max_segment_mb={cache_config.file_max_segment_bytes // (1024 * 1024)}, "
-                f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
-            )
-            # Check for recovery status
-            recovery_status = manager.backend.get_recovery_status()
-            if recovery_status:
-                console.print(
-                    "[yellow]Cache recovery completed:[/yellow] "
-                    f"recovered={recovery_status.recovered_entries} entries "
-                    f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
-                    f"lost={recovery_status.lost_entries} entries"
-                )
-                # (No per-segment error list here: recovery no longer scans
-                # segment bodies -- biopb/biopb#300 -- so it surfaces no read
-                # errors. Corrupt segments are detected, logged, and dropped by
-                # _rebuild_index_from_segments' own logger.error instead.)
-        else:
-            console.print(
-                "[green]Virtual chunk cache initialized:[/green] backend=memory (fallback)"
-            )
-        console.print("[green]Raw chunk cache: OS page cache[/green]")
-    else:
+        raise typer.Exit(1)
+    try:
+        manager = CacheManager.initialize(cache_config)
+    except OSError as e:
         console.print(
-            f"[yellow]Warning: Unknown cache backend '{cache_config.backend}', using memory[/yellow]"
+            f"[red]✗ File cache unavailable at {cache_config.file_cache_dir} "
+            f"({e})[/red]"
         )
-        CacheManager.initialize(CacheConfig())
+        raise typer.Exit(1)
+    console.print(
+        "[green]Virtual chunk cache initialized:[/green] "
+        f"cache_dir={cache_config.file_cache_dir}, "
+        f"max_segment_mb={cache_config.file_max_segment_bytes // (1024 * 1024)}, "
+        f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
+    )
+    # Check for recovery status. CacheManager is always file-backed now.
+    assert isinstance(manager.backend, ArrowFileBackend)
+    recovery_status = manager.backend.get_recovery_status()
+    if recovery_status:
+        console.print(
+            "[yellow]Cache recovery completed:[/yellow] "
+            f"recovered={recovery_status.recovered_entries} entries "
+            f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
+            f"lost={recovery_status.lost_entries} entries"
+        )
+        # (No per-segment error list here: recovery no longer scans segment
+        # bodies -- biopb/biopb#300 -- so it surfaces no read errors. Corrupt
+        # segments are detected, logged, and dropped by
+        # _rebuild_index_from_segments' own logger.error instead.)
+    console.print("[green]Raw chunk cache: OS page cache[/green]")
 
     # Resolve and separate sources (see _resolve_serve_sources)
     registry = get_default_registry()
@@ -1342,18 +1310,11 @@ def validate(
         raise typer.Exit(1)
 
     console.print("[green]✓ Config valid[/green]")
-    console.print(f"  Cache: backend={server_config.cache.backend}, ")
-    if server_config.cache.backend == "memory":
-        console.print(
-            f"    max_entries={server_config.cache.memory_max_entries}, "
-            f"max_bytes={server_config.cache.memory_max_bytes // (1024 * 1024)}MB"
-        )
-    elif server_config.cache.backend == "file":
-        console.print(
-            f"    cache_dir={server_config.cache.file_cache_dir}, "
-            f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024 * 1024)}, "
-            f"max_total_gb={server_config.cache.file_max_total_bytes // (1024 * 1024 * 1024)}"
-        )
+    console.print(
+        f"  Cache: cache_dir={server_config.cache.file_cache_dir}, "
+        f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024 * 1024)}, "
+        f"max_total_gb={server_config.cache.file_max_total_bytes // (1024 * 1024 * 1024)}"
+    )
     console.print(f"  Sources: {len(sources)} data source(s)")
 
     for source in sources:

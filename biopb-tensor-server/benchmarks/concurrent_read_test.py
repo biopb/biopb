@@ -74,7 +74,6 @@ def _run_server_process(
     try:
         CacheManager.initialize(
             CacheConfig(
-                backend="file",
                 file_cache_dir=Path(temp_cache_dir) / "server-cache",
                 file_max_segment_bytes=256 * 1024 * 1024,
                 file_max_total_bytes=64 * 1024 * 1024 * 1024,

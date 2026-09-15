@@ -17,7 +17,6 @@ from biopb_tensor_server.cache import (
     CacheEntry,
     CacheManager,
     EntryState,
-    MemoryCacheBackend,
 )
 from biopb_tensor_server.cache.file_backend import (
     CACHE_KEY_FIELD,
@@ -29,7 +28,6 @@ from biopb_tensor_server.cache.file_backend import (
     K,
     _get_size_class,
 )
-from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.recovery import (
     ProcessLock,
     WriteAheadLog,
@@ -141,174 +139,6 @@ class TestCacheEntry:
         thread.join()
 
 
-class TestMemoryCacheBackend:
-    """Tests for thread-safe MemoryCacheBackend."""
-
-    def _make_data(self, values) -> pa.RecordBatch:
-        """Helper to create RecordBatch with new schema format."""
-        return pa.RecordBatch.from_arrays(
-            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
-            ["data", "shape", "dtype"],
-        )
-
-    def test_start_compute_creates_pending(self):
-        """First request creates pending entry."""
-        config = MemoryCacheConfig(max_entries=10, max_bytes=1024 * 1024)
-        backend = MemoryCacheBackend(config)
-
-        entry, is_owner = backend.start_compute(b"key1")
-        assert is_owner is True
-        assert entry.state == EntryState.PENDING
-        assert entry.ref_count >= 1
-        backend.close()
-
-    def test_start_compute_ready_entry(self):
-        """Ready entry returns immediately."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
-
-        # Create and complete entry
-        entry, is_owner = backend.start_compute(b"key1")
-        data = self._make_data([1, 2, 3])
-        backend.complete_entry(b"key1", data, 24)
-
-        # Second request should get ready entry
-        entry2, is_owner2 = backend.start_compute(b"key1")
-        assert is_owner2 is False
-        assert entry2.state == EntryState.READY
-        assert entry2.data.column(0).to_pylist() == [[1, 2, 3]]
-        backend.close()
-
-    def test_start_compute_pending_wait(self):
-        """Second request waits on pending entry."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
-
-        results = []
-        ready_event = threading.Event()
-
-        def compute_and_complete():
-            # Wait for waiter to signal it's ready to observe
-            ready_event.wait(timeout=5.0)
-            entry, is_owner = backend.start_compute(b"key1")
-            # Should NOT be owner - waiter already created pending entry
-            assert is_owner is False
-            # Waiter's entry is pending, this thread needs to wait too
-            # Actually, this scenario shouldn't happen - both threads wait on pending
-            # Let's restructure the test
-            entry.wait_ready(timeout=5.0)
-            backend.release(b"key1")
-            results.append("computed")
-
-        def wait_for_ready():
-            entry, is_owner = backend.start_compute(b"key1")
-            # First thread creates pending - is owner
-            assert is_owner is True
-            assert entry.state == EntryState.PENDING
-            # Signal compute thread to start (it will also find pending)
-            ready_event.set()
-            time.sleep(0.1)  # Give compute thread time to see pending
-            # Now complete
-            data = self._make_data([1, 2, 3])
-            backend.complete_entry(b"key1", data, 24)
-            backend.release(b"key1")
-            results.append("waited")
-
-        # Start waiter thread first - it creates pending entry
-        t1 = threading.Thread(target=wait_for_ready)
-        t1.start()
-        # Start compute thread second - it will find pending
-        t2 = threading.Thread(target=compute_and_complete)
-        t2.start()
-
-        t1.join()
-        t2.join()
-
-        assert "waited" in results
-        assert "computed" in results
-        backend.close()
-
-    def test_release(self):
-        """Release decrements ref_count."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
-
-        entry, _ = backend.start_compute(b"key1")
-        data = self._make_data([1])
-        backend.complete_entry(b"key1", data, 8)
-        assert entry.ref_count >= 1
-
-        backend.release(b"key1")
-        assert entry.ref_count == 0
-        backend.close()
-
-    def test_eviction_skips_referenced_entries(self):
-        """Entries with ref_count > 0 cannot be evicted."""
-        config = MemoryCacheConfig(max_entries=3, max_bytes=1024 * 1024)
-        backend = MemoryCacheBackend(config)
-
-        # Create and hold entry
-        entry1, _ = backend.start_compute(b"key1")
-        backend.complete_entry(b"key1", self._make_data([1]), 8)
-
-        # Create more entries (should trigger eviction)
-        entry2, _ = backend.start_compute(b"key2")
-        backend.complete_entry(b"key2", self._make_data([2]), 8)
-        backend.release(b"key2")
-
-        entry3, _ = backend.start_compute(b"key3")
-        backend.complete_entry(b"key3", self._make_data([3]), 8)
-        backend.release(b"key3")
-
-        entry4, _ = backend.start_compute(b"key4")
-        backend.complete_entry(b"key4", self._make_data([4]), 8)
-        backend.release(b"key4")
-
-        # key1 should still exist (has ref_count > 0)
-        assert backend.start_compute(b"key1")[0].state == EntryState.READY
-        backend.close()
-
-    def test_stats_tracking(self):
-        """Statistics are tracked."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
-
-        entry, is_owner = backend.start_compute(b"key1")
-        backend.complete_entry(b"key1", self._make_data([1]), 8)
-        backend.release(b"key1")
-
-        # Hit
-        entry2, _ = backend.start_compute(b"key1")
-        backend.release(b"key1")
-
-        stats = backend.stats()
-        assert stats.hits == 1
-        assert stats.misses == 1
-        backend.close()
-
-    def test_clear_evictable_only(self):
-        """Clear only removes evictable entries."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
-
-        entry1, _ = backend.start_compute(b"key1")
-        backend.complete_entry(b"key1", self._make_data([1]), 8)
-        # Don't release - still referenced
-
-        entry2, _ = backend.start_compute(b"key2")
-        backend.complete_entry(b"key2", self._make_data([2]), 8)
-        backend.release(b"key2")  # Evictable
-
-        backend.clear()
-
-        # key1 should still exist
-        assert backend.start_compute(b"key1")[0].state == EntryState.READY
-        # key2 should be gone
-        entry, is_owner = backend.start_compute(b"key2")
-        assert is_owner is True  # New computation needed
-        backend.close()
-
-
 class TestProbeWithoutComputing:
     """`contains` / `try_acquire`: the read half of the promise, on its own.
 
@@ -326,19 +156,15 @@ class TestProbeWithoutComputing:
             ["data", "shape", "dtype"],
         )
 
-    @pytest.fixture(params=["memory", "file"])
-    def backend(self, request, tmp_path):
-        """Both backends: the probe is driven on whichever one is configured."""
-        if request.param == "memory":
-            be = MemoryCacheBackend(MemoryCacheConfig(max_entries=10))
-        else:
-            be = ArrowFileBackend(
-                ArrowFileConfig(
-                    cache_dir=tmp_path / "cache",
-                    max_segment_bytes=1024 * 1024,
-                    max_total_bytes=10 * 1024 * 1024,
-                )
+    @pytest.fixture
+    def backend(self, tmp_path):
+        be = ArrowFileBackend(
+            ArrowFileConfig(
+                cache_dir=tmp_path / "cache",
+                max_segment_bytes=1024 * 1024,
+                max_total_bytes=10 * 1024 * 1024,
             )
+        )
         try:
             yield be
         finally:
@@ -470,30 +296,8 @@ class TestProbeWithoutComputing:
         finally:
             backend.close()
 
-    def test_an_untouched_probe_does_not_refresh_lru(self):
-        """Same on the memory backend, where LRU position *is* the policy."""
-        backend = MemoryCacheBackend(MemoryCacheConfig(max_entries=10))
-        try:
-            for key in (b"a", b"b"):
-                backend.start_compute(key)
-                backend.complete_entry(key, self._data([1]), 8)
-                backend.release(key)
-            oldest = next(iter(backend._entries))
-
-            backend.try_acquire(oldest, touch=False)
-            backend.release(oldest)
-            assert next(iter(backend._entries)) == oldest, "probe must not promote"
-
-            backend.try_acquire(oldest)
-            backend.release(oldest)
-            assert next(iter(backend._entries)) != oldest, "a real read promotes"
-        finally:
-            backend.close()
-
     def test_the_manager_drives_both(self, tmp_path):
-        manager = CacheManager(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        manager = CacheManager(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             assert manager.contains(b"nope") is False
             assert manager.try_acquire(b"nope") is None
@@ -509,7 +313,7 @@ class TestProbeWithoutComputing:
 class TestCacheManager:
     """Tests for CacheManager singleton."""
 
-    def test_initialize_singleton(self):
+    def test_initialize_singleton(self, tmp_path):
         """Singleton initialization is thread-safe."""
         CacheManager.reset()
 
@@ -523,7 +327,7 @@ class TestCacheManager:
             with init_lock:
                 if not first_done.is_set():
                     # First thread initializes
-                    config = CacheConfig(backend="memory")
+                    config = CacheConfig(file_cache_dir=tmp_path / "cache")
                     manager = CacheManager.initialize(config)
                     first_done.set()
                 else:
@@ -548,10 +352,12 @@ class TestCacheManager:
             ["data", "shape", "dtype"],
         )
 
-    def test_put_stores_the_batch(self):
+    def test_put_stores_the_batch(self, tmp_path):
         """put() commits an already-computed batch and reports that it stored it."""
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         assert manager.put(b"key1", self._batch(), 24) is True
 
@@ -561,7 +367,7 @@ class TestCacheManager:
         manager.release(b"key1")
         CacheManager.reset()
 
-    def test_put_holds_no_reference(self):
+    def test_put_holds_no_reference(self, tmp_path):
         """put() leaves the entry unreferenced, so the cache can reclaim it.
 
         The leak this API replaced (biopb/biopb#545): the caller drove
@@ -570,7 +376,9 @@ class TestCacheManager:
         making the entry permanently un-removable.
         """
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         manager.put(b"key1", self._batch(), 24)
 
@@ -580,10 +388,12 @@ class TestCacheManager:
         assert manager.remove(b"key1") is True
         CacheManager.reset()
 
-    def test_put_declines_an_existing_key(self):
+    def test_put_declines_an_existing_key(self, tmp_path):
         """A second put() does not overwrite -- the incumbent batch survives."""
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         assert manager.put(b"key1", self._batch(), 24) is True
 
@@ -598,13 +408,15 @@ class TestCacheManager:
         manager.release(b"key1")
         CacheManager.reset()
 
-    def test_put_failure_leaves_no_pending_entry(self):
+    def test_put_failure_leaves_no_pending_entry(self, tmp_path):
         """A commit that raises must not strand a PENDING entry.
 
         Readers of that key would otherwise block on it until pending_timeout.
         """
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         def boom(*args, **kwargs):
             raise OSError("no space left on device")
@@ -620,10 +432,9 @@ class TestCacheManager:
 class TestConcurrentCompute:
     """Tests for concurrent computation scenarios."""
 
-    def test_concurrent_same_key_only_one_computes(self):
+    def test_concurrent_same_key_only_one_computes(self, tmp_path):
         """Multiple threads requesting same key - only one computes."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
+        backend = ArrowFileBackend(ArrowFileConfig(cache_dir=tmp_path / "cache"))
 
         compute_counts = [0]  # Use list for thread-safe increment
         compute_lock = threading.Lock()
@@ -655,10 +466,9 @@ class TestConcurrentCompute:
         assert compute_counts[0] == 1
         backend.close()
 
-    def test_concurrent_different_keys(self):
+    def test_concurrent_different_keys(self, tmp_path):
         """Different keys are computed independently."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
+        backend = ArrowFileBackend(ArrowFileConfig(cache_dir=tmp_path / "cache"))
 
         results = {}
 
@@ -686,10 +496,11 @@ class TestConcurrentCompute:
         assert len(results) == 3
         backend.close()
 
-    def test_timeout_on_pending(self):
+    def test_timeout_on_pending(self, tmp_path):
         """Waiting on pending entry returns False on timeout."""
-        config = MemoryCacheConfig(max_entries=10, pending_timeout=0.5)
-        backend = MemoryCacheBackend(config)
+        backend = ArrowFileBackend(
+            ArrowFileConfig(cache_dir=tmp_path / "cache", pending_timeout=0.5)
+        )
 
         entry, is_owner = backend.start_compute(b"key1")
         assert is_owner is True
@@ -1377,50 +1188,6 @@ class TestArrowFileBackendRecovery:
         shutil.rmtree(cache_dir)
 
 
-class TestBackendSelection:
-    """Tests for CacheManager backend selection."""
-
-    def test_memory_backend_selection(self):
-        """Config with backend='memory' uses MemoryCacheBackend."""
-        CacheManager.reset()
-        config = CacheConfig(
-            backend="memory",
-            memory_max_entries=100,
-            memory_max_bytes=1024 * 1024,
-        )
-        manager = CacheManager.initialize(config)
-        assert isinstance(manager.backend, MemoryCacheBackend)
-        CacheManager.reset()
-
-    def test_file_backend_selection(self):
-        """Config with backend='file' uses ArrowFileBackend."""
-        CacheManager.reset()
-        cache_dir = Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
-        config = CacheConfig(
-            backend="file",
-            file_cache_dir=cache_dir,
-            file_max_segment_bytes=1024 * 1024,
-            file_max_total_bytes=10 * 1024 * 1024,
-        )
-        manager = CacheManager.initialize(config)
-        assert isinstance(manager.backend, ArrowFileBackend)
-        CacheManager.reset()
-        shutil.rmtree(cache_dir)
-
-    def test_unknown_backend_raises(self):
-        """Unknown backend raises ValueError.
-
-        Config *files* never get here -- the read step clamps a bad backend to
-        the default (biopb/biopb#34) -- so this guards the in-process caller that
-        builds a CacheConfig directly.
-        """
-        CacheManager.reset()
-        config = CacheConfig(backend="unknown")
-        with pytest.raises(ValueError, match="Unknown cache backend"):
-            CacheManager.initialize(config)
-        CacheManager.reset()
-
-
 class TestOversizedChunkHandling:
     """Tests for oversized chunk handling (>2GB)."""
 
@@ -1429,26 +1196,6 @@ class TestOversizedChunkHandling:
             [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
             ["data", "shape", "dtype"],
         )
-
-    def test_memory_backend_skips_oversized(self):
-        """Memory backend skips caching oversized chunks."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
-
-        entry, is_owner = backend.start_compute(b"big_key")
-        # Simulate oversized chunk (use MAX_ARROW_BATCH_BYTES + 1)
-        oversized_bytes = MAX_ARROW_BATCH_BYTES + 1
-        data = self._make_data([1])
-        backend.complete_entry(b"big_key", data, oversized_bytes)
-
-        # Entry should be ready but not stored in cache properly
-        assert entry.state == EntryState.READY
-
-        # Stats should show oversized skip
-        stats = backend.stats()
-        assert stats.oversized_skips == 1
-
-        backend.close()
 
     def test_file_backend_skips_oversized(self):
         """File backend skips caching oversized chunks."""

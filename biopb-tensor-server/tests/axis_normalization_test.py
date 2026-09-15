@@ -12,6 +12,7 @@ Covers the rule (``core.axes.canonical_permutation``), the seam that applies it
    advertised order at the proxy's read boundary.
 """
 
+import os
 import tempfile
 import threading
 import time
@@ -533,7 +534,7 @@ class TestNormalizedCaching:
         with tempfile.TemporaryDirectory() as tmp:
             CacheManager.reset()
             CacheManager.initialize(
-                CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+                CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
             )
             try:
                 cache = CacheManager.get_instance()
@@ -641,7 +642,7 @@ class TestServedOverFlight:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = (np.arange(8 * 12 * 3, dtype=np.uint16) % 251).reshape(8, 12, 3)
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("nii", _zarr_adapter(tmp, src, ["x", "y", "z"], "nii"))
@@ -665,7 +666,7 @@ class TestServedOverFlight:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = (np.arange(8 * 12, dtype=np.uint16) % 251).reshape(8, 12)
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("img", _zarr_adapter(tmp, src, ["y", "x"], "img"))
@@ -742,7 +743,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
         up = _legacy_upstream(tmp, src, ["x", "y", "z"])
         down = TensorFlightServer("grpc://localhost:0")
@@ -778,7 +779,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
         up = _legacy_upstream(tmp, src, ["x", "y", "z"])
         down = TensorFlightServer("grpc://localhost:0")
@@ -802,7 +803,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = (np.arange(4 * 3 * 8, dtype=np.uint16) % 251).reshape(4, 3, 8)
         up = _legacy_upstream(tmp, src, ["z", "y", "x"])
         down = TensorFlightServer("grpc://localhost:0")

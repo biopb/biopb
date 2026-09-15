@@ -186,12 +186,6 @@ class CacheBackend(ABC):
     pattern for safe concurrent access.
     """
 
-    # Whether ``complete_entry`` accepts ``allow_deferred`` -- i.e. whether this
-    # backend can commit an entry before its write lands. False keeps the
-    # historical signature, so a backend that predates deferred writes, or one
-    # written outside this tree, is called exactly as it always was.
-    SUPPORTS_DEFERRED_WRITES: bool = False
-
     @abstractmethod
     def get_or_acquire(
         self,
@@ -245,6 +239,7 @@ class CacheBackend(ABC):
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
+        allow_deferred: bool = True,
     ) -> None:
         """Mark a pending entry as ready with computed data.
 
@@ -255,6 +250,11 @@ class CacheBackend(ABC):
             key: Cache key bytes
             data: Computed RecordBatch
             size_bytes: Size of data in bytes
+            allow_deferred: Whether the write may commit the entry from memory
+                before it lands on disk (see ``ArrowFileBackend._enqueue_write``).
+                ``CacheManager.put`` passes False: an upload has no backend copy
+                to fall back to, so it must not return until the bytes are on
+                disk.
         """
 
     @abstractmethod
@@ -305,8 +305,8 @@ class CacheBackend(ABC):
 
         The graceful-shutdown fast path (biopb/biopb#300): release the lock
         *first*, cheaply and upstream-independently, while segment writers/mmaps
-        stay open for any still-draining reads. Backends with no process lock
-        (memory) inherit this no-op default; the file backend overrides it.
+        stay open for any still-draining reads. No-op by default; the file
+        backend overrides it.
         """
 
     @abstractmethod
@@ -347,10 +347,9 @@ class CacheBackend(ABC):
         Backs the localhost cache-file handoff (issue #9), where a same-host
         client mmaps the segment instead of streaming the chunk over do_get.
         Declared here -- rather than sniffed with ``getattr`` -- because the
-        manager drives it on *every* backend, so a backend that cannot locate
-        (the memory backend has no segment files) should say so through the
-        interface. None means "fall back to do_get", the designed floor of the
-        whole path.
+        manager drives it on every backend; a backend with nothing to locate
+        inherits this None default. None means "fall back to do_get", the
+        designed floor of the whole path.
         """
         return None
 
@@ -360,9 +359,9 @@ class CacheBackend(ABC):
         """Handle a chunk too large to cache; True if the caller should stop.
 
         An oversized chunk is still handed to the threads waiting on it -- the
-        entry goes READY in memory -- it just is not stored. Shared by both
-        backends, which supply the ``_lock`` / ``_entries`` / ``_oversized_skips``
-        state this reads.
+        entry goes READY in memory -- it just is not stored. Relies on the
+        ``_lock`` / ``_entries`` / ``_oversized_skips`` state a concrete backend
+        supplies.
         """
         if size_bytes <= MAX_ARROW_BATCH_BYTES:
             return False

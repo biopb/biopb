@@ -73,7 +73,6 @@ from biopb_tensor_server.cache import (
     CacheManager,
     CacheStats,
     EntryState,
-    MemoryCacheBackend,
 )
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -130,7 +129,6 @@ __all__ = [
     "CacheBackend",
     "CacheEntry",
     "CacheStats",
-    "MemoryCacheBackend",
     "EntryState",
     "CacheConfig",
 ]

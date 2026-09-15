@@ -2072,7 +2072,7 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
         )
 
         cache_manager = CacheManager(
-            CacheConfig(backend="file", file_cache_dir=str(tmp_path / "cache"))
+            CacheConfig(file_cache_dir=str(tmp_path / "cache"))
         )
 
         # The client's chunk_id is a proxy envelope wrapping the UPSTREAM chunk_id

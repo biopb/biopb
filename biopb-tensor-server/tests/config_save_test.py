@@ -47,7 +47,7 @@ def test_round_trips_raw_dict_preserving_unknown_keys(tmp_path):
     path = tmp_path / CANONICAL_CONFIG_NAME
     data = {
         "server": {"host": "127.0.0.1", "port": 9000},
-        "cache": {"backend": "memory"},
+        "cache": {"file_max_total_gb": 4},
         # An advanced / future key the form never surfaces -- must survive.
         "experimental_knob": {"deep": [1, 2, 3]},
     }

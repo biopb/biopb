@@ -12,8 +12,6 @@ Exports:
     - ChunkLocation: On-disk byte range of a cached chunk (localhost handoff)
     - EntryState: PENDING, READY, or ERROR states
     - RetentionClass: what a miss costs ("cheap" | "normal" | "pinned")
-    - MemoryCacheBackend: In-memory LRU cache backend
-    - MemoryCacheConfig: Configuration for memory backend
     - ArrowFileBackend: Persistent Arrow file cache backend
     - ArrowFileConfig: Configuration for file backend
     - RecoveryStatus: Result of crash recovery
@@ -36,10 +34,6 @@ from biopb_tensor_server.cache.file_backend import (
     ArrowFileConfig,
 )
 from biopb_tensor_server.cache.manager import CacheManager
-from biopb_tensor_server.cache.memory_backend import (
-    MemoryCacheBackend,
-    MemoryCacheConfig,
-)
 from biopb_tensor_server.cache.recovery import RecoveryStatus
 
 __all__ = [
@@ -49,8 +43,6 @@ __all__ = [
     "CacheStats",
     "ChunkLocation",
     "EntryState",
-    "MemoryCacheBackend",
-    "MemoryCacheConfig",
     "ArrowFileBackend",
     "ArrowFileConfig",
     "CACHE_FILE_FORMAT_VERSION",

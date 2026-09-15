@@ -124,7 +124,7 @@ def _start_server(zarr_path: str):
 
     cache_dir = Path(tempfile.mkdtemp()) / "cache"
     CacheManager.reset()
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=str(cache_dir)))
+    CacheManager.initialize(CacheConfig(file_cache_dir=str(cache_dir)))
 
     server = TensorFlightServer("grpc://localhost:0")
     server.register_source(

@@ -743,8 +743,8 @@ class TestPrecacheSkipsUnresolved:
             sources = _Registry()
 
         worker = PrecacheWorker(_Srv(), PrecacheConfig())
-        # Past the file-backend gate so the real source-processing logic runs.
-        monkeypatch.setattr(worker, "_file_backend_active", lambda: True)
+        # Past the cache gate so the real source-processing logic runs.
+        monkeypatch.setattr(worker, "_cache_active", lambda: True)
         assert worker._process_source("s1") is False
         assert proxy.is_resolved is False
 

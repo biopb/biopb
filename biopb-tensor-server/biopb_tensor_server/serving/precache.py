@@ -16,8 +16,8 @@ It serves two tiers, in strict priority order:
 
 Design constraints (all best-effort, never fatal to the server):
 
-- **File backend only.** Inert unless the cache is the persistent
-  ``ArrowFileBackend``; on a memory backend it drops queued work.
+- **Inert without a cache.** Drops queued work when no ``CacheManager`` is
+  configured -- otherwise warming has nowhere to land.
 - **Stays out of the way.** Before each chunk it waits until the Flight server
   has been idle for ``idle_debounce_seconds`` (no in-flight ``do_get``), and it
   re-checks between chunks so a burst of live traffic preempts it at chunk
@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
-from biopb_tensor_server.cache import ArrowFileBackend, CacheManager
+from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.chunk import (
     compute_warm_selection,
     compute_warm_targets,
@@ -184,9 +184,9 @@ class PrecacheWorker:
                 self._process_live(source_id)
                 continue
 
-            # 2. Backlog tier (secondary): only on a file backend with headroom.
+            # 2. Backlog tier (secondary): only with a cache and headroom.
             if self._backlog_has_items():
-                if not self._file_backend_active():
+                if not self._cache_active():
                     self._clear_backlog()
                     continue
                 if not self._has_headroom():
@@ -258,12 +258,9 @@ class PrecacheWorker:
 
     # -- gates -------------------------------------------------------------
 
-    def _file_backend_active(self) -> bool:
-        """True only when the persistent file cache is in use."""
-        cache_manager = CacheManager.get_instance()
-        return cache_manager is not None and isinstance(
-            cache_manager.backend, ArrowFileBackend
-        )
+    def _cache_active(self) -> bool:
+        """True only when a cache manager is configured to warm into."""
+        return CacheManager.get_instance() is not None
 
     def _has_headroom(self) -> bool:
         """True while the file cache is below the backlog high-water mark.
@@ -296,10 +293,9 @@ class PrecacheWorker:
     def _process_source(self, source_id: str, backlog: bool = False) -> bool:
         """Warm every tensor of a source. Return True if a backlog pass was
         preempted (and should be re-queued)."""
-        # Runtime file-backend gate: the "only run if file-based caching"
-        # condition, enforced regardless of config.
-        if not self._file_backend_active():
-            logger.debug("precache: file backend not active, skipping %s", source_id)
+        # Runtime cache gate: nothing to warm into without a CacheManager.
+        if not self._cache_active():
+            logger.debug("precache: no cache configured, skipping %s", source_id)
             return False
         # Residency gate (#174): under a cloud root, skip a source whose member
         # files have been re-dehydrated since registration. Reading them would

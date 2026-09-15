@@ -350,9 +350,8 @@ def _start_embedded_tensor_cache(
         except Exception as e:
             logger.warning(f"Could not remove stale lock: {e}")
 
-    # Initialize cache manager singleton with file backend
+    # Initialize cache manager singleton with the on-disk Arrow file cache
     cache_config = CacheConfig(
-        backend="file",
         file_cache_dir=cache_dir,
         file_max_segment_bytes=64 * 1024 * 1024,  # 64MB segments
         file_max_total_bytes=cache_size,

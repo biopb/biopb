@@ -174,9 +174,7 @@ class TestPersistence:
         cache_dir = tmp_path / "cache"
         db = self._catalog(tmp_path)
         try:
-            manager = CacheManager(
-                CacheConfig(backend="file", file_cache_dir=cache_dir)
-            )
+            manager = CacheManager(CacheConfig(file_cache_dir=cache_dir))
             active_decode_rates().attach(db)
             _converge(active_decode_rates(), "src", 800.0)
             manager.close()
@@ -361,9 +359,7 @@ class TestTheSampleSite:
 
     @pytest.fixture
     def manager(self, tmp_path):
-        mgr = CacheManager(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        mgr = CacheManager(CacheConfig(file_cache_dir=tmp_path / "cache"))
         yield mgr
         mgr.close()
 
@@ -423,7 +419,6 @@ class TestTheManagerWiring:
         store is the catalog's, attached separately at startup."""
         mgr = CacheManager(
             CacheConfig(
-                backend="file",
                 file_cache_dir=tmp_path / "cache",
                 cheap_decode_mbps=500.0,
             )
@@ -440,7 +435,7 @@ class TestTheManagerWiring:
         db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
         db.open()
         try:
-            mgr = CacheManager(CacheConfig(backend="memory"))
+            mgr = CacheManager(CacheConfig(file_cache_dir=tmp_path / "cache"))
             active_decode_rates().attach(db)
             _converge(active_decode_rates(), "src", 800.0)
             mgr.close()
@@ -451,7 +446,7 @@ class TestTheManagerWiring:
 
     def test_the_cache_directory_holds_no_measurements(self, tmp_path):
         cache_dir = tmp_path / "cache"
-        mgr = CacheManager(CacheConfig(backend="file", file_cache_dir=cache_dir))
+        mgr = CacheManager(CacheConfig(file_cache_dir=cache_dir))
         _converge(active_decode_rates(), "src", 800.0)
         mgr.close()
 
@@ -481,7 +476,7 @@ class TestTheStartupWiring:
         config_path.write_text(
             json.dumps(
                 {
-                    "cache": {"backend": "memory"},
+                    "cache": {"file_cache_dir": str(tmp_path / "cache")},
                     "sources": [],
                     "annotations": annotations,
                 }
@@ -551,9 +546,7 @@ class TestTheExemptSourceKinds:
         adapter = _Borrowed(zarr.open_array(str(path), mode="r"), "lent", ["y", "x"])
 
         set_active_decode_rates(DecodeRates(cheap_mbps=1e-6))  # everything clears it
-        manager = CacheManager(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        manager = CacheManager(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             bounds = ChunkBounds(start=[0, 0], stop=[128, 128])
             adapter.resolve_chunk_data(encode_chunk_id("lent", bounds), manager)
@@ -569,9 +562,7 @@ class TestTheExemptSourceKinds:
         from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 
         set_active_decode_rates(DecodeRates(cheap_mbps=1e-6))  # everything clears it
-        manager = CacheManager(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        manager = CacheManager(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             CacheManager._instance = manager
             adapter = CachedSourceAdapter(

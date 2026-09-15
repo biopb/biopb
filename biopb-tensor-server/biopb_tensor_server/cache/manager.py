@@ -20,10 +20,6 @@ from biopb_tensor_server.cache.base import (
     RetentionClass,
 )
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
-from biopb_tensor_server.cache.memory_backend import (
-    MemoryCacheBackend,
-    MemoryCacheConfig,
-)
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.retention import DecodeRates, set_active_decode_rates
 
@@ -48,7 +44,7 @@ class CacheManager:
     _init_lock = threading.Lock()
 
     def __init__(self, config: CacheConfig):
-        """Initialize with CacheConfig, selecting backend based on config.backend."""
+        """Initialize with CacheConfig, backed by the on-disk Arrow file cache."""
         # On the manager rather than the backend: the scaled read holds the
         # manager and nothing else of the config.
         self.source_scaled_reads = bool(config.source_scaled_reads)
@@ -59,26 +55,14 @@ class CacheManager:
         # core.retention).
         self._rates = DecodeRates(config.cheap_decode_mbps)
         set_active_decode_rates(self._rates)
-        if config.backend == "memory":
-            self._backend = MemoryCacheBackend(
-                MemoryCacheConfig(
-                    max_entries=config.memory_max_entries,
-                    max_bytes=config.memory_max_bytes,
-                )
+        self._backend = ArrowFileBackend(
+            ArrowFileConfig(
+                cache_dir=config.file_cache_dir,
+                max_segment_bytes=config.file_max_segment_bytes,
+                max_total_bytes=config.file_max_total_bytes,
+                max_deferred_write_bytes=config.file_deferred_write_mb * 1024 * 1024,
             )
-        elif config.backend == "file":
-            self._backend = ArrowFileBackend(
-                ArrowFileConfig(
-                    cache_dir=config.file_cache_dir,
-                    max_segment_bytes=config.file_max_segment_bytes,
-                    max_total_bytes=config.file_max_total_bytes,
-                    max_deferred_write_bytes=config.file_deferred_write_mb
-                    * 1024
-                    * 1024,
-                )
-            )
-        else:
-            raise ValueError(f"Unknown cache backend: {config.backend}")
+        )
 
     @classmethod
     def initialize(cls, config: CacheConfig) -> CacheManager:
@@ -196,14 +180,9 @@ class CacheManager:
         _entry, is_owner = self._backend.start_compute(key, retention)
         try:
             if is_owner:
-                if self._backend.SUPPORTS_DEFERRED_WRITES:
-                    self._backend.complete_entry(
-                        key, data, size_bytes, allow_deferred=False
-                    )
-                else:
-                    # A backend that cannot defer is called as it always was, so
-                    # one written against the historical signature keeps working.
-                    self._backend.complete_entry(key, data, size_bytes)
+                self._backend.complete_entry(
+                    key, data, size_bytes, allow_deferred=False
+                )
         except BaseException as e:
             # A failed commit must not strand a PENDING entry: readers of this
             # key would block on it until pending_timeout.
@@ -234,11 +213,9 @@ class CacheManager:
         return True if waiter is None else waiter(key, timeout)
 
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
-        """Return the on-disk ChunkLocation for a cached chunk, or None.
+        """Return the on-disk ChunkLocation for a cached chunk, or None (issue #9).
 
-        Only the file backend can locate entries on disk (issue #9); the memory
-        backend inherits the interface's None default and the caller falls back
-        to do_get.
+        None means the caller falls back to do_get.
         """
         return self._backend.locate_entry(key)
 
@@ -253,9 +230,8 @@ class CacheManager:
     def release_process_lock(self) -> None:
         """Release the cross-process cache lock + clear the WAL, handles left open.
 
-        Delegates to the backend's fast graceful-shutdown path (no-op on the
-        memory backend). Callers guard the singleton for ``None`` themselves
-        (``CacheManager.get_instance()``).
+        Delegates to the backend's fast graceful-shutdown path. Callers guard
+        the singleton for ``None`` themselves (``CacheManager.get_instance()``).
         """
         self._backend.release_process_lock()
 
