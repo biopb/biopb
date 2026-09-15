@@ -51,6 +51,13 @@ logger = logging.getLogger(__name__)
 COLD_THRESHOLD_SECONDS = 300  # 5 minutes without access
 MMAP_LIFECYCLE_THRESHOLD = 100  # Only manage mmaps when segments > 100
 
+# Longest ``flush_deferred_writes`` sleeps between re-examining its predicate.
+# Its per-key sibling is purely signalled, but this one also tests
+# ``_write_queue.empty()``, which is outside ``_lock`` and has no notifier (the
+# stop sentinel and task_done do not signal). The cap bounds that half; it is a
+# shutdown/test path, so 50 ms of latency there costs nothing.
+_DRAIN_RECHECK_SECONDS = 0.05
+
 
 # Size class thresholds for pooling. A segment holds one class, so what this
 # buys is a uniform eviction granularity: a "large" segment loses one entry when
@@ -225,6 +232,14 @@ class ArrowFileBackend(CacheBackend):
         # `Queue` not `queue.Queue`: this module already uses `queue` as a
         # local name when ranking pool queues, and the module import shadows it.
         self._write_queue: Queue = Queue()
+        # Signalled when a key leaves ``_deferred`` -- i.e. when its write has
+        # landed (or failed). Shares ``_lock``, which already guards ``_deferred``,
+        # so the waiter's predicate and its wakeup are the same critical section
+        # and a write cannot land between the check and the wait.
+        #
+        # ``Condition.wait`` releases ``_lock`` while blocked, so this does not
+        # violate the "never hold _lock across a blocking operation" rule above.
+        self._write_done = threading.Condition(self._lock)
         self._deferred: set = set()
         self._queued_bytes = 0
         self._deferred_write_failures = 0
@@ -1739,6 +1754,12 @@ class ArrowFileBackend(CacheBackend):
                         entry = self._entries.get(key)
                         if entry is not None:
                             entry.release()
+                        # Wake anyone waiting for this key (a chunk_locate that
+                        # needs the byte range) or for the queue to drain
+                        # (shutdown). notify_all, not notify: the waiters have
+                        # different predicates, so waking one that does not care
+                        # would leave the one that does asleep.
+                        self._write_done.notify_all()
             finally:
                 self._write_queue.task_done()
 
@@ -1753,32 +1774,45 @@ class ArrowFileBackend(CacheBackend):
 
         Returns True when there is nothing to wait for, so a caller can treat it
         as "is this locatable now" without knowing whether deferral is on.
+
+        Signalled, not polled. The write this waits on is one the caller just
+        triggered and it lands in well under a millisecond, so a sleep-poll paid
+        its full step every time rather than occasionally: measured at a flat
+        ~2.07 ms on every deferred locate, against a ~290 us warm chunk_locate
+        RTT. ``_drain_writes`` notifies under the same lock that guards
+        ``_deferred``, so there is no check-then-sleep gap to lose a wakeup in.
         """
-        deadline = time.time() + timeout
-        while True:
-            with self._lock:
-                if key not in self._deferred:
-                    return True
-            if time.time() >= deadline:
-                return False
-            time.sleep(0.002)
+        deadline = time.monotonic() + timeout
+        with self._write_done:
+            while key in self._deferred:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._write_done.wait(remaining)
+            return True
 
     def flush_deferred_writes(self, timeout: Optional[float] = None) -> bool:
         """Block until the queue drains. Returns False on timeout.
 
         For shutdown and for tests that need "is it on disk yet" to be a
-        question with an answer.
+        question with an answer. Woken by ``_drain_writes`` like its per-key
+        sibling, but re-checks every ``_DRAIN_RECHECK_SECONDS`` because half its
+        predicate (``_write_queue.empty()``) has no notifier.
         """
         if self._writer_thread is None:
             return True
-        deadline = None if timeout is None else time.time() + timeout
-        while True:
-            with self._lock:
-                if not self._deferred and self._write_queue.empty():
-                    return True
-            if deadline is not None and time.time() >= deadline:
-                return False
-            time.sleep(0.005)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._write_done:
+            while self._deferred or not self._write_queue.empty():
+                if deadline is None:
+                    remaining = _DRAIN_RECHECK_SECONDS
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    remaining = min(remaining, _DRAIN_RECHECK_SECONDS)
+                self._write_done.wait(remaining)
+            return True
 
     def _stop_writer(self, timeout: float = 60.0) -> bool:
         """Retire the writer thread. False means it is still running.

@@ -536,3 +536,56 @@ def test_a_clean_drain_still_clears_everything(directory):
 
     assert not backend._wal.has_pending()
     assert not backend._process_lock.is_held()
+
+
+def test_waiting_for_a_deferred_write_is_signalled_not_polled(directory, monkeypatch):
+    """``flush_deferred_write`` sleeps on the writer, not on a clock.
+
+    The wait exists for chunk_locate, which answers with a segment byte range and
+    so cannot be served until the bytes land. A sleep-poll paid its whole step
+    every time rather than now and then -- the write it waits on is one the
+    caller just triggered, and lands well inside a single step -- which put a
+    flat ~2 ms on every deferred locate against a ~290 us warm RTT.
+
+    Asserted by mechanism rather than by clock: a wait that calls ``time.sleep``
+    at all is polling, whatever it measures on the day.
+    """
+    backend = _backend(directory, deferred_mb=64)
+    slept = []
+    monkeypatch.setattr(
+        "biopb_tensor_server.cache.file_backend.time.sleep",
+        lambda seconds: slept.append(seconds),
+    )
+    try:
+        for index in range(8):
+            key = f"s{index}".encode()
+            _store(backend, key, _batch(index))
+            assert backend.flush_deferred_write(key, timeout=10) is True
+            # It really was deferred, so the wait above was a real one.
+            assert backend.locate_entry(key) is not None
+            backend.release(key)
+        assert slept == [], f"flush_deferred_write polled: slept {slept}"
+    finally:
+        backend.close()
+
+
+def test_a_deferred_write_that_never_lands_still_times_out(directory):
+    """The signalled wait keeps the deadline it replaced.
+
+    A writer wedged on a full filesystem must not hold a locate forever; the
+    handler falls back to do_get on a False return.
+    """
+    backend = _backend(directory, deferred_mb=64)
+    gate = threading.Event()
+    _hold_the_writer(backend, gate)
+    try:
+        key = b"stuck"
+        _store(backend, key, _batch(99))
+        started = time.monotonic()
+        assert backend.flush_deferred_write(key, timeout=0.25) is False
+        waited = time.monotonic() - started
+        assert 0.25 <= waited < 5.0, f"timeout not honoured (waited {waited:.3f}s)"
+    finally:
+        gate.set()
+        backend.flush_deferred_writes(timeout=30)
+        backend.close()
