@@ -273,11 +273,12 @@ def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> N
        is not dangerous (a client that trusts it fails to verify, loudly) but it
        would leave the next plane on this port inheriting a claim it never made.
     1. Stop the precache worker -- no new warm writes.
-    2. Release the process lock + clear the WAL IMMEDIATELY. Cheap and
-       upstream-independent; leaves segment writers/mmaps OPEN (closing them here
-       would race the in-flight ``do_get`` reads the drain has not finished).
-       Clearing the WAL early is safe -- index rebuild tolerates a torn tail.
-       After this, even a SIGKILL during the steps below finds the lock released.
+    2. Release the process lock IMMEDIATELY. Cheap and upstream-independent;
+       leaves segment writers/mmaps OPEN (closing them here would race the
+       in-flight ``do_get`` reads the drain has not finished). Releasing early is
+       safe -- an interrupted write leaves a torn tail the index rebuild
+       tolerates. After this, even a SIGKILL during the steps below finds the
+       lock released.
     3. Drain the Flight server, BOUNDED. ``FlightServerBase.shutdown()`` takes no
        timeout and can block unbounded on an upstream-gated stream, so run it in a
        daemon thread and join with a short bound; on timeout, proceed (the process
@@ -285,7 +286,7 @@ def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> N
     4. Full cache close ONLY on a clean drain -- closes writers/mmaps for proper
        finalization (matters on Windows). Skipped if the drain timed out: a stuck
        in-flight ``do_get`` may still touch an mmap, so closing it could segfault,
-       and the essential work (lock + WAL) already happened in step 2. ``close()``'s
+       and the essential work (the lock) already happened in step 2. ``close()``'s
        own lock-release is then a harmless no-op (already released).
     5. Stop the source manager last (short join) -- it does not touch the chunk
        cache and the lock is already gone, so a long join has no value; a short
@@ -296,8 +297,8 @@ def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> N
     drain_ok = {"value": False}
 
     def _release_lock() -> None:
-        # Cheap, upstream-independent: clear the WAL + drop the process lock while
-        # leaving writers/mmaps open (no-op for the memory backend).
+        # Cheap, upstream-independent: drop the process lock while leaving
+        # writers/mmaps open.
         manager = CacheManager.get_instance()
         if manager is not None:
             manager.release_process_lock()
@@ -330,7 +331,7 @@ def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> N
     def _close_cache_if_drained() -> None:
         # Full close (writers/mmaps) only after a clean drain. If the drain timed
         # out a stuck do_get could still touch an mmap, so closing mid-flight
-        # risks a segfault; the lock + WAL were already handled in step 2.
+        # risks a segfault; the lock was already handled in step 2.
         if not drain_ok["value"]:
             return
         manager = CacheManager.get_instance()

@@ -29,6 +29,7 @@ __all__ = [
     "CACHE_KEY_FIELD",
     "SIDECAR_FORMAT_VERSION",
     "IndexRecord",
+    "SegmentScan",
     "read_sidecar",
     "scan_segment_records",
     "write_sidecar",
@@ -75,6 +76,11 @@ _SIDECAR_SCHEMA = pa.schema(
 
 _KNOWN_RETENTIONS = frozenset(get_args(RetentionClass))
 
+# Arrow IPC end-of-stream: the 0xFFFFFFFF continuation followed by a zero
+# metadata length. ``writer.close()`` emits it, so its presence is how a
+# cleanly sealed segment is told apart from one whose writer died mid-message.
+_IPC_END_OF_STREAM = b"\xff\xff\xff\xff\x00\x00\x00\x00"
+
 
 class IndexRecord(NamedTuple):
     """One entry's place in a segment, as every index producer reports it.
@@ -93,14 +99,29 @@ class IndexRecord(NamedTuple):
     offset: int
 
 
-def scan_segment_records(seg_file: Path) -> Optional[List[IndexRecord]]:
+class SegmentScan(NamedTuple):
+    """What a body walk found: the index records, and whether the tail was torn.
+
+    ``torn`` means a trailing message was present but could not be decoded --
+    the on-disk signature of a write interrupted mid-``write_batch``. Since a
+    segment is append-only and only the unsealed one is ever being written, that
+    is exactly one lost entry, and it is what ``RecoveryStatus.lost_entries``
+    reports. A clean tail (the reader simply runs out of messages) is not torn.
+    """
+
+    records: List[IndexRecord]
+    torn: bool
+
+
+def scan_segment_records(seg_file: Path) -> Optional[SegmentScan]:
     """Walk a sealed segment's IPC stream, returning one index record per entry.
 
     The authoritative mapping from a segment body to index entries, reused by
     the boot fallback walk and the seal-time sidecar fallback so every index
     path agrees byte-for-byte. Reads message-by-message off a private mmap to
     bracket each record batch (issue #9 needs the byte range) and stops at the
-    first unreadable/torn trailing message -- a prior partial write's slack.
+    first unreadable/torn trailing message -- a prior partial write's slack,
+    reported as ``torn`` so the boot can account for the entry it cost.
     Returns None for a legacy/corrupt segment (no per-batch key column, or
     unreadable), signalling the caller to drop or skip it. The mmap is always
     closed (an open handle blocks unlink on Windows, issue #5).
@@ -123,18 +144,22 @@ def scan_segment_records(seg_file: Path) -> Optional[List[IndexRecord]]:
         pa.ipc.read_message(mm)  # consume the leading schema message
         records = []
         entry_index = 0
+        torn = False
         while True:
             pos = mm.tell()
             try:
                 msg = pa.ipc.read_message(mm)
             except (pa.ArrowInvalid, EOFError, StopIteration, OSError):
+                torn = _tail_is_torn(mm, pos)
                 break
             if msg is None:
+                torn = _tail_is_torn(mm, pos)
                 break
             msg_len = mm.tell() - pos
             try:
                 batch = pa.ipc.read_record_batch(msg, schema)
             except Exception:
+                torn = True
                 break
             key = batch.column(CACHE_KEY_FIELD)[0].as_py()
             if key is None:
@@ -144,9 +169,26 @@ def scan_segment_records(seg_file: Path) -> Optional[List[IndexRecord]]:
             )
             records.append(IndexRecord(key, pos, msg_len, size_bytes, entry_index))
             entry_index += 1
-        return records
+        return SegmentScan(records, torn)
     finally:
         mm.close()
+
+
+def _tail_is_torn(mm, pos: int) -> bool:
+    """Is what follows the last readable message a partial write?
+
+    Two endings are clean: nothing at all (the writer died between messages, so
+    the stream simply stops) and the end-of-stream marker ``writer.close()``
+    emits. Anything else is the head of a message whose body never landed --
+    one entry lost, which is what recovery reports.
+    """
+    remaining = mm.size() - pos
+    if remaining <= 0:
+        return False
+    if remaining == len(_IPC_END_OF_STREAM):
+        mm.seek(pos)
+        return mm.read(remaining) != _IPC_END_OF_STREAM
+    return True
 
 
 def read_sidecar(

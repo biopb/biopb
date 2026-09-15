@@ -34,7 +34,7 @@ The proxy needs almost no new caching code. `TensorAdapter.resolve_chunk_data`
 is an `ArrowFileBackend`, keying on the `chunk_id` via `get_or_acquire`. `do_get`
 (`serving/server.py`) calls `adapter.resolve_chunk_data(chunk_id,
 CacheManager.get_instance())`. So **any adapter whose `get_data` pulls from an
-upstream automatically inherits the segment cache, eviction, WAL recovery, and the
+upstream automatically inherits the segment cache, eviction, crash recovery, and the
 `chunk_locate` mmap handoff — unchanged.** Consequently `#178`'s Phase 1 (extract
 the cache down into `biopb` root to break a circular dependency) is **not needed**:
 that phase assumed the shared cache would live in the *client*; with a proxy the

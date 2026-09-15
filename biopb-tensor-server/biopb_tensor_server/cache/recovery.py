@@ -1,7 +1,6 @@
 """Crash recovery utilities and Sieve-K bookkeeping for the file-based cache.
 
 Provides:
-- WriteAheadLog: Detect incomplete writes after crash
 - ProcessLock: Single-owner lock on the cache dir + unclean-exit detection
 - SegmentEntryInfo: Metadata for entries stored in segments
 - RecoveryStatus: Result of crash recovery
@@ -174,62 +173,6 @@ class RecoveryStatus:
     errors: List[str] = field(default_factory=list)
 
 
-class WriteAheadLog:
-    """Simple WAL for detecting incomplete writes.
-
-    Tracks pending writes before they are committed to segment files.
-    On recovery, entries in WAL but missing from segments are considered lost.
-    """
-
-    def __init__(self, path: Path):
-        self._path = path
-        self._pending: Dict[str, float] = {}  # key_hex -> timestamp
-        self._load()
-
-    def _load(self) -> None:
-        """Load existing WAL state from disk."""
-        if self._path.exists():
-            try:
-                with open(self._path) as f:
-                    data = json.load(f)
-                self._pending = data.get("pending", {})
-            except (OSError, json.JSONDecodeError):
-                # Corrupted WAL - start fresh
-                self._pending = {}
-
-    def _save(self) -> None:
-        """Save WAL state to disk."""
-        data = {"pending": self._pending}
-        with open(self._path, "w") as f:
-            json.dump(data, f)
-
-    def log_pending(self, key: bytes) -> None:
-        """Log key as pending write."""
-        key_hex = key.hex()
-        self._pending[key_hex] = time.time()
-        self._save()
-
-    def log_committed(self, key: bytes) -> None:
-        """Mark write as committed."""
-        key_hex = key.hex()
-        self._pending.pop(key_hex, None)
-        self._save()
-
-    def get_pending_keys(self) -> List[bytes]:
-        """Get all keys with pending writes."""
-        return [bytes.fromhex(k) for k in self._pending]
-
-    def clear(self) -> None:
-        """Clear WAL after clean shutdown."""
-        self._pending.clear()
-        if self._path.exists():
-            self._path.unlink()
-
-    def has_pending(self) -> bool:
-        """Check if there are pending writes."""
-        return len(self._pending) > 0
-
-
 class ProcessLock:
     """Single-owner lock on a cache directory, plus an unclean-exit signal.
 
@@ -242,7 +185,7 @@ class ProcessLock:
     * **Crash detection** is a sibling ``<path>.owner`` record, written after the
       lock is taken and removed on a clean release. Finding one while acquiring
       means the previous owner never released -- it crashed -- which is what
-      drives WAL recovery.
+      drives crash recovery.
 
     Splitting them is what removes the pid bookkeeping this class used to carry
     (biopb/biopb#544). Exclusion by a *record* cannot be atomic: reading a pid

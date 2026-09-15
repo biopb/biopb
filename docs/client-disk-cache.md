@@ -389,8 +389,8 @@ Real but small, because at these payload sizes the byte copy dominates the file
 metadata. And the client is buying something concrete with it: a file per chunk
 is what makes the key a pure `sha256` path lookup with no index to keep, eviction
 a plain `unlink` with no compaction, and a torn write recoverable by deleting one
-file. The segment shape needs an index, a sweeper that rewrites live entries, and
-the WAL the server carries — for 10–40% of a cost that is itself ~7% of the miss.
+file. The segment shape needs an index and a sweeper that rewrites live entries
+— for 10–40% of a cost that is itself ~7% of the miss.
 
 **Rejected: populate on second miss.** Knowing a miss is the second one requires a
 persistent record of the first — itself a write, so the cost being avoided is paid

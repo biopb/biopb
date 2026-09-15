@@ -3,7 +3,7 @@
 Implements segmented storage with:
 - Mmap reads for near-memory-speed access
 - Segment-level LRU eviction
-- Crash recovery via WAL and process lock
+- Crash recovery via the process lock and a torn-tail-tolerant boot walk
 - The future/promise pattern over the value types in cache.types
 
 Everything here is concurrent and lock-disciplined: read the ``_lock`` /
@@ -33,9 +33,12 @@ from biopb_tensor_server.cache.recovery import (
     RecoveryStatus,
     SegmentEntryInfo,
     SieveKSegmentInfo,
-    WriteAheadLog,
 )
-from biopb_tensor_server.cache.segment_index import CACHE_KEY_FIELD, IndexRecord
+from biopb_tensor_server.cache.segment_index import (
+    CACHE_KEY_FIELD,
+    IndexRecord,
+    SegmentScan,
+)
 from biopb_tensor_server.cache.types import (
     EVICTION_RANK,
     MAX_ARROW_BATCH_BYTES,
@@ -133,14 +136,14 @@ class ArrowFileBackend:
         │   ├── seg_0001.idx     # its seal-time index sidecar
         │   └── ...
         ├── format_version
-        ├── wal.json
         └── lock
 
     Key features:
     1. Future/Promise: get_or_acquire / start_compute below
     2. Mmap reads: OS page cache provides near-memory performance
     3. Segment-level eviction: Delete least-recently-used segment
-    4. Crash recovery: WAL detects incomplete writes
+    4. Crash recovery: a stale process lock triggers it; the boot walk
+       detects an interrupted write from the segment's torn tail
     """
 
     def __init__(self, config: ArrowFileConfig):
@@ -217,8 +220,7 @@ class ArrowFileBackend:
         # Access counter for periodic mmap cleanup
         self._access_counter: int = 0
 
-        # WAL and process lock
-        self._wal: Optional[WriteAheadLog] = None
+        # Process lock (cross-process ownership of the cache dir)
         self._process_lock: Optional[ProcessLock] = None
 
         # Recovery status (if recovered from crash)
@@ -250,27 +252,25 @@ class ArrowFileBackend:
         """Init steps that require the process lock; see :meth:`_initialize`."""
         # Enforce the segment format-version contract now that we are the
         # exclusive owner and before anything reads the segments: a missing or
-        # mismatched marker wipes the on-disk cache (segments + WAL). Must run
-        # ahead of WAL init and the index rebuild.
+        # mismatched marker wipes the on-disk segments. Must run ahead of
+        # recovery and the index rebuild.
         wiped = bootstrap.enforce_format_version(self._layout)
 
-        self._wal = WriteAheadLog(self._layout.wal_path)
+        # A version wipe already dropped the segments, so there is nothing to
+        # recover from even if the last owner crashed.
+        recovering = was_stale and not wiped
+        if recovering:
+            logger.info("Cache recovery: the cache dir was not released cleanly")
 
-        # Check for crash recovery. A version wipe already dropped the segments
-        # and WAL, so there is nothing to recover from.
-        if not wiped and (was_stale or self._wal.has_pending()):
-            logger.info("Cache recovery: stale lock or pending WAL entries detected")
-            self._recovery_status = bootstrap.recover(self._wal, self._layout)
+        # Rebuild the metadata index from the segment files. This is also what
+        # detects an interrupted write, so it is the source of both recovery
+        # counts -- see bootstrap.recovery_status.
+        torn_segments = self._rebuild_index_from_segments()
 
-        # Rebuild metadata index from segment files
-        self._rebuild_index_from_segments()
-
-        # Backfill the recovered-entry count from the rebuilt index:
-        # bootstrap.recover() deliberately skips the segment read
-        # (biopb/biopb#300), so the authoritative count comes from the walk that
-        # had to happen anyway.
-        if self._recovery_status is not None:
-            self._recovery_status.recovered_entries = len(self._metadata)
+        if recovering:
+            self._recovery_status = bootstrap.recovery_status(
+                self._layout, len(self._metadata), torn_segments
+            )
 
         # Find next segment ID (segments are created lazily when first write happens)
         all_segment_ids = set()
@@ -278,8 +278,13 @@ class ArrowFileBackend:
             all_segment_ids.update(pool.queue)
         self._next_segment_id = max(all_segment_ids, default=0) + 1
 
-    def _rebuild_index_from_segments(self) -> None:
+    def _rebuild_index_from_segments(self) -> int:
         """Rebuild the metadata index and pool queues from segment files at boot.
+
+        Returns the number of segments whose tail was torn -- an interrupted
+        write, one lost entry each. Only the unsealed segment can be torn (a
+        sealed one is never appended to), and it is also the one without a
+        sidecar, so the body walk below always sees it.
 
         Fast path (biopb/biopb#300): a sealed segment carries a ``seg_NNNN.idx``
         sidecar written at seal time with each entry's key -> byte range. When it
@@ -292,6 +297,7 @@ class ArrowFileBackend:
         """
         seg_files = sorted(self._layout.segments_dir.glob("seg_*.arrow"))
         walked = 0
+        torn_segments = 0
         for seg_file in seg_files:
             try:
                 segment_id = int(seg_file.stem.split("_")[1])
@@ -304,20 +310,22 @@ class ArrowFileBackend:
                 # empty walk means the segment holds no recoverable entry (a
                 # torn first batch), so it is dropped rather than tracked -- it
                 # occupies disk against max_total_bytes and can serve nothing.
-                records = self._scan_segment_records(seg_file)
-                if not records:
+                scan = self._scan_segment_records(seg_file)
+                if not scan or not scan.records:
                     logger.warning(
                         f"Discarding legacy/corrupt cache segment (unreadable or "
                         f"without per-batch key column): {seg_file}"
                     )
                     self._drop_segment_files(segment_id)
                     continue
+                if scan.torn:
+                    torn_segments += 1
                 self._open_segment_mmap(segment_id, seg_file)
-                self._install_segment_records(segment_id, seg_file, records)
+                self._install_segment_records(segment_id, seg_file, scan.records)
                 walked += 1
                 # Backfill a sidecar from the records we just read -- no second
                 # body read -- so the next boot skips this segment's walk.
-                self._write_sidecar_from_records(segment_id, records)
+                self._write_sidecar_from_records(segment_id, scan.records)
             except Exception as e:
                 logger.error(f"Error rebuilding index from {seg_file}: {e}")
                 self._drop_segment_files(segment_id)
@@ -330,6 +338,7 @@ class ArrowFileBackend:
                 walked,
                 len(seg_files),
             )
+        return torn_segments
 
     def _segment_path(self, segment_id: int) -> Path:
         """Path of a segment's body file (``seg_NNNN.arrow``)."""
@@ -436,7 +445,7 @@ class ArrowFileBackend:
             pass
         self._remove_segment_sidecar(segment_id)
 
-    def _scan_segment_records(self, seg_file: Path) -> Optional[List[IndexRecord]]:
+    def _scan_segment_records(self, seg_file: Path) -> Optional[SegmentScan]:
         """Walk a sealed segment's body for its index records, or None if it
         cannot be indexed (see :func:`segment_index.scan_segment_records`).
 
@@ -529,7 +538,8 @@ class ArrowFileBackend:
         if not seg_file.exists():
             return  # segment already gone (evicted); nothing to index
         if records is None:
-            records = self._scan_segment_records(seg_file)
+            scan = self._scan_segment_records(seg_file)
+            records = scan.records if scan else None
         if records:
             self._write_sidecar_from_records(segment_id, records)
 
@@ -1255,8 +1265,6 @@ class ArrowFileBackend:
             # fail_entry() + re-raise. That is now safe -- the `with` blocks
             # release both locks on the way out, so a failed (or stalled) write
             # can no longer leave a lock held across the read path.
-            if self._wal:
-                self._wal.log_pending(key)
             write_start = sink.tell()
             writer.write_batch(batch_with_key)
             sink.flush()
@@ -1310,9 +1318,6 @@ class ArrowFileBackend:
             # (still under _write_lock, so the segment state is stable).
             if need_close:
                 self._close_segment(segment_id)
-
-            if self._wal:
-                self._wal.log_committed(key)
 
     def fail_entry(self, key: bytes, error: Exception) -> None:
         """Mark pending entry as failed."""
@@ -1412,10 +1417,6 @@ class ArrowFileBackend:
             self._segment_pool_key.clear()
             self._entries.clear()
 
-            # Clear WAL
-            if self._wal:
-                self._wal.clear()
-
             # Reset segment ID counter
             self._next_segment_id = 1
             self._access_counter = 0
@@ -1457,22 +1458,23 @@ class ArrowFileBackend:
         return self._recovery_status
 
     def release_process_lock(self) -> None:
-        """Release the process lock + clear the WAL, leaving handles OPEN.
+        """Release the process lock, leaving handles OPEN.
 
-        This is the cheap, upstream-independent half of :meth:`close`: it clears
-        the WAL and drops the cross-process lock so the next boot never sees a
-        stale lock, but it does NOT close segment writers/mmaps. Doing so mid-flight
-        would race any ``do_get`` reads still draining. Completed writes are
-        already flushed to their segment files -- every write lands on the thread
-        that made it, so there is no queue to drain here -- and clearing the WAL
-        early is safe because ``_rebuild_index_from_segments`` tolerates a torn
-        tail message (it breaks on ArrowInvalid/EOF), so torn-write safety does
-        not depend on the WAL surviving. ``ProcessLock.release()`` is idempotent,
-        so a later :meth:`close` re-releasing the lock is a harmless no-op.
+        This is the cheap, upstream-independent half of :meth:`close`: it drops
+        the cross-process lock so the next boot never sees a stale one, but it
+        does NOT close segment writers/mmaps. Doing so mid-flight would race any
+        ``do_get`` reads still draining. Completed writes are already flushed to
+        their segment files -- every write lands on the thread that made it, so
+        there is nothing to drain here -- and a write interrupted after this
+        point leaves a torn tail that ``_rebuild_index_from_segments`` handles on
+        its own. ``ProcessLock.release()`` is idempotent, so a later
+        :meth:`close` re-releasing the lock is a harmless no-op.
+
+        The cost of releasing early is that such an interruption is no longer
+        *reported*: recovery keys off a stale lock, and this just released it
+        cleanly. The segments stay correct either way.
         """
         with self._lock:
-            if self._wal:
-                self._wal.clear()
             if self._process_lock:
                 self._process_lock.release()
 
@@ -1486,7 +1488,7 @@ class ArrowFileBackend:
         made it, so by the time any caller can reach this there is nothing in
         flight to wait for and nothing a timeout could protect against. (When
         writes could be deferred this had to drain a background writer first,
-        and on a failed drain leave the segments, WAL and process lock behind
+        and on a failed drain leave the segments and the process lock behind
         for the next boot to recover -- biopb/biopb#815, removed.)
         """
         # Seal the still-open write segments (flush their streams), capturing
@@ -1513,10 +1515,6 @@ class ArrowFileBackend:
             # Close all mmap handles
             for segment_id in list(self._segment_mmaps):
                 self._forget_segment_mmap(segment_id)
-
-            # Clear WAL (writes complete)
-            if self._wal:
-                self._wal.clear()
 
             # Release process lock
             if self._process_lock:
