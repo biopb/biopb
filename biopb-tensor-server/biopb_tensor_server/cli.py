@@ -34,19 +34,19 @@ from biopb_tensor_server.core.config import (
     SourceConfig,
     _read_config_file,
     load_config,
-    resolve_all_sources,
     validate_config_dict,
 )
 from biopb_tensor_server.core.errors import AnnotationStoreError
-from biopb_tensor_server.core.logging_config import (
+from biopb_tensor_server.core.retention import active_decode_rates
+from biopb_tensor_server.logging_config import (
     get_log_level_from_env,
     setup_logging,
 )
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
-from biopb_tensor_server.core.retention import active_decode_rates
 from biopb_tensor_server.serving.http_server import run as run_http_server
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
+from biopb_tensor_server.sources.resolve import resolve_all_sources
 from biopb_tensor_server.sources.source_manager import create_source_manager
 
 app = typer.Typer(
@@ -522,7 +522,7 @@ def _warn_if_expiring(cert_pem: bytes) -> None:
     (biopb/biopb#913). One warning here covers both the auto-generated cert and a
     BYO ``--tls-cert``, and both entry points (`serve` and `launch`).
     """
-    from biopb_tensor_server.core.tls import cert_expiry_warning
+    from biopb_tensor_server.serving.tls import cert_expiry_warning
 
     message = cert_expiry_warning(cert_pem)
     if message:
@@ -572,7 +572,7 @@ def _resolve_tls_material(
     if not tls:
         return None, None
 
-    from biopb_tensor_server.core.tls import (
+    from biopb_tensor_server.serving.tls import (
         cert_fingerprint,
         ensure_server_cert,
         format_fingerprint,
@@ -628,7 +628,7 @@ def cert_init(
     """
     from biopb._locations import tls_server_key
 
-    from biopb_tensor_server.core.tls import (
+    from biopb_tensor_server.serving.tls import (
         cert_fingerprint,
         ensure_server_cert,
         format_fingerprint,
@@ -1874,7 +1874,7 @@ def launch(
         flight_location = _grpc_location(_flight_connect_host, port)
         flight_fingerprint = None
         if tls_cert_chain is not None:
-            from biopb_tensor_server.core.tls import cert_fingerprint, leaf_pem
+            from biopb_tensor_server.serving.tls import cert_fingerprint, leaf_pem
 
             # The sidecar is on the same host as the flight plane and holds the
             # very cert that plane serves, so it verifies that exact certificate
@@ -1884,7 +1884,7 @@ def launch(
             # Identified by fingerprint, not by handing over the PEM
             # (biopb/biopb#916): the PEM resolves offline, which also skips the
             # hostname-override probe, and this dial is loopback. The generated
-            # cert always carries localhost/127.0.0.1/::1 (core.tls._host_identity)
+            # cert always carries localhost/127.0.0.1/::1 (serving.tls._host_identity)
             # so it matched anyway; a BYO cert minted for the host's public name
             # alone did not, and failed every request with "Peer name 127.0.0.1 is
             # not in peer certificate". Resolving by fingerprint ends with the

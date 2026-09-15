@@ -1920,7 +1920,7 @@ class TestStaticCatalogSeeding:
 
     def test_static_sources_populate_catalog_without_initial_sync(self, tmp_path):
         from biopb_tensor_server.core.config import SourceConfig
-        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
         from biopb_tensor_server.sources.source_manager import create_source_manager
 
         db = MetadataDatabase()

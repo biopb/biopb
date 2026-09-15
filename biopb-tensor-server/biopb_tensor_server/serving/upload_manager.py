@@ -37,7 +37,6 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.errors import UploadDiscardedError, WriteNotSupportedError
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.core.writable import (
     UploadStatus,
@@ -45,6 +44,7 @@ from biopb_tensor_server.core.writable import (
     unknown_upload_status,
     upload_of,
 )
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 __all__ = ["UPLOAD_KINDS", "UploadManager", "UploadStatus"]
 

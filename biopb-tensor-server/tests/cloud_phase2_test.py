@@ -1420,7 +1420,7 @@ class TestCloudMultiFileBan:
         # multi-file ban fires there too, not only on the monitored rescan. Spy on
         # the series adapter to capture the cloud_root it is handed.
         from biopb_tensor_server.adapters.dicom import DicomSeriesAdapter
-        from biopb_tensor_server.core.config import discover_sources
+        from biopb_tensor_server.sources.resolve import discover_sources
 
         d = tmp_path / "series"
         d.mkdir()

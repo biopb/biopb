@@ -18,12 +18,12 @@ from biopb_tensor_server import ZarrAdapter
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.chunk import encode_chunk_id, encode_chunk_id_with_scale
 from biopb_tensor_server.core.config import CacheConfig
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.core.retention import (
     DecodeRates,
     active_decode_rates,
     set_active_decode_rates,
 )
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 # An ordinary full-resolution chunk. Nothing turns on the size -- every read is
 # a sample -- so this is just a realistic number to divide by.

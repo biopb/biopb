@@ -46,17 +46,30 @@ logic), which may expose multiple tensors (e.g., multi-field) from one source.
 
 The `biopb_tensor_server` package is organized into layered subpackages:
 
-- **`core/`** — foundational primitives and contracts: adapter ABCs, `config`,
+- **`core/`** — foundational primitives and contracts: adapter ABCs, `config`
+  (the schema and its file I/O, nothing that reads a disk or a network),
   the `axes` vocabulary + its `normalize` seam, `writable` (the upload half of
-  an adapter: progress, completion, disposal), and the low-level
-  `source_registry` / `metadata_db` stores.
+  an adapter: progress, completion, disposal), and the live `source_registry`.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
-  sidecar), `upload_manager`, `precache`, `renderer`. Builds on `core`.
-- **`sources/`** — source lifecycle: `source_manager` + `tree_scanner` +
-  `watcher` (scan orchestration) and `reconciler` (the confirmed-catalog single
-  writer). Builds on `core` and `serving`.
+  sidecar), `upload_manager`, `precache`, `renderer`, plus what those servers
+  own directly: `metadata_db` (the DuckDB store whose `sources` / `rois` /
+  `decode_rates` tables back the surfaces they expose), `tls` (the listener's
+  self-signed leaf) and `activity` (in-flight read tracking). Builds on `core`.
+- **`sources/`** — source lifecycle: `resolve` (config entries -> concrete
+  sources), `source_manager` + `tree_scanner` + `watcher` (scan orchestration)
+  and `reconciler` (the confirmed-catalog single writer). Builds on `core` and
+  `adapters`; it names `serving`'s server and `metadata_db` only in type
+  annotations, never importing them at runtime.
 - **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk
   cache.
+- Top level — the entry points: `cli`, `__main__`, and `logging_config`, which
+  configures the `biopb_tensor_server` logger hierarchy for them.
+
+The dependency order is `core <- cache <- adapters <- {sources, serving} <-
+cli`, with no edge back up. Executing a config entry — walking a directory
+through the adapters' `claim()` protocol, listing an upstream catalog — needs
+the adapter registry, so it lives in `sources/resolve`, above the adapters,
+rather than in `core/config` reaching down into them.
 
 ---
 

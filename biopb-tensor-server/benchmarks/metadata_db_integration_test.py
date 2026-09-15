@@ -22,7 +22,7 @@ import time
 
 import pytest
 from biopb.tensor import TensorFlightClient
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
 

@@ -19,9 +19,9 @@ import pytest
 from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.core import metadata_db
 from biopb_tensor_server.core.errors import AnnotationStoreError
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving import metadata_db
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from google.protobuf import json_format
 
 ARRAY_ID = "zarr_a1b2c3/Image:0"
@@ -599,7 +599,7 @@ class TestBatchAtomicity:
 
     @staticmethod
     def _fail_on_nth(monkeypatch, n):
-        from biopb_tensor_server.core import metadata_db as m
+        from biopb_tensor_server.serving import metadata_db as m
 
         original = m._PreparedRoi.column_values
         calls = {"n": 0}
@@ -741,7 +741,7 @@ class TestSidecarRoutes:
         class _FakeFlightClient:
             def list_rois(self, array_id, set_name=""):
                 from biopb.image.annotation_pb2 import RoiListResult, RoiSetInfo
-                from biopb_tensor_server.core.metadata_db import is_reserved_set
+                from biopb_tensor_server.serving.metadata_db import is_reserved_set
 
                 rois, truncated = db.list_rois(array_id, set_name)
                 return RoiListResult(
@@ -780,7 +780,7 @@ class TestSidecarRoutes:
     def test_the_listing_names_a_server_owned_set_it_does_not_return(
         self, client_and_app
     ):
-        from biopb_tensor_server.core.metadata_db import RESERVED_SET_PREFIX
+        from biopb_tensor_server.serving.metadata_db import RESERVED_SET_PREFIX
 
         client, db = client_and_app
         now = datetime.now()

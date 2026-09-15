@@ -259,8 +259,8 @@ def test_sidecar_reads_over_tls_without_pinning(
     import zarr
     from biopb._locations import tls_known_hosts
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.core.tls import cert_fingerprint
     from biopb_tensor_server.serving.http_server import create_app
+    from biopb_tensor_server.serving.tls import cert_fingerprint
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
@@ -309,8 +309,8 @@ def test_sidecar_reads_over_a_cert_that_does_not_name_loopback(
     import zarr
     from biopb._locations import tls_known_hosts
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.core.tls import cert_fingerprint
     from biopb_tensor_server.serving.http_server import create_app
+    from biopb_tensor_server.serving.tls import cert_fingerprint
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
@@ -359,8 +359,8 @@ def test_sidecar_refuses_a_plane_presenting_a_different_certificate(
     import zarr
     from biopb.tensor._tls import clear_pin_cache
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.core.tls import cert_fingerprint
     from biopb_tensor_server.serving.http_server import create_app
+    from biopb_tensor_server.serving.tls import cert_fingerprint
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))

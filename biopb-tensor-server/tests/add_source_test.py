@@ -205,8 +205,8 @@ class TestAddLocalSource:
         from biopb_tensor_server.core.config import (
             ServerConfig,
             SourceConfig,
-            resolve_all_sources,
         )
+        from biopb_tensor_server.sources.resolve import resolve_all_sources
         from biopb_tensor_server.sources.source_manager import create_source_manager
 
         root = tmp_path / "acquisition"

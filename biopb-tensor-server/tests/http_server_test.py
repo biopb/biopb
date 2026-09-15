@@ -3288,7 +3288,7 @@ class TestSingleSourceIsNotCappedByTheListing:
     def _setup(self, tmp_path):
         import zarr
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
         # Query cap of 1 against 3 sources: "c" sorts last, so it is the one
         # clipped from the listing (which is a catalog query).

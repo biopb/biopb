@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (
         SourceConfig as _SourceConfig,  # noqa: F401
     )
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
     from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
@@ -597,7 +597,7 @@ class Reconciler:
             list_upstream_source_ids,
             resolve_upstream_credentials,
         )
-        from biopb_tensor_server.core.config import _namespaced_source_id
+        from biopb_tensor_server.sources.resolve import _namespaced_source_id
 
         endpoint, _ = _split_grpc_url(upstream.url)
         alias = upstream.alias

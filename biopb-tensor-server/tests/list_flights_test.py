@@ -9,7 +9,7 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from biopb.tensor.ticket_pb2 import TensorTicket
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
 

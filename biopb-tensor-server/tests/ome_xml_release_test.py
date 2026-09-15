@@ -21,11 +21,11 @@ import numpy as np
 import pytest
 import tifffile
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.fixtures import (
     create_per_plane_ome_tiff,
     create_tiled_ome_tiff,
 )
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 N_PLANES = 400
 FIELD = "Image:0"

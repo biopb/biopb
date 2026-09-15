@@ -15,13 +15,13 @@ import pytest
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from biopb_tensor_server.core.adapter_base import SourceAdapter
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.core.ome_rois import (
     OME_SET_NAME,
     imported_annotations,
     tensors_by_field,
     tensors_by_image_order,
 )
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 SOURCE_ID = "ometiff_a1b2c3"
 ARRAY_0 = f"{SOURCE_ID}/Image:0"
@@ -770,7 +770,7 @@ class TestOpenTimeClear:
     def test_a_catalog_from_a_newer_build_is_left_untouched(self, tmp_path):
         """The refusal promises exactly that, so the clear must come after it."""
         from biopb_tensor_server.core.errors import AnnotationStoreError
-        from biopb_tensor_server.core.metadata_db import _ROI_SCHEMA_VERSION
+        from biopb_tensor_server.serving.metadata_db import _ROI_SCHEMA_VERSION
 
         store = tmp_path / "catalog.duckdb"
         db = MetadataDatabase(store_path=store)

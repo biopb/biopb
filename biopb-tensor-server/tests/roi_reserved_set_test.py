@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 import pytest
 from biopb.image import ROI, Point, Polygon
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb_tensor_server.core.metadata_db import (
+from biopb_tensor_server.serving.metadata_db import (
     RESERVED_SET_PREFIX,
     MetadataDatabase,
     is_reserved_set,

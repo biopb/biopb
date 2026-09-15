@@ -63,7 +63,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, PutCommand, TensorTicket
 from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
-from biopb_tensor_server.core.activity import ActivityTracker
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
@@ -78,13 +77,14 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
-from biopb_tensor_server.core.metadata_db import (
+from biopb_tensor_server.core.retention import set_active_pyramid_config
+from biopb_tensor_server.core.source_registry import SourceRegistry
+from biopb_tensor_server.serving.activity import ActivityTracker
+from biopb_tensor_server.serving.metadata_db import (
     MetadataDatabase,
     NumpyEncoder,
     is_reserved_set,
 )
-from biopb_tensor_server.core.retention import set_active_pyramid_config
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.upload_manager import UploadManager
 
 logger = logging.getLogger(__name__)
