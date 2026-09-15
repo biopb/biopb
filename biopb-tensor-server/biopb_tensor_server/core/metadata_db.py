@@ -37,7 +37,7 @@ Security Model:
 Usage:
     db = MetadataDatabase()
     db.sync_source_added(source_id, adapter)
-    flight_info = db.handle_query("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+    table = db.query("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
 """
 
 from __future__ import annotations
@@ -45,7 +45,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
 import threading
 import time
 import uuid
@@ -543,60 +542,22 @@ class MetadataDatabase:
     Example:
         db = MetadataDatabase()
         db.sync_source_added('plate-001', adapter)
-        info = db.handle_query("SELECT source_id FROM sources WHERE dtype='uint16'")
+        table = db.query("SELECT source_id FROM sources WHERE dtype='uint16'")
     """
 
-    # Forbidden SQL keywords (write operations, table manipulation)
-    FORBIDDEN_KEYWORDS: Set[str] = {
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "DROP",
-        "CREATE",
-        "ALTER",
-        "TRUNCATE",
-        "EXECUTE",
-        "GRANT",
-        "REVOKE",
-        "COPY",
-        "EXPORT",
-        "IMPORT",
-        "LOAD",
-    }
-
-    # Match forbidden keywords only as whole words. A plain substring test
-    # rejects legitimate queries where the keyword appears inside an identifier
-    # or string literal (e.g. `LIKE '%/uploads/%'` contains LOAD, `%update%`
-    # contains UPDATE). The real defense against file/network access is
-    # enable_external_access=False on the connection; this is defense in depth.
-    FORBIDDEN_KEYWORD_PATTERN = re.compile(
-        r"\b(" + "|".join(sorted(FORBIDDEN_KEYWORDS)) + r")\b"
-    )
-
-    # The tables a query may reference when everything is enabled;
-    # ``allowed_tables`` on the instance is what is actually enforced, and drops
-    # ``rois`` when the annotation actions are off. ``rois`` is readable here
-    # as an ANALYSIS affordance (count labels, join against sources, find
-    # annotations overlapping a region); the viewer never composes SQL -- it
-    # calls list_rois(), which builds parameterized SQL itself. ``decode_rates``
-    # is read the same way, and is the whole client surface for it -- there is
-    # no action, because a table an operator wants to sort and threshold is
-    # better asked in SQL than in a bespoke RPC. Writes stay off this surface
-    # entirely: FORBIDDEN_KEYWORDS still rejects INSERT/UPDATE/DELETE.
     # The public catalog: what the ``catalog`` flight lists and SQL may read.
     # ``rois`` is deliberately absent -- annotations are private data, gated
     # per source on the ``roi`` flight, and a query has no source to authorize
-    # against (biopb/biopb#1010).
+    # against (biopb/biopb#1010). Enforced on DuckDB's own parse of the
+    # statement (``_validate_query``), never on the SQL text.
     ALLOWED_TABLES: Set[str] = {"sources", "decode_rates"}
 
-    # Pattern for detecting table references in SQL
-    TABLE_REFERENCE_PATTERN = re.compile(
-        r"\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)"
-        r"|\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)"
-        r"|\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)"
-        r"|\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-        re.IGNORECASE,
-    )
+    # Table-valued functions a query may use. ``unnest`` is the documented
+    # per-tensor idiom (``FROM sources, UNNEST(tensors)``); the rest generate
+    # rows from nothing. Everything else -- above all the file and network
+    # readers -- is refused here, and ``enable_external_access=false`` on the
+    # connection is the second wall behind that.
+    ALLOWED_TABLE_FUNCTIONS: Set[str] = {"unnest", "range", "generate_series"}
 
     def __init__(
         self,
@@ -1017,39 +978,84 @@ class MetadataDatabase:
         )
 
     def _validate_query(self, sql: str) -> None:
-        """Validate SQL query for security.
+        """Refuse anything but one SELECT over the public tables.
+
+        Walks DuckDB's own parse of the statement (``json_serialize_sql``), so
+        a quoted or schema-qualified name, a comma join, a CTE, a subquery or a
+        DESCRIBE all resolve to the tables they actually read; a regex over
+        the text cannot see those. The serializer refuses every non-SELECT and
+        every multi-statement string, which is what keeps this surface
+        read-only.
 
         Raises:
-            ValueError: If query contains forbidden keywords or references disallowed tables
+            ValueError: not a single SELECT, or a table / table function
+                outside the allowlists.
         """
-        # Strip single-quoted string literals before scanning so keywords that
-        # appear *inside* a literal (e.g. `LIKE '%update%'`) aren't mistaken for
-        # SQL keywords or table names. '' is DuckDB's escaped single quote.
-        literal_free = re.sub(r"'(?:''|[^'])*'", "''", sql)
-        normalized = literal_free.upper()
-
-        # Check for forbidden keywords (whole-word match, see pattern above)
-        match = self.FORBIDDEN_KEYWORD_PATTERN.search(normalized)
-        if match:
+        try:
+            ast = json.loads(
+                self._get_cursor()
+                .execute("SELECT json_serialize_sql(?)", [sql])
+                .fetchone()[0]
+            )
+        except duckdb.Error as e:
+            raise ValueError(f"SQL query could not be parsed: {e}")
+        if ast.get("error"):
             raise ValueError(
-                f"SQL query contains forbidden keyword: {match.group(1)}. "
-                f"Only SELECT queries are allowed."
+                f"SQL query contains a forbidden keyword or statement "
+                f"({ast.get('error_message')}). Only one SELECT query is allowed."
             )
 
-        # Check for table references
-        table_refs = self.TABLE_REFERENCE_PATTERN.findall(literal_free)
-        referenced_tables = set()
-        for match in table_refs:
-            for table_name in match:
-                if table_name:
-                    referenced_tables.add(table_name.lower())
+        tables: Set[Tuple[str, str]] = set()
+        functions: Set[str] = set()
+        ctes: Set[str] = set()
+        refused: List[str] = []
 
-        # Only allow references to permitted tables
-        for table in referenced_tables:
-            if table not in self.allowed_tables:
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                kind = node.get("type")
+                if kind == "BASE_TABLE":
+                    tables.add(
+                        (
+                            str(node.get("table_name", "")).lower(),
+                            str(node.get("schema_name", "")).lower(),
+                        )
+                    )
+                elif kind == "TABLE_FUNCTION":
+                    functions.add(
+                        str(node.get("function", {}).get("function_name", "")).lower()
+                    )
+                elif kind == "SHOW_REF":
+                    # DESCRIBE / SUMMARIZE / SHOW: schema and statistics of
+                    # whatever it names, which may be a private table.
+                    refused.append("SHOW/DESCRIBE/SUMMARIZE")
+                for key, value in node.items():
+                    if key == "cte_map":
+                        for entry in value.get("map", []):
+                            ctes.add(str(entry.get("key", "")).lower())
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(ast)
+        if refused:
+            raise ValueError(
+                f"SQL query uses {refused[0]}, which is not available here. "
+                f"Accessible here: {', '.join(sorted(self.allowed_tables))}."
+            )
+        for table, schema in sorted(tables):
+            if table in ctes and not schema:
+                continue
+            if schema not in ("", "main") or table not in self.allowed_tables:
                 raise ValueError(
                     f"SQL query references disallowed table: {table}. "
                     f"Accessible here: {', '.join(sorted(self.allowed_tables))}."
+                )
+        for fn in sorted(functions):
+            if fn not in self.ALLOWED_TABLE_FUNCTIONS:
+                raise ValueError(
+                    f"SQL query uses disallowed table function: {fn}. "
+                    f"Allowed: {', '.join(sorted(self.ALLOWED_TABLE_FUNCTIONS))}."
                 )
 
     def table_schema(self, table: str) -> pa.Schema:
@@ -1062,24 +1068,6 @@ class MetadataDatabase:
         return (
             self._get_cursor().execute(f"SELECT * FROM {table} LIMIT 0").arrow().schema
         )
-
-    def query_schema(self, sql: str) -> pa.Schema:
-        """The result schema of a validated query, without running it in full.
-
-        Raises:
-            ValueError: If query is invalid or violates security rules
-        """
-        self._validate_query(sql)
-        inner = sql.strip().rstrip(";")
-        try:
-            return (
-                self._get_cursor()
-                .execute(f"SELECT * FROM ({inner}) AS catalog_query LIMIT 0")
-                .arrow()
-                .schema
-            )
-        except duckdb.Error as e:
-            raise ValueError(f"SQL query failed: {e}")
 
     def query(self, sql: str) -> pa.Table:
         """Execute a safe SQL query; the result is what DoGet streams.

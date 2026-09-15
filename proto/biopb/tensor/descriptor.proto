@@ -192,8 +192,7 @@ message SliceHint {
 }
 
 // A read-only SQL query against the server's public catalog (the `catalog`
-// flight). Carried in FlightRequest for a schema-first GetFlightInfo, or
-// directly in a TensorTicket so DoGet answers the query in one call.
+// flight), carried in a TensorTicket so DoGet answers it in one call.
 message CatalogQuery {
   // SQL query string (e.g., "SELECT source_id FROM sources WHERE source_type='ome-zarr'")
   string sql = 1;
@@ -248,17 +247,18 @@ message TensorReadOption {
   reserved "compact_grid_ok";
 }
 
-// The GetFlightInfo command. Dispatch is the oneof arm, nothing else:
-// a tensor read plans chunk endpoints for one tensor (private data, authorized
-// on the tensor's source), a catalog query answers with the result's schema and
-// a ticket carrying the same SQL (public catalog).
+// The GetFlightInfo command. Dispatch is the oneof arm, nothing else: a
+// tensor read plans chunk endpoints for one tensor (private data, authorized
+// on the tensor's source). The catalog needs no command here -- a table is
+// addressed by a path descriptor, and an arbitrary query rides the DoGet
+// ticket (CatalogQuery in TensorTicket).
 //
 // Tags start at 11 so a request from a protocol-1 client (the retired
-// `FlightCmd`, tags 1-3) never parses into a set arm here.
+// `FlightCmd`, tags 1-3) never parses into a set arm here; the wrapper is
+// that firewall, which is why it stays even with one arm.
 message FlightRequest {
   oneof request {
     TensorReadOption tensor_read = 11;
-    CatalogQuery catalog_query = 12;
   }
 }
 

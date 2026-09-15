@@ -372,7 +372,7 @@ class TensorFlightServer(flight.FlightServerBase):
         self._start_time: float = time.time()
         # DoPut upload path: source creation, chunk writes, and per-source upload
         # progress. Registers created sources through the shared registry.
-        self.uploads = UploadManager(self.sources, write_dir, metadata_db)
+        self.uploads = UploadManager(self.sources, write_dir, self._metadata_db)
         # Readiness gate: the Flight port binds (and gRPC starts serving) in the
         # base __init__ above, *before* the caller scans/registers the data
         # folder -- a scan that can be slow for large catalogs. Until the caller
@@ -628,29 +628,25 @@ class TensorFlightServer(flight.FlightServerBase):
     def _catalog_endpoint(sql: str) -> flight.FlightEndpoint:
         """The one endpoint every catalog ``FlightInfo`` carries: a ticket with
         the SQL itself, so nothing is parked server-side between this call and
-        the DoGet. Shared by :meth:`_catalog_flight_info` and
-        :meth:`list_flights`, whose ``FlightInfo``s differ only in schema and
-        descriptor.
+        the DoGet.
         """
         ticket = TensorTicket(catalog_query=CatalogQuery(sql=sql))
         return flight.FlightEndpoint(
             ticket=flight.Ticket(ticket.SerializeToString()), locations=[]
         )
 
-    def _catalog_flight_info(self, query: CatalogQuery) -> flight.FlightInfo:
-        """Schema-first answer for a catalog query: the result's schema and a
-        ticket carrying the SQL itself, so nothing is parked server-side
-        between this call and the DoGet."""
+    def _catalog_flight_info(self, table: str) -> flight.FlightInfo:
+        """One catalog table as a flight: its real schema and a ticket that
+        reads it whole. What ListFlights advertises and what GetFlightInfo on
+        the table's path answers."""
         try:
-            schema = self._metadata_db.query_schema(query.sql)
+            schema = self._metadata_db.table_schema(table)
         except ValueError as e:
-            raise flight.FlightServerError(f"Catalog query failed: {e}") from e
+            raise flight.FlightServerError(str(e)) from e
         return flight.FlightInfo(
             schema=schema,
-            descriptor=flight.FlightDescriptor.for_command(
-                FlightRequest(catalog_query=query).SerializeToString()
-            ),
-            endpoints=[self._catalog_endpoint(query.sql)],
+            descriptor=flight.FlightDescriptor.for_path(table),
+            endpoints=[self._catalog_endpoint(f"SELECT * FROM {table}")],
             total_records=-1,
             total_bytes=-1,
         )
@@ -1267,23 +1263,18 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         self._authorize(context)
         for table in sorted(self._metadata_db.allowed_tables):
-            yield flight.FlightInfo(
-                schema=self._metadata_db.table_schema(table),
-                descriptor=flight.FlightDescriptor.for_path(table),
-                endpoints=[self._catalog_endpoint(f"SELECT * FROM {table}")],
-                total_records=-1,
-                total_bytes=-1,
-            )
+            yield self._catalog_flight_info(table)
 
     def get_flight_info(
         self, context: flight.ServerCallContext, descriptor: flight.FlightDescriptor
     ) -> flight.FlightInfo:
-        """Plan a read: the request's oneof arm says of what.
+        """Plan a read.
 
-        A ``catalog_query`` answers with the result's schema and a ticket
-        carrying the same SQL (public tier). A ``tensor_read`` binds one
-        tensor and plans its chunk endpoints (private tier, authorized on the
-        tensor's source). A path descriptor names a catalog table.
+        A path descriptor names a catalog table (public tier): its schema and
+        a ticket that reads it. A command is a ``FlightRequest`` whose
+        ``tensor_read`` binds one tensor and plans its chunk endpoints (private
+        tier, authorized on the tensor's source). An arbitrary catalog query
+        needs no GetFlightInfo: the SQL rides the DoGet ticket.
         """
         import json
 
@@ -1293,13 +1284,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 part.decode() if isinstance(part, bytes) else part
                 for part in descriptor.path
             )
-            return self._catalog_flight_info(CatalogQuery(sql=f"SELECT * FROM {table}"))
+            return self._catalog_flight_info(table)
 
         req = self._parse(FlightRequest(), descriptor.command, "GetFlightInfo command")
-        if req.WhichOneof("request") == "catalog_query":
-            self._authorize(context)
-            return self._catalog_flight_info(req.catalog_query)
-
         read_opt = req.tensor_read
         source_id, tensor_id = _split_array_id(read_opt.array_id)
         if not source_id:

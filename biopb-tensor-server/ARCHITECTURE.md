@@ -82,7 +82,7 @@ id or a byte-prefix sniff -- and the arm names the flight:
 
 | Flight | Data | GetFlightInfo | DoGet ticket | DoPut command |
 |---|---|---|---|---|
-| `catalog` | public: the DuckDB tables (`sources`, `decode_rates`) | `FlightRequest.catalog_query` -> result schema + a ticket carrying the SQL | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
+| `catalog` | public: the DuckDB tables (`sources`, `decode_rates`) | path descriptor (`for_path("sources")`) -> the table's schema + a ticket that reads it | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
 | `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted) | `PutCommand.chunk` (writable servers) |
 | `roi` | private: annotations | -- | `TensorTicket.roi_read` -> ROI rows (`biopb.image._roi_rows`), `sets` + `truncated` in schema metadata | `PutCommand.roi_put` / `roi_delete`, reply in the put's app_metadata |
 

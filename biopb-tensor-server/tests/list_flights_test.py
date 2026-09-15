@@ -105,7 +105,7 @@ def test_a_path_descriptor_names_a_table():
         _Context(), flight.FlightDescriptor.for_path("sources")
     )
     assert info.schema.names[:1] == ["source_id"]
-    with pytest.raises(flight.FlightServerError, match="disallowed table"):
+    with pytest.raises(flight.FlightServerError, match="unknown catalog table"):
         server.get_flight_info(_Context(), flight.FlightDescriptor.for_path("rois"))
 
 

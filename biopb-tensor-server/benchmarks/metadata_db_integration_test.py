@@ -8,10 +8,9 @@ Measures performance for end-to-end query path through TensorFlightClient:
 Unlike metadata_db_test.py which tests MetadataDatabase directly,
 these tests measure full request path:
   TensorFlightClient.query_sources(sql)
-    -> FlightClient.get_flight_info(TensorSelection with metadata_query)
-      -> TensorFlightServer.get_flight_info()
-        -> MetadataDatabase.handle_query(sql)
-    -> FlightClient.do_get(ticket)
+    -> FlightClient.do_get(TensorTicket.catalog_query with the SQL)
+      -> TensorFlightServer.do_get()
+        -> MetadataDatabase.query(sql)
       -> Returns Arrow Table with query results
 """
 

@@ -1942,3 +1942,27 @@ class TestDiscard:
         writable_server.uploads.discard(source_id, "x")
 
         assert "updated_at" not in client.get_upload_status(source_id)
+
+
+def test_a_durable_upload_lands_in_a_server_owned_catalog():
+    """A server built without a catalog owns one, and the upload path syncs a
+    durable upload into it like any other registration -- so list_sources
+    sees it."""
+    from biopb_tensor_server.serving.server import TensorFlightServer
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        server = TensorFlightServer(
+            location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
+        )
+        try:
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:owned",
+                shape=[8, 8],
+                dtype="uint8",
+                chunk_shape=[4, 4],
+                dim_labels=["y", "x"],
+            )
+            response_desc = server.uploads.create_source(req_desc)
+            assert response_desc.array_id in _catalog_ids(server._metadata_db)
+        finally:
+            server.shutdown()

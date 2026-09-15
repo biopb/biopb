@@ -10,6 +10,7 @@ Tests cover:
 
 import json
 
+import duckdb
 import pytest
 from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
@@ -622,17 +623,6 @@ class TestQueryHandling:
         assert (md[b"total_rows"], md[b"returned_rows"]) == (b"5", b"2")
         assert int(md[b"total_sources"]) == 5
 
-    def test_query_schema_matches_the_result(self):
-        """The schema-first answer (GetFlightInfo) agrees with the stream."""
-        db = MetadataDatabase()
-        db.sync_source_added(
-            "test-1",
-            MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"),
-        )
-        sql = "SELECT source_id, source_type FROM sources ORDER BY source_id;"
-        assert db.query_schema(sql).names == ["source_id", "source_type"]
-        assert db.query_schema(sql).types == db.query(sql).schema.types
-
     def test_table_schema_names_a_public_table_only(self):
         db = MetadataDatabase()
         assert db.table_schema("sources").names[:2] == ["source_id", "source_url"]
@@ -717,6 +707,46 @@ class TestSQLValidation:
                 "DROP TABLE sources"
             )
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT * FROM "rois"',
+            "SELECT * FROM 'rois'",
+            "SELECT * FROM main.rois",
+            "SELECT r.* FROM sources s, rois r",
+            "SELECT * FROM sources s JOIN rois r ON true",
+            "WITH x AS (SELECT * FROM rois) SELECT * FROM x",
+            "SELECT * FROM sources WHERE source_id IN (SELECT roi_id FROM rois)",
+            "SELECT (SELECT count(*) FROM rois)",
+            "FROM rois",
+        ],
+    )
+    def test_every_way_of_naming_a_private_table_is_refused(self, sql):
+        """The guard walks DuckDB's parse, not the text: quoting, schema
+        qualification, comma joins, CTEs and subqueries all resolve to the
+        table they read (biopb/biopb#1010)."""
+        db = MetadataDatabase()
+        with pytest.raises(ValueError, match="disallowed table: rois"):
+            db._validate_query(sql)
+
+    def test_describe_and_show_are_refused(self):
+        db = MetadataDatabase()
+        for sql in ("DESCRIBE rois", "SUMMARIZE sources", "SHOW TABLES"):
+            with pytest.raises(ValueError, match="not available here"):
+                db._validate_query(sql)
+
+    def test_a_cte_may_shadow_nothing_but_its_own_name(self):
+        db = MetadataDatabase()
+        db._validate_query("WITH x AS (SELECT * FROM sources) SELECT * FROM x")
+        db._validate_query(
+            "SELECT source_id, t.array_id FROM sources, UNNEST(tensors) AS u(t)"
+        )
+        db._validate_query("SELECT * FROM sources LIMIT 1 ;  ")
+        with pytest.raises(
+            ValueError, match="disallowed table function: duckdb_tables"
+        ):
+            db._validate_query("SELECT * FROM duckdb_tables()")
+
     def test_validate_disallowed_table(self):
         """Test that references to non-sources tables are blocked."""
         db = MetadataDatabase()
@@ -745,11 +775,12 @@ class TestSQLValidation:
         secret = tmp_path / "secret.txt"
         secret.write_text("TOP-SECRET")
 
-        # Bypasses the denylist validator (FROM only sees `sources`)...
-        db._validate_query(f"SELECT * FROM sources, read_text('{secret}')")
-        # ...but execution is blocked by enable_external_access=False.
-        with pytest.raises(ValueError, match="file system operations are disabled"):
-            db.query(f"SELECT content FROM sources, read_text('{secret}')")
+        # Refused by the validator as a table function outside the allowlist...
+        with pytest.raises(ValueError, match="disallowed table function: read_text"):
+            db._validate_query(f"SELECT * FROM sources, read_text('{secret}')")
+        # ...and, behind that, execution is blocked by enable_external_access=False.
+        with pytest.raises(duckdb.Error, match="file system operations are disabled"):
+            db._get_cursor().execute(f"SELECT content FROM read_text('{secret}')")
 
     def test_set_external_access_cannot_be_reenabled(self):
         """An attacker can't turn external access back on mid-query."""
