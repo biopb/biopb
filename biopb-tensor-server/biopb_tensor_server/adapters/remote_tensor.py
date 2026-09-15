@@ -40,6 +40,7 @@ from urllib.parse import urlsplit
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.tensor._catalog_rows import sql_literal
 from biopb.tensor.descriptor_pb2 import (
     FlightRequest,
     TensorDescriptor,
@@ -627,8 +628,10 @@ class RemoteTensorAdapter(TensorAdapter):
         if self._metadata_cache is not None:
             return self._metadata_cache
 
-        escaped = self._upstream_source_id.replace("'", "''")
-        sql = f"SELECT metadata_json FROM sources WHERE source_id = '{escaped}'"
+        sql = (
+            "SELECT metadata_json FROM sources WHERE source_id = "
+            f"{sql_literal(self._upstream_source_id)}"
+        )
         try:
             rows = self.client.query_sources(sql, format="records")
         except Exception as exc:

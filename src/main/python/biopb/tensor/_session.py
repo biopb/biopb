@@ -952,28 +952,42 @@ class CatalogClient:
             )
         return result
 
+    def _do_action_one_result(
+        self, action: flight.Action, *, unavailable_hint: str
+    ) -> bytes:
+        """Run a single-result ``do_action``, with the same "old server"
+        remap :meth:`_iter_action_messages` gives the streaming actions.
+
+        *unavailable_hint* is the feature-specific lead-in for the "Unknown
+        action" case (e.g. "Source removal is unavailable"); a genuinely empty
+        result stream (a server that never sends one) raises a plain
+        ``RuntimeError`` naming the action.
+        """
+        try:
+            results = self._state.client.do_action(
+                action, options=self._state.call_options
+            )
+            result = next(results)
+        except flight.FlightError as exc:
+            if "Unknown action" in str(exc):
+                raise RuntimeError(
+                    f"{unavailable_hint}: the tensor server is too old to "
+                    f"support the '{action.type}' action. Upgrade the server."
+                ) from exc
+            raise
+        except StopIteration as exc:
+            raise RuntimeError(f"{action.type} returned no result") from exc
+        return result.body.to_pybytes()
+
     def remove_source(self, root_url: str) -> "RemoveSourceResult":
         """Backs TensorFlightClient.remove_source; see that method for the full
         documentation."""
         req = RemoveSourceRequest(root_url=root_url)
         action = flight.Action("remove_source", req.SerializeToString())
-        try:
-            results = self._state.client.do_action(
-                action, options=self._state.call_options
-            )
-            result_bytes = next(results)
-        except flight.FlightError as exc:
-            if "Unknown action" in str(exc):
-                raise RuntimeError(
-                    "Source removal is unavailable: the tensor server is too old "
-                    "to support the 'remove_source' action. Upgrade the server."
-                ) from exc
-            raise
-        except StopIteration as exc:
-            raise RuntimeError(
-                f"remove_source('{root_url}') returned no result"
-            ) from exc
-        return RemoveSourceResult.FromString(result_bytes.body.to_pybytes())
+        result_bytes = self._do_action_one_result(
+            action, unavailable_hint="Source removal is unavailable"
+        )
+        return RemoveSourceResult.FromString(result_bytes)
 
     # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
 
@@ -1041,14 +1055,11 @@ class CatalogClient:
     def prune_rois(self, unseen_days: int, *, apply: bool = False) -> "RoiPruneResult":
         """Backs TensorFlightClient.prune_rois; see that method."""
         req = RoiPruneRequest(unseen_days=unseen_days, apply=apply)
-        results = self._state.client.do_action(
-            flight.Action("roi_prune", req.SerializeToString()),
-            options=self._state.call_options,
+        action = flight.Action("roi_prune", req.SerializeToString())
+        result_bytes = self._do_action_one_result(
+            action, unavailable_hint="ROI pruning is unavailable"
         )
-        body = next(iter(results), None)
-        if body is None:
-            raise RuntimeError("roi_prune returned no result")
-        return RoiPruneResult.FromString(body.body.to_pybytes())
+        return RoiPruneResult.FromString(result_bytes)
 
 
 class ChunkFetcher:

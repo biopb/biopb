@@ -210,9 +210,9 @@ public class TensorFlightClient implements AutoCloseable {
      * tensor. The transfer chunk_shape is empty here -- it is answered per tensor
      * by GetFlightInfo, which is what getTensor()/tensorFromPb() plan on.
      *
-     * Results may be truncated if server has max_list_flights_results configured.
-     * Check returned map size vs total_sources in schema metadata for truncation
-     * info.
+     * Backed by one catalog query ({@code SELECT ... FROM sources}), so it is
+     * subject to the server's query row cap like {@link #querySources}; a very
+     * large catalog is better browsed with a narrower query.
      *
      * @return Map of source_id to DataSourceDescriptor
      */

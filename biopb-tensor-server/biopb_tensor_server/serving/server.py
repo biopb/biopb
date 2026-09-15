@@ -42,6 +42,7 @@ from biopb.image.annotation_pb2 import (
     RoiPutResult,
     RoiUnseen,
 )
+from biopb.tensor._session import _split_array_id
 from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -234,15 +235,6 @@ class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
         return _AuthMiddleware(provided)
 
 
-def _split_array_id(array_id: str) -> Tuple[str, str]:
-    """``(source_id, array_id-or-empty)`` for a request id: the slash-free
-    prefix routes, and a bare source_id leaves the tensor part empty (the
-    default-tensor request)."""
-    if "/" in array_id:
-        return array_id.split("/", 1)[0], array_id
-    return array_id, ""
-
-
 def _roi_source_id(array_id: str) -> str:
     """The source an annotation's tensor belongs to, for authorization.
 
@@ -251,7 +243,8 @@ def _roi_source_id(array_id: str) -> str:
     """
     if not array_id:
         raise ValueError("array_id is required")
-    return array_id.split("/")[0]
+    source_id, _ = _split_array_id(array_id)
+    return source_id
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -359,7 +352,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # syncs it itself; one the server made for itself is kept in step by
         # register_source / swap_source / unregister_source.
         self._owns_catalog = metadata_db is None
-        self._metadata_db: Optional[MetadataDatabase] = (
+        self._metadata_db: MetadataDatabase = (
             metadata_db if metadata_db is not None else MetadataDatabase()
         )
         self._annotations_enabled = annotations_enabled
@@ -631,33 +624,33 @@ class TensorFlightServer(flight.FlightServerBase):
             return None
         return strip_source_prefix(source_id, tensor_id)
 
+    @staticmethod
+    def _catalog_endpoint(sql: str) -> flight.FlightEndpoint:
+        """The one endpoint every catalog ``FlightInfo`` carries: a ticket with
+        the SQL itself, so nothing is parked server-side between this call and
+        the DoGet. Shared by :meth:`_catalog_flight_info` and
+        :meth:`list_flights`, whose ``FlightInfo``s differ only in schema and
+        descriptor.
+        """
+        ticket = TensorTicket(catalog_query=CatalogQuery(sql=sql))
+        return flight.FlightEndpoint(
+            ticket=flight.Ticket(ticket.SerializeToString()), locations=[]
+        )
+
     def _catalog_flight_info(self, query: CatalogQuery) -> flight.FlightInfo:
         """Schema-first answer for a catalog query: the result's schema and a
         ticket carrying the SQL itself, so nothing is parked server-side
         between this call and the DoGet."""
-        if self._metadata_db is None:
-            # The CLI always attaches a metadata DB (mandatory,
-            # biopb/biopb#225); reaching here means this server was
-            # constructed without one (an embedded/test instance).
-            raise flight.FlightServerError(
-                "This server has no metadata database attached, so SQL "
-                "queries are unavailable."
-            )
         try:
             schema = self._metadata_db.query_schema(query.sql)
         except ValueError as e:
             raise flight.FlightServerError(f"Catalog query failed: {e}") from e
-        ticket = TensorTicket(catalog_query=query)
         return flight.FlightInfo(
             schema=schema,
             descriptor=flight.FlightDescriptor.for_command(
                 FlightRequest(catalog_query=query).SerializeToString()
             ),
-            endpoints=[
-                flight.FlightEndpoint(
-                    ticket=flight.Ticket(ticket.SerializeToString()), locations=[]
-                )
-            ],
+            endpoints=[self._catalog_endpoint(query.sql)],
             total_records=-1,
             total_bytes=-1,
         )
@@ -757,11 +750,6 @@ class TensorFlightServer(flight.FlightServerBase):
         maps the former to 501 (this server does not offer the feature) and the
         latter to 422 (your request was rejected).
         """
-        if self._metadata_db is None:
-            raise flight.FlightUnavailableError(
-                "This server has no metadata database attached, so ROI "
-                "annotations are unavailable."
-            )
         if not self._annotations_enabled:
             raise flight.FlightUnavailableError(
                 "ROI annotations are disabled on this server"
@@ -838,6 +826,12 @@ class TensorFlightServer(flight.FlightServerBase):
     ) -> Iterator[bytes]:
         """Execute a custom action.
 
+        Each arm authorizes itself once it knows what it needs -- most are
+        catalog tier (no source), ``chunk_locate``/``resolve``/``warm`` are
+        private tier once the source_id is parsed out of the request -- the
+        same pattern as ``get_flight_info``/``do_get``/``do_put``, rather than
+        a blanket check keyed off the action name.
+
         Args:
             context: Server call context
             action: Action to execute
@@ -845,12 +839,8 @@ class TensorFlightServer(flight.FlightServerBase):
         Yields:
             Result bytes (JSON-encoded for health action)
         """
-        if action.type in ("chunk_locate", "resolve", "warm"):
-            pass  # private tier: authorized below, once the source is known
-        else:
-            self._authorize(context)
-
         if action.type == "health":
+            self._authorize(context)
             uptime_seconds = int(time.time() - self._start_time)
             with self._scan_status_lock:
                 full_scan_in_progress = self._full_scan_in_progress
@@ -861,7 +851,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 # it before its first call. A server without the key is v1.
                 "protocol": FLIGHT_PROTOCOL_VERSION,
                 "source_count": len(self.sources),
-                "metadata_db_enabled": self._metadata_db is not None,
+                # Every server has a catalog now; kept on the wire since it is a
+                # documented part of the health contract (SDK/Java clients read
+                # it).
+                "metadata_db_enabled": True,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
                 # Catalog-freshness signals (progressive discovery). ``SERVING``
@@ -870,26 +863,22 @@ class TensorFlightServer(flight.FlightServerBase):
                 # null until the first full scan succeeds). See biopb/biopb#212.
                 "full_scan_in_progress": full_scan_in_progress,
                 "last_full_scan_finished_at": last_full_scan_at,
-            }
-            if self._metadata_db is not None:
                 # Whether drawn ROIs survive a restart. A store that was asked
                 # for and could not be opened is fatal at startup, so this is
                 # False only for a deliberately session-only server -- which a
                 # client may still want to say out loud before someone spends a
                 # morning tracing.
-                health_status["annotations_persisted"] = (
-                    self._metadata_db.annotations_persisted
-                )
+                "annotations_persisted": self._metadata_db.annotations_persisted,
                 # The same question one level down, and not the same answer: the
                 # catalog also holds `decode_rates`, and a server with the
                 # annotation actions off keeps a file for those alone. A sibling
                 # key rather than a redefinition -- `annotations_persisted` is
                 # already on the wire and means what it says.
-                health_status["catalog_persisted"] = (
-                    self._metadata_db.store_path is not None
-                )
+                "catalog_persisted": self._metadata_db.store_path is not None,
+            }
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "create_source":
+            self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
@@ -897,6 +886,7 @@ class TensorFlightServer(flight.FlightServerBase):
             response_desc = self.uploads.create_source(req_desc)
             yield response_desc.SerializeToString()
         elif action.type == "upload_status":
+            self._authorize(context)
             source_id = action.body.to_pybytes().decode("utf-8")
             yield json.dumps(self.uploads.status(source_id)).encode("utf-8")
         elif action.type == "chunk_locate":
@@ -908,6 +898,7 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context, source_id)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
+            self._authorize(context)
             from dataclasses import asdict
 
             manager = CacheManager.get_instance()
@@ -924,15 +915,19 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context, source_id)
             yield from self._handle_warm(source_id, context)
         elif action.type == "add_source":
+            self._authorize(context)
             req = AddSourceRequest.FromString(action.body.to_pybytes())
             yield from self._handle_add_source(req, context)
         elif action.type == "remove_source":
+            self._authorize(context)
             req = RemoveSourceRequest.FromString(action.body.to_pybytes())
             yield self._handle_remove_source(req)
         elif action.type == "roi_prune":
+            self._authorize(context)
             req = RoiPruneRequest.FromString(action.body.to_pybytes())
             yield self._handle_roi_prune(req)
         else:
+            self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
     def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
@@ -1268,23 +1263,14 @@ class TensorFlightServer(flight.FlightServerBase):
         see the columns, and DoGet the whole catalog without a biopb proto.
         Browsing *sources* is a catalog query too (the SDK's ``list_sources``);
         the pixels and annotations of one source are not listable, they are
-        addressed. A server without a catalog advertises nothing.
+        addressed.
         """
         self._authorize(context)
-        if self._metadata_db is None:
-            return
         for table in sorted(self._metadata_db.allowed_tables):
-            sql = f"SELECT * FROM {table}"
-            ticket = TensorTicket(catalog_query=CatalogQuery(sql=sql))
             yield flight.FlightInfo(
                 schema=self._metadata_db.table_schema(table),
                 descriptor=flight.FlightDescriptor.for_path(table),
-                endpoints=[
-                    flight.FlightEndpoint(
-                        ticket=flight.Ticket(ticket.SerializeToString()),
-                        locations=[],
-                    )
-                ],
+                endpoints=[self._catalog_endpoint(f"SELECT * FROM {table}")],
                 total_records=-1,
                 total_bytes=-1,
             )
@@ -1409,16 +1395,9 @@ class TensorFlightServer(flight.FlightServerBase):
             if read_opt.with_metadata:
                 # One scheme (biopb/biopb#253): the source-level metadata is
                 # computed once at registration and read back from the catalog --
-                # the cache -- never recomputed on the adapter. The catalog is
-                # mandatory: a DB-less server (the embedded image-base cache) has
-                # no metadata to serve, so a metadata request fails closed. A DB
-                # read error propagates (no fallback); a NULL row is a legitimate
-                # "no metadata" (empty base).
-                if self._metadata_db is None:
-                    raise flight.FlightInternalError(
-                        f"Metadata requested for {source_id} but this server "
-                        "has no metadata catalog"
-                    )
+                # the cache -- never recomputed on the adapter. A DB read error
+                # propagates (no fallback); a NULL row is a legitimate "no
+                # metadata" (empty base).
                 raw_metadata = self._metadata_db.get_metadata_json(source_id) or {}
                 # Overlay the tensor adapter's cheap per-tensor delta -- fields the
                 # source-level row cannot carry (an OME-Zarr HCS field's own OME
@@ -1482,11 +1461,6 @@ class TensorFlightServer(flight.FlightServerBase):
 
         if arm == "catalog_query":
             self._authorize(context)
-            if self._metadata_db is None:
-                raise flight.FlightServerError(
-                    "This server has no metadata database attached, so SQL "
-                    "queries are unavailable."
-                )
             try:
                 table = self._metadata_db.query(tensor_ticket.catalog_query.sql)
             except ValueError as e:
