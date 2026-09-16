@@ -29,6 +29,8 @@ from biopb_tensor_server.serving.http_server import (
 )
 from fastapi.testclient import TestClient
 
+from tests import catalog_server, register_and_catalog
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -897,7 +899,7 @@ class TestIntegration:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
         import zarr
-        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server import ZarrAdapter
 
         # Create a small Zarr array
         zarr_path = str(tmp_path / "test.zarr")
@@ -914,10 +916,10 @@ class TestIntegration:
 
         # Bind to port 0 so the OS assigns a free port, avoiding flaky
         # "Address already in use" collisions when the suite runs back-to-back.
-        server = TensorFlightServer("grpc://127.0.0.1:0")
+        server = catalog_server("grpc://127.0.0.1:0")
         # Register under the same name as the adapter's array_id so that
         # the source_id returned by the server matches the tensor_id.
-        server.register_source("int-tensor", adapter)
+        register_and_catalog(server, "int-tensor", adapter)
 
         t = threading.Thread(target=server.serve, daemon=True)
         t.start()
@@ -2647,7 +2649,7 @@ class TestIntegrationLoneQualifiedTensor:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
         import zarr
-        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server import ZarrAdapter
 
         z = zarr.open_array(
             str(tmp_path / "lone.zarr"),
@@ -2661,8 +2663,8 @@ class TestIntegrationLoneQualifiedTensor:
         # One tensor, carrying a name: array_id becomes "lone/Image:0".
         adapter._tensor_name = "Image:0"
 
-        server = TensorFlightServer("grpc://127.0.0.1:0")
-        server.register_source("lone", adapter)
+        server = catalog_server("grpc://127.0.0.1:0")
+        register_and_catalog(server, "lone", adapter)
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(0.5)
         self._loc = f"grpc://localhost:{server.port}"

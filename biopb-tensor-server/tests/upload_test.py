@@ -32,6 +32,8 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.config import CacheConfig
 
+from tests import catalog_server
+
 
 def _read_cached_batch(cache_manager: CacheManager, chunk_id: bytes) -> pa.RecordBatch:
     """The batch stored under ``chunk_id``, or fail if it is not cached.
@@ -61,11 +63,10 @@ def writable_server(tmp_path):
     `__init__`, so the port is live before this returns -- the thread only parks
     on it.
     """
-    from biopb_tensor_server.serving.server import TensorFlightServer
 
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
-    server = TensorFlightServer(
+    server = catalog_server(
         location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
     )
     server.mark_ready()
@@ -1940,10 +1941,35 @@ class TestDiscard:
         assert "updated_at" not in client.get_upload_status(source_id)
 
 
-def test_a_durable_upload_lands_in_a_server_owned_catalog():
-    """A server built without a catalog owns one, and the upload path syncs a
-    durable upload into it like any other registration -- so list_sources
-    sees it."""
+def _durable_upload(server):
+    req_desc = TensorDescriptor(
+        array_id="ome_zarr:owned",
+        shape=[8, 8],
+        dtype="uint8",
+        chunk_shape=[4, 4],
+        dim_labels=["y", "x"],
+    )
+    return server.uploads.create_source(req_desc)
+
+
+def test_a_durable_upload_lands_in_the_servers_catalog():
+    """The upload path catalogues a durable upload itself, like any other
+    registering caller -- so list_sources sees it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        server = catalog_server(
+            location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
+        )
+        try:
+            response_desc = _durable_upload(server)
+            assert response_desc.array_id in _catalog_ids(server.metadata_db)
+        finally:
+            server.shutdown()
+
+
+def test_a_durable_upload_to_a_catalog_less_server_is_addressable_not_listed():
+    """metadata_db=None is a deployment shape, not a broken one: the upload
+    succeeds and its id comes back, and there is simply nowhere to list it."""
+    import pyarrow.flight as flight
     from biopb_tensor_server.serving.server import TensorFlightServer
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1951,14 +1977,10 @@ def test_a_durable_upload_lands_in_a_server_owned_catalog():
             location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
         )
         try:
-            req_desc = TensorDescriptor(
-                array_id="ome_zarr:owned",
-                shape=[8, 8],
-                dtype="uint8",
-                chunk_shape=[4, 4],
-                dim_labels=["y", "x"],
-            )
-            response_desc = server.uploads.create_source(req_desc)
-            assert response_desc.array_id in _catalog_ids(server._metadata_db)
+            response_desc = _durable_upload(server)
+            assert response_desc.array_id  # readable by the id it hands back
+            assert server.sources.get(response_desc.array_id.split("/")[0]) is not None
+            with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
+                list(server.list_flights(None, b""))
         finally:
             server.shutdown()

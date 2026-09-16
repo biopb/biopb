@@ -17,6 +17,8 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     """Check if zarr is available with working numcodecs."""
@@ -55,8 +57,8 @@ class TestTensorFlightClientRoundTrip:
             zarr_arr = zarr.open_array(zarr_path, mode="r")
             adapter = ZarrAdapter(zarr_arr, "test-tensor", ["y", "x"])
 
-            server = TensorFlightServer("grpc://localhost:8890")
-            server.register_source("test-tensor", adapter)
+            server = catalog_server("grpc://localhost:8890")
+            register_and_catalog(server, "test-tensor", adapter)
 
             # Start server in background
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -160,7 +162,7 @@ class TestTensorFlightClientRoundTrip:
         assert server_client.cache_info()["size_bytes"] == initial_bytes
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_wait_for_upload_ready_rejects_a_catalog_source(self, server_client):
+    def test_wait_for_upload_ready_rejects_a_register_and_catalog(self, server_client):
         """Waiting on a source nobody uploaded fails fast (biopb/biopb#109).
 
         "test-tensor" is a registered on-disk source, so the server has no

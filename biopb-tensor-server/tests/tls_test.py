@@ -16,6 +16,8 @@ import time
 import pyarrow.flight as flight
 import pytest
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     return importlib.util.find_spec("zarr") is not None
@@ -103,18 +105,18 @@ def test_tls_cert_without_key_is_rejected():
 @pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
 def test_trusting_client_reads_over_tls(simple_zarr_array):
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -139,18 +141,18 @@ def test_trusting_client_reads_over_tls(simple_zarr_array):
 @pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
 def test_plaintext_client_is_refused_by_tls_server(simple_zarr_array):
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -176,7 +178,7 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
     import numpy as np
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     # Isolate the TOFU pin store (state/biopb/tls-known-hosts.json) to a tmp tree.
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
@@ -185,12 +187,12 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -258,7 +260,7 @@ def test_sidecar_reads_over_tls_without_pinning(
     """
     import zarr
     from biopb._locations import tls_known_hosts
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
     from biopb_tensor_server.serving.tls import cert_fingerprint
     from fastapi.testclient import TestClient
@@ -269,10 +271,10 @@ def test_sidecar_reads_over_tls_without_pinning(
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -308,7 +310,7 @@ def test_sidecar_reads_over_a_cert_that_does_not_name_loopback(
     """
     import zarr
     from biopb._locations import tls_known_hosts
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
     from biopb_tensor_server.serving.tls import cert_fingerprint
     from fastapi.testclient import TestClient
@@ -321,10 +323,10 @@ def test_sidecar_reads_over_a_cert_that_does_not_name_loopback(
         dns_names=("gpu-051.hpc.example",), ip_addresses=()
     )
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -358,7 +360,7 @@ def test_sidecar_refuses_a_plane_presenting_a_different_certificate(
     """
     import zarr
     from biopb.tensor._tls import clear_pin_cache
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
     from biopb_tensor_server.serving.tls import cert_fingerprint
     from fastapi.testclient import TestClient
@@ -371,10 +373,10 @@ def test_sidecar_refuses_a_plane_presenting_a_different_certificate(
     served, key_pem = _self_signed_cert()
     other, _ = _self_signed_cert()  # a different cert with the same names
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://127.0.0.1:0", tls_cert_chain=served, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -407,7 +409,7 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
     import zarr
     from biopb import _data_plane, _tls_material, _tls_record
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
@@ -419,10 +421,10 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
         dns_names=("gpu-051.hpc.example",), ip_addresses=()
     )
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -453,7 +455,7 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
 def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
     """A grpc:// sidecar against a TLS plane must fail, not silently degrade."""
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
     from fastapi.testclient import TestClient
 
@@ -461,10 +463,10 @@ def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -529,16 +531,16 @@ def test_override_hostname_is_what_makes_a_mismatched_cert_connect(simple_zarr_a
     used anywhere.)
     """
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _cert_with_sans("wrong.example", "alt.example")
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     loc = f"grpc+tls://localhost:{server.port}"
@@ -586,7 +588,7 @@ def test_sdk_client_derives_the_override_and_reads(
     import numpy as np
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
@@ -594,10 +596,10 @@ def test_sdk_client_derives_the_override_and_reads(
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _cert_with_sans("wrong.example", "alt.example")
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -617,7 +619,7 @@ def test_a_cert_that_lists_the_dialed_name_gets_no_override(
     """The normal case is untouched: nothing is substituted when nothing is wrong."""
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
@@ -625,10 +627,10 @@ def test_a_cert_that_lists_the_dialed_name_gets_no_override(
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()  # SANs: localhost + 127.0.0.1
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:

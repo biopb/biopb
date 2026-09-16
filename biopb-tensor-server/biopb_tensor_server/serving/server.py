@@ -279,9 +279,12 @@ class TensorFlightServer(flight.FlightServerBase):
         arr = zarr.open_array('data.zarr', mode='r')
         adapter = ZarrAdapter(arr, 'my-tensor')
 
-        # Start the server
-        server = TensorFlightServer('grpc://0.0.0.0:8815')
-        server.register_source('my-tensor', adapter)
+        # Start the server. Pass a catalog if the sources must be browsable:
+        # registration is the registry, cataloguing is a separate second step
+        # and the registering caller's job (see ``metadata_db``).
+        db = MetadataDatabase()
+        server = TensorFlightServer('grpc://0.0.0.0:8815', metadata_db=db)
+        db.sync_source_added('my-tensor', server.register_source('my-tensor', adapter))
         server.mark_ready()  # registration done -> health reports SERVING
         server.serve()
     """
@@ -309,8 +312,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 own). ``None`` disables it.
             writable: Enable write mode for source creation and data upload
             write_dir: Directory for zarr-backed uploaded sources (required if writable)
-            metadata_db: The catalog. ``None`` (embedded / test servers) makes
-                an in-memory one the server keeps in step with its registry.
+            metadata_db: The catalog -- the browse surface behind the
+                ``catalog`` and ``roi`` flights. ``None`` builds a catalog-less
+                server: its sources are addressed by ``source_id`` and served,
+                but nothing can be listed, queried or annotated, and every
+                catalog surface refuses with ``FlightUnavailableError``. That
+                is the embedded in-process cache's shape (biopb-image-runtime),
+                where a result's id goes back to its one caller directly.
             annotations_enabled: Serve the ``roi`` flight. Not tied to
                 ``writable``: an annotation writes no pixels, so the token is its
                 boundary. This is the switch for a deployment that wants a
@@ -347,14 +355,13 @@ class TensorFlightServer(flight.FlightServerBase):
         super().__init__(location, middleware=middleware, **kwargs)
         self.sources = SourceRegistry()
         self._writable = writable
-        # Every server has a catalog: it is the browse surface (the `catalog`
-        # flight). A caller that brings its own (the CLI's SourceManager)
-        # syncs it itself; one the server made for itself is kept in step by
-        # register_source / swap_source / unregister_source.
-        self._owns_catalog = metadata_db is None
-        self._metadata_db: MetadataDatabase = (
-            metadata_db if metadata_db is not None else MetadataDatabase()
-        )
+        # The catalog, or None for a catalog-less server. The server never
+        # writes it: registering a source and cataloguing it are two steps, and
+        # the caller that registers owns the second one, because only it knows
+        # whether a failed catalog write should roll the registration back (the
+        # reconciler) or be swallowed (an upload, whose id already reached its
+        # one client).
+        self._metadata_db: Optional[MetadataDatabase] = metadata_db
         self._annotations_enabled = annotations_enabled
         # The server-wide token: what the public catalog tier requires, and
         # what a private source without a capability token of its own falls
@@ -478,16 +485,46 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         self._remove_source_handler = handler
 
+    @property
+    def metadata_db(self) -> Optional[MetadataDatabase]:
+        """The catalog behind the ``catalog`` and ``roi`` flights, or ``None``.
+
+        Public because registering a source does not catalogue it: a caller that
+        wants its source browsable calls ``metadata_db.sync_source_added``
+        itself, under whatever failure policy that call site owes its own caller
+        (the reconciler rolls the registration back, an upload swallows it).
+        ``None`` on a catalog-less server -- see ``_require_catalog``.
+        """
+        return self._metadata_db
+
+    def _require_catalog(self) -> MetadataDatabase:
+        """The catalog, or the refusal a catalog-less server owes its client.
+
+        ``metadata_db=None`` is a deployment shape, not a degenerate one: the
+        embedded in-process cache hands each result's ``source_id`` straight
+        back to the caller that asked for it, so there is nothing to browse and
+        no store to annotate into. Unavailable rather than ServerError, the same
+        distinction ``_require_annotations`` draws: "this server does not offer
+        the feature", not "your request was bad".
+        """
+        if self._metadata_db is None:
+            raise flight.FlightUnavailableError(
+                "This server has no catalog: its sources are addressed by "
+                "source_id, not listed"
+            )
+        return self._metadata_db
+
     def register_source(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source with the server (delegates to ``sources``).
+
+        The registry only -- cataloguing is the caller's second step, see
+        ``metadata_db``.
 
         Returns the adapter as registered: the registry normalizes a
         non-canonical axis order on the way in (biopb/biopb#596), so a caller
         that keeps using the adapter afterwards must use the returned one.
         """
-        registered = self.sources.register(source_id, adapter)
-        self._catalog_sync_added(source_id, registered)
-        return registered
+        return self.sources.register(source_id, adapter)
 
     def swap_source(
         self, source_id: str, adapter: SourceAdapter
@@ -499,26 +536,20 @@ class TensorFlightServer(flight.FlightServerBase):
         rebuilt against the current bytes. The displaced adapter is left open
         for the caller to close once in-flight reads have drained.
         """
-        registered, displaced = self.sources.swap(source_id, adapter)
-        self._catalog_sync_added(source_id, registered)
-        return registered, displaced
-
-    def _catalog_sync_added(self, source_id: str, adapter: SourceAdapter) -> None:
-        """Keep a server-owned catalog in step with the registry (best-effort:
-        a catalog write must not fail a registration)."""
-        if not self._owns_catalog:
-            return
-        try:
-            self._metadata_db.sync_source_added(source_id, adapter)
-        except Exception as e:  # noqa: BLE001 -- catalog is advisory here
-            logger.warning(f"catalog sync failed for {source_id}: {e}")
+        return self.sources.swap(source_id, adapter)
 
     def _catalog_refresh_residency(
         self, source_id: str, adapter: SourceAdapter
     ) -> None:
         """Best-effort refresh of the catalog's residency flags after a warm
-        pass, without a full ``sync_source_added`` re-registration."""
-        if not self._owns_catalog:
+        pass, without a full ``sync_source_added`` re-registration.
+
+        Best-effort and not the caller's business, unlike registration: the warm
+        already happened, so there is nothing to roll back and nothing the
+        client can do about a stale flag. A catalog-less server holds no row to
+        correct, so there is nothing to do.
+        """
+        if self._metadata_db is None:
             return
         try:
             self._metadata_db.refresh_residency(
@@ -528,13 +559,11 @@ class TensorFlightServer(flight.FlightServerBase):
             logger.warning(f"catalog residency refresh failed for {source_id}: {e}")
 
     def unregister_source(self, source_id: str) -> None:
-        """Unregister a data source (its upload state, if any, goes with it)."""
+        """Unregister a data source (its upload state, if any, goes with it).
+
+        The registry only, mirroring ``register_source``.
+        """
         self.sources.unregister(source_id)
-        if self._owns_catalog:
-            try:
-                self._metadata_db.sync_source_removed(source_id)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"catalog sync failed for {source_id}: {e}")
 
     def shutdown(self) -> None:
         """Release source-adapter resources, then shut down the Flight server.
@@ -654,7 +683,7 @@ class TensorFlightServer(flight.FlightServerBase):
         reads it whole. What ListFlights advertises and what GetFlightInfo on
         the table's path answers."""
         try:
-            schema = self._metadata_db.table_schema(table)
+            schema = self._require_catalog().table_schema(table)
         except ValueError as e:
             raise flight.FlightServerError(str(e)) from e
         return flight.FlightInfo(
@@ -764,7 +793,9 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightUnavailableError(
                 "ROI annotations are disabled on this server"
             )
-        return self._metadata_db
+        # Annotations live in the catalog's store, so a catalog-less server has
+        # nowhere to put them either.
+        return self._require_catalog()
 
     def _handle_roi_prune(self, req: RoiPruneRequest) -> bytes:
         """Report, and with ``apply`` delete, annotations whose source is gone.
@@ -878,13 +909,19 @@ class TensorFlightServer(flight.FlightServerBase):
                 # False only for a deliberately session-only server -- which a
                 # client may still want to say out loud before someone spends a
                 # morning tracing.
-                "annotations_persisted": self._metadata_db.annotations_persisted,
+                "annotations_persisted": (
+                    self._metadata_db is not None
+                    and self._metadata_db.annotations_persisted
+                ),
                 # The same question one level down, and not the same answer: the
                 # catalog also holds `decode_rates`, and a server with the
                 # annotation actions off keeps a file for those alone. A sibling
                 # key rather than a redefinition -- `annotations_persisted` is
                 # already on the wire and means what it says.
-                "catalog_persisted": self._metadata_db.store_path is not None,
+                "catalog_persisted": (
+                    self._metadata_db is not None
+                    and self._metadata_db.store_path is not None
+                ),
             }
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "create_source":
@@ -965,6 +1002,9 @@ class TensorFlightServer(flight.FlightServerBase):
         adapter = self.sources.get(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
+        # The terminal message IS the catalog row, so refuse before the recall
+        # rather than after minutes of download with nothing to hand back.
+        catalog = self._require_catalog()
 
         # Name/size of what is being recalled, computed once (stat is recall-free).
         # Best-effort: an unresolved adapter exposes its URL; a directory or a
@@ -988,14 +1028,6 @@ class TensorFlightServer(flight.FlightServerBase):
                     target_bytes=target_bytes,
                 )
             ).SerializeToString()
-
-        # A server-owned catalog has no on_resolved backfill wired -- that is the
-        # SourceManager's (_on_source_resolved) -- so its placeholder row is
-        # still what registration wrote. Note that here, and re-sync below once
-        # the resolve has succeeded. Scoped to this case: for a source that was
-        # already resolved the row describes it, and re-syncing would re-parse
-        # metadata release_registration_cache has dropped.
-        was_unresolved = self._owns_catalog and not adapter.list_tensor_descriptors()
 
         result: dict = {}
 
@@ -1032,12 +1064,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
 
-        # Unconditional on the flag above: a resolve that did not hydrate raised
-        # (the branch above), so reaching here means the adapter is resolved --
-        # including to zero tensors, whose row needs the same correction.
-        if was_unresolved:
-            self._catalog_sync_added(source_id, adapter)
-        row = self._metadata_db.source_row_ipc(source_id)
+        # The row read back is the one the adapter's ``on_resolved`` callback
+        # just backfilled -- resolution fires it, and that is the only thing
+        # that overwrites the NULL-shape placeholder registration wrote. An
+        # unresolved source built without the callback has no way to correct its
+        # row, which is why this reads the catalog rather than re-syncing here.
+        row = catalog.source_row_ipc(source_id)
         if row is None:
             raise flight.FlightServerError(
                 f"resolve succeeded for {source_id!r} but the catalog has no row for it"
@@ -1306,7 +1338,7 @@ class TensorFlightServer(flight.FlightServerBase):
         addressed.
         """
         self._authorize(context)
-        for table in sorted(self._metadata_db.allowed_tables):
+        for table in sorted(self._require_catalog().allowed_tables):
             yield self._catalog_flight_info(table)
 
     def get_flight_info(
@@ -1428,8 +1460,15 @@ class TensorFlightServer(flight.FlightServerBase):
                 # computed once at registration and read back from the catalog --
                 # the cache -- never recomputed on the adapter. A DB read error
                 # propagates (no fallback); a NULL row is a legitimate "no
-                # metadata" (empty base).
-                raw_metadata = self._metadata_db.get_metadata_json(source_id) or {}
+                # metadata" (empty base). A catalog-less server has no cache to
+                # read, and nothing released the adapter's registration copy
+                # either (``sync_source_added`` is what does that), so there it
+                # is the adapter that answers.
+                raw_metadata = (
+                    self._metadata_db.get_metadata_json(source_id)
+                    if self._metadata_db is not None
+                    else source_adapter.get_metadata()
+                ) or {}
                 # Overlay the tensor adapter's cheap per-tensor delta -- fields the
                 # source-level row cannot carry (an OME-Zarr HCS field's own OME
                 # metadata; an EMD signal's original_metadata). Merged over the
@@ -1493,7 +1532,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if arm == "catalog_query":
             self._authorize(context)
             try:
-                table = self._metadata_db.query(tensor_ticket.catalog_query.sql)
+                table = self._require_catalog().query(tensor_ticket.catalog_query.sql)
             except ValueError as e:
                 raise flight.FlightServerError(f"Catalog query failed: {e}") from e
             return flight.RecordBatchStream(table)
@@ -1696,7 +1735,11 @@ def serve(
     """
     server = TensorFlightServer(location, **kwargs)
     for source_id, adapter in adapters.items():
-        server.register_source(source_id, adapter)
+        registered = server.register_source(source_id, adapter)
+        # Registration is the registry; the catalog row is what makes a source
+        # browsable, and only a caller that passed a ``metadata_db`` has one.
+        if server.metadata_db is not None:
+            server.metadata_db.sync_source_added(source_id, registered)
     # All sources registered up front -> ready immediately (health: SERVING).
     server.mark_ready()
 

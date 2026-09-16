@@ -1396,8 +1396,9 @@ def create_source_manager(
         registry: AdapterRegistry used for claim detection and adapter creation.
         monitored_sources: SourceConfig entries with monitor=True.
         static_sources: Explicit SourceConfig entries (monitor=False).
-        metadata_db: MetadataDatabase kept in sync as sources are added and
-            removed (None when the feature is disabled).
+        metadata_db: the catalog this manager writes as sources are added and
+            removed. It is the only writer: the server registers, the reconciler
+            catalogues. None leaves registered sources absent from every browse.
         credentials_config: CredentialsConfig for remote storage authentication.
         stability_window: Seconds an entry's signature must be unchanged before
             it is eligible to be claimed.

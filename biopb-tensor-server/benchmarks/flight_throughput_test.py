@@ -149,7 +149,9 @@ def bench_real_server(
         adapter = OmeZarrAdapter(level_arr, "test")
 
         server = TensorFlightServer(location)
-        server.register_source("test", adapter)
+        server.metadata_db.sync_source_added(
+            "test", server.register_source("test", adapter)
+        )
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(0.3)

@@ -551,7 +551,10 @@ def _register_source_with_server(
         raise ValueError(f"No adapter registered for type: {registry_type}")
 
     adapter = adapter_cls.create_from_config(source_config)
-    server.register_source(source_id, adapter)
+    # Registry + catalog: registration alone leaves a source unbrowsable, and a
+    # benchmark client that opens by descriptor reads the catalog row.
+    registered = server.register_source(source_id, adapter)
+    server.metadata_db.sync_source_added(source_id, registered)
 
     return source_id
 
@@ -643,11 +646,13 @@ def data_source(
 
         # Create adapter from config with anon credentials
         adapter = adapter_cls.create_from_config(source_config, anon_credentials)
-        bench_server.register_source(source_id, adapter)
+        registered = bench_server.register_source(source_id, adapter)
+        bench_server.metadata_db.sync_source_added(source_id, registered)
 
         yield spec
 
         bench_server.unregister_source(source_id)
+        bench_server.metadata_db.sync_source_removed(source_id)
 
     elif is_nfs_source(source_id):
         if not has_nfs_marker:
@@ -674,6 +679,7 @@ def data_source(
         yield spec
 
         bench_server.unregister_source(source_id)
+        bench_server.metadata_db.sync_source_removed(source_id)
 
 
 # =============================================================================

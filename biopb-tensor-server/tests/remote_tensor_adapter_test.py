@@ -14,6 +14,8 @@ import time
 import numpy as np
 import pytest
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     return importlib.util.find_spec("zarr") is not None
@@ -114,9 +116,7 @@ def _db_upstream(zarr_path, source_ids):
     upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db)
 
     def register(sid):
-        adapter = ZarrAdapter(arr, sid, ["y", "x"])
-        upstream.register_source(sid, adapter)
-        db.sync_source_added(sid, adapter)
+        register_and_catalog(upstream, sid, ZarrAdapter(arr, sid, ["y", "x"]))
 
     def unregister(sid):
         upstream.unregister_source(sid)
@@ -131,18 +131,17 @@ def _db_upstream(zarr_path, source_ids):
 class TestRemoteTensorProxy:
     def _upstream(self, zarr_path):
         import zarr
-        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(zarr_path, mode="r")
-        upstream = TensorFlightServer("grpc://localhost:0")
-        upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+        upstream = catalog_server("grpc://localhost:0")
+        register_and_catalog(upstream, "img", ZarrAdapter(arr, "img", ["y", "x"]))
         _serve(upstream)
         return upstream
 
     def _proxy(
         self, upstream_port, local_source_id="lab__img", upstream_source_id="img"
     ):
-        from biopb_tensor_server import TensorFlightServer
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
         adapter = RemoteTensorAdapter(
@@ -150,8 +149,8 @@ class TestRemoteTensorProxy:
             upstream_location=f"grpc://localhost:{upstream_port}",
             upstream_source_id=upstream_source_id,
         )
-        proxy = TensorFlightServer("grpc://localhost:0")
-        proxy.register_source(local_source_id, adapter)
+        proxy = catalog_server("grpc://localhost:0")
+        register_and_catalog(proxy, local_source_id, adapter)
         _serve(proxy)
         return proxy
 
@@ -252,11 +251,13 @@ class TestRemoteTensorProxy:
 
     def _upstream_3d(self, zarr_path):
         import zarr
-        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(zarr_path, mode="r")
-        upstream = TensorFlightServer("grpc://localhost:0")
-        upstream.register_source("aics", ZarrAdapter(arr, "aics", ["z", "y", "x"]))
+        upstream = catalog_server("grpc://localhost:0")
+        register_and_catalog(
+            upstream, "aics", ZarrAdapter(arr, "aics", ["z", "y", "x"])
+        )
         _serve(upstream)
         return upstream
 
@@ -273,7 +274,7 @@ class TestRemoteTensorProxy:
 
         import zarr
         from biopb.tensor import TensorFlightClient
-        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -286,8 +287,9 @@ class TestRemoteTensorProxy:
             )
             za[:] = src
 
-            upstream = TensorFlightServer("grpc://localhost:0")
-            upstream.register_source(
+            upstream = catalog_server("grpc://localhost:0")
+            register_and_catalog(
+                upstream,
                 "aics",
                 ZarrAdapter(zarr.open_array(zpath, mode="r"), "aics", ["z", "y", "x"]),
             )
@@ -313,8 +315,8 @@ class TestRemoteTensorProxy:
                     metadata={},
                     data_resident=True,
                 )
-                proxy = TensorFlightServer("grpc://localhost:0")
-                proxy.register_source("hpc__aics", adapter)
+                proxy = catalog_server("grpc://localhost:0")
+                register_and_catalog(proxy, "hpc__aics", adapter)
                 _serve(proxy)
                 try:
                     client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
@@ -341,7 +343,7 @@ class TestRemoteTensorProxy:
 
         import zarr
         from biopb.tensor.descriptor_pb2 import TensorReadOption
-        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
         from biopb_tensor_server.core.chunk import (
             is_proxy_envelope,
@@ -361,8 +363,9 @@ class TestRemoteTensorProxy:
             )
             za[:] = np.zeros((3, 40, 50), dtype="<i2")
 
-            upstream = TensorFlightServer("grpc://localhost:0")
-            upstream.register_source(
+            upstream = catalog_server("grpc://localhost:0")
+            register_and_catalog(
+                upstream,
                 "aics",
                 ZarrAdapter(zarr.open_array(zpath, mode="r"), "aics", ["z", "y", "x"]),
             )
@@ -423,7 +426,7 @@ class TestRemoteTensorProxy:
 
         import zarr
         from biopb.tensor.descriptor_pb2 import TensorReadOption
-        from biopb_tensor_server import OmeZarrAdapter, TensorFlightServer
+        from biopb_tensor_server import OmeZarrAdapter
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
         from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
@@ -433,8 +436,8 @@ class TestRemoteTensorProxy:
             )
             root = zarr.open_group(zpath, mode="r")
 
-            upstream = TensorFlightServer("grpc://localhost:0")
-            upstream.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
+            upstream = catalog_server("grpc://localhost:0")
+            register_and_catalog(upstream, "ome", OmeZarrAdapter(root["0"], "ome"))
             _serve(upstream)
             try:
                 adapter = RemoteTensorAdapter(
@@ -481,7 +484,7 @@ class TestRemoteTensorProxy:
 
         import zarr
         from biopb.tensor.descriptor_pb2 import TensorReadOption
-        from biopb_tensor_server import OmeZarrAdapter, TensorFlightServer
+        from biopb_tensor_server import OmeZarrAdapter
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
         from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
@@ -491,8 +494,8 @@ class TestRemoteTensorProxy:
             )
             root = zarr.open_group(zpath, mode="r")
 
-            upstream = TensorFlightServer("grpc://localhost:0")
-            upstream.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
+            upstream = catalog_server("grpc://localhost:0")
+            register_and_catalog(upstream, "ome", OmeZarrAdapter(root["0"], "ome"))
             _serve(upstream)
             try:
                 adapter = RemoteTensorAdapter(
@@ -660,7 +663,6 @@ class TestBareHostExpansion:
     """A bare grpc://host:port source mirrors *every* upstream source (§3)."""
 
     def test_expansion_mirrors_all_sources_namespaced(self, simple_zarr_array):
-        from biopb_tensor_server import TensorFlightServer
         from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.sources.resolve import discover_sources
 
@@ -680,10 +682,10 @@ class TestBareHostExpansion:
             from biopb.tensor import TensorFlightClient
             from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
-            proxy = TensorFlightServer("grpc://localhost:0")
+            proxy = catalog_server("grpc://localhost:0")
             for cfg in expanded:
-                proxy.register_source(
-                    cfg.source_id, RemoteTensorAdapter.create_from_config(cfg)
+                register_and_catalog(
+                    proxy, cfg.source_id, RemoteTensorAdapter.create_from_config(cfg)
                 )
             _serve(proxy)
             try:
@@ -994,14 +996,15 @@ def _phys_zarr_cls():
 def _upstream_with_metadata(zarr_path):
     """An upstream server whose metadata DB holds one source ('img') with metadata."""
     import zarr
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     arr = zarr.open_array(zarr_path, mode="r")
+    from biopb_tensor_server import TensorFlightServer
+
     db = MetadataDatabase()  # in-memory, enabled
     upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db)
     up_adapter = _meta_zarr_cls()(arr, "img", ["y", "x"])
-    upstream.register_source("img", up_adapter)
+    register_and_catalog(upstream, "img", up_adapter)
     db.sync_source_added("img", up_adapter)  # populate the DuckDB sources row
     _serve(upstream)
     return upstream
@@ -1039,13 +1042,14 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
     import json
 
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     upstream = _upstream_with_metadata(zarr_path)
     try:
+        from biopb_tensor_server import TensorFlightServer
+
         proxy_db = MetadataDatabase()
         proxy = TensorFlightServer("grpc://localhost:0", metadata_db=proxy_db)
         proxy_adapter = RemoteTensorAdapter(
@@ -1053,7 +1057,7 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
             upstream_location=f"grpc://localhost:{upstream.port}",
             upstream_source_id="img",
         )
-        proxy.register_source("lab__img", proxy_adapter)
+        register_and_catalog(proxy, "lab__img", proxy_adapter)
         proxy_db.sync_source_added("lab__img", proxy_adapter)  # mirror -> catalog
         _serve(proxy)
         try:
@@ -1074,17 +1078,16 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_get_metadata_mirrors_a_bare_upstreams_own_catalog(simple_zarr_array):
-    """Every server has a catalog: an upstream built without one keeps its own
-    in-memory catalog in step with its registry, so the mirror sees metadata."""
+def test_get_metadata_mirrors_an_upstreams_catalog(simple_zarr_array):
+    """Source-level metadata reaches the mirror through the upstream's catalog
+    row -- the mirror reads what the upstream catalogued, not its adapter."""
     import zarr
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = TensorFlightServer("grpc://localhost:0")  # server-owned catalog
-    upstream.register_source("img", _meta_zarr_cls()(arr, "img", ["y", "x"]))
+    upstream = catalog_server("grpc://localhost:0")
+    register_and_catalog(upstream, "img", _meta_zarr_cls()(arr, "img", ["y", "x"]))
     _serve(upstream)
     try:
         adapter = RemoteTensorAdapter(
@@ -1108,13 +1111,12 @@ def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
     (biopb/biopb#295). See test_physical_scale_surfaced_through_proxy for the
     end-to-end path."""
     import zarr
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = TensorFlightServer("grpc://localhost:0")
-    upstream.register_source("img", _phys_zarr_cls()(arr, "img", ["y", "x"]))
+    upstream = catalog_server("grpc://localhost:0")
+    register_and_catalog(upstream, "img", _phys_zarr_cls()(arr, "img", ["y", "x"]))
     _serve(upstream)
     try:
         adapter = RemoteTensorAdapter(
@@ -1136,17 +1138,17 @@ def test_physical_scale_surfaced_through_proxy(simple_zarr_array):
     GetFlightInfo already carries the grid (biopb/biopb#295, closing #266's gap)."""
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = TensorFlightServer("grpc://localhost:0")
-    upstream.register_source("img", _phys_zarr_cls()(arr, "img", ["y", "x"]))
+    upstream = catalog_server("grpc://localhost:0")
+    register_and_catalog(upstream, "img", _phys_zarr_cls()(arr, "img", ["y", "x"]))
     _serve(upstream)
     try:
-        proxy = TensorFlightServer("grpc://localhost:0")
-        proxy.register_source(
+        proxy = catalog_server("grpc://localhost:0")
+        register_and_catalog(
+            proxy,
             "lab__img",
             RemoteTensorAdapter(
                 source_id="lab__img",
@@ -1185,7 +1187,7 @@ def test_server_get_flight_info_uses_proxy_forward():
         TensorDescriptor,
         TensorReadOption,
     )
-    from biopb_tensor_server import OmeZarrAdapter, TensorFlightServer
+    from biopb_tensor_server import OmeZarrAdapter
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
     from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
     from pyarrow import flight
@@ -1196,12 +1198,13 @@ def test_server_get_flight_info_uses_proxy_forward():
         )
         root = zarr.open_group(zpath, mode="r")
 
-        upstream = TensorFlightServer("grpc://localhost:0")
-        upstream.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
+        upstream = catalog_server("grpc://localhost:0")
+        register_and_catalog(upstream, "ome", OmeZarrAdapter(root["0"], "ome"))
         _serve(upstream)
         try:
-            proxy = TensorFlightServer("grpc://localhost:0")
-            proxy.register_source(
+            proxy = catalog_server("grpc://localhost:0")
+            register_and_catalog(
+                proxy,
                 "hpc__ome",
                 RemoteTensorAdapter(
                     source_id="hpc__ome",
@@ -1241,14 +1244,14 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
     still returns a best-effort plan -- the branch degrades, it does not raise."""
     import zarr
     from biopb.tensor.descriptor_pb2 import FlightRequest, TensorReadOption
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
     from pyarrow import flight
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = TensorFlightServer("grpc://localhost:0")
-    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    upstream = catalog_server("grpc://localhost:0")
+    register_and_catalog(upstream, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     _serve(upstream)
     try:
         adapter = RemoteTensorAdapter(
@@ -1272,8 +1275,8 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
         # Force the forward to yield nothing -> the server must use the local planner.
         adapter.forward_flight_info = lambda read_opt: None
 
-        proxy = TensorFlightServer("grpc://localhost:0")
-        proxy.register_source("lab__img", adapter)
+        proxy = catalog_server("grpc://localhost:0")
+        register_and_catalog(proxy, "lab__img", adapter)
         _serve(proxy)
         try:
             cmd = FlightRequest(
@@ -1296,7 +1299,6 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
     The upstream has a metadata DB so the re-list enumerates via the complete
     query_sources catalog -- removals are only applied on a complete list."""
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
@@ -1306,7 +1308,7 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
     upstream, up_register, up_unregister = _db_upstream(zarr_path, ["img"])
     _serve(upstream)
     try:
-        proxy = TensorFlightServer("grpc://localhost:0")
+        proxy = catalog_server("grpc://localhost:0")
         _serve(proxy)
         try:
             manager = SourceManager(
@@ -1314,7 +1316,7 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
                 monitored_dirs=set(),
-                metadata_db=None,
+                metadata_db=proxy.metadata_db,
                 monitored_upstreams=[
                     SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
                 ],
@@ -1347,13 +1349,12 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
 def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr_array):
     """create_source_manager records a monitored bare-host grpc:// source as a
     re-list upstream, and excludes the single-source grpc://host/<id> form."""
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.sources.source_manager import create_source_manager
 
     zarr_path, _, _ = simple_zarr_array
-    server = TensorFlightServer("grpc://localhost:0")
+    server = catalog_server("grpc://localhost:0")
     manager = create_source_manager(
         server=server,
         registry=get_default_registry(),
@@ -1363,7 +1364,7 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
             SourceConfig(url="grpc://lab:8815", alias="lab", monitor=True),
             SourceConfig(url="grpc://lab:8815/one", alias="lab", monitor=True),
         ],
-        metadata_db=None,
+        metadata_db=server.metadata_db,
     )
     urls = [u.url for u in manager._monitored_upstreams]
     assert "grpc://lab:8815" in urls
@@ -1474,7 +1475,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
     seed.shutdown()
     url = f"grpc://localhost:{port}"
 
-    proxy = TensorFlightServer("grpc://localhost:0")
+    proxy = catalog_server("grpc://localhost:0")
     _serve(proxy)
     try:
         manager = SourceManager(
@@ -1482,7 +1483,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
             monitored_dirs=set(),
-            metadata_db=None,
+            metadata_db=proxy.metadata_db,
             monitored_upstreams=[SourceConfig(url=url, alias="lab")],
         )
         client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
@@ -1497,9 +1498,9 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
 
         # the upstream comes up on the SAME port with a populated metadata DB
         db = MetadataDatabase()
-        up = TensorFlightServer(url, metadata_db=db)
+        up = catalog_server(url, metadata_db=db)
         adapter = ZarrAdapter(arr, "img", ["y", "x"])
-        up.register_source("img", adapter)
+        register_and_catalog(up, "img", adapter)
         db.sync_source_added("img", adapter)
         _serve(up)
         try:
@@ -1521,7 +1522,6 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
     """A stable upstream is re-listed less often (period doubles in ticks while the
     source set is unchanged); a new source resets it to the fast every-tick cadence."""
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
@@ -1532,7 +1532,7 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
     _serve(upstream)
     url = f"grpc://localhost:{upstream.port}"
     try:
-        proxy = TensorFlightServer("grpc://localhost:0")
+        proxy = catalog_server("grpc://localhost:0")
         _serve(proxy)
         try:
             manager = SourceManager(
@@ -1540,7 +1540,7 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
                 monitored_dirs=set(),
-                metadata_db=None,
+                metadata_db=proxy.metadata_db,
                 monitored_upstreams=[SourceConfig(url=url, alias="lab")],
             )
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
@@ -1963,8 +1963,8 @@ class TestUnreachableUpstream:
         assert adapter.list_tensor_descriptors() == []  # down -> placeholder
 
         # bring an upstream up on that same port; the SAME adapter now serves live
-        upstream = TensorFlightServer(f"grpc://localhost:{port}")
-        upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+        upstream = catalog_server(f"grpc://localhost:{port}")
+        register_and_catalog(upstream, "img", ZarrAdapter(arr, "img", ["y", "x"]))
         _serve(upstream)
         try:
             descs = adapter.list_tensor_descriptors()
@@ -1979,12 +1979,11 @@ class TestUnreachableUpstream:
 def test_unreachable_sole_monitored_upstream_does_not_block_startup():
     """A sole bare-host monitor=true upstream that is down at boot must not stop
     the server starting -- the re-list recovers it once reachable (#178)."""
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.sources.source_manager import create_source_manager
 
-    server = TensorFlightServer("grpc://localhost:0")
+    server = catalog_server("grpc://localhost:0")
     manager = create_source_manager(
         server=server,
         registry=get_default_registry(),
@@ -1992,7 +1991,7 @@ def test_unreachable_sole_monitored_upstream_does_not_block_startup():
         monitored_sources=[
             SourceConfig(url="grpc://localhost:59599", alias="lab", monitor=True)
         ],
-        metadata_db=None,
+        metadata_db=server.metadata_db,
     )
     assert manager is not None  # would have been None (hard-fail) before the fix
     assert [u.url for u in manager._monitored_upstreams] == ["grpc://localhost:59599"]
@@ -2005,18 +2004,19 @@ def test_display_friendly_proxied_source_url(simple_zarr_array):
     identical for every source of an upstream)."""
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = TensorFlightServer("grpc://localhost:0")
-    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    upstream = catalog_server("grpc://localhost:0")
+    register_and_catalog(upstream, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     _serve(upstream)
     up = f"grpc://localhost:{upstream.port}"
     try:
-        proxy = TensorFlightServer("grpc://localhost:0")
-        proxy.register_source(  # aliased -> grpc://lab:img
+        proxy = catalog_server("grpc://localhost:0")
+        register_and_catalog(  # aliased -> grpc://lab:img
+            proxy,
             "lab__img",
             RemoteTensorAdapter(
                 source_id="lab__img",
@@ -2025,7 +2025,8 @@ def test_display_friendly_proxied_source_url(simple_zarr_array):
                 alias="lab",
             ),
         )
-        proxy.register_source(  # no alias -> grpc://<host:port>:img
+        register_and_catalog(  # no alias -> grpc://<host:port>:img
+            proxy,
             "img",
             RemoteTensorAdapter(
                 source_id="img", upstream_location=up, upstream_source_id="img"
@@ -2050,7 +2051,7 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
     cache without a second upstream fetch -- the proxy inherits the segment cache."""
     import zarr
     from biopb.tensor.ticket_pb2 import ChunkBounds
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.chunk import encode_chunk_id, encode_proxy_envelope
@@ -2058,8 +2059,8 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
 
     zarr_path, shape, chunks = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = TensorFlightServer("grpc://localhost:0")
-    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    upstream = catalog_server("grpc://localhost:0")
+    register_and_catalog(upstream, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     _serve(upstream)
     try:
         adapter = RemoteTensorAdapter(
@@ -2729,20 +2730,19 @@ def _register_static_proxy(url, alias):
     up holding. The upstream is never dialed here -- registration is offline, and
     the display url is what is under test.
     """
-    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.sources.resolve import discover_sources
     from biopb_tensor_server.sources.source_manager import create_source_manager
 
     expanded = discover_sources(SourceConfig(url=url, alias=alias))
-    server = TensorFlightServer("grpc://localhost:0")
+    server = catalog_server("grpc://localhost:0")
     create_source_manager(
         server=server,
         registry=get_default_registry(),
         static_sources=expanded,
         monitored_sources=[],
-        metadata_db=None,
+        metadata_db=server.metadata_db,
     )
     return server
 
@@ -2798,7 +2798,6 @@ class TestAliasAndSchemeSurviveRegistration:
     def test_monitored_reconcile_keeps_the_alias(self, simple_zarr_array):
         """The mirrored-source path (reconciler) drops the alias independently of
         the static path, so it needs its own coverage."""
-        from biopb_tensor_server import TensorFlightServer
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.core.discovery import DiscoveryState
@@ -2808,13 +2807,13 @@ class TestAliasAndSchemeSurviveRegistration:
         upstream, _, _ = _db_upstream(zarr_path, ["img"])
         _serve(upstream)
         try:
-            proxy = TensorFlightServer("grpc://localhost:0")
+            proxy = catalog_server("grpc://localhost:0")
             manager = SourceManager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
                 monitored_dirs=set(),
-                metadata_db=None,
+                metadata_db=proxy.metadata_db,
                 monitored_upstreams=[
                     SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
                 ],

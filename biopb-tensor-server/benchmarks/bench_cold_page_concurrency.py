@@ -821,9 +821,10 @@ def main() -> None:
 
         for sid in source_ids:
             zpath = tmp / sid / "test.zarr"
-            server.register_source(
+            registered = server.register_source(
                 sid, ZarrAdapter(zarr.open_array(str(zpath), mode="r"), sid, ["y", "x"])
             )
+            server.metadata_db.sync_source_added(sid, registered)
 
         backend = CacheManager.get_instance()._backend
 

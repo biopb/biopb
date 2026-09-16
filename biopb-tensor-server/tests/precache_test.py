@@ -14,6 +14,8 @@ from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     try:
@@ -1575,10 +1577,10 @@ class TestAdvertisedPyramidDescriptor:
     def test_the_catalog_leaves_pyramid_empty(self, tmp_path):
         from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = catalog_server("grpc://localhost:0")
         try:
-            server.register_source("big", self._big_zarr_adapter(tmp_path))
-            rows = server._metadata_db.query(
+            register_and_catalog(server, "big", self._big_zarr_adapter(tmp_path))
+            rows = server.metadata_db.query(
                 f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
             ).to_pylist()
             assert rows

@@ -127,9 +127,10 @@ def _start_server(zarr_path: str):
     CacheManager.initialize(CacheConfig(file_cache_dir=str(cache_dir)))
 
     server = TensorFlightServer("grpc://localhost:0")
-    server.register_source(
+    registered = server.register_source(
         "stack", ZarrAdapter(zarr.open_array(zarr_path, mode="r"), "stack", LABELS)
     )
+    server.metadata_db.sync_source_added("stack", registered)
     threading.Thread(target=server.serve, daemon=True).start()
     time.sleep(1.0)
     return server

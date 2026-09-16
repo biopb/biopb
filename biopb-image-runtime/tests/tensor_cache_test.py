@@ -175,7 +175,7 @@ def test_embedded_cache_rejects_non_uniform_chunks(
 
 
 def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCache):
-    """A result carries a per-source token; reads need it, the catalog does not."""
+    """A result carries a per-source token, and reads need it."""
     import pyarrow.flight as flight
 
     data = np.arange(16, dtype=np.float32).reshape(4, 4)
@@ -196,11 +196,13 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     with pytest.raises(flight.FlightError):
         TensorFlightClient.tensor_from_pb(no_token).compute()
 
-    # The catalog is public: the result is listed (by anyone reaching the
-    # server), and its pixels are what the token gates.
+    # This server is catalog-less (metadata_db=None): a result is reachable
+    # only through the source_id its SerializedTensor carries, so it cannot be
+    # enumerated by someone who merely reaches the port. The catalog surface
+    # says so rather than answering "empty".
     location = served_embedded_cache._external_location
-    listed = TensorFlightClient(location).list_sources()
-    assert source_id in listed
+    with pytest.raises(flight.FlightError, match="no catalog"):
+        TensorFlightClient(location).list_sources()
 
 
 def test_discard_refuses_later_writes_with_the_reason(
