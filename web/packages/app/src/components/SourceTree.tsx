@@ -287,13 +287,6 @@ export function TreeRow({
   const firstTensor = src.tensors[0];
   // An unresolved source has no tensor to read, so selecting it would send the
   // viewer after a tile that cannot exist.
-  //
-  // `aria-disabled`, not `disabled`: a real `disabled` button suppresses the
-  // `title` tooltip in several browsers, and the tooltip is the only thing
-  // explaining why the row will not open. It also keeps the row in the tab
-  // order, so the explanation is reachable without a pointer. The click guard
-  // below does the actual blocking; Phase 4 (#1030) swaps it for the resolve
-  // trigger.
   const unresolved = isUnresolved(src);
   const inFlight = resolving?.has(src.source_id) ?? false;
 

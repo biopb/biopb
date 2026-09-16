@@ -77,6 +77,14 @@ export function sourceLabel(src: DataSourceDescriptor): string {
   return parts[parts.length - 1] ?? src.source_id;
 }
 
+/** The last path segment of a bare id or url, falling back to the whole
+ * string -- for a short display label where only that string is known, not a
+ * full {@link DataSourceDescriptor} (e.g. a resolve/warm job's `source_id`). */
+export function shortId(idOrUrl: string): string {
+  const parts = getPathParts(idOrUrl);
+  return parts[parts.length - 1] ?? idOrUrl;
+}
+
 /**
  * Glyph marking a source the server has not hydrated yet. Matches the napari
  * `tensor_browser`'s own indicator so the two browsers read the same.

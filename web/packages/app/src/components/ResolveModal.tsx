@@ -2,6 +2,7 @@
 
 import type { SourceJobStatus } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
+import { shortId } from "../utils/sourceTree";
 
 /**
  * Modal progress for an in-flight resolve, and the one place a failed resolve
@@ -16,11 +17,6 @@ import { useAppStore } from "../store";
  * closes quietly; a completed resolve closes too, because the result is the
  * source becoming openable in the tree, which says it better than an alert.
  */
-
-function shortId(sourceId: string): string {
-  const parts = sourceId.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? sourceId;
-}
 
 export function ResolveModalView({
   job,

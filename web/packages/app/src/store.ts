@@ -1431,15 +1431,19 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
     return;
   }
 
-  for (const before of running) {
-    let after: SourceJobStatus;
-    try {
-      after = await client.http.jobStatus(before.kind, before.source_id);
-    } catch {
+  // In parallel, not one at a time: each is an independent HTTP request, and a
+  // sequential await-in-loop would make a tick's cost grow with job count and
+  // risk overlapping the next tick if it ran long.
+  const results = await Promise.allSettled(
+    running.map((j) => client.http.jobStatus(j.kind, j.source_id)),
+  );
+  for (const result of results) {
+    if (result.status === "rejected") {
       // A blip leaves the previous status in place; the next tick retries. Not
       // marked failed: the recall is server-side and unaffected by our poll.
       continue;
     }
+    const after = result.value;
     putJob(set, after);
     if (isSettled(after)) {
       await onJobSettled(get, after);
@@ -1463,8 +1467,10 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
  */
 async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
   if (job.kind !== "resolve" || job.state !== "done") return;
-  await get().loadSources();
-  await get().startWarm(job.source_id);
+  // Independent: the catalog reload and starting the warm hit different
+  // endpoints and different store slices, so there is nothing for one to wait
+  // on from the other.
+  await Promise.all([get().loadSources(), get().startWarm(job.source_id)]);
 }
 
 /**

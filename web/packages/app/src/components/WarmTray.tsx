@@ -2,6 +2,7 @@
 
 import type { SourceJobStatus } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
+import { shortId } from "../utils/sourceTree";
 
 /**
  * Hydrate-ahead progress, pinned to the foot of the catalog pane.
@@ -26,12 +27,6 @@ function formatBytes(n: number): string {
     i += 1;
   }
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
-}
-
-/** Short label for a source, which here is only ever an id. */
-function shortId(sourceId: string): string {
-  const parts = sourceId.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? sourceId;
 }
 
 export function WarmTrayRow({
