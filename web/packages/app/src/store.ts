@@ -473,22 +473,12 @@ let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
  * in-place change: a cloud source that resolves was already listed under that
  * url, it just gained its tensors and flipped its flags, so the tree kept
  * showing it as unresolved until a manual reload (biopb/biopb#1030). Warming
- * and eviction are invisible the same way.
+ * and eviction are invisible the same way. `JSON.stringify` covers every
+ * field of `DataSourceDescriptor` by construction, so a field added later
+ * can't go silently blind to the poll the way the url-only check did.
  */
 export function catalogFingerprint(sources: DataSourceDescriptor[]): string {
-  return sources
-    .map((s) =>
-      [
-        s.source_id,
-        s.source_url,
-        s.is_resolved ? "R" : "-",
-        s.data_resident ? "D" : "-",
-        s.tensors
-          .map((t) => `${t.array_id}|${t.dtype}|${t.shape.join("x")}`)
-          .join(","),
-      ].join(""),
-    )
-    .join("");
+  return JSON.stringify(sources);
 }
 
 // LocalStorage key for channel color persistence
