@@ -154,11 +154,40 @@ Java (the published artifact targets Java 11, so not a record), built by
 
 **The proto decoders stay, deprecated.** `descriptor_from_row` /
 `descriptors_from_rows` / `descriptorsFromRows` keep their names, their
-signatures and their exact output, and `list_sources` / `get_source` /
-`resolve` keep returning `DataSourceDescriptor`. Nothing an SDK user calls
+signatures and their exact output, as do `list_sources` / `get_source` — the
+two stable APIs that return `DataSourceDescriptor`. Nothing an SDK user calls
 changes shape under them; the deprecation is the message, and what it says is
 that this path cannot grow. A caller who wants `is_resolved` moves to the new
 decoder, which is one line and a name they can grep for.
+
+**`resolve()` does change, because it can.** Cloud support is experimental, so
+it returns `CatalogSource` now. The question it raises is why it does not
+mirror `warm()`, which returns a terminal `WarmProgress`. The two look
+symmetric and are not:
+
+- `warm` changes **residency**, which is deliberately not a durable catalog
+  fact (#1035). Its `files_total` / `files_done` / `bytes_done` exist nowhere
+  else — no query recovers them — so returning them is the only way they reach
+  a client. `files_total == 0` is load-bearing on exactly that basis: it is
+  how a caller learns the source had nothing to warm.
+- `resolve` changes **`is_resolved` and `tensors`**, which are columns. Its
+  result is durable by construction, so the return is a shortcut to data that
+  now exists rather than the only channel to it.
+
+And a terminal `ResolveProgress` would carry `elapsed_seconds` (the caller can
+time it) plus `target_name` / `target_bytes` (derivable from `source_url`) —
+the reconstructible half — while dropping the tensor list, the half that is
+the point. That is backwards from `warm`, where the returned counts are the
+irreplaceable part. So: a status where there is only a status, a result where
+there is a result.
+
+The nearest real alternative was `resolve() -> None`, matching §2's
+`add_source`: the row is written, and one addressed `query_sources` away.
+Returning it wins on ergonomics — the caller's next move is to read the
+tensors — and it closes the transition in one call, with no window in which a
+rescan re-registers the source. (§2's stated reason, that the enumeration is
+"not otherwise obtainable without hitting the browse cap", is not the right
+one: `WHERE source_id = ...` returns a single row and no cap ever bites.)
 
 **Absent beats empty.** §1 noted `descriptor_from_row` hardcoded
 `metadata_json=""`, and §3's invariant is that a catalog entry carries no
@@ -174,12 +203,11 @@ resolved cleanly and held nothing readable. Both now read the flag, and both say
 something different for the two cases. The `biopb tensor query` CLI prints
 `<unresolved>` rather than `<no tensors>` for the first.
 
-Those three are also the worked example of the migration: each moved off the
+Those are also the worked example of the migration: each moved off the
 deprecated decoder because it needed the field, which is the only reason to
-move. `TensorConnection.resolve_source` is the one that cost anything — it used
-to hand the widget whatever `resolve()` returned, and now reads the row back by
-id (addressed, so the browse cap cannot hide it) because the widget's next
-decision, whether to warm, needs `is_resolved`.
+move. `TensorConnection.resolve_source` still hands the widget whatever
+`resolve()` returned — that is now a `CatalogSource`, so the widget's next
+decision, whether to warm, reads the flag straight off it.
 
 The proto message stays in `descriptor.proto`, unused: removing it would break
 codegen for consumers outside this repo, and it costs nothing to leave.
@@ -191,7 +219,9 @@ fallbacks in both clients (a bare serialized descriptor as the resolve terminal;
 the empty-body heartbeat convention) went with it. Field numbers 2
 (`ResolveStreamMessage.result`) and 1 (`AddSourceResult.added`) are reserved.
 
-§6 changes no wire bytes, and no SDK signature — it adds a decoder and
-deprecates one. It does add `is_resolved` to `SOURCE_ROW_COLUMNS`, so an SDK
-from after #1032 against a server from before #1033 fails the SELECT rather
-than degrading; that is the same coupling `data_resident` already had.
+§6 changes no wire bytes. It adds a decoder, deprecates one, and leaves every
+stable signature alone; the single return-type change is `resolve()`, which
+cloud support's experimental status allows. It does add `is_resolved` to
+`SOURCE_ROW_COLUMNS`, so an SDK from after #1032 against a server from before
+#1033 fails the SELECT rather than degrading; that is the same coupling
+`data_resident` already had.

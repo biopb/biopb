@@ -42,7 +42,9 @@ from biopb.image.annotation_pb2 import (
 )
 from biopb.tensor._catalog_rows import (
     SOURCE_ROW_COLUMNS,
+    CatalogSource,
     _descriptor_from_row,
+    source_from_row,
     sql_literal,
 )
 from biopb.tensor._pool import (
@@ -491,6 +493,23 @@ class CatalogClient:
         for tensor_desc in source_desc.tensors:
             self._state.cache_descriptor(tensor_desc)
 
+    def _cache_catalog_tensors(self, source: CatalogSource) -> None:
+        """The same cache, seeded from the struct form of a row.
+
+        The cache holds ``TensorDescriptor`` -- the type GetFlightInfo
+        answers with and the read path reads -- so the structural fields are
+        copied across. A catalog entry fills only those, as it always did.
+        """
+        for tensor in source.tensors:
+            self._state.cache_descriptor(
+                TensorDescriptor(
+                    array_id=tensor.array_id,
+                    dim_labels=tensor.dim_labels,
+                    shape=tensor.shape,
+                    dtype=tensor.dtype,
+                )
+            )
+
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Backs TensorFlightClient.query_sources; see that method for the full
         documentation."""
@@ -808,7 +827,7 @@ class CatalogClient:
         *,
         on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> "DataSourceDescriptor":
+    ) -> CatalogSource:
         """Backs TensorFlightClient.resolve; see that method for the full
         documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
@@ -840,9 +859,9 @@ class CatalogClient:
                 f"resolve('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
-        desc = _descriptor_from_row(row)
-        self._cache_tensors(desc)
-        return desc
+        source = source_from_row(row)
+        self._cache_catalog_tensors(source)
+        return source
 
     def warm(
         self,

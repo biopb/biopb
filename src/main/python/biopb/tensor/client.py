@@ -36,6 +36,7 @@ from biopb.image.annotation_pb2 import (
     RoiPruneResult,
     RoiPutResult,
 )
+from biopb.tensor._catalog_rows import CatalogSource
 from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
@@ -469,12 +470,15 @@ class TensorFlightClient:
         *,
         on_progress: Optional[Callable[[ResolveProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> DataSourceDescriptor:
-        """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
+    ) -> CatalogSource:
+        """Resolve an unresolved source and return its full `CatalogSource`.
 
         Note:
             Experimental. Cloud / remote source support (unresolved sources,
             resolve, and `warm`) is experimental and its behavior may change.
+            This returned a ``DataSourceDescriptor`` before biopb/biopb#1032;
+            it is the same row either way, decoded into a struct that can
+            carry ``is_resolved``.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
         list are unknown until first access (its catalog row has
@@ -503,13 +507,17 @@ class TensorFlightClient:
                 completion and is cached, so a later ``resolve`` reuses it.
 
         Returns:
-            The full ``DataSourceDescriptor`` with every tensor/field enumerated
-            -- the complete field set in one call, regardless of catalog size.
-            Built from the source's catalog row as the server now holds it, so
-            it agrees with a following `query_sources` exactly. It does not
-            carry ``is_resolved`` (the message has no field for it); decode the
-            row yourself with `biopb.tensor.source_from_row` if you want it
-            (biopb/biopb#1032).
+            The full `CatalogSource` with every tensor enumerated -- the
+            complete field set in one call. It is the catalog row the server
+            just wrote, so it agrees with a following `query_sources` exactly,
+            and returning it closes the transition in one call rather than
+            leaving a window in which a rescan could re-register the source.
+
+            Unlike `warm`, which returns a *status* because residency is not a
+            durable catalog fact, this returns a *result*: resolving is defined
+            by what it writes to the row. The recall's elapsed time and target
+            size ride ``on_progress`` instead -- both are things a caller can
+            already measure or derive, where `warm`'s file counts are not.
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.

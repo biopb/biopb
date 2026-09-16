@@ -544,7 +544,7 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Resolve an unresolved source and return its full {@link DataSourceDescriptor}.
+     * Resolve an unresolved source and return its full {@link CatalogSource}.
      *
      * <p>An <i>unresolved</i> source is catalogued by URL only -- its
      * shape/dtype/field list are unknown until first access (it lists with
@@ -559,24 +559,25 @@ public class TensorFlightClient implements AutoCloseable {
      * Afterwards {@link #getTensor} and friends work normally. Idempotent.
      *
      * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
-     * @return The full DataSourceDescriptor with every tensor/field enumerated.
-     *         It carries no {@code isResolved} -- the generated message has no
-     *         field for it; decode the row with {@link #sourcesFromRows} if
-     *         you need it (biopb/biopb#1032).
+     * @return The full CatalogSource with every tensor enumerated -- the catalog
+     *         row the server just wrote. Unlike {@link #warm}, which returns a
+     *         status because residency is not a durable catalog fact, this
+     *         returns a result: resolving is defined by what it writes to the
+     *         row (biopb/biopb#1032).
      * @throws IOException If the action fails or the server returns no row
      */
-    public DataSourceDescriptor resolve(String sourceId) throws IOException {
+    public CatalogSource resolve(String sourceId) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
         // point that performs the (possibly minutes-long) recall. The action
         // streams ResolveStreamMessage progress heartbeats to keep the
         // connection warm under proxy idle timeouts; the terminal message
         // carries the source's now-concrete catalog row (Arrow IPC), decoded
-        // through the same descriptorsFromRows() that backs listSources().
+        // through the same sourcesFromRows() that a catalog browse uses.
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
                 "resolve",
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
-        DataSourceDescriptor desc = null;
+        CatalogSource source = null;
         java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
         while (iter.hasNext()) {
             byte[] body = iter.next().getBody();
@@ -590,21 +591,19 @@ public class TensorFlightClient implements AutoCloseable {
             try (ArrowStreamReader reader = new ArrowStreamReader(
                     new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
                 while (reader.loadNextBatch()) {
-                    List<DataSourceDescriptor> rows = descriptorsFromRows(reader.getVectorSchemaRoot());
+                    List<CatalogSource> rows = sourcesFromRows(reader.getVectorSchemaRoot());
                     if (!rows.isEmpty()) {
-                        desc = rows.get(0);
+                        source = rows.get(0);
                     }
                 }
             }
         }
-        if (desc == null) {
+        if (source == null) {
             throw new IOException("resolve('" + sourceId
                     + "') returned no catalog row (server closed the stream without a result)");
         }
-        for (TensorDescriptor tensorDesc : desc.getTensorsList()) {
-            descriptors.put(tensorDesc.getArrayId(), tensorDesc);
-        }
-        return desc;
+        cacheTensors(source);
+        return source;
     }
 
     /**

@@ -9,7 +9,6 @@ the service module itself imports no Qt/napari.)
 import contextlib
 import json
 import os
-import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -63,18 +62,7 @@ def _fake_client(sources):
     client = MagicMock()
     # `catalog` is the knob: assign a new id set and the next browse sees it.
     client.catalog = list(sources)
-
-    def _query(sql, **_kw):
-        rows = _catalog_rows(client.catalog)
-        # Honour an addressed lookup: `resolve_source` reads one row back by
-        # id, and a fake that ignored the predicate would pass whatever
-        # happened to sort first.
-        match = re.search(r"WHERE source_id = '([^']*)'", sql)
-        if match:
-            rows = [r for r in rows if r["source_id"] == match.group(1)]
-        return rows
-
-    client.query_sources.side_effect = _query
+    client.query_sources.side_effect = lambda sql, **kw: _catalog_rows(client.catalog)
     client.health_check.return_value = {"status": "SERVING"}
     return client
 
@@ -485,10 +473,11 @@ class TestConnect:
             conn.resolve_source("cloud_x")
 
     def test_resolve_source_delegates_and_refreshes(self, monkeypatch):
-        # resolve() hydrates; the connection then re-lists so its snapshot
-        # carries the now-populated field set, and reads the row back.
+        # resolve() returns the resolved row; the connection then re-lists so
+        # its snapshot carries the now-populated field set.
+        resolved = CatalogSource(source_id="cloud_x", source_type="zarr")
         client = _fake_client({"cloud_x": MagicMock()})
-        client.resolve.return_value = MagicMock(name="legacy-descriptor")
+        client.resolve.return_value = resolved
         monkeypatch.setattr(
             _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
@@ -504,11 +493,10 @@ class TestConnect:
         client.resolve.assert_called_once_with(
             "cloud_x", on_progress=None, should_cancel=None
         )
-        # Not resolve()'s return: that is the deprecated DataSourceDescriptor,
-        # which has no `is_resolved` (biopb/biopb#1032). The row is read back
-        # addressed, so a catalog past the browse cap still answers.
-        assert isinstance(out, CatalogSource)
-        assert out.source_id == "cloud_x"
+        # Returned verbatim: resolve() hands back the row it just wrote, which
+        # carries `is_resolved` -- the caller's next question is whether to
+        # warm, and that needs it (biopb/biopb#1032).
+        assert out is resolved
         assert out.is_resolved is True
         assert set(conn.sources) == {"cloud_x", "other"}  # snapshot refreshed
 

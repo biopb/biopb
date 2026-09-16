@@ -25,7 +25,7 @@ def _progress_body(elapsed, name="img.tif", nbytes=0):
     ).SerializeToString()
 
 
-def _source_row(source_id, array_ids=(), resident=True):
+def _source_row(source_id, array_ids=(), resident=True, is_resolved=True):
     """One ``sources`` catalog row, Arrow IPC -- what the terminal message is."""
     table = pa.table(
         {
@@ -33,6 +33,7 @@ def _source_row(source_id, array_ids=(), resident=True):
             "source_url": [f"file:///{source_id}"],
             "source_type": ["ome-zarr"],
             "data_resident": [resident],
+            "is_resolved": [is_resolved],
             "tensors": [
                 [
                     {
@@ -52,9 +53,9 @@ def _source_row(source_id, array_ids=(), resident=True):
     return sink.getvalue().to_pybytes()
 
 
-def _result_body(source_id, array_ids=(), resident=True):
+def _result_body(source_id, array_ids=(), resident=True, is_resolved=True):
     return ResolveStreamMessage(
-        source_row=_source_row(source_id, array_ids, resident)
+        source_row=_source_row(source_id, array_ids, resident, is_resolved)
     ).SerializeToString()
 
 
@@ -113,7 +114,10 @@ class _FakeFlight:
 class TestResolve:
     def test_returns_the_full_row_from_resolve_action(self):
         # resolve() makes a single streaming `resolve` do_action and returns the
-        # terminal row directly -- ALL fields, no list_sources, no cap.
+        # terminal row directly -- ALL fields, no list_sources, no cap. A row,
+        # not a progress snapshot: resolving is defined by what it writes to
+        # the catalog, unlike warm, whose counts are its only evidence
+        # (biopb/biopb#1032).
         client = _bare_client()
         client._state.client = _FakeFlight(
             [_FakeResult(_result_body("cloud_x", ["cloud_x/f0", "cloud_x/f1"]))]
@@ -126,6 +130,7 @@ class TestResolve:
         assert out.source_id == "cloud_x"
         assert out.source_url == "file:///cloud_x"
         assert out.data_resident is True
+        assert out.is_resolved is True  # the flag the proto had no room for
         assert len(out.tensors) == 2  # complete field set, never truncated
         # The per-tensor cache is seeded, so a following read needs no probe.
         assert set(client._descriptors) == {"cloud_x/f0", "cloud_x/f1"}
