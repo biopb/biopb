@@ -70,8 +70,7 @@ _BASE_INSTRUCTIONS = (
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
     "explicitly asks.\n"
     '- Browse the catalog with `client.query_sources(sql, format="pandas")` '
-    "(server-side DuckDB, complete), not `client.list_sources()` "
-    "(server-capped for large catalogs); the `sources` columns are source_id, "
+    "(server-side DuckDB, the only browse surface); the `sources` columns are source_id, "
     "source_url, source_type, dtype, indexed_at, metadata_json, "
     "shape_summary, data_resident, and `tensors` (a LIST of "
     "STRUCT(array_id, dim_labels, shape, dtype), one per tensor -- "

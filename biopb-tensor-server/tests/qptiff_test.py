@@ -298,8 +298,7 @@ class TestQptiffAdapter:
                 # repr).
                 assert lvl.source_url == adapter._source_url
                 assert lvl.source_type == "qptiff"
-                src_desc = lvl.get_source_descriptor()
-                assert src_desc.source_id == adapter.source_id
+                assert lvl.source_id == adapter.source_id
                 assert [d.array_id for d in lvl.list_tensor_descriptors()] == [
                     f"{adapter.source_id}/1"
                 ]

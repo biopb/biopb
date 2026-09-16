@@ -262,9 +262,14 @@ message FlightRequest {
   }
 }
 
-// Describes a data source containing one or more tensors.
-// Carried as a `sources` catalog row; the SDK rebuilds it from the row.
-// Enables multifield support where tensors within a source have different shapes.
+// Describes a data source containing one or more tensors. Enables multifield
+// support where tensors within a source have different shapes.
+//
+// NOT a wire type: no message carries one, and no action returns one. A source
+// crosses the wire only as its `sources` catalog row, and each SDK rebuilds
+// this from that row as its own structural view. The shapes are identical --
+// this is here to name the row's fields and their contract, not to be a second
+// encoding of them. Do not put it back on an action.
 message DataSourceDescriptor {
   // Unique identifier for the data source (flight identifier)
   string source_id = 1;
@@ -315,14 +320,24 @@ message ResolveProgress {
 }
 
 // One message in the "resolve" action's result stream. The server emits zero or
-// more `progress` heartbeats followed by exactly one terminal `result` carrying
-// the resolved DataSourceDescriptor. (Replaces the older convention of an empty
-// body for a heartbeat and a bare serialized descriptor for the result, so a
-// heartbeat can now carry progress -- clients must read this envelope.)
+// more `progress` heartbeats followed by exactly one terminal `source_row`
+// carrying the source's now-resolved catalog row.
 message ResolveStreamMessage {
+  // Field 2 was `DataSourceDescriptor result`. The server had to build that
+  // from the adapter a second time, after it had already written the catalog
+  // row -- two encodings of one projection, which could disagree on
+  // `data_resident` (the adapter answers live, the row is a snapshot). The row
+  // it just wrote is now what comes back.
+  reserved 2;
+
   oneof payload {
     ResolveProgress progress = 1;
-    DataSourceDescriptor result = 2;
+
+    // Arrow IPC stream: exactly one `sources` row, with the same columns the
+    // catalog flight serves (source_id, source_url, source_type,
+    // data_resident, tensors). A client rebuilds its own view from it -- the
+    // SDKs' `descriptor_from_row` / `descriptorsFromRows`.
+    bytes source_row = 3;
   }
 }
 
@@ -416,8 +431,14 @@ message AddSourceFailure {
 
 // Terminal message of the "add_source" stream: the tally of what happened.
 message AddSourceResult {
-  // Sources newly registered by this request.
-  repeated DataSourceDescriptor added = 1;
+  // Field 1 was `repeated DataSourceDescriptor added`: a full descriptor per
+  // source, which no client ever read past its length. Registration already
+  // wrote each source's catalog row, so anything more than the ids belongs in a
+  // catalog query the caller makes when it wants it.
+  reserved 1;
+
+  // source_ids newly registered by this request.
+  repeated string added = 6;
 
   // source_ids that were already registered (same deterministic id) -- upsert
   // no-ops, surfaced so the client can say "already present" rather than

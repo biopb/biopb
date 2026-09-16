@@ -6,11 +6,11 @@ reading any byte recalls the whole dehydrated object (slow, fills the disk the
 user freed, blocks offline). ``UnresolvedSourceAdapter`` is the placeholder the
 server registers for such a source. It is deliberately split into two surfaces:
 
-- A **catalog surface** -- ``list_tensor_descriptors``/``get_source_descriptor``/
-  ``get_metadata`` -- that NEVER resolves. It reports an
-  empty, not-resident source so ListFlights, the metadata-DB sync, and the
-  precache worker all stay cheap (precache loops ``list_tensor_descriptors`` and
-  skips an empty source before it ever reaches a serving call).
+- A **catalog surface** -- ``list_tensor_descriptors`` / ``get_metadata`` /
+  ``is_resident`` -- that NEVER resolves. It reports an empty, not-resident
+  source so the metadata-DB sync and the precache worker both stay cheap
+  (precache loops ``list_tensor_descriptors`` and skips an empty source before
+  it ever reaches a serving call).
 
 - A **serve surface** -- ``get_tensor_adapter`` -- that IS the consented
   resolution hook. The first ``GetFlightInfo`` routes through it, so on first
@@ -31,13 +31,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-
-from biopb_tensor_server.core.adapter_base import (
-    SourceAdapter,
-    TensorAdapter,
-    to_catalog_url,
-)
+from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
@@ -107,18 +101,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
         if self._resolved is not None:
             return self._resolved.get_metadata()
         return {}
-
-    def get_source_descriptor(self) -> DataSourceDescriptor:
-        if self._resolved is not None:
-            return self._resolved.get_source_descriptor()
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._catalog_url or to_catalog_url(self._source_url),
-            source_type=self._source_type,
-            tensors=[],
-            metadata_json="",
-            data_resident=False,
-        )
 
     def is_resident(self) -> bool:
         if self._resolved is not None:
@@ -200,12 +182,13 @@ class UnresolvedSourceAdapter(SourceAdapter):
 
     # --- resolution (the consented hook) ------------------------------------
 
-    def resolve(self) -> DataSourceDescriptor:
-        """Hydrate the source (downloading it if dehydrated) and return its full,
-        now-resolved ``DataSourceDescriptor``. The sole resolution trigger; safe
-        to call repeatedly (the underlying hydrate is once-only)."""
+    def resolve(self) -> None:
+        """Hydrate the source, downloading it if dehydrated. The sole resolution
+        trigger; safe to call repeatedly (the underlying hydrate is once-only).
+
+        Resolution fires ``on_resolved``, which re-syncs the catalog row from
+        the now-concrete adapter -- that row is what the caller reads back."""
         self._resolve()
-        return self.get_source_descriptor()  # delegates -> full tensor list
 
     @classmethod
     def create_from_config(
@@ -231,8 +214,8 @@ class UnresolvedSourceAdapter(SourceAdapter):
                 return self._resolved
             adapter = self._build_resolved_adapter()
             # Carry the drag-drop catalog-url override onto the real adapter so
-            # the resolved descriptor keeps rendering under its drop root (the
-            # proxy delegates get_source_descriptor to it after resolution).
+            # the resolved row keeps rendering under its drop root (the catalog
+            # re-syncs from that adapter, not from this proxy).
             if self._catalog_url:
                 adapter._catalog_url = self._catalog_url
             self._resolved = adapter

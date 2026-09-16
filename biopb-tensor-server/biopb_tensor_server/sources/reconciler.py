@@ -628,7 +628,10 @@ class Reconciler:
             else:
                 # Legacy upstream without a SQL catalog: id-only enumeration, no
                 # seed -> each added source syncs via a live per-source RPC.
-                upstream_ids, complete = list_upstream_source_ids(client, endpoint)
+                # Complete: list_upstream_source_ids raises rather than
+                # returning a truncated list.
+                upstream_ids = list_upstream_source_ids(client, endpoint)
+                complete = True
                 seed_by_up_id = {}
         finally:
             # An exception here would replace whatever is propagating out of the

@@ -26,7 +26,11 @@ from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.core.adapter_base import SourceAdapter, catalog_entry
+from biopb_tensor_server.core.adapter_base import (
+    SourceAdapter,
+    catalog_entry,
+    catalog_tensors,
+)
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
@@ -88,12 +92,12 @@ def test_listing_is_structural_and_binding_answers_the_grid(live_sources, family
         assert all(1 <= g <= dim for g, dim in zip(grid, entry.shape, strict=True))
 
 
-def test_source_descriptor_strips_a_grid_the_listing_leaked(live_sources):
-    """The base class enforces it, not each adapter's good behaviour.
+def test_catalog_tensors_strips_a_grid_the_listing_leaked(live_sources):
+    """The projection enforces it, not each adapter's good behaviour.
 
-    ``get_source_descriptor`` is the only path into the DuckDB row and into the
-    adapter-fallback ListFlights, so an adapter that still names a grid cannot
-    reach a client through it.
+    ``catalog_tensors`` is the only path into the DuckDB row, and the row is the
+    only representation of a source that crosses the wire -- so an adapter that
+    still names a grid cannot reach a client through it.
     """
 
     class _LeakyAdapter(SourceAdapter):
@@ -123,8 +127,7 @@ def test_source_descriptor_strips_a_grid_the_listing_leaked(live_sources):
                 )
             ]
 
-    desc = _LeakyAdapter().get_source_descriptor()
-    (tensor,) = desc.tensors
+    (tensor,) = catalog_tensors(_LeakyAdapter())
     assert list(tensor.shape) == [64, 64]  # structure survives
     assert tensor.dtype == "uint8"
     assert list(tensor.chunk_shape) == []  # the read plan does not

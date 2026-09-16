@@ -69,8 +69,10 @@ import numpy as np
 import pyarrow as pa
 from biopb.image.annotation_pb2 import RoiAnnotation, RoiConflict
 from biopb.image.roi_pb2 import ROI
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from google.protobuf import json_format
 
+from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.errors import AnnotationStoreError
 
 if TYPE_CHECKING:
@@ -1127,12 +1129,12 @@ class MetadataDatabase:
 
         Called by ``SourceManager`` when a source is registered and, for a
         previously-unresolved cloud source, again when it resolves (the upsert
-        overwrites the placeholder row with the concrete descriptor).
+        overwrites the placeholder row with the concrete one).
 
-        Raises on failure (descriptor read, JSON encode, or DB write) rather
-        than swallowing, so the caller can react -- the registration path rolls
-        back the matching ``register_source`` so the catalog and ``ListFlights``
-        never silently disagree. Logging is the caller's responsibility.
+        Raises on failure (adapter read, JSON encode, or DB write) rather than
+        swallowing, so the caller can react -- the registration path rolls back
+        the matching ``register_source`` so the catalog and the registry never
+        silently disagree. Logging is the caller's responsibility.
 
         Once the row is committed this calls
         ``adapter.release_registration_cache()``: the catalog now holds the
@@ -1144,8 +1146,14 @@ class MetadataDatabase:
         """
         conn = self._get_connection()
 
-        # Get source descriptor and metadata
-        source_desc = adapter.get_source_descriptor()
+        # Read the row's fields off the adapter. This is the ONLY place a
+        # source's catalog row is built, so `catalog_tensors` is where the
+        # "no chunk_shape on a catalog entry" invariant is enforced
+        # (biopb/biopb#812).
+        source_url = adapter.catalog_url
+        source_type = adapter.source_type
+        data_resident = adapter.is_resident()
+        catalog = catalog_tensors(adapter)
         metadata = adapter.get_metadata()
 
         # Scalar first-tensor projection, kept for back-compat: the MCP guide's
@@ -1154,16 +1162,15 @@ class MetadataDatabase:
         # they can never desync from it.
         shape_summary = None
         dtype = None
-        if source_desc.tensors:
-            first_tensor = source_desc.tensors[0]
-            shape_summary = json.dumps(list(first_tensor.shape))
-            dtype = first_tensor.dtype
+        if catalog:
+            shape_summary = json.dumps(list(catalog[0].shape))
+            dtype = catalog[0].dtype
 
-        # Full per-tensor structural info (biopb/biopb#224): one struct per tensor,
-        # not just tensors[0]. Every field here is already populated in the lean
-        # source descriptor, so this adds no adapter call and no recall.
-        # Expensive/lazy fields (metadata_json, pyramid, physical_scale) are
-        # omitted. Unresolved cloud sources have no tensors -> empty list.
+        # Full per-tensor structural info (biopb/biopb#224): one struct per
+        # tensor, not just tensors[0]. Expensive/lazy fields (metadata_json,
+        # pyramid, physical_scale) are omitted -- they belong to the
+        # tensor-bound adapter GetFlightInfo binds. Unresolved cloud sources
+        # have no tensors -> empty list.
         tensors = [
             {
                 "array_id": t.array_id,
@@ -1171,7 +1178,7 @@ class MetadataDatabase:
                 "shape": [int(s) for s in t.shape],
                 "dtype": t.dtype,
             }
-            for t in source_desc.tensors
+            for t in catalog
         ]
 
         # ROIs the file carries, filed in the reserved @ome set (#951). Derived
@@ -1208,7 +1215,7 @@ class MetadataDatabase:
                     # given, which may be None. The line below has always
                     # tolerated that, so does this one.
                     metadata or {},
-                    [(t.array_id, list(t.dim_labels)) for t in source_desc.tensors],
+                    [(t.array_id, list(t.dim_labels)) for t in catalog],
                     max_per_tensor=self._max_rois_per_tensor,
                 )
         except Exception:
@@ -1245,13 +1252,13 @@ class MetadataDatabase:
                 """,
                 [
                     source_id,
-                    source_desc.source_url,
-                    source_desc.source_type,
+                    source_url,
+                    source_type,
                     dtype,
                     indexed_at,
                     metadata_json,
                     shape_summary,
-                    source_desc.data_resident,
+                    data_resident,
                     tensors,
                 ],
             )
@@ -1261,7 +1268,7 @@ class MetadataDatabase:
         # an annotation, which is the wrong way round: an imported set is
         # disposable (the next registration rebuilds it, and open clears it
         # anyway) where a source that will not register is an outage.
-        self._replace_imported(source_id, source_desc.source_url, imported, indexed_at)
+        self._replace_imported(source_id, source_url, imported, indexed_at)
 
         # The row is committed, so the catalog -- not the adapter -- now owns this
         # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
@@ -1365,6 +1372,29 @@ class MetadataDatabase:
                     # registered, which IS the sighting these rows record.
                     + [1, now, now, source_url, now],
                 )
+
+    def source_row_ipc(self, source_id: str) -> Optional[bytes]:
+        """One source's catalog row as an Arrow IPC stream, or ``None``.
+
+        The row is the only representation of a source that crosses the wire:
+        the ``catalog`` flight streams these, and the ``resolve`` action returns
+        the single row it just wrote rather than building a second encoding from
+        the adapter. Same columns either way (``SOURCE_ROW_COLUMNS``), so a
+        client has one decoder.
+
+        Uses ``cursor()`` for a thread-safe read; raises on a DuckDB error.
+        """
+        cursor = self._get_cursor()
+        table = cursor.execute(
+            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources WHERE source_id = ?",
+            [source_id],
+        ).to_arrow_table()
+        if table.num_rows == 0:
+            return None
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        return sink.getvalue().to_pybytes()
 
     def get_metadata_json(self, source_id: str) -> Optional[dict]:
         """Return a source's stored metadata as a dict, or ``None`` when empty.

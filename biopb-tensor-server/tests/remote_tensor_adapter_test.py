@@ -81,13 +81,11 @@ class TestMirrorSourceUrlTree:
         assert a.seed_catalog([], {}, True, "file:///a/x.tif") is False
         assert a.seed_catalog([], {}, True, "file:///a/y.tif") is True
 
-    def test_descriptor_carries_the_tree_url(self):
-        # get_source_descriptor() is what the metadata-DB catalog stores.
+    def test_catalog_url_carries_the_tree_url(self):
+        # catalog_url is what the metadata-DB row stores.
         a = self._adapter()
         a.seed_catalog([], {}, True, "file:///labs/exp/img.tif")
-        assert (
-            a.get_source_descriptor().source_url == "grpc://store:8815/labs/exp/img.tif"
-        )
+        assert a.catalog_url == "grpc://store:8815/labs/exp/img.tif"
 
 
 # -------------------------------------------------------------------- end-to-end
@@ -958,7 +956,7 @@ def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkey
     monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
     monkeypatch.setattr(
         "biopb_tensor_server.sources.resolve.list_upstream_source_ids",
-        lambda client, location: ([], True),
+        lambda client, location: [],
     )
     discover_sources(
         _upstream_source(url="grpcs://lab:8815", credentials_profile="lab-store"),
@@ -1928,9 +1926,6 @@ class TestUnreachableUpstream:
         # no raise: empty placeholder catalog row, marked non-resident
         assert adapter.list_tensor_descriptors() == []
         assert adapter.is_resident() is False
-        desc = adapter.get_source_descriptor()
-        assert list(desc.tensors) == []
-        assert desc.data_resident is False
 
     def test_serve_surface_still_raises_when_unreachable(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -2454,26 +2449,21 @@ def test_fetch_upstream_catalog_none_on_no_sql_catalog():
     assert complete is False
 
 
-def test_fallback_warning_names_the_upstream_from_its_location_argument(caplog):
-    """The upstream is named from the caller's endpoint, not from the SDK client's
-    private ``_location`` (biopb/biopb#529). The fake declares no such attribute,
-    so a reintroduced probe degrades the warning to "?" and fails this test."""
-    import logging
+def test_id_enumeration_raises_rather_than_degrading():
+    """A catalog-less upstream surfaces as the error it is.
 
+    The only fallback there ever was is ``list_sources()``, which in protocol v2
+    runs this same query -- so it could only fail identically, and pretending
+    otherwise reported a truncated mirror as a complete one.
+    """
     from biopb_tensor_server.adapters.remote_tensor import list_upstream_source_ids
 
     class _FakeClient:
         def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("no metadata DB")
 
-        def list_sources(self):
-            return {"a": object()}
-
-    with caplog.at_level(logging.WARNING):
-        ids, complete = list_upstream_source_ids(_FakeClient(), "grpc://lab:8815")
-
-    assert (ids, complete) == (["a"], False)
-    assert "grpc://lab:8815" in caplog.text
+    with pytest.raises(RuntimeError, match="no metadata DB"):
+        list_upstream_source_ids(_FakeClient(), "grpc://lab:8815")
 
 
 def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeypatch):
@@ -2493,9 +2483,6 @@ def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeyp
             pass
 
         def query_sources(self, *_a, **_k):
-            raise RuntimeError("channel is dead")
-
-        def list_sources(self):
             raise RuntimeError("upstream unreachable")
 
         def close(self):
@@ -2582,16 +2569,21 @@ class _CatalogRowAdapter:
         self._resident = resident
         self._metadata = metadata or {}
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            data_resident=self._resident,
-            tensors=[TensorDescriptor(**t) for t in self._tensors],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    def is_resident(self):
+        return self._resident
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [TensorDescriptor(**t) for t in self._tensors]
 
     def get_metadata(self):
         return self._metadata
@@ -2785,9 +2777,7 @@ class TestAliasAndSchemeSurviveRegistration:
             # what a bulk upstream re-list seeds (biopb/biopb#297)
             adapter.seed_catalog([], {}, True, "file:///data/example")
             assert adapter._source_url == "grpcs://lab/data/example"
-            assert (
-                adapter.get_source_descriptor().source_url == "grpcs://lab/data/example"
-            )
+            assert adapter.catalog_url == "grpcs://lab/data/example"
         finally:
             server.shutdown()
 

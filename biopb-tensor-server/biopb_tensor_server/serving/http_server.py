@@ -52,6 +52,7 @@ import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
 from biopb.image.annotation_pb2 import RoiAnnotation
+from biopb.tensor._catalog_rows import sql_literal
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
@@ -653,12 +654,20 @@ def _tensor_desc_by_array_id(
 def _tensor_candidates(client: TensorFlightClient, array_id: str) -> List[str]:
     """array_ids of the source *array_id* points at, for a 404 that helps.
 
+    One addressed row, not a listing: naming the alternatives needs this
+    source's tensors, and streaming the whole catalog to find them also
+    inherited the browse cap, so a source past it lost its 404 text.
+
     Unversioned ids: they are what the catalog holds, and an unversioned request
     resolves fine (it just gets the hour-long cache policy rather than
     ``immutable``). The canonical versioned form comes from ``tile_info``.
     """
-    desc = client.list_sources().get(_split_array_version(array_id)[0].split("/", 1)[0])
-    return [td.array_id for td in desc.tensors] if desc else []
+    source_id = _split_array_version(array_id)[0].split("/", 1)[0]
+    rows = client.query_sources(
+        f"SELECT tensors FROM sources WHERE source_id = {sql_literal(source_id)}",
+        format="records",
+    )
+    return [t["array_id"] for t in (rows[0]["tensors"] or [])] if rows else []
 
 
 def _no_such_tensor(array_id: str, candidates: List[str]) -> str:
@@ -1677,8 +1686,10 @@ async def list_sources(request: Request) -> JSONResponse:
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        sources = client.list_sources()
-        result = [_source_desc_to_dict(desc) for desc in sources.values()]
+        rows = client.query_sources(
+            _SOURCE_LIST_SQL + " ORDER BY source_id", format="records"
+        )
+        result = [_source_row_to_dict(row) for row in rows]
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
         logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
@@ -1888,13 +1899,16 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
         # already in hand -- so streaming every source to look one up cost
         # O(catalog) per call and, worse, inherited the listing's safety cap:
         # a source past it answered 404 while being perfectly readable.
-        source = client.get_source(source_id)
-        if source is None:
+        rows = client.query_sources(
+            f"{_SOURCE_LIST_SQL} WHERE source_id = {sql_literal(source_id)}",
+            format="records",
+        )
+        if not rows:
             raise HTTPException(
                 status_code=404, detail=f"Source not found: {source_id}"
             )
         ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-        return JSONResponse(_source_desc_to_dict(source))
+        return JSONResponse(_source_row_to_dict(rows[0]))
     except HTTPException:
         raise
     except Exception as exc:
@@ -2851,18 +2865,25 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 
-def _source_desc_to_dict(desc: Any) -> Dict[str, Any]:
-    """Convert a DataSourceDescriptor proto to a JSON-serialisable dict."""
+#: The catalog columns the source routes project. Deliberately not
+#: ``metadata_json``: the listing is structural, and the OME tree is its own
+#: route (``/api/sources/{id}/metadata``).
+_SOURCE_LIST_SQL = "SELECT source_id, source_url, source_type, tensors FROM sources"
+
+
+def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    """One ``sources`` catalog row as the TS ``DataSourceDescriptor`` JSON."""
     return {
-        "source_id": desc.source_id,
-        "source_url": desc.source_url,
-        "source_type": desc.source_type,
-        "metadata_json": desc.metadata_json or None,
-        "tensors": [_tensor_desc_to_dict(t) for t in desc.tensors],
+        "source_id": row["source_id"],
+        "source_url": row.get("source_url") or "",
+        "source_type": row.get("source_type") or "",
+        # Always null on a listing; see _SOURCE_LIST_SQL.
+        "metadata_json": None,
+        "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }
 
 
-def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
+def _tensor_row_to_dict(t: Dict[str, Any]) -> Dict[str, Any]:
     """JSON form of one tensor entry inside a source listing.
 
     ``chunk_shape`` is carried for shape-compatibility with the TS
@@ -2871,11 +2892,11 @@ def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
     ``/api/tile_info`` (which describes the tensor) -- biopb/biopb#812.
     """
     return {
-        "array_id": td.array_id,
-        "dim_labels": list(td.dim_labels),
-        "shape": [int(x) for x in td.shape],
-        "chunk_shape": [int(x) for x in td.chunk_shape],
-        "dtype": td.dtype,
+        "array_id": t["array_id"],
+        "dim_labels": list(t.get("dim_labels") or []),
+        "shape": [int(x) for x in (t.get("shape") or [])],
+        "chunk_shape": [],
+        "dtype": t.get("dtype") or "",
     }
 
 

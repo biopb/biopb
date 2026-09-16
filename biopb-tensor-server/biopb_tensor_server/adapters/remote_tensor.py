@@ -197,8 +197,8 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
-def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
-    """Every source_id on an upstream tensor server. Returns ``(ids, complete)``.
+def list_upstream_source_ids(client, location: str) -> List[str]:
+    """Every source_id on an upstream tensor server.
 
     ``location`` is the upstream endpoint, named in the fallback warning. It is a
     parameter rather than something read off the client because the callers
@@ -207,31 +207,17 @@ def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
     another package's private state to recover a value that was in scope
     (biopb/biopb#529).
 
-    Enumerating a catalog with ``list_sources()`` is **unsafe**: it is one
-    catalog query capped at the server's ``max_query_results``, so a large
-    upstream is silently truncated -- mirroring it would drop sources, and
-    reconciling against a truncated list would spuriously *remove* the ones
-    past the cap. Query the ids alone instead (``query_sources`` on one narrow
-    column, the canonical browse surface, biopb/biopb#225). Fall back to
-    ``list_sources()`` only when the query fails, and flag the result
-    ``complete=False`` so a caller (e.g. the monitor re-list) can avoid
-    destructive reconciliation on a partial list.
+    Queries the ids alone (``query_sources`` on one narrow column, the
+    canonical browse surface, biopb/biopb#225) -- an untruncated read, so the
+    result is always complete and a caller (e.g. the monitor re-list) may
+    reconcile destructively against it.
+
+    An upstream with no readable catalog raises rather than degrading: the only
+    fallback there ever was is ``list_sources()``, which in protocol v2 runs
+    this same query and so fails identically.
     """
-    try:
-        rows = client.query_sources("SELECT source_id FROM sources", format="records")
-        return [row["source_id"] for row in rows], True
-    except Exception as exc:
-        ids = list(client.list_sources().keys())
-        logger.warning(
-            "upstream %s has no SQL catalog (query_sources failed: %s); falling "
-            "back to the capped list_sources() -- the mirror may be incomplete "
-            "(%d sources seen). Enable the upstream's metadata DB for a complete "
-            "mirror.",
-            location,
-            exc,
-            len(ids),
-        )
-        return ids, False
+    rows = client.query_sources("SELECT source_id FROM sources", format="records")
+    return [row["source_id"] for row in rows]
 
 
 # Transport failures, as opposed to "this upstream has no SQL catalog". The
@@ -377,7 +363,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
         # the whole upstream catalog in one query_sources, it seeds these so
-        # registration (sync_source_added -> get_source_descriptor/get_metadata)
+        # registration (sync_source_added -> list_tensor_descriptors/get_metadata)
         # needs no per-source upstream RPC. None = not seeded (fall back to a live
         # per-source fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
@@ -528,8 +514,8 @@ class RemoteTensorAdapter(TensorAdapter):
 
         Called by the reconcile (biopb/biopb#266) with this source's row from a
         single upstream catalog fetch, so ``sync_source_added``
-        (``get_source_descriptor`` + ``get_metadata``) needs no per-source upstream
-        RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
+        (``list_tensor_descriptors`` + ``get_metadata``) needs no per-source
+        upstream RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
         array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
         exactly as the live path's ``_localize_descriptor`` would. Unlike the live
         ``list_tensor_descriptors`` (default field only), this seeds **all** of the

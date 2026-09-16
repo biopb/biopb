@@ -100,8 +100,7 @@ def _discover_tensor_server(
 
     # Bare-host form: mirror every source on the upstream. Enumerate via the
     # complete server-side catalog (not the capped list_sources -- see
-    # list_upstream_source_ids); an incomplete fallback list still mirrors what
-    # it can.
+    # list_upstream_source_ids).
     from biopb.tensor import TensorFlightClient
 
     credentials = resolve_upstream_credentials(source, credentials_config)
@@ -113,8 +112,7 @@ def _discover_tensor_server(
         tls_fingerprint=credentials.tls_fingerprint,
     )
     try:
-        ids, _complete = list_upstream_source_ids(client, endpoint)
-        upstream_ids = sorted(ids)
+        upstream_ids = sorted(list_upstream_source_ids(client, endpoint))
     finally:
         # Never let a failing close() replace the upstream error propagating out
         # of the try: body (biopb/biopb#529).

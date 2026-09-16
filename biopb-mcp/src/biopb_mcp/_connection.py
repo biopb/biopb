@@ -25,9 +25,9 @@ widget's auto-connect tick and button handlers) and read in the same kernel
 process during ``execute_code``. The one off-thread writer is the background
 source watcher (:meth:`start_source_watch`, issue #44), which re-lists from its
 own daemon thread. It only ever *rebinds* ``self.sources`` to a fresh dict
-returned by ``list_sources()`` (never mutates the dict in place), so readers on
-other threads see either the whole old catalog or the whole new one under the
-GIL — no torn reads, hence no lock. ``connect()`` is still expected on one
+(never mutates the dict in place), so readers on other threads see either the
+whole old catalog or the whole new one under the GIL — no torn reads, hence no
+lock. ``connect()`` is still expected on one
 thread at a time.
 """
 
@@ -38,7 +38,8 @@ import time
 from typing import Dict
 
 from biopb import _data_plane
-from biopb.tensor import TensorFlightClient
+from biopb.tensor import TensorFlightClient, descriptors_from_rows
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
 from ._config import CONFIG
@@ -48,6 +49,21 @@ logger = logging.getLogger(__name__)
 
 # Catalogs larger than this switch to server-side SQL filtering.
 SERVER_QUERY_THRESHOLD = 1000
+
+#: The catalog browse this connection keeps its snapshot from. One
+#: ``query_sources`` -- the complete, server-side surface -- decoded with the
+#: SDK's own row reader.
+_SOURCES_SQL = f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
+
+
+def _browse(client) -> Dict[str, DataSourceDescriptor]:
+    """The server's whole catalog as ``{source_id: DataSourceDescriptor}``.
+
+    ``query_sources`` rather than the deprecated ``list_sources`` -- same rows,
+    same server-side cap, but without the deprecation warning.
+    """
+    rows = client.query_sources(_SOURCES_SQL, format="records")
+    return {d.source_id: d for d in descriptors_from_rows(rows)}
 
 
 class ServerStarting(Exception):
@@ -254,12 +270,12 @@ class TensorConnection:
 
         Before trusting the catalog, a best-effort health probe gates on the
         server being ready: the server binds its port *before* finishing its
-        data-folder scan, so a mid-scan ``list_sources()`` can return a partial
-        catalog that looks complete. If the server reports a non-``SERVING``
-        status (biopb#17), this raises :class:`ServerStarting` so the caller can
+        data-folder scan, so a mid-scan browse can return a partial catalog that
+        looks complete. If the server reports a non-``SERVING`` status
+        (biopb#17), this raises :class:`ServerStarting` so the caller can
         keep waiting with feedback instead of failing or trusting a half-built
         catalog. The probe is *advisory*: a server with no health action (older
-        servers) or a transient probe error falls through to ``list_sources()``,
+        servers) or a transient probe error falls through to the catalog query,
         which stays the authoritative connectivity test — so older servers
         behave exactly as before (issue #12).
         """
@@ -268,7 +284,7 @@ class TensorConnection:
                 url, token=token, tls_fingerprint=_local_fingerprint(url)
             )
 
-            # Advisory probe: any failure falls through to list_sources(),
+            # Advisory probe: any failure falls through to the catalog query,
             # which stays the authoritative connectivity test.
             try:
                 health = client.health_check()
@@ -288,7 +304,7 @@ class TensorConnection:
                 self.last_message = _starting_message(health)
                 raise ServerStarting(status, health)
 
-            sources = client.list_sources()
+            sources = _browse(client)
             self.client = client
             self.url = url
             self.token = token
@@ -321,7 +337,7 @@ class TensorConnection:
         """Re-list sources from the connected server."""
         if self.client is None:
             raise RuntimeError("Not connected")
-        sources = self.client.list_sources()
+        sources = _browse(self.client)
         self.sources = sources
         self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
         return sources

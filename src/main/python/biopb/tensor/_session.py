@@ -17,7 +17,7 @@ from ``biopb.tensor.client``.
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -87,17 +87,19 @@ logger = logging.getLogger(__name__)
 class _ClientState:
     """Per-connection state shared by CatalogClient / ChunkFetcher / the facade.
 
-    Holds the Flight connection handles plus the two catalog caches. The caches
-    are mutable and shared by reference: every collaborator reads
-    ``state.sources`` / ``state.descriptors`` live, and TensorFlightClient
-    exposes them as its ``_sources`` / ``_descriptors`` (property + setter) so
-    the historical ``client._sources = {...}`` reset semantics still hold.
+    Holds the Flight connection handles plus the structural descriptor cache,
+    which is mutable and shared by reference: every collaborator reads
+    ``state.descriptors`` live, and TensorFlightClient exposes it as its
+    ``_descriptors`` (property + setter).
 
     ``descriptors`` is keyed by ``array_id``, which the identity policy
     (``proto/biopb/tensor/descriptor.proto``) makes globally unique and
     identical across every RPC that reports it. It holds *structural*
     (whole-tensor) descriptors only -- never a request-shaped read response,
-    whose ``shape`` is the sliced/downsampled one.
+    whose ``shape`` is the sliced/downsampled one. It is an *addressing* cache,
+    not a catalog snapshot: there is deliberately no source-keyed twin, because
+    the catalog is the server's and a stale local copy of it answered questions
+    ("what does this server hold?") it could not actually answer.
     """
 
     raw_client: flight.FlightClient
@@ -110,7 +112,6 @@ class _ClientState:
     # graph so every dask worker's FlightClient trusts the same pinned root
     # without re-running TOFU (biopb/biopb#604, biopb/biopb#606).
     tls_trust: Optional[TlsTrust] = None
-    sources: Dict[str, DataSourceDescriptor] = field(default_factory=dict)
     descriptors: Dict[str, TensorDescriptor] = field(default_factory=dict)
     # Set once the server's Flight protocol shape has been checked (or when
     # the check is bypassed, e.g. for a test double).
@@ -471,7 +472,6 @@ class CatalogClient:
             source_desc = descriptor_from_row(row)
             source_descriptors[source_desc.source_id] = source_desc
             self._cache_tensors(source_desc)
-        self._state.sources = source_descriptors
         logger.info(f"list_sources: returned {len(source_descriptors)} sources")
         return source_descriptors
 
@@ -484,10 +484,6 @@ class CatalogClient:
         for row in table.to_pylist():
             source_desc = descriptor_from_row(row)
             self._cache_tensors(source_desc)
-            # Deliberately not written to ``self._state.sources``: that map is
-            # the last *listing*, and callers read its size and membership as
-            # "what the catalog holds". Folding one addressed answer into it
-            # would make a lookup look like a browse result.
             return source_desc
         return None
 
@@ -573,47 +569,31 @@ class CatalogClient:
     def get_source_metadata(self, source_id: str) -> dict:
         """Backs TensorFlightClient.get_source_metadata; see that method for the full
         documentation."""
-
-        if source_id not in self._state.sources:
-            self.list_sources()
-
-        source_desc = self._state.sources.get(source_id)
-        if source_desc is None:
+        # One addressed catalog row. The column IS the answer: get_metadata() is
+        # called once at registration to fill it, and the serve path reads it
+        # back rather than recomputing (biopb/biopb#253). Going through a
+        # tensor-bound GetFlightInfo instead used to overlay the *first* field's
+        # get_tensor_metadata() delta, so a multi-field source reported one
+        # arbitrary field's extras as the source's metadata.
+        table = self._query_table(
+            "SELECT tensors, metadata_json FROM sources "
+            f"WHERE source_id = {sql_literal(source_id)}"
+        )
+        rows = table.to_pylist()
+        if not rows:
             raise ValueError(f"Source not found: {source_id}")
+        row = rows[0]
 
-        if not source_desc.tensors:
+        if not row.get("tensors"):
             # Unresolved (cloud / synced-folder) source: tensors are unknown
             # until resolve. Don't silently return {} -- that conflates
             # "unresolved" with "resolved, no metadata" (the line below). Steer
             # the caller to the explicit, consented resolve() instead, matching
-            # get_physical_scale / get_tensor (#108). Crucially this stays a
-            # cheap read: it must NOT silently recall the whole file the way a
-            # resolve-on-serve probe (get_descriptor) would.
+            # get_physical_scale / get_tensor (#108).
             raise _unresolved_source_error(source_id)
 
-        # metadata_json is populated on the descriptor GetFlightInfo returns, so
-        # we fetch it via the source's first tensor.
-        cmd = _tensor_read_cmd(
-            source_desc.tensors[0].array_id,
-            TensorReadOption(
-                with_metadata=True,
-                # Metadata describe: read only metadata_json, so skip the O(chunks)
-                # read plan (biopb/biopb#563). Pyramid stays off (unneeded here).
-                with_read_plan=False,
-            ),
-        )
-        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._state.client.get_flight_info(
-            flight_desc, options=self._state.call_options
-        )
-        response_desc = TensorDescriptor.FromString(info.descriptor.command)
-
-        if response_desc.metadata_json:
-            # The server wraps it as {"type": ..., "dim_label": [...],
-            # "metadata": {...}}; return just the inner metadata dict.
-            wrapped = json.loads(response_desc.metadata_json)
-            return wrapped.get("metadata", {})
-        return {}
+        raw = row.get("metadata_json")
+        return json.loads(raw) if raw else {}
 
     def get_physical_scale(
         self, array_id: str
@@ -622,17 +602,14 @@ class CatalogClient:
         documentation."""
         desc = self._state.descriptors.get(array_id)
         if desc is None:
-            source_id, _ = _split_array_id(array_id)
-            # Don't silently recall (download) a whole cloud file just to read its
-            # pixel size: if the source is known-unresolved, steer the caller to
-            # resolve() explicitly -- consistent with get_tensor, and faithful to
-            # resolution being a consented act, not a side effect of a metadata
-            # probe. (Only catches sources already in the catalog cache; a
-            # never-listed id still falls through to the fetch below, same as
-            # every other entry point.)
-            cached = self._state.sources.get(source_id)
-            if cached is not None and not cached.tensors:
-                raise _unresolved_source_error(source_id)
+            # Don't silently recall (download) a whole cloud file just to read
+            # its pixel size: the probe below never resolves on serve, so an
+            # unresolved source refuses there and _fetch_tensor_descriptor
+            # restates it as the directive steer to resolve(). That refusal is
+            # the server's, so it holds for every id -- where the old local
+            # pre-check only fired for a source a prior list_sources() happened
+            # to have cached.
+            #
             # A real fetch error (server unreachable, source not found)
             # propagates to the caller -- it must stay distinguishable from "no
             # physical scale recorded", which is the only case that yields None.
@@ -685,9 +662,6 @@ class CatalogClient:
         the echoed-back array_id) for the readers that want addressing facts --
         see :func:`_structural_descriptor` for what that keeps and why the
         masked-off parts are deliberately not stored (biopb/biopb#795).
-        ``self._state.sources`` is intentionally NOT touched, so
-        a single-tensor probe never clobbers a full enumeration cached by
-        ``list_sources()`` (issue #75).
         """
         cmd = _tensor_read_cmd(
             array_id,
@@ -751,16 +725,14 @@ class CatalogClient:
             return desc
 
         source_id, tensor_id = _split_array_id(array_id)
-        source_desc = self._state.sources.get(source_id)
-        if source_desc is None:
-            try:
-                source_desc = self.get_source(source_id)
-            except flight.FlightError:
-                # No catalog to ask (a capability token reads one source's
-                # pixels, not the catalog; an embedded server may have none):
-                # the per-tensor probe below is the private path, and its
-                # error is the one worth reporting.
-                source_desc = None
+        try:
+            source_desc = self.get_source(source_id)
+        except flight.FlightError:
+            # No catalog to ask (a capability token reads one source's pixels,
+            # not the catalog; an embedded server may have none): the per-tensor
+            # probe below is the private path, and its error is the one worth
+            # reporting.
+            source_desc = None
 
         if source_desc is not None:
             if not source_desc.tensors:
@@ -797,8 +769,8 @@ class CatalogClient:
 
         The loop shared by :meth:`resolve` / :meth:`warm` / :meth:`add_source`:
         the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
-        into ``msg_cls`` (a bad parse yields ``which=None`` so a legacy bare-body
-        caller can fall back on the raw ``body``), and the old-server
+        into ``msg_cls`` (a bad parse yields ``which=None``, which every caller
+        ignores -- the SDK refuses a pre-v2 server at connect), and the old-server
         ``"Unknown action"`` -> :class:`RuntimeError` remap -- applied only when
         ``unknown_action_msg`` is given; otherwise the ``FlightServerError``
         propagates unchanged.
@@ -838,37 +810,36 @@ class CatalogClient:
         """Backs TensorFlightClient.resolve; see that method for the full
         documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
-        # entry point that performs the (possibly minutes-long) recall, and it
-        # returns the full DataSourceDescriptor directly -- no GetFlightInfo +
-        # list_sources two-step, so no truncation hole for multi-field sources
-        # beyond the list cap. The action streams ``ResolveStreamMessage``
-        # heartbeats (a ``progress`` arm) to keep the connection warm under proxy
-        # idle timeouts; the single terminal message carries the descriptor in
-        # its ``result`` arm. ``should_cancel`` / ``on_progress`` are polled once
-        # per received message, i.e. roughly once per server heartbeat.
+        # entry point that performs the (possibly minutes-long) recall, and its
+        # terminal message carries the source's now-concrete catalog row -- no
+        # GetFlightInfo + list_sources two-step, so no truncation hole for
+        # multi-field sources beyond the list cap. The action streams
+        # ``ResolveStreamMessage`` heartbeats (a ``progress`` arm) to keep the
+        # connection warm under proxy idle timeouts. ``should_cancel`` /
+        # ``on_progress`` are polled once per received message, i.e. roughly
+        # once per server heartbeat.
         action = flight.Action("resolve", source_id.encode("utf-8"))
-        desc: Optional[DataSourceDescriptor] = None
-        for which, msg, body in self._iter_action_messages(
-            action, ResolveStreamMessage
-        ):
+        row: Optional[Mapping[str, Any]] = None
+        for which, msg, _ in self._iter_action_messages(action, ResolveStreamMessage):
             if should_cancel is not None and should_cancel():
                 raise ResolveCancelled(f"resolve('{source_id}') cancelled by caller")
             if which == "progress":
                 if on_progress is not None:
                     on_progress(msg.progress)
-            elif which == "result":
-                desc = DataSourceDescriptor()
-                desc.CopyFrom(msg.result)
-            else:
-                # Legacy server: a non-empty body IS a bare serialized
-                # DataSourceDescriptor (pre-envelope protocol).
-                desc = DataSourceDescriptor.FromString(body)
-        if desc is None:
+            elif which == "source_row":
+                # The same row list_sources reads, through the same decoder --
+                # one representation of a source, so a resolve and a subsequent
+                # browse cannot disagree about it.
+                rows = pa.ipc.open_stream(msg.source_row).read_all().to_pylist()
+                if rows:
+                    row = rows[0]
+        if row is None:
             raise RuntimeError(
-                f"resolve('{source_id}') returned no descriptor "
+                f"resolve('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
-        self._state.sources[source_id] = desc
+        desc = descriptor_from_row(row)
+        self._cache_tensors(desc)
         return desc
 
     def warm(

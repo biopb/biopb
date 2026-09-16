@@ -38,7 +38,6 @@ from typing import (
 import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import (
-    DataSourceDescriptor,
     SliceHint,
     TensorDescriptor,
 )
@@ -178,7 +177,7 @@ def catalog_entry(desc: TensorDescriptor) -> TensorDescriptor:
     the tensor adapter first -- is the one place a grid is published. Keeping
     ``TensorDescriptor`` as the wire type for both (rather than splitting the
     proto message) makes the invariant "``chunk_shape`` is empty on every
-    catalog entry", enforced here and in :meth:`SourceAdapter.get_source_descriptor`.
+    catalog entry", enforced here and re-applied by :func:`catalog_tensors`.
     """
     return TensorDescriptor(
         array_id=desc.array_id,
@@ -186,6 +185,21 @@ def catalog_entry(desc: TensorDescriptor) -> TensorDescriptor:
         shape=desc.shape,
         dtype=desc.dtype,
     )
+
+
+def catalog_tensors(adapter: Any) -> List[TensorDescriptor]:
+    """A source's tensors as the catalog stores them.
+
+    The catalog invariant's enforcement point: the one path into the DuckDB
+    ``sources.tensors`` column goes through here, so a listing that still
+    carries a serving field cannot reach a client (biopb/biopb#812). Re-applies
+    :func:`catalog_entry` even though implementations are asked to, because a
+    source that forgets must not be able to publish a grid it guessed.
+
+    Duck-typed on ``list_tensor_descriptors`` alone, like the rest of the
+    registration surface ``sync_source_added`` reads.
+    """
+    return [catalog_entry(t) for t in adapter.list_tensor_descriptors()]
 
 
 @dataclass
@@ -286,6 +300,16 @@ class SourceAdapter(ABC):
         Wraps the backing ``_source_type``; None when the adapter never set one.
         """
         return self._source_type
+
+    @property
+    def catalog_url(self) -> str:
+        """The URL the catalog row carries -- what clients group the tree by.
+
+        The display form of :attr:`source_url`: a ``_catalog_url`` override when
+        one was set (drag-drop re-rooting), else the raw path normalized by
+        :func:`to_catalog_url`. Never used for filesystem ops.
+        """
+        return self._catalog_url or to_catalog_url(self._source_url)
 
     @property
     def capability_token(self) -> Optional[str]:
@@ -421,8 +445,8 @@ class SourceAdapter(ABC):
 
         Implementations return :func:`catalog_entry` of whatever they have (the
         single-tensor idiom is ``[catalog_entry(self.get_tensor_descriptor())]``);
-        :meth:`get_source_descriptor` re-applies it so the invariant holds for
-        the catalog even if an implementation forgets.
+        :func:`catalog_tensors` re-applies it so the invariant holds for the
+        catalog even if an implementation forgets.
         """
 
     @abstractmethod
@@ -477,27 +501,8 @@ class SourceAdapter(ABC):
         """
         return {}, None
 
-    def get_source_descriptor(self) -> DataSourceDescriptor:
-        """Build DataSourceDescriptor from this adapter.
-
-        Returns:
-            DataSourceDescriptor.
-        """
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._catalog_url or to_catalog_url(self._source_url),
-            source_type=self._source_type,
-            # The catalog invariant's enforcement point: every path into the
-            # DuckDB row and into ListFlights goes through here, so a listing
-            # that still carries a serving field cannot reach a client
-            # (biopb/biopb#812). See :func:`catalog_entry`.
-            tensors=[catalog_entry(t) for t in self.list_tensor_descriptors()],
-            metadata_json="",  # filled by GetFlightInfo()
-            data_resident=self.is_resident(),
-        )
-
-    def resolve(self) -> DataSourceDescriptor:
-        """Hydrate this source if needed, then return its full descriptor.
+    def resolve(self) -> None:
+        """Hydrate this source if needed.
 
         This is the ONE consented entry point that may perform an extended,
         blocking recall (e.g. downloading a whole cloud / synced-folder file).
@@ -506,12 +511,15 @@ class SourceAdapter(ABC):
         SourceUnresolvedError on an unresolved source so the only thing that
         downloads is an explicit ``resolve``.
 
-        For an already-resident source this is a cheap no-op that just returns the
-        current descriptor (idempotent), so the server's ``resolve`` action works
-        uniformly across all source kinds. ``UnresolvedSourceAdapter`` overrides
-        it to actually hydrate.
+        For an already-resident source this is a cheap no-op (idempotent), so
+        the server's ``resolve`` action works uniformly across all source kinds.
+        ``UnresolvedSourceAdapter`` overrides it to actually hydrate.
+
+        Returns nothing: what the caller wants afterwards is the source's now-
+        concrete catalog row, which resolution writes (``on_resolved`` ->
+        ``sync_source_added``) and the server reads back.
         """
-        return self.get_source_descriptor()
+        return None  # a resident source is already resolved
 
     def is_resident(self) -> bool:
         """Best-effort, recall-free: is this source's content local and cheap to
@@ -1603,7 +1611,7 @@ _SOURCE_SCOPED_API = frozenset(
         "list_tensor_descriptors",
         "get_metadata",
         "get_embedded_rois",
-        "get_source_descriptor",
+        "catalog_url",
         "resolve",
         "is_resident",
         "get_tensor_adapter",

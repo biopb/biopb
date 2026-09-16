@@ -30,22 +30,27 @@ class MockAdapter:
         self._dtype = dtype
         self._data_resident = data_resident
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            data_resident=self._data_resident,
-            tensors=[
-                TensorDescriptor(
-                    array_id=self.source_id,
-                    shape=self._shape,
-                    dtype=self._dtype,
-                )
-            ],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    def is_resident(self):
+        return self._data_resident
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [
+            TensorDescriptor(
+                array_id=self.source_id,
+                shape=self._shape,
+                dtype=self._dtype,
+            )
+        ]
 
     def get_metadata(self):
         return {"test_key": "test_value", "nested": {"a": 1, "b": 2}}
@@ -178,11 +183,11 @@ class TestSourceSync:
         assert result[0] == 0
 
     def test_sync_source_added_propagates_failure(self):
-        """A descriptor-read error surfaces to the caller instead of being
+        """An adapter-read error surfaces to the caller instead of being
         swallowed, so the registration path can roll back (issue #223)."""
 
         class FailingAdapter(MockAdapter):
-            def get_source_descriptor(self):
+            def list_tensor_descriptors(self):
                 raise RuntimeError("Simulated failure")
 
         db = MetadataDatabase()
@@ -215,16 +220,21 @@ class MultiTensorAdapter:
         )
         self._data_resident = data_resident
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            data_resident=self._data_resident,
-            tensors=[TensorDescriptor(**t) for t in self._tensors],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    def is_resident(self):
+        return self._data_resident
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [TensorDescriptor(**t) for t in self._tensors]
 
     def get_metadata(self):
         return {}
@@ -851,16 +861,17 @@ class TestDataResidentColumn:
             self.source_id = source_id
             self._source_url = source_url
 
-        def get_source_descriptor(self):
-            from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+        source_type = "unresolved"
 
-            return DataSourceDescriptor(
-                source_id=self.source_id,
-                source_url=self._source_url,
-                source_type="unresolved",
-                data_resident=False,  # not local yet
-                # no tensors -> NULL dtype / shape_summary
-            )
+        @property
+        def catalog_url(self):
+            return self._source_url
+
+        def is_resident(self):
+            return False  # not local yet
+
+        def list_tensor_descriptors(self):
+            return []  # no tensors -> NULL dtype / shape_summary
 
         def get_metadata(self):
             return {}

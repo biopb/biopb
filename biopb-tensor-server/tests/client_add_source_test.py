@@ -15,7 +15,6 @@ from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
     AddSourceStreamMessage,
-    DataSourceDescriptor,
 )
 
 
@@ -26,8 +25,7 @@ def _progress_body(count, path=""):
 
 
 def _result_body(added=(), already=(), failed=()):
-    r = AddSourceResult(already_present=list(already))
-    r.added.extend(added)
+    r = AddSourceResult(added=list(added), already_present=list(already))
     for path, reason in failed:
         r.failed.add(path=path, reason=reason)
     return AddSourceStreamMessage(result=r).SerializeToString()
@@ -100,15 +98,14 @@ def _flip_after(n):
 class TestAddSource:
     def test_terminal_result_returned(self):
         client = _bare_client()
-        added = DataSourceDescriptor(source_id="s1")
         client._state.client = _FakeFlight(
-            [_FakeResult(_result_body(added=[added], already=["s0"]))]
+            [_FakeResult(_result_body(added=["s1"], already=["s0"]))]
         )
 
         out = client.add_source("/drop")
 
         assert client._state.client.action.type == "add_source"
-        assert [d.source_id for d in out.added] == ["s1"]
+        assert list(out.added) == ["s1"]
         assert list(out.already_present) == ["s0"]
 
     def test_progress_envelopes_reported_then_terminal_taken(self):
@@ -149,17 +146,16 @@ class TestAddSource:
         # message, i.e. as the terminal is consumed -- the old top-of-loop poll
         # would have broken before capturing it and returned an empty tally.
         client = _bare_client()
-        added = DataSourceDescriptor(source_id="s1")
         client._state.client = _FakeFlight(
             [
                 _FakeResult(_progress_body(1, "/d/s1")),
-                _FakeResult(_result_body(added=[added], already=["s0"])),
+                _FakeResult(_result_body(added=["s1"], already=["s0"])),
             ]
         )
 
         out = client.add_source("/drop", should_cancel=_flip_after(1))
 
-        assert [d.source_id for d in out.added] == ["s1"]
+        assert list(out.added) == ["s1"]
         assert list(out.already_present) == ["s0"]
 
     def test_cancel_mid_walk_returns_empty_tally(self):
