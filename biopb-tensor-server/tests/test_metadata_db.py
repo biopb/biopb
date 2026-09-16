@@ -448,9 +448,7 @@ class TestSourceRowProjection:
         assert d["source_url"] == "/data/s1.zarr"
         assert d["source_type"] == "zarr"
         assert d["is_resolved"] is True
-        # No residency: it is answered by the `is_resident` action, live, not by
-        # a column anyone can read a stale copy of (biopb/biopb#1035).
-        assert "data_resident" not in d
+        assert "data_resident" not in d  # the action answers it, not a column
         # Lean: source metadata is filled only by GetFlightInfo, so the browse
         # projection does not select it at all.
         assert "metadata_json" not in d
@@ -542,8 +540,7 @@ class TestDeprecatedDescriptorProjection:
 
         assert d.source_id == "s1"
         assert d.source_url == "/data/s1.zarr"
-        # The row has no residency to decode, so the proto's field stays unset
-        # rather than claiming False (biopb/biopb#1035).
+        # Nothing to decode, so the field stays unset rather than claiming False.
         assert not d.HasField("data_resident")
         assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
         assert list(d.tensors[0].shape) == [8, 512, 512]
@@ -939,10 +936,8 @@ class TestClose:
 class TestNoResidencyColumn:
     """There is no residency column, and registration never asks for one.
 
-    #110 added `data_resident` so unresolved (cloud) sources stayed filterable
-    when their NULL dtype hid them from a `WHERE dtype=...`. `is_resolved` does
-    that job now and can be stored, being monotonic; residency cannot, because
-    a synced folder re-dehydrates with no event to refresh a row from
+    `is_resolved` carries what #110 added `data_resident` for -- keeping a
+    NULL-dtype cloud source filterable -- and can be stored, being monotonic
     (biopb/biopb#1035).
     """
 
@@ -984,9 +979,9 @@ class TestNoResidencyColumn:
             db._get_connection().execute("SELECT data_resident FROM sources")
 
     def test_registration_never_asks_the_adapter(self):
-        """The upsert reads no residency at all -- an adapter that refuses to
-        answer still registers. A `directory_is_resident()` walk is not free,
-        and the row has nowhere to put the result."""
+        """The upsert reads no residency at all, so an adapter that refuses to
+        answer still registers -- a `directory_is_resident()` walk is not
+        free."""
         db = MetadataDatabase()
         db.sync_source_added(
             "cloud-1", self._UnresolvedAdapter("cloud-1", "https://x/y.zarr")

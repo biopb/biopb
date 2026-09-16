@@ -62,8 +62,8 @@ def _fake_client(sources):
     # `catalog` is the knob: assign a new id set and the next browse sees it.
     client.catalog = list(sources)
     client.query_sources.side_effect = lambda sql, **kw: _catalog_rows(client.catalog)
-    # Residency is a separate live call, not a row column (biopb/biopb#1035).
-    # `resident` is its knob; default nothing known, like an old server.
+    # Residency is a separate live call, not a row column. `resident` is its
+    # knob; default nothing known, like an old server.
     client.resident = {}
     client.is_resident.side_effect = lambda *a, **kw: dict(client.resident)
     client.health_check.return_value = {"status": "SERVING"}
@@ -471,8 +471,7 @@ class TestConnect:
         assert conn.last_message == "Lost connection to server"
 
     def test_browse_stamps_sources_with_live_residency(self, monkeypatch):
-        # Residency is not in the row: one `is_resident` call per browse answers
-        # for the whole page (biopb/biopb#1035).
+        # One `is_resident` call per browse answers for the whole page.
         client = _fake_client(["a", "b"])
         client.resident = {"a": True, "b": False}
         monkeypatch.setattr(
@@ -504,9 +503,8 @@ class TestConnect:
         assert conn.sources["a"].data_resident is None
 
     def test_a_stale_residency_column_is_ignored(self, monkeypatch):
-        # An older server still carries `data_resident` in its rows. It is the
-        # value this issue exists to stop reading, so the live answer wins and
-        # the column is not consulted at all.
+        # An older server still carries `data_resident` in its rows; the live
+        # answer wins and the column is not consulted at all.
         client = _fake_client(["a"])
         client.query_sources.side_effect = lambda sql, **kw: [
             dict(row, data_resident=True) for row in _catalog_rows(client.catalog)

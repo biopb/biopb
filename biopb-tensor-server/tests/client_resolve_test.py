@@ -26,10 +26,7 @@ def _progress_body(elapsed, name="img.tif", nbytes=0):
 
 
 def _source_row(source_id, array_ids=(), is_resolved=True):
-    """One ``sources`` catalog row, Arrow IPC -- what the terminal message is.
-
-    No residency column: it is not in a row anywhere (biopb/biopb#1035).
-    """
+    """One ``sources`` catalog row, Arrow IPC -- what the terminal message is."""
     table = pa.table(
         {
             "source_id": [source_id],
@@ -212,7 +209,7 @@ def _unresolved_row_table():
 
 
 class TestIsResident:
-    """The SDK side of the live residency action (biopb/biopb#1035)."""
+    """The SDK side of the live residency action."""
 
     def test_sends_a_json_array_and_decodes_the_map(self):
         client = _bare_client()

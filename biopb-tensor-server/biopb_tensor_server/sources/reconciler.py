@@ -676,11 +676,8 @@ class Reconciler:
             return (
                 row.get("tensors") or [],
                 metadata,
-                # The upstream's `is_resolved`, not its residency: what the
-                # mirror needs to know is whether that row describes a real
-                # source yet, and residency is not a catalog column any more
-                # (biopb/biopb#1035). Default True for an upstream predating
-                # the column.
+                # Whether that row describes a real source yet. True for an
+                # upstream predating the column.
                 bool(row.get("is_resolved", True)),
                 row.get("source_url"),
                 row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
@@ -845,27 +842,22 @@ class Reconciler:
     def should_warm(self, source_id: str) -> bool:
         """Whether the precache worker may warm *source_id* right now.
 
-        Registration decides residency once (``_claim_is_unresolved``): a source
-        whose files were resident then registers as a normal adapter and keeps
-        that registration even if the cloud provider (OneDrive Files On-Demand,
-        ...) later re-dehydrates the bytes. Precache has no per-chunk residency
-        gate, so a backlog pass would read those bytes and trigger exactly the
-        background recall the ``cloud = true`` policy exists to prevent (#174).
+        Registration decides residency once (``_claim_is_unresolved``), but the
+        cloud provider (OneDrive Files On-Demand, ...) can re-dehydrate the bytes
+        afterwards, and precache has no per-chunk gate -- so a backlog pass would
+        trigger exactly the recall the ``cloud = true`` policy exists to prevent
+        (#174).
 
-        So this asks the *adapter*, now -- ``is_resident()``, the same live check
-        the ``is_resident`` action serves. It used to ask the claim's member
-        paths instead, which is a strictly weaker question: ``member_paths`` for
-        every directory-claimed format (zarr, ome-zarr, ome-zarr-hcs, ndtiff,
-        tiff-sequence, micromanager-legacy) is just the directory, and the
-        placeholder stat is ``is_file``-guarded, so a wholly dehydrated store
-        answered "resident" and precache warmed it -- the gate failing open on
-        precisely the sources it exists for (biopb/biopb#1035).
+        Ask the adapter, not the claim's ``member_paths``: those are just the
+        directory for every dir-claimed format (zarr, ome-zarr, ome-zarr-hcs,
+        ndtiff, tiff-sequence, micromanager-legacy), and the placeholder stat is
+        ``is_file``-guarded, so a wholly dehydrated store reads as resident
+        (biopb/biopb#1035).
 
-        Only sources under a ``cloud`` root are asked: a normal local source
-        always warms, and short-circuiting keeps the bounded stat walk off the
-        common path. Returns False when the source is no longer registered, or
-        when its adapter cannot answer -- a residency gate that cannot see is
-        not permission to read.
+        Only sources under a ``cloud`` root are asked, which keeps the bounded
+        stat walk off the common path. Returns False when the source is no longer
+        registered or its adapter cannot answer -- a gate that cannot see is not
+        permission to read.
         """
         with self._lock:
             claim = self._state.claims.get(source_id)

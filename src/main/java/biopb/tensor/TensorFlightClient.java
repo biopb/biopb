@@ -342,11 +342,9 @@ public class TensorFlightClient implements AutoCloseable {
                     .setSourceType(text(types, i))
                     .setMetadataJson("")
                     .addAllTensors(tensorsFromRow(root, i));
-            // data_resident is no longer a catalog column: residency is asked
-            // live via isResident(), because a stored copy of "right now" only
-            // ever records where the bytes were last seen (biopb/biopb#1035).
-            // Still decoded when an older server's row carries it, so this
-            // returns what it always did against that server.
+            // No current server sends data_resident -- residency is isResident()
+            // now (biopb/biopb#1035) -- but an older one does, and this decode
+            // still answers it identically against that server.
             Boolean res = nullableBool(resident, i);
             if (res != null) {
                 desc.setDataResident(res);
@@ -647,16 +645,14 @@ public class TensorFlightClient implements AutoCloseable {
      * source directory server-side and reads every file to force the sync
      * engine's recall; no pixels cross the wire, only progress. It is idempotent
      * (already-resident files are cheap local reads) and a no-op for a
-     * single-file source (resolve already recalled it). A source whose url is
-     * remote -- an object store, or a {@code grpc://} mirror of another server
-     * -- fails instead: its bytes are not on the serving machine, so nothing
-     * there can be made resident (biopb/biopb#1035).
+     * single-file source (resolve already recalled it). A remote-url source --
+     * an object store, or a {@code grpc://} mirror -- fails instead: nothing on
+     * the serving machine can be made resident (biopb/biopb#1035).
      *
      * @param sourceId The (already-resolved) source to warm.
      * @return The terminal {@link WarmProgress} snapshot (files/bytes made
      *         resident). {@code filesTotal == 0} means the source was local and
-     *         had nothing to warm, i.e. it is single-file -- never "not
-     *         applicable", which raises.
+     *         had nothing to warm, i.e. single-file; "not applicable" raises.
      * @throws IOException If the action fails, the server is too old to support
      *         the {@code warm} action, or it returns no terminal status.
      */
@@ -688,12 +684,10 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Ask the server, right now, whose content is local and cheap to read.
      *
-     * <p>Residency is volatile: a synced folder (OneDrive / iCloud Files-On-
-     * Demand) re-dehydrates under storage pressure with nothing to notify
-     * anyone, so no stored answer stays true. That is why this is an action and
-     * not a catalog column -- a row could only say where the bytes were when
-     * someone last looked (biopb/biopb#1035). Do not cache the result; ask
-     * again.
+     * <p>Volatile: a synced folder (OneDrive / iCloud Files-On-Demand)
+     * re-dehydrates under storage pressure with nothing to notify anyone, so no
+     * stored answer stays true -- which is why it is an action and not a catalog
+     * column (biopb/biopb#1035). Do not cache the result.
      *
      * <p>Not the same question as a row's {@code is_resolved}, which asks
      * whether the server has read the source at all yet. An unresolved source

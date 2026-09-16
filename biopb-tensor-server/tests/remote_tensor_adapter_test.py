@@ -1922,9 +1922,7 @@ class TestUnreachableUpstream:
         )
         # no raise: empty placeholder catalog row
         assert adapter.list_tensor_descriptors() == []
-        # Residency is not the proxy's to claim either way -- a mirror's bytes
-        # are on another machine, up or down (biopb/biopb#1035).
-        assert adapter.is_resident() is False
+        assert adapter.is_resident() is False  # never local, up or down
 
     def test_serve_surface_still_raises_when_unreachable(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -1969,9 +1967,7 @@ class TestUnreachableUpstream:
             descs = adapter.list_tensor_descriptors()
             assert len(descs) == 1
             assert descs[0].array_id == "lab__img"  # localized
-            # Recovery shows in the catalog surface, not in residency: the
-            # mirror reports non-resident whether the upstream is up or down,
-            # because the data is never local here (biopb/biopb#1035).
+            # Recovery shows in the catalog surface, never in residency.
             assert adapter.is_resident() is False
             assert tuple(adapter.get_tensor_descriptor().shape) == shape
         finally:
@@ -2597,12 +2593,8 @@ class _CatalogRowAdapter:
 
 def test_seed_catalog_carries_resolution_and_detects_change():
     """An unresolved upstream source (is_resolved=false, empty tensors) mirrors as
-    unresolved and non-resident; re-seeding reports change only when something
-    differs, and an in-place resolution flips both plus the tensors.
-
-    Seeded from the upstream's `is_resolved`, not its residency: the mirror needs
-    to know whether that row describes a real source yet, which is the monotonic
-    question, and residency is no longer a column to read (biopb/biopb#1035).
+    unresolved; re-seeding reports change only when something differs, and an
+    in-place resolution flips the flag and the tensors together.
     """
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
@@ -2644,14 +2636,12 @@ def test_seed_catalog_carries_resolution_and_detects_change():
 
 
 def test_a_mirror_is_never_resident():
-    """A proxied source's bytes are on another machine, so they are not local
-    and not cheap to read -- reachable or not, resolved upstream or not.
+    """A proxied source's bytes are on another machine: not local, not cheap to
+    read, whatever the endpoint's reachability or the upstream's resolution.
 
-    There used to be an override reporting endpoint reachability here, because
-    the base's "remote scheme -> non-resident" was being read as *unresolved*.
-    `is_resolved()` is that question now, so the base can say the true thing
-    (biopb/biopb#1035). Nothing acts on the answer: a mirror cannot be warmed
-    (see `test_warm_refuses_a_remote_source`), which is what residency is for.
+    Do not reinstate an override here -- "should a client offer to resolve this"
+    is `is_resolved()`, and a mirror cannot be warmed anyway
+    (`test_warm_refuses_a_remote_source`), which is what residency decides.
     """
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 

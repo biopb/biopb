@@ -68,11 +68,9 @@ def _descriptor_from_row(row: Mapping[str, Any]) -> DataSourceDescriptor:
         tensors=tensors,
         metadata_json="",
     )
-    # `data_resident` was field 6 here and is gone from the catalog entirely --
-    # residency is answered live by `is_resident()`, because a stored copy of
-    # "right now" is only ever where it was last looked (biopb/biopb#1035).
-    # Still filled when a row from an older server carries it, so this decode
-    # keeps returning byte-for-byte what it used to against that server.
+    # No current server sends `data_resident` -- residency is the `is_resident()`
+    # action now (biopb/biopb#1035) -- but an older one does, and this decode
+    # still answers it identically against that server.
     resident = row.get("data_resident")
     if resident is not None:
         desc.data_resident = bool(resident)

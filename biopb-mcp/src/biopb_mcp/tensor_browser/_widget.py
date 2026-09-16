@@ -490,14 +490,11 @@ def _residency_state(src: CatalogSource) -> str | None:
 
     Returns ``"resident"`` (content local, cheap to read), ``"remote"`` (not
     local -- remote or dehydrated, slow or blocking to read), or ``None`` when
-    the residency is unknown (a server too old for the ``is_resident`` action,
-    or a call that failed), in which case the UI shows no indicator rather than
-    guessing.
+    residency is unknown (an old server, or a failed call), in which case the UI
+    shows no indicator rather than guessing.
 
-    As live as the listing that produced *src*, and no more: the server answers
-    this fresh every time it is asked, but the tree is drawn from a snapshot
-    (biopb/biopb#1035). A badge is the right consumer of that -- it is redrawn
-    when the list is -- where a read path wanting certainty asks again.
+    Only as live as the listing that produced *src* -- a badge, not a read-path
+    gate (biopb/biopb#1035).
     """
     if src.data_resident is None:
         return None

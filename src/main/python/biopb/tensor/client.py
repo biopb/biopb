@@ -557,9 +557,8 @@ class TensorFlightClient:
         files are cheap local reads -- so a ``warm`` re-run after a cancel simply
         finishes the remainder. Only meaningful for multi-file sources; a
         single-file source returns immediately (resolve already recalled it), and
-        a source whose url is remote (an object store, or a ``grpc://`` mirror of
-        another server) raises -- its bytes are not on the serving machine at
-        all, so there is nothing there to make resident.
+        a remote-url source (an object store, or a ``grpc://`` mirror) raises --
+        nothing on the serving machine can be made resident.
 
         Args:
             source_id: The (already-resolved) source to warm.
@@ -574,10 +573,9 @@ class TensorFlightClient:
         Returns:
             The terminal ``WarmProgress`` snapshot (``files_done`` /
             ``bytes_done`` reflect what was made resident). ``files_total == 0``
-            means the source was local and had nothing to warm -- which is how a
-            client learns it is single-file. It does *not* mean "not applicable":
-            that case raises instead, so the two cannot be confused
-            (biopb/biopb#1035).
+            means the source was local and had nothing to warm -- how a client
+            learns it is single-file. It never means "not applicable"; that
+            case raises (biopb/biopb#1035).
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
@@ -598,20 +596,16 @@ class TensorFlightClient:
         Note:
             Experimental, with the rest of cloud / remote source support.
 
-        Residency is volatile: a synced folder (OneDrive / iCloud Files-On-
-        Demand) re-dehydrates its files under storage pressure with nothing to
-        notify anyone, so there is no moment at which a stored answer stays
-        true. That is why this is an action and not a catalog column -- a row
-        could only ever tell you where the bytes were when someone last looked
-        (biopb/biopb#1035). Do not cache what it returns; ask again.
+        Volatile: a synced folder (OneDrive / iCloud Files-On-Demand)
+        re-dehydrates under storage pressure with nothing to notify anyone, so
+        no stored answer stays true -- which is why it is an action and not a
+        catalog column (biopb/biopb#1035). **Do not cache what it returns.**
 
-        Distinct from ``is_resolved`` on a source's row, which is the other
-        question: whether the server has read the source at all yet. An
-        unresolved source is never resident, but a resolved one can stop being.
+        Not the same question as a row's ``is_resolved``, which asks whether the
+        server has read the source at all yet. An unresolved source is never
+        resident; a resolved one can stop being.
 
-        Batched, because the caller is usually a list: one call answers a whole
-        catalog page, where a call per row would cost a round trip and a stat
-        walk each.
+        Batched: one call answers a whole catalog page.
 
         Args:
             source_ids: The sources to ask about; ``None`` (the default) asks
@@ -622,9 +616,9 @@ class TensorFlightClient:
             simply absent -- missing means "no answer", not "not resident".
 
         Raises:
-            RuntimeError: if the server predates the ``is_resident`` action.
-                Residency is unknown in that case, which for a UI is a reason
-                to show nothing rather than to guess.
+            RuntimeError: if the server predates the ``is_resident`` action --
+                residency unknown, which a UI should draw as no indicator
+                rather than guess at.
         """
         return self._catalog.is_resident(source_ids)
 

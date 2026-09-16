@@ -64,11 +64,10 @@ def _browse(client) -> Dict[str, CatalogSource]:
     rows; :mod:`._catalog` is this package's choice of what to make of them
     (biopb/biopb#1032).
 
-    Two calls, because residency is not in the row: one ``is_resident`` covers
-    the whole page and stamps each source with what was true at list time
-    (biopb/biopb#1035). Best-effort -- an older server has no such action, and
-    the badge is worth no failed browse -- so a refusal leaves every residency
-    unknown, which the UI already draws as no indicator at all.
+    Two calls: residency is not in the row, so one ``is_resident`` stamps the
+    whole page (biopb/biopb#1035). Best-effort -- a badge is worth no failed
+    browse -- so a refusal leaves residency unknown, which the UI draws as no
+    indicator.
     """
     rows = client.query_sources(_SOURCES_SQL, format="records")
     try:
@@ -402,12 +401,9 @@ class TensorConnection:
         # resolve() already re-listed server-side; mirror it into our snapshot so
         # the widget/agent see the full field set without a second round-trip.
         self.refresh()
-        # The row resolve just wrote, not the refreshed snapshot entry: the row
-        # is what the server committed for THIS resolve, where a re-list could
-        # have caught a rescan re-registering the source underneath it. Its
-        # residency is unknown, and that is fine -- the tree redraws from
-        # ``sources``, which the refresh above stamped; this return answers
-        # "what is in the source now", which is the tensors.
+        # The row this resolve committed, not the refreshed snapshot entry,
+        # which a concurrent rescan could have re-registered underneath. Its
+        # residency is unknown; the tree redraws from ``sources`` for that.
         return source_from_row(row)
 
     def warm_source(
@@ -432,9 +428,8 @@ class TensorConnection:
         :class:`~biopb.tensor.ResolveCancelled` when it returns True) are forwarded
         verbatim so a GUI can show a non-modal progress + Cancel affordance.
         Returns the terminal ``WarmProgress`` snapshot. No catalog refresh: warm
-        changes residency, which is not in the catalog -- the snapshot's
-        residency is whatever the last browse asked for, so a caller that wants
-        the badge to move re-lists (biopb/biopb#1035).
+        changes residency, which is not in the catalog -- re-list to move the
+        badge (biopb/biopb#1035).
         """
         if self.client is None:
             raise RuntimeError("Not connected")

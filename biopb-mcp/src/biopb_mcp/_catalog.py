@@ -54,17 +54,11 @@ class CatalogSource:
     #: resolved" with "resolved, and there was nothing readable in it"
     #: (biopb/biopb#1032).
     is_resolved: bool = True
-    #: Whether the content was local and cheap to read at the moment the
-    #: catalog was listed. Not a row column -- it comes from the server's live
-    #: ``is_resident`` action, because residency has no shelf life: a
-    #: synced-folder source re-dehydrates under storage pressure with nothing
-    #: to refresh a stored value from (biopb/biopb#1035). Which makes this a
-    #: snapshot too, honest only about the instant it was taken: fine for a
-    #: badge on a list that is redrawn when the list is, wrong for a read path,
-    #: which should ask the server again.
-    #:
-    #: ``None`` when nobody answered -- a server too old for the action, or one
-    #: that does not serve this source.
+    #: Whether the content was local and cheap to read *at the moment this
+    #: catalog was listed*. Not a row column: it comes from the server's live
+    #: ``is_resident`` action (biopb/biopb#1035), which makes this a snapshot
+    #: -- fine for a badge redrawn with the list, wrong for a read path, which
+    #: should ask the server again. ``None`` when nobody answered.
     data_resident: Optional[bool] = None
 
 
@@ -94,9 +88,7 @@ def source_from_row(
         # it costs a resolve the UI does not offer, never a browse that silently
         # treats a real source as a placeholder.
         is_resolved=bool(row.get("is_resolved", True)),
-        # Not in the row -- see :attr:`CatalogSource.data_resident`. A caller
-        # holding the live answer passes it in; :func:`sources_from_rows` does
-        # that for a whole listing.
+        # Not in the row; the caller passes the live answer in.
         data_resident=resident,
     )
 

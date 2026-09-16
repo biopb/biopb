@@ -745,20 +745,15 @@ class MetadataDatabase:
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
                 shape_summary TEXT,
-                -- Does a real, hydrated adapter back this row? Monotonic for
-                -- the life of the process -- never flips back to FALSE once
-                -- TRUE, since a source is not un-resolved by re-dehydrating --
-                -- which is the whole reason it can live in a table: a stored
-                -- copy can only lag in the harmless direction. TRUE default:
+                -- Does a real, hydrated adapter back this row? Monotonic --
+                -- never flips back to FALSE once TRUE -- which is what makes it
+                -- storable: a stale copy can only lag harmlessly. TRUE default:
                 -- every adapter but the unresolved-cloud proxy is resolved by
                 -- construction.
                 --
-                -- There is deliberately no `data_resident` beside it. "Are the
-                -- bytes local right now" swings both ways over a source's life
-                -- (a synced folder re-dehydrates under storage pressure, with
-                -- no event to refresh a row from), so a column could only ever
-                -- record where it was last looked at. The `is_resident` Flight
-                -- action answers it live instead (biopb/biopb#1035).
+                -- Residency deliberately has no column beside it. It swings both
+                -- ways with no event to refresh a row from, so the `is_resident`
+                -- action answers it live (biopb/biopb#1035).
                 is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
                 -- Full per-tensor structural info (biopb/biopb#224): one struct
                 -- per tensor, so multi-field / HCS sources are queryable per

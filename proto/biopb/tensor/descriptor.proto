@@ -291,14 +291,11 @@ message DataSourceDescriptor {
   // Source-level OME/vendor metadata (JSON format)
   string metadata_json = 5;
 
-  // DEAD: no current server fills this, and no current client reads it.
-  // Residency is volatile -- a synced-folder source re-dehydrates under storage
-  // pressure with no event to refresh from -- so a stored bit could only ever
-  // say where the bytes were when someone last looked. The `sources` catalog
-  // dropped its column and the `is_resident` action answers live instead
-  // (biopb/biopb#1035). Kept, unremoved, only because the deprecated
-  // descriptor_from_row / descriptorsFromRows still fill it when decoding a row
-  // from an older server, so those keep returning what they always did.
+  // DEAD: no current server fills this. Residency is volatile -- a
+  // synced-folder source re-dehydrates with no event to refresh from -- so the
+  // catalog dropped its column and the `is_resident` action answers it live
+  // (biopb/biopb#1035). Kept only so the deprecated row decoders still fill it
+  // from an older server's row.
   optional bool data_resident = 6;
 }
 
@@ -327,7 +324,7 @@ message ResolveStreamMessage {
   // Field 2 was `DataSourceDescriptor result`. The server had to build that
   // from the adapter a second time, after it had already written the catalog
   // row -- two encodings of one projection, which could disagree on
-  // `data_resident` (the adapter answered live, the row was a snapshot -- the
+  // `data_resident` (the adapter answered live, the row was a snapshot; the
   // column is since gone for that same reason). The row it just wrote is now
   // what comes back.
   reserved 2;
@@ -376,10 +373,9 @@ message WarmProgress {
 // more `progress` updates followed by exactly one terminal `done` snapshot. On
 // normal completion `done.files_done == done.files_total`; on cancellation (the
 // client closing the stream) the `done` reflects partial progress. A
-// single-file source yields one `done` with files_total == 0. A source whose
-// url is remote (an object store, or a `grpc://` mirror of another server)
-// fails instead: its bytes are not on the serving machine, so there is nothing
-// to make resident, and a zero count would read as "already done".
+// single-file source yields one `done` with files_total == 0. A remote-url
+// source (an object store, or a `grpc://` mirror) fails instead: nothing on the
+// serving machine can be made resident, and a zero count would read as "done".
 message WarmStreamMessage {
   oneof payload {
     WarmProgress progress = 1;

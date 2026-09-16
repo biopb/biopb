@@ -945,8 +945,8 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context, source_id)
             yield from self._handle_warm(source_id, context)
         elif action.type == "is_resident":
-            # Catalog tier, like the `data_resident` column this replaces: which
-            # sources are local is part of browsing, not of reading their pixels.
+            # Catalog tier: which sources are local is part of browsing, not
+            # of reading their pixels.
             self._authorize(context)
             yield self._handle_is_resident(action.body.to_pybytes())
         elif action.type == "add_source":
@@ -968,20 +968,16 @@ class TensorFlightServer(flight.FlightServerBase):
     def _handle_is_resident(self, body: bytes) -> bytes:
         """Residency of the named sources, asked of the adapters right now.
 
-        An action and not a catalog column because the answer has no shelf life:
-        a synced folder re-dehydrates under storage pressure with nothing for a
-        stored value to hang a refresh on, so any persisted copy is only ever
-        "was, when we last looked" (biopb/biopb#1035). Every call re-runs
-        ``adapter.is_resident()`` -- the same shape as ``chunk_locate``, which
-        is likewise a live lookup rather than a row.
+        An action rather than a catalog column because the answer has no shelf
+        life: a synced folder re-dehydrates with no event to refresh a stored
+        value from, so every call re-runs ``adapter.is_resident()``
+        (biopb/biopb#1035). Never cache it here or anywhere.
 
-        Batched because the callers are lists: a browser draws a residency glyph
-        per row, and one action beats a round trip per source (each of which may
-        cost a bounded stat walk). Body is a JSON array of source ids, or empty
-        for every registered source. The reply is a JSON object of id ->
-        boolean; an id the server does not serve is simply absent, which a
-        client reads as "unknown" -- the same thing an older server's missing
-        action means.
+        Batched because the callers are lists drawing a glyph per row. Body is a
+        JSON array of source ids, or empty for every registered source; the
+        reply is a JSON object of id -> boolean. An id the server does not serve
+        is absent, which reads as "unknown" -- never False, which would send a
+        client to hydrate a file already on disk.
         """
         raw = body.decode("utf-8").strip()
         if raw:
@@ -1133,9 +1129,8 @@ class TensorFlightServer(flight.FlightServerBase):
         Properties:
         - **No-op for single-file sources** -- their one file was already
           recalled by resolve, so this emits one terminal ``done`` with
-          ``files_total == 0`` and returns. A *remote* source raises instead:
-          there is no local tree to recall into, and saying "done, 0 files"
-          would be indistinguishable from the no-op above.
+          ``files_total == 0`` and returns. A *remote* source raises instead;
+          nothing here can be made resident.
         - **Read every file unconditionally** -- residency is volatile (eviction /
           re-dehydration can flip it underneath us), so a "skip already-resident"
           check would be a TOCTOU trap; an unconditional read is idempotent
@@ -1151,17 +1146,11 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
         root = adapter.source_url
-        # A remote source has no local tree to walk. Warming reads files on THIS
-        # server's filesystem to force a sync engine's recall, and these bytes
-        # are somewhere else entirely -- an fsspec object store, or another
-        # tensor server for a `grpc://` mirror. Refusing is the honest answer;
-        # it used to fall into the no-op below and report success with
-        # `files_total == 0`, which is the signal a single-file source sends
-        # when it genuinely had nothing to warm, so a caller could not tell
-        # "finished" from "never applicable" (biopb/biopb#1035).
-        #
-        # Scheme only, which is why a mirror's aliased `source_url` (display
-        # authority, never the dial address) is still a sound thing to ask.
+        # A remote source has no local tree to walk, so refuse rather than fall
+        # into the no-op below: `files_total == 0` is how a client learns a
+        # source is single-file, and must not also mean "not applicable"
+        # (biopb/biopb#1035). Scheme only, so a mirror's aliased `source_url`
+        # (display authority, never the dial address) is still sound to ask.
         if root and is_remote_url(root):
             scheme = root.split("://", 1)[0]
             raise flight.FlightServerError(

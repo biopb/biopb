@@ -615,9 +615,8 @@ class TestUnresolvedDecision:
 class _ResidencyAdapter:
     """Stand-in carrying the *real* ``is_resident()`` off the adapter base.
 
-    Not a stub returning a canned bool: the gate's whole failure mode was
-    asking a weaker question than the adapter would, so the test has to run the
-    adapter's own answer (biopb/biopb#1035).
+    Not a canned bool: the gate's failure mode is asking a weaker question than
+    the adapter would, so the test runs the adapter's own answer.
     """
 
     def __init__(self, source_url):
@@ -676,13 +675,10 @@ class TestShouldWarm:
         assert mgr.should_warm("s1") is False
 
     def test_dehydrated_directory_source_skipped(self, tmp_path, force_nonresident):
-        """The gate's old blind spot, pinned (biopb/biopb#1035).
-
-        A zarr store claims the *directory*, so ``member_paths`` is just that
-        directory and the old member check -- ``is_file``-guarded -- could never
-        see a placeholder inside it. Every such source answered "resident" and
-        precache recalled the whole store, which is exactly what #174's policy
-        exists to stop. The adapter's ``is_resident()`` samples the interior.
+        """A zarr store claims the *directory*, so ``member_paths`` is just that
+        directory and an ``is_file``-guarded member check cannot see a
+        placeholder inside it -- the whole store reads as resident and precache
+        recalls it, against #174's policy. The adapter samples the interior.
         """
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
@@ -1087,8 +1083,7 @@ class TestResolveAction:
             assert row["source_id"] == "cloud1"
             assert [t["shape"] for t in row["tensors"]] == [[16, 24]]
             assert row["is_resolved"] is True
-            # Residency is not in the row at all (biopb/biopb#1035).
-            assert "data_resident" not in row
+            assert "data_resident" not in row  # never in a row
             assert proxy.is_resolved() is True
 
             # It IS the catalog row, not a second encoding built beside it. The
@@ -1310,12 +1305,8 @@ class _ResidencyProbeAdapter:
 
 
 class TestIsResidentAction:
-    """The live residency action (biopb/biopb#1035).
-
-    Residency has no durable form -- a synced folder re-dehydrates with no event
-    to refresh a stored value from -- so it is asked, per call, never read off a
-    row.
-    """
+    """The live residency action: asked per call, never read off a row
+    (biopb/biopb#1035)."""
 
     def _server(self, adapters):
         from biopb_tensor_server.serving.server import TensorFlightServer
@@ -1429,18 +1420,9 @@ class TestWarmAction:
         return paths
 
     def test_warm_writes_nothing_to_the_catalog(self, tmp_path):
-        """#1033's post-warm resync is gone (biopb/biopb#1035).
-
-        Replaces #1038's `test_warm_refreshes_residency_on_a_catalog_it_was_handed`,
-        which pinned that the refresh reached a *supplied* catalog. There is no
-        refresh to reach one now.
-
-        It existed to move `data_resident` from "correct at resolve time" to
-        "correct at warm time", which is not correct-ness, only a later stale
-        instant. It cost a `directory_is_resident()` stat walk over a directory
-        that had just been recalled, and the client that draws the badge never
-        re-listed after a warm, so nothing read it.
-        """
+        """Warm touches no catalog at all: residency is not stored, so there is
+        nothing for it to correct, and the `directory_is_resident()` walk that
+        used to run here was pure cost (biopb/biopb#1035)."""
         import pyarrow.flight as flight
 
         class _Forbidden:
@@ -1464,8 +1446,8 @@ class TestWarmAction:
         assert kinds[-1] == "done"
 
     def test_the_catalog_cannot_refresh_residency_at_all(self):
-        """The method went with its only caller: it wrote `data_resident` and an
-        `is_resolved` that was already true on the one path that called it."""
+        """It wrote `data_resident`, plus an `is_resolved` already true on the
+        one path that called it."""
         from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
         assert not hasattr(MetadataDatabase, "refresh_residency")
@@ -1562,13 +1544,9 @@ class TestWarmAction:
         assert msgs[-1].done.files_total == 0  # nothing to warm
 
     def test_warm_refuses_a_remote_source(self):
-        """A remote url has no local tree to recall into, so warm fails loudly.
-
-        It used to fall into the single-file no-op and answer `files_total == 0`
-        -- the same thing a local single-file source says when it genuinely had
-        nothing left to warm. A caller could not tell "finished" from "never
-        applicable", which is the shape of bug biopb/biopb#1032 was about, one
-        action over (biopb/biopb#1035).
+        """A remote url has no local tree to recall into, so warm fails loudly
+        rather than answering `files_total == 0` -- which a local single-file
+        source already uses to mean "nothing left to warm" (biopb/biopb#1035).
         """
         import pyarrow.flight as flight
 
@@ -1577,8 +1555,7 @@ class TestWarmAction:
             list(server.do_action(_Ctx(), flight.Action("warm", b"s9")))
 
     def test_warm_names_the_scheme_and_where_to_go(self):
-        # The message has to be actionable: which source, why it cannot work
-        # here, and that the data's own server is where to warm it.
+        # Actionable: which source, why not here, and where to warm it.
         import pyarrow.flight as flight
 
         server = self._server("s10", _DirAdapter("s3://bucket/img.zarr"))
@@ -1590,9 +1567,8 @@ class TestWarmAction:
         assert "server that holds the data" in message
 
     def test_warm_still_no_ops_on_a_local_single_file_source(self, tmp_path):
-        # The counterpart the refusal must not swallow: `files_total == 0` stays
-        # the signal for "local, and there was nothing to warm" -- a client
-        # (the web SPA) reads exactly that to know a source is single-file.
+        # The refusal must not swallow this: `files_total == 0` is how a client
+        # (the web SPA) learns a source is single-file.
         import pyarrow.flight as flight
 
         f = tmp_path / "scan.nii"

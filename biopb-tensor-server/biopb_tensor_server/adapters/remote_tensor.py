@@ -364,10 +364,8 @@ class RemoteTensorAdapter(TensorAdapter):
         # per-source fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
         self._metadata_cache: Optional[dict] = None
-        # Whether the upstream *source* has resolved (carried from the bulk
-        # row). None until seeded; is_resolved() reads it, so an unresolved
-        # upstream source mirrors as unresolved rather than as an empty
-        # readable one (biopb/biopb#266).
+        # Whether the upstream *source* has resolved (carried from the bulk row),
+        # None until seeded. is_resolved() is its only reader (biopb/biopb#266).
         self._upstream_resolved: Optional[bool] = None
 
     # ------------------------------------------------------------------ upstream
@@ -440,10 +438,8 @@ class RemoteTensorAdapter(TensorAdapter):
     def _mark_unreachable(self, exc: Exception) -> None:
         """React to an upstream connectivity failure (catalog-surface degradation).
 
-        There is no reachability *flag* any more -- it existed only to answer
-        ``is_resident()``, which a mirror no longer overrides (biopb/biopb#1035).
-        The catalog surface degrades on its own: the callers that land here
-        return an empty descriptor list, which is what a client sees.
+        No flag to set: the callers that land here return an empty descriptor
+        list, which is the degradation a client sees.
         """
         # Drop this adapter's reference and evict the shared pooled client so the
         # next call (from any mirrored source of this endpoint) reconnects.
@@ -525,11 +521,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         ``is_resolved`` is the upstream *source*'s own flag (from its row): an
         unresolved upstream source (``is_resolved=false``, empty tensors) must
-        mirror as unresolved, not be advertised as readable. This is the only
-        consumer of the seeded flag. It used to be the
-        upstream's ``data_resident``, which conflated "not hydrated yet" with
-        "hydrated, bytes not local" and is no longer a column at all
-        (biopb/biopb#1035). Idempotent and
+        mirror as unresolved, not be advertised as readable. Idempotent and
         re-appliable: the reconcile re-seeds every mirrored source each re-list,
         so an in-place upstream resolution (empty -> populated tensors,
         false -> true) refreshes here rather than going stale.
@@ -684,20 +676,10 @@ class RemoteTensorAdapter(TensorAdapter):
             return []  # unreachable / unresolved upstream -> placeholder row
         return [catalog_entry(self._localize_descriptor(desc))]
 
-    # No is_resident() override. There used to be one, reporting the endpoint's
-    # last-known reachability, because the base calls a `grpc://` url
-    # non-resident and that answer was being read as "unresolved" -- the
-    # conflation biopb/biopb#1032 gave its own flag and #1035 removed the column
-    # for. `is_resolved` below is that question now, so the base is free to say
-    # the true thing: a mirrored source's bytes are on another machine, so they
-    # are not local and not cheap to read, reachable or not.
-    #
-    # Nothing is lost with it. Residency exists to decide whether warming is
-    # worth it, and a mirror cannot be warmed at all -- `_handle_warm` walks a
-    # local directory, and this source's url is a remote scheme (it now refuses
-    # rather than reporting a hollow success). Individual cached chunks ARE
-    # local and cheap, but that is per-chunk, and no per-source answer, old or
-    # new, ever spoke for the cache.
+    # No is_resident() override: a mirror's bytes are on another machine, so the
+    # base's "remote scheme -> non-resident" is the true answer, and `warm`
+    # refuses a remote url outright. Do not override it to report reachability
+    # -- that is is_resolved()'s job below (biopb/biopb#1035).
 
     def is_resolved(self) -> bool:
         """Whether the upstream has hydrated the source this mirrors.
