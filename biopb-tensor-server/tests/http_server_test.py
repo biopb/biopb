@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pyarrow.flight as flight
 import pytest
+from biopb.tensor._session import ResolveCancelled
 from biopb_tensor_server.serving.http_server import (
     _ADVERTISED,
     _advertised_levels,
@@ -3400,3 +3401,176 @@ class TestSingleSourceIsNotCappedByTheListing:
         with self._tc() as tc:
             r = tc.get("/api/sources/nope", headers=_bearer(_TOKEN))
         assert r.status_code == 404
+
+
+# ===========================================================================
+# Resolve / warm jobs
+# ===========================================================================
+
+
+def _await_state(tc, kind, source_id, want, timeout=5.0):
+    """Poll a job's status until it reaches `want`. Returns the final body."""
+    deadline = time.monotonic() + timeout
+    body = None
+    while time.monotonic() < deadline:
+        r = tc.get(f"/api/sources/{source_id}/{kind}/status", headers=_bearer(_TOKEN))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        if body["state"] == want:
+            return body
+        time.sleep(0.01)
+    raise AssertionError(f"{kind} never reached {want!r}; last={body}")
+
+
+class TestResolveWarmJobs:
+    def test_resolve_starts_a_job_and_reports_done(self, auth_client):
+        tc, mock_fc = auth_client
+        r = tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        assert r.status_code == 202
+        assert r.json()["started"] is True
+        assert _await_state(tc, "resolve", "cloud0", "done")["error"] is None
+        mock_fc.resolve.assert_called_once()
+
+    def test_status_route_is_not_swallowed_by_the_source_catch_all(self, auth_client):
+        # /api/sources/{source_id:path} is greedy: without this route ordering
+        # the status GET reads as a source whose id is "cloud0/resolve/status".
+        tc, _ = auth_client
+        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        body = _await_state(tc, "resolve", "cloud0", "done")
+        assert body["kind"] == "resolve"
+        assert body["source_id"] == "cloud0"
+
+    def test_status_is_404_before_anything_started(self, auth_client):
+        tc, _ = auth_client
+        r = tc.get("/api/sources/never/resolve/status", headers=_bearer(_TOKEN))
+        assert r.status_code == 404
+
+    def test_a_second_start_joins_the_recall_already_running(self, auth_client):
+        # The point of keying the registry by (kind, source_id): a double-click
+        # must not start a second download of the same bytes.
+        tc, mock_fc = auth_client
+        release = threading.Event()
+        mock_fc.resolve.side_effect = lambda *a, **k: release.wait(5)
+
+        first = tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        second = tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        assert first.json()["started"] is True
+        assert second.json()["started"] is False
+        release.set()
+        _await_state(tc, "resolve", "cloud0", "done")
+        assert mock_fc.resolve.call_count == 1
+
+    def test_progress_heartbeats_reach_the_status_body(self, auth_client):
+        tc, mock_fc = auth_client
+        seen = threading.Event()
+
+        def _resolve(source_id, on_progress=None, should_cancel=None):
+            on_progress(
+                SimpleNamespace(
+                    elapsed_seconds=1.5, target_name="big.zarr", target_bytes=4096
+                )
+            )
+            seen.wait(5)
+
+        mock_fc.resolve.side_effect = _resolve
+        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        body = _await_state(tc, "resolve", "cloud0", "running")
+        assert body["progress"]["target_name"] == "big.zarr"
+        assert body["progress"]["target_bytes"] == 4096
+        seen.set()
+        _await_state(tc, "resolve", "cloud0", "done")
+
+    def test_cancel_is_reported_before_the_worker_unwinds(self, auth_client):
+        tc, mock_fc = auth_client
+        observed = {}
+        release = threading.Event()
+
+        def _resolve(source_id, on_progress=None, should_cancel=None):
+            release.wait(5)
+            observed["cancelled"] = should_cancel()
+            raise ResolveCancelled("stopped")
+
+        mock_fc.resolve.side_effect = _resolve
+        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        r = tc.post("/api/sources/cloud0/resolve/cancel", headers=_bearer(_TOKEN))
+        # Flag first, state later: the UI needs the flag to stop offering a
+        # button it has already been told about.
+        assert r.json()["cancel_requested"] is True
+        release.set()
+        assert _await_state(tc, "resolve", "cloud0", "cancelled")["error"] is None
+        assert observed["cancelled"] is True
+
+    def test_cancelling_a_finished_job_is_not_an_error(self, auth_client):
+        tc, _ = auth_client
+        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        _await_state(tc, "resolve", "cloud0", "done")
+        r = tc.post("/api/sources/cloud0/resolve/cancel", headers=_bearer(_TOKEN))
+        # The click races the last heartbeat often enough that erroring here
+        # would show a failure for doing nothing wrong.
+        assert r.status_code == 200
+        assert r.json()["state"] == "done"
+
+    def test_a_failed_resolve_surfaces_its_reason(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.resolve.side_effect = RuntimeError("offline")
+        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        body = _await_state(tc, "resolve", "cloud0", "error")
+        assert "offline" in body["error"]
+
+    def test_warm_reports_the_terminal_counts_not_the_last_heartbeat(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.warm.return_value = SimpleNamespace(
+            files_total=12,
+            files_done=12,
+            bytes_total=2048,
+            bytes_done=2048,
+            current_name="",
+            elapsed_seconds=3.0,
+        )
+        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
+        body = _await_state(tc, "warm", "cloud0", "done")
+        assert body["progress"]["files_done"] == 12
+        assert body["progress"]["bytes_total"] == 2048
+
+    def test_warm_on_a_single_file_source_reports_nothing_to_do(self, auth_client):
+        # files_total == 0 is how a client tells single-file from multi-file
+        # without keeping its own list of source types.
+        tc, mock_fc = auth_client
+        mock_fc.warm.return_value = SimpleNamespace(
+            files_total=0,
+            files_done=0,
+            bytes_total=0,
+            bytes_done=0,
+            current_name="",
+            elapsed_seconds=0.0,
+        )
+        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
+        body = _await_state(tc, "warm", "cloud0", "done")
+        assert body["progress"]["files_total"] == 0
+
+    def test_resolve_and_warm_are_separate_jobs_on_one_source(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.warm.return_value = SimpleNamespace(
+            files_total=1,
+            files_done=1,
+            bytes_total=8,
+            bytes_done=8,
+            current_name="",
+            elapsed_seconds=0.1,
+        )
+        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
+        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
+        _await_state(tc, "resolve", "cloud0", "done")
+        _await_state(tc, "warm", "cloud0", "done")
+
+    def test_every_route_requires_the_token(self, auth_client):
+        tc, _ = auth_client
+        for method, path in [
+            ("post", "/api/sources/c/resolve"),
+            ("get", "/api/sources/c/resolve/status"),
+            ("post", "/api/sources/c/resolve/cancel"),
+            ("post", "/api/sources/c/warm"),
+            ("get", "/api/sources/c/warm/status"),
+            ("post", "/api/sources/c/warm/cancel"),
+        ]:
+            assert getattr(tc, method)(path).status_code == 401, path

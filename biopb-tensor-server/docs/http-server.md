@@ -63,6 +63,12 @@ is the local **default**, not a property of local mode.
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
+| `POST` | `/api/sources/{id}/resolve` | ✓ | Begin resolving an unresolved source; joins one already running (same-origin guarded) |
+| `GET` | `/api/sources/{id}/resolve/status` | ✓ | Poll that resolve; 404 if none was started |
+| `POST` | `/api/sources/{id}/resolve/cancel` | ✓ | Ask it to stop (same-origin guarded) |
+| `POST` | `/api/sources/{id}/warm` | ✓ | Hydrate-ahead a resolved source's member files (same-origin guarded) |
+| `GET` | `/api/sources/{id}/warm/status` | ✓ | Poll that warm; 404 if none was started |
+| `POST` | `/api/sources/{id}/warm/cancel` | ✓ | Ask it to stop (same-origin guarded) |
 | `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels, selectable axes and the 3-D volume plan |
 | `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (raw bytes) |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region; `scale_policy` delegates the scale |
@@ -74,9 +80,9 @@ is the local **default**, not a property of local mode.
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
 | `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker (local only — see the auth caveat) |
 
-> **Route ordering:** `/api/sources/{id}/metadata` and `/ticket/{ticket_hex}` are
-> registered *before* the greedy `{source_id:path}` catch-all to avoid Starlette
-> first-match shadowing.
+> **Route ordering:** `/api/sources/{id}/metadata`, `/ticket/{ticket_hex}` and the
+> `/resolve` + `/warm` sub-paths are registered *before* the greedy
+> `{source_id:path}` catch-all to avoid Starlette first-match shadowing.
 >
 > **`/readyz` connects.** It opens the Flight connection if none exists yet, so it
 > answers from the backend rather than from whatever traffic happened to arrive
@@ -109,6 +115,40 @@ past that cap has a descriptor here but no entry on `/api/sources`
 too (the token gates its pixels), but a `cache:` upload has no catalog row at
 all (biopb/biopb#265) — reach one through
 `/api/tile_info/{array_id}`.
+
+## Resolve and warm
+
+Both hydrate cloud / synced-folder data and both can run for minutes, which is
+longer than a request should be held open. They are **jobs**: `POST` to start,
+`GET .../status` to poll, `POST .../cancel` to stop. The recall itself lives on
+the server and outlives the HTTP request either way.
+
+**Polling, not SSE.** Every other route here is request/response, and a status
+object the client re-reads survives the two things a stream does not: a reload
+mid-resolve, and a second tab watching the same source.
+
+**Keyed by `(kind, source_id)`, not a generated job id.** That key *is* the
+idempotency callers need — a double-click, a retry, or a second tab joins the
+recall already running rather than starting a second one against the same bytes.
+`POST` answers `202` either way, with `started` saying which happened.
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `running`, `done`, `error`, `cancelled` |
+| `progress` | Kind-specific. Resolve: `elapsed_seconds`, `target_name`, `target_bytes`. Warm: `files_total`/`files_done`, `bytes_total`/`bytes_done`, `current_name`, `elapsed_seconds` |
+| `error` | Reason, on `state == "error"` only |
+| `cancel_requested` | Set the moment a cancel is asked for — before `state` turns, which only happens once the worker unwinds |
+
+**Cancelling a finished job is a no-op, not an error.** The click races the last
+heartbeat often enough that erroring would show a failure for doing nothing wrong.
+
+**Warm needs no client-side list of multi-file source types.** A source with
+nothing to warm finishes immediately with `files_total == 0` — the server decides
+structurally (is the source a directory), so no client has to keep a copy of that
+list and keep it in step.
+
+Finished outcomes stay readable for five minutes, then are reaped on the next
+start, so a slow poller still learns *why* a job ended.
 
 ## Tile endpoints
 
