@@ -714,13 +714,14 @@ async def execute_code(
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
-      data_resident, is_resolved (note source_url, not "url"). This is the browse
+      is_resolved (note source_url, not "url"). This is the browse
       surface; there is no other. Unresolved
       (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
       predicate hides them; use `is_resolved` to filter on them on purpose
       (e.g. `WHERE NOT is_resolved` to list what hasn't been resolved yet).
-      `data_resident` is a different question -- "are the bytes local right
-      now" -- and is volatile.
+    - "are the bytes local right now" is a different question and not a column:
+      it is volatile, so client.is_resident() asks the server live and returns
+      {source_id: bool}. Don't cache it.
     - viewer.add_tensor(array_id) loads a tensor as a layer (auto-handles the
       multiscale pyramid); client.get_tensor(array_id) returns a lazy dask
       array without adding a layer. Both take the same id: "source_id/t1"

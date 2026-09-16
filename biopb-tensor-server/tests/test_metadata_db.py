@@ -27,7 +27,6 @@ class MockAdapter:
         source_type,
         shape,
         dtype,
-        data_resident=True,
         is_resolved=True,
     ):
         self.source_id = source_id
@@ -35,7 +34,6 @@ class MockAdapter:
         self._source_type = source_type
         self._shape = shape
         self._dtype = dtype
-        self._data_resident = data_resident
         self._is_resolved = is_resolved
 
     @property
@@ -46,9 +44,8 @@ class MockAdapter:
     def source_type(self):
         return self._source_type
 
-    def is_resident(self):
-        return self._data_resident
-
+    # No is_resident(): the catalog does not ask, and a fake that answers a
+    # question nothing puts would only invite putting it (biopb/biopb#1035).
     def is_resolved(self):
         return self._is_resolved
 
@@ -228,7 +225,6 @@ class MultiTensorAdapter:
         source_url,
         source_type,
         tensors,
-        data_resident=True,
         is_resolved=True,
     ):
         self.source_id = source_id
@@ -237,7 +233,6 @@ class MultiTensorAdapter:
         self._tensors = (
             tensors  # list of dicts: array_id, dim_labels, shape, chunk_shape, dtype
         )
-        self._data_resident = data_resident
         self._is_resolved = is_resolved
 
     @property
@@ -248,9 +243,8 @@ class MultiTensorAdapter:
     def source_type(self):
         return self._source_type
 
-    def is_resident(self):
-        return self._data_resident
-
+    # No is_resident(): the catalog does not ask, and a fake that answers a
+    # question nothing puts would only invite putting it (biopb/biopb#1035).
     def is_resolved(self):
         return self._is_resolved
 
@@ -370,20 +364,20 @@ class TestPerTensorCatalog:
 
     def test_no_tensors_is_empty_list(self):
         """An unresolved (no-tensor) source stores an empty list, so per-tensor
-        predicates exclude it while `WHERE NOT data_resident` still finds it."""
+        predicates exclude it while `WHERE NOT is_resolved` still finds it."""
         db = MetadataDatabase()
         db.sync_source_added(
             "unresolved",
             MultiTensorAdapter(
-                "unresolved", "s3://b/x.zarr", "zarr", [], data_resident=False
+                "unresolved", "s3://b/x.zarr", "zarr", [], is_resolved=False
             ),
         )
         conn = db._get_connection()
-        tensors, resident = conn.execute(
-            "SELECT tensors, data_resident FROM sources WHERE source_id='unresolved'"
+        tensors, resolved = conn.execute(
+            "SELECT tensors, is_resolved FROM sources WHERE source_id='unresolved'"
         ).fetchone()
         assert tensors == []
-        assert resident is False
+        assert resolved is False
 
     def test_per_tensor_query_roundtrips_through_query(self):
         """The documented per-tensor idiom works through the real query path
@@ -399,7 +393,7 @@ class TestPerTensorCatalog:
         db.sync_source_added(
             "unresolved",
             MultiTensorAdapter(
-                "unresolved", "s3://b/x.zarr", "zarr", [], data_resident=False
+                "unresolved", "s3://b/x.zarr", "zarr", [], is_resolved=False
             ),
         )
 
@@ -453,8 +447,10 @@ class TestSourceRowProjection:
         assert d["source_id"] == "s1"
         assert d["source_url"] == "/data/s1.zarr"
         assert d["source_type"] == "zarr"
-        assert d["data_resident"] is True
         assert d["is_resolved"] is True
+        # No residency: it is answered by the `is_resident` action, live, not by
+        # a column anyone can read a stale copy of (biopb/biopb#1035).
+        assert "data_resident" not in d
         # Lean: source metadata is filled only by GetFlightInfo, so the browse
         # projection does not select it at all.
         assert "metadata_json" not in d
@@ -511,13 +507,11 @@ class TestSourceRowProjection:
                 "s3://b/x.zarr",
                 "zarr",
                 [],
-                data_resident=False,
                 is_resolved=False,
             ),
         )
         sources = _sources(db)
         assert len(sources[0]["tensors"]) == 0
-        assert sources[0]["data_resident"] is False
         # Empty tensors is not what makes it unresolved -- the flag is
         # (biopb/biopb#1032).
         assert sources[0]["is_resolved"] is False
@@ -548,7 +542,9 @@ class TestDeprecatedDescriptorProjection:
 
         assert d.source_id == "s1"
         assert d.source_url == "/data/s1.zarr"
-        assert d.data_resident is True
+        # The row has no residency to decode, so the proto's field stays unset
+        # rather than claiming False (biopb/biopb#1035).
+        assert not d.HasField("data_resident")
         assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
         assert list(d.tensors[0].shape) == [8, 512, 512]
         assert any(issubclass(w.category, DeprecationWarning) for w in caught)
@@ -568,7 +564,6 @@ class TestDeprecatedDescriptorProjection:
                 "s3://b/x.zarr",
                 "zarr",
                 [],
-                data_resident=False,
                 is_resolved=False,
             ),
         )
@@ -941,9 +936,15 @@ class TestClose:
         db.close()
 
 
-class TestDataResidentColumn:
-    """The `data_resident` column (#110): a queryable residency signal so
-    unresolved (cloud) sources can be filtered on purpose, not hidden by NULLs."""
+class TestNoResidencyColumn:
+    """There is no residency column, and registration never asks for one.
+
+    #110 added `data_resident` so unresolved (cloud) sources stayed filterable
+    when their NULL dtype hid them from a `WHERE dtype=...`. `is_resolved` does
+    that job now and can be stored, being monotonic; residency cannot, because
+    a synced folder re-dehydrates with no event to refresh a row from
+    (biopb/biopb#1035).
+    """
 
     class _UnresolvedAdapter:
         """A cloud / synced-folder source catalogued by URL only: no tensors
@@ -960,7 +961,7 @@ class TestDataResidentColumn:
             return self._source_url
 
         def is_resident(self):
-            return False  # not local yet
+            raise AssertionError("sync_source_added must not ask about residency")
 
         def is_resolved(self):
             return False
@@ -971,29 +972,35 @@ class TestDataResidentColumn:
         def get_metadata(self):
             return {}
 
-    def test_resident_local_source_is_true(self):
+    def test_the_column_is_gone(self):
+        import duckdb
+
         db = MetadataDatabase()
         db.sync_source_added(
             "local-1",
-            MockAdapter(
-                "local-1",
-                "/data/x.zarr",
-                "ome-zarr",
-                [10, 10],
-                "uint8",
-                data_resident=True,
-            ),
+            MockAdapter("local-1", "/data/x.zarr", "ome-zarr", [10, 10], "uint8"),
         )
-        row = (
+        with pytest.raises(duckdb.BinderException):
+            db._get_connection().execute("SELECT data_resident FROM sources")
+
+    def test_registration_never_asks_the_adapter(self):
+        """The upsert reads no residency at all -- an adapter that refuses to
+        answer still registers. A `directory_is_resident()` walk is not free,
+        and the row has nowhere to put the result."""
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "cloud-1", self._UnresolvedAdapter("cloud-1", "https://x/y.zarr")
+        )
+        (resolved,) = (
             db._get_connection()
-            .execute("SELECT data_resident FROM sources WHERE source_id='local-1'")
+            .execute("SELECT is_resolved FROM sources WHERE source_id='cloud-1'")
             .fetchone()
         )
-        assert row[0] is True
+        assert resolved is False
 
-    def test_unresolved_source_is_false_and_filterable(self):
-        # An unresolved source has NULL dtype, so a dtype predicate hides it;
-        # data_resident makes it filterable on purpose instead.
+    def test_unresolved_source_is_still_filterable(self):
+        # The footgun #110 was about: a dtype predicate silently drops a source
+        # with no tensors. `is_resolved` is what makes it discoverable now.
         db = MetadataDatabase()
         db.sync_source_added(
             "local-1",
@@ -1004,53 +1011,22 @@ class TestDataResidentColumn:
         )
         conn = db._get_connection()
 
-        resident = conn.execute(
-            "SELECT data_resident FROM sources WHERE source_id='cloud-1'"
-        ).fetchone()
-        assert resident[0] is False
-
-        # The footgun: a dtype filter silently drops the unresolved source...
         by_dtype = conn.execute(
             "SELECT source_id FROM sources WHERE dtype='uint8'"
         ).fetchall()
         assert [r[0] for r in by_dtype] == ["local-1"]
 
-        # ...but residency makes the unresolved one discoverable on purpose.
         unresolved = conn.execute(
-            "SELECT source_id FROM sources WHERE NOT data_resident"
+            "SELECT source_id FROM sources WHERE NOT is_resolved"
         ).fetchall()
         assert [r[0] for r in unresolved] == ["cloud-1"]
 
-    def test_column_is_not_null_with_false_default(self):
-        # The NOT NULL DEFAULT FALSE constraint: an insert omitting data_resident
-        # gets FALSE (future insert paths can't accidentally leave it NULL), and
-        # an explicit NULL is rejected -- so the column always partitions cleanly.
-        import duckdb
-
-        db = MetadataDatabase()
-        db.sync_source_added(
-            "seed", MockAdapter("seed", "/s.zarr", "ome-zarr", [4, 4], "uint8")
-        )
-        conn = db._get_connection()
-
-        conn.execute(
-            "INSERT INTO sources (source_id, source_url) VALUES ('partial', '/p')"
-        )
-        row = conn.execute(
-            "SELECT data_resident FROM sources WHERE source_id='partial'"
-        ).fetchone()
-        assert row[0] is False  # DEFAULT filled it, not NULL
-
-        with pytest.raises(duckdb.ConstraintException):
-            conn.execute(
-                "INSERT INTO sources (source_id, data_resident) VALUES ('bad', NULL)"
-            )
-
 
 class TestIsResolvedColumn:
-    """The `is_resolved` column: deterministic, unlike data_resident, so it is
-    the right signal for "does a client need to resolve this" rather than
-    data_resident's volatile "is it cheap to read right now"."""
+    """The `is_resolved` column: deterministic, which is what lets it be a
+    column at all. It answers "does a client need to resolve this"; whether the
+    bytes are cheap to read right now is the `is_resident` action's question,
+    and is stored nowhere."""
 
     def test_resolved_source_is_true(self):
         db = MetadataDatabase()
@@ -1073,7 +1049,7 @@ class TestIsResolvedColumn:
         )
         db.sync_source_added(
             "cloud-1",
-            TestDataResidentColumn._UnresolvedAdapter("cloud-1", "https://x/y.zarr"),
+            TestNoResidencyColumn._UnresolvedAdapter("cloud-1", "https://x/y.zarr"),
         )
         conn = db._get_connection()
 

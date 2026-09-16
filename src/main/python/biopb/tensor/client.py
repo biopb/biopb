@@ -12,7 +12,7 @@ Features:
 import json
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -581,6 +581,44 @@ class TensorFlightClient:
         return self._catalog.warm(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
+
+    def is_resident(
+        self, source_ids: Optional[Iterable[str]] = None
+    ) -> Dict[str, bool]:
+        """Ask the server, right now, whose content is local and cheap to read.
+
+        Note:
+            Experimental, with the rest of cloud / remote source support.
+
+        Residency is volatile: a synced folder (OneDrive / iCloud Files-On-
+        Demand) re-dehydrates its files under storage pressure with nothing to
+        notify anyone, so there is no moment at which a stored answer stays
+        true. That is why this is an action and not a catalog column -- a row
+        could only ever tell you where the bytes were when someone last looked
+        (biopb/biopb#1035). Do not cache what it returns; ask again.
+
+        Distinct from ``is_resolved`` on a source's row, which is the other
+        question: whether the server has read the source at all yet. An
+        unresolved source is never resident, but a resolved one can stop being.
+
+        Batched, because the caller is usually a list: one call answers a whole
+        catalog page, where a call per row would cost a round trip and a stat
+        walk each.
+
+        Args:
+            source_ids: The sources to ask about; ``None`` (the default) asks
+                about every source the server has registered.
+
+        Returns:
+            ``{source_id: bool}``. A requested id the server does not serve is
+            simply absent -- missing means "no answer", not "not resident".
+
+        Raises:
+            RuntimeError: if the server predates the ``is_resident`` action.
+                Residency is unknown in that case, which for a UI is a reason
+                to show nothing rather than to guess.
+        """
+        return self._catalog.is_resident(source_ids)
 
     def add_source(
         self,

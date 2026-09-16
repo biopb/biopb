@@ -536,9 +536,11 @@ else:
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table columns: source_id, source_url, source_type, dtype,
-# indexed_at, metadata_json, shape_summary, data_resident, is_resolved, and `tensors`
+# indexed_at, metadata_json, shape_summary, is_resolved, and `tensors`
 # (a LIST of STRUCT(array_id, dim_labels, shape, dtype) -- one per tensor;
 # `dtype`/`shape_summary` are just the first-tensor projection).
+# There is no residency column: whether a source's bytes are local is true only
+# of the instant you ask, so `client.is_resident()` answers it live instead.
 # The catalog is structural: the transfer grid a tensor is delivered on is not
 # stored here -- `client.get_descriptor(array_id).chunk_shape` answers it.
 df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
@@ -580,13 +582,20 @@ row, = client.query_sources(
     format="records")
 if not row["is_resolved"]:                   # never resolved
     src = client.resolve("source_id")        # downloads + resolves (may take minutes)
-    tensors = [(t.array_id, list(t.shape)) for t in src.tensors]  # now populated
+    tensors = [(t["array_id"], t["shape"]) for t in src["tensors"]]  # now populated
 ```
-`is_resolved`, not `data_resident`: the first says the server has read this
-source's structure and is monotonic (false to true once, never back); the
-second says its bytes are local *right now*, and a synced folder re-dehydrates
-under storage pressure. An empty `tensors` answers neither -- a source can
-resolve cleanly and hold nothing readable.
+`is_resolved` is the column to ask; residency is not a column at all. The two
+are different questions: `is_resolved` says the server has read this source's
+structure and is monotonic (false to true once, never back), which is what lets
+it live in a row. Whether the bytes are local is true only right now -- a synced
+folder re-dehydrates under storage pressure -- so it comes from a live call:
+```python
+client.is_resident()                  # {source_id: bool} for the whole catalog
+client.is_resident(["source_id"])     # or just the ones you care about
+```
+Don't cache what it returns, and don't read residency as resolution: an empty
+`tensors` answers neither, since a source can resolve cleanly and hold nothing
+readable.
 
 Hydrate-ahead (optional): `resolve()` fetches a multi-file source's *metadata*
 only -- the bulk data files (e.g. zarr/ome-zarr chunks) still recall one-by-one,

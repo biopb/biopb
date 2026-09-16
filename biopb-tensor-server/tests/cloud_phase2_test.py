@@ -545,6 +545,9 @@ class _FakeServer:
     def __init__(self):
         self.registered = {}
         self._metadata_db = _FakeMetadataDb()
+        # The reconciler reaches adapters through `sources`, the real server's
+        # registry; `registered` is this fake's own record of the same calls.
+        self.sources = self.registered
 
     def register_source(self, source_id, adapter):
         self.registered[source_id] = adapter
@@ -608,21 +611,44 @@ class TestUnresolvedDecision:
         assert mgr._reconciler._claim_is_unresolved(claim) is False
 
 
+class _ResidencyAdapter:
+    """Stand-in carrying the *real* ``is_resident()`` off the adapter base.
+
+    Not a stub returning a canned bool: the gate's whole failure mode was
+    asking a weaker question than the adapter would, so the test has to run the
+    adapter's own answer (biopb/biopb#1035).
+    """
+
+    def __init__(self, source_url):
+        self._source_url = str(source_url)
+
+    from biopb_tensor_server.core.adapter_base import SourceAdapter as _Base
+
+    is_resident = _Base.is_resident
+    del _Base
+
+
 class TestShouldWarm:
     """Residency gate the precache worker consults before warming (#174).
 
-    Mirrors ``_claim_is_unresolved`` so a source that re-dehydrates after
+    Asks the registered adapter, live, so a source that re-dehydrates after
     registration is skipped instead of recalled on a later backlog pass.
     """
 
-    def _register(self, mgr, claim):
+    def _register(self, mgr, claim, server=None):
         mgr._reconciler._state.claims[claim.source_id] = claim
+        if server is not None:
+            server.register_source(
+                claim.source_id, _ResidencyAdapter(claim.primary_path)
+            )
 
     def test_unknown_source_not_warmed(self, tmp_path):
         mgr = _make_manager(_FakeServer())
         assert mgr.should_warm("nope") is False
 
     def test_local_source_outside_cloud_root_always_warms(self, tmp_path):
+        # No adapter registered, and none needed: outside a cloud root the gate
+        # short-circuits rather than paying for a stat walk per source.
         mgr = _make_manager(_FakeServer())
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
@@ -631,16 +657,49 @@ class TestShouldWarm:
         assert mgr.should_warm("s1") is True
 
     def test_resident_cloud_source_warms(self, tmp_path):
-        mgr = _make_manager(_FakeServer(), cloud_roots={tmp_path.resolve()})
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
         claim = SourceClaim("nifti", str(f), source_id="s1")
-        self._register(mgr, claim)
+        self._register(mgr, claim, server)
         assert mgr.should_warm("s1") is True
 
     def test_rehydrated_cloud_source_skipped(self, tmp_path, force_nonresident):
         # Registered as a normal adapter while resident, then OneDrive evicted the
         # bytes: should_warm now returns False so the warm read never recalls them.
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
+        f = tmp_path / "scan.nii"
+        f.write_bytes(b"payload")
+        claim = SourceClaim("nifti", str(f), source_id="s1")
+        self._register(mgr, claim, server)
+        assert mgr.should_warm("s1") is False
+
+    def test_dehydrated_directory_source_skipped(self, tmp_path, force_nonresident):
+        """The gate's old blind spot, pinned (biopb/biopb#1035).
+
+        A zarr store claims the *directory*, so ``member_paths`` is just that
+        directory and the old member check -- ``is_file``-guarded -- could never
+        see a placeholder inside it. Every such source answered "resident" and
+        precache recalled the whole store, which is exactly what #174's policy
+        exists to stop. The adapter's ``is_resident()`` samples the interior.
+        """
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
+        store = tmp_path / "img.zarr"
+        store.mkdir()
+        (store / ".zattrs").write_text("{}")
+        (store / "0.0").write_bytes(b"chunk")
+        claim = SourceClaim("ome-zarr", str(store), source_id="s1")
+        self._register(mgr, claim, server)
+        # The member check still says "resident" -- it is looking at a directory.
+        assert mgr._reconciler._claim_has_dehydrated_member(claim) is False
+        assert mgr.should_warm("s1") is False
+
+    def test_unregistered_adapter_is_not_permission_to_warm(self, tmp_path):
+        # A claim without a live adapter: nothing can answer, so the gate stays
+        # shut rather than defaulting open.
         mgr = _make_manager(_FakeServer(), cloud_roots={tmp_path.resolve()})
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
@@ -1028,7 +1087,9 @@ class TestResolveAction:
             (row,) = self._rows(terminal[0])
             assert row["source_id"] == "cloud1"
             assert [t["shape"] for t in row["tensors"]] == [[16, 24]]
-            assert row["data_resident"] is True
+            assert row["is_resolved"] is True
+            # Residency is not in the row at all (biopb/biopb#1035).
+            assert "data_resident" not in row
             assert proxy.is_resolved() is True
 
             # It IS the catalog row, not a second encoding built beside it. The
@@ -1230,6 +1291,104 @@ class _Ctx:
         return None  # no bearer presented; the servers here have no token
 
 
+class _ResidencyProbeAdapter:
+    """Registered adapter that counts residency questions and answers a knob."""
+
+    capability_token = None
+
+    def __init__(self, resident=True):
+        self.resident = resident
+        self.asked = 0
+        self._source_url = "/data/probe"
+
+    @property
+    def source_url(self):
+        return self._source_url
+
+    def is_resident(self):
+        self.asked += 1
+        return self.resident
+
+
+class TestIsResidentAction:
+    """The live residency action (biopb/biopb#1035).
+
+    Residency has no durable form -- a synced folder re-dehydrates with no event
+    to refresh a stored value from -- so it is asked, per call, never read off a
+    row.
+    """
+
+    def _server(self, adapters):
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        server = TensorFlightServer("grpc://localhost:0")
+        for source_id, adapter in adapters.items():
+            server.register_source(source_id, adapter)
+        return server
+
+    def _call(self, server, body):
+        import json
+
+        import pyarrow.flight as flight
+
+        bodies = [
+            bytes(r)
+            for r in server.do_action(_Ctx(), flight.Action("is_resident", body))
+        ]
+        assert len(bodies) == 1
+        return json.loads(bodies[0].decode("utf-8"))
+
+    def test_asks_the_adapter_every_call(self):
+        # The property that makes this an action: no memoization anywhere, so a
+        # source that re-dehydrates between two calls reports differently.
+        probe = _ResidencyProbeAdapter(resident=True)
+        server = self._server({"s1": probe})
+
+        assert self._call(server, b'["s1"]') == {"s1": True}
+        probe.resident = False
+        assert self._call(server, b'["s1"]') == {"s1": False}
+        assert probe.asked == 2
+
+    def test_empty_body_answers_for_every_registered_source(self):
+        # What a browser wants: one call per page, not one per row.
+        server = self._server(
+            {
+                "s1": _ResidencyProbeAdapter(resident=True),
+                "s2": _ResidencyProbeAdapter(resident=False),
+            }
+        )
+        assert self._call(server, b"") == {"s1": True, "s2": False}
+
+    def test_unknown_source_is_absent_not_false(self):
+        # Missing means "no answer". Reporting False would say the bytes are
+        # elsewhere, which is a claim the server cannot make about a source it
+        # does not serve.
+        server = self._server({"s1": _ResidencyProbeAdapter(resident=True)})
+        assert self._call(server, b'["s1", "nope"]') == {"s1": True}
+
+    def test_a_balky_adapter_does_not_sink_the_batch(self):
+        class _Raises(_ResidencyProbeAdapter):
+            def is_resident(self):
+                raise OSError("stat failed")
+
+        server = self._server(
+            {"ok": _ResidencyProbeAdapter(resident=True), "bad": _Raises()}
+        )
+        assert self._call(server, b'["ok", "bad"]') == {"ok": True}
+
+    def test_a_non_list_body_is_refused(self):
+        import pyarrow.flight as flight
+
+        server = self._server({"s1": _ResidencyProbeAdapter()})
+        with pytest.raises(flight.FlightServerError, match="JSON array"):
+            list(server.do_action(_Ctx(), flight.Action("is_resident", b'"s1"')))
+
+    def test_the_action_is_advertised(self):
+        server = self._server({})
+        names = {a.type for a in server.list_actions(_Ctx())}
+        assert "is_resident" in names
+
+
 class TestWarmAction:
     """The dedicated streaming `warm` do_action: server-side hydrate-ahead. It
     walks the resolved source directory and reads every file (forcing recall),
@@ -1269,6 +1428,48 @@ class TestWarmAction:
                 fh.write(b"\xa5" * size)
             paths.append(p)
         return paths
+
+    def test_warm_writes_nothing_to_the_catalog(self, tmp_path):
+        """#1033's post-warm resync is gone (biopb/biopb#1035).
+
+        Replaces #1038's `test_warm_refreshes_residency_on_a_catalog_it_was_handed`,
+        which pinned that the refresh reached a *supplied* catalog. There is no
+        refresh to reach one now.
+
+        It existed to move `data_resident` from "correct at resolve time" to
+        "correct at warm time", which is not correct-ness, only a later stale
+        instant. It cost a `directory_is_resident()` stat walk over a directory
+        that had just been recalled, and the client that draws the badge never
+        re-listed after a warm, so nothing read it.
+        """
+        import pyarrow.flight as flight
+
+        class _Forbidden:
+            annotations_persisted = False
+            store_path = None
+
+            def __getattr__(self, name):
+                raise AssertionError(f"warm touched the catalog: {name}")
+
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        self._make_files(root, {"a.bin": 8})
+
+        server = self._server("s1", _DirAdapter(root))
+        server._metadata_db = _Forbidden()
+
+        bodies = [
+            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s1"))
+        ]
+        _msgs, kinds = self._parse(bodies)
+        assert kinds[-1] == "done"
+
+    def test_the_catalog_cannot_refresh_residency_at_all(self):
+        """The method went with its only caller: it wrote `data_resident` and an
+        `is_resolved` that was already true on the one path that called it."""
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+        assert not hasattr(MetadataDatabase, "refresh_residency")
 
     def test_warm_streams_progress_and_terminal_done(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
@@ -1396,55 +1597,6 @@ class TestWarmAction:
         server = self._server("s7", _DirAdapter("/nonexistent"))
         with pytest.raises(flight.FlightServerError, match="Source not found"):
             list(server.do_action(_Ctx(), flight.Action("warm", b"missing")))
-
-    def test_warm_refreshes_residency_on_a_catalog_it_was_handed(self, tmp_path):
-        """The refresh is not conditional on where the catalog came from.
-
-        A real deployment hands the server a MetadataDatabase that its
-        SourceManager also writes, and the row's data_resident is frozen at
-        registration -- before warm recalled a byte. Correcting it there is the
-        whole point of the refresh, so it must not skip a supplied catalog.
-        """
-        import pyarrow.flight as flight
-        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        root = str(tmp_path / "src")
-        os.makedirs(root)
-        self._make_files(root, {"a.bin": 8})
-
-        class _Recallable(_DirAdapter):
-            source_type = "zarr"
-            catalog_url = "file:///src"
-
-            def __init__(self, url):
-                super().__init__(url)
-                self.resident = False
-
-            def is_resident(self):
-                return self.resident
-
-            def is_resolved(self):
-                return True
-
-            def list_tensor_descriptors(self):
-                return []
-
-            def get_metadata(self):
-                return {}
-
-        adapter = _Recallable(root)
-        db = MetadataDatabase()  # supplied, the way cli.py supplies one
-        server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
-        db.sync_source_added("s8", server.register_source("s8", adapter))
-
-        resident = "SELECT data_resident FROM sources WHERE source_id = 's8'"
-        assert db.query(resident).to_pylist() == [{"data_resident": False}]
-
-        adapter.resident = True  # the recall the warm loop below is doing
-        list(server.do_action(_Ctx(), flight.Action("warm", b"s8")))
-
-        assert db.query(resident).to_pylist() == [{"data_resident": True}]
 
 
 # --------------------------------------------------------------------------- #

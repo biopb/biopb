@@ -50,7 +50,6 @@ def _catalog_rows(sources):
             "source_id": sid,
             "source_url": f"/data/{sid}",
             "source_type": "zarr",
-            "data_resident": True,
             "is_resolved": True,
             "tensors": [],
         }
@@ -63,6 +62,10 @@ def _fake_client(sources):
     # `catalog` is the knob: assign a new id set and the next browse sees it.
     client.catalog = list(sources)
     client.query_sources.side_effect = lambda sql, **kw: _catalog_rows(client.catalog)
+    # Residency is a separate live call, not a row column (biopb/biopb#1035).
+    # `resident` is its knob; default nothing known, like an old server.
+    client.resident = {}
+    client.is_resident.side_effect = lambda *a, **kw: dict(client.resident)
     client.health_check.return_value = {"status": "SERVING"}
     return client
 
@@ -467,6 +470,57 @@ class TestConnect:
         assert conn.last_status == "error"
         assert conn.last_message == "Lost connection to server"
 
+    def test_browse_stamps_sources_with_live_residency(self, monkeypatch):
+        # Residency is not in the row: one `is_resident` call per browse answers
+        # for the whole page (biopb/biopb#1035).
+        client = _fake_client(["a", "b"])
+        client.resident = {"a": True, "b": False}
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
+        )
+
+        conn = TensorConnection()
+        conn.connect("grpc://host:9")
+
+        assert conn.sources["a"].data_resident is True
+        assert conn.sources["b"].data_resident is False
+        # One call for the page, not one per source.
+        assert client.is_resident.call_count == 1
+
+    def test_browse_survives_a_server_without_the_action(self, monkeypatch):
+        # An older server refuses `is_resident`. Residency is then unknown --
+        # which the tree draws as no badge -- and the browse still succeeds,
+        # because a glyph is worth no failed catalog listing.
+        client = _fake_client(["a"])
+        client.is_resident.side_effect = RuntimeError("Unknown action")
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
+        )
+
+        conn = TensorConnection()
+        conn.connect("grpc://host:9")
+
+        assert set(conn.sources) == {"a"}
+        assert conn.sources["a"].data_resident is None
+
+    def test_a_stale_residency_column_is_ignored(self, monkeypatch):
+        # An older server still carries `data_resident` in its rows. It is the
+        # value this issue exists to stop reading, so the live answer wins and
+        # the column is not consulted at all.
+        client = _fake_client(["a"])
+        client.query_sources.side_effect = lambda sql, **kw: [
+            dict(row, data_resident=True) for row in _catalog_rows(client.catalog)
+        ]
+        client.resident = {"a": False}
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None, **_: client
+        )
+
+        conn = TensorConnection()
+        conn.connect("grpc://host:9")
+
+        assert conn.sources["a"].data_resident is False
+
     def test_resolve_source_requires_connection(self):
         conn = TensorConnection()
         with pytest.raises(RuntimeError, match="Not connected"):
@@ -480,7 +534,6 @@ class TestConnect:
             "source_id": "cloud_x",
             "source_url": "/data/cloud_x",
             "source_type": "zarr",
-            "data_resident": True,
             "is_resolved": True,
             "tensors": [
                 {

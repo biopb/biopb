@@ -291,13 +291,14 @@ message DataSourceDescriptor {
   // Source-level OME/vendor metadata (JSON format)
   string metadata_json = 5;
 
-  // Advisory, point-in-time hint: this source's content is local and cheap to
-  // read right now. VOLATILE -- a synced-folder source can re-dehydrate under
-  // storage pressure, so the authoritative residency gate is a fresh stat
-  // (adapter.is_resident()), not this stored value. `optional` so absence is
-  // distinguishable from false: servers predating this field leave it unset
-  // (residency unknown); a resident local source sets it true, a remote
-  // (fsspec) source false until its pixels are materialized locally.
+  // DEAD: no current server fills this, and no current client reads it.
+  // Residency is volatile -- a synced-folder source re-dehydrates under storage
+  // pressure with no event to refresh from -- so a stored bit could only ever
+  // say where the bytes were when someone last looked. The `sources` catalog
+  // dropped its column and the `is_resident` action answers live instead
+  // (biopb/biopb#1035). Kept, unremoved, only because the deprecated
+  // descriptor_from_row / descriptorsFromRows still fill it when decoding a row
+  // from an older server, so those keep returning what they always did.
   optional bool data_resident = 6;
 }
 
@@ -326,17 +327,18 @@ message ResolveStreamMessage {
   // Field 2 was `DataSourceDescriptor result`. The server had to build that
   // from the adapter a second time, after it had already written the catalog
   // row -- two encodings of one projection, which could disagree on
-  // `data_resident` (the adapter answers live, the row is a snapshot). The row
-  // it just wrote is now what comes back.
+  // `data_resident` (the adapter answered live, the row was a snapshot -- the
+  // column is since gone for that same reason). The row it just wrote is now
+  // what comes back.
   reserved 2;
 
   oneof payload {
     ResolveProgress progress = 1;
 
     // Arrow IPC stream: exactly one `sources` row, with the same columns the
-    // catalog flight serves (source_id, source_url, source_type,
-    // data_resident, tensors). A client rebuilds its own view from it -- the
-    // SDKs' `descriptor_from_row` / `descriptorsFromRows`.
+    // catalog flight serves (source_id, source_url, source_type, is_resolved,
+    // tensors). A client decodes it however it likes -- the row is the data
+    // structure, and the SDKs pick none (biopb/biopb#1032).
     bytes source_row = 3;
   }
 }

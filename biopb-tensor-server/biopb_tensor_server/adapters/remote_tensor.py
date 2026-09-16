@@ -236,7 +236,7 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
 
     Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
-    ``source_url``, ``source_type``, ``metadata_json``, ``data_resident``, the
+    ``source_url``, ``source_type``, ``metadata_json``, ``is_resolved``, the
     per-tensor ``tensors`` STRUCT[] (biopb/biopb#224), and ``indexed_at`` (the
     upstream's per-source register timestamp) -- everything needed to seed a
     mirrored source's catalog entry without a per-source upstream RPC
@@ -245,9 +245,9 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     ``indexed_at`` becomes the mirror's content_version (biopb/biopb#178): it
     changes when the upstream re-registers the source, so the proxy's chunk cache
     re-namespaces instead of serving stale chunks.
-    ``data_resident`` is carried so an unresolved upstream
-    source (``data_resident=false``, empty ``tensors``) mirrors as non-resident
-    rather than being advertised resident. ``complete`` is True because the
+    ``is_resolved`` is carried so an unresolved upstream source
+    (``is_resolved=false``, empty ``tensors``) mirrors as unresolved rather than
+    being advertised as a readable source. ``complete`` is True because the
     server-side DuckDB catalog is not truncated like ``list_sources()``.
 
     ``rows`` is ``None`` when the upstream has no SQL catalog (``query_sources``
@@ -260,7 +260,7 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     try:
         rows = client.query_sources(
             "SELECT source_id, source_url, source_type, metadata_json, "
-            "data_resident, tensors, indexed_at FROM sources",
+            "is_resolved, tensors, indexed_at FROM sources",
             format="records",
         )
         return rows, True
@@ -368,10 +368,11 @@ class RemoteTensorAdapter(TensorAdapter):
         # per-source fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
         self._metadata_cache: Optional[dict] = None
-        # Whether the upstream *source* is resident (carried from the bulk row).
-        # None until seeded; is_resident() = reachable AND this (when seeded), so
-        # an unresolved upstream source mirrors as non-resident (biopb/biopb#266).
-        self._upstream_resident: Optional[bool] = None
+        # Whether the upstream *source* has resolved (carried from the bulk
+        # row). None until seeded; both is_resolved() and is_resident() read it,
+        # so an unresolved upstream source mirrors as unresolved and
+        # non-resident rather than as an empty readable one (biopb/biopb#266).
+        self._upstream_resolved: Optional[bool] = None
 
     # ------------------------------------------------------------------ upstream
 
@@ -506,7 +507,7 @@ class RemoteTensorAdapter(TensorAdapter):
         self,
         upstream_tensors: List[dict],
         metadata: Optional[dict],
-        data_resident: bool = True,
+        is_resolved: bool = True,
         source_url: Optional[str] = None,
         indexed_at: object = None,
     ) -> bool:
@@ -521,9 +522,12 @@ class RemoteTensorAdapter(TensorAdapter):
         ``list_tensor_descriptors`` (default field only), this seeds **all** of the
         source's tensors, so a multi-field upstream mirrors completely.
 
-        ``data_resident`` is the upstream *source*'s residency (from its row): an
-        unresolved upstream source (``data_resident=false``, empty tensors) must
-        mirror as non-resident, not be advertised resident. Idempotent and
+        ``is_resolved`` is the upstream *source*'s own flag (from its row): an
+        unresolved upstream source (``is_resolved=false``, empty tensors) must
+        mirror as unresolved, not be advertised as readable. It used to be the
+        upstream's ``data_resident``, which conflated "not hydrated yet" with
+        "hydrated, bytes not local" and is no longer a column at all
+        (biopb/biopb#1035). Idempotent and
         re-appliable: the reconcile re-seeds every mirrored source each re-list,
         so an in-place upstream resolution (empty -> populated tensors,
         false -> true) refreshes here rather than going stale.
@@ -561,19 +565,19 @@ class RemoteTensorAdapter(TensorAdapter):
                 )
             )
         new_metadata = metadata or {}
-        new_resident = bool(data_resident)
+        new_resolved = bool(is_resolved)
         # Mirror the upstream's real path into the display url (biopb/biopb#297).
         new_url = self._display_source_url(source_url)
         changed = (
             descs != self._descriptors_cache
             or new_metadata != self._metadata_cache
-            or new_resident != self._upstream_resident
+            or new_resolved != self._upstream_resolved
             or new_url != self._source_url
         )
         self._descriptors_cache = descs
         self._metadata_cache = new_metadata
         self._reachable = True
-        self._upstream_resident = new_resident
+        self._upstream_resolved = new_resolved
         self._source_url = new_url
         if changed:
             # Say it at seed time, not only when someone opens the tensor: a
@@ -684,19 +688,27 @@ class RemoteTensorAdapter(TensorAdapter):
         """Best-effort residency of the mirrored source.
 
         The base implementation would call a ``grpc://`` source non-resident (a
-        remote scheme), wrongly tripping unresolved-source handling. Instead track
-        reachability from the catalog-surface upstream calls: an unreachable
-        upstream reports ``data_resident=False`` (paired with the empty
-        placeholder tensor list above) until it recovers.
+        remote scheme), wrongly tripping unresolved-source handling. Instead
+        track reachability from the catalog-surface upstream calls: an
+        unreachable upstream reports non-resident until it recovers.
 
-        When bulk-seeded (biopb/biopb#266), also require the upstream *source* to
-        be resident -- so a mirror of an unresolved upstream source
-        (``data_resident=false`` on the upstream) reports non-resident rather
-        than being advertised resident just because the endpoint is reachable.
+        When bulk-seeded (biopb/biopb#266), also require the upstream *source*
+        to have resolved -- a mirror of a source the upstream cannot read yet
+        has nothing local to offer either, however reachable the endpoint is.
         """
-        if self._upstream_resident is not None:
-            return self._reachable and self._upstream_resident
+        if self._upstream_resolved is not None:
+            return self._reachable and self._upstream_resolved
         return self._reachable
+
+    def is_resolved(self) -> bool:
+        """Whether the upstream has hydrated the source this mirrors.
+
+        The default (always True) would advertise a mirror of an unresolved
+        upstream source as readable-with-no-tensors, which is the conflation
+        biopb/biopb#1032 is about -- one layer further out. Unseeded (no bulk
+        catalog fetch, so nothing said otherwise) stays True.
+        """
+        return self._upstream_resolved is not False
 
     def get_tensor_adapter(self, tensor_id: Optional[str]):
         """Return a tensor-layer view bound to the requested within-source field."""

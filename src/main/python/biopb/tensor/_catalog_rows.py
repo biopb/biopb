@@ -38,9 +38,7 @@ from typing import Any, Iterable, List, Mapping
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
 #: The columns a ``sources`` row carries, as a SELECT list.
-SOURCE_ROW_COLUMNS = (
-    "source_id, source_url, source_type, data_resident, is_resolved, tensors"
-)
+SOURCE_ROW_COLUMNS = "source_id, source_url, source_type, is_resolved, tensors"
 
 _DEPRECATION = (
     "biopb.tensor.{name}() is deprecated. DataSourceDescriptor is a generated "
@@ -70,6 +68,11 @@ def _descriptor_from_row(row: Mapping[str, Any]) -> DataSourceDescriptor:
         tensors=tensors,
         metadata_json="",
     )
+    # `data_resident` was field 6 here and is gone from the catalog entirely --
+    # residency is answered live by `is_resident()`, because a stored copy of
+    # "right now" is only ever where it was last looked (biopb/biopb#1035).
+    # Still filled when a row from an older server carries it, so this decode
+    # keeps returning byte-for-byte what it used to against that server.
     resident = row.get("data_resident")
     if resident is not None:
         desc.data_resident = bool(resident)

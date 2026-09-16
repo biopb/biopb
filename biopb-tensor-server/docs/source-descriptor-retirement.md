@@ -45,10 +45,12 @@ with the same `descriptor_from_row` / `descriptorsFromRows` that backs
 `list_sources`, so the public return type is unchanged and the proto stops being
 a wire type.
 
-That also removes a divergence: the adapter answers live (`is_resident()` is
+That also removed a divergence: the adapter answered live (`is_resident()` is
 documented VOLATILE, "evaluate at the moment of use and never cache") while the
-row is a snapshot, so `resolve()` then a browse could report different
-`data_resident` for one source. Returning the row makes that impossible.
+row was a snapshot, so `resolve()` then a browse could report different
+`data_resident` for one source. Returning the row made the two agree — and
+§7 then removed the column, which is the same disagreement seen from further
+back: nothing that volatile belongs in a row for anyone to disagree with.
 
 Resolve's *reason* for returning anything stays valid: an unresolved source has
 an empty `tensors` list, and the post-resolution enumeration is not otherwise
@@ -76,10 +78,10 @@ It had three callers, none of which needed a descriptor: `resolve()`,
 straight back into columns; all four are on the adapter already. It built a
 proto because v1's listing path had one.
 
-So the adapter surface is the four reads: `catalog_url` (new, the display form
+So the adapter surface is three reads: `catalog_url` (new, the display form
 of `source_url` that `_catalog_url` used to override inside the descriptor),
-`source_type`, `is_resident()` and `list_tensor_descriptors()`. `resolve()`
-returns nothing.
+`source_type` and `list_tensor_descriptors()`. `is_resident()` was a fourth
+until §7 took residency out of the row entirely. `resolve()` returns nothing.
 
 **The invariant moved with it.** `get_source_descriptor` was the enforcement
 point for #812 (no `chunk_shape` on a catalog entry) via its `catalog_entry()`
@@ -237,3 +239,38 @@ leaves every stable signature alone; the single return-type change is
 `is_resolved` to `SOURCE_ROW_COLUMNS`, so an SDK from after #1032 against a
 server from before #1033 fails the SELECT rather than degrading; that is the
 same coupling `data_resident` already had.
+
+## 7. Residency left the row too (#1035)
+
+`SOURCE_ROW_COLUMNS` lost `data_resident`, and the `sources` table lost the
+column, right after §6 landed. The reasoning is §2's, pushed one step: a row is
+a snapshot, and residency has no state worth snapshotting. OneDrive
+re-dehydrates a source's files under storage pressure in the same running
+process, so there is no event to refresh from and no instant after which a
+stored value stays true — it can only ever say where the bytes were when
+someone last looked.
+
+The evidence that this was not theoretical: #1033 had already added a post-warm
+resync whose entire job was to move that instant from "when the source resolved"
+to "when the warm finished". It cost a `directory_is_resident()` stat walk over
+a directory that had just been recalled, and the one client that draws a
+residency badge — the napari browser — never re-listed after a warm, so nothing
+read what it wrote. That path is gone, with `refresh_residency()` and
+`_catalog_refresh_residency()`.
+
+What replaces it is `do_action("is_resident", [...])`, which calls
+`adapter.is_resident()` on every invocation and returns `{source_id: bool}` —
+batched, because its callers are lists drawing a glyph per row. Live like
+`chunk_locate`, which is likewise a lookup and not a column.
+
+The same asymmetry §4 draws between `warm` and `resolve` returns explains why
+`is_resolved` stayed and residency did not: monotonic facts can be stored,
+because a stale copy only ever lags harmlessly. Bidirectional ones cannot.
+
+It also fixed a gate that had been failing open. `Reconciler.should_warm()`
+asked the claim's `member_paths` whether any member *file* was a placeholder,
+and `member_paths` for every directory-claimed format (zarr, ome-zarr,
+ome-zarr-hcs, ndtiff, tiff-sequence, micromanager-legacy) is just the directory
+— so a wholly dehydrated store answered "resident" and precache recalled it,
+which is precisely the background recall #174's `cloud = true` policy exists to
+prevent. It asks the adapter now.

@@ -539,8 +539,9 @@ class SourceAdapter(ABC):
         materialized into a local copy (a later phase); a local source is
         resident unless it is an offline cloud placeholder. This is the
         authoritative, point-in-time residency gate -- VOLATILE, so evaluate it
-        at the moment of use and never cache the result. ``data_resident`` on the
-        descriptor is only an advisory snapshot of this.
+        at the moment of use and never cache the result. Nothing stores the
+        answer: the catalog has no residency column and the ``is_resident``
+        action re-asks this on every call (biopb/biopb#1035).
         """
         # Lazy import: base <-> discovery only cross-import under TYPE_CHECKING,
         # so importing these at module scope would be circular.

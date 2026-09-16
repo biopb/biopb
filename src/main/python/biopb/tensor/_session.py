@@ -17,7 +17,17 @@ from ``biopb.tensor.client``.
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import dask.array as da
 import numpy as np
@@ -895,6 +905,18 @@ class CatalogClient:
                 "(server closed the stream without a 'done')"
             )
         return done
+
+    def is_resident(
+        self, source_ids: Optional[Iterable[str]] = None
+    ) -> Dict[str, bool]:
+        """Backs TensorFlightClient.is_resident; see that method for the full
+        documentation."""
+        body = b"" if source_ids is None else json.dumps(list(source_ids)).encode()
+        result_bytes = self._do_action_one_result(
+            flight.Action("is_resident", body),
+            unavailable_hint="Live residency is unavailable",
+        )
+        return {k: bool(v) for k, v in json.loads(result_bytes.decode("utf-8")).items()}
 
     def add_source(
         self,
