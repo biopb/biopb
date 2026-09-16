@@ -558,9 +558,11 @@ class _SourceJobs:
         either, so there is nothing to reap, and this avoids a timer.
         """
         cutoff = time.time() - _JOB_RETENTION_SECONDS
-        for key, job in list(self._jobs.items()):
-            if job.finished_before(cutoff):
-                del self._jobs[key]
+        self._jobs = {
+            key: job
+            for key, job in self._jobs.items()
+            if not job.finished_before(cutoff)
+        }
 
 
 def _sidecar(request: Request) -> _SidecarContext:
@@ -2050,11 +2052,35 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
 # swallowed as part of the id.
 
 
+def _run_recall(
+    ctx: _SidecarContext,
+    job: _SourceJob,
+    call: Callable[[], Any],
+    on_success: Callable[[Any], None] = lambda _result: None,
+) -> None:
+    """Shared try/except/finish skeleton for a resolve or warm job.
+
+    ``call`` does the blocking Flight-client recall; ``on_success`` gets its
+    return value to record any final progress before the job finishes done.
+    """
+    try:
+        result = call()
+    except ResolveCancelled:
+        job.finish(_JOB_CANCELLED)
+    except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
+        logger.warning(f"{job.kind} failed for {job.source_id}: {exc}")
+        ctx.diag.mark_error(f"{job.kind.upper()}_FAILED", str(exc))
+        job.finish(_JOB_ERROR, f"{type(exc).__name__}: {exc}")
+    else:
+        on_success(result)
+        job.finish(_JOB_DONE)
+
+
 def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
     """Body of a resolve job. Runs on the registry's daemon thread."""
-    try:
-        client = ctx.get_client()
-        client.resolve(
+
+    def _call() -> None:
+        ctx.get_client().resolve(
             job.source_id,
             on_progress=lambda p: job.set_progress(
                 {
@@ -2065,14 +2091,8 @@ def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
             ),
             should_cancel=job.cancel_requested,
         )
-    except ResolveCancelled:
-        job.finish(_JOB_CANCELLED)
-    except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
-        logger.warning(f"resolve failed for {job.source_id}: {exc}")
-        ctx.diag.mark_error("RESOLVE_FAILED", str(exc))
-        job.finish(_JOB_ERROR, f"{type(exc).__name__}: {exc}")
-    else:
-        job.finish(_JOB_DONE)
+
+    _run_recall(ctx, job, _call)
 
 
 def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
@@ -2091,27 +2111,21 @@ def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
             "elapsed_seconds": float(p.elapsed_seconds),
         }
 
-    try:
-        client = ctx.get_client()
-        final = client.warm(
+    def _call() -> Any:
+        return ctx.get_client().warm(
             job.source_id,
             on_progress=lambda p: job.set_progress(_snapshot(p)),
             should_cancel=job.cancel_requested,
         )
-    except ResolveCancelled:
-        job.finish(_JOB_CANCELLED)
-    except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
-        logger.warning(f"warm failed for {job.source_id}: {exc}")
-        ctx.diag.mark_error("WARM_FAILED", str(exc))
-        job.finish(_JOB_ERROR, f"{type(exc).__name__}: {exc}")
-    else:
-        # The terminal counts, not the last heartbeat: a fast warm can finish
-        # without ever emitting one, and `files_total == 0` is how a client
-        # learns the source had nothing to warm (single-file -- resolve already
-        # recalled it). That is the server's own structural answer, so no client
-        # has to keep its own list of which source types are multi-file.
-        job.set_progress(_snapshot(final))
-        job.finish(_JOB_DONE)
+
+    # The terminal counts, not the last heartbeat: a fast warm can finish
+    # without ever emitting one, and `files_total == 0` is how a client learns
+    # the source had nothing to warm (single-file -- resolve already recalled
+    # it). That is the server's own structural answer, so no client has to
+    # keep its own list of which source types are multi-file.
+    _run_recall(
+        ctx, job, _call, on_success=lambda final: job.set_progress(_snapshot(final))
+    )
 
 
 def _start_job(
