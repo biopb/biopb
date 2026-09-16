@@ -1005,7 +1005,6 @@ def _upstream_with_metadata(zarr_path):
     upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db)
     up_adapter = _meta_zarr_cls()(arr, "img", ["y", "x"])
     register_and_catalog(upstream, "img", up_adapter)
-    db.sync_source_added("img", up_adapter)  # populate the DuckDB sources row
     _serve(upstream)
     return upstream
 
@@ -1058,7 +1057,6 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
             upstream_source_id="img",
         )
         register_and_catalog(proxy, "lab__img", proxy_adapter)
-        proxy_db.sync_source_added("lab__img", proxy_adapter)  # mirror -> catalog
         _serve(proxy)
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
@@ -1501,7 +1499,6 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
         up = catalog_server(url, metadata_db=db)
         adapter = ZarrAdapter(arr, "img", ["y", "x"])
         register_and_catalog(up, "img", adapter)
-        db.sync_source_added("img", adapter)
         _serve(up)
         try:
             # this rescan is NOT a force-full pass, yet the failed upstream is

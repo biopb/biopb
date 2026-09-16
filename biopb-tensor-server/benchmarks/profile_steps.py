@@ -27,6 +27,7 @@ def _setup():
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     tmp = tempfile.mkdtemp()
     shape = (CHUNK_Z * 4, 1024, 1344)
@@ -46,7 +47,7 @@ def _setup():
     z[:] = arr
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=str(Path(tmp) / "cache")))
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("grpc://localhost:0", metadata_db=MetadataDatabase())
     registered = server.register_source(
         "d", ZarrAdapter(zarr.open_array(zpath, mode="r"), "d", ["z", "y", "x"])
     )

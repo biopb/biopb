@@ -271,6 +271,7 @@ def _start_server(cache_dir: Path, max_segment_bytes: int | None):
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     config_kwargs = {
         "file_cache_dir": cache_dir / "server-cache",
@@ -281,7 +282,7 @@ def _start_server(cache_dir: Path, max_segment_bytes: int | None):
 
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(**config_kwargs))
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("grpc://localhost:0", metadata_db=MetadataDatabase())
     threading.Thread(target=server.serve, daemon=True).start()
     time.sleep(0.5)
     return server

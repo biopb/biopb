@@ -162,7 +162,7 @@ class TestTensorFlightClientRoundTrip:
         assert server_client.cache_info()["size_bytes"] == initial_bytes
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_wait_for_upload_ready_rejects_a_register_and_catalog(self, server_client):
+    def test_wait_for_upload_ready_rejects_a_catalog_source(self, server_client):
         """Waiting on a source nobody uploaded fails fast (biopb/biopb#109).
 
         "test-tensor" is a registered on-disk source, so the server has no

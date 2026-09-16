@@ -886,6 +886,7 @@ class TensorFlightServer(flight.FlightServerBase):
             with self._scan_status_lock:
                 full_scan_in_progress = self._full_scan_in_progress
                 last_full_scan_at = self._last_full_scan_at
+            db = self._metadata_db
             health_status = {
                 "status": "SERVING" if self._ready.is_set() else "STARTING",
                 # The Flight protocol shape this server speaks; the SDK checks
@@ -909,19 +910,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 # False only for a deliberately session-only server -- which a
                 # client may still want to say out loud before someone spends a
                 # morning tracing.
-                "annotations_persisted": (
-                    self._metadata_db is not None
-                    and self._metadata_db.annotations_persisted
-                ),
+                "annotations_persisted": db is not None and db.annotations_persisted,
                 # The same question one level down, and not the same answer: the
                 # catalog also holds `decode_rates`, and a server with the
                 # annotation actions off keeps a file for those alone. A sibling
                 # key rather than a redefinition -- `annotations_persisted` is
                 # already on the wire and means what it says.
-                "catalog_persisted": (
-                    self._metadata_db is not None
-                    and self._metadata_db.store_path is not None
-                ),
+                "catalog_persisted": db is not None and db.store_path is not None,
             }
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "create_source":
