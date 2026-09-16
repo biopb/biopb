@@ -319,19 +319,20 @@ export function TreeRow({
           </span>
         ) : null}
         <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
-        {unresolved ? null : hasMultipleTensors ? (
-          <span className="tensor-pill" style={{ marginLeft: 8 }}>
-            {src.tensors.length}
-          </span>
-        ) : firstTensor ? (
-          <span
-            className="dim-badge"
-            style={{ marginLeft: 8 }}
-            title={formatShape(firstTensor.shape)}
-          >
-            {formatShape(firstTensor.shape)}
-          </span>
-        ) : null}
+        {!unresolved &&
+          (hasMultipleTensors ? (
+            <span className="tensor-pill" style={{ marginLeft: 8 }}>
+              {src.tensors.length}
+            </span>
+          ) : firstTensor ? (
+            <span
+              className="dim-badge"
+              style={{ marginLeft: 8 }}
+              title={formatShape(firstTensor.shape)}
+            >
+              {formatShape(firstTensor.shape)}
+            </span>
+          ) : null)}
       </button>
 
       {/* Nested tensors when source is active and has multiple tensors */}
