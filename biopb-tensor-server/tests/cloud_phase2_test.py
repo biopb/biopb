@@ -1093,6 +1093,68 @@ class TestResolveAction:
         assert elapsed == sorted(elapsed)
         assert elapsed[-1] >= 0.0
 
+    @pytest.mark.parametrize(
+        "exc_type, flight_error",
+        [
+            ("retriable", "FlightUnavailableError"),
+            ("permanent", "FlightInternalError"),
+        ],
+    )
+    def test_a_resolve_that_does_not_hydrate_raises_and_syncs_nothing(
+        self, exc_type, flight_error
+    ):
+        """The failure branch is what makes the backfill below it safe: a
+        resolve that did not hydrate never reaches the catalog sync or the row
+        read, so the placeholder row stays as registration wrote it."""
+        import pyarrow.flight as flight
+        from biopb_tensor_server.core.errors import (
+            SourceResolveRetriableError,
+            SourceUnresolvedError,
+        )
+
+        err = (
+            SourceResolveRetriableError("recall failed")
+            if exc_type == "retriable"
+            else SourceUnresolvedError("unsupported type")
+        )
+
+        class _WontHydrate:
+            capability_token = None
+            source_url = None
+            catalog_url = "file:///cloud1"
+            source_type = "ome-zarr"
+            synced = 0
+
+            def is_resident(self):
+                return False
+
+            def list_tensor_descriptors(self):
+                # Empty before AND after: the source never hydrates.
+                return []
+
+            def get_metadata(self):
+                type(self).synced += 1
+                return {}
+
+            def resolve(self):
+                raise err
+
+        adapter = _WontHydrate()
+        server = self._server("cloud1", adapter)
+        synced_at_registration = _WontHydrate.synced
+
+        action = flight.Action("resolve", b"cloud1")
+        with pytest.raises(getattr(flight, flight_error)):
+            list(server.do_action(None, action))
+
+        # No second sync: the backfill is downstream of the raise.
+        assert _WontHydrate.synced == synced_at_registration
+        # ... and the placeholder row is untouched.
+        (row,) = server._metadata_db.query(
+            "SELECT tensors FROM sources WHERE source_id = 'cloud1'"
+        ).to_pylist()
+        assert row["tensors"] == []
+
     def test_resolve_action_unknown_source_errors(self):
         import pyarrow.flight as flight
 

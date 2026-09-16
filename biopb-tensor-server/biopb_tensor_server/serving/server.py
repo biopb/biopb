@@ -976,10 +976,11 @@ class TensorFlightServer(flight.FlightServerBase):
             ).SerializeToString()
 
         # A server-owned catalog has no on_resolved backfill wired -- that is the
-        # SourceManager's (_on_source_resolved). Note whether this source was
-        # unresolved so the row can be brought up to date below, and only then:
-        # for an already-resolved source the row already describes it, and
-        # re-syncing would re-parse metadata the registration cache has dropped.
+        # SourceManager's (_on_source_resolved) -- so its placeholder row is
+        # still what registration wrote. Note that here, and re-sync below once
+        # the resolve has succeeded. Scoped to this case: for a source that was
+        # already resolved the row describes it, and re-syncing would re-parse
+        # metadata release_registration_cache has dropped.
         was_unresolved = self._owns_catalog and not adapter.list_tensor_descriptors()
 
         result: dict = {}
@@ -1017,7 +1018,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
 
-        if was_unresolved and adapter.list_tensor_descriptors():
+        # Unconditional on the flag above: a resolve that did not hydrate raised
+        # (the branch above), so reaching here means the adapter is resolved --
+        # including to zero tensors, whose row needs the same correction.
+        if was_unresolved:
             self._catalog_sync_added(source_id, adapter)
         row = self._metadata_db.source_row_ipc(source_id)
         if row is None:
