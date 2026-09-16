@@ -36,6 +36,7 @@ from biopb.image.annotation_pb2 import (
     RoiPruneResult,
     RoiPutResult,
 )
+from biopb.tensor._catalog_rows import CatalogSource
 from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
@@ -65,7 +66,6 @@ from biopb.tensor._upload import UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
-    DataSourceDescriptor,
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
@@ -235,42 +235,42 @@ class TensorFlightClient:
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
-    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
+    def list_sources(self) -> Dict[str, CatalogSource]:
         """List available data sources.
 
         Deprecated:
-            Use :meth:`query_sources`, and `biopb.tensor.descriptors_from_rows`
-            if you want descriptors. This is a thin wrapper around
+            Use :meth:`query_sources`, and `biopb.tensor.sources_from_rows`
+            if you want structs. This is a thin wrapper around
             ``SELECT ... FROM sources`` that inherits the server's query row
             cap, so a large catalog comes back silently truncated -- and a
             browse is exactly where that matters.
 
         Returns:
-            Dictionary mapping source_id to DataSourceDescriptor.
-            Each DataSourceDescriptor.tensors carries the *structural* entry for
+            Dictionary mapping source_id to `CatalogSource`.
+            Each ``CatalogSource.tensors`` carries the *structural* entry for
             every tensor in that source -- array_id, dim_labels, shape, dtype.
-            The transfer ``chunk_shape`` is empty here by contract; ask
+            The transfer ``chunk_shape`` is not on it at all; ask
             :meth:`get_descriptor` for the grid of a specific tensor
             (biopb/biopb#812).
         """
         warnings.warn(
             "TensorFlightClient.list_sources() is deprecated and is capped by "
             "the server's query row limit; use query_sources() (with "
-            "biopb.tensor.descriptors_from_rows if you want descriptors).",
+            "biopb.tensor.sources_from_rows if you want structs).",
             DeprecationWarning,
             stacklevel=2,
         )
         return self._catalog.list_sources()
 
-    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
-        """One source's ``DataSourceDescriptor`` by id, or ``None``.
+    def get_source(self, source_id: str) -> Optional[CatalogSource]:
+        """One source's `CatalogSource` by id, or ``None``.
 
         Deprecated:
             Use :meth:`query_sources` with a ``WHERE source_id = ...``, and
-            `biopb.tensor.descriptor_from_row` if you want a descriptor.
+            `biopb.tensor.source_from_row` if you want a struct.
 
         The catalog is public: a source whose pixels need a capability token
-        still has its descriptor here. Knowing its id is not authority to read
+        still has its row here. Knowing its id is not authority to read
         it -- that is what the token gates, on :meth:`get_tensor` and
         :meth:`list_rois`.
 
@@ -280,12 +280,11 @@ class TensorFlightClient:
                 ``"aics_7f3/Image:0"``.
 
         Returns:
-            The ``DataSourceDescriptor``, or ``None`` when nothing answers to
-            that id.
+            The `CatalogSource`, or ``None`` when nothing answers to that id.
         """
         warnings.warn(
             "TensorFlightClient.get_source() is deprecated; use query_sources() "
-            "(with biopb.tensor.descriptor_from_row if you want a descriptor).",
+            "(with biopb.tensor.source_from_row if you want a struct).",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -468,8 +467,8 @@ class TensorFlightClient:
         *,
         on_progress: Optional[Callable[[ResolveProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> DataSourceDescriptor:
-        """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
+    ) -> CatalogSource:
+        """Resolve an unresolved source and return its full `CatalogSource`.
 
         Note:
             Experimental. Cloud / remote source support (unresolved sources,
@@ -477,7 +476,7 @@ class TensorFlightClient:
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
         list are unknown until first access (its catalog row has
-        ``data_resident`` false and an empty ``tensors``). The canonical case is
+        ``is_resolved`` false and an empty ``tensors``). The canonical case is
         a cloud / synced-folder ("Files-On-Demand") source.
 
         Resolving asks the server to hydrate it. For a dehydrated placeholder this
@@ -502,7 +501,7 @@ class TensorFlightClient:
                 completion and is cached, so a later ``resolve`` reuses it.
 
         Returns:
-            The full ``DataSourceDescriptor`` with every tensor/field enumerated
+            The full `CatalogSource` with every tensor/field enumerated
             -- the complete field set in one call, regardless of catalog size.
             Built from the source's catalog row as the server now holds it, so
             it agrees with a following `query_sources` exactly.

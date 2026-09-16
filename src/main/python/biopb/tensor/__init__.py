@@ -6,7 +6,7 @@ for efficient multi-dimensional array storage and retrieval.
 Key components:
 - TensorFlightClient: Client for accessing tensors from a TensorFlightServer
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
-- descriptors_from_rows: `sources` catalog rows -> DataSourceDescriptors
+- sources_from_rows: `sources` catalog rows -> CatalogSource structs
 - CLI diagnostics: `biopb tensor` command for inspecting sources and tensors
 
 The CLI module provides the `biopb tensor` command with four subcommands:
@@ -18,7 +18,12 @@ The CLI module provides the `biopb tensor` command with four subcommands:
 Note: Server components have been moved to the biopb-tensor-server package.
 """
 
-from biopb.tensor._catalog_rows import descriptor_from_row, descriptors_from_rows
+from biopb.tensor._catalog_rows import (
+    CatalogSource,
+    CatalogTensor,
+    source_from_row,
+    sources_from_rows,
+)
 
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
@@ -67,9 +72,11 @@ __all__ = [
     "WarmProgress",
     "SerializedTensor",
     "SerializedEndpoint",
-    # Catalog rows -> descriptors (what `query_sources` results decode with)
-    "descriptor_from_row",
-    "descriptors_from_rows",
+    # Catalog rows -> structs (what `query_sources` results decode with)
+    "CatalogSource",
+    "CatalogTensor",
+    "source_from_row",
+    "sources_from_rows",
     # Client
     "TensorFlightClient",
     "ResolveCancelled",

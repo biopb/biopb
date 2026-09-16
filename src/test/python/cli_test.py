@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from biopb.tensor import CatalogSource, CatalogTensor
 from biopb.tensor.cli import _parse_slice_hint, app
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from typer.testing import CliRunner
 
 runner = CliRunner()
@@ -45,21 +45,12 @@ def _build_mock_client() -> MagicMock:
     """Build a mock TensorFlightClient for testing."""
     mock_client = MagicMock()
 
-    # Create mock source and tensor descriptors
-    tensor_desc_1 = TensorDescriptor(
-        array_id="pos_0",
-        shape=[512, 512],
-        dtype="uint8",
-    )
-    tensor_desc_2 = TensorDescriptor(
-        array_id="pos_1",
-        shape=[512, 512],
-        dtype="uint16",
-    )
-
-    source_desc = DataSourceDescriptor(
+    source_desc = CatalogSource(
         source_id="my-source",
-        tensors=[tensor_desc_1, tensor_desc_2],
+        tensors=(
+            CatalogTensor(array_id="pos_0", shape=(512, 512), dtype="uint8"),
+            CatalogTensor(array_id="pos_1", shape=(512, 512), dtype="uint16"),
+        ),
     )
 
     # Mock list_sources

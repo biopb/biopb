@@ -42,7 +42,8 @@ from biopb.image.annotation_pb2 import (
 )
 from biopb.tensor._catalog_rows import (
     SOURCE_ROW_COLUMNS,
-    descriptor_from_row,
+    CatalogSource,
+    source_from_row,
     sql_literal,
 )
 from biopb.tensor._pool import (
@@ -58,7 +59,6 @@ from biopb.tensor.descriptor_pb2 import (
     AddSourceResult,
     AddSourceStreamMessage,
     CatalogQuery,
-    DataSourceDescriptor,
     FlightRequest,
     RemoveSourceRequest,
     RemoveSourceResult,
@@ -463,33 +463,46 @@ class CatalogClient:
 
     _SOURCES_SQL = f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
 
-    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
+    def list_sources(self) -> Dict[str, CatalogSource]:
         """Backs TensorFlightClient.list_sources; see that method for the full
         documentation."""
         table = self._query_table(self._SOURCES_SQL + " ORDER BY source_id")
         source_descriptors = {}
         for row in table.to_pylist():
-            source_desc = descriptor_from_row(row)
+            source_desc = source_from_row(row)
             source_descriptors[source_desc.source_id] = source_desc
             self._cache_tensors(source_desc)
         logger.info(f"list_sources: returned {len(source_descriptors)} sources")
         return source_descriptors
 
-    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
+    def get_source(self, source_id: str) -> Optional[CatalogSource]:
         """Backs TensorFlightClient.get_source; see that method for the full
         documentation."""
         table = self._query_table(
             f"{self._SOURCES_SQL} WHERE source_id = {sql_literal(source_id)}"
         )
         for row in table.to_pylist():
-            source_desc = descriptor_from_row(row)
+            source_desc = source_from_row(row)
             self._cache_tensors(source_desc)
             return source_desc
         return None
 
-    def _cache_tensors(self, source_desc: DataSourceDescriptor) -> None:
-        for tensor_desc in source_desc.tensors:
-            self._state.cache_descriptor(tensor_desc)
+    def _cache_tensors(self, source: CatalogSource) -> None:
+        """Seed the array_id -> descriptor cache from a row's tensors.
+
+        The cache holds ``TensorDescriptor``, the type GetFlightInfo answers
+        with and the read path reads; a catalog entry fills only its
+        structural part, exactly as before this decoded to protos directly.
+        """
+        for tensor in source.tensors:
+            self._state.cache_descriptor(
+                TensorDescriptor(
+                    array_id=tensor.array_id,
+                    dim_labels=tensor.dim_labels,
+                    shape=tensor.shape,
+                    dtype=tensor.dtype,
+                )
+            )
 
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Backs TensorFlightClient.query_sources; see that method for the full
@@ -806,7 +819,7 @@ class CatalogClient:
         *,
         on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> "DataSourceDescriptor":
+    ) -> CatalogSource:
         """Backs TensorFlightClient.resolve; see that method for the full
         documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
@@ -838,9 +851,9 @@ class CatalogClient:
                 f"resolve('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
-        desc = descriptor_from_row(row)
-        self._cache_tensors(desc)
-        return desc
+        source = source_from_row(row)
+        self._cache_tensors(source)
+        return source
 
     def warm(
         self,

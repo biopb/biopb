@@ -1,8 +1,9 @@
-# Retiring DataSourceDescriptor from the wire
+# Retiring DataSourceDescriptor
 
-Status: **implemented**. Five coupled changes that finish what Flight protocol
-v2 (#1018) started: the catalog row is now the only representation of a source
-on the wire, and `DataSourceDescriptor` is an SDK-side view built from rows.
+Status: **implemented**, in two passes. Five coupled changes (#1025) finished
+what Flight protocol v2 (#1018) started: the catalog row became the only
+representation of a source on the wire, and `DataSourceDescriptor` an SDK-side
+view built from rows. Then #1032 retired the message from that view too — §6.
 
 ## What v2 already changed
 
@@ -40,9 +41,8 @@ one it had just written.
 
 **`resolve` returns the row**, as an Arrow IPC stream of one `sources` row with
 `SOURCE_ROW_COLUMNS` (`ResolveStreamMessage.source_row`). Each SDK decodes it
-with the same `descriptor_from_row` / `descriptorsFromRows` that backs
-`list_sources`, so the public return type is unchanged and the proto stops being
-a wire type.
+with the same `source_from_row` / `sourcesFromRows` that backs `list_sources`,
+so the public return type is unchanged and the proto stops being a wire type.
 
 That also removes a divergence: the adapter answers live (`is_resident()` is
 documented VOLATILE, "evaluate at the moment of use and never cache") while the
@@ -91,7 +91,7 @@ Both are wrappers around `query_sources` that inherit the server's query row cap
 — so a browse, which is exactly where the cap matters, came back silently
 truncated. The repo's own guidance already steered away from them. They still
 work; they warn, and point at `query_sources` plus
-`biopb.tensor.descriptors_from_rows` (now exported, in both SDKs, as the
+`biopb.tensor.sources_from_rows` (now exported, in both SDKs, as the
 migration path).
 
 `_state.sources` is gone. It was a cache, not state — every read fell back — and
@@ -133,9 +133,52 @@ It now reads `sources.metadata_json` via a one-row `query_sources`. The
 per-tensor overlay stays where it belongs, on a tensor-bound read's
 `with_metadata`.
 
+## 6. The SDK-side view is no longer a proto either (#1032)
+
+§1–5 left the message off the wire but kept it as what each SDK decoded a row
+*into*. That was the expensive half. The message is generated code, so every
+catalog column a client wanted cost a `.proto` edit and a `buf generate` across
+every binding — for a struct no message carries. `is_resolved` (#1030) made the
+price concrete: one boolean, a full codegen cycle.
+
+The "one schema, every language" argument for paying it was already void.
+TypeScript never shared the type — `web/packages/tensor-flight-client/src/types.ts`
+hand-rolls the same shape — and `http_server.py`'s `/api/sources` decodes rows to
+plain dicts. Two of three consumers had already converged on a hand-written
+struct.
+
+So each SDK decodes into its own: `CatalogSource` / `CatalogTensor`, a frozen
+dataclass in Python and a plain immutable class in Java (the published artifact
+targets Java 11, so not a record). `descriptor_from_row` / `descriptors_from_rows`
+/ `descriptorsFromRows` are now `source_from_row` / `sources_from_rows` /
+`sourcesFromRows` — renamed rather than silently re-typed, so a caller gets an
+error and not a different object.
+
+**Absent beats empty.** §1 noted `descriptor_from_row` hardcoded
+`metadata_json=""`, and §3's invariant is that a catalog entry carries no
+`chunk_shape`. A proto could only express those as *empty*: present, testable,
+and permanently meaningless. The struct simply has no such field, which deleted
+an unreachable `if tensor_desc.chunk_shape:` branch in the napari widget and
+turned three tests from "asserts empty" into "asserts no such attribute".
+
+**And it fixed a bug.** With no `is_resolved` to read, both the napari
+`tensor_browser` (`_is_unresolved`) and the Java `getTensor` path inferred
+"unresolved" from `len(tensors) == 0` — which also describes a source that
+resolved cleanly and held nothing readable. Both now read the flag, and both say
+something different for the two cases. The `biopb tensor query` CLI prints
+`<unresolved>` rather than `<no tensors>` for the first.
+
+The proto message stays in `descriptor.proto`, unused: removing it would break
+codegen for consumers outside this repo, and it costs nothing to leave.
+
 ## Wire compatibility
 
 Deliberately breaking. The SDK refuses a pre-v2 server at connect, so the v1
 fallbacks in both clients (a bare serialized descriptor as the resolve terminal;
 the empty-body heartbeat convention) went with it. Field numbers 2
 (`ResolveStreamMessage.result`) and 1 (`AddSourceResult.added`) are reserved.
+
+§6 changes no wire bytes at all — only what each SDK builds from them. It does
+add `is_resolved` to `SOURCE_ROW_COLUMNS`, so an SDK from after #1032 against a
+server from before #1033 fails the SELECT rather than degrading; that is the
+same coupling `data_resident` already had.

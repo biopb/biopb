@@ -266,7 +266,11 @@ def query(
 
         for source_id, source_desc in sources.items():
             if not source_desc.tensors:
-                table.add_row(source_id, "<no tensors>", "-", "-")
+                # Two different states, and only one of them is actionable:
+                # an unresolved source has tensors the server has not looked
+                # for yet (biopb/biopb#1032).
+                why = "<no tensors>" if source_desc.is_resolved else "<unresolved>"
+                table.add_row(source_id, why, "-", "-")
                 continue
             for tensor_desc in source_desc.tensors:
                 table.add_row(

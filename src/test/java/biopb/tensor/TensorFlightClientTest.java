@@ -47,13 +47,14 @@ public class TensorFlightClientTest {
     public void testListSourcesAndTensorLookup() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, DataSourceDescriptor> sources = client.listSources();
+                Map<String, CatalogSource> sources = client.listSources();
                 Assert.assertTrue(sources.containsKey("test-source"));
 
-                DataSourceDescriptor sourceDesc = sources.get("test-source");
-                Assert.assertEquals(1, sourceDesc.getTensorsCount());
-                Assert.assertEquals("test-tensor", sourceDesc.getTensors(0).getArrayId());
-                Assert.assertEquals(Arrays.asList(4L, 4L), sourceDesc.getTensors(0).getShapeList());
+                CatalogSource source = sources.get("test-source");
+                Assert.assertEquals(1, source.getTensors().size());
+                Assert.assertTrue(source.isResolved());
+                Assert.assertEquals("test-tensor", source.getTensors().get(0).getArrayId());
+                Assert.assertEquals(Arrays.asList(4L, 4L), source.getTensors().get(0).getShape());
             }
         }
     }
@@ -540,7 +541,6 @@ public class TensorFlightClientTest {
 
     private static class TensorTestProducer extends NoOpFlightProducer {
         private final BufferAllocator allocator;
-        private final DataSourceDescriptor sourceDescriptor;
         private final TensorDescriptor baseDescriptor;
         private final org.apache.arrow.vector.types.pojo.Schema schema;
         private final Map<String, float[]> chunkData;
@@ -562,15 +562,6 @@ public class TensorFlightClientTest {
                     .addChunkShape(2)
                     .addChunkShape(2)
                     .setDtype("float32")
-                    .build();
-
-            // Source descriptor containing the tensor
-            this.sourceDescriptor = DataSourceDescriptor.newBuilder()
-                    .setSourceId("test-source")
-                    .setSourceUrl("mock://test")
-                    .setSourceType("mock")
-                    .addTensors(baseDescriptor)
-                    .setMetadataJson("")
                     .build();
 
             this.schema = createSchema(allocator);
@@ -786,6 +777,7 @@ public class TensorFlightClientTest {
                     new Field("source_url", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
                     new Field("source_type", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
                     new Field("data_resident", FieldType.nullable(ArrowType.Bool.INSTANCE), null),
+                    new Field("is_resolved", FieldType.nullable(ArrowType.Bool.INSTANCE), null),
                     new Field("tensors", FieldType.nullable(ArrowType.List.INSTANCE),
                             Collections.singletonList(tensorStruct))));
             VectorSchemaRoot root = VectorSchemaRoot.create(catalogSchema, allocator);
@@ -801,6 +793,7 @@ public class TensorFlightClientTest {
             ((org.apache.arrow.vector.VarCharVector) root.getVector("source_type"))
                     .setSafe(0, "mock".getBytes(StandardCharsets.UTF_8));
             ((org.apache.arrow.vector.BitVector) root.getVector("data_resident")).setSafe(0, 1);
+            ((org.apache.arrow.vector.BitVector) root.getVector("is_resolved")).setSafe(0, 1);
             ListVector tensors = (ListVector) root.getVector("tensors");
             UnionListWriter writer = tensors.getWriter();
             writer.setPosition(0);

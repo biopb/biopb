@@ -536,7 +536,7 @@ else:
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table columns: source_id, source_url, source_type, dtype,
-# indexed_at, metadata_json, shape_summary, data_resident, and `tensors`
+# indexed_at, metadata_json, shape_summary, data_resident, is_resolved, and `tensors`
 # (a LIST of STRUCT(array_id, dim_labels, shape, dtype) -- one per tensor;
 # `dtype`/`shape_summary` are just the first-tensor projection).
 # The catalog is structural: the transfer grid a tensor is delivered on is not
@@ -570,18 +570,24 @@ print(meta)
 Cloud / remote source support is **experimental** and may change.
 Some sources (cloud / synced-folder, e.g. OneDrive "Files-On-Demand") are
 catalogued by URL only: their shape/dtype/fields are *unknown* until first read.
-They list with `data_resident == False` and an empty `tensors`, and reading one
+They list with `is_resolved == False` and an empty `tensors`, and reading one
 (`get_tensor`/`add_tensor`) raises until you resolve it. Resolving asks the
 server to **download the whole file** (slow, uses disk, fails offline), so it is
 explicit -- never triggered by browsing.
 ```python
 row, = client.query_sources(
-    "SELECT data_resident FROM sources WHERE source_id = 'source_id'",
+    "SELECT is_resolved FROM sources WHERE source_id = 'source_id'",
     format="records")
-if not row["data_resident"]:                 # unresolved / not local
+if not row["is_resolved"]:                   # never resolved
     src = client.resolve("source_id")        # downloads + resolves (may take minutes)
     tensors = [(t.array_id, list(t.shape)) for t in src.tensors]  # now populated
 ```
+`is_resolved`, not `data_resident`: the first says the server has read this
+source's structure and is monotonic (false to true once, never back); the
+second says its bytes are local *right now*, and a synced folder re-dehydrates
+under storage pressure. An empty `tensors` answers neither -- a source can
+resolve cleanly and hold nothing readable.
+
 Hydrate-ahead (optional): `resolve()` fetches a multi-file source's *metadata*
 only -- the bulk data files (e.g. zarr/ome-zarr chunks) still recall one-by-one,
 slowly, the first time a read touches them, which makes the first pass over a big
@@ -596,11 +602,11 @@ done = client.warm("source_id",
 ```
 Filter footgun: an unresolved source has NULL `dtype`/`shape_summary` in the
 `sources` table, so `query_sources("... WHERE dtype='uint8'")` silently *drops*
-it -- it's hidden for being unresolved, not for not matching. The table carries
-a `data_resident` column so you can filter on residency on purpose:
+it -- it's hidden for being unresolved, not for not matching. Filter on it on
+purpose instead:
 ```python
 # what hasn't been resolved (downloaded) yet?
-client.query_sources("SELECT source_id, source_url FROM sources WHERE NOT data_resident",
+client.query_sources("SELECT source_id, source_url FROM sources WHERE NOT is_resolved",
                      format="pandas")
 ```
 

@@ -8,7 +8,7 @@ unlike the viewer-dependent ``test_tensor_browser_widget.py``.
 
 from types import SimpleNamespace
 
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+from biopb.tensor import CatalogSource
 
 from biopb_mcp.tensor_browser._widget import (
     _build_tree,
@@ -132,7 +132,7 @@ class TestGetPathParts:
 
 
 def _src(source_id, source_url):
-    """Minimal stand-in for DataSourceDescriptor (``_build_tree`` reads only
+    """Minimal stand-in for a catalog row (``_build_tree`` reads only
     ``source_id`` and ``source_url``)."""
     return SimpleNamespace(source_id=source_id, source_url=source_url)
 
@@ -162,17 +162,16 @@ class TestResidencyState:
     """Tri-state residency indicator: resident / remote / unknown (unset)."""
 
     def test_unset_is_unknown(self):
-        # Old server (field absent) -> None, so the UI shows no indicator.
-        src = DataSourceDescriptor(source_id="s")
-        assert src.HasField("data_resident") is False
+        # Server didn't report it -> None, so the UI shows no indicator.
+        src = CatalogSource(source_id="s")
+        assert src.data_resident is None
         assert _residency_state(src) is None
 
     def test_true_is_resident(self):
-        src = DataSourceDescriptor(source_id="s", data_resident=True)
+        src = CatalogSource(source_id="s", data_resident=True)
         assert _residency_state(src) == "resident"
 
     def test_false_is_remote(self):
-        src = DataSourceDescriptor(source_id="s", data_resident=False)
-        # Explicitly set false (present) -> remote, not unknown.
-        assert src.HasField("data_resident") is True
+        # Explicitly false -- reported, and remote, not unknown.
+        src = CatalogSource(source_id="s", data_resident=False)
         assert _residency_state(src) == "remote"

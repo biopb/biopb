@@ -200,31 +200,29 @@ public class TensorFlightClient implements AutoCloseable {
         return cacheBytes;
     }
 
-    /** The columns {@link #descriptorsFromRows} reads, as a SELECT list. */
+    /** The columns {@link #sourcesFromRows} reads, as a SELECT list. */
     static final String SOURCE_ROW_COLUMNS =
-            "source_id, source_url, source_type, data_resident, tensors";
+            "source_id, source_url, source_type, data_resident, is_resolved, tensors";
 
     /**
      * List available data sources.
      *
-     * @deprecated Use {@link #querySources} with {@link #descriptorsFromRows}.
+     * @deprecated Use {@link #querySources} with {@link #sourcesFromRows}.
      *             This is a thin wrapper around {@code SELECT ... FROM sources}
      *             that inherits the server's query row cap, so a large catalog
      *             comes back silently truncated -- and a browse is exactly where
      *             that matters.
      *
-     * @return Map of source_id to DataSourceDescriptor
+     * @return Map of source_id to CatalogSource
      */
     @Deprecated
-    public Map<String, DataSourceDescriptor> listSources() throws IOException {
-        Map<String, DataSourceDescriptor> result = new HashMap<>();
+    public Map<String, CatalogSource> listSources() throws IOException {
+        Map<String, CatalogSource> result = new HashMap<>();
         try (VectorSchemaRoot root = querySources(
                 "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources ORDER BY source_id")) {
-            for (DataSourceDescriptor sourceDesc : descriptorsFromRows(root)) {
-                result.put(sourceDesc.getSourceId(), sourceDesc);
-                for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
-                    descriptors.put(tensorDesc.getArrayId(), tensorDesc);
-                }
+            for (CatalogSource source : sourcesFromRows(root)) {
+                result.put(source.getSourceId(), source);
+                cacheTensors(source);
             }
         }
         LOGGER.info("listSources: returned " + result.size() + " sources");
@@ -232,27 +230,47 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * One source's descriptor by id, or {@code null} when nothing answers to it.
+     * One source's catalog row by id, or {@code null} when nothing answers to it.
      *
      * <p>One addressed catalog row, so a source past the browse cap still
      * resolves. Caches the row's per-tensor entries for later addressing.
      */
-    private DataSourceDescriptor fetchSourceDescriptor(String sourceId) throws IOException {
+    private CatalogSource fetchSource(String sourceId) throws IOException {
         try (VectorSchemaRoot root = querySources(
                 "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources WHERE source_id = "
                         + sqlLiteral(sourceId))) {
-            for (DataSourceDescriptor sourceDesc : descriptorsFromRows(root)) {
-                for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
-                    descriptors.put(tensorDesc.getArrayId(), tensorDesc);
-                }
-                return sourceDesc;
+            for (CatalogSource source : sourcesFromRows(root)) {
+                cacheTensors(source);
+                return source;
             }
         }
         return null;
     }
 
     /**
-     * Rebuild lean {@link DataSourceDescriptor}s from {@code sources} catalog rows.
+     * Seed the array_id -&gt; descriptor cache from a row's tensors.
+     *
+     * <p>The cache holds {@link TensorDescriptor}, the type GetFlightInfo
+     * answers with and the read path reads; a catalog entry fills only its
+     * structural part.
+     */
+    private void cacheTensors(CatalogSource source) {
+        for (CatalogTensor tensor : source.getTensors()) {
+            descriptors.put(tensor.getArrayId(), toDescriptor(tensor));
+        }
+    }
+
+    private static TensorDescriptor toDescriptor(CatalogTensor tensor) {
+        return TensorDescriptor.newBuilder()
+                .setArrayId(tensor.getArrayId())
+                .addAllDimLabels(tensor.getDimLabels())
+                .addAllShape(tensor.getShape())
+                .setDtype(tensor.getDtype())
+                .build();
+    }
+
+    /**
+     * Rebuild lean {@link CatalogSource}s from {@code sources} catalog rows.
      *
      * <p>Structural only: per-tensor array_id / dim_labels / shape / dtype from the
      * {@code tensors} LIST&lt;STRUCT&gt; column. The transfer chunk_shape belongs to the
@@ -261,23 +279,18 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>Public because it is the migration path off {@link #listSources}: query
      * the catalog yourself, decode the rows with this.
      */
-    public static List<DataSourceDescriptor> descriptorsFromRows(VectorSchemaRoot root) {
-        List<DataSourceDescriptor> out = new ArrayList<>();
+    public static List<CatalogSource> sourcesFromRows(VectorSchemaRoot root) {
+        List<CatalogSource> out = new ArrayList<>();
         FieldVector sourceIds = root.getVector("source_id");
         FieldVector urls = root.getVector("source_url");
         FieldVector types = root.getVector("source_type");
         FieldVector resident = root.getVector("data_resident");
+        FieldVector resolved = root.getVector("is_resolved");
         FieldVector tensors = root.getVector("tensors");
         for (int i = 0; i < root.getRowCount(); i++) {
-            DataSourceDescriptor.Builder desc = DataSourceDescriptor.newBuilder()
-                    .setSourceId(text(sourceIds, i))
-                    .setSourceUrl(text(urls, i))
-                    .setSourceType(text(types, i))
-                    .setMetadataJson("");
             Object res = resident == null || resident.isNull(i) ? null : resident.getObject(i);
-            if (res instanceof Boolean) {
-                desc.setDataResident((Boolean) res);
-            }
+            Object isRes = resolved == null || resolved.isNull(i) ? null : resolved.getObject(i);
+            List<CatalogTensor> entries = new ArrayList<>();
             Object list = tensors == null || tensors.isNull(i) ? null : tensors.getObject(i);
             if (list instanceof List) {
                 for (Object entry : (List<?>) list) {
@@ -285,25 +298,38 @@ public class TensorFlightClient implements AutoCloseable {
                         continue;
                     }
                     Map<?, ?> t = (Map<?, ?>) entry;
-                    TensorDescriptor.Builder td = TensorDescriptor.newBuilder()
-                            .setArrayId(String.valueOf(t.get("array_id")))
-                            .setDtype(t.get("dtype") == null ? "" : String.valueOf(t.get("dtype")));
-                    Object labels = t.get("dim_labels");
-                    if (labels instanceof List) {
-                        for (Object l : (List<?>) labels) {
-                            td.addDimLabels(String.valueOf(l));
+                    List<String> labels = new ArrayList<>();
+                    Object rawLabels = t.get("dim_labels");
+                    if (rawLabels instanceof List) {
+                        for (Object l : (List<?>) rawLabels) {
+                            labels.add(String.valueOf(l));
                         }
                     }
-                    Object shape = t.get("shape");
-                    if (shape instanceof List) {
-                        for (Object d : (List<?>) shape) {
-                            td.addShape(((Number) d).longValue());
+                    List<Long> shape = new ArrayList<>();
+                    Object rawShape = t.get("shape");
+                    if (rawShape instanceof List) {
+                        for (Object d : (List<?>) rawShape) {
+                            shape.add(((Number) d).longValue());
                         }
                     }
-                    desc.addTensors(td.build());
+                    entries.add(new CatalogTensor(
+                            String.valueOf(t.get("array_id")),
+                            labels,
+                            shape,
+                            t.get("dtype") == null ? "" : String.valueOf(t.get("dtype"))));
                 }
             }
-            out.add(desc.build());
+            // True for an absent column, the harmless direction for a
+            // monotonic flag; a server whose table predates it fails the
+            // SELECT outright, so this only covers a narrower projection.
+            boolean isResolved = !(isRes instanceof Boolean) || (Boolean) isRes;
+            out.add(new CatalogSource(
+                    text(sourceIds, i),
+                    text(urls, i),
+                    text(types, i),
+                    entries,
+                    isResolved,
+                    res instanceof Boolean ? (Boolean) res : null));
         }
         return out;
     }
@@ -482,11 +508,11 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Resolve an unresolved source and return its full {@link DataSourceDescriptor}.
+     * Resolve an unresolved source and return its full {@link CatalogSource}.
      *
      * <p>An <i>unresolved</i> source is catalogued by URL only -- its
      * shape/dtype/field list are unknown until first access (it lists with
-     * {@code data_resident} false and an empty {@code tensors}). The canonical
+     * {@code is_resolved} false and an empty {@code tensors}). The canonical
      * case is a cloud / synced-folder ("Files-On-Demand") source.
      *
      * <p>Resolving asks the server to hydrate it. For a dehydrated placeholder
@@ -497,21 +523,21 @@ public class TensorFlightClient implements AutoCloseable {
      * Afterwards {@link #getTensor} and friends work normally. Idempotent.
      *
      * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
-     * @return The full DataSourceDescriptor with every tensor/field enumerated
+     * @return The full CatalogSource with every tensor/field enumerated
      * @throws IOException If the action fails or the server returns no row
      */
-    public DataSourceDescriptor resolve(String sourceId) throws IOException {
+    public CatalogSource resolve(String sourceId) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
         // point that performs the (possibly minutes-long) recall. The action
         // streams ResolveStreamMessage progress heartbeats to keep the
         // connection warm under proxy idle timeouts; the terminal message
         // carries the source's now-concrete catalog row (Arrow IPC), decoded
-        // through the same descriptorsFromRows() that backs listSources().
+        // through the same sourcesFromRows() that backs listSources().
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
                 "resolve",
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
-        DataSourceDescriptor desc = null;
+        CatalogSource source = null;
         java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
         while (iter.hasNext()) {
             byte[] body = iter.next().getBody();
@@ -525,21 +551,19 @@ public class TensorFlightClient implements AutoCloseable {
             try (ArrowStreamReader reader = new ArrowStreamReader(
                     new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
                 while (reader.loadNextBatch()) {
-                    List<DataSourceDescriptor> rows = descriptorsFromRows(reader.getVectorSchemaRoot());
+                    List<CatalogSource> rows = sourcesFromRows(reader.getVectorSchemaRoot());
                     if (!rows.isEmpty()) {
-                        desc = rows.get(0);
+                        source = rows.get(0);
                     }
                 }
             }
         }
-        if (desc == null) {
+        if (source == null) {
             throw new IOException("resolve('" + sourceId
                     + "') returned no catalog row (server closed the stream without a result)");
         }
-        for (TensorDescriptor tensorDesc : desc.getTensorsList()) {
-            descriptors.put(tensorDesc.getArrayId(), tensorDesc);
-        }
-        return desc;
+        cacheTensors(source);
+        return source;
     }
 
     /**
@@ -1280,38 +1304,54 @@ public class TensorFlightClient implements AutoCloseable {
             // One addressed catalog row. No catalog to ask (a capability token
             // reads one source's pixels, not the catalog) falls through to the
             // per-tensor probe below, which is the private path.
-            DataSourceDescriptor sourceDesc = null;
+            CatalogSource source = null;
             try {
-                sourceDesc = fetchSourceDescriptor(sourceId);
+                source = fetchSource(sourceId);
             } catch (IOException | RuntimeException ignored) {
                 // fall through to the per-tensor probe
             }
-            if (sourceDesc == null) {
+            if (source == null) {
                 // Probe the server directly. Swallow a fetch failure and let the
                 // clean "Source not found" below surface (matches the Python
-                // client). An unresolved source still lists with empty tensors, so
-                // its directive is raised from the tensorId==null branch, not here.
+                // client). A probe that answers has resolved the tensor by
+                // definition, so the synthesized row is a resolved one.
                 try {
                     TensorDescriptor td = fetchTensorDescriptor(sourceId, tensorId);
-                    sourceDesc = DataSourceDescriptor.newBuilder()
-                            .setSourceId(sourceId)
-                            .addTensors(td)
-                            .build();
+                    source = new CatalogSource(
+                            sourceId,
+                            "",
+                            "",
+                            java.util.Collections.singletonList(new CatalogTensor(
+                                    td.getArrayId(),
+                                    td.getDimLabelsList(),
+                                    td.getShapeList(),
+                                    td.getDtype())),
+                            true,
+                            null);
                 } catch (RuntimeException ignored) {
                     // fall through to the clean error below
                 }
             }
-            if (sourceDesc == null) {
+            if (source == null) {
                 throw new IllegalArgumentException("Source not found: " + sourceId);
             }
 
             // Resolve a null tensorId (the bare-source_id array_id path).
             if (tensorId == null) {
-                int n = sourceDesc.getTensorsCount();
+                int n = source.getTensors().size();
                 if (n == 1) {
-                    tensorId = sourceDesc.getTensors(0).getArrayId();
+                    tensorId = source.getTensors().get(0).getArrayId();
                 } else if (n == 0) {
-                    throw unresolvedSourceError(sourceId);
+                    // The server's flag, not the empty tensor list: "nothing to
+                    // address" also describes a source that resolved and had
+                    // nothing readable in it, and telling that user to resolve
+                    // sends them at an operation that can only succeed and
+                    // change nothing (biopb/biopb#1032).
+                    if (!source.isResolved()) {
+                        throw unresolvedSourceError(sourceId);
+                    }
+                    throw new IllegalArgumentException(
+                            "Source '" + sourceId + "' has no readable tensors");
                 } else {
                     throw new IllegalArgumentException(
                             "Source '" + sourceId + "' has multiple tensors (" + n
@@ -1319,16 +1359,16 @@ public class TensorFlightClient implements AutoCloseable {
                 }
             }
 
-            // Find tensor descriptor to get shape for validation; fall back to a
-            // direct server fetch when the cached source descriptor is stale/partial.
-            for (TensorDescriptor desc : sourceDesc.getTensorsList()) {
-                if (desc.getArrayId().equals(tensorId)) {
-                    baseDescriptor = desc;
+            // Find the tensor entry to get shape for validation; fall back to a
+            // direct server fetch when the cached row is stale/partial.
+            for (CatalogTensor tensor : source.getTensors()) {
+                if (tensor.getArrayId().equals(tensorId)) {
+                    baseDescriptor = toDescriptor(tensor);
                     break;
                 }
             }
             if (baseDescriptor == null) {
-                // Stale/partial cached descriptor -- probe the server. Swallow a fetch
+                // Stale/partial cached row -- probe the server. Swallow a fetch
                 // failure and surface the clean "not found" below (matches Python).
                 try {
                     baseDescriptor = fetchTensorDescriptor(sourceId, tensorId);
