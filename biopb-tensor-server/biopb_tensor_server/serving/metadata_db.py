@@ -753,6 +753,16 @@ class MetadataDatabase:
                 -- both. FALSE is the conservative default (unknown -> treat as
                 -- non-resident; still discoverable via `WHERE NOT data_resident`).
                 data_resident BOOLEAN NOT NULL DEFAULT FALSE,
+                -- Deterministic, unlike data_resident: does a real, hydrated
+                -- adapter back this row right now? Monotonic for the life of
+                -- the process (never flips back to FALSE once TRUE -- a
+                -- source is not un-resolved by re-dehydrating), so this is
+                -- the signal for "should a client offer to resolve this",
+                -- where data_resident legitimately swings both ways across a
+                -- source's lifetime and cannot answer that question. TRUE
+                -- default: every adapter but the unresolved-cloud proxy is
+                -- resolved by construction.
+                is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
                 -- Full per-tensor structural info (biopb/biopb#224): one struct
                 -- per tensor, so multi-field / HCS sources are queryable per
                 -- tensor instead of via the first-tensor projection only. Only
@@ -1153,6 +1163,7 @@ class MetadataDatabase:
         source_url = adapter.catalog_url
         source_type = adapter.source_type
         data_resident = adapter.is_resident()
+        is_resolved = adapter.is_resolved()
         catalog = catalog_tensors(adapter)
         metadata = adapter.get_metadata()
 
@@ -1247,8 +1258,8 @@ class MetadataDatabase:
                 """
                 INSERT OR REPLACE INTO sources
                 (source_id, source_url, source_type, dtype, indexed_at,
-                 metadata_json, shape_summary, data_resident, tensors)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 metadata_json, shape_summary, data_resident, is_resolved, tensors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     source_id,
@@ -1259,6 +1270,7 @@ class MetadataDatabase:
                     metadata_json,
                     shape_summary,
                     data_resident,
+                    is_resolved,
                     tensors,
                 ],
             )
@@ -1283,6 +1295,25 @@ class MetadataDatabase:
             )
 
         logger.debug(f"Synced source to metadata database: {source_id}")
+
+    def refresh_residency(
+        self, source_id: str, data_resident: bool, is_resolved: bool
+    ) -> None:
+        """Update only the two residency-derived flags on an existing row.
+
+        For a caller (the warm loop) that just re-derived ``data_resident`` /
+        ``is_resolved`` and needs the catalog row to reflect it, without
+        paying for the rest of ``sync_source_added``'s upsert -- re-reading
+        metadata, re-importing ROIs, and bumping ``indexed_at`` for a row
+        whose structure hasn't changed.
+        """
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute(
+                "UPDATE sources SET data_resident = ?, is_resolved = ? "
+                "WHERE source_id = ?",
+                [data_resident, is_resolved, source_id],
+            )
 
     def _replace_imported(
         self,

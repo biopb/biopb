@@ -96,12 +96,14 @@ def _make_source_desc(
     source_id: str = "src0",
     source_url: str = "/data/src0",
     tensors=None,
+    is_resolved: bool = True,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         source_id=source_id,
         source_url=source_url,
         source_type="zarr",
         metadata_json=None,
+        is_resolved=is_resolved,
         tensors=tensors or [_make_tensor_desc()],
     )
 
@@ -112,6 +114,10 @@ def _source_row(desc) -> dict:
         "source_id": desc.source_id,
         "source_url": desc.source_url,
         "source_type": desc.source_type,
+        # getattr: several bespoke SimpleNamespace descriptors in this file
+        # predate the field and don't set it -- same default as production's
+        # _source_row_to_dict.
+        "is_resolved": getattr(desc, "is_resolved", True),
         "tensors": [
             {
                 "array_id": t.array_id,
@@ -455,6 +461,36 @@ class TestSourcesEndpoints:
         tc, mock_fc = auth_client
         tc.get("/api/sources", headers=_bearer(_TOKEN))
         mock_fc.query_sources.assert_called()
+
+    def test_list_sources_is_resolved_field(self):
+        unresolved = _make_source_desc(tensors=[], is_resolved=False)
+        mock_fc = _build_mock_client(unresolved)
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.json()[0]["is_resolved"] is False
+
+    def test_list_sources_is_resolved_defaults_true_on_missing_column(
+        self, auth_client
+    ):
+        # A server predating this column has no is_resolved key in the row at
+        # all; the default reads as resolved, the correct answer for every
+        # pre-existing source.
+        tc, mock_fc = auth_client
+        mock_fc.query_sources.side_effect = lambda sql, format="arrow": [  # noqa: A006
+            {
+                "source_id": "src0",
+                "source_url": "/data/src0",
+                "source_type": "zarr",
+                "tensors": [],
+            }
+        ]
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.json()[0]["is_resolved"] is True
 
 
 # ===========================================================================

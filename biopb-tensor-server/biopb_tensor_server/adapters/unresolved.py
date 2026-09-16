@@ -83,7 +83,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
 
     # --- introspection ------------------------------------------------------
 
-    @property
     def is_resolved(self) -> bool:
         return self._resolved is not None
 

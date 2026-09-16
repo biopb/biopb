@@ -501,6 +501,16 @@ class SourceAdapter(ABC):
         """
         return {}, None
 
+    def is_resolved(self) -> bool:
+        """Deterministic: is there a hydrated adapter backing this source?
+
+        True by default; only ``UnresolvedSourceAdapter`` overrides it. Unlike
+        ``is_resident()``, this never flips back to False once True in a
+        process (a source isn't un-resolved by re-dehydrating) -- the signal
+        for "should a client offer to resolve this".
+        """
+        return True
+
     def resolve(self) -> None:
         """Hydrate this source if needed.
 
@@ -536,7 +546,10 @@ class SourceAdapter(ABC):
         # so importing these at module scope would be circular.
         from pathlib import Path
 
-        from biopb_tensor_server.core.discovery import _is_offline_placeholder
+        from biopb_tensor_server.core.discovery import (
+            _is_offline_placeholder,
+            directory_is_resident,
+        )
         from biopb_tensor_server.core.remote import is_remote_url
 
         if is_remote_url(self._source_url):
@@ -546,10 +559,11 @@ class SourceAdapter(ABC):
         # -- discovery only consults it for files (see should_skip_walk_entry,
         # which gates it on `not is_dir`). A directory-based source (zarr,
         # ome-zarr store) legitimately reports st_blocks == 0 on some filesystems
-        # (e.g. macOS APFS), so applying the file check to it would wrongly flag
-        # an entirely local store as non-resident. Treat a directory as resident.
+        # (e.g. macOS APFS), so applying the file check to the directory path
+        # itself would wrongly flag an entirely local store as non-resident.
+        # `directory_is_resident` instead samples files *inside* the directory.
         if path.is_dir():
-            return True
+            return directory_is_resident(path)
         return not _is_offline_placeholder(path)
 
     def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
@@ -1614,6 +1628,7 @@ _SOURCE_SCOPED_API = frozenset(
         "catalog_url",
         "resolve",
         "is_resident",
+        "is_resolved",
         "get_tensor_adapter",
         "put_chunk",
         "close",

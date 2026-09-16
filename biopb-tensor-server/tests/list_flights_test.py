@@ -30,6 +30,9 @@ class _CatalogAdapter:
     def is_resident(self):
         return True
 
+    def is_resolved(self):
+        return True
+
     def list_tensor_descriptors(self):
         return [
             TensorDescriptor(

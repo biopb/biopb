@@ -2580,6 +2580,9 @@ class _CatalogRowAdapter:
     def is_resident(self):
         return self._resident
 
+    def is_resolved(self):
+        return bool(self._tensors)
+
     def list_tensor_descriptors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 

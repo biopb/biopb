@@ -21,7 +21,14 @@ class MockAdapter:
     capability_token = None
 
     def __init__(
-        self, source_id, source_url, source_type, shape, dtype, data_resident=True
+        self,
+        source_id,
+        source_url,
+        source_type,
+        shape,
+        dtype,
+        data_resident=True,
+        is_resolved=True,
     ):
         self.source_id = source_id
         self._source_url = source_url
@@ -29,6 +36,7 @@ class MockAdapter:
         self._shape = shape
         self._dtype = dtype
         self._data_resident = data_resident
+        self._is_resolved = is_resolved
 
     @property
     def catalog_url(self):
@@ -40,6 +48,9 @@ class MockAdapter:
 
     def is_resident(self):
         return self._data_resident
+
+    def is_resolved(self):
+        return self._is_resolved
 
     def list_tensor_descriptors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -230,6 +241,9 @@ class MultiTensorAdapter:
 
     def is_resident(self):
         return self._data_resident
+
+    def is_resolved(self):
+        return True
 
     def list_tensor_descriptors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -870,6 +884,9 @@ class TestDataResidentColumn:
         def is_resident(self):
             return False  # not local yet
 
+        def is_resolved(self):
+            return False
+
         def list_tensor_descriptors(self):
             return []  # no tensors -> NULL dtype / shape_summary
 
@@ -949,4 +966,62 @@ class TestDataResidentColumn:
         with pytest.raises(duckdb.ConstraintException):
             conn.execute(
                 "INSERT INTO sources (source_id, data_resident) VALUES ('bad', NULL)"
+            )
+
+
+class TestIsResolvedColumn:
+    """The `is_resolved` column: deterministic, unlike data_resident, so it is
+    the right signal for "does a client need to resolve this" rather than
+    data_resident's volatile "is it cheap to read right now"."""
+
+    def test_resolved_source_is_true(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "local-1",
+            MockAdapter("local-1", "/data/x.zarr", "ome-zarr", [10, 10], "uint8"),
+        )
+        row = (
+            db._get_connection()
+            .execute("SELECT is_resolved FROM sources WHERE source_id='local-1'")
+            .fetchone()
+        )
+        assert row[0] is True
+
+    def test_unresolved_source_is_false_and_filterable(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "local-1",
+            MockAdapter("local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"),
+        )
+        db.sync_source_added(
+            "cloud-1",
+            TestDataResidentColumn._UnresolvedAdapter("cloud-1", "https://x/y.zarr"),
+        )
+        conn = db._get_connection()
+
+        unresolved = conn.execute(
+            "SELECT source_id FROM sources WHERE NOT is_resolved"
+        ).fetchall()
+        assert [r[0] for r in unresolved] == ["cloud-1"]
+
+    def test_column_is_not_null_with_true_default(self):
+        # NOT NULL DEFAULT TRUE: an insert omitting is_resolved gets TRUE (every
+        # adapter but the unresolved-cloud proxy is resolved by construction),
+        # and an explicit NULL is rejected.
+        import duckdb
+
+        db = MetadataDatabase()
+        conn = db._get_connection()
+
+        conn.execute(
+            "INSERT INTO sources (source_id, source_url) VALUES ('partial', '/p')"
+        )
+        row = conn.execute(
+            "SELECT is_resolved FROM sources WHERE source_id='partial'"
+        ).fetchone()
+        assert row[0] is True  # DEFAULT filled it, not NULL
+
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO sources (source_id, is_resolved) VALUES ('bad', NULL)"
             )

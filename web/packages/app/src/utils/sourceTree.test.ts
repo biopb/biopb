@@ -7,6 +7,7 @@ const source = (over: Partial<DataSourceDescriptor> = {}): DataSourceDescriptor 
   source_url: "file:///data/experiment/plate1.zarr",
   source_type: "zarr",
   metadata_json: null,
+  is_resolved: true,
   tensors: [],
   ...over,
 });

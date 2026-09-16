@@ -231,6 +231,54 @@ def should_skip_walk_entry(
     return _is_offline_placeholder(path, stat_result)
 
 
+# Bound on directory_is_resident's sample -- large enough that a resolved-but-
+# never-warmed cloud source (every data file still a placeholder) is caught by
+# the first file checked, small enough that this stays a cheap, recall-free
+# probe rather than the full walk `warm` itself does.
+_RESIDENCY_SAMPLE_LIMIT = 32
+
+
+def directory_is_resident(root: Path, max_files: int = _RESIDENCY_SAMPLE_LIMIT) -> bool:
+    """Best-effort, recall-free: does *root* look locally resident?
+
+    A directory's own stat bits are not a usable signal here -- it can
+    legitimately report ``st_blocks == 0`` on some local filesystems (e.g.
+    macOS APFS) even when fully resident, which is why ``is_resident()``
+    does not apply the file-level check to the directory path itself. This
+    instead samples a bounded number of the *files* inside it and applies
+    that same check to each, short-circuiting on the first placeholder found.
+    A cloud source that has been resolved but never warmed has every data
+    file still dehydrated, so a small sample reliably catches that case; this
+    is not a full-tree scan and gives no guarantee for a directory that is
+    only partially rehydrated.
+
+    Never raises and never opens file content -- an unreadable directory, or
+    one exhausted by the sample cap without finding a placeholder, reads as
+    resident, on the same best-effort terms as the rest of this module.
+    """
+    checked = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Sorted so the sample is deterministic (which files a cap of
+            # `max_files` reaches should not depend on directory-entry order).
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if not should_skip_walk_entry(Path(dirpath) / d, is_dir=True)
+            )
+            for name in sorted(filenames):
+                if name.startswith("."):
+                    continue
+                if _is_offline_placeholder(Path(dirpath) / name):
+                    return False
+                checked += 1
+                if checked >= max_files:
+                    return True
+    except OSError:
+        return True
+    return True
+
+
 class ClaimContext(abc.ABC):
     """Unified path access for the claim protocol.
 

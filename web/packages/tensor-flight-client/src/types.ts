@@ -22,6 +22,13 @@ export interface DataSourceDescriptor {
   source_type: string;
   /** Raw OME-NGFF JSON string, or null. */
   metadata_json: string | null;
+  /**
+   * Deterministic: does a real, hydrated adapter back this source right now?
+   * False only for an unresolved cloud/synced-folder source awaiting an
+   * explicit `resolve`. Unlike a residency/warm-state flag, this never flips
+   * back to false once true for the life of the server process.
+   */
+  is_resolved: boolean;
   /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */
   tensors: TensorDescriptor[];
 }
