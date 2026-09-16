@@ -721,9 +721,15 @@ public class TensorFlightClientTest {
 
             TensorTicket tensorTicket = parseTicket(ticket.getBytes());
             if (tensorTicket.hasCatalogQuery()) {
-                // The `catalog` flight: one `sources` row, as the server's DuckDB
-                // would stream it (tensors is a LIST<STRUCT>).
-                try (VectorSchemaRoot root = catalogRoot()) {
+                // The `catalog` flight: the `sources` row(s) the query selects, as
+                // the server's DuckDB would stream them (tensors is a LIST<STRUCT>).
+                // The WHERE clause is honoured because the client now addresses
+                // single rows with one -- a fake that answered every id with its
+                // one row would report a missing source as present.
+                String sql = tensorTicket.getCatalogQuery().getSql();
+                boolean matches = !sql.contains("WHERE source_id = ")
+                        || sql.contains("'test-source'");
+                try (VectorSchemaRoot root = catalogRoot(matches ? 1 : 0)) {
                     listener.start(root);
                     listener.putNext();
                     listener.completed();
@@ -766,7 +772,7 @@ public class TensorFlightClientTest {
             }
         }
 
-        private VectorSchemaRoot catalogRoot() {
+        private VectorSchemaRoot catalogRoot(int rows) {
             Field arrayId = new Field("array_id", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
             Field dimLabels = new Field("dim_labels", FieldType.nullable(ArrowType.List.INSTANCE),
                     Collections.singletonList(new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null)));
@@ -784,6 +790,10 @@ public class TensorFlightClientTest {
                             Collections.singletonList(tensorStruct))));
             VectorSchemaRoot root = VectorSchemaRoot.create(catalogSchema, allocator);
             root.allocateNew();
+            if (rows == 0) {
+                root.setRowCount(0);
+                return root;
+            }
             ((org.apache.arrow.vector.VarCharVector) root.getVector("source_id"))
                     .setSafe(0, "test-source".getBytes(StandardCharsets.UTF_8));
             ((org.apache.arrow.vector.VarCharVector) root.getVector("source_url"))
