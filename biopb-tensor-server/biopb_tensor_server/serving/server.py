@@ -1225,7 +1225,6 @@ class TensorFlightServer(flight.FlightServerBase):
                     return
                 progress_state["current_name"] = name
 
-            started_file = True
             try:
                 # Each executor worker owns and reuses its buffer: sharing the
                 # old single buffer would race readinto() calls and corrupt the
@@ -1239,15 +1238,17 @@ class TensorFlightServer(flight.FlightServerBase):
                         n = fh.readinto(buf)
                         if not n:
                             break
+                        # current_name was already set above; re-stamping it on
+                        # every block would retake the lock for no new value and
+                        # serialize the fast path -- already-resident files that
+                        # read fast enough for 4 workers to contend on this lock.
                         with progress_lock:
                             progress_state["bytes_done"] += n
-                            progress_state["current_name"] = name
             except OSError as exc:
                 logger.warning("warm: skipping %s: %s", fpath, exc)
             finally:
-                if started_file:
-                    with progress_lock:
-                        progress_state["files_done"] += 1
+                with progress_lock:
+                    progress_state["files_done"] += 1
 
         try:
             # Warming registers as in-flight activity so the precache worker parks.
@@ -1295,72 +1296,67 @@ class TensorFlightServer(flight.FlightServerBase):
                 # bounding threads, fds, and per-worker buffers, this preserves
                 # the existing smallest-files-first launch order without queuing
                 # tens of thousands of futures in the executor.
-                pool = ThreadPoolExecutor(max_workers=_WARM_MAX_WORKERS)
                 pending = set()
                 next_entry = 0
-                try:
 
-                    def _submit_next() -> None:
-                        nonlocal next_entry
-                        if cancel_event.is_set() or next_entry >= files_total:
-                            return
-                        fpath = entries[next_entry][1]
-                        next_entry += 1
-                        pending.add(pool.submit(_read_file, fpath))
-
+                def _check_cancel() -> None:
                     if context.is_cancelled():
                         cancel_event.set()
-                    while (
-                        not cancel_event.is_set()
-                        and len(pending) < _WARM_MAX_WORKERS
-                        and next_entry < files_total
-                    ):
-                        _submit_next()
 
-                    while pending:
-                        if context.is_cancelled():
-                            cancel_event.set()
+                with ThreadPoolExecutor(max_workers=_WARM_MAX_WORKERS) as pool:
 
-                        completed, pending = wait(
-                            pending,
-                            timeout=_WARM_POLL_SECONDS,
-                            return_when=FIRST_COMPLETED,
-                        )
-                        for future in completed:
-                            future.result()
-
-                        if context.is_cancelled():
-                            cancel_event.set()
+                    def _refill() -> None:
+                        nonlocal next_entry
                         while (
                             not cancel_event.is_set()
                             and len(pending) < _WARM_MAX_WORKERS
                             and next_entry < files_total
                         ):
-                            _submit_next()
+                            fpath = entries[next_entry][1]
+                            next_entry += 1
+                            pending.add(pool.submit(_read_file, fpath))
 
-                        now = time.monotonic()
-                        if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
-                            last_yield = now
-                            done_files, done_bytes, current_name = _snapshot()
-                            yield _progress(
-                                files_total,
-                                done_files,
-                                bytes_total,
-                                done_bytes,
-                                current_name,
+                    try:
+                        _check_cancel()
+                        _refill()
+
+                        while pending:
+                            _check_cancel()
+
+                            completed, pending = wait(
+                                pending,
+                                timeout=_WARM_POLL_SECONDS,
+                                return_when=FIRST_COMPLETED,
                             )
+                            for future in completed:
+                                future.result()
 
-                    # The executor has no queued work here. Shutdown still joins
-                    # any read that was in progress before cancellation.
-                    done_files, done_bytes, current_name = _snapshot()
-                    files_done = done_files
-                    bytes_done = done_bytes
-                finally:
-                    # A client may close the generator at a progress yield. Set the
-                    # flag before the executor joins its in-flight workers so they
-                    # stop before opening another file.
-                    cancel_event.set()
-                    pool.shutdown(wait=True)
+                            _check_cancel()
+                            _refill()
+
+                            now = time.monotonic()
+                            if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
+                                last_yield = now
+                                done_files, done_bytes, current_name = _snapshot()
+                                yield _progress(
+                                    files_total,
+                                    done_files,
+                                    bytes_total,
+                                    done_bytes,
+                                    current_name,
+                                )
+
+                        # The executor has no queued work here. Shutdown still
+                        # joins any read that was in progress before cancellation.
+                        done_files, done_bytes, current_name = _snapshot()
+                        files_done = done_files
+                        bytes_done = done_bytes
+                    finally:
+                        # A client may close the generator at a progress yield.
+                        # Set the flag before the `with` block joins the
+                        # executor's in-flight workers so they stop before
+                        # opening another file.
+                        cancel_event.set()
 
                 # 4. Terminal done (partial counts if cancelled mid-loop).
                 yield WarmStreamMessage(
