@@ -197,8 +197,8 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
-def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
-    """Every source_id on an upstream tensor server. Returns ``(ids, complete)``.
+def list_upstream_source_ids(client, location: str) -> List[str]:
+    """Every source_id on an upstream tensor server.
 
     ``location`` is the upstream endpoint, named in the fallback warning. It is a
     parameter rather than something read off the client because the callers
@@ -208,18 +208,16 @@ def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
     (biopb/biopb#529).
 
     Queries the ids alone (``query_sources`` on one narrow column, the
-    canonical browse surface, biopb/biopb#225). ``complete`` is always True:
-    the server-side catalog is not truncated, so a caller (e.g. the monitor
-    re-list) may reconcile destructively against this list. The flag stays in
-    the signature because the caller pairs it with
-    :func:`fetch_upstream_catalog`'s, which is not.
+    canonical browse surface, biopb/biopb#225) -- an untruncated read, so the
+    result is always complete and a caller (e.g. the monitor re-list) may
+    reconcile destructively against it.
 
     An upstream with no readable catalog raises rather than degrading: the only
     fallback there ever was is ``list_sources()``, which in protocol v2 runs
     this same query and so fails identically.
     """
     rows = client.query_sources("SELECT source_id FROM sources", format="records")
-    return [row["source_id"] for row in rows], True
+    return [row["source_id"] for row in rows]
 
 
 # Transport failures, as opposed to "this upstream has no SQL catalog". The

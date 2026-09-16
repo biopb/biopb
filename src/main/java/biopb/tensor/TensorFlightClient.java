@@ -1271,69 +1271,75 @@ public class TensorFlightClient implements AutoCloseable {
 
         LOGGER.fine("getTensor: sourceId=" + sourceId + ", tensorId=" + tensorId);
 
-        // One addressed catalog row. No catalog to ask (a capability token reads
-        // one source's pixels, not the catalog) falls through to the per-tensor
-        // probe below, which is the private path.
-        DataSourceDescriptor sourceDesc = null;
-        try {
-            sourceDesc = fetchSourceDescriptor(sourceId);
-        } catch (IOException | RuntimeException ignored) {
-            // fall through to the per-tensor probe
-        }
-        if (sourceDesc == null) {
-            // Probe the server directly. Swallow a fetch failure and let the
-            // clean "Source not found" below surface (matches the Python
-            // client). An unresolved source still lists with empty tensors, so
-            // its directive is raised from the tensorId==null branch, not here.
-            try {
-                TensorDescriptor td = fetchTensorDescriptor(sourceId, tensorId);
-                sourceDesc = DataSourceDescriptor.newBuilder()
-                        .setSourceId(sourceId)
-                        .addTensors(td)
-                        .build();
-            } catch (RuntimeException ignored) {
-                // fall through to the clean error below
-            }
-        }
-        if (sourceDesc == null) {
-            throw new IllegalArgumentException("Source not found: " + sourceId);
-        }
+        // A fully-qualified tensorId that is already cached (a prior getTensor
+        // or getDescriptor on it) needs neither the catalog row nor a probe --
+        // this is the repeat-read hot path.
+        TensorDescriptor baseDescriptor = tensorId != null ? descriptors.get(tensorId) : null;
 
-        // Resolve a null tensorId (the bare-source_id array_id path).
-        if (tensorId == null) {
-            int n = sourceDesc.getTensorsCount();
-            if (n == 1) {
-                tensorId = sourceDesc.getTensors(0).getArrayId();
-            } else if (n == 0) {
-                throw unresolvedSourceError(sourceId);
-            } else {
+        if (baseDescriptor == null) {
+            // One addressed catalog row. No catalog to ask (a capability token
+            // reads one source's pixels, not the catalog) falls through to the
+            // per-tensor probe below, which is the private path.
+            DataSourceDescriptor sourceDesc = null;
+            try {
+                sourceDesc = fetchSourceDescriptor(sourceId);
+            } catch (IOException | RuntimeException ignored) {
+                // fall through to the per-tensor probe
+            }
+            if (sourceDesc == null) {
+                // Probe the server directly. Swallow a fetch failure and let the
+                // clean "Source not found" below surface (matches the Python
+                // client). An unresolved source still lists with empty tensors, so
+                // its directive is raised from the tensorId==null branch, not here.
+                try {
+                    TensorDescriptor td = fetchTensorDescriptor(sourceId, tensorId);
+                    sourceDesc = DataSourceDescriptor.newBuilder()
+                            .setSourceId(sourceId)
+                            .addTensors(td)
+                            .build();
+                } catch (RuntimeException ignored) {
+                    // fall through to the clean error below
+                }
+            }
+            if (sourceDesc == null) {
+                throw new IllegalArgumentException("Source not found: " + sourceId);
+            }
+
+            // Resolve a null tensorId (the bare-source_id array_id path).
+            if (tensorId == null) {
+                int n = sourceDesc.getTensorsCount();
+                if (n == 1) {
+                    tensorId = sourceDesc.getTensors(0).getArrayId();
+                } else if (n == 0) {
+                    throw unresolvedSourceError(sourceId);
+                } else {
+                    throw new IllegalArgumentException(
+                            "Source '" + sourceId + "' has multiple tensors (" + n
+                                    + "); a within-source field must be specified (use \"source_id/field\")");
+                }
+            }
+
+            // Find tensor descriptor to get shape for validation; fall back to a
+            // direct server fetch when the cached source descriptor is stale/partial.
+            for (TensorDescriptor desc : sourceDesc.getTensorsList()) {
+                if (desc.getArrayId().equals(tensorId)) {
+                    baseDescriptor = desc;
+                    break;
+                }
+            }
+            if (baseDescriptor == null) {
+                // Stale/partial cached descriptor -- probe the server. Swallow a fetch
+                // failure and surface the clean "not found" below (matches Python).
+                try {
+                    baseDescriptor = fetchTensorDescriptor(sourceId, tensorId);
+                } catch (RuntimeException ignored) {
+                    // fall through to the clean error below
+                }
+            }
+            if (baseDescriptor == null) {
                 throw new IllegalArgumentException(
-                        "Source '" + sourceId + "' has multiple tensors (" + n
-                                + "); a within-source field must be specified (use \"source_id/field\")");
+                        "Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
             }
-        }
-
-        // Find tensor descriptor to get shape for validation; fall back to a
-        // direct server fetch when the cached source descriptor is stale/partial.
-        TensorDescriptor baseDescriptor = null;
-        for (TensorDescriptor desc : sourceDesc.getTensorsList()) {
-            if (desc.getArrayId().equals(tensorId)) {
-                baseDescriptor = desc;
-                break;
-            }
-        }
-        if (baseDescriptor == null) {
-            // Stale/partial cached descriptor -- probe the server. Swallow a fetch
-            // failure and surface the clean "not found" below (matches Python).
-            try {
-                baseDescriptor = fetchTensorDescriptor(sourceId, tensorId);
-            } catch (RuntimeException ignored) {
-                // fall through to the clean error below
-            }
-        }
-        if (baseDescriptor == null) {
-            throw new IllegalArgumentException(
-                    "Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
         }
 
         // Validate scale hint dimensionality if provided

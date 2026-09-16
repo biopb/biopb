@@ -956,7 +956,7 @@ def test_bare_host_expansion_dials_the_upstream_with_its_configured_trust(monkey
     monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
     monkeypatch.setattr(
         "biopb_tensor_server.sources.resolve.list_upstream_source_ids",
-        lambda client, location: ([], True),
+        lambda client, location: [],
     )
     discover_sources(
         _upstream_source(url="grpcs://lab:8815", credentials_profile="lab-store"),

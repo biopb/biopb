@@ -39,6 +39,7 @@ from typing import Dict
 
 from biopb import _data_plane
 from biopb.tensor import TensorFlightClient, descriptors_from_rows
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
 from ._config import CONFIG
@@ -52,19 +53,14 @@ SERVER_QUERY_THRESHOLD = 1000
 #: The catalog browse this connection keeps its snapshot from. One
 #: ``query_sources`` -- the complete, server-side surface -- decoded with the
 #: SDK's own row reader.
-_SOURCES_SQL = (
-    "SELECT source_id, source_url, source_type, data_resident, tensors "
-    "FROM sources ORDER BY source_id"
-)
+_SOURCES_SQL = f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
 
 
 def _browse(client) -> Dict[str, DataSourceDescriptor]:
     """The server's whole catalog as ``{source_id: DataSourceDescriptor}``.
 
-    ``query_sources`` rather than the deprecated ``list_sources``: same rows,
-    but the SQL surface is the complete one -- the wrapper inherited the
-    server's query row cap, which silently truncated exactly the large catalogs
-    ``use_server_query`` exists for.
+    ``query_sources`` rather than the deprecated ``list_sources`` -- same rows,
+    same server-side cap, but without the deprecation warning.
     """
     rows = client.query_sources(_SOURCES_SQL, format="records")
     return {d.source_id: d for d in descriptors_from_rows(rows)}
