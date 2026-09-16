@@ -1075,7 +1075,10 @@ class TensorFlightClient:
                 use the freshness fields below to tell whether indexing is
                 still in progress.
             - `source_count`: Number of registered sources
-            - `metadata_db_enabled`: Whether metadata database is enabled
+            - `metadata_db_enabled`: Whether the server offers a catalog.
+                False means it serves its sources by id alone and every
+                catalog surface (list_sources, query_sources, resolve,
+                annotations) refuses
             - `writable`: Whether server accepts uploads
             - `uptime_seconds`: Server uptime in seconds
             - `full_scan_in_progress`: Whether a full catalog rescan is

@@ -893,10 +893,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 # it before its first call. A server without the key is v1.
                 "protocol": FLIGHT_PROTOCOL_VERSION,
                 "source_count": len(self.sources),
-                # Every server has a catalog now; kept on the wire since it is a
-                # documented part of the health contract (SDK/Java clients read
-                # it).
-                "metadata_db_enabled": True,
+                # Whether this server offers a catalog at all. A constant True
+                # since #225 ("every server has a catalog now"), which is the
+                # assumption retiring _owns_catalog removes -- so it is a real
+                # signal again, and the one a client can read *before* calling a
+                # catalog surface rather than eating its refusal.
+                "metadata_db_enabled": db is not None,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
                 # Catalog-freshness signals (progressive discovery). ``SERVING``
@@ -907,9 +909,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "last_full_scan_finished_at": last_full_scan_at,
                 # Whether drawn ROIs survive a restart. A store that was asked
                 # for and could not be opened is fatal at startup, so this is
-                # False only for a deliberately session-only server -- which a
-                # client may still want to say out loud before someone spends a
-                # morning tracing.
+                # False for a deliberately session-only server, or one with no
+                # catalog at all (which cannot take annotations either) -- both
+                # of which a client may want to say out loud before someone
+                # spends a morning tracing.
                 "annotations_persisted": db is not None and db.annotations_persisted,
                 # The same question one level down, and not the same answer: the
                 # catalog also holds `decode_rates`, and a server with the

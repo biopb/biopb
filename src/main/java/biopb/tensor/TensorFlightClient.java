@@ -1222,7 +1222,8 @@ public class TensorFlightClient implements AutoCloseable {
      * Returns a map with health status information including:
      * - status: "SERVING" or other status string
      * - source_count: number of registered sources
-     * - metadata_db_enabled: whether metadata database is enabled
+     * - metadata_db_enabled: whether the server offers a catalog (false means it
+     *   serves sources by id alone and every catalog surface refuses)
      * - writable: whether server accepts uploads
      * - uptime_seconds: server uptime in seconds
      *
