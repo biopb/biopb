@@ -497,6 +497,8 @@ class TensorFlightClient:
         Returns:
             The full ``DataSourceDescriptor`` with every tensor/field enumerated
             -- the complete field set in one call, regardless of catalog size.
+            Built from the source's catalog row as the server now holds it, so
+            it agrees with a following `query_sources` exactly.
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
@@ -572,7 +574,7 @@ class TensorFlightClient:
         adapter -> catalog pipeline the directory watcher uses. A dropped
         directory that is not itself a dataset is walked recursively and may
         register several sources, so the action streams progress and a final
-        tally rather than returning a single descriptor.
+        tally rather than returning a single source.
 
         The path must exist on the server. Because a dropped directory's walk has
         no known size up front, there is no percentage -- progress is a running
@@ -583,18 +585,19 @@ class TensorFlightClient:
             source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
                 empty means auto-detect via the adapters' claim protocol.
             on_progress: Optional callback invoked with an ``AddSourceProgress``
-                (count + current path + last descriptor) per source as it
-                registers. Called on the calling thread; keep it cheap.
+                (count + current path) per source as it registers. Called on the
+                calling thread; keep it cheap.
             should_cancel: Optional predicate polled per message; when it returns
                 True the client closes the stream, which the server observes and
                 stops discovery -- sources already registered stay registered.
 
         Returns:
-            The terminal ``AddSourceResult``: ``added`` descriptors,
-            ``already_present`` / ``refreshed`` / ``removed`` source_ids, and
-            ``failed`` ``(path, reason)`` pairs. A directory dropped above the
-            large-scan threshold comes back as a ``failed`` entry, not a special
-            flag.
+            The terminal ``AddSourceResult``: ``added`` / ``already_present`` /
+            ``refreshed`` / ``removed`` source_ids, and ``failed``
+            ``(path, reason)`` pairs. A directory dropped above the large-scan
+            threshold comes back as a ``failed`` entry, not a special flag.
+            Registration wrote each source's catalog row, so anything beyond the
+            ids is one `query_sources` away.
 
             Re-adding a path that is already registered REBUILDS it against the
             file as it is now -- that is what ``refreshed`` reports, and it is

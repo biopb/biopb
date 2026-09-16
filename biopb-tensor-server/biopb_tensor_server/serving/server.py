@@ -936,12 +936,17 @@ class TensorFlightServer(flight.FlightServerBase):
         proxy idle read timeouts (e.g. nginx ``grpc_read_timeout``, default 60s)
         and reset the stream, and the elapsed/size fields let a client show
         progress and decide whether to cancel. The single terminal message
-        carries the now-resolved ``DataSourceDescriptor`` in its ``result`` arm.
+        carries the source's now-concrete catalog row.
 
-        Resolving an already-resident source is a cheap no-op (returns its
-        descriptor). If the client disconnects mid-resolve the daemon thread runs
-        to completion and caches the result on the adapter, so a retry coalesces
-        onto the finished work rather than downloading again.
+        The row, not a descriptor rebuilt from the adapter: resolution has
+        already written it, and returning a second encoding of the same
+        projection let the two disagree (the adapter answers ``is_resident()``
+        live, the row is a snapshot).
+
+        Resolving an already-resident source is a cheap no-op. If the client
+        disconnects mid-resolve the daemon thread runs to completion and caches
+        the result on the adapter, so a retry coalesces onto the finished work
+        rather than downloading again.
         """
         adapter = self.sources.get(source_id)
         if adapter is None:
@@ -970,11 +975,18 @@ class TensorFlightServer(flight.FlightServerBase):
                 )
             ).SerializeToString()
 
+        # A server-owned catalog has no on_resolved backfill wired -- that is the
+        # SourceManager's (_on_source_resolved). Note whether this source was
+        # unresolved so the row can be brought up to date below, and only then:
+        # for an already-resolved source the row already describes it, and
+        # re-syncing would re-parse metadata the registration cache has dropped.
+        was_unresolved = self._owns_catalog and not adapter.list_tensor_descriptors()
+
         result: dict = {}
 
         def _run() -> None:
             try:
-                result["desc"] = adapter.resolve()
+                adapter.resolve()
             except BaseException as exc:  # surfaced on the stream below
                 result["err"] = exc
 
@@ -1004,7 +1016,15 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
-        yield ResolveStreamMessage(result=result["desc"]).SerializeToString()
+
+        if was_unresolved and adapter.list_tensor_descriptors():
+            self._catalog_sync_added(source_id, adapter)
+        row = self._metadata_db.source_row_ipc(source_id)
+        if row is None:
+            raise flight.FlightServerError(
+                f"resolve succeeded for {source_id!r} but the catalog has no row for it"
+            )
+        yield ResolveStreamMessage(source_row=row).SerializeToString()
 
     def _handle_warm(
         self, source_id: str, context: flight.ServerCallContext
@@ -1216,11 +1236,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 else:  # "result"
                     _, tally = event
                     result = AddSourceResult(
+                        added=tally.added,
                         already_present=tally.already_present,
                         refreshed=tally.refreshed,
                         removed=tally.removed,
                     )
-                    result.added.extend(d for d in tally.added if d is not None)
                     for path, reason in tally.failed:
                         result.failed.add(path=path, reason=reason)
                     yield AddSourceStreamMessage(result=result).SerializeToString()

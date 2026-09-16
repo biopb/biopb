@@ -406,10 +406,7 @@ class TestUnresolvedProxy:
         # (pyramid checks are now tensor-scoped on the resolved adapter).
         assert proxy.list_tensor_descriptors() == []
         assert proxy.is_resident() is False
-        desc = proxy.get_source_descriptor()
-        assert list(desc.tensors) == []
-        assert desc.data_resident is False
-        assert desc.source_type == "ome-zarr"
+        assert proxy.source_type == "ome-zarr"
         assert proxy.is_resolved is False
 
     def test_close_forwards_to_the_resolved_adapter(self):
@@ -492,10 +489,7 @@ class TestUnresolvedProxy:
                 source_type="ome-zarr",  # provisional guess; real type is "zarr"
                 on_resolved=lambda sid, ad: fired.update(sid=sid, type=ad._source_type),
             )
-            # resolve() returns the full, now-resolved descriptor directly.
-            desc = proxy.resolve()
-            assert [list(t.shape) for t in desc.tensors] == [[64, 128]]
-            assert desc.data_resident is True
+            proxy.resolve()
             assert proxy.is_resolved is True
             # The authoritative type came from re-probing the hydrated content.
             assert fired == {"sid": "s1", "type": "zarr"}
@@ -683,11 +677,11 @@ class TestCloudRegistrationEndToEnd:
         assert isinstance(adapter, UnresolvedSourceAdapter)
         assert adapter.list_tensor_descriptors() == []
         assert server._metadata_db.added[-1][0] == "cloud1"
-        assert adapter.get_source_descriptor().data_resident is False
+        assert adapter.is_resident() is False
 
-        # An explicit resolve -> backfills the DB with the concrete descriptor.
-        desc = adapter.resolve()
-        assert [list(t.shape) for t in desc.tensors] == [[32, 48]]
+        # An explicit resolve -> backfills the DB with the concrete row.
+        adapter.resolve()
+        assert [list(t.shape) for t in adapter.list_tensor_descriptors()] == [[32, 48]]
         # on_resolved fired a second sync_source_added (the upsert backfill).
         assert [sid for sid, _ in server._metadata_db.added].count("cloud1") == 2
         resolved_adapter = server._metadata_db.added[-1][1]
@@ -795,7 +789,7 @@ class TestCloudRescanGating:
         adapter = next(iter(server.registered.values()))
         assert isinstance(adapter, UnresolvedSourceAdapter)
         assert adapter.list_tensor_descriptors() == []
-        assert adapter.get_source_descriptor().data_resident is False
+        assert adapter.is_resident() is False
         # Catalogued in the DB with an empty (NULL-shape) row.
         assert server._metadata_db.added
 
@@ -970,8 +964,8 @@ class TestCloudRescanGating:
 class TestResolveAction:
     """The dedicated streaming `resolve` do_action: the SOLE resolution entry
     point. Emits ``ResolveStreamMessage`` progress heartbeats while the recall
-    runs, then one terminal message carrying the full DataSourceDescriptor in its
-    ``result`` arm."""
+    runs, then one terminal message carrying the source's now-concrete catalog
+    row in its ``source_row`` arm."""
 
     def _server(self, source_id, adapter):
         from biopb_tensor_server.serving.server import TensorFlightServer
@@ -987,9 +981,16 @@ class TestResolveAction:
         msgs = [ResolveStreamMessage.FromString(b) for b in bodies]
         return msgs, [m.WhichOneof("payload") for m in msgs]
 
-    def test_resolve_action_streams_full_descriptor(self):
+    @staticmethod
+    def _rows(msg):
+        import pyarrow as pa
+
+        return pa.ipc.open_stream(msg.source_row).read_all().to_pylist()
+
+    def test_resolve_action_streams_the_backfilled_catalog_row(self):
         import pyarrow.flight as flight
         import zarr
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 
@@ -1006,16 +1007,25 @@ class TestResolveAction:
             # do_action yields raw bytes (the Flight framework wraps each in a Result).
             bodies = [bytes(r) for r in server.do_action(None, action)]
             msgs, kinds = self._parse(bodies)
-            results = [
-                m.result for m, k in zip(msgs, kinds, strict=True) if k == "result"
+            terminal = [
+                m for m, k in zip(msgs, kinds, strict=True) if k == "source_row"
             ]
-            assert len(results) == 1  # exactly one terminal descriptor
-            assert kinds[-1] == "result"
-            desc = results[0]
-            assert desc.source_id == "cloud1"
-            assert [list(t.shape) for t in desc.tensors] == [[16, 24]]
-            assert desc.data_resident is True
+            assert len(terminal) == 1  # exactly one terminal row
+            assert kinds[-1] == "source_row"
+            (row,) = self._rows(terminal[0])
+            assert row["source_id"] == "cloud1"
+            assert [t["shape"] for t in row["tensors"]] == [[16, 24]]
+            assert row["data_resident"] is True
             assert proxy.is_resolved is True
+
+            # It IS the catalog row, not a second encoding built beside it. The
+            # backfill matters here: this server owns its catalog, so no
+            # SourceManager fired on_resolved and the placeholder row would
+            # otherwise still read empty.
+            browsed = server._metadata_db.query(
+                f"SELECT {SOURCE_ROW_COLUMNS} FROM sources WHERE source_id = 'cloud1'"
+            ).to_pylist()
+            assert browsed == [row]
 
     def test_resolve_action_emits_heartbeats_during_long_recall(self, monkeypatch):
         # The stream must carry progress keep-alives BEFORE the terminal descriptor
@@ -1031,7 +1041,7 @@ class TestResolveAction:
         import threading
 
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
         from biopb_tensor_server.serving import server as server_mod
 
         monkeypatch.setattr(server_mod, "_RESOLVE_HEARTBEAT_SECONDS", 0.01)
@@ -1041,12 +1051,22 @@ class TestResolveAction:
         class _SlowAdapter:
             source_url = None
             capability_token = None
+            catalog_url = "file:///slow"
+            source_type = "zarr"
+
+            def is_resident(self):
+                return True
+
+            def list_tensor_descriptors(self):
+                return [TensorDescriptor(array_id="slow", shape=[2, 2], dtype="uint8")]
+
+            def get_metadata(self):
+                return {}
 
             def resolve(self):
                 # Park until the test has observed the first heartbeat, then finish.
                 # Bounded wait so a broken test can never hang the drain below.
                 release.wait(timeout=5.0)
-                return DataSourceDescriptor(source_id="slow")
 
         server = self._server("slow", _SlowAdapter())
         action = flight.Action("resolve", b"slow")
@@ -1062,8 +1082,8 @@ class TestResolveAction:
 
         assert kinds[0] == "progress"  # deterministically, a heartbeat leads
         assert kinds.count("progress") >= 1  # at least one heartbeat
-        assert kinds[-1] == "result"  # terminal is the descriptor
-        assert msgs[-1].result.source_id == "slow"
+        assert kinds[-1] == "source_row"  # terminal is the catalog row
+        assert self._rows(msgs[-1])[0]["source_id"] == "slow"
         # progress heartbeats carry a monotonically non-decreasing elapsed clock
         elapsed = [
             m.progress.elapsed_seconds

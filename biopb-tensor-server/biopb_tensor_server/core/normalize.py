@@ -77,10 +77,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyarrow as pa
-from biopb.tensor.descriptor_pb2 import (
-    DataSourceDescriptor,
-    TensorDescriptor,
-)
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
@@ -323,19 +320,10 @@ class NormalizingAdapter(TensorAdapter):
         # is what carries the guarantee.
         return self._inner.get_metadata()
 
-    def get_source_descriptor(self) -> DataSourceDescriptor:
-        desc = self._inner.get_source_descriptor()
-        normalized = [_normalize_descriptor(t) for t in desc.tensors]
-        del desc.tensors[:]
-        desc.tensors.extend(normalized)
-        return desc
-
-    def resolve(self) -> DataSourceDescriptor:
-        desc = self._inner.resolve()
-        normalized = [_normalize_descriptor(t) for t in desc.tensors]
-        del desc.tensors[:]
-        desc.tensors.extend(normalized)
-        return desc
+    def resolve(self) -> None:
+        # Nothing to normalize: resolution hydrates, and the tensors the caller
+        # reads afterwards come back through list_tensor_descriptors above.
+        self._inner.resolve()
 
     def is_resident(self) -> bool:
         return self._inner.is_resident()

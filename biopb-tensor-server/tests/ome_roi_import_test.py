@@ -13,7 +13,7 @@ import math
 
 import pytest
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.adapters._ome_rois import (
     OME_SET_NAME,
     imported_annotations,
@@ -409,22 +409,22 @@ class _FakeAdapter:
             max_per_tensor=max_per_tensor,
         )
 
-    def get_source_descriptor(self):
-        return DataSourceDescriptor(
-            source_id=SOURCE_ID,
-            source_url="/data/exp.ome.tif",
-            source_type="ome-tiff",
-            tensors=[
-                TensorDescriptor(
-                    array_id=f"{SOURCE_ID}/{scene}",
-                    dim_labels=dims,
-                    shape=[1, 1, 1, 8, 8],
-                    dtype="uint8",
-                )
-                for scene, dims in self._tensors
-            ],
-            data_resident=True,
-        )
+    catalog_url = "/data/exp.ome.tif"
+    source_type = "ome-tiff"
+
+    def is_resident(self):
+        return True
+
+    def list_tensor_descriptors(self):
+        return [
+            TensorDescriptor(
+                array_id=f"{SOURCE_ID}/{scene}",
+                dim_labels=dims,
+                shape=[1, 1, 1, 8, 8],
+                dtype="uint8",
+            )
+            for scene, dims in self._tensors
+        ]
 
     def get_metadata(self):
         return self._metadata

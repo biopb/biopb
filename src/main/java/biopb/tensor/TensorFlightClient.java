@@ -1,5 +1,6 @@
 package biopb.tensor;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -23,13 +24,13 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
-import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
@@ -478,16 +479,15 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
      * @return The full DataSourceDescriptor with every tensor/field enumerated
-     * @throws IOException If the action fails or the server returns no descriptor
+     * @throws IOException If the action fails or the server returns no row
      */
     public DataSourceDescriptor resolve(String sourceId) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
-        // point that performs the (possibly minutes-long) recall and returns the
-        // full descriptor directly. The action streams ResolveStreamMessage
-        // progress heartbeats to keep the connection warm under proxy idle
-        // timeouts; the terminal message carries the descriptor in its `result`
-        // arm. (An empty body / bare serialized descriptor is also accepted for
-        // back-compat with a server predating the progress envelope.)
+        // point that performs the (possibly minutes-long) recall. The action
+        // streams ResolveStreamMessage progress heartbeats to keep the
+        // connection warm under proxy idle timeouts; the terminal message
+        // carries the source's now-concrete catalog row (Arrow IPC), decoded
+        // through the same descriptorsFromRows() that backs listSources().
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
                 "resolve",
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -497,27 +497,30 @@ public class TensorFlightClient implements AutoCloseable {
         while (iter.hasNext()) {
             byte[] body = iter.next().getBody();
             if (body == null || body.length == 0) {
-                continue; // legacy empty-body heartbeat (pre-envelope server)
+                continue;
             }
-            try {
-                ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
-                if (msg.getPayloadCase() == ResolveStreamMessage.PayloadCase.RESULT) {
-                    desc = msg.getResult();
-                } else if (msg.getPayloadCase() == ResolveStreamMessage.PayloadCase.PROGRESS) {
-                    continue; // heartbeat (no progress callback on the Java client yet)
-                } else {
-                    // Legacy server: a non-empty body IS a bare serialized descriptor.
-                    desc = DataSourceDescriptor.parseFrom(body);
+            ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
+            if (msg.getPayloadCase() != ResolveStreamMessage.PayloadCase.SOURCE_ROW) {
+                continue; // heartbeat (no progress callback on the Java client yet)
+            }
+            try (ArrowStreamReader reader = new ArrowStreamReader(
+                    new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
+                while (reader.loadNextBatch()) {
+                    List<DataSourceDescriptor> rows = descriptorsFromRows(reader.getVectorSchemaRoot());
+                    if (!rows.isEmpty()) {
+                        desc = rows.get(0);
+                    }
                 }
-            } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-                desc = DataSourceDescriptor.parseFrom(body); // legacy bare descriptor
             }
         }
         if (desc == null) {
             throw new IOException("resolve('" + sourceId
-                    + "') returned no descriptor (server closed the stream without a result)");
+                    + "') returned no catalog row (server closed the stream without a result)");
         }
         sources.put(sourceId, desc);
+        for (TensorDescriptor tensorDesc : desc.getTensorsList()) {
+            descriptors.put(tensorDesc.getArrayId(), tensorDesc);
+        }
         return desc;
     }
 

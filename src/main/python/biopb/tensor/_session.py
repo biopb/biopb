@@ -17,7 +17,7 @@ from ``biopb.tensor.client``.
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -781,8 +781,8 @@ class CatalogClient:
 
         The loop shared by :meth:`resolve` / :meth:`warm` / :meth:`add_source`:
         the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
-        into ``msg_cls`` (a bad parse yields ``which=None`` so a legacy bare-body
-        caller can fall back on the raw ``body``), and the old-server
+        into ``msg_cls`` (a bad parse yields ``which=None``, which every caller
+        ignores -- the SDK refuses a pre-v2 server at connect), and the old-server
         ``"Unknown action"`` -> :class:`RuntimeError` remap -- applied only when
         ``unknown_action_msg`` is given; otherwise the ``FlightServerError``
         propagates unchanged.
@@ -822,37 +822,37 @@ class CatalogClient:
         """Backs TensorFlightClient.resolve; see that method for the full
         documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
-        # entry point that performs the (possibly minutes-long) recall, and it
-        # returns the full DataSourceDescriptor directly -- no GetFlightInfo +
-        # list_sources two-step, so no truncation hole for multi-field sources
-        # beyond the list cap. The action streams ``ResolveStreamMessage``
-        # heartbeats (a ``progress`` arm) to keep the connection warm under proxy
-        # idle timeouts; the single terminal message carries the descriptor in
-        # its ``result`` arm. ``should_cancel`` / ``on_progress`` are polled once
-        # per received message, i.e. roughly once per server heartbeat.
+        # entry point that performs the (possibly minutes-long) recall, and its
+        # terminal message carries the source's now-concrete catalog row -- no
+        # GetFlightInfo + list_sources two-step, so no truncation hole for
+        # multi-field sources beyond the list cap. The action streams
+        # ``ResolveStreamMessage`` heartbeats (a ``progress`` arm) to keep the
+        # connection warm under proxy idle timeouts. ``should_cancel`` /
+        # ``on_progress`` are polled once per received message, i.e. roughly
+        # once per server heartbeat.
         action = flight.Action("resolve", source_id.encode("utf-8"))
-        desc: Optional[DataSourceDescriptor] = None
-        for which, msg, body in self._iter_action_messages(
-            action, ResolveStreamMessage
-        ):
+        row: Optional[Mapping[str, Any]] = None
+        for which, msg, _ in self._iter_action_messages(action, ResolveStreamMessage):
             if should_cancel is not None and should_cancel():
                 raise ResolveCancelled(f"resolve('{source_id}') cancelled by caller")
             if which == "progress":
                 if on_progress is not None:
                     on_progress(msg.progress)
-            elif which == "result":
-                desc = DataSourceDescriptor()
-                desc.CopyFrom(msg.result)
-            else:
-                # Legacy server: a non-empty body IS a bare serialized
-                # DataSourceDescriptor (pre-envelope protocol).
-                desc = DataSourceDescriptor.FromString(body)
-        if desc is None:
+            elif which == "source_row":
+                # The same row list_sources reads, through the same decoder --
+                # one representation of a source, so a resolve and a subsequent
+                # browse cannot disagree about it.
+                rows = pa.ipc.open_stream(msg.source_row).read_all().to_pylist()
+                if rows:
+                    row = rows[0]
+        if row is None:
             raise RuntimeError(
-                f"resolve('{source_id}') returned no descriptor "
+                f"resolve('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
+        desc = descriptor_from_row(row)
         self._state.sources[source_id] = desc
+        self._cache_tensors(desc)
         return desc
 
     def warm(

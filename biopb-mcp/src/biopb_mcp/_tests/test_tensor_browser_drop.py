@@ -47,7 +47,7 @@ def _result(added=(), already=(), refreshed=(), removed=(), failed=()):
 def test_worker_maps_single_result(_qapp):
     conn = MagicMock()
     conn.add_source.return_value = _result(
-        added=[MagicMock(source_id="a")],
+        added=["a"],
         already=["c"],
         refreshed=["c"],
         removed=["d"],
@@ -65,7 +65,7 @@ def test_worker_maps_single_result(_qapp):
 
     conn.add_source.assert_called_once()
     assert conn.add_source.call_args.args[0] == "/A"
-    assert [d.source_id for d in captured["added"]] == ["a"]
+    assert captured["added"] == ["a"]
     # A re-dropped path is reported as REBUILT, not as a no-op: the worker
     # relays `refreshed`, not `already_present` (biopb/biopb#944).
     assert captured["refreshed"] == ["c"]

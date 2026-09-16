@@ -81,13 +81,11 @@ class TestMirrorSourceUrlTree:
         assert a.seed_catalog([], {}, True, "file:///a/x.tif") is False
         assert a.seed_catalog([], {}, True, "file:///a/y.tif") is True
 
-    def test_descriptor_carries_the_tree_url(self):
-        # get_source_descriptor() is what the metadata-DB catalog stores.
+    def test_catalog_url_carries_the_tree_url(self):
+        # catalog_url is what the metadata-DB row stores.
         a = self._adapter()
         a.seed_catalog([], {}, True, "file:///labs/exp/img.tif")
-        assert (
-            a.get_source_descriptor().source_url == "grpc://store:8815/labs/exp/img.tif"
-        )
+        assert a.catalog_url == "grpc://store:8815/labs/exp/img.tif"
 
 
 # -------------------------------------------------------------------- end-to-end
@@ -1928,9 +1926,6 @@ class TestUnreachableUpstream:
         # no raise: empty placeholder catalog row, marked non-resident
         assert adapter.list_tensor_descriptors() == []
         assert adapter.is_resident() is False
-        desc = adapter.get_source_descriptor()
-        assert list(desc.tensors) == []
-        assert desc.data_resident is False
 
     def test_serve_surface_still_raises_when_unreachable(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -2582,16 +2577,21 @@ class _CatalogRowAdapter:
         self._resident = resident
         self._metadata = metadata or {}
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            data_resident=self._resident,
-            tensors=[TensorDescriptor(**t) for t in self._tensors],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    def is_resident(self):
+        return self._resident
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [TensorDescriptor(**t) for t in self._tensors]
 
     def get_metadata(self):
         return self._metadata
@@ -2785,9 +2785,7 @@ class TestAliasAndSchemeSurviveRegistration:
             # what a bulk upstream re-list seeds (biopb/biopb#297)
             adapter.seed_catalog([], {}, True, "file:///data/example")
             assert adapter._source_url == "grpcs://lab/data/example"
-            assert (
-                adapter.get_source_descriptor().source_url == "grpcs://lab/data/example"
-            )
+            assert adapter.catalog_url == "grpcs://lab/data/example"
         finally:
             server.shutdown()
 

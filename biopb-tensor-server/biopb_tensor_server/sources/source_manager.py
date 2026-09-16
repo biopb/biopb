@@ -115,7 +115,7 @@ class AddSourceTally:
     ids, so a mis-ordered unpack at one of the yield sites would be silent.
     """
 
-    added: List[Any] = field(default_factory=list)
+    added: List[str] = field(default_factory=list)
     already_present: List[str] = field(default_factory=list)
     refreshed: List[str] = field(default_factory=list)
     removed: List[str] = field(default_factory=list)
@@ -892,8 +892,8 @@ class SourceManager:
             targets = [
                 source_id
                 for source_id in source_ids
-                if (desc := self._descriptor_for(source_id)) is not None
-                and (desc.source_url == root_url or desc.source_url.startswith(prefix))
+                if (url := self._catalog_url_for(source_id)) is not None
+                and (url == root_url or url.startswith(prefix))
             ]
             for source_id in targets:
                 if self._reconciler._commit_remove_source(source_id):
@@ -1300,8 +1300,7 @@ class SourceManager:
                     if self._reconciler._commit_add_claim(
                         claim, catalog_url=catalog_url
                     ):
-                        desc = self._descriptor_for(claim.source_id)
-                        tally.added.append(desc)
+                        tally.added.append(claim.source_id)
                         yield ("progress", len(tally.added), str(claim.primary_path))
                     else:
                         tally.failed.append(
@@ -1356,10 +1355,10 @@ class SourceManager:
                 logger.info("Deregistered source %s: %s is gone", source_id, primary)
         return removed
 
-    def _descriptor_for(self, source_id: str):
-        """Fetch the registered source's DataSourceDescriptor (None if missing)."""
+    def _catalog_url_for(self, source_id: str) -> Optional[str]:
+        """The registered source's catalog ``source_url`` (None if missing)."""
         adapter = self._server.sources.get(source_id)
-        return adapter.get_source_descriptor() if adapter is not None else None
+        return adapter.catalog_url if adapter is not None else None
 
 
 def create_source_manager(

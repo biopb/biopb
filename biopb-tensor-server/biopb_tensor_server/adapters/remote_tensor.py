@@ -377,7 +377,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
         # the whole upstream catalog in one query_sources, it seeds these so
-        # registration (sync_source_added -> get_source_descriptor/get_metadata)
+        # registration (sync_source_added -> list_tensor_descriptors/get_metadata)
         # needs no per-source upstream RPC. None = not seeded (fall back to a live
         # per-source fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
@@ -528,8 +528,8 @@ class RemoteTensorAdapter(TensorAdapter):
 
         Called by the reconcile (biopb/biopb#266) with this source's row from a
         single upstream catalog fetch, so ``sync_source_added``
-        (``get_source_descriptor`` + ``get_metadata``) needs no per-source upstream
-        RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
+        (``list_tensor_descriptors`` + ``get_metadata``) needs no per-source
+        upstream RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
         array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
         exactly as the live path's ``_localize_descriptor`` would. Unlike the live
         ``list_tensor_descriptors`` (default field only), this seeds **all** of the

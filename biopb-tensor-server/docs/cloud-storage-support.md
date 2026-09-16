@@ -98,9 +98,9 @@ content read to resolve.
 `UnresolvedSourceAdapter` — a catalog row with empty `tensors` /
 `data_resident=false`. It is deliberately split into two surfaces:
 
-- a **catalog surface** (`list_tensor_descriptors` / `get_source_descriptor` /
-  `get_metadata`) that **never resolves**, keeping ListFlights, the metadata-DB
-  sync, and the precache worker cheap (precache loops the empty tensor list and
+- a **catalog surface** (`list_tensor_descriptors` / `get_metadata` /
+  `is_resident`) that **never resolves**, keeping the metadata-DB sync and the
+  precache worker cheap (precache loops the empty tensor list and
   skips before any serving call — an unresolved source is thus never
   background-warmed);
 - a **serve surface** (`get_tensor_adapter`) that raises `SourceUnresolvedError`,

@@ -36,21 +36,27 @@ class MockAdapter:
         self._shape = shape
         self._dtype = dtype
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            tensors=[
-                TensorDescriptor(
-                    array_id=self.source_id,
-                    shape=self._shape,
-                    dtype=self._dtype,
-                )
-            ],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    def is_resident(self):
+        return True
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [
+            TensorDescriptor(
+                array_id=self.source_id,
+                shape=self._shape,
+                dtype=self._dtype,
+            )
+        ]
 
     def get_metadata(self):
         return {

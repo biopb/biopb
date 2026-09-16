@@ -1,11 +1,16 @@
 """The ``sources`` catalog row as a ``DataSourceDescriptor``.
 
-The catalog is the browse surface (the ``catalog`` flight, SQL over DoGet); a
-``DataSourceDescriptor`` is the SDK's structural view of one row. Only the
-cheap, structural fields are carried: per-tensor ``array_id`` / ``dim_labels``
-/ ``shape`` / ``dtype`` from the ``tensors`` STRUCT[]. ``chunk_shape`` (the
-transfer grid), ``pyramid`` and ``metadata_json`` belong to the tensor-bound
-adapter and are answered by GetFlightInfo (biopb/biopb#812).
+The row is the only representation of a source that crosses the wire -- the
+``catalog`` flight streams them (SQL over DoGet) and ``resolve`` returns the
+one it just wrote. ``DataSourceDescriptor`` is the SDK's structural view of one
+row, built here. Only the cheap, structural fields are carried: per-tensor
+``array_id`` / ``dim_labels`` / ``shape`` / ``dtype`` from the ``tensors``
+STRUCT[]. ``chunk_shape`` (the transfer grid), ``pyramid`` and ``metadata_json``
+belong to the tensor-bound adapter and are answered by GetFlightInfo
+(biopb/biopb#812).
+
+``SOURCE_ROW_COLUMNS`` is the shared column contract, so the server selects it
+too (``MetadataDatabase.source_row_ipc``) and a client has one decoder.
 """
 
 from __future__ import annotations

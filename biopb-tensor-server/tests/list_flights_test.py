@@ -7,7 +7,7 @@ not flights -- browsing them is a catalog query, reading them is addressed.
 
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import TensorTicket
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
@@ -21,21 +21,24 @@ class _CatalogAdapter:
     def __init__(self, source_id):
         self.source_id = source_id
 
-    def get_source_descriptor(self):
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=f"file:///{self.source_id}",
-            source_type="zarr",
-            data_resident=True,
-            tensors=[
-                TensorDescriptor(
-                    array_id=self.source_id,
-                    shape=[10, 10],
-                    chunk_shape=[10, 10],
-                    dtype="uint8",
-                )
-            ],
-        )
+    source_type = "zarr"
+
+    @property
+    def catalog_url(self):
+        return f"file:///{self.source_id}"
+
+    def is_resident(self):
+        return True
+
+    def list_tensor_descriptors(self):
+        return [
+            TensorDescriptor(
+                array_id=self.source_id,
+                shape=[10, 10],
+                chunk_shape=[10, 10],  # stripped by catalog_tensors (#812)
+                dtype="uint8",
+            )
+        ]
 
     def get_metadata(self):
         return {}

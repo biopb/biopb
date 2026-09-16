@@ -8,7 +8,6 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.adapter_base import (
-    DataSourceDescriptor,
     TensorAdapter,
     TensorDescriptor,
     strip_source_prefix,
@@ -81,16 +80,6 @@ class MockMultifieldAdapter(TensorAdapter):
         if tensor_id in self._tensor_adapters:
             return self._tensor_adapters[tensor_id]
         raise ValueError(f"Unknown tensor: {tensor_id}")
-
-    def get_source_descriptor(self) -> DataSourceDescriptor:
-        """Build DataSourceDescriptor with correct source_id."""
-        return DataSourceDescriptor(
-            source_id=self.source_id,  # Use actual source_id, not tensor's
-            source_url=self._source_url,
-            source_type=self._source_type,
-            tensors=self.list_tensor_descriptors(),
-            metadata_json="",  # Not populated; returned via GetFlightInfo instead
-        )
 
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
@@ -190,22 +179,23 @@ class TestMultifieldSourceLevel:
         assert desc.array_id == "multifield-source/tensor_1"  # Full path
         assert desc.shape == [128, 128]
 
-    def test_get_source_descriptor_contains_all_tensors(self):
-        """get_source_descriptor() should contain all tensor info."""
+    def test_catalog_row_fields_cover_all_tensors(self):
+        """What the source contributes to its catalog row: its own id/url/type,
+        and a structural entry per tensor (not just tensors[0])."""
+        from biopb_tensor_server.core.adapter_base import catalog_tensors
+
         tensor_specs = [
             ("tensor_0", (64, 64), "uint8"),
             ("tensor_1", (128, 128), "uint16"),
         ]
         adapter = MockMultifieldAdapter("multifield-source", tensor_specs)
 
-        source_desc = adapter.get_source_descriptor()
-
-        assert source_desc.source_id == "multifield-source"  # Uses actual source_id
-        assert source_desc.source_url == "mock://multifield"
-        assert source_desc.source_type == "mock-multifield"
-        assert len(source_desc.tensors) == 2
-        assert source_desc.tensors[0].array_id == "tensor_0"
-        assert source_desc.tensors[1].array_id == "tensor_1"
+        assert adapter.source_id == "multifield-source"
+        assert adapter.catalog_url == "mock://multifield"
+        assert adapter.source_type == "mock-multifield"
+        entries = catalog_tensors(adapter)
+        assert [t.array_id for t in entries] == ["tensor_0", "tensor_1"]
+        assert all(not t.chunk_shape for t in entries)  # #812
 
 
 class TestMultifieldServerClient:

@@ -309,10 +309,12 @@ class TestNormalizedDescriptorAndData:
             )
             assert list(desc.chunk_shape) == native[::-1]
 
-    def test_source_descriptor_and_catalog_row_are_canonical(self):
+    def test_catalog_row_tensors_are_canonical(self):
+        from biopb_tensor_server.core.adapter_base import catalog_tensors
+
         with tempfile.TemporaryDirectory() as tmp:
             adapter, _ = self._wrapped(tmp)
-            tensors = adapter.get_source_descriptor().tensors
+            tensors = catalog_tensors(adapter)
             assert [list(t.dim_labels) for t in tensors] == [["z", "y", "x"]]
             assert [list(t.shape) for t in tensors] == [[4, 3, 2]]
             assert [list(t.dim_labels) for t in adapter.list_tensor_descriptors()] == [

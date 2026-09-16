@@ -80,7 +80,6 @@ class TestResolvedAdapterRegression:
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter = self._make_adapter(tmpdir)
             assert adapter.is_resident() is True
-            assert adapter.get_source_descriptor().data_resident is True
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -101,4 +100,3 @@ class TestRemoteSourceResidency:
             adapter._source_url = "s3://bucket/remote.zarr"
 
             assert adapter.is_resident() is False
-            assert adapter.get_source_descriptor().data_resident is False
