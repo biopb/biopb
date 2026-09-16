@@ -3206,8 +3206,7 @@ def create_app(
 #: ``metadata_json``: the listing is structural, and the OME tree is its own
 #: route (``/api/sources/{id}/metadata``).
 _SOURCE_LIST_SQL = (
-    "SELECT source_id, source_url, source_type, data_resident, is_resolved, "
-    "tensors FROM sources"
+    "SELECT source_id, source_url, source_type, is_resolved, tensors FROM sources"
 )
 
 
@@ -3224,14 +3223,13 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # listing carries the struct. A scalar that only describes tensors[0]
         # is a trap next to a real per-tensor list.
         #
-        # The two source-state flags, which say different things and both
-        # matter to the tree: `is_resolved` is deterministic and monotonic
-        # (does a real adapter back this row), `data_resident` is volatile and
-        # bidirectional (are the bytes here *now* -- a warmed source can be
-        # evicted back to placeholders). Defaults match the DuckDB column
-        # defaults, so a row from a server predating either column reads the
-        # way every pre-existing source should.
-        "data_resident": bool(row.get("data_resident", False)),
+        # Deliberately not `data_resident` either, for a different reason: a
+        # SQL column is the wrong shape for a value defined as "true right
+        # now", and this listing would only make a second client depend on the
+        # stale one (biopb/biopb#1035). `is_resolved` is the opposite case and
+        # belongs here -- monotonic, so a persisted row can only lag in the
+        # harmless direction. Default True for a row from a server predating
+        # the column, the right reading for every pre-existing source.
         "is_resolved": bool(row.get("is_resolved", True)),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }

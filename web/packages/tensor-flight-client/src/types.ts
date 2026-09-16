@@ -23,13 +23,6 @@ export interface DataSourceDescriptor {
   /** Raw OME-NGFF JSON string, or null. */
   metadata_json: string | null;
   /**
-   * Volatile: are this source's bytes actually here *now*? Sampled per
-   * request, and bidirectional — a warmed source evicted back to cloud
-   * placeholders flips this to false again. Not a substitute for
-   * `is_resolved`.
-   */
-  data_resident: boolean;
-  /**
    * Deterministic: does a real, hydrated adapter back this source right now?
    * False only for an unresolved cloud/synced-folder source awaiting an
    * explicit `resolve`. Unlike a residency/warm-state flag, this never flips

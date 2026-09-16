@@ -98,14 +98,12 @@ def _make_source_desc(
     source_url: str = "/data/src0",
     tensors=None,
     is_resolved: bool = True,
-    data_resident: bool = True,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         source_id=source_id,
         source_url=source_url,
         source_type="zarr",
         metadata_json=None,
-        data_resident=data_resident,
         is_resolved=is_resolved,
         # `is not None`, not `or`: an explicit [] means a tensorless source,
         # which is exactly what an unresolved row looks like.
@@ -120,9 +118,8 @@ def _source_row(desc) -> dict:
         "source_url": desc.source_url,
         "source_type": desc.source_type,
         # getattr: several bespoke SimpleNamespace descriptors in this file
-        # predate these fields and don't set them -- same defaults as
-        # production's _source_row_to_dict.
-        "data_resident": getattr(desc, "data_resident", False),
+        # predate the field and don't set it -- same default as production's
+        # _source_row_to_dict.
         "is_resolved": getattr(desc, "is_resolved", True),
         "tensors": [
             {
@@ -503,34 +500,6 @@ class TestSourcesEndpoints:
         ]
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.json()[0]["is_resolved"] is True
-
-    def test_list_sources_data_resident_field(self):
-        evicted = _make_source_desc(data_resident=False)
-        mock_fc = _build_mock_client(evicted)
-        with patch(
-            "biopb_tensor_server.serving.http_server.TensorFlightClient",
-            return_value=mock_fc,
-        ):
-            app = create_app(token=_TOKEN)
-            with TestClient(app, raise_server_exceptions=True) as tc:
-                r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        body = r.json()[0]
-        # Orthogonal to is_resolved: a resolved source whose bytes were evicted
-        # back to cloud placeholders is resident=False, resolved=True.
-        assert body["data_resident"] is False
-        assert body["is_resolved"] is True
-
-    def test_list_sources_data_resident_defaults_false_on_missing_column(
-        self, auth_client
-    ):
-        # Absent column reads as not-resident: claiming bytes are here is the
-        # expensive direction to be wrong in.
-        tc, mock_fc = auth_client
-        mock_fc.query_sources.side_effect = lambda sql, format="arrow": [  # noqa: A006
-            {"source_id": "src0", "source_url": "/d", "source_type": "zarr"}
-        ]
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.json()[0]["data_resident"] is False
 
 
 # ===========================================================================

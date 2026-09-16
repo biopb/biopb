@@ -28,7 +28,6 @@ const SOURCE: DataSourceDescriptor = {
   source_url: "file:///listed",
   source_type: "file",
   metadata_json: null,
-  data_resident: true,
   is_resolved: true,
   tensors: [],
 };
@@ -1257,10 +1256,13 @@ describe("catalogFingerprint", () => {
     expect(before).not.toBe(after);
   });
 
-  it("changes when residency flips either way", () => {
-    const resident = catalogFingerprint([{ ...SOURCE, data_resident: true }]);
-    const evicted = catalogFingerprint([{ ...SOURCE, data_resident: false }]);
-    expect(resident).not.toBe(evicted);
+  it("changes on a field it was never told about", () => {
+    // The point of stringifying the whole descriptor: a field added to
+    // DataSourceDescriptor later is covered without anyone remembering to
+    // extend this, which is how the url-only check went blind.
+    const before = catalogFingerprint([{ ...SOURCE, source_type: "zarr" }]);
+    const after = catalogFingerprint([{ ...SOURCE, source_type: "nd2" }]);
+    expect(before).not.toBe(after);
   });
 
   it("changes when a tensor's shape grows", () => {
