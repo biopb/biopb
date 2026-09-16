@@ -77,6 +77,43 @@ export function sourceLabel(src: DataSourceDescriptor): string {
   return parts[parts.length - 1] ?? src.source_id;
 }
 
+/** The last path segment of a bare id or url, falling back to the whole
+ * string -- for a short display label where only that string is known, not a
+ * full {@link DataSourceDescriptor} (e.g. a resolve/warm job's `source_id`). */
+export function shortId(idOrUrl: string): string {
+  const parts = getPathParts(idOrUrl);
+  return parts[parts.length - 1] ?? idOrUrl;
+}
+
+/**
+ * Glyph marking a source the server has not hydrated yet. Matches the napari
+ * `tensor_browser`'s own indicator so the two browsers read the same.
+ */
+export const UNRESOLVED_GLYPH = "\u2601";
+
+/** Hover copy for {@link UNRESOLVED_GLYPH}. */
+export const UNRESOLVED_TOOLTIP =
+  "Not resolved \u2014 this source's content is remote and has not been " +
+  "downloaded yet, so its tensors are unknown. It has to be resolved before " +
+  "it can be opened. (Cloud / remote source support is experimental.)";
+
+/**
+ * Has the server got a real, hydrated adapter behind this source?
+ *
+ * The catalog field, not `tensors.length === 0` -- napari infers it that way
+ * (`_is_unresolved`) and the inference is wrong in both directions: a resolved
+ * source can legitimately carry no tensor, and an unresolved one is not
+ * *defined* by the empty list, it just happens to have one. `is_resolved` is
+ * the server's own answer, and it is monotonic, so a listing can only ever lag
+ * in the harmless direction (biopb/biopb#1030).
+ *
+ * Defaults to resolved for a descriptor from a server predating the field --
+ * the right reading for every source that existed before it.
+ */
+export function isUnresolved(src: DataSourceDescriptor): boolean {
+  return src.is_resolved === false;
+}
+
 /**
  * The "Recent" folder, or null when nothing is in it.
  *

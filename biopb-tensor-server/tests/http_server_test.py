@@ -105,7 +105,9 @@ def _make_source_desc(
         source_type="zarr",
         metadata_json=None,
         is_resolved=is_resolved,
-        tensors=tensors or [_make_tensor_desc()],
+        # `is not None`, not `or`: an explicit [] means a tensorless source,
+        # which is exactly what an unresolved row looks like.
+        tensors=tensors if tensors is not None else [_make_tensor_desc()],
     )
 
 
@@ -184,11 +186,17 @@ def _build_mock_client(src_desc=None) -> MagicMock:
         "full_scan_in_progress": False,
     }
 
-    # get_tensor → lazy array whose .compute() returns a numpy array
-    arr = np.zeros(src.tensors[0].shape, dtype=src.tensors[0].dtype)
-    lazy = MagicMock()
-    lazy.compute.return_value = arr
-    mc.get_tensor.return_value = lazy
+    # get_tensor → lazy array whose .compute() returns a numpy array. A
+    # tensorless source (an unresolved one) has nothing to read, so the stub
+    # raises the way the real client would rather than inventing an array.
+    if src.tensors:
+        lazy = MagicMock()
+        lazy.compute.return_value = np.zeros(
+            src.tensors[0].shape, dtype=src.tensors[0].dtype
+        )
+        mc.get_tensor.return_value = lazy
+    else:
+        mc.get_tensor.side_effect = flight.FlightServerError("no tensors")
 
     return mc
 

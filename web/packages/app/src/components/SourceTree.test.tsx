@@ -2,7 +2,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { TreeRow } from "./SourceTree";
-import { type TreeNode, recentNode } from "../utils/sourceTree";
+import {
+  UNRESOLVED_GLYPH,
+  type TreeNode,
+  recentNode,
+} from "../utils/sourceTree";
 
 // `TreeRow` takes props, so it server-renders. `SourceTree` itself does not:
 // zustand's server snapshot is `getInitialState()`, so a store-reading component
@@ -75,5 +79,96 @@ describe("TreeRow under Recent", () => {
       depth: 1,
     });
     expect(html).toContain(`data-source-id="${LISTED.source_id}"`);
+  });
+});
+
+describe("TreeRow for an unresolved source", () => {
+  const CLOUD: DataSourceDescriptor = {
+    source_id: "onedrive_9c1",
+    source_url: "file:///data/cloud/timelapse.zarr",
+    source_type: "zarr",
+    metadata_json: null,
+    is_resolved: false,
+    tensors: [],
+  };
+
+  const sourceNode = (src: DataSourceDescriptor): TreeNode => ({
+    id: src.source_id,
+    name: "timelapse.zarr",
+    type: "source",
+    children: [],
+    source: src,
+    depth: 1,
+  });
+
+  it("marks it with the glyph napari uses and dims the row", () => {
+    const html = render(sourceNode(CLOUD));
+    expect(html).toContain(UNRESOLVED_GLYPH);
+    expect(html).toContain("unresolved");
+  });
+
+  it("is not openable: selecting it would fetch a tile that cannot exist", () => {
+    // The row is a div, not a button, so there is nothing to activate. That
+    // also keeps the Resolve button below legal -- interactive content cannot
+    // nest inside a button.
+    const html = render(sourceNode(CLOUD));
+    expect(html).toContain("<div");
+    expect(html).not.toContain("<button");
+  });
+
+  it("offers Resolve, the only control on the row", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={sourceNode(CLOUD)}
+        activeSourceId={null}
+        activeTensorId={null}
+        expandedFolders={new Set(["onedrive_9c1"])}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        startResolve={() => {}}
+        resolving={new Set()}
+      />,
+    );
+    expect(html).toContain("Resolve");
+    expect(html).toContain("resolve-btn");
+  });
+
+  it("says so instead of re-offering while a resolve is under way", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={sourceNode(CLOUD)}
+        activeSourceId={null}
+        activeTensorId={null}
+        expandedFolders={new Set(["onedrive_9c1"])}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        startResolve={() => {}}
+        resolving={new Set(["onedrive_9c1"])}
+      />,
+    );
+    expect(html).toContain("Resolving");
+    expect(html).toContain("disabled");
+  });
+
+  it("explains itself on hover, keeping the url", () => {
+    const html = render(sourceNode(CLOUD));
+    expect(html).toContain("Not resolved");
+    expect(html).toContain("timelapse.zarr");
+  });
+
+  it("leaves a resolved source untouched", () => {
+    // The guard is `is_resolved`, not "has no tensors" -- a resolved source
+    // that happens to list none must not be dimmed or disabled.
+    const html = render(sourceNode({ ...CLOUD, is_resolved: true }));
+    expect(html).not.toContain(UNRESOLVED_GLYPH);
+    expect(html).toContain("<button");
+  });
+
+  it("shows no shape badge, having nothing to report yet", () => {
+    const withTensors = { ...CLOUD, tensors: UPLOAD.tensors, is_resolved: true };
+    expect(render(sourceNode(withTensors))).toContain("1024×1024");
+    expect(render(sourceNode({ ...withTensors, is_resolved: false }))).not.toContain(
+      "1024×1024",
+    );
   });
 });

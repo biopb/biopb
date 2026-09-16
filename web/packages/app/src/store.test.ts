@@ -4,6 +4,7 @@ import type {
   DataSourceDescriptor,
   RoiAnnotation,
   RoiSetInfo,
+  SourceJobStatus,
   TensorFlightClient,
   TileInfo,
 } from "@biopb/tensor-flight-client";
@@ -19,6 +20,7 @@ import {
   selectContrastTrack,
   selectObservedLimits,
   selectTileInfo,
+  catalogFingerprint,
   useAppStore,
 } from "./store";
 
@@ -1224,5 +1226,218 @@ describe("recent sources", () => {
     useAppStore.setState({ recentIds: ["a"] });
     useAppStore.getState().syncRecents(["b", "a"]);
     expect(useAppStore.getState().recentIds).toEqual(["b", "a"]);
+  });
+});
+
+describe("catalogFingerprint", () => {
+  const tensor = (over = {}) => ({
+    array_id: "listed",
+    dim_labels: ["y", "x"],
+    shape: [4, 4],
+    chunk_shape: [],
+    dtype: "uint16",
+    ...over,
+  });
+
+  it("is stable across separately-built but equal listings", () => {
+    expect(catalogFingerprint([{ ...SOURCE }])).toBe(
+      catalogFingerprint([{ ...SOURCE }]),
+    );
+  });
+
+  it("changes when a source resolves in place", () => {
+    // The url set is identical here -- the whole point. Before this keyed on
+    // more than urls, a resolve that completed was invisible to the poll.
+    const before = catalogFingerprint([
+      { ...SOURCE, is_resolved: false, tensors: [] },
+    ]);
+    const after = catalogFingerprint([
+      { ...SOURCE, is_resolved: true, tensors: [tensor()] },
+    ]);
+    expect(before).not.toBe(after);
+  });
+
+  it("changes on a field it was never told about", () => {
+    // The point of stringifying the whole descriptor: a field added to
+    // DataSourceDescriptor later is covered without anyone remembering to
+    // extend this, which is how the url-only check went blind.
+    const before = catalogFingerprint([{ ...SOURCE, source_type: "zarr" }]);
+    const after = catalogFingerprint([{ ...SOURCE, source_type: "nd2" }]);
+    expect(before).not.toBe(after);
+  });
+
+  it("changes when a tensor's shape grows", () => {
+    const small = catalogFingerprint([{ ...SOURCE, tensors: [tensor()] }]);
+    const grown = catalogFingerprint([
+      { ...SOURCE, tensors: [tensor({ shape: [8, 4, 4] })] },
+    ]);
+    expect(small).not.toBe(grown);
+  });
+
+  it("changes when a source gains a second tensor", () => {
+    const one = catalogFingerprint([{ ...SOURCE, tensors: [tensor()] }]);
+    const two = catalogFingerprint([
+      { ...SOURCE, tensors: [tensor(), tensor({ array_id: "listed/b" })] },
+    ]);
+    expect(one).not.toBe(two);
+  });
+
+  it("does not collide across a field boundary", () => {
+    // Both of these concatenated to "abRD" under the hand-rolled version this
+    // replaced, so a poll could miss a change outright. JSON's own framing is
+    // what makes them distinguishable.
+    expect(
+      catalogFingerprint([{ ...SOURCE, source_id: "a", source_url: "b" }]),
+    ).not.toBe(
+      catalogFingerprint([{ ...SOURCE, source_id: "ab", source_url: "" }]),
+    );
+  });
+
+  it("does not collide across a source boundary", () => {
+    // Same failure one level up: two sources ran together into one string.
+    expect(
+      catalogFingerprint([
+        { ...SOURCE, source_id: "x", source_url: "" },
+        { ...SOURCE, source_id: "y", source_url: "" },
+      ]),
+    ).not.toBe(
+      catalogFingerprint([{ ...SOURCE, source_id: "xRDy", source_url: "" }]),
+    );
+  });
+});
+
+describe("resolve / warm jobs", () => {
+  const status = (over: Partial<SourceJobStatus> = {}): SourceJobStatus => ({
+    kind: "resolve",
+    source_id: "cloud0",
+    state: "running",
+    progress: {},
+    error: null,
+    elapsed_seconds: 0,
+    cancel_requested: false,
+    ...over,
+  });
+
+  const stubClient = (http: Record<string, unknown>) =>
+    ({ http, listSources: vi.fn().mockResolvedValue([]) }) as unknown as TensorFlightClient;
+
+  afterEach(() => {
+    useAppStore.getState().stopJobPolling();
+    useAppStore.setState({ sourceJobs: {}, client: null });
+  });
+
+  it("records the job the server hands back", async () => {
+    useAppStore.setState({
+      client: stubClient({
+        startResolve: vi.fn().mockResolvedValue(status({ started: true })),
+      }),
+    });
+    await useAppStore.getState().startResolve("cloud0");
+    expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe("running");
+  });
+
+  it("surfaces a resolve that never started", async () => {
+    // The modal reads sourceJobs, so a rejected POST has to leave an entry
+    // behind or the failure is invisible.
+    useAppStore.setState({
+      client: stubClient({
+        startResolve: vi.fn().mockRejectedValue(new Error("host unreachable")),
+      }),
+    });
+    await useAppStore.getState().startResolve("cloud0");
+    const job = useAppStore.getState().sourceJobs["resolve:cloud0"];
+    expect(job?.state).toBe("error");
+    expect(job?.error).toContain("host unreachable");
+  });
+
+  it("keeps resolve and warm on one source apart", async () => {
+    useAppStore.setState({
+      client: stubClient({
+        startResolve: vi.fn().mockResolvedValue(status()),
+        startWarm: vi.fn().mockResolvedValue(status({ kind: "warm" })),
+      }),
+    });
+    await useAppStore.getState().startResolve("cloud0");
+    await useAppStore.getState().startWarm("cloud0");
+    expect(Object.keys(useAppStore.getState().sourceJobs).sort()).toEqual([
+      "resolve:cloud0",
+      "warm:cloud0",
+    ]);
+  });
+
+  it("dismisses only the job named", async () => {
+    useAppStore.setState({
+      sourceJobs: {
+        "resolve:cloud0": status({ state: "error" }),
+        "warm:cloud0": status({ kind: "warm", state: "done" }),
+      },
+    });
+    useAppStore.getState().dismissSourceJob("resolve", "cloud0");
+    expect(Object.keys(useAppStore.getState().sourceJobs)).toEqual(["warm:cloud0"]);
+  });
+
+  it("a failed cancel leaves the job alone", async () => {
+    // Only the server can stop the recall, and it re-reports the flag on the
+    // next poll -- a failed cancel means the button has not taken yet, which is
+    // not something to tell the user about.
+    useAppStore.setState({
+      client: stubClient({ cancelJob: vi.fn().mockRejectedValue(new Error("nope")) }),
+      sourceJobs: { "warm:cloud0": status({ kind: "warm" }) },
+    });
+    await useAppStore.getState().cancelSourceJob("warm", "cloud0");
+    expect(useAppStore.getState().sourceJobs["warm:cloud0"]?.state).toBe("running");
+  });
+
+  it("auto-warms once a resolve lands, with no second confirmation", async () => {
+    // Matching napari: the user already consented to the expensive part. And
+    // unconditionally -- the server answers "is there anything to warm"
+    // structurally, so this side keeps no list of multi-file source types.
+    const listSources = vi.fn().mockResolvedValue([]);
+    const startWarm = vi.fn().mockResolvedValue(status({ kind: "warm" }));
+    const client = {
+      listSources,
+      http: {
+        startResolve: vi.fn().mockResolvedValue(status()),
+        jobStatus: vi.fn().mockResolvedValue(status({ state: "done" })),
+        startWarm,
+      },
+    } as unknown as TensorFlightClient;
+    useAppStore.setState({ client });
+
+    await useAppStore.getState().startResolve("cloud0");
+    await vi.waitFor(
+      () => expect(useAppStore.getState().sourceJobs["warm:cloud0"]).toBeDefined(),
+      { timeout: 3000 },
+    );
+    // The row is stale the moment a resolve lands -- it still lists the
+    // pre-resolve tensors -- so the catalog is re-read before the warm starts.
+    expect(listSources).toHaveBeenCalled();
+    expect(startWarm).toHaveBeenCalledWith("cloud0");
+  });
+
+  it("does not auto-warm a resolve that failed or was cancelled", async () => {
+    const startWarm = vi.fn();
+    for (const state of ["error", "cancelled"] as const) {
+      useAppStore.setState({
+        sourceJobs: {},
+        client: {
+          listSources: vi.fn().mockResolvedValue([]),
+          http: {
+            startResolve: vi.fn().mockResolvedValue(status()),
+            jobStatus: vi.fn().mockResolvedValue(status({ state })),
+            startWarm,
+          },
+        } as unknown as TensorFlightClient,
+      });
+      await useAppStore.getState().startResolve("cloud0");
+      await vi.waitFor(
+        () =>
+          expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe(
+            state,
+          ),
+        { timeout: 3000 },
+      );
+    }
+    expect(startWarm).not.toHaveBeenCalled();
   });
 });

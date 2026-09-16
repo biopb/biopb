@@ -3218,10 +3218,18 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_type": row.get("source_type") or "",
         # Always null on a listing; see _SOURCE_LIST_SQL.
         "metadata_json": None,
-        # Deterministic (unlike data_resident, deliberately not projected
-        # here): does a real, hydrated adapter back this row. Default True on
-        # a row from a server predating this column (DuckDB's column
-        # default), which is the right reading for every pre-existing source.
+        # Deliberately not the scalar dtype/shape_summary columns: those exist
+        # for catalog clients that never read the tensors struct, and this
+        # listing carries the struct. A scalar that only describes tensors[0]
+        # is a trap next to a real per-tensor list.
+        #
+        # Deliberately not `data_resident` either, for a different reason: a
+        # SQL column is the wrong shape for a value defined as "true right
+        # now", and this listing would only make a second client depend on the
+        # stale one (biopb/biopb#1035). `is_resolved` is the opposite case and
+        # belongs here -- monotonic, so a persisted row can only lag in the
+        # harmless direction. Default True for a row from a server predating
+        # the column, the right reading for every pre-existing source.
         "is_resolved": bool(row.get("is_resolved", True)),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }

@@ -5,10 +5,14 @@ import { selectTileInfo, useAppStore } from "../store";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { splitArrayVersion } from "@biopb/tensor-flight-client";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
+import { WarmTray } from "./WarmTray";
 import {
   RECENT_FOLDER_ID,
   type TreeNode,
+  UNRESOLVED_GLYPH,
+  UNRESOLVED_TOOLTIP,
   getPathParts,
+  isUnresolved,
   matchesQuery,
   recentNode,
   sourceLabel,
@@ -218,6 +222,14 @@ export interface TreeRowProps {
   expandedFolders: Set<string>;
   toggleFolder: (id: string) => void;
   selectSource: (sourceId: string, tensorId?: string) => void;
+  /**
+   * Begin resolving an unresolved source. Optional so `TreeRow` stays a pure
+   * props component (it is rendered standalone in tests); a row without it
+   * simply shows no resolve button.
+   */
+  startResolve?: (sourceId: string) => void;
+  /** Source ids with a resolve already under way, so the button can say so. */
+  resolving?: ReadonlySet<string>;
 }
 
 export function TreeRow({
@@ -227,6 +239,8 @@ export function TreeRow({
   expandedFolders,
   toggleFolder,
   selectSource,
+  startResolve,
+  resolving,
 }: TreeRowProps) {
   const indent = node.depth * 12 + 12;
 
@@ -258,6 +272,8 @@ export function TreeRow({
               expandedFolders={expandedFolders}
               toggleFolder={toggleFolder}
               selectSource={selectSource}
+              startResolve={startResolve}
+              resolving={resolving}
             />
           ))}
       </>
@@ -269,6 +285,51 @@ export function TreeRow({
   const isActive = src.source_id === activeSourceId;
   const hasMultipleTensors = src.tensors.length > 1;
   const firstTensor = src.tensors[0];
+  // An unresolved source has no tensor to read, so selecting it would send the
+  // viewer after a tile that cannot exist.
+  const unresolved = isUnresolved(src);
+  const inFlight = resolving?.has(src.source_id) ?? false;
+
+  // An unresolved row is a plain div, not a disabled button: it carries a real
+  // Resolve button, and interactive content cannot nest inside a button. The
+  // row itself has nothing to activate -- there is no tensor to open until the
+  // server hydrates it -- so dropping it from the tab order costs nothing and
+  // leaves exactly one focusable control, the one that does something.
+  if (unresolved) {
+    return (
+      <div
+        className="tree-item unresolved"
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          paddingLeft: indent,
+        }}
+        data-source-id={node.id === src.source_id ? src.source_id : undefined}
+        title={`${src.source_url}\n${UNRESOLVED_TOOLTIP}`}
+      >
+        <ChevronSlot />
+        <span className="unresolved-glyph" aria-label="Not resolved">
+          {UNRESOLVED_GLYPH}
+        </span>
+        <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
+        {startResolve ? (
+          <button
+            className="resolve-btn"
+            disabled={inFlight}
+            onClick={() => startResolve(src.source_id)}
+            title={
+              inFlight
+                ? "Already resolving this source"
+                : "Resolve this source \u2014 downloads its content, which can take minutes"
+            }
+          >
+            {inFlight ? "Resolving\u2026" : "Resolve"}
+          </button>
+        ) : null}
+      </div>
+    );
+  }
 
   return (
     <>
@@ -362,6 +423,20 @@ export function SourceTree() {
   const recentSources = useAppStore((s) => s.recentSources);
   const syncRecents = useAppStore((s) => s.syncRecents);
   const hydrateRecents = useAppStore((s) => s.hydrateRecents);
+  const startResolve = useAppStore((s) => s.startResolve);
+  const sourceJobs = useAppStore((s) => s.sourceJobs);
+
+  // Ids whose resolve is under way, so a row can say so rather than offering a
+  // button that would only join the job it already started.
+  const resolving = useMemo(
+    () =>
+      new Set(
+        Object.values(sourceJobs)
+          .filter((j) => j.kind === "resolve" && j.state === "running")
+          .map((j) => j.source_id),
+      ),
+    [sourceJobs],
+  );
 
   const [query, setQuery] = useState("");
   const [serverFilteredIds, setServerFilteredIds] = useState<Set<string> | null>(null);
@@ -599,12 +674,15 @@ export function SourceTree() {
                   expandedFolders={expandedFolders}
                   toggleFolder={toggleFolder}
                   selectSource={selectSource}
+                  startResolve={startResolve}
+                  resolving={resolving}
                 />
               ))
             )}
           </>
         )}
       </div>
+      <WarmTray />
     </section>
   );
 }

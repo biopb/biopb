@@ -109,6 +109,113 @@ html, body {
 .tree-item:hover { background: #1e2435; color: #e2e8f0; }
 .tree-item.active { background: #2a3347; color: #60a5fa; }
 
+/* An unresolved (cloud / synced-folder) source: dimmed and not openable until
+   the server hydrates it. Matches the napari tensor_browser's greyed row. */
+.tree-item.unresolved {
+  color: #64748b;
+  cursor: not-allowed;
+  font-style: italic;
+}
+.tree-item.unresolved:hover { background: none; color: #64748b; }
+
+.unresolved-glyph {
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1;
+  opacity: 0.8;
+}
+
+/* Resolve trigger, in the slot an unresolved row's shape badge would occupy.
+   A span with role=button, not a <button>: it sits inside the row's own button
+   and nested interactive elements are invalid HTML. */
+.resolve-btn {
+  font-size: 10px;
+  font-style: normal;
+  background: #1e3a5f;
+  border: 1px solid #2d5a8f;
+  border-radius: 3px;
+  padding: 1px 6px;
+  margin-left: 8px;
+  color: #93c5fd;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.resolve-btn:hover { background: #2d5a8f; color: #dbeafe; }
+
+/* Hydrate-ahead tray, pinned to the foot of the catalog pane. flex-shrink so
+   it keeps its height while the tree above it takes the slack. */
+.warm-tray {
+  flex-shrink: 0;
+  border-top: 1px solid #2d3748;
+  background: #11151d;
+  padding: 0.5rem 0.75rem 0.6rem;
+  max-height: 40%;
+  overflow-y: auto;
+}
+.warm-tray-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #64748b;
+  margin-bottom: 0.4rem;
+}
+.warm-tray-list { list-style: none; margin: 0; padding: 0; }
+
+.warm-row { margin-bottom: 0.55rem; }
+.warm-row:last-child { margin-bottom: 0; }
+.warm-row-head { display: flex; align-items: center; gap: 0.5rem; }
+.warm-row-name {
+  flex: 1;
+  font-size: 11px;
+  color: #cbd5e1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.warm-row-action {
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 10px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.warm-row-action:hover:not(:disabled) { color: #e2e8f0; }
+.warm-row-action:disabled { cursor: default; opacity: 0.6; }
+.warm-row-detail { font-size: 10px; color: #64748b; margin-top: 2px; }
+.warm-row.error .warm-row-detail { color: #fca5a5; }
+
+.warm-bar {
+  height: 3px;
+  background: #1e293b;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+.warm-bar-fill { height: 100%; background: #3b82f6; transition: width 0.2s; }
+.warm-row.done .warm-bar-fill { background: #34d399; }
+.warm-row.error .warm-bar-fill { background: #ef4444; }
+.warm-row.cancelled .warm-bar-fill { background: #64748b; }
+
+/* Enumerating, or a resolve, where the server reports no completed fraction at
+   all -- so the bar has to say "working" without implying a number. */
+.warm-bar.indeterminate .warm-bar-fill {
+  width: 100% !important;
+  background: linear-gradient(
+    90deg,
+    transparent 0%, #3b82f6 50%, transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: warm-sweep 1.4s linear infinite;
+}
+@keyframes warm-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .warm-bar.indeterminate .warm-bar-fill { animation: none; opacity: 0.55; }
+}
+
 .tree-folder {
   color: #e2e8f0;
   font-weight: 500;

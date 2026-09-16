@@ -20,6 +20,7 @@ import type {
   DiagnosticsSnapshot,
   QuerySourcesResult,
   ReadyzSnapshot,
+  SourceJobStatus,
   SliceRequest,
   TileInfo,
   TileRequest,
@@ -408,6 +409,66 @@ export class TensorHttpClient {
     return this.fetchJson<DataSourceDescriptor[]>(
       "/api/sources",
       undefined,
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
+
+  // -- Resolve / warm jobs --------------------------------------------------
+  //
+  // Start -> poll -> optionally cancel. Starting is idempotent per source: the
+  // server keys jobs by (kind, source_id), so a double-click joins the recall
+  // already in flight rather than downloading the same bytes twice.
+
+  /** Begin resolving an unresolved source, or join the resolve already running. */
+  async startResolve(
+    sourceId: string,
+    opts?: RequestOptions,
+  ): Promise<SourceJobStatus> {
+    return this.startJob("resolve", sourceId, opts);
+  }
+
+  /** Begin (or join) a hydrate-ahead warm of a resolved source. */
+  async startWarm(sourceId: string, opts?: RequestOptions): Promise<SourceJobStatus> {
+    return this.startJob("warm", sourceId, opts);
+  }
+
+  /** Poll a job. Rejects with a 404 `TensorApiError` if none was started. */
+  async jobStatus(
+    kind: "resolve" | "warm",
+    sourceId: string,
+    opts?: RequestOptions,
+  ): Promise<SourceJobStatus> {
+    return this.fetchJson<SourceJobStatus>(
+      `/api/sources/${encodeURIComponent(sourceId)}/${kind}/status`,
+      undefined,
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
+
+  /** Ask a job to stop. A no-op on one that already finished, not an error. */
+  async cancelJob(
+    kind: "resolve" | "warm",
+    sourceId: string,
+    opts?: RequestOptions,
+  ): Promise<SourceJobStatus> {
+    return this.fetchJson<SourceJobStatus>(
+      `/api/sources/${encodeURIComponent(sourceId)}/${kind}/cancel`,
+      { method: "POST" },
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
+
+  private async startJob(
+    kind: "resolve" | "warm",
+    sourceId: string,
+    opts?: RequestOptions,
+  ): Promise<SourceJobStatus> {
+    return this.fetchJson<SourceJobStatus>(
+      `/api/sources/${encodeURIComponent(sourceId)}/${kind}`,
+      { method: "POST" },
       this.metadataTimeoutMs,
       opts,
     );
