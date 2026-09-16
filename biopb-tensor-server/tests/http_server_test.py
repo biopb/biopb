@@ -98,26 +98,37 @@ def _make_source_desc(
     source_url: str = "/data/src0",
     tensors=None,
     is_resolved: bool = True,
+    data_resident: bool = True,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         source_id=source_id,
         source_url=source_url,
         source_type="zarr",
         metadata_json=None,
+        data_resident=data_resident,
         is_resolved=is_resolved,
-        tensors=tensors or [_make_tensor_desc()],
+        # `is not None`, not `or`: an explicit [] means a tensorless source,
+        # which is exactly what an unresolved row looks like.
+        tensors=tensors if tensors is not None else [_make_tensor_desc()],
     )
 
 
 def _source_row(desc) -> dict:
     """The `sources` catalog row a real ``query_sources`` would hand back."""
+    tensors = list(desc.tensors)
     return {
         "source_id": desc.source_id,
         "source_url": desc.source_url,
         "source_type": desc.source_type,
+        # The scalar columns are tensors[0] projections written in the same
+        # upsert as the struct below, so mirror them off the same list rather
+        # than letting a fixture set them independently.
+        "dtype": tensors[0].dtype if tensors else None,
+        "shape_summary": json.dumps(list(tensors[0].shape)) if tensors else None,
         # getattr: several bespoke SimpleNamespace descriptors in this file
-        # predate the field and don't set it -- same default as production's
-        # _source_row_to_dict.
+        # predate these fields and don't set them -- same defaults as
+        # production's _source_row_to_dict.
+        "data_resident": getattr(desc, "data_resident", False),
         "is_resolved": getattr(desc, "is_resolved", True),
         "tensors": [
             {
@@ -126,7 +137,7 @@ def _source_row(desc) -> dict:
                 "shape": list(t.shape),
                 "dtype": t.dtype,
             }
-            for t in desc.tensors
+            for t in tensors
         ],
     }
 
@@ -184,11 +195,17 @@ def _build_mock_client(src_desc=None) -> MagicMock:
         "full_scan_in_progress": False,
     }
 
-    # get_tensor → lazy array whose .compute() returns a numpy array
-    arr = np.zeros(src.tensors[0].shape, dtype=src.tensors[0].dtype)
-    lazy = MagicMock()
-    lazy.compute.return_value = arr
-    mc.get_tensor.return_value = lazy
+    # get_tensor → lazy array whose .compute() returns a numpy array. A
+    # tensorless source (an unresolved one) has nothing to read, so the stub
+    # raises the way the real client would rather than inventing an array.
+    if src.tensors:
+        lazy = MagicMock()
+        lazy.compute.return_value = np.zeros(
+            src.tensors[0].shape, dtype=src.tensors[0].dtype
+        )
+        mc.get_tensor.return_value = lazy
+    else:
+        mc.get_tensor.side_effect = flight.FlightServerError("no tensors")
 
     return mc
 
@@ -492,6 +509,72 @@ class TestSourcesEndpoints:
         ]
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.json()[0]["is_resolved"] is True
+
+    def test_list_sources_data_resident_field(self):
+        evicted = _make_source_desc(data_resident=False)
+        mock_fc = _build_mock_client(evicted)
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        body = r.json()[0]
+        # Orthogonal to is_resolved: a resolved source whose bytes were evicted
+        # back to cloud placeholders is resident=False, resolved=True.
+        assert body["data_resident"] is False
+        assert body["is_resolved"] is True
+
+    def test_list_sources_data_resident_defaults_false_on_missing_column(
+        self, auth_client
+    ):
+        # Absent column reads as not-resident: claiming bytes are here is the
+        # expensive direction to be wrong in.
+        tc, mock_fc = auth_client
+        mock_fc.query_sources.side_effect = lambda sql, format="arrow": [  # noqa: A006
+            {"source_id": "src0", "source_url": "/d", "source_type": "zarr"}
+        ]
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.json()[0]["data_resident"] is False
+
+    def test_list_sources_scalar_projections(self, auth_client):
+        tc, _ = auth_client
+        body = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()[0]
+        first = body["tensors"][0]
+        # Scalar columns describe tensors[0] and are decoded, not raw JSON text.
+        assert body["dtype"] == first["dtype"]
+        assert body["shape_summary"] == first["shape"]
+
+    def test_list_sources_scalar_projections_null_without_tensors(self):
+        mock_fc = _build_mock_client(
+            _make_source_desc(tensors=[], is_resolved=False, data_resident=False)
+        )
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                body = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()[0]
+        assert body["dtype"] is None
+        assert body["shape_summary"] is None
+
+    def test_list_sources_survives_malformed_shape_summary(self, auth_client):
+        # One unparseable row must not 500 the whole listing.
+        tc, mock_fc = auth_client
+        mock_fc.query_sources.side_effect = lambda sql, format="arrow": [  # noqa: A006
+            {
+                "source_id": "src0",
+                "source_url": "/d",
+                "source_type": "zarr",
+                "shape_summary": "not json",
+                "tensors": [],
+            }
+        ]
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.status_code == 200
+        assert r.json()[0]["shape_summary"] is None
 
 
 # ===========================================================================

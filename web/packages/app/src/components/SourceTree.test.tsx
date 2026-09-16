@@ -14,6 +14,9 @@ const LISTED: DataSourceDescriptor = {
   source_url: "file:///data/experiment/plate1.zarr",
   source_type: "zarr",
   metadata_json: null,
+  dtype: null,
+  shape_summary: null,
+  data_resident: true,
   is_resolved: true,
   tensors: [],
 };
@@ -23,6 +26,9 @@ const UPLOAD: DataSourceDescriptor = {
   source_url: "",
   source_type: "",
   metadata_json: null,
+  dtype: null,
+  shape_summary: null,
+  data_resident: true,
   is_resolved: true,
   tensors: [
     {

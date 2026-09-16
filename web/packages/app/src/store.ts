@@ -175,12 +175,11 @@ export interface AppState {
    * The transfer grid of the tensor in view, published by whichever viewer
    * mounted it.
    *
-   * The catalog's descriptor is not a substitute: `/api/sources` is a listing,
-   * refreshed only when the set of source *urls* changes, so a source that
-   * gains a tensor or a timelapse whose `T` grows keeps its old `shape` there
-   * until a reload. Bounding a slider on that means a control that cannot reach
-   * frames the tensor has. `tile_info` is fetch-per-call and answers for the
-   * tensor as it is now.
+   * The catalog's descriptor is not a substitute: `/api/sources` is a listing
+   * refreshed on a 60s poll, so a timelapse whose `T` grows keeps its old
+   * `shape` there until the next tick. Bounding a slider on that means a
+   * control that cannot reach frames the tensor has. `tile_info` is
+   * fetch-per-call and answers for the tensor as it is now.
    *
    * Null while nothing is loaded, and cleared on a source change so a stale
    * grid can never bound the next tensor.
@@ -466,6 +465,31 @@ export interface AppState {
 
 // Internal timer storage (non-reactive, module-level)
 let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Everything about a catalog listing the tree renders off, as one string.
+ *
+ * The poll used to diff the `source_url` set alone, which is blind to every
+ * in-place change: a cloud source that resolves was already listed under that
+ * url, it just gained its tensors and flipped its flags, so the tree kept
+ * showing it as unresolved until a manual reload (biopb/biopb#1030). Warming
+ * and eviction are invisible the same way.
+ */
+export function catalogFingerprint(sources: DataSourceDescriptor[]): string {
+  return sources
+    .map((s) =>
+      [
+        s.source_id,
+        s.source_url,
+        s.is_resolved ? "R" : "-",
+        s.data_resident ? "D" : "-",
+        s.tensors
+          .map((t) => `${t.array_id}|${t.dtype}|${t.shape.join("x")}`)
+          .join(","),
+      ].join(""),
+    )
+    .join("");
+}
 
 // LocalStorage key for channel color persistence
 const CHANNEL_COLORS_STORAGE_KEY = "biopb_channel_colors";
@@ -1238,11 +1262,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           // ignore transient readyz errors
         }
 
-        // Compare source_urls to detect changes
-        const oldUrls = sources.map((s) => s.source_url).join(",");
-        const newUrls = sorted.map((s) => s.source_url).join(",");
-
-        if (oldUrls !== newUrls) {
+        if (catalogFingerprint(sources) !== catalogFingerprint(sorted)) {
           set({ sources: sorted });
 
           // A catalog response is a listing, not proof that an unlisted source

@@ -19,6 +19,7 @@ import {
   selectContrastTrack,
   selectObservedLimits,
   selectTileInfo,
+  catalogFingerprint,
   useAppStore,
 } from "./store";
 
@@ -27,6 +28,9 @@ const SOURCE: DataSourceDescriptor = {
   source_url: "file:///listed",
   source_type: "file",
   metadata_json: null,
+  dtype: null,
+  shape_summary: null,
+  data_resident: true,
   is_resolved: true,
   tensors: [],
 };
@@ -1224,5 +1228,68 @@ describe("recent sources", () => {
     useAppStore.setState({ recentIds: ["a"] });
     useAppStore.getState().syncRecents(["b", "a"]);
     expect(useAppStore.getState().recentIds).toEqual(["b", "a"]);
+  });
+});
+
+describe("catalogFingerprint", () => {
+  const tensor = (over = {}) => ({
+    array_id: "listed",
+    dim_labels: ["y", "x"],
+    shape: [4, 4],
+    chunk_shape: [],
+    dtype: "uint16",
+    ...over,
+  });
+
+  it("is stable across separately-built but equal listings", () => {
+    expect(catalogFingerprint([{ ...SOURCE }])).toBe(
+      catalogFingerprint([{ ...SOURCE }]),
+    );
+  });
+
+  it("changes when a source resolves in place", () => {
+    // The url set is identical here -- the whole point. Before this keyed on
+    // more than urls, a resolve that completed was invisible to the poll.
+    const before = catalogFingerprint([
+      { ...SOURCE, is_resolved: false, tensors: [] },
+    ]);
+    const after = catalogFingerprint([
+      { ...SOURCE, is_resolved: true, tensors: [tensor()] },
+    ]);
+    expect(before).not.toBe(after);
+  });
+
+  it("changes when residency flips either way", () => {
+    const resident = catalogFingerprint([{ ...SOURCE, data_resident: true }]);
+    const evicted = catalogFingerprint([{ ...SOURCE, data_resident: false }]);
+    expect(resident).not.toBe(evicted);
+  });
+
+  it("changes when a tensor's shape grows", () => {
+    const small = catalogFingerprint([{ ...SOURCE, tensors: [tensor()] }]);
+    const grown = catalogFingerprint([
+      { ...SOURCE, tensors: [tensor({ shape: [8, 4, 4] })] },
+    ]);
+    expect(small).not.toBe(grown);
+  });
+
+  it("changes when a source gains a second tensor", () => {
+    const one = catalogFingerprint([{ ...SOURCE, tensors: [tensor()] }]);
+    const two = catalogFingerprint([
+      { ...SOURCE, tensors: [tensor(), tensor({ array_id: "listed/b" })] },
+    ]);
+    expect(one).not.toBe(two);
+  });
+
+  it("does not collide across a source boundary", () => {
+    // Field and record separators exist so "a" + "b" can't read as "ab".
+    const split = catalogFingerprint([
+      { ...SOURCE, source_id: "a", source_url: "" },
+      { ...SOURCE, source_id: "b", source_url: "" },
+    ]);
+    const joined = catalogFingerprint([
+      { ...SOURCE, source_id: "ab", source_url: "" },
+    ]);
+    expect(split).not.toBe(joined);
   });
 });
