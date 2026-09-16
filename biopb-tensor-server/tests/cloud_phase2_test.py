@@ -1561,6 +1561,50 @@ class TestWarmAction:
         assert kinds == ["done"]
         assert msgs[-1].done.files_total == 0  # nothing to warm
 
+    def test_warm_refuses_a_remote_source(self):
+        """A remote url has no local tree to recall into, so warm fails loudly.
+
+        It used to fall into the single-file no-op and answer `files_total == 0`
+        -- the same thing a local single-file source says when it genuinely had
+        nothing left to warm. A caller could not tell "finished" from "never
+        applicable", which is the shape of bug biopb/biopb#1032 was about, one
+        action over (biopb/biopb#1035).
+        """
+        import pyarrow.flight as flight
+
+        server = self._server("s9", _DirAdapter("grpc://lab/img.zarr"))
+        with pytest.raises(flight.FlightServerError, match="remote"):
+            list(server.do_action(_Ctx(), flight.Action("warm", b"s9")))
+
+    def test_warm_names_the_scheme_and_where_to_go(self):
+        # The message has to be actionable: which source, why it cannot work
+        # here, and that the data's own server is where to warm it.
+        import pyarrow.flight as flight
+
+        server = self._server("s10", _DirAdapter("s3://bucket/img.zarr"))
+        with pytest.raises(flight.FlightServerError) as caught:
+            list(server.do_action(_Ctx(), flight.Action("warm", b"s10")))
+        message = str(caught.value)
+        assert "s10" in message
+        assert "s3" in message
+        assert "server that holds the data" in message
+
+    def test_warm_still_no_ops_on_a_local_single_file_source(self, tmp_path):
+        # The counterpart the refusal must not swallow: `files_total == 0` stays
+        # the signal for "local, and there was nothing to warm" -- a client
+        # (the web SPA) reads exactly that to know a source is single-file.
+        import pyarrow.flight as flight
+
+        f = tmp_path / "scan.nii"
+        f.write_bytes(b"payload")
+        server = self._server("s11", _DirAdapter(str(f)))
+        bodies = [
+            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s11"))
+        ]
+        msgs, kinds = self._parse(bodies)
+        assert kinds == ["done"]
+        assert msgs[-1].done.files_total == 0
+
     def test_warm_cancel_stops_early_with_partial_done(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
 

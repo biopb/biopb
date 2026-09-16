@@ -376,7 +376,10 @@ message WarmProgress {
 // more `progress` updates followed by exactly one terminal `done` snapshot. On
 // normal completion `done.files_done == done.files_total`; on cancellation (the
 // client closing the stream) the `done` reflects partial progress. A
-// single-file or non-directory source yields one `done` with files_total == 0.
+// single-file source yields one `done` with files_total == 0. A source whose
+// url is remote (an object store, or a `grpc://` mirror of another server)
+// fails instead: its bytes are not on the serving machine, so there is nothing
+// to make resident, and a zero count would read as "already done".
 message WarmStreamMessage {
   oneof payload {
     WarmProgress progress = 1;

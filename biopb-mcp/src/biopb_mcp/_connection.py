@@ -424,7 +424,8 @@ class TensorConnection:
         so later reads are warm and never stall. The recall is entirely
         server-side (no pixels cross the wire); this is slow and blocking, so call
         it off the GUI thread. Only meaningful for multi-file (directory) sources;
-        a single-file source returns immediately.
+        a single-file source returns immediately, and a remote-url source (an
+        object store, or a mirror of another server) raises.
 
         ``on_progress`` (called with a ``WarmProgress`` per message) and
         ``should_cancel`` (polled per message; raising

@@ -77,6 +77,7 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
+from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.activity import ActivityTracker
@@ -1130,9 +1131,11 @@ class TensorFlightServer(flight.FlightServerBase):
         to preserve.
 
         Properties:
-        - **No-op for non-directory sources** -- a single-file source's one file
-          was already recalled by resolve, so this emits one terminal ``done``
-          with ``files_total == 0`` and returns.
+        - **No-op for single-file sources** -- their one file was already
+          recalled by resolve, so this emits one terminal ``done`` with
+          ``files_total == 0`` and returns. A *remote* source raises instead:
+          there is no local tree to recall into, and saying "done, 0 files"
+          would be indistinguishable from the no-op above.
         - **Read every file unconditionally** -- residency is volatile (eviction /
           re-dehydration can flip it underneath us), so a "skip already-resident"
           check would be a TOCTOU trap; an unconditional read is idempotent
@@ -1148,7 +1151,26 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
         root = adapter.source_url
-        # Single-file / remote / non-directory source: nothing to warm beyond what
+        # A remote source has no local tree to walk. Warming reads files on THIS
+        # server's filesystem to force a sync engine's recall, and these bytes
+        # are somewhere else entirely -- an fsspec object store, or another
+        # tensor server for a `grpc://` mirror. Refusing is the honest answer;
+        # it used to fall into the no-op below and report success with
+        # `files_total == 0`, which is the signal a single-file source sends
+        # when it genuinely had nothing to warm, so a caller could not tell
+        # "finished" from "never applicable" (biopb/biopb#1035).
+        #
+        # Scheme only, which is why a mirror's aliased `source_url` (display
+        # authority, never the dial address) is still a sound thing to ask.
+        if root and is_remote_url(root):
+            scheme = root.split("://", 1)[0]
+            raise flight.FlightServerError(
+                f"Cannot warm {source_id!r}: it is a remote ({scheme}) source, "
+                "and warm recalls member files onto the serving machine's own "
+                "filesystem. Nothing here can be made resident. Warm it on the "
+                "server that holds the data."
+            )
+        # Single-file / non-directory source: nothing to warm beyond what
         # resolve already recalled. One terminal `done`, files_total == 0.
         if not root or not os.path.isdir(root):
             yield WarmStreamMessage(done=WarmProgress()).SerializeToString()

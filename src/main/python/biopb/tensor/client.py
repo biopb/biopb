@@ -556,7 +556,10 @@ class TensorFlightClient:
         pixels cross the wire, only progress. It is idempotent -- already-resident
         files are cheap local reads -- so a ``warm`` re-run after a cancel simply
         finishes the remainder. Only meaningful for multi-file sources; a
-        single-file source returns immediately (resolve already recalled it).
+        single-file source returns immediately (resolve already recalled it), and
+        a source whose url is remote (an object store, or a ``grpc://`` mirror of
+        another server) raises -- its bytes are not on the serving machine at
+        all, so there is nothing there to make resident.
 
         Args:
             source_id: The (already-resolved) source to warm.
@@ -570,13 +573,18 @@ class TensorFlightClient:
 
         Returns:
             The terminal ``WarmProgress`` snapshot (``files_done`` /
-            ``bytes_done`` reflect what was made resident; on a no-op source
-            ``files_total == 0``).
+            ``bytes_done`` reflect what was made resident). ``files_total == 0``
+            means the source was local and had nothing to warm -- which is how a
+            client learns it is single-file. It does *not* mean "not applicable":
+            that case raises instead, so the two cannot be confused
+            (biopb/biopb#1035).
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
             RuntimeError: if the server predates the ``warm`` action (too old for
                 hydrate-ahead), or closes the stream without a terminal status.
+            FlightServerError: if the source's url is remote. Warm it on the
+                server that holds the data.
         """
         return self._catalog.warm(
             source_id, on_progress=on_progress, should_cancel=should_cancel

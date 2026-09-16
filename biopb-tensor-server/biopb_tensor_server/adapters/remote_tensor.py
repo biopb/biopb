@@ -356,10 +356,6 @@ class RemoteTensorAdapter(TensorAdapter):
         self._capability_token: Optional[str] = None
 
         self._client = None  # lazy TensorFlightClient to the upstream
-        # Best-effort reachability, updated by every catalog-surface call to the
-        # upstream. Optimistic until proven otherwise so a never-yet-listed source
-        # is not pre-emptively reported unresolved.
-        self._reachable = True
 
         # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
         # the whole upstream catalog in one query_sources, it seeds these so
@@ -369,9 +365,9 @@ class RemoteTensorAdapter(TensorAdapter):
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
         self._metadata_cache: Optional[dict] = None
         # Whether the upstream *source* has resolved (carried from the bulk
-        # row). None until seeded; both is_resolved() and is_resident() read it,
-        # so an unresolved upstream source mirrors as unresolved and
-        # non-resident rather than as an empty readable one (biopb/biopb#266).
+        # row). None until seeded; is_resolved() reads it, so an unresolved
+        # upstream source mirrors as unresolved rather than as an empty
+        # readable one (biopb/biopb#266).
         self._upstream_resolved: Optional[bool] = None
 
     # ------------------------------------------------------------------ upstream
@@ -442,8 +438,13 @@ class RemoteTensorAdapter(TensorAdapter):
         return out
 
     def _mark_unreachable(self, exc: Exception) -> None:
-        """Record an upstream connectivity failure (catalog-surface degradation)."""
-        self._reachable = False
+        """React to an upstream connectivity failure (catalog-surface degradation).
+
+        There is no reachability *flag* any more -- it existed only to answer
+        ``is_resident()``, which a mirror no longer overrides (biopb/biopb#1035).
+        The catalog surface degrades on its own: the callers that land here
+        return an empty descriptor list, which is what a client sees.
+        """
         # Drop this adapter's reference and evict the shared pooled client so the
         # next call (from any mirrored source of this endpoint) reconnects.
         self._client = None
@@ -524,7 +525,8 @@ class RemoteTensorAdapter(TensorAdapter):
 
         ``is_resolved`` is the upstream *source*'s own flag (from its row): an
         unresolved upstream source (``is_resolved=false``, empty tensors) must
-        mirror as unresolved, not be advertised as readable. It used to be the
+        mirror as unresolved, not be advertised as readable. This is the only
+        consumer of the seeded flag. It used to be the
         upstream's ``data_resident``, which conflated "not hydrated yet" with
         "hydrated, bytes not local" and is no longer a column at all
         (biopb/biopb#1035). Idempotent and
@@ -576,7 +578,6 @@ class RemoteTensorAdapter(TensorAdapter):
         )
         self._descriptors_cache = descs
         self._metadata_cache = new_metadata
-        self._reachable = True
         self._upstream_resolved = new_resolved
         self._source_url = new_url
         if changed:
@@ -681,24 +682,22 @@ class RemoteTensorAdapter(TensorAdapter):
         except Exception as exc:
             self._mark_unreachable(exc)
             return []  # unreachable / unresolved upstream -> placeholder row
-        self._reachable = True
         return [catalog_entry(self._localize_descriptor(desc))]
 
-    def is_resident(self) -> bool:
-        """Best-effort residency of the mirrored source.
-
-        The base implementation would call a ``grpc://`` source non-resident (a
-        remote scheme), wrongly tripping unresolved-source handling. Instead
-        track reachability from the catalog-surface upstream calls: an
-        unreachable upstream reports non-resident until it recovers.
-
-        When bulk-seeded (biopb/biopb#266), also require the upstream *source*
-        to have resolved -- a mirror of a source the upstream cannot read yet
-        has nothing local to offer either, however reachable the endpoint is.
-        """
-        if self._upstream_resolved is not None:
-            return self._reachable and self._upstream_resolved
-        return self._reachable
+    # No is_resident() override. There used to be one, reporting the endpoint's
+    # last-known reachability, because the base calls a `grpc://` url
+    # non-resident and that answer was being read as "unresolved" -- the
+    # conflation biopb/biopb#1032 gave its own flag and #1035 removed the column
+    # for. `is_resolved` below is that question now, so the base is free to say
+    # the true thing: a mirrored source's bytes are on another machine, so they
+    # are not local and not cheap to read, reachable or not.
+    #
+    # Nothing is lost with it. Residency exists to decide whether warming is
+    # worth it, and a mirror cannot be warmed at all -- `_handle_warm` walks a
+    # local directory, and this source's url is a remote scheme (it now refuses
+    # rather than reporting a hollow success). Individual cached chunks ARE
+    # local and cheap, but that is per-chunk, and no per-source answer, old or
+    # new, ever spoke for the cache.
 
     def is_resolved(self) -> bool:
         """Whether the upstream has hydrated the source this mirrors.

@@ -135,11 +135,14 @@ own upstream. Multi-upstream + local sources coexist in the one flat
   seeds the upstream path) — the configured `alias` and the upstream's own
   `grpc`/`grpcs` scheme, never the dial authority; the real endpoint stays on
   `_upstream_location` for dialing.
-  `is_resident()` tracks reachability (`_reachable`) — overridden `True` because a
-  `grpc://` url is a remote scheme the base would wrongly call non-resident. A
-  bulk-seeded mirror also carries the upstream row's `is_resolved`, so a mirror
-  of a source the upstream hasn't read yet reports unresolved rather than
-  advertising itself as an empty readable source (biopb/biopb#1035).
+  `is_resident()` is **not** overridden: a mirror's bytes are on another machine,
+  so the base's "remote scheme → non-resident" is the true answer, and a mirror
+  cannot be warmed anyway (`warm` now refuses a remote url outright rather than
+  reporting a hollow `files_total == 0`). The override used to report endpoint
+  reachability, because that False was being read as "unresolved"; `is_resolved()`
+  is that question now, seeded from the upstream row's own flag, so a mirror of a
+  source the upstream hasn't read yet reports unresolved instead of advertising
+  itself as an empty readable one (biopb/biopb#1035).
 - **Tensor layer** — `get_tensor_descriptor` mirrors upstream under the local
   `array_id`. `get_physical_scale()` is overridden to read `physical_scale` /
   `physical_unit` from the upstream `get_descriptor` (the server clears+refills
@@ -273,9 +276,8 @@ skip the source, but name it as configuration.
 download, so recovery is **transparent** (no `UnresolvedSourceAdapter` consent
 step). The adapter splits its surfaces: the **catalog surface degrades to a
 placeholder** — `list_tensor_descriptors` / `get_metadata` catch the failure and
-return empty, `is_resident()` follows `_reachable`, so the catalog upsert
-writes a row with empty tensors and registration's metadata-DB sync doesn't
-fail-and-roll-back. The **serve surface stays live** —
+return empty, so the catalog upsert writes a row with empty tensors and
+registration's metadata-DB sync doesn't fail-and-roll-back. The **serve surface stays live** —
 `get_tensor_descriptor` / `get_data` / `resolve_chunk_data` still raise (→ retryable
 `UNAVAILABLE`) on a miss, and a failed catalog call drops the dead client so the
 next call reconnects, so real tensors reappear the moment the upstream is back.

@@ -647,11 +647,16 @@ public class TensorFlightClient implements AutoCloseable {
      * source directory server-side and reads every file to force the sync
      * engine's recall; no pixels cross the wire, only progress. It is idempotent
      * (already-resident files are cheap local reads) and a no-op for a
-     * single-file source (resolve already recalled it).
+     * single-file source (resolve already recalled it). A source whose url is
+     * remote -- an object store, or a {@code grpc://} mirror of another server
+     * -- fails instead: its bytes are not on the serving machine, so nothing
+     * there can be made resident (biopb/biopb#1035).
      *
      * @param sourceId The (already-resolved) source to warm.
      * @return The terminal {@link WarmProgress} snapshot (files/bytes made
-     *         resident; {@code filesTotal == 0} for a no-op source).
+     *         resident). {@code filesTotal == 0} means the source was local and
+     *         had nothing to warm, i.e. it is single-file -- never "not
+     *         applicable", which raises.
      * @throws IOException If the action fails, the server is too old to support
      *         the {@code warm} action, or it returns no terminal status.
      */
