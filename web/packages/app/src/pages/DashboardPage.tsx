@@ -130,6 +130,16 @@ export default function DashboardPage() {
   // Whether a token is held (remote mode). Lock only means something when there
   // is a token to drop; local mode has none, so the button is disabled.
   const [hasToken, setHasToken] = useState(() => !!getToken());
+  // Whether the data plane itself answers SERVING on its own Flight health
+  // check (not just "our child holds the port"). null = not yet probed.
+  // `dataPlane.state` comes from DataPlaneSupervisor.snapshot(), which is a
+  // raw TCP port check by design (_supervisor.py) -- true the moment the gRPC
+  // socket accepts a connection, well before mark_ready() (e.g. while static
+  // sources are still being registered synchronously at startup). Badging
+  // that alone as "serving" reads as "ready" when the catalog can still be
+  // empty (biopb/biopb#1028), so the badge is downgraded to "starting" until
+  // this independently confirms the backend's own readyz.
+  const [backendReady, setBackendReady] = useState<boolean | null>(null);
 
   const pollStatus = useCallback(async () => {
     try {
@@ -143,6 +153,20 @@ export default function DashboardPage() {
     } catch {
       setConn("control unreachable");
       setConnOk(false);
+    }
+  }, []);
+
+  // Reverse-proxied to the data plane's own HTTP sidecar (unauthenticated,
+  // see http_server.py:/readyz); a plain fetch, same as ClientBootstrap's
+  // startup wait, not fetchAuth -- the sidecar's health endpoints predate any
+  // token gate. 503/unreachable both read as "not ready yet".
+  const pollBackendReady = useCallback(async () => {
+    try {
+      const r = await fetch(withBase("/data_plane/readyz"));
+      const j = await r.json().catch(() => null);
+      setBackendReady(!!j && j.ready === true);
+    } catch {
+      setBackendReady(false);
     }
   }, []);
 
@@ -204,12 +228,14 @@ export default function DashboardPage() {
     pollSessions();
     pollAgents();
     pollAlgos();
+    pollBackendReady();
     const id = setInterval(() => {
       pollStatus();
       pollSessions();
+      pollBackendReady();
     }, POLL_MS);
     return () => clearInterval(id);
-  }, [pollStatus, pollSessions, pollAgents, pollAlgos]);
+  }, [pollStatus, pollSessions, pollAgents, pollAlgos, pollBackendReady]);
 
   // Launching a viewer is slow by nature: the control waits for the child to
   // open its napari window before it answers, so this holds for as long as a
@@ -320,7 +346,12 @@ export default function DashboardPage() {
   );
 
   const dpState = dataPlane.state || "unknown";
+  // Links stay live as soon as the port is up (a TCP dial succeeds regardless
+  // of backend readiness); the badge is what a human reads as "is it up", so
+  // it also folds in whether the data plane's own health check agrees.
   const linksOff = dpState !== "serving";
+  const displayState =
+    dpState === "serving" && backendReady === false ? "starting" : dpState;
 
   return (
     <div className="ctrl-dash">
@@ -360,7 +391,16 @@ export default function DashboardPage() {
         <div className="card">
           <h2>Data plane</h2>
           <div>
-            <span className={"badge " + dpState}>{dpState}</span>
+            <span
+              className={"badge " + displayState}
+              title={
+                displayState === "starting" && dpState === "serving"
+                  ? "Process is up but the data plane hasn't finished its own startup scan yet."
+                  : undefined
+              }
+            >
+              {displayState}
+            </span>
           </div>
           <dl>
             <dt>gRPC</dt>
