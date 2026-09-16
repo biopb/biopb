@@ -46,13 +46,24 @@ import threading
 import time
 from datetime import datetime, timezone
 from functools import partial
-from typing import Any, Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor._catalog_rows import sql_literal
+from biopb.tensor._session import ResolveCancelled
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
@@ -339,6 +350,9 @@ class _SidecarContext:
         # Lazy-init Flight client (first request will connect)
         self._client_lock = threading.Lock()
         self._client_holder: Dict[str, Optional[TensorFlightClient]] = {"client": None}
+        # In-flight resolve/warm recalls. Per-app, so two apps in one process
+        # (tests) cannot see each other's jobs.
+        self.jobs = _SourceJobs()
 
     def get_client(self) -> TensorFlightClient:
         """Return the Flight client, connecting on first use."""
@@ -406,6 +420,149 @@ class _SidecarContext:
         expected = self.token
         if not _web_auth.token_valid(request.headers.get, expected):
             raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+# ---------------------------------------------------------------------------
+# Resolve / warm jobs
+#
+# Both are minutes-long, consenting recalls of cloud / synced-folder data, which
+# is longer than any request should be held open. They run on a daemon thread
+# and the browser polls; the shape is start -> poll -> (optionally) cancel.
+#
+# Polling rather than SSE deliberately: every other route here is
+# request/response, and a status object the client re-reads survives the two
+# things a stream does not -- a reload mid-resolve, and a second tab watching
+# the same source. The server-side recall outlives the HTTP request either way.
+# ---------------------------------------------------------------------------
+
+#: How long a finished job's outcome stays readable. Long enough that a client
+#: polling on a slow interval still sees *why* a job ended rather than finding
+#: nothing and having to guess; short enough that the registry cannot grow
+#: without bound on a long-lived server.
+_JOB_RETENTION_SECONDS = 300.0
+
+#: Terminal job states. "cancelled" is distinct from "error" because the UI
+#: treats them oppositely -- a cancel is the user's own doing and stays quiet,
+#: an error needs saying.
+_JOB_DONE = "done"
+_JOB_ERROR = "error"
+_JOB_CANCELLED = "cancelled"
+_JOB_RUNNING = "running"
+
+
+class _SourceJob:
+    """One resolve or warm, in flight or recently finished.
+
+    Every field a route reads is taken under ``_lock``: the worker thread writes
+    progress on the Flight client's callback while a request thread is rendering
+    the status JSON.
+    """
+
+    def __init__(self, kind: str, source_id: str) -> None:
+        self.kind = kind
+        self.source_id = source_id
+        self.started_at = time.time()
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._state = _JOB_RUNNING
+        self._progress: Dict[str, Any] = {}
+        self._error: Optional[str] = None
+        self._finished_at: Optional[float] = None
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+
+    def cancel_requested(self) -> bool:
+        """The ``should_cancel`` predicate handed to the Flight client."""
+        return self._cancel.is_set()
+
+    def set_progress(self, progress: Dict[str, Any]) -> None:
+        with self._lock:
+            self._progress = progress
+
+    def finish(self, state: str, error: Optional[str] = None) -> None:
+        with self._lock:
+            self._state = state
+            self._error = error
+            self._finished_at = time.time()
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._state == _JOB_RUNNING
+
+    def finished_before(self, cutoff: float) -> bool:
+        with self._lock:
+            return self._finished_at is not None and self._finished_at < cutoff
+
+    def snapshot(self) -> Dict[str, Any]:
+        """The status JSON for this job."""
+        with self._lock:
+            end = self._finished_at if self._finished_at is not None else time.time()
+            return {
+                "kind": self.kind,
+                "source_id": self.source_id,
+                "state": self._state,
+                "progress": dict(self._progress),
+                "error": self._error,
+                "elapsed_seconds": end - self.started_at,
+                # Distinct from state == "cancelled": the flag is set the moment
+                # the cancel is asked for, while the state only turns once the
+                # worker has actually unwound. A UI needs the first to stop
+                # offering a button it has already been told about.
+                "cancel_requested": self._cancel.is_set(),
+            }
+
+
+class _SourceJobs:
+    """The per-app registry of resolve/warm jobs, keyed by ``(kind, source_id)``.
+
+    Keyed by the pair, not by a generated job id, because that key *is* the
+    idempotency the callers need: a double-click, a retry, or a second tab must
+    join the recall already running rather than start a second one against the
+    same bytes. Re-reading a finished job is what makes the poll work.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: Dict[Tuple[str, str], _SourceJob] = {}
+
+    def start(
+        self, kind: str, source_id: str, run: Callable[[_SourceJob], None]
+    ) -> Tuple[_SourceJob, bool]:
+        """Start a job, or join the one already running. ``(job, started_now)``."""
+        with self._lock:
+            self._evict_locked()
+            key = (kind, source_id)
+            existing = self._jobs.get(key)
+            if existing is not None and existing.running:
+                return existing, False
+            job = _SourceJob(kind, source_id)
+            self._jobs[key] = job
+            threading.Thread(
+                target=run,
+                args=(job,),
+                name=f"{kind}-{source_id}",
+                daemon=True,
+            ).start()
+            return job, True
+
+    def get(self, kind: str, source_id: str) -> Optional[_SourceJob]:
+        with self._lock:
+            return self._jobs.get((kind, source_id))
+
+    def _evict_locked(self) -> None:
+        """Drop outcomes nobody can still be waiting on.
+
+        On ``start`` only: a registry that is never written to is never read
+        either, so there is nothing to reap, and this avoids a timer.
+        """
+        cutoff = time.time() - _JOB_RETENTION_SECONDS
+        self._jobs = {
+            key: job
+            for key, job in self._jobs.items()
+            if not job.finished_before(cutoff)
+        }
 
 
 def _sidecar(request: Request) -> _SidecarContext:
@@ -1886,6 +2043,186 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
         raise HTTPException(
             status_code=502, detail=f"Flight error: {type(exc).__name__}"
         )
+
+
+# -- Resolve / warm (consented cloud recalls) --------------------------------
+#
+# Registered above the greedy /api/sources/{source_id:path} catch-all, the same
+# way /metadata and /ticket are: route order is what keeps a sub-path from being
+# swallowed as part of the id.
+
+
+def _run_recall(
+    ctx: _SidecarContext,
+    job: _SourceJob,
+    call: Callable[[], Any],
+    on_success: Callable[[Any], None] = lambda _result: None,
+) -> None:
+    """Shared try/except/finish skeleton for a resolve or warm job.
+
+    ``call`` does the blocking Flight-client recall; ``on_success`` gets its
+    return value to record any final progress before the job finishes done.
+    """
+    try:
+        result = call()
+    except ResolveCancelled:
+        job.finish(_JOB_CANCELLED)
+    except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
+        logger.warning(f"{job.kind} failed for {job.source_id}: {exc}")
+        ctx.diag.mark_error(f"{job.kind.upper()}_FAILED", str(exc))
+        job.finish(_JOB_ERROR, f"{type(exc).__name__}: {exc}")
+    else:
+        on_success(result)
+        job.finish(_JOB_DONE)
+
+
+def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
+    """Body of a resolve job. Runs on the registry's daemon thread."""
+
+    def _call() -> None:
+        ctx.get_client().resolve(
+            job.source_id,
+            on_progress=lambda p: job.set_progress(
+                {
+                    "elapsed_seconds": float(p.elapsed_seconds),
+                    "target_name": str(p.target_name),
+                    "target_bytes": int(p.target_bytes),
+                }
+            ),
+            should_cancel=job.cancel_requested,
+        )
+
+    _run_recall(ctx, job, _call)
+
+
+def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
+    """Body of a warm job. Runs on the registry's daemon thread."""
+
+    def _snapshot(p: Any) -> Dict[str, Any]:
+        # Coerced, not passed through: `progress` is rendered straight to JSON
+        # by the status route, so anything unserializable landing here would
+        # turn every subsequent poll into a 500 rather than a failed job.
+        return {
+            "files_total": int(p.files_total),
+            "files_done": int(p.files_done),
+            "bytes_total": int(p.bytes_total),
+            "bytes_done": int(p.bytes_done),
+            "current_name": str(p.current_name),
+            "elapsed_seconds": float(p.elapsed_seconds),
+        }
+
+    def _call() -> Any:
+        return ctx.get_client().warm(
+            job.source_id,
+            on_progress=lambda p: job.set_progress(_snapshot(p)),
+            should_cancel=job.cancel_requested,
+        )
+
+    # The terminal counts, not the last heartbeat: a fast warm can finish
+    # without ever emitting one, and `files_total == 0` is how a client learns
+    # the source had nothing to warm (single-file -- resolve already recalled
+    # it). That is the server's own structural answer, so no client has to
+    # keep its own list of which source types are multi-file.
+    _run_recall(
+        ctx, job, _call, on_success=lambda final: job.set_progress(_snapshot(final))
+    )
+
+
+def _start_job(
+    kind: str,
+    worker: Callable[[_SidecarContext, _SourceJob], None],
+    source_id: str,
+    request: Request,
+) -> JSONResponse:
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    job, started = ctx.jobs.start(kind, source_id, lambda j: worker(ctx, j))
+    # 202 either way: the caller's question is "is it under way", and joining a
+    # recall already in flight is the same answer as having begun one. `started`
+    # distinguishes them for a caller that cares.
+    return JSONResponse({**job.snapshot(), "started": started}, status_code=202)
+
+
+def _job_status(kind: str, source_id: str, request: Request) -> JSONResponse:
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    job = ctx.jobs.get(kind, source_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404, detail=f"No {kind} job for source: {source_id}"
+        )
+    return JSONResponse(job.snapshot())
+
+
+def _cancel_job(kind: str, source_id: str, request: Request) -> JSONResponse:
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    job = ctx.jobs.get(kind, source_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404, detail=f"No {kind} job for source: {source_id}"
+        )
+    # Idempotent, and deliberately not an error on an already-finished job: the
+    # click races the last heartbeat often enough that treating it as a failure
+    # would mean showing the user an error for doing nothing wrong.
+    job.request_cancel()
+    return JSONResponse(job.snapshot())
+
+
+@_router.post("/api/sources/{source_id:path}/resolve/cancel")
+async def cancel_resolve(source_id: str, request: Request) -> JSONResponse:
+    """Ask an in-flight resolve to stop.
+
+    The server-side recall runs to completion and is cached regardless -- this
+    stops the client waiting on it, so a later resolve coalesces onto the
+    finished work rather than downloading again.
+    """
+    return _cancel_job("resolve", source_id, request)
+
+
+@_router.get("/api/sources/{source_id:path}/resolve/status")
+async def resolve_status(source_id: str, request: Request) -> JSONResponse:
+    """Progress of the resolve on this source. 404 if none was ever started."""
+    return _job_status("resolve", source_id, request)
+
+
+@_router.post("/api/sources/{source_id:path}/resolve")
+async def start_resolve(source_id: str, request: Request) -> JSONResponse:
+    """Begin resolving an unresolved (cloud / synced-folder) source.
+
+    Hydrating a dehydrated placeholder downloads the whole file -- minutes, real
+    disk, and a failure mode when offline -- so this is the consenting action
+    that catalog browsing deliberately avoids. Returns immediately with a job to
+    poll; a second call while one is running joins it rather than starting a
+    second recall of the same bytes.
+    """
+    return _start_job("resolve", _resolve_worker, source_id, request)
+
+
+@_router.post("/api/sources/{source_id:path}/warm/cancel")
+async def cancel_warm(source_id: str, request: Request) -> JSONResponse:
+    """Ask an in-flight warm to stop. Files already recalled stay resident."""
+    return _cancel_job("warm", source_id, request)
+
+
+@_router.get("/api/sources/{source_id:path}/warm/status")
+async def warm_status(source_id: str, request: Request) -> JSONResponse:
+    """Progress of the warm on this source. 404 if none was ever started."""
+    return _job_status("warm", source_id, request)
+
+
+@_router.post("/api/sources/{source_id:path}/warm")
+async def start_warm(source_id: str, request: Request) -> JSONResponse:
+    """Hydrate-ahead: recall a resolved source's member files server-side.
+
+    Idempotent and safe to call on any resolved source -- one with nothing to
+    warm finishes immediately with ``files_total == 0``, which is how a client
+    tells a single-file source from a multi-file one without keeping its own
+    list of source types.
+    """
+    return _start_job("warm", _warm_worker, source_id, request)
 
 
 @_router.get("/api/sources/{source_id:path}")
