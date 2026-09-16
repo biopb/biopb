@@ -878,7 +878,7 @@ class Reconciler:
             return False
         try:
             return bool(adapter.is_resident())
-        except OSError:
+        except Exception:  # noqa: BLE001 -- a gate that cannot see fails closed
             return False
 
     def _on_source_resolved(self, source_id: str, adapter: Any) -> None:

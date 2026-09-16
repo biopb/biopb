@@ -17,6 +17,7 @@ import tempfile
 import pytest
 from biopb_tensor_server.adapters import tiff as tiff_mod
 from biopb_tensor_server.core import discovery
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.config import SourceConfig, parse_config
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
@@ -622,10 +623,8 @@ class _ResidencyAdapter:
     def __init__(self, source_url):
         self._source_url = str(source_url)
 
-    from biopb_tensor_server.core.adapter_base import SourceAdapter as _Base
-
-    is_resident = _Base.is_resident
-    del _Base
+    def is_resident(self):
+        return SourceAdapter.is_resident(self)
 
 
 class TestShouldWarm:

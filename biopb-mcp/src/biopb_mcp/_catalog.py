@@ -103,13 +103,13 @@ def source_from_row(
 
 def sources_from_rows(
     rows: Iterable[Mapping[str, Any]],
-    resident: Optional[Mapping[str, bool]] = None,
+    resident_by_id: Optional[Mapping[str, bool]] = None,
 ) -> List[CatalogSource]:
     """Decode rows, optionally stamping each with a live residency answer.
 
-    *resident* is what the server's ``is_resident`` action returned; a source
-    missing from it keeps ``None`` (unknown), which is what an older server or
-    a failed call leaves too.
+    *resident_by_id* is what the server's ``is_resident`` action returned; a
+    source missing from it keeps ``None`` (unknown), which is what an older
+    server or a failed call leaves too.
     """
-    lookup = resident or {}
+    lookup = resident_by_id or {}
     return [source_from_row(r, lookup.get(r["source_id"])) for r in rows]
