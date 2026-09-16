@@ -238,7 +238,7 @@ class TensorFlightClient:
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
         """List available data sources.
 
-        .. deprecated::
+        Deprecated:
             Use :meth:`query_sources`, and `biopb.tensor.descriptors_from_rows`
             if you want descriptors. This is a thin wrapper around
             ``SELECT ... FROM sources`` that inherits the server's query row
@@ -265,7 +265,7 @@ class TensorFlightClient:
     def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
         """One source's ``DataSourceDescriptor`` by id, or ``None``.
 
-        .. deprecated::
+        Deprecated:
             Use :meth:`query_sources` with a ``WHERE source_id = ...``, and
             `biopb.tensor.descriptor_from_row` if you want a descriptor.
 
