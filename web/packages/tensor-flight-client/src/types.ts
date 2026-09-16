@@ -33,6 +33,58 @@ export interface DataSourceDescriptor {
   tensors: TensorDescriptor[];
 }
 
+/**
+ * One resolve or warm job on one source, as `/api/sources/{id}/{kind}/status`
+ * reports it.
+ *
+ * Both hydrate cloud / synced-folder data and both can run for minutes, so they
+ * are jobs rather than requests: start, poll, optionally cancel. The recall
+ * lives on the server and outlives any one HTTP request.
+ */
+export interface SourceJobStatus {
+  kind: "resolve" | "warm";
+  source_id: string;
+  state: "running" | "done" | "error" | "cancelled";
+  /**
+   * Kind-specific counters. Resolve reports `elapsed_seconds`, `target_name`
+   * and `target_bytes`; warm reports files/bytes done vs total plus
+   * `current_name`. Empty until the first heartbeat lands.
+   */
+  progress: Partial<SourceJobProgress>;
+  /** Reason, on `state === "error"` only. */
+  error: string | null;
+  elapsed_seconds: number;
+  /**
+   * Set the moment a cancel is asked for -- before `state` turns, which only
+   * happens once the server-side worker unwinds. Use this, not the state, to
+   * stop offering a cancel the user has already clicked.
+   */
+  cancel_requested: boolean;
+  /** Only on the response that started it: false means it joined one running. */
+  started?: boolean;
+}
+
+/** The union of both job kinds' progress counters; each reports its own subset. */
+export interface SourceJobProgress {
+  elapsed_seconds: number;
+  /** Resolve: basename of the recall target. */
+  target_name: string;
+  /** Resolve: size of the recall target, 0 when unknown. */
+  target_bytes: number;
+  /**
+   * Warm: files discovered under the source. **0 on a finished warm means the
+   * source had nothing to warm** -- it is single-file, and resolve already
+   * recalled it. That is the server's own structural answer, so no client
+   * keeps its own list of which source types are multi-file.
+   */
+  files_total: number;
+  files_done: number;
+  bytes_total: number;
+  bytes_done: number;
+  /** Warm: the file being recalled right now. */
+  current_name: string;
+}
+
 /** Parameters for a single array-slice request. */
 export interface SliceRequest {
   /**

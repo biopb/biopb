@@ -7,6 +7,7 @@ import type {
   RoiGeometry,
   RoiListResult,
   RoiSetInfo,
+  SourceJobStatus,
   TileInfo,
 } from "@biopb/tensor-flight-client";
 import { DEFAULT_POLYLINE_WIDTH, clampPolylineWidth } from "./utils/roiDraft";
@@ -461,10 +462,47 @@ export interface AppState {
   clearSession: () => void;
   startCatalogPolling: () => void;
   stopCatalogPolling: () => void;
+
+  /**
+   * Resolve/warm jobs in flight or recently settled, keyed `"<kind>:<id>"`.
+   *
+   * Server-owned: these mirror `/api/sources/{id}/{kind}/status` and are
+   * re-read on a poll, never advanced locally. A recall survives a reload and
+   * a second tab, so the browser's copy is a view of it, not the record of it.
+   */
+  sourceJobs: Record<string, SourceJobStatus>;
+  startResolve: (sourceId: string) => Promise<void>;
+  startWarm: (sourceId: string) => Promise<void>;
+  cancelSourceJob: (kind: SourceJobKind, sourceId: string) => Promise<void>;
+  dismissSourceJob: (kind: SourceJobKind, sourceId: string) => void;
+  stopJobPolling: () => void;
 }
 
 // Internal timer storage (non-reactive, module-level)
 let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
+
+export type SourceJobKind = "resolve" | "warm";
+
+/** Composite key for {@link AppState.sourceJobs}. */
+export function jobKey(kind: SourceJobKind, sourceId: string): string {
+  return `${kind}:${sourceId}`;
+}
+
+/**
+ * How often an in-flight resolve/warm is re-read.
+ *
+ * Far tighter than the 60s catalog poll because this one is only running while
+ * the user is watching a progress bar they asked for, and it stops the moment
+ * nothing is in flight.
+ */
+const JOB_POLL_MS = 1000;
+
+let _jobPollTimerId: ReturnType<typeof setInterval> | undefined;
+
+/** A job that has stopped moving, whatever the reason. */
+function isSettled(job: SourceJobStatus): boolean {
+  return job.state !== "running";
+}
 
 /**
  * Everything about a catalog listing the tree renders off, as one string.
@@ -1295,7 +1333,139 @@ export const useAppStore = create<AppState>((set, get) => ({
       _pollingTimerId = undefined;
     }
   },
+
+  sourceJobs: {},
+
+  async startResolve(sourceId: string) {
+    await startSourceJob(get, set, "resolve", sourceId);
+  },
+
+  async startWarm(sourceId: string) {
+    await startSourceJob(get, set, "warm", sourceId);
+  },
+
+  async cancelSourceJob(kind: SourceJobKind, sourceId: string) {
+    const { client } = get();
+    if (!client) return;
+    try {
+      const status = await client.http.cancelJob(kind, sourceId);
+      putJob(set, status);
+    } catch {
+      // The server is the only thing that can actually stop the recall, and it
+      // re-reports the flag on the next poll. A failed cancel is worth nothing
+      // to say here -- the button simply hasn't taken yet.
+    }
+  },
+
+  dismissSourceJob(kind: SourceJobKind, sourceId: string) {
+    set((s) => {
+      const next = { ...s.sourceJobs };
+      delete next[jobKey(kind, sourceId)];
+      return { sourceJobs: next };
+    });
+  },
+
+  stopJobPolling() {
+    if (_jobPollTimerId) {
+      clearInterval(_jobPollTimerId);
+      _jobPollTimerId = undefined;
+    }
+  },
 }));
+
+type Get = () => AppState;
+type Set = (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void;
+
+function putJob(set: Set, status: SourceJobStatus): void {
+  set((s) => ({
+    sourceJobs: {
+      ...s.sourceJobs,
+      [jobKey(status.kind, status.source_id)]: status,
+    },
+  }));
+}
+
+async function startSourceJob(
+  get: Get,
+  set: Set,
+  kind: SourceJobKind,
+  sourceId: string,
+): Promise<void> {
+  const { client } = get();
+  if (!client) return;
+  try {
+    const status =
+      kind === "resolve"
+        ? await client.http.startResolve(sourceId)
+        : await client.http.startWarm(sourceId);
+    putJob(set, status);
+    ensureJobPolling(get, set);
+  } catch (err) {
+    // Synthesised rather than swallowed: a resolve that never started is the
+    // one failure the user most needs told about, and the surface that shows
+    // it reads `sourceJobs` -- so there has to be an entry for it to read.
+    putJob(set, {
+      kind,
+      source_id: sourceId,
+      state: "error",
+      progress: {},
+      error: err instanceof Error ? err.message : String(err),
+      elapsed_seconds: 0,
+      cancel_requested: false,
+    });
+  }
+}
+
+function ensureJobPolling(get: Get, set: Set): void {
+  if (_jobPollTimerId) return;
+  _jobPollTimerId = setInterval(() => {
+    void pollSourceJobs(get, set);
+  }, JOB_POLL_MS);
+}
+
+async function pollSourceJobs(get: Get, set: Set): Promise<void> {
+  const { client, sourceJobs } = get();
+  const running = Object.values(sourceJobs).filter((j) => !isSettled(j));
+  if (!client || running.length === 0) {
+    get().stopJobPolling();
+    return;
+  }
+
+  for (const before of running) {
+    let after: SourceJobStatus;
+    try {
+      after = await client.http.jobStatus(before.kind, before.source_id);
+    } catch {
+      // A blip leaves the previous status in place; the next tick retries. Not
+      // marked failed: the recall is server-side and unaffected by our poll.
+      continue;
+    }
+    putJob(set, after);
+    if (isSettled(after)) {
+      await onJobSettled(get, after);
+    }
+  }
+}
+
+/**
+ * What happens when a job stops.
+ *
+ * A finished resolve leaves the catalog row stale -- the source is hydrated but
+ * the tree still has the listing from before -- so the list is re-read, and
+ * then the warm starts automatically.
+ *
+ * Auto-warm with no second confirmation, matching napari: the user already
+ * consented to the expensive part. It is also unconditional, with no check for
+ * whether the source is multi-file, because the server answers that
+ * structurally -- a single-file source's warm finishes at once with
+ * `files_total === 0` and the tray never shows a bar for it. Keeping a list of
+ * multi-file source types on this side would be a copy that drifts.
+ */
+async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
+  if (job.kind !== "resolve" || job.state !== "done") return;
+  await get().loadSources();
+  await get().startWarm(job.source_id);
+}
 
 /**
  * The grid for what is currently addressed, or null while none has landed.

@@ -108,9 +108,46 @@ describe("TreeRow for an unresolved source", () => {
   });
 
   it("is not openable: selecting it would fetch a tile that cannot exist", () => {
-    // aria-, not the real attribute: `disabled` would suppress the title
-    // tooltip that carries the explanation, and drop the row from tab order.
-    expect(render(sourceNode(CLOUD))).toContain('aria-disabled="true"');
+    // The row is a div, not a button, so there is nothing to activate. That
+    // also keeps the Resolve button below legal -- interactive content cannot
+    // nest inside a button.
+    const html = render(sourceNode(CLOUD));
+    expect(html).toContain("<div");
+    expect(html).not.toContain("<button");
+  });
+
+  it("offers Resolve, the only control on the row", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={sourceNode(CLOUD)}
+        activeSourceId={null}
+        activeTensorId={null}
+        expandedFolders={new Set(["onedrive_9c1"])}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        startResolve={() => {}}
+        resolving={new Set()}
+      />,
+    );
+    expect(html).toContain("Resolve");
+    expect(html).toContain("resolve-btn");
+  });
+
+  it("says so instead of re-offering while a resolve is under way", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={sourceNode(CLOUD)}
+        activeSourceId={null}
+        activeTensorId={null}
+        expandedFolders={new Set(["onedrive_9c1"])}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        startResolve={() => {}}
+        resolving={new Set(["onedrive_9c1"])}
+      />,
+    );
+    expect(html).toContain("Resolving");
+    expect(html).toContain("disabled");
   });
 
   it("explains itself on hover, keeping the url", () => {
@@ -124,7 +161,7 @@ describe("TreeRow for an unresolved source", () => {
     // that happens to list none must not be dimmed or disabled.
     const html = render(sourceNode({ ...CLOUD, is_resolved: true }));
     expect(html).not.toContain(UNRESOLVED_GLYPH);
-    expect(html).not.toContain("aria-disabled");
+    expect(html).toContain("<button");
   });
 
   it("shows no shape badge, having nothing to report yet", () => {

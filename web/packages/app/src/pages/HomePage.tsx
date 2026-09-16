@@ -7,6 +7,7 @@ import { MetaPanel } from "../components/MetaPanel";
 import { RoiAuthor, RoiPanel } from "../components/RoiPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
+import { ResolveModal } from "../components/ResolveModal";
 import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { useViewerUrlSync } from "../hooks/useViewerUrlSync";
@@ -183,6 +184,8 @@ export function HomePage() {
       <aside className="app-sidebar">
         <SourceTree />
       </aside>
+
+      <ResolveModal />
 
       <main className="app-main">
         {splitter("sidebar", "Resize the source list")}
