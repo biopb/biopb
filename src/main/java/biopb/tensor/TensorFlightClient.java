@@ -288,8 +288,8 @@ public class TensorFlightClient implements AutoCloseable {
         FieldVector resolved = root.getVector("is_resolved");
         FieldVector tensors = root.getVector("tensors");
         for (int i = 0; i < root.getRowCount(); i++) {
-            Object res = resident == null || resident.isNull(i) ? null : resident.getObject(i);
-            Object isRes = resolved == null || resolved.isNull(i) ? null : resolved.getObject(i);
+            Boolean res = nullableBool(resident, i);
+            Boolean isRes = nullableBool(resolved, i);
             List<CatalogTensor> entries = new ArrayList<>();
             Object list = tensors == null || tensors.isNull(i) ? null : tensors.getObject(i);
             if (list instanceof List) {
@@ -322,14 +322,9 @@ public class TensorFlightClient implements AutoCloseable {
             // True for an absent column, the harmless direction for a
             // monotonic flag; a server whose table predates it fails the
             // SELECT outright, so this only covers a narrower projection.
-            boolean isResolved = !(isRes instanceof Boolean) || (Boolean) isRes;
+            boolean isResolved = isRes == null || isRes;
             out.add(new CatalogSource(
-                    text(sourceIds, i),
-                    text(urls, i),
-                    text(types, i),
-                    entries,
-                    isResolved,
-                    res instanceof Boolean ? (Boolean) res : null));
+                    text(sourceIds, i), text(urls, i), text(types, i), entries, isResolved, res));
         }
         return out;
     }
@@ -339,6 +334,13 @@ public class TensorFlightClient implements AutoCloseable {
             return "";
         }
         return String.valueOf(vector.getObject(index));
+    }
+
+    private static Boolean nullableBool(FieldVector vector, int index) {
+        if (vector == null || vector.isNull(index)) {
+            return null;
+        }
+        return (Boolean) vector.getObject(index);
     }
 
     /**
@@ -480,12 +482,11 @@ public class TensorFlightClient implements AutoCloseable {
         boolean found = false;
         boolean resolved = false;
         try (VectorSchemaRoot root = querySources(
-                "SELECT tensors, metadata_json FROM sources WHERE source_id = " + sqlLiteral(sourceId))) {
+                "SELECT is_resolved, metadata_json FROM sources WHERE source_id = " + sqlLiteral(sourceId))) {
             if (root.getRowCount() > 0) {
                 found = true;
-                FieldVector tensors = root.getVector("tensors");
-                Object list = tensors == null || tensors.isNull(0) ? null : tensors.getObject(0);
-                resolved = list instanceof List && !((List<?>) list).isEmpty();
+                Boolean isRes = nullableBool(root.getVector("is_resolved"), 0);
+                resolved = isRes == null || isRes;
                 FieldVector meta = root.getVector("metadata_json");
                 metadataJson = meta == null || meta.isNull(0) ? null : String.valueOf(meta.getObject(0));
             }
@@ -497,6 +498,8 @@ public class TensorFlightClient implements AutoCloseable {
             // Unresolved (cloud / synced-folder) source: tensors are unknown until
             // resolve. Don't return {} -- that conflates "unresolved" with
             // "resolved, no metadata". Steer to the explicit, consented resolve().
+            // The flag, not an empty tensor list -- a source can resolve cleanly
+            // and hold nothing readable (biopb/biopb#1032).
             throw unresolvedSourceError(sourceId);
         }
         return parseMetadataJson(metadataJson);

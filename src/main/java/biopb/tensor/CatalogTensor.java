@@ -25,13 +25,15 @@ public final class CatalogTensor {
 
     public CatalogTensor(String arrayId, List<String> dimLabels, List<Long> shape, String dtype) {
         this.arrayId = arrayId == null ? "" : arrayId;
-        this.dimLabels = dimLabels == null
-                ? Collections.emptyList()
-                : Collections.unmodifiableList(new java.util.ArrayList<>(dimLabels));
-        this.shape = shape == null
-                ? Collections.emptyList()
-                : Collections.unmodifiableList(new java.util.ArrayList<>(shape));
+        this.dimLabels = immutableCopy(dimLabels);
+        this.shape = immutableCopy(shape);
         this.dtype = dtype == null ? "" : dtype;
+    }
+
+    private static <T> List<T> immutableCopy(List<T> list) {
+        return list == null
+                ? Collections.emptyList()
+                : Collections.unmodifiableList(new java.util.ArrayList<>(list));
     }
 
     /** Globally-unique tensor identifier: {@code source_id} or {@code source_id/field}. */

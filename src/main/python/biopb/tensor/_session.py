@@ -589,7 +589,7 @@ class CatalogClient:
         # get_tensor_metadata() delta, so a multi-field source reported one
         # arbitrary field's extras as the source's metadata.
         table = self._query_table(
-            "SELECT tensors, metadata_json FROM sources "
+            "SELECT is_resolved, metadata_json FROM sources "
             f"WHERE source_id = {sql_literal(source_id)}"
         )
         rows = table.to_pylist()
@@ -597,12 +597,14 @@ class CatalogClient:
             raise ValueError(f"Source not found: {source_id}")
         row = rows[0]
 
-        if not row.get("tensors"):
+        if not row.get("is_resolved", True):
             # Unresolved (cloud / synced-folder) source: tensors are unknown
             # until resolve. Don't silently return {} -- that conflates
             # "unresolved" with "resolved, no metadata" (the line below). Steer
             # the caller to the explicit, consented resolve() instead, matching
-            # get_physical_scale / get_tensor (#108).
+            # get_physical_scale / get_tensor (#108). The flag, not an empty
+            # tensor list -- a source can resolve cleanly and hold nothing
+            # readable (biopb/biopb#1032).
             raise _unresolved_source_error(source_id)
 
         raw = row.get("metadata_json")
