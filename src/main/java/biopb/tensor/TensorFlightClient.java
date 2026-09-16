@@ -208,21 +208,26 @@ public class TensorFlightClient implements AutoCloseable {
      * List available data sources.
      *
      * @deprecated Use {@link #querySources} with {@link #sourcesFromRows}.
+     *             The descriptors returned here also carry no
+     *             {@code isResolved} -- the generated message has no field
+     *             for it (biopb/biopb#1032).
      *             This is a thin wrapper around {@code SELECT ... FROM sources}
      *             that inherits the server's query row cap, so a large catalog
      *             comes back silently truncated -- and a browse is exactly where
      *             that matters.
      *
-     * @return Map of source_id to CatalogSource
+     * @return Map of source_id to DataSourceDescriptor
      */
     @Deprecated
-    public Map<String, CatalogSource> listSources() throws IOException {
-        Map<String, CatalogSource> result = new HashMap<>();
+    public Map<String, DataSourceDescriptor> listSources() throws IOException {
+        Map<String, DataSourceDescriptor> result = new HashMap<>();
         try (VectorSchemaRoot root = querySources(
                 "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources ORDER BY source_id")) {
-            for (CatalogSource source : sourcesFromRows(root)) {
-                result.put(source.getSourceId(), source);
-                cacheTensors(source);
+            for (DataSourceDescriptor sourceDesc : descriptorsFromRows(root)) {
+                result.put(sourceDesc.getSourceId(), sourceDesc);
+                for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
+                    descriptors.put(tensorDesc.getArrayId(), tensorDesc);
+                }
             }
         }
         LOGGER.info("listSources: returned " + result.size() + " sources");
@@ -267,6 +272,34 @@ public class TensorFlightClient implements AutoCloseable {
                 .addAllShape(tensor.getShape())
                 .setDtype(tensor.getDtype())
                 .build();
+    }
+
+    /**
+     * Rebuild lean {@link DataSourceDescriptor}s from {@code sources} catalog rows.
+     *
+     * @deprecated Use {@link #sourcesFromRows}. This builds the generated
+     *             message, which has no field for {@code is_resolved} and
+     *             cannot gain one without a regenerate in every language
+     *             (biopb/biopb#1032).
+     */
+    @Deprecated
+    public static List<DataSourceDescriptor> descriptorsFromRows(VectorSchemaRoot root) {
+        List<DataSourceDescriptor> out = new ArrayList<>();
+        for (CatalogSource source : sourcesFromRows(root)) {
+            DataSourceDescriptor.Builder desc = DataSourceDescriptor.newBuilder()
+                    .setSourceId(source.getSourceId())
+                    .setSourceUrl(source.getSourceUrl())
+                    .setSourceType(source.getSourceType())
+                    .setMetadataJson("");
+            if (source.getDataResident() != null) {
+                desc.setDataResident(source.getDataResident());
+            }
+            for (CatalogTensor tensor : source.getTensors()) {
+                desc.addTensors(toDescriptor(tensor));
+            }
+            out.add(desc.build());
+        }
+        return out;
     }
 
     /**
@@ -511,7 +544,7 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Resolve an unresolved source and return its full {@link CatalogSource}.
+     * Resolve an unresolved source and return its full {@link DataSourceDescriptor}.
      *
      * <p>An <i>unresolved</i> source is catalogued by URL only -- its
      * shape/dtype/field list are unknown until first access (it lists with
@@ -526,21 +559,24 @@ public class TensorFlightClient implements AutoCloseable {
      * Afterwards {@link #getTensor} and friends work normally. Idempotent.
      *
      * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
-     * @return The full CatalogSource with every tensor/field enumerated
+     * @return The full DataSourceDescriptor with every tensor/field enumerated.
+     *         It carries no {@code isResolved} -- the generated message has no
+     *         field for it; decode the row with {@link #sourcesFromRows} if
+     *         you need it (biopb/biopb#1032).
      * @throws IOException If the action fails or the server returns no row
      */
-    public CatalogSource resolve(String sourceId) throws IOException {
+    public DataSourceDescriptor resolve(String sourceId) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
         // point that performs the (possibly minutes-long) recall. The action
         // streams ResolveStreamMessage progress heartbeats to keep the
         // connection warm under proxy idle timeouts; the terminal message
         // carries the source's now-concrete catalog row (Arrow IPC), decoded
-        // through the same sourcesFromRows() that backs listSources().
+        // through the same descriptorsFromRows() that backs listSources().
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
                 "resolve",
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
-        CatalogSource source = null;
+        DataSourceDescriptor desc = null;
         java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
         while (iter.hasNext()) {
             byte[] body = iter.next().getBody();
@@ -554,19 +590,21 @@ public class TensorFlightClient implements AutoCloseable {
             try (ArrowStreamReader reader = new ArrowStreamReader(
                     new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
                 while (reader.loadNextBatch()) {
-                    List<CatalogSource> rows = sourcesFromRows(reader.getVectorSchemaRoot());
+                    List<DataSourceDescriptor> rows = descriptorsFromRows(reader.getVectorSchemaRoot());
                     if (!rows.isEmpty()) {
-                        source = rows.get(0);
+                        desc = rows.get(0);
                     }
                 }
             }
         }
-        if (source == null) {
+        if (desc == null) {
             throw new IOException("resolve('" + sourceId
                     + "') returned no catalog row (server closed the stream without a result)");
         }
-        cacheTensors(source);
-        return source;
+        for (TensorDescriptor tensorDesc : desc.getTensorsList()) {
+            descriptors.put(tensorDesc.getArrayId(), tensorDesc);
+        }
+        return desc;
     }
 
     /**

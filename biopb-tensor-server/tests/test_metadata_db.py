@@ -222,7 +222,15 @@ class TestSourceSync:
 class MultiTensorAdapter:
     """Mock adapter exposing several tensors (multi-field / HCS source)."""
 
-    def __init__(self, source_id, source_url, source_type, tensors, data_resident=True):
+    def __init__(
+        self,
+        source_id,
+        source_url,
+        source_type,
+        tensors,
+        data_resident=True,
+        is_resolved=True,
+    ):
         self.source_id = source_id
         self._source_url = source_url
         self._source_type = source_type
@@ -230,6 +238,7 @@ class MultiTensorAdapter:
             tensors  # list of dicts: array_id, dim_labels, shape, chunk_shape, dtype
         )
         self._data_resident = data_resident
+        self._is_resolved = is_resolved
 
     @property
     def catalog_url(self):
@@ -243,7 +252,7 @@ class MultiTensorAdapter:
         return self._data_resident
 
     def is_resolved(self):
-        return True
+        return self._is_resolved
 
     def list_tensor_descriptors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -499,11 +508,79 @@ class TestSourceRowProjection:
         db = MetadataDatabase()
         db.sync_source_added(
             "u",
-            MultiTensorAdapter("u", "s3://b/x.zarr", "zarr", [], data_resident=False),
+            MultiTensorAdapter(
+                "u",
+                "s3://b/x.zarr",
+                "zarr",
+                [],
+                data_resident=False,
+                is_resolved=False,
+            ),
         )
-        descriptors = _sources(db)
-        assert len(descriptors[0].tensors) == 0
-        assert descriptors[0].data_resident is False
+        sources = _sources(db)
+        assert len(sources[0].tensors) == 0
+        assert sources[0].data_resident is False
+        # Empty tensors is not what makes it unresolved -- the flag is
+        # (biopb/biopb#1032).
+        assert sources[0].is_resolved is False
+
+
+class TestDeprecatedDescriptorProjection:
+    """The proto decoder still answers, and still cannot carry `is_resolved`."""
+
+    def _rows(self, db):
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+
+        return db.query(
+            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
+        ).to_pylist()
+
+    def test_still_builds_the_same_descriptor(self):
+        import warnings
+
+        from biopb.tensor import descriptors_from_rows
+
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            (d,) = descriptors_from_rows(self._rows(db))
+
+        assert d.source_id == "s1"
+        assert d.source_url == "/data/s1.zarr"
+        assert d.data_resident is True
+        assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
+        assert list(d.tensors[0].shape) == [8, 512, 512]
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+    def test_cannot_carry_is_resolved(self):
+        """The reason for the deprecation, pinned: an unresolved source decodes
+        to a descriptor indistinguishable from a resolved-but-empty one."""
+        import warnings
+
+        from biopb.tensor import descriptors_from_rows
+
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "u",
+            MultiTensorAdapter(
+                "u",
+                "s3://b/x.zarr",
+                "zarr",
+                [],
+                data_resident=False,
+                is_resolved=False,
+            ),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            (d,) = descriptors_from_rows(self._rows(db))
+
+        assert not hasattr(d, "is_resolved")
+        # Same row through the struct decoder answers.
+        assert _sources(db)[0].is_resolved is False
 
 
 class TestGetMetadataJson:

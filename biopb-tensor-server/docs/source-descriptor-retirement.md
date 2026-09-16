@@ -41,8 +41,9 @@ one it had just written.
 
 **`resolve` returns the row**, as an Arrow IPC stream of one `sources` row with
 `SOURCE_ROW_COLUMNS` (`ResolveStreamMessage.source_row`). Each SDK decodes it
-with the same `source_from_row` / `sourcesFromRows` that backs `list_sources`,
-so the public return type is unchanged and the proto stops being a wire type.
+with the same `descriptor_from_row` / `descriptorsFromRows` that backs
+`list_sources`, so the public return type is unchanged and the proto stops being
+a wire type.
 
 That also removes a divergence: the adapter answers live (`is_resident()` is
 documented VOLATILE, "evaluate at the moment of use and never cache") while the
@@ -90,9 +91,8 @@ row's `tensors` column.
 Both are wrappers around `query_sources` that inherit the server's query row cap
 — so a browse, which is exactly where the cap matters, came back silently
 truncated. The repo's own guidance already steered away from them. They still
-work; they warn, and point at `query_sources` plus
-`biopb.tensor.sources_from_rows` (now exported, in both SDKs, as the
-migration path).
+work; they warn, and point at `query_sources` plus a row decoder (now exported,
+in both SDKs, as the migration path).
 
 `_state.sources` is gone. It was a cache, not state — every read fell back — and
 both first-party consumers keep their own (`TensorConnection.sources`, the SPA's
@@ -147,12 +147,18 @@ hand-rolls the same shape — and `http_server.py`'s `/api/sources` decodes rows
 plain dicts. Two of three consumers had already converged on a hand-written
 struct.
 
-So each SDK decodes into its own: `CatalogSource` / `CatalogTensor`, a frozen
-dataclass in Python and a plain immutable class in Java (the published artifact
-targets Java 11, so not a record). `descriptor_from_row` / `descriptors_from_rows`
-/ `descriptorsFromRows` are now `source_from_row` / `sources_from_rows` /
-`sourcesFromRows` — renamed rather than silently re-typed, so a caller gets an
-error and not a different object.
+So each SDK gained a decoder into its own struct: `CatalogSource` /
+`CatalogTensor`, a frozen dataclass in Python and a plain immutable class in
+Java (the published artifact targets Java 11, so not a record), built by
+`source_from_row` / `sources_from_rows` / `sourcesFromRows`.
+
+**The proto decoders stay, deprecated.** `descriptor_from_row` /
+`descriptors_from_rows` / `descriptorsFromRows` keep their names, their
+signatures and their exact output, and `list_sources` / `get_source` /
+`resolve` keep returning `DataSourceDescriptor`. Nothing an SDK user calls
+changes shape under them; the deprecation is the message, and what it says is
+that this path cannot grow. A caller who wants `is_resolved` moves to the new
+decoder, which is one line and a name they can grep for.
 
 **Absent beats empty.** §1 noted `descriptor_from_row` hardcoded
 `metadata_json=""`, and §3's invariant is that a catalog entry carries no
@@ -168,6 +174,13 @@ resolved cleanly and held nothing readable. Both now read the flag, and both say
 something different for the two cases. The `biopb tensor query` CLI prints
 `<unresolved>` rather than `<no tensors>` for the first.
 
+Those three are also the worked example of the migration: each moved off the
+deprecated decoder because it needed the field, which is the only reason to
+move. `TensorConnection.resolve_source` is the one that cost anything — it used
+to hand the widget whatever `resolve()` returned, and now reads the row back by
+id (addressed, so the browse cap cannot hide it) because the widget's next
+decision, whether to warm, needs `is_resolved`.
+
 The proto message stays in `descriptor.proto`, unused: removing it would break
 codegen for consumers outside this repo, and it costs nothing to leave.
 
@@ -178,7 +191,7 @@ fallbacks in both clients (a bare serialized descriptor as the resolve terminal;
 the empty-body heartbeat convention) went with it. Field numbers 2
 (`ResolveStreamMessage.result`) and 1 (`AddSourceResult.added`) are reserved.
 
-§6 changes no wire bytes at all — only what each SDK builds from them. It does
-add `is_resolved` to `SOURCE_ROW_COLUMNS`, so an SDK from after #1032 against a
-server from before #1033 fails the SELECT rather than degrading; that is the
-same coupling `data_resident` already had.
+§6 changes no wire bytes, and no SDK signature — it adds a decoder and
+deprecates one. It does add `is_resolved` to `SOURCE_ROW_COLUMNS`, so an SDK
+from after #1032 against a server from before #1033 fails the SELECT rather
+than degrading; that is the same coupling `data_resident` already had.

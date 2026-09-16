@@ -340,11 +340,10 @@ class TestOmeZarrIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            # The catalog stays lean: no physical scale advertised there, and
-            # the struct has no field to advertise one in (biopb/biopb#1032).
+            # list_flights stays lean: no physical scale advertised there.
             sources = client.list_sources()
             listed = sources["phys"].tensors[0]
-            assert not hasattr(listed, "physical_scale")
+            assert not listed.physical_scale
 
             # A normal get_tensor (with_metadata=False) populates the cached
             # descriptor's summary; get_physical_scale reads it with no extra

@@ -221,17 +221,16 @@ class TestSourceMetadataUnresolvedGuard:
     """F2 (#108): get_source_metadata must steer to resolve(), not return {}."""
 
     def test_unresolved_source_raises_instead_of_returning_empty(self, monkeypatch):
-        # An unresolved source's row has an empty `tensors` list; the old
-        # behavior returned {}, conflating "unresolved" with "resolved, no
-        # metadata". It must instead raise the directive error -- and without
-        # any GetFlightInfo recall.
+        # An unresolved source's row says so; the old behavior returned {},
+        # conflating "unresolved" with "resolved, no metadata". It must instead
+        # raise the directive error -- and without any GetFlightInfo recall.
         import pyarrow as pa
 
         client = _bare_client()
         monkeypatch.setattr(
             client._catalog,
             "_query_table",
-            lambda sql: pa.table({"tensors": [[]], "metadata_json": [None]}),
+            lambda sql: pa.table({"is_resolved": [False], "metadata_json": [None]}),
         )
         recalled = []
         client._state.client = type(
@@ -245,6 +244,20 @@ class TestSourceMetadataUnresolvedGuard:
         assert "unresolved" in msg
         assert "client.resolve('cloud_x')" in msg
         assert recalled == []  # no GetFlightInfo / download was triggered
+
+    def test_resolved_source_with_no_metadata_returns_empty(self, monkeypatch):
+        """The other half of the same distinction: a source that resolved and
+        simply has no metadata gets ``{}``, not a directive telling the caller
+        to resolve something already resolved (biopb/biopb#1032)."""
+        import pyarrow as pa
+
+        client = _bare_client()
+        monkeypatch.setattr(
+            client._catalog,
+            "_query_table",
+            lambda sql: pa.table({"is_resolved": [True], "metadata_json": [None]}),
+        )
+        assert client.get_source_metadata("local_x") == {}
 
 
 class TestPhysicalScaleUnresolvedGuard:

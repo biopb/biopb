@@ -36,7 +36,6 @@ from biopb.image.annotation_pb2 import (
     RoiPruneResult,
     RoiPutResult,
 )
-from biopb.tensor._catalog_rows import CatalogSource
 from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
@@ -66,6 +65,7 @@ from biopb.tensor._upload import UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
+    DataSourceDescriptor,
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
@@ -235,7 +235,7 @@ class TensorFlightClient:
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
-    def list_sources(self) -> Dict[str, CatalogSource]:
+    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
         """List available data sources.
 
         Deprecated:
@@ -246,12 +246,13 @@ class TensorFlightClient:
             browse is exactly where that matters.
 
         Returns:
-            Dictionary mapping source_id to `CatalogSource`.
-            Each ``CatalogSource.tensors`` carries the *structural* entry for
+            Dictionary mapping source_id to DataSourceDescriptor.
+            Each DataSourceDescriptor.tensors carries the *structural* entry for
             every tensor in that source -- array_id, dim_labels, shape, dtype.
-            The transfer ``chunk_shape`` is not on it at all; ask
+            The transfer ``chunk_shape`` is empty here by contract; ask
             :meth:`get_descriptor` for the grid of a specific tensor
-            (biopb/biopb#812).
+            (biopb/biopb#812). ``is_resolved`` is not carried at all -- the
+            message has no field for it (biopb/biopb#1032).
         """
         warnings.warn(
             "TensorFlightClient.list_sources() is deprecated and is capped by "
@@ -262,15 +263,15 @@ class TensorFlightClient:
         )
         return self._catalog.list_sources()
 
-    def get_source(self, source_id: str) -> Optional[CatalogSource]:
-        """One source's `CatalogSource` by id, or ``None``.
+    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
+        """One source's ``DataSourceDescriptor`` by id, or ``None``.
 
         Deprecated:
             Use :meth:`query_sources` with a ``WHERE source_id = ...``, and
             `biopb.tensor.source_from_row` if you want a struct.
 
         The catalog is public: a source whose pixels need a capability token
-        still has its row here. Knowing its id is not authority to read
+        still has its descriptor here. Knowing its id is not authority to read
         it -- that is what the token gates, on :meth:`get_tensor` and
         :meth:`list_rois`.
 
@@ -280,7 +281,8 @@ class TensorFlightClient:
                 ``"aics_7f3/Image:0"``.
 
         Returns:
-            The `CatalogSource`, or ``None`` when nothing answers to that id.
+            The ``DataSourceDescriptor``, or ``None`` when nothing answers to
+            that id.
         """
         warnings.warn(
             "TensorFlightClient.get_source() is deprecated; use query_sources() "
@@ -467,8 +469,8 @@ class TensorFlightClient:
         *,
         on_progress: Optional[Callable[[ResolveProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> CatalogSource:
-        """Resolve an unresolved source and return its full `CatalogSource`.
+    ) -> DataSourceDescriptor:
+        """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
 
         Note:
             Experimental. Cloud / remote source support (unresolved sources,
@@ -501,10 +503,13 @@ class TensorFlightClient:
                 completion and is cached, so a later ``resolve`` reuses it.
 
         Returns:
-            The full `CatalogSource` with every tensor/field enumerated
+            The full ``DataSourceDescriptor`` with every tensor/field enumerated
             -- the complete field set in one call, regardless of catalog size.
             Built from the source's catalog row as the server now holds it, so
-            it agrees with a following `query_sources` exactly.
+            it agrees with a following `query_sources` exactly. It does not
+            carry ``is_resolved`` (the message has no field for it); decode the
+            row yourself with `biopb.tensor.source_from_row` if you want it
+            (biopb/biopb#1032).
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.

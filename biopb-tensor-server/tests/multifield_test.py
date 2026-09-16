@@ -202,7 +202,7 @@ class TestMultifieldServerClient:
     """Tests for server/client with multifield sources."""
 
     def test_list_sources_returns_all_tensors_in_descriptor(self):
-        """list_sources() should return a CatalogSource with all tensors."""
+        """list_sources() should return DataSourceDescriptor with all tensors."""
         tensor_specs = [
             ("pos_0", (64, 64), "uint8"),
             ("pos_1", (100, 100), "uint8"),
@@ -225,8 +225,8 @@ class TestMultifieldServerClient:
             source_desc = sources["multifield-test"]
             assert len(source_desc.tensors) == 2
             # Client has all tensor shape info upfront
-            assert source_desc.tensors[0].shape == (64, 64)
-            assert source_desc.tensors[1].shape == (100, 100)
+            assert source_desc.tensors[0].shape == [64, 64]
+            assert source_desc.tensors[1].shape == [100, 100]
 
             client.close()
         finally:

@@ -9,9 +9,11 @@ the service module itself imports no Qt/napari.)
 import contextlib
 import json
 import os
+import re
 from unittest.mock import MagicMock
 
 import pytest
+from biopb.tensor import CatalogSource
 
 from biopb_mcp import _connection
 from biopb_mcp._connection import (
@@ -50,6 +52,7 @@ def _catalog_rows(sources):
             "source_url": f"/data/{sid}",
             "source_type": "zarr",
             "data_resident": True,
+            "is_resolved": True,
             "tensors": [],
         }
         for sid in sources
@@ -60,7 +63,18 @@ def _fake_client(sources):
     client = MagicMock()
     # `catalog` is the knob: assign a new id set and the next browse sees it.
     client.catalog = list(sources)
-    client.query_sources.side_effect = lambda sql, **kw: _catalog_rows(client.catalog)
+
+    def _query(sql, **_kw):
+        rows = _catalog_rows(client.catalog)
+        # Honour an addressed lookup: `resolve_source` reads one row back by
+        # id, and a fake that ignored the predicate would pass whatever
+        # happened to sort first.
+        match = re.search(r"WHERE source_id = '([^']*)'", sql)
+        if match:
+            rows = [r for r in rows if r["source_id"] == match.group(1)]
+        return rows
+
+    client.query_sources.side_effect = _query
     client.health_check.return_value = {"status": "SERVING"}
     return client
 
@@ -471,11 +485,10 @@ class TestConnect:
             conn.resolve_source("cloud_x")
 
     def test_resolve_source_delegates_and_refreshes(self, monkeypatch):
-        # resolve() returns the resolved descriptor; the connection then re-lists
-        # so its snapshot carries the now-populated field set.
-        resolved = MagicMock(name="resolved-descriptor")
+        # resolve() hydrates; the connection then re-lists so its snapshot
+        # carries the now-populated field set, and reads the row back.
         client = _fake_client({"cloud_x": MagicMock()})
-        client.resolve.return_value = resolved
+        client.resolve.return_value = MagicMock(name="legacy-descriptor")
         monkeypatch.setattr(
             _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
@@ -491,7 +504,12 @@ class TestConnect:
         client.resolve.assert_called_once_with(
             "cloud_x", on_progress=None, should_cancel=None
         )
-        assert out is resolved  # the resolved descriptor is returned verbatim
+        # Not resolve()'s return: that is the deprecated DataSourceDescriptor,
+        # which has no `is_resolved` (biopb/biopb#1032). The row is read back
+        # addressed, so a catalog past the browse cap still answers.
+        assert isinstance(out, CatalogSource)
+        assert out.source_id == "cloud_x"
+        assert out.is_resolved is True
         assert set(conn.sources) == {"cloud_x", "other"}  # snapshot refreshed
 
     def test_warm_source_requires_connection(self):

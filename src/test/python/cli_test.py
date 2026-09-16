@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from biopb.tensor import CatalogSource, CatalogTensor
 from biopb.tensor.cli import _parse_slice_hint, app
 from typer.testing import CliRunner
 
@@ -45,18 +44,31 @@ def _build_mock_client() -> MagicMock:
     """Build a mock TensorFlightClient for testing."""
     mock_client = MagicMock()
 
-    source_desc = CatalogSource(
-        source_id="my-source",
-        tensors=(
-            CatalogTensor(array_id="pos_0", shape=(512, 512), dtype="uint8"),
-            CatalogTensor(array_id="pos_1", shape=(512, 512), dtype="uint16"),
-        ),
-    )
-
-    # Mock list_sources
-    mock_client.list_sources.return_value = {
-        "my-source": source_desc,
-    }
+    # The CLI browses with query_sources + sources_from_rows, so the mock
+    # answers with catalog rows rather than a descriptor map.
+    mock_client.query_sources.return_value = [
+        {
+            "source_id": "my-source",
+            "source_url": "/data/my-source.zarr",
+            "source_type": "zarr",
+            "data_resident": True,
+            "is_resolved": True,
+            "tensors": [
+                {
+                    "array_id": "pos_0",
+                    "dim_labels": ["y", "x"],
+                    "shape": [512, 512],
+                    "dtype": "uint8",
+                },
+                {
+                    "array_id": "pos_1",
+                    "dim_labels": ["y", "x"],
+                    "shape": [512, 512],
+                    "dtype": "uint16",
+                },
+            ],
+        }
+    ]
 
     # Mock get_source_metadata
     mock_client.get_source_metadata.return_value = {
@@ -141,7 +153,7 @@ class TestQueryCommand:
         """Test that query handles empty source list gracefully."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
-            mock_client.list_sources.return_value = {}
+            mock_client.query_sources.return_value = []
             mock_fc_class.return_value = mock_client
 
             result = runner.invoke(app, ["query"])
@@ -587,8 +599,8 @@ class TestEveryCommandClassifiesItsFailures:
 
     # (argv, the client method whose call is the command's first RPC)
     CASES = [
-        (["query"], "list_sources"),
-        (["metadata", "my-source"], "list_sources"),
+        (["query"], "query_sources"),
+        (["metadata", "my-source"], "query_sources"),
         (["get", "my-source", "-o", "-"], "get_tensor_pb"),
         (["stats", "my-source"], "get_tensor"),
         (["cache-stats"], "cache_stats"),

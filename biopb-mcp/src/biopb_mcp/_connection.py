@@ -39,7 +39,11 @@ from typing import Dict
 
 from biopb import _data_plane
 from biopb.tensor import CatalogSource, TensorFlightClient, sources_from_rows
-from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+from biopb.tensor._catalog_rows import (
+    SOURCE_ROW_COLUMNS,
+    source_from_row,
+    sql_literal,
+)
 
 from ._config import CONFIG
 from ._control_client import ensure_data_plane
@@ -370,9 +374,14 @@ class TensorConnection:
         Delegates to the SDK's :meth:`TensorFlightClient.resolve` — which asks the
         server to hydrate the source (for a dehydrated placeholder this **downloads
         the whole file**, so it is slow and blocking and must be called off the GUI
-        thread) and returns the now-populated `CatalogSource`. The local
-        catalog snapshot (:attr:`sources`) is then refreshed so callers re-render
-        from the resolved field list. Returns the resolved descriptor.
+        thread). The local catalog snapshot (:attr:`sources`) is then refreshed so
+        callers re-render from the resolved field list.
+
+        Returns a `CatalogSource`, read back addressed rather than taken from
+        ``resolve()``: that returns the deprecated ``DataSourceDescriptor``, which
+        has no ``is_resolved`` (biopb/biopb#1032), and the caller's next question
+        is whether to warm — which needs it. Addressed, not off :attr:`sources`,
+        so a catalog past the browse cap still answers.
 
         ``on_progress`` (called with a ``ResolveProgress`` per server heartbeat)
         and ``should_cancel`` (polled per heartbeat; raising
@@ -381,13 +390,22 @@ class TensorConnection:
         """
         if self.client is None:
             raise RuntimeError("Not connected")
-        descriptor = self.client.resolve(
+        self.client.resolve(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
         # resolve() already re-listed server-side; mirror it into our snapshot so
         # the widget/agent see the full field set without a second round-trip.
         self.refresh()
-        return descriptor
+        return self._read_source(source_id)
+
+    def _read_source(self, source_id: str) -> CatalogSource | None:
+        """One source's catalog row by id, or ``None``."""
+        rows = self.client.query_sources(
+            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources "
+            f"WHERE source_id = {sql_literal(source_id)}",
+            format="records",
+        )
+        return source_from_row(rows[0]) if rows else None
 
     def warm_source(
         self,

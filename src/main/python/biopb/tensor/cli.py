@@ -28,6 +28,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb import _data_plane
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, sources_from_rows
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
@@ -64,6 +65,21 @@ _OPT_CACHE_BYTES = typer.Option(
 _OPT_SLICE = typer.Option(
     None, "--slice", "-S", help="Slice specification, e.g. '0:100,0:200'"
 )
+
+
+def _browse(client) -> dict:
+    """The catalog as ``{source_id: CatalogSource}``.
+
+    ``query_sources`` rather than the deprecated ``list_sources``: same rows and
+    the same server-side cap, but the struct carries ``is_resolved``, which the
+    listing needs to tell "not resolved yet" from "nothing readable in it"
+    (biopb/biopb#1032).
+    """
+    rows = client.query_sources(
+        f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id",
+        format="records",
+    )
+    return {s.source_id: s for s in sources_from_rows(rows)}
 
 
 def _log_timing(start_time: float) -> None:
@@ -252,7 +268,7 @@ def query(
     start_time = time.time()
     client, endpoint = _connect(server, token, cache_bytes)
     try:
-        sources = client.list_sources()
+        sources = _browse(client)
         if not sources:
             stderr_console.print(f"[yellow]No sources found on {endpoint.url}[/yellow]")
             _log_timing(start_time)
@@ -411,7 +427,7 @@ def metadata(
     start_time = time.time()
     client, endpoint = _connect(server, token, cache_bytes)
     try:
-        sources = client.list_sources()
+        sources = _browse(client)
         if source_id not in sources:
             stderr_console.print(f"[red]Source not found:[/red] {source_id}")
             raise typer.Exit(1)

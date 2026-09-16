@@ -7,6 +7,7 @@ Key components:
 - TensorFlightClient: Client for accessing tensors from a TensorFlightServer
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
 - sources_from_rows: `sources` catalog rows -> CatalogSource structs
+  (descriptors_from_rows is the deprecated DataSourceDescriptor form)
 - CLI diagnostics: `biopb tensor` command for inspecting sources and tensors
 
 The CLI module provides the `biopb tensor` command with four subcommands:
@@ -21,6 +22,8 @@ Note: Server components have been moved to the biopb-tensor-server package.
 from biopb.tensor._catalog_rows import (
     CatalogSource,
     CatalogTensor,
+    descriptor_from_row,
+    descriptors_from_rows,
     source_from_row,
     sources_from_rows,
 )
@@ -77,6 +80,9 @@ __all__ = [
     "CatalogTensor",
     "source_from_row",
     "sources_from_rows",
+    # Deprecated: the same rows as DataSourceDescriptor (biopb/biopb#1032)
+    "descriptor_from_row",
+    "descriptors_from_rows",
     # Client
     "TensorFlightClient",
     "ResolveCancelled",

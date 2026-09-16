@@ -47,14 +47,35 @@ public class TensorFlightClientTest {
     public void testListSourcesAndTensorLookup() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, CatalogSource> sources = client.listSources();
+                @SuppressWarnings("deprecation")
+                Map<String, DataSourceDescriptor> sources = client.listSources();
                 Assert.assertTrue(sources.containsKey("test-source"));
 
-                CatalogSource source = sources.get("test-source");
-                Assert.assertEquals(1, source.getTensors().size());
-                Assert.assertTrue(source.isResolved());
-                Assert.assertEquals("test-tensor", source.getTensors().get(0).getArrayId());
-                Assert.assertEquals(Arrays.asList(4L, 4L), source.getTensors().get(0).getShape());
+                DataSourceDescriptor sourceDesc = sources.get("test-source");
+                Assert.assertEquals(1, sourceDesc.getTensorsCount());
+                Assert.assertEquals("test-tensor", sourceDesc.getTensors(0).getArrayId());
+                Assert.assertEquals(Arrays.asList(4L, 4L), sourceDesc.getTensors(0).getShapeList());
+            }
+        }
+    }
+
+    @Test
+    public void testCatalogRowsDecodeToStructsCarryingIsResolved() throws Exception {
+        // The same rows listSources() reads, through the decoder that is not
+        // bounded by the generated message (biopb/biopb#1032).
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                try (VectorSchemaRoot root = client.querySources(
+                        "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
+                    List<CatalogSource> sources = TensorFlightClient.sourcesFromRows(root);
+                    Assert.assertEquals(1, sources.size());
+                    CatalogSource source = sources.get(0);
+                    Assert.assertEquals("test-source", source.getSourceId());
+                    Assert.assertTrue(source.isResolved());
+                    Assert.assertEquals(1, source.getTensors().size());
+                    Assert.assertEquals("test-tensor", source.getTensors().get(0).getArrayId());
+                    Assert.assertEquals(Arrays.asList(4L, 4L), source.getTensors().get(0).getShape());
+                }
             }
         }
     }
