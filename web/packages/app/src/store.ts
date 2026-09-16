@@ -476,6 +476,18 @@ let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
  * and eviction are invisible the same way. `JSON.stringify` covers every
  * field of `DataSourceDescriptor` by construction, so a field added later
  * can't go silently blind to the poll the way the url-only check did.
+ *
+ * It is order-sensitive, in both array and key order, and that is safe: the
+ * worst an ordering change can do is a false *positive* -- one extra repaint.
+ * A false negative is impossible, because two listings stringify alike only
+ * when every field of every source already matches.
+ *
+ * Order is deterministic anyway, resting on three things worth naming since
+ * nothing else states them: the server lists `ORDER BY source_id` (unique, so
+ * a total order); `.sort()` is stable, so the `source_url` ties -- real, every
+ * upload sorts as `""` -- keep that order; and both sides are `JSON.parse` of
+ * the same endpoint, whose key order is fixed by `_source_row_to_dict`. Feed
+ * `sources` from a hand-built descriptor instead and the third stops holding.
  */
 export function catalogFingerprint(sources: DataSourceDescriptor[]): string {
   return JSON.stringify(sources);
