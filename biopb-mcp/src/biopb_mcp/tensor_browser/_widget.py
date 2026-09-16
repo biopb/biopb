@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
 from biopb.tensor import ResolveCancelled
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -41,6 +40,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from .._catalog import CatalogSource
 from .._connection import TensorConnection
 from .._tensor_utils import add_tensor_layer
 
@@ -64,7 +64,7 @@ class _TreeNode:
         name: str,
         node_type: str,  # "folder" or "source"
         depth: int,
-        source: DataSourceDescriptor | None = None,
+        source: CatalogSource | None = None,
     ):
         self.node_id = node_id
         self.name = name
@@ -155,12 +155,18 @@ _REMOTE_TOOLTIP = (
 _RESIDENT_TOOLTIP = "Resident — content is local and cheap to read"
 
 
-def _is_unresolved(src: DataSourceDescriptor) -> bool:
-    """A source whose content has not been resolved yet: its field list is empty,
-    so shape/dtype are unknown until the server hydrates it (the cloud / synced-
-    folder case). Resolving such a source downloads its whole file, so it is an
-    explicit, blocking action rather than something browsing triggers."""
-    return len(src.tensors) == 0
+def _is_unresolved(src: CatalogSource) -> bool:
+    """A source whose content has not been resolved yet, so shape/dtype are
+    unknown until the server hydrates it (the cloud / synced-folder case).
+    Resolving such a source downloads its whole file, so it is an explicit,
+    blocking action rather than something browsing triggers.
+
+    The server's own answer, not the empty field list it used to be inferred
+    from: "no tensors" also describes a source that resolved cleanly and had
+    nothing readable in it, and offering *that* a Resolve that can only
+    succeed-and-change-nothing is the wrong branch (biopb/biopb#1032).
+    """
+    return not src.is_resolved
 
 
 class _ResolveWorker(QThread):
@@ -176,7 +182,7 @@ class _ResolveWorker(QThread):
     server-side recall finishes and is cached, so a later resolve coalesces).
     """
 
-    resolved = Signal(object)  # the refreshed DataSourceDescriptor
+    resolved = Signal(object)  # the refreshed CatalogSource
     failed = Signal(str)
     cancelled = Signal()
     progress = Signal(object)  # ResolveProgress
@@ -223,7 +229,7 @@ _MULTIFILE_SOURCE_TYPES = frozenset(
 )
 
 
-def _is_multifile_source(src: DataSourceDescriptor) -> bool:
+def _is_multifile_source(src: CatalogSource) -> bool:
     """A resolved, directory-backed multi-file source -- the case where member
     data files recall lazily onto the read path, so hydrate-ahead helps."""
     return not _is_unresolved(src) and src.source_type in _MULTIFILE_SOURCE_TYPES
@@ -479,7 +485,7 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f} TB"
 
 
-def _residency_state(src: DataSourceDescriptor) -> str | None:
+def _residency_state(src: CatalogSource) -> str | None:
     """Residency of a source's content, or ``None`` when the server didn't report it.
 
     Returns ``"resident"`` (content local, cheap to read), ``"remote"`` (not
@@ -487,12 +493,12 @@ def _residency_state(src: DataSourceDescriptor) -> str | None:
     ``data_resident`` is unset (a server predating the field; residency unknown,
     so the UI shows no indicator rather than guessing).
     """
-    if not src.HasField("data_resident"):
+    if src.data_resident is None:
         return None
     return "resident" if src.data_resident else "remote"
 
 
-def _build_tree(sources: Dict[str, DataSourceDescriptor]) -> _TreeNode:
+def _build_tree(sources: Dict[str, CatalogSource]) -> _TreeNode:
     """Build hierarchical tree from sources based on source_url paths."""
     root = _TreeNode(node_id="", name="", node_type="folder", depth=0)
 
@@ -745,7 +751,7 @@ class MetadataDialog(QDialog):
     def __init__(
         self,
         parent: QWidget,
-        source: DataSourceDescriptor,
+        source: CatalogSource,
         tensor_id: str | None = None,
         metadata: Dict | None = None,
     ):
@@ -773,7 +779,7 @@ class MetadataDialog(QDialog):
             tensor_desc = next(
                 (t for t in source.tensors if t.array_id == tensor_id), None
             )
-        elif len(source.tensors) == 1 and source.tensors[0]:
+        elif len(source.tensors) == 1:
             tensor_desc = source.tensors[0]
 
         if tensor_desc:
@@ -1702,7 +1708,7 @@ class TensorBrowserWidget(QWidget):
             src = node.source
             assert src is not None
             display_name = node.name
-            if len(src.tensors) == 1 and src.tensors[0]:
+            if len(src.tensors) == 1:
                 # Show shape badge for single tensor
                 shape_str = _format_shape(src.tensors[0].shape)
                 display_name = f"{node.name}  [{shape_str}]"
@@ -1891,7 +1897,7 @@ class TensorBrowserWidget(QWidget):
             source_id = item.data(0, Qt.ItemDataRole.UserRole)
             self._selected_source_id = source_id
             src = self._sources.get(source_id)
-            if src and len(src.tensors) == 1 and src.tensors[0]:
+            if src and len(src.tensors) == 1:
                 self._selected_tensor_id = src.tensors[0].array_id
             else:
                 self._selected_tensor_id = None
@@ -1929,7 +1935,7 @@ class TensorBrowserWidget(QWidget):
                 # consented resolve (downloads the file), not a viewer add.
                 self._resolve_source(source_id)
                 return
-            if src and len(src.tensors) == 1 and src.tensors[0]:
+            if src and len(src.tensors) == 1:
                 self._selected_source_id = source_id
                 self._selected_tensor_id = src.tensors[0].array_id
             else:
@@ -1960,7 +1966,7 @@ class TensorBrowserWidget(QWidget):
             source_id = item.data(0, Qt.ItemDataRole.UserRole)
             src = self._sources.get(source_id)
             is_unresolved_source = src is not None and _is_unresolved(src)
-            if src and len(src.tensors) == 1 and src.tensors[0]:
+            if src and len(src.tensors) == 1:
                 tensor_id = src.tensors[0].array_id
                 is_multi_tensor_source = False
             else:
@@ -2340,13 +2346,12 @@ class TensorBrowserWidget(QWidget):
             f"Dtype: {tensor_desc.dtype}",
             f"Dims: {dims_str}",
         ]
-        # These descriptors come from the catalog listing, which is structural
-        # and carries no chunk grid: the transfer grid belongs to the tensor
-        # GetFlightInfo binds, which is authoritative for it (biopb/biopb#684,
-        # biopb/biopb#812). Omit the row rather than render an empty one; a
-        # descriptor that does carry a grid still shows it.
-        if tensor_desc.chunk_shape:
-            lines.append(f"Chunks: {_format_shape(tensor_desc.chunk_shape)}")
+        # No chunk grid here. These entries come from the catalog listing,
+        # and the transfer grid belongs to the tensor GetFlightInfo binds,
+        # which is authoritative for it (biopb/biopb#684, biopb/biopb#812).
+        # This used to be a `if tensor_desc.chunk_shape:` row, unreachable
+        # since the listing has always left the field empty; the catalog
+        # struct no longer has one to test (biopb/biopb#1032).
         self._metadata_label.setText("\n".join(lines))
         self._metadata_pane.setVisible(True)
 

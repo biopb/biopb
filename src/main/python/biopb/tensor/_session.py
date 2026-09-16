@@ -42,7 +42,7 @@ from biopb.image.annotation_pb2 import (
 )
 from biopb.tensor._catalog_rows import (
     SOURCE_ROW_COLUMNS,
-    descriptor_from_row,
+    _descriptor_from_row,
     sql_literal,
 )
 from biopb.tensor._pool import (
@@ -469,7 +469,7 @@ class CatalogClient:
         table = self._query_table(self._SOURCES_SQL + " ORDER BY source_id")
         source_descriptors = {}
         for row in table.to_pylist():
-            source_desc = descriptor_from_row(row)
+            source_desc = _descriptor_from_row(row)
             source_descriptors[source_desc.source_id] = source_desc
             self._cache_tensors(source_desc)
         logger.info(f"list_sources: returned {len(source_descriptors)} sources")
@@ -482,7 +482,7 @@ class CatalogClient:
             f"{self._SOURCES_SQL} WHERE source_id = {sql_literal(source_id)}"
         )
         for row in table.to_pylist():
-            source_desc = descriptor_from_row(row)
+            source_desc = _descriptor_from_row(row)
             self._cache_tensors(source_desc)
             return source_desc
         return None
@@ -490,6 +490,25 @@ class CatalogClient:
     def _cache_tensors(self, source_desc: DataSourceDescriptor) -> None:
         for tensor_desc in source_desc.tensors:
             self._state.cache_descriptor(tensor_desc)
+
+    def _cache_row_tensors(self, row: Mapping[str, Any]) -> None:
+        """The same cache, seeded straight from a row.
+
+        The cache holds ``TensorDescriptor`` -- the type GetFlightInfo answers
+        with and the read path reads -- so the row's structural fields are
+        copied into one. A catalog entry fills only those, as it always did.
+        Built here rather than by decoding the whole row into a source: that
+        choice is the caller's now (biopb/biopb#1032).
+        """
+        for tensor in row.get("tensors") or []:
+            self._state.cache_descriptor(
+                TensorDescriptor(
+                    array_id=tensor["array_id"],
+                    dim_labels=tensor.get("dim_labels") or [],
+                    shape=tensor.get("shape") or [],
+                    dtype=tensor.get("dtype") or "",
+                )
+            )
 
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Backs TensorFlightClient.query_sources; see that method for the full
@@ -576,7 +595,7 @@ class CatalogClient:
         # get_tensor_metadata() delta, so a multi-field source reported one
         # arbitrary field's extras as the source's metadata.
         table = self._query_table(
-            "SELECT tensors, metadata_json FROM sources "
+            "SELECT is_resolved, metadata_json FROM sources "
             f"WHERE source_id = {sql_literal(source_id)}"
         )
         rows = table.to_pylist()
@@ -584,12 +603,14 @@ class CatalogClient:
             raise ValueError(f"Source not found: {source_id}")
         row = rows[0]
 
-        if not row.get("tensors"):
+        if not row.get("is_resolved", True):
             # Unresolved (cloud / synced-folder) source: tensors are unknown
             # until resolve. Don't silently return {} -- that conflates
             # "unresolved" with "resolved, no metadata" (the line below). Steer
             # the caller to the explicit, consented resolve() instead, matching
-            # get_physical_scale / get_tensor (#108).
+            # get_physical_scale / get_tensor (#108). The flag, not an empty
+            # tensor list -- a source can resolve cleanly and hold nothing
+            # readable (biopb/biopb#1032).
             raise _unresolved_source_error(source_id)
 
         raw = row.get("metadata_json")
@@ -806,7 +827,7 @@ class CatalogClient:
         *,
         on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> "DataSourceDescriptor":
+    ) -> Dict[str, Any]:
         """Backs TensorFlightClient.resolve; see that method for the full
         documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
@@ -838,9 +859,8 @@ class CatalogClient:
                 f"resolve('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
-        desc = descriptor_from_row(row)
-        self._cache_tensors(desc)
-        return desc
+        self._cache_row_tensors(row)
+        return dict(row)
 
     def warm(
         self,

@@ -207,7 +207,7 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
             # Not in the (possibly truncated) cached catalog — fetch the tensor
             # descriptor directly from the server and wrap it as a single-tensor
             # source (a bare source_id resolves the source's default tensor).
-            from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+            from .._catalog import CatalogSource, CatalogTensor
 
             try:
                 desc = client.get_descriptor(tensor_id or source_id)
@@ -216,10 +216,20 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
                     f"Source '{source_id}' not found. "
                     f"Available: {list(sources.keys())[:20]}"
                 ) from exc
-            src = DataSourceDescriptor(source_id=source_id, tensors=[desc])
+            src = CatalogSource(
+                source_id=source_id,
+                tensors=(
+                    CatalogTensor(
+                        array_id=desc.array_id,
+                        dim_labels=tuple(desc.dim_labels),
+                        shape=tuple(desc.shape),
+                        dtype=desc.dtype,
+                    ),
+                ),
+            )
 
         if tensor_id is None:
-            if len(src.tensors) == 1 and src.tensors[0]:
+            if len(src.tensors) == 1:
                 tensor_id = src.tensors[0].array_id
             else:
                 ids = [t.array_id for t in src.tensors]

@@ -359,19 +359,17 @@ class TestGetPhysicalScale:
 
     @staticmethod
     def _desc(array_id, scale=None, unit=None):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-
         desc = TensorDescriptor(array_id=array_id, dim_labels=["z", "y", "x"])
         if scale is not None:
             desc.physical_scale[:] = scale
             desc.physical_unit[:] = unit
-        return desc, DataSourceDescriptor
+        return desc
 
     def test_reads_cached_descriptor_without_rpc(self):
         # A descriptor cached by a prior get_tensor() carries the summary, so
         # get_physical_scale returns it with no extra fetch.
         client = self._client()
-        desc, _ = self._desc(
+        desc = self._desc(
             "t1", [2.0, 0.325, 0.325], ["micrometer", "micrometer", "micrometer"]
         )
         client._descriptors["src/t1"] = desc
@@ -385,7 +383,7 @@ class TestGetPhysicalScale:
     def test_none_when_summary_empty(self):
         # Old server / no physical sizes -> empty repeated field -> None.
         client = self._client()
-        desc, _ = self._desc("t1")  # no physical_scale set
+        desc = self._desc("t1")  # no physical_scale set
         client._descriptors["src/t1"] = desc
 
         assert client.get_physical_scale("src/t1") is None
@@ -396,7 +394,7 @@ class TestGetPhysicalScale:
         # resolves the source's default tensor. No get_source / _sources fallback
         # (removed with the array_id-keyed accessor, #75).
         client = self._client()
-        desc, _ = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
+        desc = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
         client._catalog._fetch_tensor_descriptor.return_value = desc
 
         scale, unit = client.get_physical_scale("src")  # bare source id -> default

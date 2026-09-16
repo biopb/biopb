@@ -27,7 +27,7 @@ def connection():
 
 
 def _make_source(source_url, tensors):
-    """Create a mock DataSourceDescriptor."""
+    """Create a mock catalog source."""
     src = MagicMock()
     src.source_url = source_url
     src.tensors = tensors

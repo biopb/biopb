@@ -38,10 +38,10 @@ import time
 from typing import Dict
 
 from biopb import _data_plane
-from biopb.tensor import TensorFlightClient, descriptors_from_rows
+from biopb.tensor import TensorFlightClient
 from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
+from ._catalog import CatalogSource, source_from_row, sources_from_rows
 from ._config import CONFIG
 from ._control_client import ensure_data_plane
 
@@ -56,14 +56,16 @@ SERVER_QUERY_THRESHOLD = 1000
 _SOURCES_SQL = f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
 
 
-def _browse(client) -> Dict[str, DataSourceDescriptor]:
-    """The server's whole catalog as ``{source_id: DataSourceDescriptor}``.
+def _browse(client) -> Dict[str, CatalogSource]:
+    """The server's whole catalog as ``{source_id: CatalogSource}``.
 
     ``query_sources`` rather than the deprecated ``list_sources`` -- same rows,
-    same server-side cap, but without the deprecation warning.
+    same server-side cap, but without the deprecation warning. The SDK returns
+    rows; :mod:`._catalog` is this package's choice of what to make of them
+    (biopb/biopb#1032).
     """
     rows = client.query_sources(_SOURCES_SQL, format="records")
-    return {d.source_id: d for d in descriptors_from_rows(rows)}
+    return {s.source_id: s for s in sources_from_rows(rows)}
 
 
 class ServerStarting(Exception):
@@ -204,7 +206,7 @@ class TensorConnection:
 
     def __init__(self) -> None:
         self.client: TensorFlightClient | None = None
-        self.sources: Dict[str, DataSourceDescriptor] = {}
+        self.sources: Dict[str, CatalogSource] = {}
         self.use_server_query: bool = False
 
         # Last connect outcome, read by the widget status label and the MCP
@@ -256,7 +258,7 @@ class TensorConnection:
 
     def connect(
         self, url: str, token: str | None = None, *, from_env: bool = False
-    ) -> Dict[str, DataSourceDescriptor]:
+    ) -> Dict[str, CatalogSource]:
         """Connect to *url* and list available sources.
 
         Updates ``client``/``sources``/``url``/``token``/``use_server_query``. On
@@ -333,7 +335,7 @@ class TensorConnection:
             )
             raise
 
-    def refresh(self) -> Dict[str, DataSourceDescriptor]:
+    def refresh(self) -> Dict[str, CatalogSource]:
         """Re-list sources from the connected server."""
         if self.client is None:
             raise RuntimeError("Not connected")
@@ -365,15 +367,16 @@ class TensorConnection:
         *,
         on_progress=None,
         should_cancel=None,
-    ) -> DataSourceDescriptor:
+    ) -> CatalogSource:
         """Resolve an unresolved (cloud / synced-folder) source, then refresh.
 
         Delegates to the SDK's :meth:`TensorFlightClient.resolve` — which asks the
         server to hydrate the source (for a dehydrated placeholder this **downloads
         the whole file**, so it is slow and blocking and must be called off the GUI
-        thread) and returns the now-populated ``DataSourceDescriptor``. The local
-        catalog snapshot (:attr:`sources`) is then refreshed so callers re-render
-        from the resolved field list. Returns the resolved descriptor.
+        thread) and returns the source's now-populated catalog row. The local
+        snapshot (:attr:`sources`) is then refreshed so callers re-render from the
+        resolved field list. Returns the resolved source, decoded like any other
+        row this package reads.
 
         ``on_progress`` (called with a ``ResolveProgress`` per server heartbeat)
         and ``should_cancel`` (polled per heartbeat; raising
@@ -382,13 +385,13 @@ class TensorConnection:
         """
         if self.client is None:
             raise RuntimeError("Not connected")
-        descriptor = self.client.resolve(
+        row = self.client.resolve(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
         # resolve() already re-listed server-side; mirror it into our snapshot so
         # the widget/agent see the full field set without a second round-trip.
         self.refresh()
-        return descriptor
+        return source_from_row(row)
 
     def warm_source(
         self,
@@ -646,7 +649,7 @@ class TensorConnection:
         max_interval: float = 5.0,
         *,
         from_env: bool = False,
-    ) -> Dict[str, DataSourceDescriptor]:
+    ) -> Dict[str, CatalogSource]:
         """Connect to a server we just launched, waiting it through boot.
 
         Polls :meth:`connect` with capped exponential backoff until it returns

@@ -222,7 +222,15 @@ class TestSourceSync:
 class MultiTensorAdapter:
     """Mock adapter exposing several tensors (multi-field / HCS source)."""
 
-    def __init__(self, source_id, source_url, source_type, tensors, data_resident=True):
+    def __init__(
+        self,
+        source_id,
+        source_url,
+        source_type,
+        tensors,
+        data_resident=True,
+        is_resolved=True,
+    ):
         self.source_id = source_id
         self._source_url = source_url
         self._source_type = source_type
@@ -230,6 +238,7 @@ class MultiTensorAdapter:
             tensors  # list of dicts: array_id, dim_labels, shape, chunk_shape, dtype
         )
         self._data_resident = data_resident
+        self._is_resolved = is_resolved
 
     @property
     def catalog_url(self):
@@ -243,7 +252,7 @@ class MultiTensorAdapter:
         return self._data_resident
 
     def is_resolved(self):
-        return True
+        return self._is_resolved
 
     def list_tensor_descriptors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -417,41 +426,42 @@ class TestPerTensorCatalog:
         assert by_id["hcs"][1]["shape"] == [8, 256, 256]  # full struct, not projection
 
 
-def _descriptors(db):
-    """The SDK's projection of the catalog rows (what list_sources returns)."""
-    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, descriptors_from_rows
+def _sources(db):
+    """The `sources` rows a client browses, in the shared column contract."""
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-    return descriptors_from_rows(
-        db.query(
-            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
-        ).to_pylist()
-    )
+    return db.query(
+        f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
+    ).to_pylist()
 
 
 class TestSourceRowProjection:
-    """A catalog row rebuilds the lean DataSourceDescriptor (biopb/biopb#265)."""
+    """A catalog row carries the lean projection, nothing more (biopb/biopb#265)."""
 
     def test_empty_catalog_returns_no_rows(self):
-        assert _descriptors(MetadataDatabase()) == []
+        assert _sources(MetadataDatabase()) == []
 
-    def test_reconstructs_lean_descriptor(self):
+    def test_row_is_lean(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
         )
 
-        descriptors = _descriptors(db)
-        assert len(descriptors) == 1
-        d = descriptors[0]
-        assert d.source_id == "s1"
-        assert d.source_url == "/data/s1.zarr"
-        assert d.source_type == "zarr"
-        assert d.data_resident is True
-        assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
-        assert len(d.tensors) == 1
-        assert d.tensors[0].array_id == "s1"
-        assert list(d.tensors[0].shape) == [8, 512, 512]
-        assert d.tensors[0].dtype == "uint16"
+        sources = _sources(db)
+        assert len(sources) == 1
+        d = sources[0]
+        assert d["source_id"] == "s1"
+        assert d["source_url"] == "/data/s1.zarr"
+        assert d["source_type"] == "zarr"
+        assert d["data_resident"] is True
+        assert d["is_resolved"] is True
+        # Lean: source metadata is filled only by GetFlightInfo, so the browse
+        # projection does not select it at all.
+        assert "metadata_json" not in d
+        assert len(d["tensors"]) == 1
+        assert d["tensors"][0]["array_id"] == "s1"
+        assert d["tensors"][0]["shape"] == [8, 512, 512]
+        assert d["tensors"][0]["dtype"] == "uint16"
 
     def test_multi_tensor_all_reconstructed(self):
         db = MetadataDatabase()
@@ -475,14 +485,14 @@ class TestSourceRowProjection:
             "hcs", MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", fields)
         )
 
-        tensors = _descriptors(db)[0].tensors
-        assert [t.array_id for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
-        assert list(tensors[1].dim_labels) == ["z", "y", "x"]
-        assert list(tensors[1].shape) == [8, 256, 256]
-        # Structural only: no grid is stored, so none is reconstructed
-        # (biopb/biopb#812).
-        assert list(tensors[1].chunk_shape) == []
-        assert tensors[1].dtype == "uint8"
+        tensors = _sources(db)[0]["tensors"]
+        assert [t["array_id"] for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
+        assert tensors[1]["dim_labels"] == ["z", "y", "x"]
+        assert tensors[1]["shape"] == [8, 256, 256]
+        # Structural only: no grid is stored, and the tensors struct has no
+        # column to reconstruct one into (biopb/biopb#812).
+        assert "chunk_shape" not in tensors[1]
+        assert tensors[1]["dtype"] == "uint8"
 
     def test_ordered_by_source_id(self):
         db = MetadataDatabase()
@@ -490,17 +500,85 @@ class TestSourceRowProjection:
             db.sync_source_added(
                 sid, MockAdapter(sid, f"/d/{sid}", "zarr", [4, 4], "uint8")
             )
-        assert [d.source_id for d in _descriptors(db)] == ["a", "b", "c"]
+        assert [d["source_id"] for d in _sources(db)] == ["a", "b", "c"]
 
     def test_unresolved_source_has_no_tensors(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "u",
-            MultiTensorAdapter("u", "s3://b/x.zarr", "zarr", [], data_resident=False),
+            MultiTensorAdapter(
+                "u",
+                "s3://b/x.zarr",
+                "zarr",
+                [],
+                data_resident=False,
+                is_resolved=False,
+            ),
         )
-        descriptors = _descriptors(db)
-        assert len(descriptors[0].tensors) == 0
-        assert descriptors[0].data_resident is False
+        sources = _sources(db)
+        assert len(sources[0]["tensors"]) == 0
+        assert sources[0]["data_resident"] is False
+        # Empty tensors is not what makes it unresolved -- the flag is
+        # (biopb/biopb#1032).
+        assert sources[0]["is_resolved"] is False
+
+
+class TestDeprecatedDescriptorProjection:
+    """The proto decoder still answers, and still cannot carry `is_resolved`."""
+
+    def _rows(self, db):
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+
+        return db.query(
+            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
+        ).to_pylist()
+
+    def test_still_builds_the_same_descriptor(self):
+        import warnings
+
+        from biopb.tensor import descriptors_from_rows
+
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            (d,) = descriptors_from_rows(self._rows(db))
+
+        assert d.source_id == "s1"
+        assert d.source_url == "/data/s1.zarr"
+        assert d.data_resident is True
+        assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
+        assert list(d.tensors[0].shape) == [8, 512, 512]
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+    def test_cannot_carry_is_resolved(self):
+        """The reason for the deprecation, pinned: an unresolved source decodes
+        to a descriptor indistinguishable from a resolved-but-empty one."""
+        import warnings
+
+        from biopb.tensor import descriptors_from_rows
+
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "u",
+            MultiTensorAdapter(
+                "u",
+                "s3://b/x.zarr",
+                "zarr",
+                [],
+                data_resident=False,
+                is_resolved=False,
+            ),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            (d,) = descriptors_from_rows(self._rows(db))
+
+        assert not hasattr(d, "is_resolved")
+        # The row itself answers.
+        assert _sources(db)[0]["is_resolved"] is False
 
 
 class TestGetMetadataJson:

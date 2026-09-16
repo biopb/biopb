@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp import _connection
+from biopb_mcp._catalog import CatalogSource
 from biopb_mcp._connection import (
     SERVER_QUERY_THRESHOLD,
     TensorConnection,
@@ -50,6 +51,7 @@ def _catalog_rows(sources):
             "source_url": f"/data/{sid}",
             "source_type": "zarr",
             "data_resident": True,
+            "is_resolved": True,
             "tensors": [],
         }
         for sid in sources
@@ -471,11 +473,24 @@ class TestConnect:
             conn.resolve_source("cloud_x")
 
     def test_resolve_source_delegates_and_refreshes(self, monkeypatch):
-        # resolve() returns the resolved descriptor; the connection then re-lists
-        # so its snapshot carries the now-populated field set.
-        resolved = MagicMock(name="resolved-descriptor")
+        # resolve() returns the resolved catalog row; the connection decodes it
+        # and re-lists so its snapshot carries the now-populated field set.
         client = _fake_client({"cloud_x": MagicMock()})
-        client.resolve.return_value = resolved
+        client.resolve.return_value = {
+            "source_id": "cloud_x",
+            "source_url": "/data/cloud_x",
+            "source_type": "zarr",
+            "data_resident": True,
+            "is_resolved": True,
+            "tensors": [
+                {
+                    "array_id": "cloud_x",
+                    "dim_labels": ["y", "x"],
+                    "shape": [8, 8],
+                    "dtype": "uint8",
+                }
+            ],
+        }
         monkeypatch.setattr(
             _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
@@ -491,7 +506,13 @@ class TestConnect:
         client.resolve.assert_called_once_with(
             "cloud_x", on_progress=None, should_cancel=None
         )
-        assert out is resolved  # the resolved descriptor is returned verbatim
+        # The SDK hands back a row; this package decodes it into its own type
+        # (biopb/biopb#1032). `is_resolved` is what the caller's next question
+        # -- whether to warm -- turns on.
+        assert isinstance(out, CatalogSource)
+        assert out.source_id == "cloud_x"
+        assert out.is_resolved is True
+        assert [t.array_id for t in out.tensors] == ["cloud_x"]
         assert set(conn.sources) == {"cloud_x", "other"}  # snapshot refreshed
 
     def test_warm_source_requires_connection(self):

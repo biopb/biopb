@@ -1,8 +1,9 @@
-# Retiring DataSourceDescriptor from the wire
+# Retiring DataSourceDescriptor
 
-Status: **implemented**. Five coupled changes that finish what Flight protocol
-v2 (#1018) started: the catalog row is now the only representation of a source
-on the wire, and `DataSourceDescriptor` is an SDK-side view built from rows.
+Status: **implemented**, in two passes. Five coupled changes (#1025) finished
+what Flight protocol v2 (#1018) started: the catalog row became the only
+representation of a source on the wire, and `DataSourceDescriptor` an SDK-side
+view built from rows. Then #1032 retired the message from that view too — §6.
 
 ## What v2 already changed
 
@@ -90,9 +91,8 @@ row's `tensors` column.
 Both are wrappers around `query_sources` that inherit the server's query row cap
 — so a browse, which is exactly where the cap matters, came back silently
 truncated. The repo's own guidance already steered away from them. They still
-work; they warn, and point at `query_sources` plus
-`biopb.tensor.descriptors_from_rows` (now exported, in both SDKs, as the
-migration path).
+work; they warn, and point at `query_sources` plus a row decoder (now exported,
+in both SDKs, as the migration path).
 
 `_state.sources` is gone. It was a cache, not state — every read fell back — and
 both first-party consumers keep their own (`TensorConnection.sources`, the SPA's
@@ -133,9 +133,107 @@ It now reads `sources.metadata_json` via a one-row `query_sources`. The
 per-tensor overlay stays where it belongs, on a tensor-bound read's
 `with_metadata`.
 
+## 6. The SDK-side view is no longer a proto either (#1032)
+
+§1–5 left the message off the wire but kept it as what each SDK decoded a row
+*into*. That was the expensive half. The message is generated code, so every
+catalog column a client wanted cost a `.proto` edit and a `buf generate` across
+every binding — for a struct no message carries. `is_resolved` (#1030) made the
+price concrete: one boolean, a full codegen cycle.
+
+The "one schema, every language" argument for paying it was already void.
+TypeScript never shared the type — `web/packages/tensor-flight-client/src/types.ts`
+hand-rolls the same shape — and `http_server.py`'s `/api/sources` decodes rows to
+plain dicts. Two of three consumers had already converged on a hand-written
+struct.
+
+The fix is not a nicer struct — it is **no struct**. Replacing a proto the SDK
+picked with a dataclass the SDK picked keeps the shape of the mistake, just
+cheaper: the next field still lands in a type the caller did not choose. So
+the SDK stops choosing. `query_sources` already answers in `records` / `arrow`
+/ `pandas`; `resolve` returns the single row it just wrote, in the same
+`records` shape (Java: a `VectorSchemaRoot`, the type `querySources` already
+returns). Every client can decode a row — that is the one thing they all
+share — and what they decode it into is theirs.
+
+biopb-mcp is the worked example: it wants attribute access for a Qt widget
+that reads these fields across a few hundred lines, so it defines its own
+frozen dataclass in `_catalog.py`. That is a caller's choice, made in caller
+code, which is exactly what the original design intended.
+
+**The proto decoders stay, deprecated.** `descriptor_from_row` /
+`descriptors_from_rows` / `descriptorsFromRows` keep their names, their
+signatures and their exact output, as do `list_sources` / `get_source` — the
+two stable APIs that return `DataSourceDescriptor`. Nothing an SDK user calls
+changes shape under them; the deprecation is the message, and what it says is
+that this path cannot grow. There is deliberately **no replacement decoder to
+point at** — the row is the data structure, and the warning says so.
+
+**`resolve()` does change, because it can.** Cloud support is experimental, so
+it returns the row now — a `records`-shaped dict in Python, a
+`VectorSchemaRoot` in Java. The question it raises is why it does not mirror
+`warm()`, which returns a terminal `WarmProgress`. The two look symmetric and
+are not:
+
+- `warm` changes **residency**, which is deliberately not a durable catalog
+  fact (#1035). Its `files_total` / `files_done` / `bytes_done` exist nowhere
+  else — no query recovers them — so returning them is the only way they reach
+  a client. `files_total == 0` is load-bearing on exactly that basis: it is
+  how a caller learns the source had nothing to warm.
+- `resolve` changes **`is_resolved` and `tensors`**, which are columns. Its
+  result is durable by construction, so the return is a shortcut to data that
+  now exists rather than the only channel to it.
+
+And a terminal `ResolveProgress` would carry `elapsed_seconds` (the caller can
+time it) plus `target_name` / `target_bytes` (derivable from `source_url`) —
+the reconstructible half — while dropping the tensor list, the half that is
+the point. That is backwards from `warm`, where the returned counts are the
+irreplaceable part. So: a status where there is only a status, a result where
+there is a result.
+
+The nearest real alternative was `resolve() -> None`, matching §2's
+`add_source`: the row is written, and one addressed `query_sources` away.
+Returning it wins on ergonomics — the caller's next move is to read the
+tensors — and it closes the transition in one call, with no window in which a
+rescan re-registers the source. (§2's stated reason, that the enumeration is
+"not otherwise obtainable without hitting the browse cap", is not the right
+one: `WHERE source_id = ...` returns a single row and no cap ever bites.)
+
+**Absent beats empty.** §1 noted `descriptor_from_row` hardcoded
+`metadata_json=""`, and §3's invariant is that a catalog entry carries no
+`chunk_shape`. A proto could only express those as *empty*: present, testable,
+and permanently meaningless. A row simply has no such column, which deleted an
+unreachable `if tensor_desc.chunk_shape:` branch in the napari widget and
+turned several tests from "asserts empty" into "asserts the column is not
+there".
+
+**And it fixed a bug.** With no `is_resolved` to read, both the napari
+`tensor_browser` (`_is_unresolved`) and the Java `getTensor` path inferred
+"unresolved" from `len(tensors) == 0` — which also describes a source that
+resolved cleanly and held nothing readable. Both now read the flag, and both say
+something different for the two cases. The `biopb tensor query` CLI prints
+`<unresolved>` rather than `<no tensors>` for the first.
+
+Each moved off the deprecated decoder because it needed the field, which is the
+only reason to move — and each picked its own landing place. The CLI reads the
+row's keys directly; biopb-mcp decodes into its own dataclass;
+`TensorConnection.resolve_source` decodes `resolve()`'s row the same way, so
+the widget's next decision — whether to warm — reads the flag off the type that
+package chose.
+
+The proto message stays in `descriptor.proto`, unused: removing it would break
+codegen for consumers outside this repo, and it costs nothing to leave.
+
 ## Wire compatibility
 
 Deliberately breaking. The SDK refuses a pre-v2 server at connect, so the v1
 fallbacks in both clients (a bare serialized descriptor as the resolve terminal;
 the empty-body heartbeat convention) went with it. Field numbers 2
 (`ResolveStreamMessage.result`) and 1 (`AddSourceResult.added`) are reserved.
+
+§6 changes no wire bytes. It deprecates a decoder without adding one, and
+leaves every stable signature alone; the single return-type change is
+`resolve()`, which cloud support's experimental status allows. It does add
+`is_resolved` to `SOURCE_ROW_COLUMNS`, so an SDK from after #1032 against a
+server from before #1033 fails the SELECT rather than degrading; that is the
+same coupling `data_resident` already had.

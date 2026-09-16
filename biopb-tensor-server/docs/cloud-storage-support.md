@@ -113,7 +113,7 @@ earlier "resolve-on-serve via `GetFlightInfo`", which smuggled a minutes-long
 hydrate into a descriptor RPC, tripped proxy idle-read timeouts, and truncated
 multi-field sources at the list cap). It **streams**: empty-body heartbeat
 Results keep the connection warm under proxy timeouts, then one terminal Result
-carries the full `DataSourceDescriptor` (all fields, one call). Resolution
+carries the source's now-concrete catalog row (every tensor, one call). Resolution
 re-runs the real claim + `create_from_config` on the now-resident path (the
 recorded `source_type` was a recall-free guess; the authoritative one comes from
 the hydrated content), caches the real adapter, fires `on_resolved` (the

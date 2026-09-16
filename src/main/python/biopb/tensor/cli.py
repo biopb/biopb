@@ -28,6 +28,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb import _data_plane
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
@@ -64,6 +65,21 @@ _OPT_CACHE_BYTES = typer.Option(
 _OPT_SLICE = typer.Option(
     None, "--slice", "-S", help="Slice specification, e.g. '0:100,0:200'"
 )
+
+
+def _browse(client) -> dict:
+    """The catalog as ``{source_id: row}``.
+
+    ``query_sources`` rather than the deprecated ``list_sources``: same rows
+    and the same server-side cap, but a row carries ``is_resolved``, which the
+    listing needs to tell "not resolved yet" from "nothing readable in it"
+    (biopb/biopb#1032).
+    """
+    rows = client.query_sources(
+        f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id",
+        format="records",
+    )
+    return {row["source_id"]: row for row in rows}
 
 
 def _log_timing(start_time: float) -> None:
@@ -252,7 +268,7 @@ def query(
     start_time = time.time()
     client, endpoint = _connect(server, token, cache_bytes)
     try:
-        sources = client.list_sources()
+        sources = _browse(client)
         if not sources:
             stderr_console.print(f"[yellow]No sources found on {endpoint.url}[/yellow]")
             _log_timing(start_time)
@@ -264,16 +280,21 @@ def query(
         table.add_column("Shape", style="green")
         table.add_column("Dtype", style="blue")
 
-        for source_id, source_desc in sources.items():
-            if not source_desc.tensors:
-                table.add_row(source_id, "<no tensors>", "-", "-")
+        for source_id, row in sources.items():
+            tensors = row.get("tensors") or []
+            if not tensors:
+                # Two different states, and only one of them is actionable:
+                # an unresolved source has tensors the server has not looked
+                # for yet (biopb/biopb#1032).
+                why = "<no tensors>" if row.get("is_resolved", True) else "<unresolved>"
+                table.add_row(source_id, why, "-", "-")
                 continue
-            for tensor_desc in source_desc.tensors:
+            for tensor in tensors:
                 table.add_row(
                     source_id,
-                    tensor_desc.array_id,
-                    str(list(tensor_desc.shape)),
-                    str(tensor_desc.dtype),
+                    tensor["array_id"],
+                    str(list(tensor.get("shape") or [])),
+                    str(tensor.get("dtype") or ""),
                 )
 
         console.print(table)
@@ -407,28 +428,30 @@ def metadata(
     start_time = time.time()
     client, endpoint = _connect(server, token, cache_bytes)
     try:
-        sources = client.list_sources()
+        sources = _browse(client)
         if source_id not in sources:
             stderr_console.print(f"[red]Source not found:[/red] {source_id}")
             raise typer.Exit(1)
 
-        source_desc = sources[source_id]
+        row = sources[source_id]
+        tensors = row.get("tensors") or []
 
         # Show metadata for the entire source
         console.print(f"[bold green]Source:[/bold green] {source_id}")
-        console.print(f"[bold green]Tensors:[/bold green] {len(source_desc.tensors)}")
+        console.print(f"[bold green]Tensors:[/bold green] {len(tensors)}")
 
         # List all tensors in the source
-        for tensor_desc in source_desc.tensors:
+        for entry in tensors:
             console.print(
-                f"  [cyan]{tensor_desc.array_id}[/cyan] "
-                f"shape={list(tensor_desc.shape)} dtype={tensor_desc.dtype}"
+                f"  [cyan]{entry['array_id']}[/cyan] "
+                f"shape={list(entry.get('shape') or [])} "
+                f"dtype={entry.get('dtype') or ''}"
             )
 
         # If --tensor specified, show detailed descriptor info
         if tensor:
             tensor_desc = next(
-                (t for t in source_desc.tensors if t.array_id == tensor),
+                (t for t in tensors if t["array_id"] == tensor),
                 None,
             )
             if tensor_desc is None:
@@ -437,9 +460,9 @@ def metadata(
 
             console.print(f"\n[bold green]Tensor Descriptor: {tensor}[/bold green]")
             detail_table = Table(show_header=False)
-            detail_table.add_row("Array ID", tensor_desc.array_id)
-            detail_table.add_row("Shape", str(list(tensor_desc.shape)))
-            detail_table.add_row("Dtype", str(tensor_desc.dtype))
+            detail_table.add_row("Array ID", tensor_desc["array_id"])
+            detail_table.add_row("Shape", str(list(tensor_desc.get("shape") or [])))
+            detail_table.add_row("Dtype", str(tensor_desc.get("dtype") or ""))
             console.print(detail_table)
 
         # Fetch and display source-level metadata (OME/vendor JSON)

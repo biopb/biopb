@@ -47,6 +47,7 @@ public class TensorFlightClientTest {
     public void testListSourcesAndTensorLookup() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                @SuppressWarnings("deprecation")
                 Map<String, DataSourceDescriptor> sources = client.listSources();
                 Assert.assertTrue(sources.containsKey("test-source"));
 
@@ -54,6 +55,43 @@ public class TensorFlightClientTest {
                 Assert.assertEquals(1, sourceDesc.getTensorsCount());
                 Assert.assertEquals("test-tensor", sourceDesc.getTensors(0).getArrayId());
                 Assert.assertEquals(Arrays.asList(4L, 4L), sourceDesc.getTensors(0).getShapeList());
+            }
+        }
+    }
+
+    @Test
+    public void testCatalogRowCarriesIsResolvedForCallersToRead() throws Exception {
+        // What a caller actually gets: a row. `is_resolved` is a column on it,
+        // read without any type this SDK picked -- which is the whole point of
+        // biopb/biopb#1032, and what listSources() cannot give you because
+        // DataSourceDescriptor has no field for it.
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                try (VectorSchemaRoot root = client.querySources(
+                        "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
+                    Assert.assertEquals(1, root.getRowCount());
+                    Assert.assertEquals("test-source",
+                            String.valueOf(root.getVector("source_id").getObject(0)));
+                    Assert.assertEquals(Boolean.TRUE,
+                            root.getVector("is_resolved").getObject(0));
+
+                    Object tensors = root.getVector("tensors").getObject(0);
+                    Assert.assertTrue(tensors instanceof List);
+                    Map<?, ?> tensor = (Map<?, ?>) ((List<?>) tensors).get(0);
+                    Assert.assertEquals("test-tensor",
+                            String.valueOf(tensor.get("array_id")));
+                }
+
+                // The deprecated decoder still answers, and still cannot carry
+                // the flag -- the message has no field for it.
+                try (VectorSchemaRoot root = client.querySources(
+                        "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
+                    @SuppressWarnings("deprecation")
+                    List<DataSourceDescriptor> descs =
+                            TensorFlightClient.descriptorsFromRows(root);
+                    Assert.assertEquals(1, descs.size());
+                    Assert.assertEquals("test-source", descs.get(0).getSourceId());
+                }
             }
         }
     }
@@ -486,6 +524,199 @@ public class TensorFlightClientTest {
         }
     }
 
+    // ---- cloud path: resolve / warm / getSourceMetadata -------------------
+    // These run against a `doAction` fake, which is what the suite lacked: the
+    // three calls that drive an unresolved (cloud / synced-folder) source were
+    // compiled but never executed here.
+
+    @Test
+    public void testResolveReturnsTheCatalogRow() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceResolved(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                // A row, not a struct this SDK picked: the caller decodes it the
+                // same way it decodes a querySources result (biopb/biopb#1032).
+                try (VectorSchemaRoot row = client.resolve("test-source")) {
+                    Assert.assertEquals(1, row.getRowCount());
+                    Assert.assertEquals("test-source",
+                            String.valueOf(row.getVector("source_id").getObject(0)));
+                    // Resolution is what flipped it; the terminal row says so.
+                    Assert.assertEquals(Boolean.TRUE, row.getVector("is_resolved").getObject(0));
+
+                    Object tensors = row.getVector("tensors").getObject(0);
+                    Map<?, ?> tensor = (Map<?, ?>) ((List<?>) tensors).get(0);
+                    Assert.assertEquals("test-tensor", String.valueOf(tensor.get("array_id")));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testResolveOutlivesTheStreamItArrivedOn() throws Exception {
+        // The row rides an ArrowStreamReader that frees its buffers on close, so
+        // resolve() has to hand back a copy. Reading after the call is what would
+        // catch a returned view into freed memory.
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                VectorSchemaRoot row = client.resolve("test-source");
+                try {
+                    Assert.assertEquals("test-source",
+                            String.valueOf(row.getVector("source_id").getObject(0)));
+                    Assert.assertEquals("mock://test",
+                            String.valueOf(row.getVector("source_url").getObject(0)));
+                } finally {
+                    row.close();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testResolveSkipsProgressHeartbeats() throws Exception {
+        // Heartbeats keep the connection warm under proxy idle timeouts; only the
+        // terminal message carries the row.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setResolveHeartbeats(3);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                try (VectorSchemaRoot row = client.resolve("test-source")) {
+                    Assert.assertEquals(1, row.getRowCount());
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testResolveWithoutTerminalRowFails() throws Exception {
+        // Heartbeats and nothing else: the server closed without a row. That is an
+        // error, not an empty result.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setResolveHeartbeats(2);
+            server.setResolveSendsRow(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IOException error = Assert.assertThrows(
+                        IOException.class,
+                        () -> client.resolve("test-source"));
+                Assert.assertTrue(error.getMessage().contains("no catalog row"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetTensorOnUnresolvedSourceSteersToResolve() throws Exception {
+        // The Java twin of napari's `_is_unresolved`: a source with no tensors
+        // and is_resolved false needs the consented resolve, and the error says
+        // so (biopb/biopb#1032).
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceHasTensors(false);
+            server.setSourceResolved(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IllegalStateException error = Assert.assertThrows(
+                        IllegalStateException.class,
+                        () -> client.getTensor("test-source"));
+                Assert.assertTrue(error.getMessage().contains("is unresolved"));
+                Assert.assertTrue(error.getMessage().contains("resolve('test-source')"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetTensorOnResolvedSourceWithNoTensorsSaysSo() throws Exception {
+        // The other half: it resolved, and there was nothing readable in it.
+        // Sending this caller at resolve() would point them at an operation that
+        // can only succeed and change nothing -- which is what the old
+        // `n == 0 -> unresolved` inference did.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceHasTensors(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IllegalArgumentException error = Assert.assertThrows(
+                        IllegalArgumentException.class,
+                        () -> client.getTensor("test-source"));
+                Assert.assertTrue(error.getMessage().contains("no readable tensors"));
+                Assert.assertFalse(error.getMessage().contains("unresolved"));
+            }
+        }
+    }
+
+    @Test
+    public void testWarmReturnsTheTerminalCounts() throws Exception {
+        // warm returns a status, not a row: residency is not a durable catalog
+        // fact, so these counts exist nowhere else (biopb/biopb#1035).
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                WarmProgress done = client.warm("test-source");
+                Assert.assertEquals(2, done.getFilesTotal());
+                Assert.assertEquals(2, done.getFilesDone());
+                Assert.assertEquals(2048L, done.getBytesDone());
+            }
+        }
+    }
+
+    @Test
+    public void testWarmWithoutTerminalStatusFails() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setWarmSendsDone(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IOException error = Assert.assertThrows(
+                        IOException.class,
+                        () -> client.warm("test-source"));
+                Assert.assertTrue(error.getMessage().contains("no terminal status"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetSourceMetadataReadsTheColumn() throws Exception {
+        // The column IS the answer -- filled once at registration, read back from
+        // the catalog rather than recomputed (biopb/biopb#253).
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Map<String, Object> metadata = client.getSourceMetadata("test-source");
+                Assert.assertEquals("test_value", metadata.get("test_key"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetSourceMetadataOnUnresolvedSourceSteersToResolve() throws Exception {
+        // The flag, not an empty tensor list: a source can resolve cleanly and
+        // hold nothing readable, and telling *that* caller to resolve sends them
+        // at an operation that can only succeed and change nothing
+        // (biopb/biopb#1032).
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceResolved(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IllegalStateException error = Assert.assertThrows(
+                        IllegalStateException.class,
+                        () -> client.getSourceMetadata("test-source"));
+                Assert.assertTrue(error.getMessage().contains("is unresolved"));
+                Assert.assertTrue(error.getMessage().contains("resolve('test-source')"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetSourceMetadataReturnsEmptyForResolvedSourceWithNone() throws Exception {
+        // The other half of the same distinction: resolved, simply no metadata.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceMetadataJson(null);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertTrue(client.getSourceMetadata("test-source").isEmpty());
+            }
+        }
+    }
+
+    @Test
+    public void testGetSourceMetadataUnknownSourceThrows() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IllegalArgumentException error = Assert.assertThrows(
+                        IllegalArgumentException.class,
+                        () -> client.getSourceMetadata("nope"));
+                Assert.assertTrue(error.getMessage().contains("Source not found"));
+            }
+        }
+    }
+
     private static Map<String, Object> status(String sourceId, String state, int expectedChunks, int uploadedChunks) {
         Map<String, Object> status = new HashMap<>();
         status.put("source_id", sourceId);
@@ -531,6 +762,30 @@ public class TensorFlightClientTest {
             producer.setUploadStatusSequence(sourceId, Arrays.asList(statuses));
         }
 
+        void setSourceResolved(boolean resolved) {
+            producer.sourceResolved = resolved;
+        }
+
+        void setSourceMetadataJson(String json) {
+            producer.sourceMetadataJson = json;
+        }
+
+        void setResolveHeartbeats(int count) {
+            producer.resolveHeartbeats = count;
+        }
+
+        void setResolveSendsRow(boolean sends) {
+            producer.resolveSendsRow = sends;
+        }
+
+        void setWarmSendsDone(boolean sends) {
+            producer.warmSendsDone = sends;
+        }
+
+        void setSourceHasTensors(boolean has) {
+            producer.sourceHasTensors = has;
+        }
+
         @Override
         public void close() throws Exception {
             server.close();
@@ -540,7 +795,6 @@ public class TensorFlightClientTest {
 
     private static class TensorTestProducer extends NoOpFlightProducer {
         private final BufferAllocator allocator;
-        private final DataSourceDescriptor sourceDescriptor;
         private final TensorDescriptor baseDescriptor;
         private final org.apache.arrow.vector.types.pojo.Schema schema;
         private final Map<String, float[]> chunkData;
@@ -548,6 +802,18 @@ public class TensorFlightClientTest {
         private final Map<String, List<Map<String, Object>>> uploadStatusSequences;
         private final Map<String, AtomicInteger> uploadStatusCalls;
         private volatile FlightRequest lastCmd;
+        // Cloud-path knobs. `sourceResolved` is what a row's is_resolved
+        // column says; a resolve flips it, which is the transition the client
+        // exists to drive.
+        private volatile boolean sourceResolved = true;
+        private volatile String sourceMetadataJson = "{\"test_key\": \"test_value\"}";
+        private volatile int resolveHeartbeats = 0;
+        private volatile boolean resolveSendsRow = true;
+        private volatile boolean warmSendsDone = true;
+        // An unresolved source lists with no tensors -- but so does one that
+        // resolved and held nothing readable, which is the pair #1032 exists
+        // to stop conflating.
+        private volatile boolean sourceHasTensors = true;
 
         TensorTestProducer(BufferAllocator allocator) {
             this.allocator = allocator;
@@ -562,15 +828,6 @@ public class TensorFlightClientTest {
                     .addChunkShape(2)
                     .addChunkShape(2)
                     .setDtype("float32")
-                    .build();
-
-            // Source descriptor containing the tensor
-            this.sourceDescriptor = DataSourceDescriptor.newBuilder()
-                    .setSourceId("test-source")
-                    .setSourceUrl("mock://test")
-                    .setSourceType("mock")
-                    .addTensors(baseDescriptor)
-                    .setMetadataJson("")
                     .build();
 
             this.schema = createSchema(allocator);
@@ -695,6 +952,14 @@ public class TensorFlightClientTest {
                 FlightProducer.CallContext context,
                 Action action,
                 FlightProducer.StreamListener<Result> listener) {
+            if ("resolve".equals(action.getType())) {
+                doResolve(new String(action.getBody(), StandardCharsets.UTF_8), listener);
+                return;
+            }
+            if ("warm".equals(action.getType())) {
+                doWarm(listener);
+                return;
+            }
             if (!"upload_status".equals(action.getType())) {
                 listener.onError(new IllegalArgumentException("Unknown action: " + action.getType()));
                 return;
@@ -710,6 +975,81 @@ public class TensorFlightClientTest {
             int index = Math.min(calls.getAndIncrement(), sequence.size() - 1);
             String json = new Gson().toJson(sequence.get(index));
             listener.onNext(new Result(json.getBytes(StandardCharsets.UTF_8)));
+            listener.onCompleted();
+        }
+
+        /**
+         * The `resolve` action: zero or more progress heartbeats, then one
+         * terminal message carrying the source's now-concrete catalog row as
+         * an Arrow IPC stream.
+         */
+        private void doResolve(String sourceId, FlightProducer.StreamListener<Result> listener) {
+            for (int i = 0; i < resolveHeartbeats; i++) {
+                ResolveStreamMessage beat = ResolveStreamMessage.newBuilder()
+                        .setProgress(ResolveProgress.newBuilder()
+                                .setElapsedSeconds(i)
+                                .setTargetName("img.tif")
+                                .setTargetBytes(1024)
+                                .build())
+                        .build();
+                listener.onNext(new Result(beat.toByteArray()));
+            }
+            if (!resolveSendsRow) {
+                // A stream of heartbeats and nothing else: the server closed
+                // without a row, which the client must treat as an error.
+                listener.onCompleted();
+                return;
+            }
+            // Resolution is what makes the source resolved -- the row the
+            // terminal message carries reflects that, and so does a later
+            // browse.
+            sourceResolved = true;
+            byte[] ipc;
+            try (VectorSchemaRoot root = catalogRoot(
+                    "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources", 1)) {
+                java.io.ByteArrayOutputStream sink = new java.io.ByteArrayOutputStream();
+                try (org.apache.arrow.vector.ipc.ArrowStreamWriter writer =
+                        new org.apache.arrow.vector.ipc.ArrowStreamWriter(
+                                root, null, java.nio.channels.Channels.newChannel(sink))) {
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                }
+                ipc = sink.toByteArray();
+            } catch (Exception e) {
+                listener.onError(e);
+                return;
+            }
+            ResolveStreamMessage done = ResolveStreamMessage.newBuilder()
+                    .setSourceRow(ByteString.copyFrom(ipc))
+                    .build();
+            listener.onNext(new Result(done.toByteArray()));
+            listener.onCompleted();
+        }
+
+        /** The `warm` action: one progress update, then the terminal counts. */
+        private void doWarm(FlightProducer.StreamListener<Result> listener) {
+            WarmStreamMessage beat = WarmStreamMessage.newBuilder()
+                    .setProgress(WarmProgress.newBuilder()
+                            .setFilesTotal(2)
+                            .setFilesDone(1)
+                            .setBytesTotal(2048)
+                            .setBytesDone(1024)
+                            .setCurrentName("0.0.0")
+                            .build())
+                    .build();
+            listener.onNext(new Result(beat.toByteArray()));
+            if (warmSendsDone) {
+                WarmStreamMessage done = WarmStreamMessage.newBuilder()
+                        .setDone(WarmProgress.newBuilder()
+                                .setFilesTotal(2)
+                                .setFilesDone(2)
+                                .setBytesTotal(2048)
+                                .setBytesDone(2048)
+                                .build())
+                        .build();
+                listener.onNext(new Result(done.toByteArray()));
+            }
             listener.onCompleted();
         }
 
@@ -729,7 +1069,7 @@ public class TensorFlightClientTest {
                 String sql = tensorTicket.getCatalogQuery().getSql();
                 boolean matches = !sql.contains("WHERE source_id = ")
                         || sql.contains("'test-source'");
-                try (VectorSchemaRoot root = catalogRoot(matches ? 1 : 0)) {
+                try (VectorSchemaRoot root = catalogRoot(sql, matches ? 1 : 0)) {
                     listener.start(root);
                     listener.putNext();
                     listener.completed();
@@ -772,7 +1112,18 @@ public class TensorFlightClientTest {
             }
         }
 
-        private VectorSchemaRoot catalogRoot(int rows) {
+        /**
+         * The `sources` row(s) a query selects, projected to the SELECT list.
+         *
+         * <p>Projected, not "always every column": getSourceMetadata asks for
+         * {@code SELECT is_resolved, metadata_json}, and a fake that answered
+         * with the browse columns instead would hand back a root with no
+         * metadata_json vector -- which the client reads as "no metadata"
+         * rather than failing, so the test would pass without ever exercising
+         * the column it exists to check.
+         */
+        private VectorSchemaRoot catalogRoot(String sql, int rows) {
+            List<String> selected = selectedColumns(sql);
             Field arrayId = new Field("array_id", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
             Field dimLabels = new Field("dim_labels", FieldType.nullable(ArrowType.List.INSTANCE),
                     Collections.singletonList(new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null)));
@@ -781,49 +1132,97 @@ public class TensorFlightClientTest {
             Field dtype = new Field("dtype", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
             Field tensorStruct = new Field("item", FieldType.nullable(ArrowType.Struct.INSTANCE),
                     Arrays.asList(arrayId, dimLabels, shape, dtype));
-            Schema catalogSchema = new Schema(Arrays.asList(
-                    new Field("source_id", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
-                    new Field("source_url", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
-                    new Field("source_type", FieldType.nullable(ArrowType.Utf8.INSTANCE), null),
-                    new Field("data_resident", FieldType.nullable(ArrowType.Bool.INSTANCE), null),
-                    new Field("tensors", FieldType.nullable(ArrowType.List.INSTANCE),
-                            Collections.singletonList(tensorStruct))));
-            VectorSchemaRoot root = VectorSchemaRoot.create(catalogSchema, allocator);
+            Map<String, Field> columns = new java.util.LinkedHashMap<>();
+            columns.put("source_id", new Field("source_id", FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
+            columns.put("source_url", new Field("source_url", FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
+            columns.put("source_type", new Field("source_type", FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
+            columns.put("metadata_json", new Field("metadata_json", FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
+            columns.put("data_resident", new Field("data_resident", FieldType.nullable(ArrowType.Bool.INSTANCE), null));
+            columns.put("is_resolved", new Field("is_resolved", FieldType.nullable(ArrowType.Bool.INSTANCE), null));
+            columns.put("tensors", new Field("tensors", FieldType.nullable(ArrowType.List.INSTANCE),
+                    Collections.singletonList(tensorStruct)));
+
+            List<Field> fields = new ArrayList<>();
+            for (String name : selected) {
+                Field field = columns.get(name);
+                if (field == null) {
+                    throw new IllegalArgumentException("fake catalog has no column: " + name);
+                }
+                fields.add(field);
+            }
+            VectorSchemaRoot root = VectorSchemaRoot.create(new Schema(fields), allocator);
             root.allocateNew();
             if (rows == 0) {
                 root.setRowCount(0);
                 return root;
             }
-            ((org.apache.arrow.vector.VarCharVector) root.getVector("source_id"))
-                    .setSafe(0, "test-source".getBytes(StandardCharsets.UTF_8));
-            ((org.apache.arrow.vector.VarCharVector) root.getVector("source_url"))
-                    .setSafe(0, "mock://test".getBytes(StandardCharsets.UTF_8));
-            ((org.apache.arrow.vector.VarCharVector) root.getVector("source_type"))
-                    .setSafe(0, "mock".getBytes(StandardCharsets.UTF_8));
-            ((org.apache.arrow.vector.BitVector) root.getVector("data_resident")).setSafe(0, 1);
+            setText(root, "source_id", "test-source");
+            setText(root, "source_url", "mock://test");
+            setText(root, "source_type", "mock");
+            if (sourceMetadataJson != null) {
+                setText(root, "metadata_json", sourceMetadataJson);
+            }
+            setBool(root, "data_resident", true);
+            setBool(root, "is_resolved", sourceResolved);
             ListVector tensors = (ListVector) root.getVector("tensors");
-            UnionListWriter writer = tensors.getWriter();
-            writer.setPosition(0);
-            writer.startList();
-            org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter sw = writer.struct();
-            sw.start();
-            sw.varChar("array_id").writeVarChar("test-tensor");
-            org.apache.arrow.vector.complex.writer.BaseWriter.ListWriter labels = sw.list("dim_labels");
-            labels.startList();
-            labels.varChar().writeVarChar("y");
-            labels.varChar().writeVarChar("x");
-            labels.endList();
-            org.apache.arrow.vector.complex.writer.BaseWriter.ListWriter shapeW = sw.list("shape");
-            shapeW.startList();
-            shapeW.bigInt().writeBigInt(4);
-            shapeW.bigInt().writeBigInt(4);
-            shapeW.endList();
-            sw.varChar("dtype").writeVarChar("float32");
-            sw.end();
-            writer.endList();
-            tensors.setValueCount(1);
+            if (tensors != null && !sourceHasTensors) {
+                UnionListWriter empty = tensors.getWriter();
+                empty.setPosition(0);
+                empty.startList();
+                empty.endList();
+                tensors.setValueCount(1);
+            } else if (tensors != null) {
+                UnionListWriter writer = tensors.getWriter();
+                writer.setPosition(0);
+                writer.startList();
+                org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter sw = writer.struct();
+                sw.start();
+                sw.varChar("array_id").writeVarChar("test-tensor");
+                org.apache.arrow.vector.complex.writer.BaseWriter.ListWriter labels = sw.list("dim_labels");
+                labels.startList();
+                labels.varChar().writeVarChar("y");
+                labels.varChar().writeVarChar("x");
+                labels.endList();
+                org.apache.arrow.vector.complex.writer.BaseWriter.ListWriter shapeW = sw.list("shape");
+                shapeW.startList();
+                shapeW.bigInt().writeBigInt(4);
+                shapeW.bigInt().writeBigInt(4);
+                shapeW.endList();
+                sw.varChar("dtype").writeVarChar("float32");
+                sw.end();
+                writer.endList();
+                tensors.setValueCount(1);
+            }
             root.setRowCount(1);
             return root;
+        }
+
+        /** The column names between SELECT and FROM, in order. */
+        private static List<String> selectedColumns(String sql) {
+            int select = sql.toUpperCase(java.util.Locale.ROOT).indexOf("SELECT ");
+            int from = sql.toUpperCase(java.util.Locale.ROOT).indexOf(" FROM ");
+            String list = sql.substring(select + "SELECT ".length(), from);
+            List<String> out = new ArrayList<>();
+            for (String part : list.split(",")) {
+                out.add(part.trim());
+            }
+            return out;
+        }
+
+        private static void setText(VectorSchemaRoot root, String column, String value) {
+            org.apache.arrow.vector.VarCharVector vector =
+                    (org.apache.arrow.vector.VarCharVector) root.getVector(column);
+            if (vector != null) {
+                vector.setSafe(0, value.getBytes(StandardCharsets.UTF_8));
+            }
+        }
+
+        private static void setBool(VectorSchemaRoot root, String column, boolean value) {
+            org.apache.arrow.vector.BitVector vector =
+                    (org.apache.arrow.vector.BitVector) root.getVector(column);
+            if (vector != null) {
+                vector.setSafe(0, value ? 1 : 0);
+            }
         }
 
         private List<FlightEndpoint> baseEndpoints() {

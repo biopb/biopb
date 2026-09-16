@@ -94,12 +94,12 @@ class TestBuildTreeDroppedTagging:
 
     @staticmethod
     def _src(source_id, source_url):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
 
-        return DataSourceDescriptor(
+        return CatalogSource(
             source_id=source_id,
             source_url=source_url,
-            tensors=[TensorDescriptor(array_id=source_id, shape=[8, 8], dtype="uint8")],
+            tensors=(CatalogTensor(array_id=source_id, shape=(8, 8), dtype="uint8"),),
         )
 
     @staticmethod
@@ -548,20 +548,15 @@ class TestResidencyIndicator:
     """`_add_tree_node` decorates a source row from its `data_resident` state."""
 
     def _node(self, data_resident):
-        from biopb.tensor.descriptor_pb2 import (
-            DataSourceDescriptor,
-            TensorDescriptor,
-        )
-
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
-        src = DataSourceDescriptor(
+        src = CatalogSource(
             source_id="s",
             source_url="/data/s.zarr",
-            tensors=[TensorDescriptor(array_id="s", shape=[10, 10], dtype="uint8")],
+            tensors=(CatalogTensor(array_id="s", shape=(10, 10), dtype="uint8"),),
+            data_resident=data_resident,
         )
-        if data_resident is not None:
-            src.data_resident = data_resident
         return _TreeNode(
             node_id="s", name="s.zarr", node_type="source", depth=0, source=src
         )
@@ -606,17 +601,13 @@ class TestRemoveButton:
     """`_add_tree_node` puts a remove [x] in column 1 for dropped roots only."""
 
     def _node(self, *, dropped, source_url="dnd://exp.zarr", name="exp.zarr"):
-        from biopb.tensor.descriptor_pb2 import (
-            DataSourceDescriptor,
-            TensorDescriptor,
-        )
-
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
-        src = DataSourceDescriptor(
+        src = CatalogSource(
             source_id="s",
             source_url=source_url,
-            tensors=[TensorDescriptor(array_id="s", shape=[10, 10], dtype="uint8")],
+            tensors=(CatalogTensor(array_id="s", shape=(10, 10), dtype="uint8"),),
         )
         node = _TreeNode(
             node_id="s", name=name, node_type="source", depth=0, source=src
@@ -681,20 +672,16 @@ class TestRestoreSelection:
     """`_restore_selection` re-highlights the tracked row in a rebuilt tree (#191)."""
 
     def _source_node(self, source_id, tensors):
-        from biopb.tensor.descriptor_pb2 import (
-            DataSourceDescriptor,
-            TensorDescriptor,
-        )
-
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
-        src = DataSourceDescriptor(
+        src = CatalogSource(
             source_id=source_id,
             source_url=f"/data/{source_id}.zarr",
-            tensors=[
-                TensorDescriptor(array_id=tid, shape=[8, 8], dtype="uint8")
+            tensors=tuple(
+                CatalogTensor(array_id=tid, shape=(8, 8), dtype="uint8")
                 for tid in tensors
-            ],
+            ),
         )
         return _TreeNode(
             node_id=source_id,
@@ -756,17 +743,19 @@ def _user_role():
     return Qt.ItemDataRole.UserRole
 
 
-def _descriptor(source_id, *, tensors, source_type=""):
-    from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+def _source(source_id, *, tensors, source_type="", is_resolved=True):
+    """A catalog row. ``is_resolved`` is independent of ``tensors`` on purpose:
+    the two are what biopb/biopb#1032 stopped conflating."""
+    from biopb_mcp._catalog import CatalogSource, CatalogTensor
 
-    return DataSourceDescriptor(
+    return CatalogSource(
         source_id=source_id,
         source_url=f"/cloud/{source_id}.zarr",
         source_type=source_type,
-        tensors=[
-            TensorDescriptor(array_id=tid, shape=[8, 8], dtype="uint8")
-            for tid in tensors
-        ],
+        is_resolved=is_resolved,
+        tensors=tuple(
+            CatalogTensor(array_id=tid, shape=(8, 8), dtype="uint8") for tid in tensors
+        ),
     )
 
 
@@ -814,12 +803,21 @@ class _FakeProgress:
 
 
 class TestUnresolvedHelper:
-    def test_empty_tensors_is_unresolved(self):
+    def test_reads_the_servers_flag(self):
         from biopb_mcp.tensor_browser._widget import _is_unresolved
 
-        assert _is_unresolved(_descriptor("c", tensors=[]))
-        assert not _is_unresolved(_descriptor("c", tensors=["c"]))
-        assert not _is_unresolved(_descriptor("c", tensors=["c/a", "c/b"]))
+        assert _is_unresolved(_source("c", tensors=[], is_resolved=False))
+        assert not _is_unresolved(_source("c", tensors=["c"]))
+        assert not _is_unresolved(_source("c", tensors=["c/a", "c/b"]))
+
+    def test_resolved_but_empty_is_not_unresolved(self):
+        """A source that resolved and had nothing readable in it. The old
+        ``len(tensors) == 0`` proxy called this unresolved and offered a
+        Resolve that could only succeed and change nothing
+        (biopb/biopb#1032)."""
+        from biopb_mcp.tensor_browser._widget import _is_unresolved
+
+        assert not _is_unresolved(_source("c", tensors=[]))
 
 
 class TestResolveAction:
@@ -835,7 +833,7 @@ class TestResolveAction:
 
         w, conn, _ = widget
         conn.is_connected = True
-        conn.sources = {"cloud_x": _descriptor("cloud_x", tensors=[])}
+        conn.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
 
         answer = widget_mod.QMessageBox.Ok if accept else widget_mod.QMessageBox.Cancel
         monkeypatch.setattr(
@@ -885,7 +883,7 @@ class TestResolveAction:
             widget,
             monkeypatch,
             accept=True,
-            outcome=("resolved", _descriptor("cloud_x", tensors=["cloud_x"])),
+            outcome=("resolved", _source("cloud_x", tensors=["cloud_x"])),
         )
         w._resolve_source("cloud_x")
         assert started["n"] == 1  # resolve ran off-thread
@@ -926,7 +924,7 @@ class TestResolveAction:
 
         w, conn, _ = widget
         conn.is_connected = True
-        conn.sources = {"cloud_x": _descriptor("cloud_x", tensors=[])}
+        conn.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
         monkeypatch.setattr(
             widget_mod.QMessageBox,
             "warning",
@@ -978,7 +976,7 @@ class TestResolveAction:
             accept=True,
             outcome=(
                 "resolved",
-                _descriptor("cloud_x", tensors=["cloud_x"], source_type="zarr"),
+                _source("cloud_x", tensors=["cloud_x"], source_type="zarr"),
             ),
         )
         w._warm_source = MagicMock()
@@ -989,7 +987,7 @@ class TestResolveAction:
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
         w, conn, _ = widget
-        conn.sources = {"cloud_x": _descriptor("cloud_x", tensors=[])}
+        conn.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
         w._add_tree_node(
             w._tree_widget,
             _TreeNode(
@@ -1028,18 +1026,16 @@ class TestMultifileHelper:
     def test_multifile_types_detected(self):
         from biopb_mcp.tensor_browser._widget import _is_multifile_source
 
-        assert _is_multifile_source(_descriptor("z", tensors=["z"], source_type="zarr"))
-        assert _is_multifile_source(
-            _descriptor("o", tensors=["o"], source_type="ome-zarr")
-        )
+        assert _is_multifile_source(_source("z", tensors=["z"], source_type="zarr"))
+        assert _is_multifile_source(_source("o", tensors=["o"], source_type="ome-zarr"))
         # single-file / unknown type -> no warm offer
         assert not _is_multifile_source(
-            _descriptor("t", tensors=["t"], source_type="ome-tiff")
+            _source("t", tensors=["t"], source_type="ome-tiff")
         )
-        assert not _is_multifile_source(_descriptor("p", tensors=["p"]))
+        assert not _is_multifile_source(_source("p", tensors=["p"]))
         # unresolved (no tensors) is never "multifile" regardless of type
         assert not _is_multifile_source(
-            _descriptor("u", tensors=[], source_type="zarr")
+            _source("u", tensors=[], source_type="zarr", is_resolved=False)
         )
 
 
@@ -1067,7 +1063,7 @@ class TestHydrateAction:
 
         w, conn, _ = widget
         conn.is_connected = True
-        src = _descriptor("m", tensors=["m"], source_type="zarr")
+        src = _source("m", tensors=["m"], source_type="zarr")
         conn.sources = {"m": src}
         # A real tree row so the inline indicator can be read back off the item.
         self._add_row(w, src)
@@ -1273,7 +1269,7 @@ class TestAddToViewer:
         # `_client`/`_sources` are read-only views onto the connection.
         w, conn, _ = widget
         conn.client = MagicMock()
-        conn.sources = {"m": _descriptor("m", tensors=["m"], source_type="zarr")}
+        conn.sources = {"m": _source("m", tensors=["m"], source_type="zarr")}
         w._selected_source_id = "m"
         w._selected_tensor_id = "m"
         w._show_error = MagicMock()
@@ -1308,7 +1304,7 @@ class TestInfoPaneIsReadableOut:
     def _select(self, widget, source_id="ome-tiff_8cc0", tensor="Image:0"):
         w, conn, _ = widget
         array_id = f"{source_id}/{tensor}"
-        conn.sources = {source_id: _descriptor(source_id, tensors=[array_id])}
+        conn.sources = {source_id: _source(source_id, tensors=[array_id])}
         w._selected_source_id = source_id
         w._selected_tensor_id = array_id
         w._update_metadata_display()

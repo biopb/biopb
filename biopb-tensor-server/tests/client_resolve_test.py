@@ -25,7 +25,7 @@ def _progress_body(elapsed, name="img.tif", nbytes=0):
     ).SerializeToString()
 
 
-def _source_row(source_id, array_ids=(), resident=True):
+def _source_row(source_id, array_ids=(), resident=True, is_resolved=True):
     """One ``sources`` catalog row, Arrow IPC -- what the terminal message is."""
     table = pa.table(
         {
@@ -33,6 +33,7 @@ def _source_row(source_id, array_ids=(), resident=True):
             "source_url": [f"file:///{source_id}"],
             "source_type": ["ome-zarr"],
             "data_resident": [resident],
+            "is_resolved": [is_resolved],
             "tensors": [
                 [
                     {
@@ -52,9 +53,9 @@ def _source_row(source_id, array_ids=(), resident=True):
     return sink.getvalue().to_pybytes()
 
 
-def _result_body(source_id, array_ids=(), resident=True):
+def _result_body(source_id, array_ids=(), resident=True, is_resolved=True):
     return ResolveStreamMessage(
-        source_row=_source_row(source_id, array_ids, resident)
+        source_row=_source_row(source_id, array_ids, resident, is_resolved)
     ).SerializeToString()
 
 
@@ -114,6 +115,11 @@ class TestResolve:
     def test_returns_the_full_row_from_resolve_action(self):
         # resolve() makes a single streaming `resolve` do_action and returns the
         # terminal row directly -- ALL fields, no list_sources, no cap.
+        #
+        # A row, not a progress snapshot: resolving is defined by what it
+        # writes to the catalog, unlike warm, whose counts are its only
+        # evidence. And a row, not a struct the SDK picked: every client can
+        # already decode one (biopb/biopb#1032).
         client = _bare_client()
         client._state.client = _FakeFlight(
             [_FakeResult(_result_body("cloud_x", ["cloud_x/f0", "cloud_x/f1"]))]
@@ -123,10 +129,11 @@ class TestResolve:
 
         assert client._state.client.action.type == "resolve"
         assert bytes(client._state.client.action.body) == b"cloud_x"
-        assert out.source_id == "cloud_x"
-        assert out.source_url == "file:///cloud_x"
-        assert out.data_resident is True
-        assert len(out.tensors) == 2  # complete field set, never truncated
+        assert out["source_id"] == "cloud_x"
+        assert out["source_url"] == "file:///cloud_x"
+        assert out["data_resident"] is True
+        assert out["is_resolved"] is True  # the flag the proto had no room for
+        assert len(out["tensors"]) == 2  # complete field set, never truncated
         # The per-tensor cache is seeded, so a following read needs no probe.
         assert set(client._descriptors) == {"cloud_x/f0", "cloud_x/f1"}
 
@@ -145,7 +152,7 @@ class TestResolve:
 
         out = client.resolve("cloud_x", on_progress=seen.append)
 
-        assert [t.array_id for t in out.tensors] == ["cloud_x"]
+        assert [t["array_id"] for t in out["tensors"]] == ["cloud_x"]
         assert [round(p.elapsed_seconds, 1) for p in seen] == [0.0, 0.5]
         assert seen[0].target_name == "img.tif" and seen[0].target_bytes == 1024
 
@@ -162,7 +169,7 @@ class TestResolve:
 
         out = client.resolve("cloud_x")
 
-        assert [t.array_id for t in out.tensors] == ["cloud_x"]
+        assert [t["array_id"] for t in out["tensors"]] == ["cloud_x"]
 
     def test_should_cancel_raises_resolve_cancelled(self):
         # should_cancel polled per received message; True stops the stream and
@@ -221,17 +228,16 @@ class TestSourceMetadataUnresolvedGuard:
     """F2 (#108): get_source_metadata must steer to resolve(), not return {}."""
 
     def test_unresolved_source_raises_instead_of_returning_empty(self, monkeypatch):
-        # An unresolved source's row has an empty `tensors` list; the old
-        # behavior returned {}, conflating "unresolved" with "resolved, no
-        # metadata". It must instead raise the directive error -- and without
-        # any GetFlightInfo recall.
+        # An unresolved source's row says so; the old behavior returned {},
+        # conflating "unresolved" with "resolved, no metadata". It must instead
+        # raise the directive error -- and without any GetFlightInfo recall.
         import pyarrow as pa
 
         client = _bare_client()
         monkeypatch.setattr(
             client._catalog,
             "_query_table",
-            lambda sql: pa.table({"tensors": [[]], "metadata_json": [None]}),
+            lambda sql: pa.table({"is_resolved": [False], "metadata_json": [None]}),
         )
         recalled = []
         client._state.client = type(
@@ -245,6 +251,20 @@ class TestSourceMetadataUnresolvedGuard:
         assert "unresolved" in msg
         assert "client.resolve('cloud_x')" in msg
         assert recalled == []  # no GetFlightInfo / download was triggered
+
+    def test_resolved_source_with_no_metadata_returns_empty(self, monkeypatch):
+        """The other half of the same distinction: a source that resolved and
+        simply has no metadata gets ``{}``, not a directive telling the caller
+        to resolve something already resolved (biopb/biopb#1032)."""
+        import pyarrow as pa
+
+        client = _bare_client()
+        monkeypatch.setattr(
+            client._catalog,
+            "_query_table",
+            lambda sql: pa.table({"is_resolved": [True], "metadata_json": [None]}),
+        )
+        assert client.get_source_metadata("local_x") == {}
 
 
 class TestPhysicalScaleUnresolvedGuard:

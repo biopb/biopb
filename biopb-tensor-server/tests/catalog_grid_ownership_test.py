@@ -302,18 +302,18 @@ def test_the_catalog_is_structural_and_get_flight_info_carries_the_grid(
     server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
     server.sources.replace({"oz": adapter})
 
-    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, descriptors_from_rows
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-    (listed,) = descriptors_from_rows(
-        db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
-    )
-    (entry,) = listed.tensors
-    assert list(entry.shape)
-    assert list(entry.chunk_shape) == []
+    (listed,) = db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
+    (entry,) = listed["tensors"]
+    assert entry["shape"]
+    # Not "empty grid" -- no grid. The row's tensors struct has no
+    # chunk_shape column to be wrong about (biopb/biopb#812).
+    assert "chunk_shape" not in entry
 
-    tensor_adapter = adapter.get_tensor_adapter(entry.array_id)
+    tensor_adapter = adapter.get_tensor_adapter(entry["array_id"])
     plan = tensor_adapter.plan_flight_info(
-        TensorReadOption(array_id=entry.array_id), PyramidConfig()
+        TensorReadOption(array_id=entry["array_id"]), PyramidConfig()
     )
     grid = list(plan.descriptor.chunk_shape)
     assert grid == list(tensor_adapter.get_transfer_chunk_size())
@@ -328,14 +328,12 @@ def test_catalog_round_trip_never_reintroduces_a_grid(multires_ome_zarr):
     db = MetadataDatabase()
     db.sync_source_added("oz", adapter)
 
-    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, descriptors_from_rows
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-    descriptors = descriptors_from_rows(
-        db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
-    )
-    (entry,) = descriptors[0].tensors
-    assert list(entry.shape)
-    assert list(entry.chunk_shape) == []
+    rows = db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
+    (entry,) = rows[0]["tensors"]
+    assert entry["shape"]
+    assert "chunk_shape" not in entry
 
     ((_, struct_type, *_),) = [
         row
