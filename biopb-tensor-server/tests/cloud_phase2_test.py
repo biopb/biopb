@@ -13,6 +13,8 @@ dehydrated cloud placeholder without a special filesystem.
 import json
 import os
 import tempfile
+import threading
+import time
 
 import pytest
 from biopb_tensor_server.adapters import tiff as tiff_mod
@@ -1486,29 +1488,86 @@ class TestWarmAction:
 
     def test_warm_orders_files_ascending_by_size(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
+        from biopb_tensor_server.serving import server as server_mod
 
         self._no_throttle(monkeypatch)
         root = str(tmp_path / "src")
         os.makedirs(root)
         self._make_files(root, {"big": 90, "small": 10, "mid": 40})
 
-        server = self._server("s2", _DirAdapter(root))
-        bodies = [
-            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s2"))
-        ]
-        msgs, kinds = self._parse(bodies)
+        submitted = []
+        original_submit = server_mod.ThreadPoolExecutor.submit
 
-        # The current_name as each file finishes, in order (dedupe consecutive
-        # repeats from per-block progress): smallest first.
-        names = []
-        for m, k in zip(msgs, kinds, strict=True):
-            if (
-                k == "progress"
-                and m.progress.current_name
-                and (not names or names[-1] != m.progress.current_name)
-            ):
-                names.append(m.progress.current_name)
-        assert names == ["small", "mid", "big"]
+        def record_submit(executor, fn, *args, **kwargs):
+            submitted.append(os.path.basename(args[0]))
+            return original_submit(executor, fn, *args, **kwargs)
+
+        monkeypatch.setattr(server_mod.ThreadPoolExecutor, "submit", record_submit)
+        server = self._server("s2", _DirAdapter(root))
+        list(server.do_action(_Ctx(), flight.Action("warm", b"s2")))
+
+        # Completion order is intentionally concurrent and may vary. The
+        # scheduler must still feed the pool in the coarsest-first order.
+        assert submitted == ["small", "mid", "big"]
+
+    def test_warm_reads_files_concurrently_with_bounded_workers(
+        self, tmp_path, monkeypatch
+    ):
+        import pyarrow.flight as flight
+        from biopb_tensor_server.serving import server as server_mod
+
+        self._no_throttle(monkeypatch)
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        worker_count = server_mod._WARM_MAX_WORKERS
+        sizes = {f"f{i}.bin": 8 for i in range(worker_count + 2)}
+        self._make_files(root, sizes)
+
+        active = [0]
+        max_active = [0]
+        active_lock = threading.Lock()
+        real_open = open
+
+        class TrackedFile:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __enter__(self):
+                self._wrapped.__enter__()
+                return self
+
+            def __exit__(self, *exc_info):
+                try:
+                    return self._wrapped.__exit__(*exc_info)
+                finally:
+                    with active_lock:
+                        active[0] -= 1
+
+            def readinto(self, buf):
+                # Hold each read briefly so all initially scheduled workers have
+                # an opportunity to overlap before the first one completes.
+                time.sleep(0.05)
+                return self._wrapped.readinto(buf)
+
+        def tracked_open(*args, **kwargs):
+            wrapped = real_open(*args, **kwargs)
+            with active_lock:
+                active[0] += 1
+                max_active[0] = max(max_active[0], active[0])
+            return TrackedFile(wrapped)
+
+        monkeypatch.setattr(server_mod, "open", tracked_open, raising=False)
+        server = self._server("s-concurrent", _DirAdapter(root))
+        bodies = [
+            bytes(r)
+            for r in server.do_action(_Ctx(), flight.Action("warm", b"s-concurrent"))
+        ]
+        msgs, _kinds = self._parse(bodies)
+
+        assert max_active[0] > 1
+        assert max_active[0] <= server_mod._WARM_MAX_WORKERS
+        assert msgs[-1].done.files_done == len(sizes)
+        assert msgs[-1].done.bytes_done == sum(sizes.values())
 
     def test_warm_walk_is_recursive(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
