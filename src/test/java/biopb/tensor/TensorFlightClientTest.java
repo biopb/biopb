@@ -602,6 +602,42 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testGetTensorOnUnresolvedSourceSteersToResolve() throws Exception {
+        // The Java twin of napari's `_is_unresolved`: a source with no tensors
+        // and is_resolved false needs the consented resolve, and the error says
+        // so (biopb/biopb#1032).
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceHasTensors(false);
+            server.setSourceResolved(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IllegalStateException error = Assert.assertThrows(
+                        IllegalStateException.class,
+                        () -> client.getTensor("test-source"));
+                Assert.assertTrue(error.getMessage().contains("is unresolved"));
+                Assert.assertTrue(error.getMessage().contains("resolve('test-source')"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetTensorOnResolvedSourceWithNoTensorsSaysSo() throws Exception {
+        // The other half: it resolved, and there was nothing readable in it.
+        // Sending this caller at resolve() would point them at an operation that
+        // can only succeed and change nothing -- which is what the old
+        // `n == 0 -> unresolved` inference did.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceHasTensors(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IllegalArgumentException error = Assert.assertThrows(
+                        IllegalArgumentException.class,
+                        () -> client.getTensor("test-source"));
+                Assert.assertTrue(error.getMessage().contains("no readable tensors"));
+                Assert.assertFalse(error.getMessage().contains("unresolved"));
+            }
+        }
+    }
+
+    @Test
     public void testWarmReturnsTheTerminalCounts() throws Exception {
         // warm returns a status, not a row: residency is not a durable catalog
         // fact, so these counts exist nowhere else (biopb/biopb#1035).
@@ -746,6 +782,10 @@ public class TensorFlightClientTest {
             producer.warmSendsDone = sends;
         }
 
+        void setSourceHasTensors(boolean has) {
+            producer.sourceHasTensors = has;
+        }
+
         @Override
         public void close() throws Exception {
             server.close();
@@ -770,6 +810,10 @@ public class TensorFlightClientTest {
         private volatile int resolveHeartbeats = 0;
         private volatile boolean resolveSendsRow = true;
         private volatile boolean warmSendsDone = true;
+        // An unresolved source lists with no tensors -- but so does one that
+        // resolved and held nothing readable, which is the pair #1032 exists
+        // to stop conflating.
+        private volatile boolean sourceHasTensors = true;
 
         TensorTestProducer(BufferAllocator allocator) {
             this.allocator = allocator;
@@ -1121,7 +1165,13 @@ public class TensorFlightClientTest {
             setBool(root, "data_resident", true);
             setBool(root, "is_resolved", sourceResolved);
             ListVector tensors = (ListVector) root.getVector("tensors");
-            if (tensors != null) {
+            if (tensors != null && !sourceHasTensors) {
+                UnionListWriter empty = tensors.getWriter();
+                empty.setPosition(0);
+                empty.startList();
+                empty.endList();
+                tensors.setValueCount(1);
+            } else if (tensors != null) {
                 UnionListWriter writer = tensors.getWriter();
                 writer.setPosition(0);
                 writer.startList();
