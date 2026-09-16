@@ -2,7 +2,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { TreeRow } from "./SourceTree";
-import { type TreeNode, recentNode } from "../utils/sourceTree";
+import {
+  UNRESOLVED_GLYPH,
+  type TreeNode,
+  recentNode,
+} from "../utils/sourceTree";
 
 // `TreeRow` takes props, so it server-renders. `SourceTree` itself does not:
 // zustand's server snapshot is `getInitialState()`, so a store-reading component
@@ -75,5 +79,59 @@ describe("TreeRow under Recent", () => {
       depth: 1,
     });
     expect(html).toContain(`data-source-id="${LISTED.source_id}"`);
+  });
+});
+
+describe("TreeRow for an unresolved source", () => {
+  const CLOUD: DataSourceDescriptor = {
+    source_id: "onedrive_9c1",
+    source_url: "file:///data/cloud/timelapse.zarr",
+    source_type: "zarr",
+    metadata_json: null,
+    is_resolved: false,
+    tensors: [],
+  };
+
+  const sourceNode = (src: DataSourceDescriptor): TreeNode => ({
+    id: src.source_id,
+    name: "timelapse.zarr",
+    type: "source",
+    children: [],
+    source: src,
+    depth: 1,
+  });
+
+  it("marks it with the glyph napari uses and dims the row", () => {
+    const html = render(sourceNode(CLOUD));
+    expect(html).toContain(UNRESOLVED_GLYPH);
+    expect(html).toContain("unresolved");
+  });
+
+  it("is not openable: selecting it would fetch a tile that cannot exist", () => {
+    // aria-, not the real attribute: `disabled` would suppress the title
+    // tooltip that carries the explanation, and drop the row from tab order.
+    expect(render(sourceNode(CLOUD))).toContain('aria-disabled="true"');
+  });
+
+  it("explains itself on hover, keeping the url", () => {
+    const html = render(sourceNode(CLOUD));
+    expect(html).toContain("Not resolved");
+    expect(html).toContain("timelapse.zarr");
+  });
+
+  it("leaves a resolved source untouched", () => {
+    // The guard is `is_resolved`, not "has no tensors" -- a resolved source
+    // that happens to list none must not be dimmed or disabled.
+    const html = render(sourceNode({ ...CLOUD, is_resolved: true }));
+    expect(html).not.toContain(UNRESOLVED_GLYPH);
+    expect(html).not.toContain("aria-disabled");
+  });
+
+  it("shows no shape badge, having nothing to report yet", () => {
+    const withTensors = { ...CLOUD, tensors: UPLOAD.tensors, is_resolved: true };
+    expect(render(sourceNode(withTensors))).toContain("1024×1024");
+    expect(render(sourceNode({ ...withTensors, is_resolved: false }))).not.toContain(
+      "1024×1024",
+    );
   });
 });

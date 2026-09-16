@@ -8,7 +8,10 @@ import { readRecents, subscribeRecents } from "../utils/recentSources";
 import {
   RECENT_FOLDER_ID,
   type TreeNode,
+  UNRESOLVED_GLYPH,
+  UNRESOLVED_TOOLTIP,
   getPathParts,
+  isUnresolved,
   matchesQuery,
   recentNode,
   sourceLabel,
@@ -269,11 +272,22 @@ export function TreeRow({
   const isActive = src.source_id === activeSourceId;
   const hasMultipleTensors = src.tensors.length > 1;
   const firstTensor = src.tensors[0];
+  // An unresolved source has no tensor to read, so selecting it would send the
+  // viewer after a tile that cannot exist.
+  //
+  // `aria-disabled`, not `disabled`: a real `disabled` button suppresses the
+  // `title` tooltip in several browsers, and the tooltip is the only thing
+  // explaining why the row will not open. It also keeps the row in the tab
+  // order, so the explanation is reachable without a pointer. The click guard
+  // below does the actual blocking; Phase 4 (#1030) swaps it for the resolve
+  // trigger.
+  const unresolved = isUnresolved(src);
 
   return (
     <>
       <button
-        className={`tree-item ${isActive ? "active" : ""}`}
+        aria-disabled={unresolved || undefined}
+        className={`tree-item ${isActive ? "active" : ""} ${unresolved ? "unresolved" : ""}`}
         style={{
           width: "100%",
           textAlign: "left",
@@ -287,17 +301,25 @@ export function TreeRow({
         // otherwise shadow it.
         data-source-id={node.id === src.source_id ? src.source_id : undefined}
         onClick={() => {
+          if (unresolved) return;
           if (src.tensors.length === 1) {
             selectSource(src.source_id, src.tensors[0]?.array_id);
           } else {
             selectSource(src.source_id);
           }
         }}
-        title={src.source_url}
+        title={
+          unresolved ? `${src.source_url}\n${UNRESOLVED_TOOLTIP}` : src.source_url
+        }
       >
         <ChevronSlot />
+        {unresolved ? (
+          <span className="unresolved-glyph" aria-label="Not resolved">
+            {UNRESOLVED_GLYPH}
+          </span>
+        ) : null}
         <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
-        {hasMultipleTensors ? (
+        {unresolved ? null : hasMultipleTensors ? (
           <span className="tensor-pill" style={{ marginLeft: 8 }}>
             {src.tensors.length}
           </span>

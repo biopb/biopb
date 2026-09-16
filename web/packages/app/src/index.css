@@ -109,6 +109,22 @@ html, body {
 .tree-item:hover { background: #1e2435; color: #e2e8f0; }
 .tree-item.active { background: #2a3347; color: #60a5fa; }
 
+/* An unresolved (cloud / synced-folder) source: dimmed and not openable until
+   the server hydrates it. Matches the napari tensor_browser's greyed row. */
+.tree-item.unresolved {
+  color: #64748b;
+  cursor: not-allowed;
+  font-style: italic;
+}
+.tree-item.unresolved:hover { background: none; color: #64748b; }
+
+.unresolved-glyph {
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1;
+  opacity: 0.8;
+}
+
 .tree-folder {
   color: #e2e8f0;
   font-weight: 500;

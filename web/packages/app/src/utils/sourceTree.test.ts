@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
-import { getPathParts, recentNode, sourceLabel } from "./sourceTree";
+import {
+  getPathParts,
+  isUnresolved,
+  recentNode,
+  sourceLabel,
+} from "./sourceTree";
 
 const source = (over: Partial<DataSourceDescriptor> = {}): DataSourceDescriptor => ({
   source_id: "zarr_a3f2",
@@ -110,5 +115,35 @@ describe("recentNode", () => {
 
   it("carries the descriptor through, so a row can be opened", () => {
     expect(recentNode([UPLOAD])?.children[0]?.source).toBe(UPLOAD);
+  });
+});
+
+describe("isUnresolved", () => {
+  const tensor = {
+    array_id: "a",
+    dim_labels: ["y", "x"],
+    shape: [4, 4],
+    chunk_shape: [],
+    dtype: "uint16",
+  };
+
+  it("reads the server's own answer", () => {
+    expect(isUnresolved(source({ is_resolved: false }))).toBe(true);
+    expect(isUnresolved(source({ is_resolved: true }))).toBe(false);
+  });
+
+  it("does not infer from an empty tensor list, the way napari does", () => {
+    // `_is_unresolved(src) = len(src.tensors) == 0` is wrong in both
+    // directions; these two cases are what a catalog field buys us.
+    expect(isUnresolved(source({ is_resolved: true, tensors: [] }))).toBe(false);
+    expect(isUnresolved(source({ is_resolved: false, tensors: [tensor] }))).toBe(
+      true,
+    );
+  });
+
+  it("treats a descriptor from a server predating the field as resolved", () => {
+    const legacy = source();
+    delete (legacy as Partial<DataSourceDescriptor>).is_resolved;
+    expect(isUnresolved(legacy)).toBe(false);
   });
 });
