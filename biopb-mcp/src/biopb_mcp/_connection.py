@@ -63,9 +63,19 @@ def _browse(client) -> Dict[str, CatalogSource]:
     same server-side cap, but without the deprecation warning. The SDK returns
     rows; :mod:`._catalog` is this package's choice of what to make of them
     (biopb/biopb#1032).
+
+    Two calls: residency is not in the row, so one ``is_resident`` stamps the
+    whole page (biopb/biopb#1035). Best-effort -- a badge is worth no failed
+    browse -- so a refusal leaves residency unknown, which the UI draws as no
+    indicator.
     """
     rows = client.query_sources(_SOURCES_SQL, format="records")
-    return {s.source_id: s for s in sources_from_rows(rows)}
+    try:
+        resident = client.is_resident()
+    except Exception:
+        logger.debug("live residency unavailable", exc_info=True)
+        resident = None
+    return {s.source_id: s for s in sources_from_rows(rows, resident)}
 
 
 class ServerStarting(Exception):
@@ -391,6 +401,9 @@ class TensorConnection:
         # resolve() already re-listed server-side; mirror it into our snapshot so
         # the widget/agent see the full field set without a second round-trip.
         self.refresh()
+        # The row this resolve committed, not the refreshed snapshot entry,
+        # which a concurrent rescan could have re-registered underneath. Its
+        # residency is unknown; the tree redraws from ``sources`` for that.
         return source_from_row(row)
 
     def warm_source(
@@ -407,14 +420,16 @@ class TensorConnection:
         so later reads are warm and never stall. The recall is entirely
         server-side (no pixels cross the wire); this is slow and blocking, so call
         it off the GUI thread. Only meaningful for multi-file (directory) sources;
-        a single-file source returns immediately.
+        a single-file source returns immediately, and a remote-url source (an
+        object store, or a mirror of another server) raises.
 
         ``on_progress`` (called with a ``WarmProgress`` per message) and
         ``should_cancel`` (polled per message; raising
         :class:`~biopb.tensor.ResolveCancelled` when it returns True) are forwarded
         verbatim so a GUI can show a non-modal progress + Cancel affordance.
-        Returns the terminal ``WarmProgress`` snapshot. No catalog refresh — warm
-        changes residency, not the descriptor.
+        Returns the terminal ``WarmProgress`` snapshot. No catalog refresh: warm
+        changes residency, which is not in the catalog -- re-list to move the
+        badge (biopb/biopb#1035).
         """
         if self.client is None:
             raise RuntimeError("Not connected")

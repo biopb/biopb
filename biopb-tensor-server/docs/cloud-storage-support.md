@@ -64,19 +64,23 @@ normal source thereafter (shape known, cached)
 Two descriptor bits the naive API conflates ("is `shape` present?"), genuinely
 orthogonal:
 
-| Bit | Meaning | Gates |
-|---|---|---|
-| `resolved` | descriptor known (shape/dtype/fields) — immutable once true | serving; the resolution boundary |
-| `data_resident` | content local & cheap to read **right now** — **volatile** | pre-cache warming; leave-no-trace |
+| Bit | Meaning | Gates | Lives in |
+|---|---|---|---|
+| `is_resolved` | descriptor known (shape/dtype/fields) — immutable once true | serving; the resolution boundary | a `sources` column |
+| residency | content local & cheap to read **right now** — **volatile** | pre-cache warming; leave-no-trace | the `is_resident` action |
 
-`data_resident` is volatile because OneDrive re-dehydrates under storage
-pressure, so a *persisted* `data_resident=true` goes stale. The descriptor field
-is an advisory point-in-time display hint; the authoritative gate is a **fresh**
-`stat`-based `adapter.is_resident()` (recall-free, treats directories as
-resident) evaluated at the moment of use. The `sources` table gained a
-`data_resident BOOLEAN` column so unresolved sources (NULL dtype) are filterable
-on purpose — `WHERE NOT data_resident` finds what isn't resolved yet — instead of
-being silently dropped by a `WHERE dtype=…` predicate.
+The difference in the last column is the whole point, and it took a wrong turn
+to find (biopb/biopb#1035). `is_resolved` is monotonic — false to true once,
+never back — so a stored copy can only lag in the direction that costs nothing.
+Residency goes both ways: OneDrive re-dehydrates under storage pressure, in the
+same running process, with no event for a refresh to hang on. A column could
+therefore only ever record where the bytes were when someone last looked, which
+is not the question anyone asks. So there is no residency column and no
+descriptor field; `do_action("is_resident", [...])` calls straight through to
+`adapter.is_resident()` on every invocation — a live lookup like `chunk_locate`,
+not a row. Unresolved sources (NULL dtype) stay filterable on purpose via
+`WHERE NOT is_resolved`, instead of being silently dropped by a `WHERE dtype=…`
+predicate.
 
 ## Shipped architecture
 
@@ -95,8 +99,8 @@ content read to resolve.
 
 **The unresolved adapter (`adapters/unresolved.py`).**
 `SourceManager._claim_is_unresolved` registers a cloud source behind an
-`UnresolvedSourceAdapter` — a catalog row with empty `tensors` /
-`data_resident=false`. It is deliberately split into two surfaces:
+`UnresolvedSourceAdapter` — a catalog row with empty `tensors` and
+`is_resolved=false`. It is deliberately split into two surfaces:
 
 - a **catalog surface** (`list_tensor_descriptors` / `get_metadata` /
   `is_resident`) that **never resolves**, keeping the metadata-DB sync and the
@@ -192,9 +196,10 @@ cites this §9 for why multi-file monoliths degrade rather than reconstruct.)
 - **Shape-presence no longer protects pre-cache.** An unresolved source
   auto-skips (empty shape). But once resolved-and-persisted it returns with a
   concrete shape, so a naive backlog would re-warm it on restart — which is why
-  `data_resident` must be a separate, live-checked bit. (The explicit
-  `is_resident()` skip gate is a future phase; the backfire can't manifest while
-  resolution stays in-memory.)
+  residency has to be its own bit, checked live. `Reconciler.should_warm()` now
+  does exactly that: it asks the registered adapter's `is_resident()` at warm
+  time. It used to ask the claim's `member_paths` instead, a check that could
+  not see inside a directory-claimed store (biopb/biopb#1035).
 
 ## Not done / future
 

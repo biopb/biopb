@@ -313,7 +313,7 @@ class TestRemoteTensorProxy:
                         }
                     ],
                     metadata={},
-                    data_resident=True,
+                    is_resolved=True,
                 )
                 proxy = catalog_server("grpc://localhost:0")
                 register_and_catalog(proxy, "hpc__aics", adapter)
@@ -387,7 +387,7 @@ class TestRemoteTensorProxy:
                         }
                     ],
                     metadata={},
-                    data_resident=True,
+                    is_resolved=True,
                     indexed_at="2026-07-19 00:00:00",
                 )
                 plan = adapter.forward_flight_info(
@@ -456,7 +456,7 @@ class TestRemoteTensorProxy:
                         }
                     ],
                     metadata={},
-                    data_resident=True,
+                    is_resolved=True,
                 )
                 plan = adapter.forward_flight_info(
                     TensorReadOption(array_id="hpc__ome", with_pyramid=True)
@@ -514,7 +514,7 @@ class TestRemoteTensorProxy:
                         }
                     ],
                     metadata={},
-                    data_resident=True,
+                    is_resolved=True,
                 )
                 plan = adapter.forward_flight_info(
                     TensorReadOption(array_id="hpc__ome", with_read_plan=False)
@@ -553,7 +553,7 @@ class TestRemoteTensorProxy:
                 }
             ],
             metadata={},
-            data_resident=True,
+            is_resolved=True,
         )
         with caplog.at_level(
             logging.DEBUG, logger="biopb_tensor_server.adapters.remote_tensor"
@@ -595,7 +595,7 @@ class TestRemoteTensorProxy:
                 }
             ],
             metadata={},
-            data_resident=True,
+            is_resolved=True,
         )
         # A valid descriptor but a junk endpoint (no .ticket) -> the parse loop
         # raises inside the guarded LOGIC block (not the transport block).
@@ -1268,7 +1268,7 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
                 }
             ],
             metadata={},
-            data_resident=True,
+            is_resolved=True,
         )
         # Force the forward to yield nothing -> the server must use the local planner.
         adapter.forward_flight_info = lambda read_opt: None
@@ -1920,9 +1920,9 @@ class TestUnreachableUpstream:
             upstream_location=f"grpc://localhost:{self._dead_port()}",
             upstream_source_id="img",
         )
-        # no raise: empty placeholder catalog row, marked non-resident
+        # no raise: empty placeholder catalog row
         assert adapter.list_tensor_descriptors() == []
-        assert adapter.is_resident() is False
+        assert adapter.is_resident() is False  # never local, up or down
 
     def test_serve_surface_still_raises_when_unreachable(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -1967,7 +1967,8 @@ class TestUnreachableUpstream:
             descs = adapter.list_tensor_descriptors()
             assert len(descs) == 1
             assert descs[0].array_id == "lab__img"  # localized
-            assert adapter.is_resident() is True
+            # Recovery shows in the catalog surface, never in residency.
+            assert adapter.is_resident() is False
             assert tuple(adapter.get_tensor_descriptor().shape) == shape
         finally:
             upstream.shutdown()
@@ -2557,14 +2558,14 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
 
 class _CatalogRowAdapter:
     """Minimal adapter to seed a controllable upstream catalog row
-    (data_resident / tensors / metadata)."""
+    (is_resolved / tensors / metadata)."""
 
-    def __init__(self, source_id, tensors, resident, metadata=None):
+    def __init__(self, source_id, tensors, resolved=None, metadata=None):
         self.source_id = source_id
         self._source_url = f"/data/{source_id}"
         self._source_type = "zarr"
         self._tensors = tensors
-        self._resident = resident
+        self._resolved = bool(tensors) if resolved is None else resolved
         self._metadata = metadata or {}
 
     @property
@@ -2576,10 +2577,10 @@ class _CatalogRowAdapter:
         return self._source_type
 
     def is_resident(self):
-        return self._resident
+        raise AssertionError("the catalog never asks an adapter about residency")
 
     def is_resolved(self):
-        return bool(self._tensors)
+        return self._resolved
 
     def list_tensor_descriptors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -2590,10 +2591,11 @@ class _CatalogRowAdapter:
         return self._metadata
 
 
-def test_seed_catalog_carries_residency_and_detects_change():
-    """An unresolved upstream source (data_resident=false, empty tensors) mirrors
-    as non-resident; re-seeding reports change only when something differs, and an
-    in-place resolution flips residency + tensors."""
+def test_seed_catalog_carries_resolution_and_detects_change():
+    """An unresolved upstream source (is_resolved=false, empty tensors) mirrors as
+    unresolved; re-seeding reports change only when something differs, and an
+    in-place resolution flips the flag and the tensors together.
+    """
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     adapter = RemoteTensorAdapter(
@@ -2602,14 +2604,14 @@ def test_seed_catalog_carries_residency_and_detects_change():
         upstream_source_id="cloud",
     )
 
-    changed = adapter.seed_catalog([], None, data_resident=False)
+    changed = adapter.seed_catalog([], None, is_resolved=False)
     assert changed is True
     assert adapter.list_tensor_descriptors() == []
-    assert adapter.is_resident() is False  # unresolved upstream -> not resident
+    assert adapter.is_resolved() is False  # mirrors the upstream's own flag
     assert adapter._client is None
 
     # identical re-seed -> no change (so the caller skips a redundant re-sync)
-    assert adapter.seed_catalog([], None, data_resident=False) is False
+    assert adapter.seed_catalog([], None, is_resolved=False) is False
 
     # in-place resolution upstream -> change detected, now resident with tensors
     changed = adapter.seed_catalog(
@@ -2623,19 +2625,55 @@ def test_seed_catalog_carries_residency_and_detects_change():
             }
         ],
         {"ome": "m"},
-        data_resident=True,
+        is_resolved=True,
     )
     assert changed is True
-    assert adapter.is_resident() is True
+    assert adapter.is_resolved() is True
+    # Resolution upstream does not make anything local here.
+    assert adapter.is_resident() is False
     assert [d.array_id for d in adapter.list_tensor_descriptors()] == ["lab__cloud"]
     assert adapter._client is None
 
 
+def test_a_mirror_is_never_resident():
+    """A proxied source's bytes are on another machine: not local, not cheap to
+    read, whatever the endpoint's reachability or the upstream's resolution.
+
+    Do not reinstate an override here -- "should a client offer to resolve this"
+    is `is_resolved()`, and a mirror cannot be warmed anyway
+    (`test_warm_refuses_a_remote_source`), which is what residency decides.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    assert adapter.is_resident() is False
+    # Seeding a resolved upstream row moves is_resolved, and only that.
+    adapter.seed_catalog(
+        [
+            {
+                "array_id": "img",
+                "dim_labels": ["y", "x"],
+                "shape": [4, 4],
+                "dtype": "uint8",
+            }
+        ],
+        None,
+        is_resolved=True,
+    )
+    assert adapter.is_resolved() is True
+    assert adapter.is_resident() is False
+    assert adapter._client is None  # and none of it dialed
+
+
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
-    """A mirror of an unresolved upstream source is non-resident with no tensors;
+    """A mirror of an unresolved upstream source is unresolved with no tensors;
     when the upstream resolves it in place, the next re-list refreshes the local
-    catalog row (residency + tensors) without a per-source RPC."""
+    catalog row (is_resolved + tensors) without a per-source RPC."""
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
@@ -2646,7 +2684,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
     up_db = MetadataDatabase()
     upstream = TensorFlightServer("grpc://localhost:0", metadata_db=up_db)
     up_db.sync_source_added(
-        "cloud", _CatalogRowAdapter("cloud", tensors=[], resident=False)
+        "cloud", _CatalogRowAdapter("cloud", tensors=[], resolved=False)
     )
     _serve(upstream)
     try:
@@ -2671,16 +2709,16 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
                 return (
                     local_db._get_connection()
                     .execute(
-                        "SELECT data_resident, tensors FROM sources "
+                        "SELECT is_resolved, tensors FROM sources "
                         "WHERE source_id='lab__cloud'"
                     )
                     .fetchone()
                 )
 
-            resident, tensors = _row()
-            assert resident is False  # unresolved mirror, not advertised resident
+            resolved, tensors = _row()
+            assert resolved is False  # unresolved mirror, not advertised readable
             assert tensors == []
-            assert proxy.sources.get("lab__cloud").is_resident() is False
+            assert proxy.sources.get("lab__cloud").is_resolved() is False
 
             # upstream resolves the source in place (same source_id)
             up_db.sync_source_added(
@@ -2696,18 +2734,17 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
                             "dtype": "uint8",
                         }
                     ],
-                    resident=True,
                     metadata={"ome": "m"},
                 ),
             )
 
             manager._reconcile_upstreams()
 
-            resident, tensors = _row()
-            assert resident is True  # refreshed from the bulk re-list
+            resolved, tensors = _row()
+            assert resolved is True  # refreshed from the bulk re-list
             assert len(tensors) == 1
             assert tensors[0]["array_id"] == "lab__cloud"  # localized
-            assert proxy.sources.get("lab__cloud").is_resident() is True
+            assert proxy.sources.get("lab__cloud").is_resolved() is True
         finally:
             proxy.shutdown()
     finally:

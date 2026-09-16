@@ -77,6 +77,7 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
+from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.activity import ActivityTracker
@@ -538,26 +539,6 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return self.sources.swap(source_id, adapter)
 
-    def _catalog_refresh_residency(
-        self, source_id: str, adapter: SourceAdapter
-    ) -> None:
-        """Best-effort refresh of the catalog's residency flags after a warm
-        pass, without a full ``sync_source_added`` re-registration.
-
-        Best-effort and not the caller's business, unlike registration: the warm
-        already happened, so there is nothing to roll back and nothing the
-        client can do about a stale flag. A catalog-less server holds no row to
-        correct, so there is nothing to do.
-        """
-        if self._metadata_db is None:
-            return
-        try:
-            self._metadata_db.refresh_residency(
-                source_id, adapter.is_resident(), adapter.is_resolved()
-            )
-        except Exception as e:  # noqa: BLE001 -- catalog is advisory here
-            logger.warning(f"catalog residency refresh failed for {source_id}: {e}")
-
     def unregister_source(self, source_id: str) -> None:
         """Unregister a data source (its upload state, if any, goes with it).
 
@@ -847,6 +828,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "Hydrate-ahead: recall a resolved cloud source's member files server-side",
             ),
             flight.ActionType(
+                "is_resident",
+                "Live residency of sources right now (never a stored catalog value)",
+            ),
+            flight.ActionType(
                 "add_source",
                 "Register a local path/dir as a served source at runtime (streams progress)",
             ),
@@ -959,6 +944,11 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize(context, source_id)
             yield from self._handle_warm(source_id, context)
+        elif action.type == "is_resident":
+            # Catalog tier: which sources are local is part of browsing, not
+            # of reading their pixels.
+            self._authorize(context)
+            yield self._handle_is_resident(action.body.to_pybytes())
         elif action.type == "add_source":
             self._authorize(context)
             req = AddSourceRequest.FromString(action.body.to_pybytes())
@@ -974,6 +964,46 @@ class TensorFlightServer(flight.FlightServerBase):
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
+
+    def _handle_is_resident(self, body: bytes) -> bytes:
+        """Residency of the named sources, asked of the adapters right now.
+
+        An action rather than a catalog column because the answer has no shelf
+        life: a synced folder re-dehydrates with no event to refresh a stored
+        value from, so every call re-runs ``adapter.is_resident()``
+        (biopb/biopb#1035). Never cache it here or anywhere.
+
+        Batched because the callers are lists drawing a glyph per row. Body is a
+        JSON array of source ids, or empty for every registered source; the
+        reply is a JSON object of id -> boolean. An id the server does not serve
+        is absent, which reads as "unknown" -- never False, which would send a
+        client to hydrate a file already on disk.
+        """
+        raw = body.decode("utf-8").strip()
+        if raw:
+            try:
+                requested = json.loads(raw)
+            except ValueError as exc:
+                raise flight.FlightServerError(
+                    f"is_resident takes a JSON array of source ids: {exc}"
+                ) from exc
+            if not isinstance(requested, list):
+                raise flight.FlightServerError(
+                    "is_resident takes a JSON array of source ids"
+                )
+            pairs = [(str(sid), self.sources.get(str(sid))) for sid in requested]
+        else:
+            pairs = self.sources.snapshot()
+
+        resident: Dict[str, bool] = {}
+        for source_id, adapter in pairs:
+            if adapter is None:
+                continue
+            try:
+                resident[source_id] = bool(adapter.is_resident())
+            except Exception:  # noqa: BLE001 -- one balky adapter is not the batch
+                logger.debug("is_resident failed for %s", source_id, exc_info=True)
+        return json.dumps(resident).encode("utf-8")
 
     def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
         """Stream the result of resolving a source.
@@ -1097,9 +1127,10 @@ class TensorFlightServer(flight.FlightServerBase):
         to preserve.
 
         Properties:
-        - **No-op for non-directory sources** -- a single-file source's one file
-          was already recalled by resolve, so this emits one terminal ``done``
-          with ``files_total == 0`` and returns.
+        - **No-op for single-file sources** -- their one file was already
+          recalled by resolve, so this emits one terminal ``done`` with
+          ``files_total == 0`` and returns. A *remote* source raises instead;
+          nothing here can be made resident.
         - **Read every file unconditionally** -- residency is volatile (eviction /
           re-dehydration can flip it underneath us), so a "skip already-resident"
           check would be a TOCTOU trap; an unconditional read is idempotent
@@ -1115,7 +1146,20 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
         root = adapter.source_url
-        # Single-file / remote / non-directory source: nothing to warm beyond what
+        # A remote source has no local tree to walk, so refuse rather than fall
+        # into the no-op below: `files_total == 0` is how a client learns a
+        # source is single-file, and must not also mean "not applicable"
+        # (biopb/biopb#1035). Scheme only, so a mirror's aliased `source_url`
+        # (display authority, never the dial address) is still sound to ask.
+        if root and is_remote_url(root):
+            scheme = root.split("://", 1)[0]
+            raise flight.FlightServerError(
+                f"Cannot warm {source_id!r}: it is a remote ({scheme}) source, "
+                "and warm recalls member files onto the serving machine's own "
+                "filesystem. Nothing here can be made resident. Warm it on the "
+                "server that holds the data."
+            )
+        # Single-file / non-directory source: nothing to warm beyond what
         # resolve already recalled. One terminal `done`, files_total == 0.
         if not root or not os.path.isdir(root):
             yield WarmStreamMessage(done=WarmProgress()).SerializeToString()
@@ -1229,13 +1273,7 @@ class TensorFlightServer(flight.FlightServerBase):
                             name,
                         )
 
-                # 4. Refresh the catalog's data_resident snapshot: it was
-                # frozen at resolve time, before any file here was warmed, so
-                # it still reads "not resident" for a directory source unless
-                # this re-syncs it.
-                self._catalog_refresh_residency(source_id, adapter)
-
-                # 5. Terminal done (partial counts if cancelled mid-loop).
+                # 4. Terminal done (partial counts if cancelled mid-loop).
                 yield WarmStreamMessage(
                     done=WarmProgress(
                         files_total=files_total,

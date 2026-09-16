@@ -12,7 +12,7 @@ Features:
 import json
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -556,7 +556,9 @@ class TensorFlightClient:
         pixels cross the wire, only progress. It is idempotent -- already-resident
         files are cheap local reads -- so a ``warm`` re-run after a cancel simply
         finishes the remainder. Only meaningful for multi-file sources; a
-        single-file source returns immediately (resolve already recalled it).
+        single-file source returns immediately (resolve already recalled it), and
+        a remote-url source (an object store, or a ``grpc://`` mirror) raises --
+        nothing on the serving machine can be made resident.
 
         Args:
             source_id: The (already-resolved) source to warm.
@@ -570,17 +572,55 @@ class TensorFlightClient:
 
         Returns:
             The terminal ``WarmProgress`` snapshot (``files_done`` /
-            ``bytes_done`` reflect what was made resident; on a no-op source
-            ``files_total == 0``).
+            ``bytes_done`` reflect what was made resident). ``files_total == 0``
+            means the source was local and had nothing to warm -- how a client
+            learns it is single-file. It never means "not applicable"; that
+            case raises (biopb/biopb#1035).
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
             RuntimeError: if the server predates the ``warm`` action (too old for
                 hydrate-ahead), or closes the stream without a terminal status.
+            FlightServerError: if the source's url is remote. Warm it on the
+                server that holds the data.
         """
         return self._catalog.warm(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
+
+    def is_resident(
+        self, source_ids: Optional[Iterable[str]] = None
+    ) -> Dict[str, bool]:
+        """Ask the server, right now, whose content is local and cheap to read.
+
+        Note:
+            Experimental, with the rest of cloud / remote source support.
+
+        Volatile: a synced folder (OneDrive / iCloud Files-On-Demand)
+        re-dehydrates under storage pressure with nothing to notify anyone, so
+        no stored answer stays true -- which is why it is an action and not a
+        catalog column (biopb/biopb#1035). **Do not cache what it returns.**
+
+        Not the same question as a row's ``is_resolved``, which asks whether the
+        server has read the source at all yet. An unresolved source is never
+        resident; a resolved one can stop being.
+
+        Batched: one call answers a whole catalog page.
+
+        Args:
+            source_ids: The sources to ask about; ``None`` (the default) asks
+                about every source the server has registered.
+
+        Returns:
+            ``{source_id: bool}``. A requested id the server does not serve is
+            simply absent -- missing means "no answer", not "not resident".
+
+        Raises:
+            RuntimeError: if the server predates the ``is_resident`` action --
+                residency unknown, which a UI should draw as no indicator
+                rather than guess at.
+        """
+        return self._catalog.is_resident(source_ids)
 
     def add_source(
         self,

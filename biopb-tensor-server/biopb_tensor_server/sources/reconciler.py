@@ -664,7 +664,7 @@ class Reconciler:
             self._commit_remove_source(source_id)
 
         def _row_to_seed(row):
-            """(tensors, metadata, data_resident, source_url, indexed_at) for
+            """(tensors, metadata, is_resolved, source_url, indexed_at) for
             seed_catalog, or None."""
             if row is None:
                 return None
@@ -676,7 +676,9 @@ class Reconciler:
             return (
                 row.get("tensors") or [],
                 metadata,
-                bool(row.get("data_resident")),
+                # Whether that row describes a real source yet. True for an
+                # upstream predating the column.
+                bool(row.get("is_resolved", True)),
                 row.get("source_url"),
                 row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
             )
@@ -702,7 +704,7 @@ class Reconciler:
 
         # Refresh already-mirrored sources from the same bulk result, so an
         # in-place upstream change -- notably unresolved -> resolved (empty ->
-        # populated tensors, data_resident false -> true) -- is reflected on the
+        # populated tensors, is_resolved false -> true) -- is reflected on the
         # catalog surface without a per-source RPC (biopb/biopb#266). Re-sync the
         # DuckDB row only when the seed actually changed, so a steady re-list does
         # not churn indexed_at.
@@ -840,27 +842,22 @@ class Reconciler:
     def should_warm(self, source_id: str) -> bool:
         """Whether the precache worker may warm *source_id* right now.
 
-        Residency is decided once, at registration time (``_claim_is_unresolved``):
-        a source whose files were resident then registers as a normal adapter and
-        keeps that registration even if the cloud provider (OneDrive Files
-        On-Demand, ...) later re-dehydrates the bytes. Precache has no per-chunk
-        residency gate, so a later backlog pass would read those bytes and trigger
-        a background recall the ``cloud = true`` policy exists to prevent (#174).
+        Registration decides residency once (``_claim_is_unresolved``), but the
+        cloud provider (OneDrive Files On-Demand, ...) can re-dehydrate the bytes
+        afterwards, and precache has no per-chunk gate -- so a backlog pass would
+        trigger exactly the recall the ``cloud = true`` policy exists to prevent
+        (#174).
 
-        This re-checks residency at warm time, mirroring the registration-path
-        rule so the two stay in sync. Only sources under a ``cloud`` root are
-        gated -- a normal local source always warms -- and the check is
-        metadata-only, so it never recalls content itself. Returns False (skip)
-        when any member *file* is now a placeholder, or when the source is no
-        longer registered.
+        Ask the adapter, not the claim's ``member_paths``: those are just the
+        directory for every dir-claimed format (zarr, ome-zarr, ome-zarr-hcs,
+        ndtiff, tiff-sequence, micromanager-legacy), and the placeholder stat is
+        ``is_file``-guarded, so a wholly dehydrated store reads as resident
+        (biopb/biopb#1035).
 
-        Boundary: like ``_claim_has_dehydrated_member``, the residency check is
-        ``is_file``-guarded, so it does not catch re-dehydration of a
-        dir-claiming source's *interior* files (ome-zarr, micromanager, ndtiff,
-        tiff-sequence, whose ``member_paths`` is just the directory). Those are
-        kept safe today by ``UnresolvedSourceAdapter.list_tensor_descriptors``
-        returning empty until resolved; closing the post-resolution re-warm path
-        is the cloud-storage spec's phase-4 deferral.
+        Only sources under a ``cloud`` root are asked, which keeps the bounded
+        stat walk off the common path. Returns False when the source is no longer
+        registered or its adapter cannot answer -- a gate that cannot see is not
+        permission to read.
         """
         with self._lock:
             claim = self._state.claims.get(source_id)
@@ -868,7 +865,13 @@ class Reconciler:
             return False
         if not self._is_under_cloud_root(claim.primary_path):
             return True
-        return not self._claim_has_dehydrated_member(claim)
+        adapter = self._server.sources.get(source_id)
+        if adapter is None:
+            return False
+        try:
+            return bool(adapter.is_resident())
+        except Exception:  # noqa: BLE001 -- a gate that cannot see fails closed
+            return False
 
     def _on_source_resolved(self, source_id: str, adapter: Any) -> None:
         """Backfill the metadata DB when an unresolved cloud source resolves.
@@ -936,7 +939,7 @@ class Reconciler:
         good if the rebuild then failed.
 
         ``catalog_seed`` (biopb/biopb#266) is an optional
-        ``(tensors, metadata, data_resident, source_url)`` tuple from a bulk upstream
+        ``(tensors, metadata, is_resolved, source_url)`` tuple from a bulk upstream
         ``query_sources``; when the adapter supports it (the remote proxy), it is
         applied before ``sync_source_added`` so registration needs no per-source
         upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
@@ -985,11 +988,11 @@ class Reconciler:
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
                 # adapter opting in via seed_catalog (only the remote proxy does).
                 if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
-                    tensors, metadata, data_resident, source_url, indexed_at = (
+                    tensors, metadata, is_resolved, source_url, indexed_at = (
                         catalog_seed
                     )
                     adapter.seed_catalog(
-                        tensors, metadata, data_resident, source_url, indexed_at
+                        tensors, metadata, is_resolved, source_url, indexed_at
                     )
         except UpstreamConfigError as e:
             # Same skip, different diagnosis: "failed to create adapter" reads as

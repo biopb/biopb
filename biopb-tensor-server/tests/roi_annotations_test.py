@@ -1682,7 +1682,7 @@ class TestSchemaVersioning:
         columns = {
             r[0] for r in db._get_cursor().execute("DESCRIBE sources").fetchall()
         }
-        assert {"data_resident", "tensors", "source_url"} <= columns
+        assert {"is_resolved", "tensors", "source_url"} <= columns
 
     def test_the_expected_columns_come_from_the_ddl_itself(self, tmp_path):
         # The check must not rest on a hand-written column list, because the

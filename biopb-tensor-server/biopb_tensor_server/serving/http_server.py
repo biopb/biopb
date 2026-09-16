@@ -3223,13 +3223,13 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # listing carries the struct. A scalar that only describes tensors[0]
         # is a trap next to a real per-tensor list.
         #
-        # Deliberately not `data_resident` either, for a different reason: a
-        # SQL column is the wrong shape for a value defined as "true right
-        # now", and this listing would only make a second client depend on the
-        # stale one (biopb/biopb#1035). `is_resolved` is the opposite case and
-        # belongs here -- monotonic, so a persisted row can only lag in the
-        # harmless direction. Default True for a row from a server predating
-        # the column, the right reading for every pre-existing source.
+        # There is no residency field here, and no column to read one from:
+        # "are the bytes local right now" is answered live by the `is_resident`
+        # action, never by a row (biopb/biopb#1035). `is_resolved` is the
+        # opposite case and belongs here -- monotonic, so a persisted row can
+        # only lag in the harmless direction. Default True for a row from a
+        # server predating the column, the right reading for every pre-existing
+        # source.
         "is_resolved": bool(row.get("is_resolved", True)),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }

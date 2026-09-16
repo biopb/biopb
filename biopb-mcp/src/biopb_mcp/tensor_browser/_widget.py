@@ -486,12 +486,15 @@ def _human_bytes(n: int) -> str:
 
 
 def _residency_state(src: CatalogSource) -> str | None:
-    """Residency of a source's content, or ``None`` when the server didn't report it.
+    """Residency of a source's content, or ``None`` when nobody answered.
 
     Returns ``"resident"`` (content local, cheap to read), ``"remote"`` (not
     local -- remote or dehydrated, slow or blocking to read), or ``None`` when
-    ``data_resident`` is unset (a server predating the field; residency unknown,
-    so the UI shows no indicator rather than guessing).
+    residency is unknown (an old server, or a failed call), in which case the UI
+    shows no indicator rather than guessing.
+
+    Only as live as the listing that produced *src* -- a badge, not a read-path
+    gate (biopb/biopb#1035).
     """
     if src.data_resident is None:
         return None
@@ -795,7 +798,7 @@ class MetadataDialog(QDialog):
             _make_selectable(dtype_label)
             header_layout.addWidget(dtype_label)
 
-        # Source-level residency badge (omitted when the server didn't report it)
+        # Source-level residency badge (omitted when residency is unknown)
         residency = _residency_state(source)
         if residency == "remote":
             res_label = QLabel(f"{_RESIDENCY_GLYPH} remote")
@@ -1719,7 +1722,7 @@ class TensorBrowserWidget(QWidget):
             # Residency indicator: flag non-resident (remote/dehydrated) sources
             # with a leading cloud glyph and greyed text; resident sources stay
             # plain. Both known states get an explanatory note; an unknown state
-            # (old server) is left unmarked.
+            # (no answer from the server) is left unmarked.
             residency = _residency_state(src)
             residency_note = None
             if residency == "remote":

@@ -2,7 +2,7 @@
 
 Covers:
 - `require_resolved` / `SourceUnresolvedError` at the read-planning boundary,
-- the `is_resident()` residency gate and the `data_resident` descriptor copy.
+- the `is_resident()` residency gate, which is answered live and stored nowhere.
 """
 
 import os

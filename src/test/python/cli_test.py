@@ -51,7 +51,6 @@ def _build_mock_client() -> MagicMock:
             "source_id": "my-source",
             "source_url": "/data/my-source.zarr",
             "source_type": "zarr",
-            "data_resident": True,
             "is_resolved": True,
             "tensors": [
                 {

@@ -54,15 +54,22 @@ class CatalogSource:
     #: resolved" with "resolved, and there was nothing readable in it"
     #: (biopb/biopb#1032).
     is_resolved: bool = True
-    #: Advisory, point-in-time: the content is local and cheap to read *right
-    #: now*. VOLATILE -- a synced-folder source re-dehydrates under storage
-    #: pressure -- so a read path wanting certainty asks the server, not this.
-    #: ``None`` when the server did not report it.
+    #: Whether the content was local and cheap to read *at the moment this
+    #: catalog was listed*. Not a row column: it comes from the server's live
+    #: ``is_resident`` action (biopb/biopb#1035), which makes this a snapshot
+    #: -- fine for a badge redrawn with the list, wrong for a read path, which
+    #: should ask the server again. ``None`` when nobody answered.
     data_resident: Optional[bool] = None
 
 
-def source_from_row(row: Mapping[str, Any]) -> CatalogSource:
-    """One ``sources`` row (as ``query_sources(format="records")`` yields it)."""
+def source_from_row(
+    row: Mapping[str, Any], resident: Optional[bool] = None
+) -> CatalogSource:
+    """One ``sources`` row (as ``query_sources(format="records")`` yields it).
+
+    *resident* is the live residency answer for this source, when the caller
+    has one; residency is not in the row.
+    """
     tensors = tuple(
         CatalogTensor(
             array_id=t["array_id"],
@@ -72,7 +79,6 @@ def source_from_row(row: Mapping[str, Any]) -> CatalogSource:
         )
         for t in (row.get("tensors") or ())
     )
-    resident = row.get("data_resident")
     return CatalogSource(
         source_id=row["source_id"],
         source_url=row.get("source_url") or "",
@@ -82,9 +88,20 @@ def source_from_row(row: Mapping[str, Any]) -> CatalogSource:
         # it costs a resolve the UI does not offer, never a browse that silently
         # treats a real source as a placeholder.
         is_resolved=bool(row.get("is_resolved", True)),
-        data_resident=None if resident is None else bool(resident),
+        # Not in the row; the caller passes the live answer in.
+        data_resident=resident,
     )
 
 
-def sources_from_rows(rows: Iterable[Mapping[str, Any]]) -> List[CatalogSource]:
-    return [source_from_row(r) for r in rows]
+def sources_from_rows(
+    rows: Iterable[Mapping[str, Any]],
+    resident_by_id: Optional[Mapping[str, bool]] = None,
+) -> List[CatalogSource]:
+    """Decode rows, optionally stamping each with a live residency answer.
+
+    *resident_by_id* is what the server's ``is_resident`` action returned; a
+    source missing from it keeps ``None`` (unknown), which is what an older
+    server or a failed call leaves too.
+    """
+    lookup = resident_by_id or {}
+    return [source_from_row(r, lookup.get(r["source_id"])) for r in rows]

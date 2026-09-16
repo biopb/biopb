@@ -202,7 +202,7 @@ public class TensorFlightClient implements AutoCloseable {
 
     /** The columns a {@code sources} row carries, as a SELECT list. */
     static final String SOURCE_ROW_COLUMNS =
-            "source_id, source_url, source_type, data_resident, is_resolved, tensors";
+            "source_id, source_url, source_type, is_resolved, tensors";
 
     /**
      * List available data sources.
@@ -342,6 +342,9 @@ public class TensorFlightClient implements AutoCloseable {
                     .setSourceType(text(types, i))
                     .setMetadataJson("")
                     .addAllTensors(tensorsFromRow(root, i));
+            // No current server sends data_resident -- residency is isResident()
+            // now (biopb/biopb#1035) -- but an older one does, and this decode
+            // still answers it identically against that server.
             Boolean res = nullableBool(resident, i);
             if (res != null) {
                 desc.setDataResident(res);
@@ -642,11 +645,14 @@ public class TensorFlightClient implements AutoCloseable {
      * source directory server-side and reads every file to force the sync
      * engine's recall; no pixels cross the wire, only progress. It is idempotent
      * (already-resident files are cheap local reads) and a no-op for a
-     * single-file source (resolve already recalled it).
+     * single-file source (resolve already recalled it). A remote-url source --
+     * an object store, or a {@code grpc://} mirror -- fails instead: nothing on
+     * the serving machine can be made resident (biopb/biopb#1035).
      *
      * @param sourceId The (already-resolved) source to warm.
      * @return The terminal {@link WarmProgress} snapshot (files/bytes made
-     *         resident; {@code filesTotal == 0} for a no-op source).
+     *         resident). {@code filesTotal == 0} means the source was local and
+     *         had nothing to warm, i.e. single-file; "not applicable" raises.
      * @throws IOException If the action fails, the server is too old to support
      *         the {@code warm} action, or it returns no terminal status.
      */
@@ -673,6 +679,51 @@ public class TensorFlightClient implements AutoCloseable {
                     + "') returned no terminal status (server closed the stream without a 'done')");
         }
         return done;
+    }
+
+    /**
+     * Ask the server, right now, whose content is local and cheap to read.
+     *
+     * <p>Volatile: a synced folder (OneDrive / iCloud Files-On-Demand)
+     * re-dehydrates under storage pressure with nothing to notify anyone, so no
+     * stored answer stays true -- which is why it is an action and not a catalog
+     * column (biopb/biopb#1035). Do not cache the result.
+     *
+     * <p>Not the same question as a row's {@code is_resolved}, which asks
+     * whether the server has read the source at all yet. An unresolved source
+     * is never resident; a resolved one can stop being.
+     *
+     * @param sourceIds The sources to ask about, or {@code null} for every
+     *                  source the server has registered.
+     * @return {@code source_id -> resident}. A requested id the server does not
+     *         serve is absent: missing means "no answer", not "not resident".
+     * @throws IOException If the server closes the stream without a reply. A
+     *         server too old for the action fails with the Flight layer's own
+     *         unchecked error, as {@link #warm} does.
+     */
+    public Map<String, Boolean> isResident(List<String> sourceIds) throws IOException {
+        // Empty body means "every registered source"; otherwise a JSON array.
+        byte[] body = sourceIds == null
+                ? new byte[0]
+                : GSON.toJson(sourceIds).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        org.apache.arrow.flight.Action action =
+                new org.apache.arrow.flight.Action("is_resident", body);
+
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        if (!iter.hasNext()) {
+            throw new IOException("is_resident returned no result");
+        }
+        byte[] reply = iter.next().getBody();
+        Map<String, Boolean> out = reply == null || reply.length == 0
+                ? new HashMap<>()
+                : GSON.fromJson(new String(reply, java.nio.charset.StandardCharsets.UTF_8),
+                        new TypeToken<Map<String, Boolean>>() {
+                        }.getType());
+        // Drain, so the server sees the stream consumed rather than cancelled.
+        while (iter.hasNext()) {
+            iter.next();
+        }
+        return out;
     }
 
     /**
