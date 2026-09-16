@@ -427,23 +427,21 @@ class TestPerTensorCatalog:
 
 
 def _sources(db):
-    """The SDK's projection of the catalog rows (what list_sources returns)."""
-    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, sources_from_rows
+    """The `sources` rows a client browses, in the shared column contract."""
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-    return sources_from_rows(
-        db.query(
-            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
-        ).to_pylist()
-    )
+    return db.query(
+        f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
+    ).to_pylist()
 
 
 class TestSourceRowProjection:
-    """A catalog row rebuilds the lean `CatalogSource` (biopb/biopb#265)."""
+    """A catalog row carries the lean projection, nothing more (biopb/biopb#265)."""
 
     def test_empty_catalog_returns_no_rows(self):
         assert _sources(MetadataDatabase()) == []
 
-    def test_reconstructs_lean_source(self):
+    def test_row_is_lean(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
@@ -452,18 +450,18 @@ class TestSourceRowProjection:
         sources = _sources(db)
         assert len(sources) == 1
         d = sources[0]
-        assert d.source_id == "s1"
-        assert d.source_url == "/data/s1.zarr"
-        assert d.source_type == "zarr"
-        assert d.data_resident is True
-        assert d.is_resolved is True
-        # Lean: source metadata is filled only by GetFlightInfo, so the
-        # struct has no metadata_json field at all (biopb/biopb#1032).
-        assert not hasattr(d, "metadata_json")
-        assert len(d.tensors) == 1
-        assert d.tensors[0].array_id == "s1"
-        assert list(d.tensors[0].shape) == [8, 512, 512]
-        assert d.tensors[0].dtype == "uint16"
+        assert d["source_id"] == "s1"
+        assert d["source_url"] == "/data/s1.zarr"
+        assert d["source_type"] == "zarr"
+        assert d["data_resident"] is True
+        assert d["is_resolved"] is True
+        # Lean: source metadata is filled only by GetFlightInfo, so the browse
+        # projection does not select it at all.
+        assert "metadata_json" not in d
+        assert len(d["tensors"]) == 1
+        assert d["tensors"][0]["array_id"] == "s1"
+        assert d["tensors"][0]["shape"] == [8, 512, 512]
+        assert d["tensors"][0]["dtype"] == "uint16"
 
     def test_multi_tensor_all_reconstructed(self):
         db = MetadataDatabase()
@@ -487,14 +485,14 @@ class TestSourceRowProjection:
             "hcs", MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", fields)
         )
 
-        tensors = _sources(db)[0].tensors
-        assert [t.array_id for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
-        assert list(tensors[1].dim_labels) == ["z", "y", "x"]
-        assert list(tensors[1].shape) == [8, 256, 256]
-        # Structural only: no grid is stored, and the struct has no field to
-        # reconstruct one into (biopb/biopb#812, biopb/biopb#1032).
-        assert not hasattr(tensors[1], "chunk_shape")
-        assert tensors[1].dtype == "uint8"
+        tensors = _sources(db)[0]["tensors"]
+        assert [t["array_id"] for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
+        assert tensors[1]["dim_labels"] == ["z", "y", "x"]
+        assert tensors[1]["shape"] == [8, 256, 256]
+        # Structural only: no grid is stored, and the tensors struct has no
+        # column to reconstruct one into (biopb/biopb#812).
+        assert "chunk_shape" not in tensors[1]
+        assert tensors[1]["dtype"] == "uint8"
 
     def test_ordered_by_source_id(self):
         db = MetadataDatabase()
@@ -502,7 +500,7 @@ class TestSourceRowProjection:
             db.sync_source_added(
                 sid, MockAdapter(sid, f"/d/{sid}", "zarr", [4, 4], "uint8")
             )
-        assert [d.source_id for d in _sources(db)] == ["a", "b", "c"]
+        assert [d["source_id"] for d in _sources(db)] == ["a", "b", "c"]
 
     def test_unresolved_source_has_no_tensors(self):
         db = MetadataDatabase()
@@ -518,11 +516,11 @@ class TestSourceRowProjection:
             ),
         )
         sources = _sources(db)
-        assert len(sources[0].tensors) == 0
-        assert sources[0].data_resident is False
+        assert len(sources[0]["tensors"]) == 0
+        assert sources[0]["data_resident"] is False
         # Empty tensors is not what makes it unresolved -- the flag is
         # (biopb/biopb#1032).
-        assert sources[0].is_resolved is False
+        assert sources[0]["is_resolved"] is False
 
 
 class TestDeprecatedDescriptorProjection:
@@ -579,8 +577,8 @@ class TestDeprecatedDescriptorProjection:
             (d,) = descriptors_from_rows(self._rows(db))
 
         assert not hasattr(d, "is_resolved")
-        # Same row through the struct decoder answers.
-        assert _sources(db)[0].is_resolved is False
+        # The row itself answers.
+        assert _sources(db)[0]["is_resolved"] is False
 
 
 class TestGetMetadataJson:

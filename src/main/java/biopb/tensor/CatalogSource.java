@@ -18,9 +18,10 @@ import java.util.List;
  * language" reason for paying that was already gone: TypeScript hand-rolls the
  * same shape, and the HTTP sidecar decodes rows to plain dicts.
  *
- * <p>Immutable, and Java 11 -- hence getters rather than a record.
+ * <p>Immutable, and Java 11 -- hence getters rather than a record. Package-private:
+ * this is the client's own view of a row, not API (biopb/biopb#1032).
  */
-public final class CatalogSource {
+final class CatalogSource {
 
     private final String sourceId;
     private final String sourceUrl;

@@ -16,7 +16,7 @@ import java.util.List;
  *
  * @see CatalogSource
  */
-public final class CatalogTensor {
+final class CatalogTensor {
 
     private final String arrayId;
     private final List<String> dimLabels;

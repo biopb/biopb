@@ -309,10 +309,11 @@ public class TensorFlightClient implements AutoCloseable {
      * {@code tensors} LIST&lt;STRUCT&gt; column. The transfer chunk_shape belongs to the
      * tensor-bound adapter and is answered by GetFlightInfo (biopb/biopb#812).
      *
-     * <p>Public because it is the migration path off {@link #listSources}: query
-     * the catalog yourself, decode the rows with this.
+     * <p>Package-private: this is how the client reads its own rows, not an API.
+     * A caller decodes a {@link VectorSchemaRoot} into whatever suits them --
+     * the SDK deliberately picks no structure (biopb/biopb#1032).
      */
-    public static List<CatalogSource> sourcesFromRows(VectorSchemaRoot root) {
+    static List<CatalogSource> sourcesFromRows(VectorSchemaRoot root) {
         List<CatalogSource> out = new ArrayList<>();
         FieldVector sourceIds = root.getVector("source_id");
         FieldVector urls = root.getVector("source_url");
@@ -544,7 +545,7 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Resolve an unresolved source and return its full {@link CatalogSource}.
+     * Resolve an unresolved source and return its {@code sources} catalog row.
      *
      * <p>An <i>unresolved</i> source is catalogued by URL only -- its
      * shape/dtype/field list are unknown until first access (it lists with
@@ -559,51 +560,85 @@ public class TensorFlightClient implements AutoCloseable {
      * Afterwards {@link #getTensor} and friends work normally. Idempotent.
      *
      * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
-     * @return The full CatalogSource with every tensor enumerated -- the catalog
-     *         row the server just wrote. Unlike {@link #warm}, which returns a
-     *         status because residency is not a durable catalog fact, this
-     *         returns a result: resolving is defined by what it writes to the
-     *         row (biopb/biopb#1032).
+     * @return The source's {@code sources} row, with every tensor enumerated --
+     *         one {@link VectorSchemaRoot}, the same type {@link #querySources}
+     *         returns, which the <b>caller must close</b>. A row, not a type
+     *         this SDK picked: every client can already decode one, and what
+     *         you decode it into stays yours (biopb/biopb#1032).
+     *         <p>Unlike {@link #warm}, which returns a status because residency
+     *         is not a durable catalog fact and its file counts exist nowhere
+     *         else, this returns the result: resolving is defined by what it
+     *         writes to the row.
      * @throws IOException If the action fails or the server returns no row
      */
-    public CatalogSource resolve(String sourceId) throws IOException {
+    public VectorSchemaRoot resolve(String sourceId) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
         // point that performs the (possibly minutes-long) recall. The action
         // streams ResolveStreamMessage progress heartbeats to keep the
         // connection warm under proxy idle timeouts; the terminal message
-        // carries the source's now-concrete catalog row (Arrow IPC), decoded
-        // through the same sourcesFromRows() that a catalog browse uses.
+        // carries the source's now-concrete catalog row as an Arrow IPC stream,
+        // handed back as-is.
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
                 "resolve",
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
-        CatalogSource source = null;
+        VectorSchemaRoot row = null;
         java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
-        while (iter.hasNext()) {
-            byte[] body = iter.next().getBody();
-            if (body == null || body.length == 0) {
-                continue;
-            }
-            ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
-            if (msg.getPayloadCase() != ResolveStreamMessage.PayloadCase.SOURCE_ROW) {
-                continue; // heartbeat (no progress callback on the Java client yet)
-            }
-            try (ArrowStreamReader reader = new ArrowStreamReader(
-                    new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
-                while (reader.loadNextBatch()) {
-                    List<CatalogSource> rows = sourcesFromRows(reader.getVectorSchemaRoot());
-                    if (!rows.isEmpty()) {
-                        source = rows.get(0);
+        try {
+            while (iter.hasNext()) {
+                byte[] body = iter.next().getBody();
+                if (body == null || body.length == 0) {
+                    continue;
+                }
+                ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
+                if (msg.getPayloadCase() != ResolveStreamMessage.PayloadCase.SOURCE_ROW) {
+                    continue; // heartbeat (no progress callback on the Java client yet)
+                }
+                try (ArrowStreamReader reader = new ArrowStreamReader(
+                        new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
+                    while (reader.loadNextBatch()) {
+                        VectorSchemaRoot streamed = reader.getVectorSchemaRoot();
+                        // Seed the per-tensor cache while the batch is still
+                        // loaded, then take a copy that outlives the reader --
+                        // the reader owns those buffers and frees them on close
+                        // (the same reason querySources clones its batches).
+                        for (CatalogSource decoded : sourcesFromRows(streamed)) {
+                            cacheTensors(decoded);
+                        }
+                        if (row != null) {
+                            row.close();
+                        }
+                        row = copyOf(streamed);
                     }
                 }
             }
+        } catch (Exception e) {
+            if (row != null) {
+                row.close();
+            }
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw new IOException("resolve failed: " + e.getMessage(), e);
         }
-        if (source == null) {
+        if (row == null) {
             throw new IOException("resolve('" + sourceId
                     + "') returned no catalog row (server closed the stream without a result)");
         }
-        cacheTensors(source);
-        return source;
+        return row;
+    }
+
+    /** A standalone copy of {@code src}, owned by this client's allocator. */
+    private VectorSchemaRoot copyOf(VectorSchemaRoot src) {
+        VectorUnloader unloader = new VectorUnloader(src);
+        ArrowRecordBatch batch = unloader.getRecordBatch().cloneWithTransfer(allocator);
+        try {
+            VectorSchemaRoot out = VectorSchemaRoot.create(src.getSchema(), allocator);
+            new VectorLoader(out).load(batch);
+            return out;
+        } finally {
+            batch.close();
+        }
     }
 
     /**

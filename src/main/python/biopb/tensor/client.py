@@ -36,7 +36,6 @@ from biopb.image.annotation_pb2 import (
     RoiPruneResult,
     RoiPutResult,
 )
-from biopb.tensor._catalog_rows import CatalogSource
 from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
@@ -240,8 +239,9 @@ class TensorFlightClient:
         """List available data sources.
 
         Deprecated:
-            Use :meth:`query_sources`, and `biopb.tensor.sources_from_rows`
-            if you want structs. This is a thin wrapper around
+            Use :meth:`query_sources`, which hands back rows in the format
+            you ask for and leaves the structure to you. This is a thin
+            wrapper around
             ``SELECT ... FROM sources`` that inherits the server's query row
             cap, so a large catalog comes back silently truncated -- and a
             browse is exactly where that matters.
@@ -257,8 +257,8 @@ class TensorFlightClient:
         """
         warnings.warn(
             "TensorFlightClient.list_sources() is deprecated and is capped by "
-            "the server's query row limit; use query_sources() (with "
-            "biopb.tensor.sources_from_rows if you want structs).",
+            "the server's query row limit; use query_sources(), which returns "
+            "rows in the format you ask for.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -268,8 +268,7 @@ class TensorFlightClient:
         """One source's ``DataSourceDescriptor`` by id, or ``None``.
 
         Deprecated:
-            Use :meth:`query_sources` with a ``WHERE source_id = ...``, and
-            `biopb.tensor.source_from_row` if you want a struct.
+            Use :meth:`query_sources` with a ``WHERE source_id = ...``.
 
         The catalog is public: a source whose pixels need a capability token
         still has its descriptor here. Knowing its id is not authority to read
@@ -287,7 +286,7 @@ class TensorFlightClient:
         """
         warnings.warn(
             "TensorFlightClient.get_source() is deprecated; use query_sources() "
-            "(with biopb.tensor.source_from_row if you want a struct).",
+            "with a WHERE source_id = ... instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -470,15 +469,15 @@ class TensorFlightClient:
         *,
         on_progress: Optional[Callable[[ResolveProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> CatalogSource:
-        """Resolve an unresolved source and return its full `CatalogSource`.
+    ) -> Dict[str, Any]:
+        """Resolve an unresolved source and return its ``sources`` catalog row.
 
         Note:
             Experimental. Cloud / remote source support (unresolved sources,
             resolve, and `warm`) is experimental and its behavior may change.
-            This returned a ``DataSourceDescriptor`` before biopb/biopb#1032;
-            it is the same row either way, decoded into a struct that can
-            carry ``is_resolved``.
+            This returned a ``DataSourceDescriptor`` before biopb/biopb#1032
+            and now returns the row itself -- the same information, without
+            the SDK picking a structure for it.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
         list are unknown until first access (its catalog row has
@@ -507,17 +506,23 @@ class TensorFlightClient:
                 completion and is cached, so a later ``resolve`` reuses it.
 
         Returns:
-            The full `CatalogSource` with every tensor enumerated -- the
-            complete field set in one call. It is the catalog row the server
-            just wrote, so it agrees with a following `query_sources` exactly,
-            and returning it closes the transition in one call rather than
-            leaving a window in which a rescan could re-register the source.
+            The source's ``sources`` row, shaped exactly like one element of
+            ``query_sources(..., format="records")`` -- ``SOURCE_ROW_COLUMNS``,
+            with every tensor enumerated under ``tensors``. A row, not a
+            bespoke type: every client can already decode one, and the choice
+            of what to decode it into stays yours (biopb/biopb#1032).
+
+            It is the row the server just wrote, so it agrees with a following
+            `query_sources` exactly, and returning it closes the transition in
+            one call rather than leaving a window in which a rescan could
+            re-register the source underneath you.
 
             Unlike `warm`, which returns a *status* because residency is not a
-            durable catalog fact, this returns a *result*: resolving is defined
-            by what it writes to the row. The recall's elapsed time and target
+            durable catalog fact (biopb/biopb#1035) and its file counts exist
+            nowhere else, this returns the *result*: resolving is defined by
+            what it writes to the row. The recall's elapsed time and target
             size ride ``on_progress`` instead -- both are things a caller can
-            already measure or derive, where `warm`'s file counts are not.
+            already measure or derive, where `warm`'s counts are not.
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.

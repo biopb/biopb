@@ -114,10 +114,12 @@ class _FakeFlight:
 class TestResolve:
     def test_returns_the_full_row_from_resolve_action(self):
         # resolve() makes a single streaming `resolve` do_action and returns the
-        # terminal row directly -- ALL fields, no list_sources, no cap. A row,
-        # not a progress snapshot: resolving is defined by what it writes to
-        # the catalog, unlike warm, whose counts are its only evidence
-        # (biopb/biopb#1032).
+        # terminal row directly -- ALL fields, no list_sources, no cap.
+        #
+        # A row, not a progress snapshot: resolving is defined by what it
+        # writes to the catalog, unlike warm, whose counts are its only
+        # evidence. And a row, not a struct the SDK picked: every client can
+        # already decode one (biopb/biopb#1032).
         client = _bare_client()
         client._state.client = _FakeFlight(
             [_FakeResult(_result_body("cloud_x", ["cloud_x/f0", "cloud_x/f1"]))]
@@ -127,11 +129,11 @@ class TestResolve:
 
         assert client._state.client.action.type == "resolve"
         assert bytes(client._state.client.action.body) == b"cloud_x"
-        assert out.source_id == "cloud_x"
-        assert out.source_url == "file:///cloud_x"
-        assert out.data_resident is True
-        assert out.is_resolved is True  # the flag the proto had no room for
-        assert len(out.tensors) == 2  # complete field set, never truncated
+        assert out["source_id"] == "cloud_x"
+        assert out["source_url"] == "file:///cloud_x"
+        assert out["data_resident"] is True
+        assert out["is_resolved"] is True  # the flag the proto had no room for
+        assert len(out["tensors"]) == 2  # complete field set, never truncated
         # The per-tensor cache is seeded, so a following read needs no probe.
         assert set(client._descriptors) == {"cloud_x/f0", "cloud_x/f1"}
 
@@ -150,7 +152,7 @@ class TestResolve:
 
         out = client.resolve("cloud_x", on_progress=seen.append)
 
-        assert [t.array_id for t in out.tensors] == ["cloud_x"]
+        assert [t["array_id"] for t in out["tensors"]] == ["cloud_x"]
         assert [round(p.elapsed_seconds, 1) for p in seen] == [0.0, 0.5]
         assert seen[0].target_name == "img.tif" and seen[0].target_bytes == 1024
 
@@ -167,7 +169,7 @@ class TestResolve:
 
         out = client.resolve("cloud_x")
 
-        assert [t.array_id for t in out.tensors] == ["cloud_x"]
+        assert [t["array_id"] for t in out["tensors"]] == ["cloud_x"]
 
     def test_should_cancel_raises_resolve_cancelled(self):
         # should_cancel polled per received message; True stops the stream and

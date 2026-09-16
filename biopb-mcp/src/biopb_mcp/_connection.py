@@ -38,9 +38,10 @@ import time
 from typing import Dict
 
 from biopb import _data_plane
-from biopb.tensor import CatalogSource, TensorFlightClient, sources_from_rows
+from biopb.tensor import TensorFlightClient
 from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
+from ._catalog import CatalogSource, source_from_row, sources_from_rows
 from ._config import CONFIG
 from ._control_client import ensure_data_plane
 
@@ -59,7 +60,9 @@ def _browse(client) -> Dict[str, CatalogSource]:
     """The server's whole catalog as ``{source_id: CatalogSource}``.
 
     ``query_sources`` rather than the deprecated ``list_sources`` -- same rows,
-    same server-side cap, but without the deprecation warning.
+    same server-side cap, but without the deprecation warning. The SDK returns
+    rows; :mod:`._catalog` is this package's choice of what to make of them
+    (biopb/biopb#1032).
     """
     rows = client.query_sources(_SOURCES_SQL, format="records")
     return {s.source_id: s for s in sources_from_rows(rows)}
@@ -370,9 +373,10 @@ class TensorConnection:
         Delegates to the SDK's :meth:`TensorFlightClient.resolve` — which asks the
         server to hydrate the source (for a dehydrated placeholder this **downloads
         the whole file**, so it is slow and blocking and must be called off the GUI
-        thread) and returns the now-populated `CatalogSource`. The local catalog
+        thread) and returns the source's now-populated catalog row. The local
         snapshot (:attr:`sources`) is then refreshed so callers re-render from the
-        resolved field list. Returns the resolved source.
+        resolved field list. Returns the resolved source, decoded like any other
+        row this package reads.
 
         ``on_progress`` (called with a ``ResolveProgress`` per server heartbeat)
         and ``should_cancel`` (polled per heartbeat; raising
@@ -381,13 +385,13 @@ class TensorConnection:
         """
         if self.client is None:
             raise RuntimeError("Not connected")
-        source = self.client.resolve(
+        row = self.client.resolve(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
         # resolve() already re-listed server-side; mirror it into our snapshot so
         # the widget/agent see the full field set without a second round-trip.
         self.refresh()
-        return source
+        return source_from_row(row)
 
     def warm_source(
         self,

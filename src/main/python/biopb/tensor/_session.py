@@ -42,9 +42,7 @@ from biopb.image.annotation_pb2 import (
 )
 from biopb.tensor._catalog_rows import (
     SOURCE_ROW_COLUMNS,
-    CatalogSource,
     _descriptor_from_row,
-    source_from_row,
     sql_literal,
 )
 from biopb.tensor._pool import (
@@ -493,20 +491,22 @@ class CatalogClient:
         for tensor_desc in source_desc.tensors:
             self._state.cache_descriptor(tensor_desc)
 
-    def _cache_catalog_tensors(self, source: CatalogSource) -> None:
-        """The same cache, seeded from the struct form of a row.
+    def _cache_row_tensors(self, row: Mapping[str, Any]) -> None:
+        """The same cache, seeded straight from a row.
 
-        The cache holds ``TensorDescriptor`` -- the type GetFlightInfo
-        answers with and the read path reads -- so the structural fields are
-        copied across. A catalog entry fills only those, as it always did.
+        The cache holds ``TensorDescriptor`` -- the type GetFlightInfo answers
+        with and the read path reads -- so the row's structural fields are
+        copied into one. A catalog entry fills only those, as it always did.
+        Built here rather than by decoding the whole row into a source: that
+        choice is the caller's now (biopb/biopb#1032).
         """
-        for tensor in source.tensors:
+        for tensor in row.get("tensors") or []:
             self._state.cache_descriptor(
                 TensorDescriptor(
-                    array_id=tensor.array_id,
-                    dim_labels=tensor.dim_labels,
-                    shape=tensor.shape,
-                    dtype=tensor.dtype,
+                    array_id=tensor["array_id"],
+                    dim_labels=tensor.get("dim_labels") or [],
+                    shape=tensor.get("shape") or [],
+                    dtype=tensor.get("dtype") or "",
                 )
             )
 
@@ -827,7 +827,7 @@ class CatalogClient:
         *,
         on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> CatalogSource:
+    ) -> Dict[str, Any]:
         """Backs TensorFlightClient.resolve; see that method for the full
         documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
@@ -859,9 +859,8 @@ class CatalogClient:
                 f"resolve('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
-        source = source_from_row(row)
-        self._cache_catalog_tensors(source)
-        return source
+        self._cache_row_tensors(row)
+        return dict(row)
 
     def warm(
         self,

@@ -207,7 +207,7 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
             # Not in the (possibly truncated) cached catalog — fetch the tensor
             # descriptor directly from the server and wrap it as a single-tensor
             # source (a bare source_id resolves the source's default tensor).
-            from biopb.tensor import CatalogSource, CatalogTensor
+            from .._catalog import CatalogSource, CatalogTensor
 
             try:
                 desc = client.get_descriptor(tensor_id or source_id)

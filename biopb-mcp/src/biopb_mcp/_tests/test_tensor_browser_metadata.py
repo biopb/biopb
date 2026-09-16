@@ -8,8 +8,7 @@ unlike the viewer-dependent ``test_tensor_browser_widget.py``.
 
 from types import SimpleNamespace
 
-from biopb.tensor import CatalogSource
-
+from biopb_mcp._catalog import CatalogSource
 from biopb_mcp.tensor_browser._widget import (
     _build_tree,
     _filter_empty_metadata,

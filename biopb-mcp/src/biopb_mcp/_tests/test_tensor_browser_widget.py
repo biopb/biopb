@@ -94,7 +94,7 @@ class TestBuildTreeDroppedTagging:
 
     @staticmethod
     def _src(source_id, source_url):
-        from biopb.tensor import CatalogSource, CatalogTensor
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
 
         return CatalogSource(
             source_id=source_id,
@@ -548,8 +548,7 @@ class TestResidencyIndicator:
     """`_add_tree_node` decorates a source row from its `data_resident` state."""
 
     def _node(self, data_resident):
-        from biopb.tensor import CatalogSource, CatalogTensor
-
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
         src = CatalogSource(
@@ -602,8 +601,7 @@ class TestRemoveButton:
     """`_add_tree_node` puts a remove [x] in column 1 for dropped roots only."""
 
     def _node(self, *, dropped, source_url="dnd://exp.zarr", name="exp.zarr"):
-        from biopb.tensor import CatalogSource, CatalogTensor
-
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
         src = CatalogSource(
@@ -674,8 +672,7 @@ class TestRestoreSelection:
     """`_restore_selection` re-highlights the tracked row in a rebuilt tree (#191)."""
 
     def _source_node(self, source_id, tensors):
-        from biopb.tensor import CatalogSource, CatalogTensor
-
+        from biopb_mcp._catalog import CatalogSource, CatalogTensor
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
         src = CatalogSource(
@@ -749,7 +746,7 @@ def _user_role():
 def _source(source_id, *, tensors, source_type="", is_resolved=True):
     """A catalog row. ``is_resolved`` is independent of ``tensors`` on purpose:
     the two are what biopb/biopb#1032 stopped conflating."""
-    from biopb.tensor import CatalogSource, CatalogTensor
+    from biopb_mcp._catalog import CatalogSource, CatalogTensor
 
     return CatalogSource(
         source_id=source_id,

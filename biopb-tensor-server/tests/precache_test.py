@@ -1573,7 +1573,7 @@ class TestAdvertisedPyramidDescriptor:
             server.shutdown()
 
     def test_the_catalog_leaves_pyramid_empty(self, tmp_path):
-        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, sources_from_rows
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
         server = TensorFlightServer("grpc://localhost:0")
         try:
@@ -1581,11 +1581,10 @@ class TestAdvertisedPyramidDescriptor:
             rows = server._metadata_db.query(
                 f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
             ).to_pylist()
-            srcs = sources_from_rows(rows)
-            assert srcs
-            # No pyramid on the struct at all -- the catalog cannot carry one
-            # to be non-empty (biopb/biopb#1032).
-            assert all(not hasattr(t, "pyramid") for d in srcs for t in d.tensors)
+            assert rows
+            # No pyramid column at all -- the catalog cannot carry one to be
+            # non-empty (biopb/biopb#812).
+            assert all("pyramid" not in t for r in rows for t in (r["tensors"] or []))
         finally:
             server.shutdown()
 

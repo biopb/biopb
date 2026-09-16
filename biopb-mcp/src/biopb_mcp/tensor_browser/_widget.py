@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
-from biopb.tensor import CatalogSource, ResolveCancelled
+from biopb.tensor import ResolveCancelled
 from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -40,6 +40,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from .._catalog import CatalogSource
 from .._connection import TensorConnection
 from .._tensor_utils import add_tensor_layer
 

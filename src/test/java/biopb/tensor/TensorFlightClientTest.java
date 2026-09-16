@@ -60,21 +60,37 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testCatalogRowsDecodeToStructsCarryingIsResolved() throws Exception {
-        // The same rows listSources() reads, through the decoder that is not
-        // bounded by the generated message (biopb/biopb#1032).
+    public void testCatalogRowCarriesIsResolvedForCallersToRead() throws Exception {
+        // What a caller actually gets: a row. `is_resolved` is a column on it,
+        // read without any type this SDK picked -- which is the whole point of
+        // biopb/biopb#1032, and what listSources() cannot give you because
+        // DataSourceDescriptor has no field for it.
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 try (VectorSchemaRoot root = client.querySources(
                         "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
-                    List<CatalogSource> sources = TensorFlightClient.sourcesFromRows(root);
-                    Assert.assertEquals(1, sources.size());
-                    CatalogSource source = sources.get(0);
-                    Assert.assertEquals("test-source", source.getSourceId());
-                    Assert.assertTrue(source.isResolved());
-                    Assert.assertEquals(1, source.getTensors().size());
-                    Assert.assertEquals("test-tensor", source.getTensors().get(0).getArrayId());
-                    Assert.assertEquals(Arrays.asList(4L, 4L), source.getTensors().get(0).getShape());
+                    Assert.assertEquals(1, root.getRowCount());
+                    Assert.assertEquals("test-source",
+                            String.valueOf(root.getVector("source_id").getObject(0)));
+                    Assert.assertEquals(Boolean.TRUE,
+                            root.getVector("is_resolved").getObject(0));
+
+                    Object tensors = root.getVector("tensors").getObject(0);
+                    Assert.assertTrue(tensors instanceof List);
+                    Map<?, ?> tensor = (Map<?, ?>) ((List<?>) tensors).get(0);
+                    Assert.assertEquals("test-tensor",
+                            String.valueOf(tensor.get("array_id")));
+                }
+
+                // The deprecated decoder still answers, and still cannot carry
+                // the flag -- the message has no field for it.
+                try (VectorSchemaRoot root = client.querySources(
+                        "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
+                    @SuppressWarnings("deprecation")
+                    List<DataSourceDescriptor> descs =
+                            TensorFlightClient.descriptorsFromRows(root);
+                    Assert.assertEquals(1, descs.size());
+                    Assert.assertEquals("test-source", descs.get(0).getSourceId());
                 }
             }
         }

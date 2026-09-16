@@ -6,8 +6,8 @@ for efficient multi-dimensional array storage and retrieval.
 Key components:
 - TensorFlightClient: Client for accessing tensors from a TensorFlightServer
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
-- sources_from_rows: `sources` catalog rows -> CatalogSource structs
-  (descriptors_from_rows is the deprecated DataSourceDescriptor form)
+- query_sources / resolve hand back `sources` catalog rows; what you decode
+  them into is yours (descriptors_from_rows is the deprecated proto form)
 - CLI diagnostics: `biopb tensor` command for inspecting sources and tensors
 
 The CLI module provides the `biopb tensor` command with four subcommands:
@@ -19,14 +19,7 @@ The CLI module provides the `biopb tensor` command with four subcommands:
 Note: Server components have been moved to the biopb-tensor-server package.
 """
 
-from biopb.tensor._catalog_rows import (
-    CatalogSource,
-    CatalogTensor,
-    descriptor_from_row,
-    descriptors_from_rows,
-    source_from_row,
-    sources_from_rows,
-)
+from biopb.tensor._catalog_rows import descriptor_from_row, descriptors_from_rows
 
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
@@ -75,12 +68,8 @@ __all__ = [
     "WarmProgress",
     "SerializedTensor",
     "SerializedEndpoint",
-    # Catalog rows -> structs (what `query_sources` results decode with)
-    "CatalogSource",
-    "CatalogTensor",
-    "source_from_row",
-    "sources_from_rows",
-    # Deprecated: the same rows as DataSourceDescriptor (biopb/biopb#1032)
+    # Deprecated: `sources` rows as DataSourceDescriptor (biopb/biopb#1032).
+    # There is no replacement -- a row is the data structure.
     "descriptor_from_row",
     "descriptors_from_rows",
     # Client
