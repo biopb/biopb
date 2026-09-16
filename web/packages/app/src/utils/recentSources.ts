@@ -110,8 +110,6 @@ export function descriptorFromTileInfo(
     source_url: "",
     source_type: "",
     metadata_json: null,
-    dtype: info.dtype,
-    shape_summary: info.shape,
     // tile_info only exists for a tensor that was actually read, so the bytes
     // were there and a real adapter backed it -- this descriptor cannot
     // represent an unresolved source.

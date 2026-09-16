@@ -27,8 +27,6 @@ const SOURCE: DataSourceDescriptor = {
   source_url: "/data/src0",
   source_type: "zarr",
   metadata_json: null,
-  dtype: null,
-  shape_summary: null,
   data_resident: true,
   is_resolved: true,
   tensors: [

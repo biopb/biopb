@@ -115,16 +115,10 @@ def _make_source_desc(
 
 def _source_row(desc) -> dict:
     """The `sources` catalog row a real ``query_sources`` would hand back."""
-    tensors = list(desc.tensors)
     return {
         "source_id": desc.source_id,
         "source_url": desc.source_url,
         "source_type": desc.source_type,
-        # The scalar columns are tensors[0] projections written in the same
-        # upsert as the struct below, so mirror them off the same list rather
-        # than letting a fixture set them independently.
-        "dtype": tensors[0].dtype if tensors else None,
-        "shape_summary": json.dumps(list(tensors[0].shape)) if tensors else None,
         # getattr: several bespoke SimpleNamespace descriptors in this file
         # predate these fields and don't set them -- same defaults as
         # production's _source_row_to_dict.
@@ -137,7 +131,7 @@ def _source_row(desc) -> dict:
                 "shape": list(t.shape),
                 "dtype": t.dtype,
             }
-            for t in tensors
+            for t in desc.tensors
         ],
     }
 
@@ -537,44 +531,6 @@ class TestSourcesEndpoints:
         ]
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.json()[0]["data_resident"] is False
-
-    def test_list_sources_scalar_projections(self, auth_client):
-        tc, _ = auth_client
-        body = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()[0]
-        first = body["tensors"][0]
-        # Scalar columns describe tensors[0] and are decoded, not raw JSON text.
-        assert body["dtype"] == first["dtype"]
-        assert body["shape_summary"] == first["shape"]
-
-    def test_list_sources_scalar_projections_null_without_tensors(self):
-        mock_fc = _build_mock_client(
-            _make_source_desc(tensors=[], is_resolved=False, data_resident=False)
-        )
-        with patch(
-            "biopb_tensor_server.serving.http_server.TensorFlightClient",
-            return_value=mock_fc,
-        ):
-            app = create_app(token=_TOKEN)
-            with TestClient(app, raise_server_exceptions=True) as tc:
-                body = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()[0]
-        assert body["dtype"] is None
-        assert body["shape_summary"] is None
-
-    def test_list_sources_survives_malformed_shape_summary(self, auth_client):
-        # One unparseable row must not 500 the whole listing.
-        tc, mock_fc = auth_client
-        mock_fc.query_sources.side_effect = lambda sql, format="arrow": [  # noqa: A006
-            {
-                "source_id": "src0",
-                "source_url": "/d",
-                "source_type": "zarr",
-                "shape_summary": "not json",
-                "tensors": [],
-            }
-        ]
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert r.json()[0]["shape_summary"] is None
 
 
 # ===========================================================================

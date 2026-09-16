@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import collections
 import hashlib
-import json
 import logging
 import os
 import re
@@ -3207,8 +3206,8 @@ def create_app(
 #: ``metadata_json``: the listing is structural, and the OME tree is its own
 #: route (``/api/sources/{id}/metadata``).
 _SOURCE_LIST_SQL = (
-    "SELECT source_id, source_url, source_type, dtype, shape_summary, "
-    "data_resident, is_resolved, tensors FROM sources"
+    "SELECT source_id, source_url, source_type, data_resident, is_resolved, "
+    "tensors FROM sources"
 )
 
 
@@ -3220,10 +3219,11 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_type": row.get("source_type") or "",
         # Always null on a listing; see _SOURCE_LIST_SQL.
         "metadata_json": None,
-        # Scalar tensors[0] projections, carried to mirror the catalog row.
-        # Null on a source with no tensors (an unresolved one, mainly).
-        "dtype": row.get("dtype") or None,
-        "shape_summary": _decode_shape_summary(row.get("shape_summary")),
+        # Deliberately not the scalar dtype/shape_summary columns: those exist
+        # for catalog clients that never read the tensors struct, and this
+        # listing carries the struct. A scalar that only describes tensors[0]
+        # is a trap next to a real per-tensor list.
+        #
         # The two source-state flags, which say different things and both
         # matter to the tree: `is_resolved` is deterministic and monotonic
         # (does a real adapter back this row), `data_resident` is volatile and
@@ -3235,22 +3235,6 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "is_resolved": bool(row.get("is_resolved", True)),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }
-
-
-def _decode_shape_summary(raw: Any) -> Optional[List[int]]:
-    """``shape_summary`` as a real array rather than the JSON text it is stored as.
-
-    The column holds ``json.dumps(shape)``; handing that string to the client
-    just makes every caller re-parse it. Malformed text is treated as absent --
-    a listing must not 500 over one bad row.
-    """
-    if not raw:
-        return None
-    try:
-        decoded = json.loads(raw)
-        return [int(x) for x in decoded]
-    except (ValueError, TypeError):
-        return None
 
 
 def _tensor_row_to_dict(t: Dict[str, Any]) -> Dict[str, Any]:

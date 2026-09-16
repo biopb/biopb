@@ -28,8 +28,6 @@ const SOURCE: DataSourceDescriptor = {
   source_url: "file:///listed",
   source_type: "file",
   metadata_json: null,
-  dtype: null,
-  shape_summary: null,
   data_resident: true,
   is_resolved: true,
   tensors: [],
@@ -1281,15 +1279,26 @@ describe("catalogFingerprint", () => {
     expect(one).not.toBe(two);
   });
 
+  it("does not collide across a field boundary", () => {
+    // Both of these concatenated to "abRD" under the hand-rolled version this
+    // replaced, so a poll could miss a change outright. JSON's own framing is
+    // what makes them distinguishable.
+    expect(
+      catalogFingerprint([{ ...SOURCE, source_id: "a", source_url: "b" }]),
+    ).not.toBe(
+      catalogFingerprint([{ ...SOURCE, source_id: "ab", source_url: "" }]),
+    );
+  });
+
   it("does not collide across a source boundary", () => {
-    // Field and record separators exist so "a" + "b" can't read as "ab".
-    const split = catalogFingerprint([
-      { ...SOURCE, source_id: "a", source_url: "" },
-      { ...SOURCE, source_id: "b", source_url: "" },
-    ]);
-    const joined = catalogFingerprint([
-      { ...SOURCE, source_id: "ab", source_url: "" },
-    ]);
-    expect(split).not.toBe(joined);
+    // Same failure one level up: two sources ran together into one string.
+    expect(
+      catalogFingerprint([
+        { ...SOURCE, source_id: "x", source_url: "" },
+        { ...SOURCE, source_id: "y", source_url: "" },
+      ]),
+    ).not.toBe(
+      catalogFingerprint([{ ...SOURCE, source_id: "xRDy", source_url: "" }]),
+    );
   });
 });

@@ -23,17 +23,6 @@ export interface DataSourceDescriptor {
   /** Raw OME-NGFF JSON string, or null. */
   metadata_json: string | null;
   /**
-   * dtype of `tensors[0]` only, mirroring the catalog's scalar column. Null
-   * when the source has no tensors. Read `tensors[n].dtype` to describe a
-   * source rather than this — they differ the moment a source is multi-tensor.
-   */
-  dtype: string | null;
-  /**
-   * Shape of `tensors[0]` only, same caveat as `dtype`. Decoded from the
-   * catalog's JSON-text column by the server, so it arrives as a real array.
-   */
-  shape_summary: number[] | null;
-  /**
    * Volatile: are this source's bytes actually here *now*? Sampled per
    * request, and bidirectional — a warmed source evicted back to cloud
    * placeholders flips this to false again. Not a substitute for
