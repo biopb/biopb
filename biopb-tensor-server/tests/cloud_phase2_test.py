@@ -407,7 +407,7 @@ class TestUnresolvedProxy:
         assert proxy.list_tensor_descriptors() == []
         assert proxy.is_resident() is False
         assert proxy.source_type == "ome-zarr"
-        assert proxy.is_resolved is False
+        assert proxy.is_resolved() is False
 
     def test_close_forwards_to_the_resolved_adapter(self):
         """The proxy must not swallow the inner adapter's close (biopb/biopb#71).
@@ -426,7 +426,7 @@ class TestUnresolvedProxy:
         proxy._resolved = _Inner()
         proxy.close()
         assert closed == [True]
-        assert proxy.is_resolved is False
+        assert proxy.is_resolved() is False
         proxy.close()  # idempotent
         assert closed == [True]
 
@@ -469,7 +469,7 @@ class TestUnresolvedProxy:
             proxy = self._make_proxy(zpath)
             with pytest.raises(SourceUnresolvedError):
                 proxy.get_tensor_adapter("s1")
-            assert proxy.is_resolved is False  # the refusal did not hydrate
+            assert proxy.is_resolved() is False  # the refusal did not hydrate
             # After an explicit resolve the serve surface delegates normally.
             proxy.resolve()
             ta = proxy.get_tensor_adapter("s1")
@@ -490,7 +490,7 @@ class TestUnresolvedProxy:
                 on_resolved=lambda sid, ad: fired.update(sid=sid, type=ad._source_type),
             )
             proxy.resolve()
-            assert proxy.is_resolved is True
+            assert proxy.is_resolved() is True
             # The authoritative type came from re-probing the hydrated content.
             assert fired == {"sid": "s1", "type": "zarr"}
             # Catalog surface now delegates to the resolved adapter.
@@ -710,7 +710,7 @@ class TestPrecacheSkipsUnresolved:
 
         monkeypatch.setattr(proxy, "get_tensor_adapter", _boom)
         assert proxy.list_tensor_descriptors() == []
-        assert proxy.is_resolved is False
+        assert proxy.is_resolved() is False
 
     def test_real_precache_worker_does_not_resolve_unresolved(self, monkeypatch):
         # Drives the actual PrecacheWorker._process_source: the empty tensor list
@@ -740,7 +740,7 @@ class TestPrecacheSkipsUnresolved:
         # Past the cache gate so the real source-processing logic runs.
         monkeypatch.setattr(worker, "_cache_active", lambda: True)
         assert worker._process_source("s1") is False
-        assert proxy.is_resolved is False
+        assert proxy.is_resolved() is False
 
 
 # --------------------------------------------------------------------------- #
@@ -1016,7 +1016,7 @@ class TestResolveAction:
             assert row["source_id"] == "cloud1"
             assert [t["shape"] for t in row["tensors"]] == [[16, 24]]
             assert row["data_resident"] is True
-            assert proxy.is_resolved is True
+            assert proxy.is_resolved() is True
 
             # It IS the catalog row, not a second encoding built beside it. The
             # backfill matters here: this server owns its catalog, so no
@@ -1055,6 +1055,9 @@ class TestResolveAction:
             source_type = "zarr"
 
             def is_resident(self):
+                return True
+
+            def is_resolved(self):
                 return True
 
             def list_tensor_descriptors(self):
@@ -1126,6 +1129,9 @@ class TestResolveAction:
             synced = 0
 
             def is_resident(self):
+                return False
+
+            def is_resolved(self):
                 return False
 
             def list_tensor_descriptors(self):

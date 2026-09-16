@@ -501,6 +501,20 @@ class SourceAdapter(ABC):
         """
         return {}, None
 
+    def is_resolved(self) -> bool:
+        """Deterministic: does a real, hydrated adapter exist for this source?
+
+        True for every concrete adapter -- it exists only because something
+        already resolved it (or it was never unresolved to begin with).
+        ``UnresolvedSourceAdapter`` overrides this with the one meaningful
+        answer, ``self._resolved is not None``. Unlike ``is_resident()``, this
+        never flips back to False once True for the life of the process (a
+        source is not un-resolved by re-dehydrating), so it is the right
+        signal for "should a client offer to resolve this", where
+        ``is_resident()`` legitimately swings both ways.
+        """
+        return True
+
     def resolve(self) -> None:
         """Hydrate this source if needed.
 
@@ -1618,6 +1632,7 @@ _SOURCE_SCOPED_API = frozenset(
         "catalog_url",
         "resolve",
         "is_resident",
+        "is_resolved",
         "get_tensor_adapter",
         "put_chunk",
         "close",

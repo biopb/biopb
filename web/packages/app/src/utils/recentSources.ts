@@ -110,6 +110,9 @@ export function descriptorFromTileInfo(
     source_url: "",
     source_type: "",
     metadata_json: null,
+    // tile_info only exists for a tensor that was actually read -- this
+    // descriptor cannot represent an unresolved source.
+    is_resolved: true,
     tensors: [
       {
         array_id: sourceId,

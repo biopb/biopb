@@ -2868,7 +2868,9 @@ def create_app(
 #: The catalog columns the source routes project. Deliberately not
 #: ``metadata_json``: the listing is structural, and the OME tree is its own
 #: route (``/api/sources/{id}/metadata``).
-_SOURCE_LIST_SQL = "SELECT source_id, source_url, source_type, tensors FROM sources"
+_SOURCE_LIST_SQL = (
+    "SELECT source_id, source_url, source_type, is_resolved, tensors FROM sources"
+)
 
 
 def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -2879,6 +2881,11 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_type": row.get("source_type") or "",
         # Always null on a listing; see _SOURCE_LIST_SQL.
         "metadata_json": None,
+        # Deterministic (unlike data_resident, deliberately not projected
+        # here): does a real, hydrated adapter back this row. Default True on
+        # a row from a server predating this column (DuckDB's column
+        # default), which is the right reading for every pre-existing source.
+        "is_resolved": bool(row.get("is_resolved", True)),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }
 
