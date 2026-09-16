@@ -1296,6 +1296,25 @@ class MetadataDatabase:
 
         logger.debug(f"Synced source to metadata database: {source_id}")
 
+    def refresh_residency(
+        self, source_id: str, data_resident: bool, is_resolved: bool
+    ) -> None:
+        """Update only the two residency-derived flags on an existing row.
+
+        For a caller (the warm loop) that just re-derived ``data_resident`` /
+        ``is_resolved`` and needs the catalog row to reflect it, without
+        paying for the rest of ``sync_source_added``'s upsert -- re-reading
+        metadata, re-importing ROIs, and bumping ``indexed_at`` for a row
+        whose structure hasn't changed.
+        """
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute(
+                "UPDATE sources SET data_resident = ?, is_resolved = ? "
+                "WHERE source_id = ?",
+                [data_resident, is_resolved, source_id],
+            )
+
     def _replace_imported(
         self,
         source_id: str,

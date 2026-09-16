@@ -513,6 +513,20 @@ class TensorFlightServer(flight.FlightServerBase):
         except Exception as e:  # noqa: BLE001 -- catalog is advisory here
             logger.warning(f"catalog sync failed for {source_id}: {e}")
 
+    def _catalog_refresh_residency(
+        self, source_id: str, adapter: SourceAdapter
+    ) -> None:
+        """Best-effort refresh of the catalog's residency flags after a warm
+        pass, without a full ``sync_source_added`` re-registration."""
+        if not self._owns_catalog:
+            return
+        try:
+            self._metadata_db.refresh_residency(
+                source_id, adapter.is_resident(), adapter.is_resolved()
+            )
+        except Exception as e:  # noqa: BLE001 -- catalog is advisory here
+            logger.warning(f"catalog residency refresh failed for {source_id}: {e}")
+
     def unregister_source(self, source_id: str) -> None:
         """Unregister a data source (its upload state, if any, goes with it)."""
         self.sources.unregister(source_id)
@@ -1188,20 +1202,8 @@ class TensorFlightServer(flight.FlightServerBase):
                 # 4. Refresh the catalog's data_resident snapshot: it was
                 # frozen at resolve time, before any file here was warmed, so
                 # it still reads "not resident" for a directory source unless
-                # this re-syncs it. sync_source_added is the same idempotent
-                # upsert registration uses (its own docstring documents being
-                # re-callable on resolve) and is_resident() only samples a
-                # bounded set of files, so this stays cheap. Not fatal: a
-                # stale advisory flag is not worth failing the warm itself
-                # over.
-                try:
-                    self._metadata_db.sync_source_added(source_id, adapter)
-                except Exception:
-                    logger.warning(
-                        "warm: could not refresh catalog residency for %s",
-                        source_id,
-                        exc_info=True,
-                    )
+                # this re-syncs it.
+                self._catalog_refresh_residency(source_id, adapter)
 
                 # 5. Terminal done (partial counts if cancelled mid-loop).
                 yield WarmStreamMessage(

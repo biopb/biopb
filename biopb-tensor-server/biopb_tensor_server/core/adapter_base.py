@@ -502,16 +502,12 @@ class SourceAdapter(ABC):
         return {}, None
 
     def is_resolved(self) -> bool:
-        """Deterministic: does a real, hydrated adapter exist for this source?
+        """Deterministic: is there a hydrated adapter backing this source?
 
-        True for every concrete adapter -- it exists only because something
-        already resolved it (or it was never unresolved to begin with).
-        ``UnresolvedSourceAdapter`` overrides this with the one meaningful
-        answer, ``self._resolved is not None``. Unlike ``is_resident()``, this
-        never flips back to False once True for the life of the process (a
-        source is not un-resolved by re-dehydrating), so it is the right
-        signal for "should a client offer to resolve this", where
-        ``is_resident()`` legitimately swings both ways.
+        True by default; only ``UnresolvedSourceAdapter`` overrides it. Unlike
+        ``is_resident()``, this never flips back to False once True in a
+        process (a source isn't un-resolved by re-dehydrating) -- the signal
+        for "should a client offer to resolve this".
         """
         return True
 
