@@ -413,6 +413,11 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Get source-level OME/vendor metadata as a map.
      *
+     * <p>Source-scoped, and read from the source's own catalog row: this is the
+     * metadata the format carries for the whole container. A <i>field's</i> own
+     * extras (an OME-Zarr HCS field's OME block, an EMD signal's
+     * {@code original_metadata}) are per-tensor and are not merged in here.
+     *
      * @param sourceId Source identifier
      * @return The source's metadata map, or an empty map if it carries none
      * @throws IllegalArgumentException if the source is unknown
@@ -421,44 +426,38 @@ public class TensorFlightClient implements AutoCloseable {
      *                                  first
      */
     public Map<String, Object> getSourceMetadata(String sourceId) throws IOException {
-        if (!sources.containsKey(sourceId)) {
-            listSources();
+        // The column IS the answer: the server calls the adapter's get_metadata()
+        // once at registration to fill it and reads it back from the catalog on
+        // the serve path rather than recomputing (biopb/biopb#253).
+        String metadataJson = null;
+        boolean found = false;
+        boolean resolved = false;
+        try (VectorSchemaRoot root = querySources(
+                "SELECT tensors, metadata_json FROM sources WHERE source_id = " + sqlLiteral(sourceId))) {
+            if (root.getRowCount() > 0) {
+                found = true;
+                FieldVector tensors = root.getVector("tensors");
+                Object list = tensors == null || tensors.isNull(0) ? null : tensors.getObject(0);
+                resolved = list instanceof List && !((List<?>) list).isEmpty();
+                FieldVector meta = root.getVector("metadata_json");
+                metadataJson = meta == null || meta.isNull(0) ? null : String.valueOf(meta.getObject(0));
+            }
         }
-        DataSourceDescriptor sourceDesc = sources.get(sourceId);
-        if (sourceDesc == null) {
+        if (!found) {
             throw new IllegalArgumentException("Source not found: " + sourceId);
         }
-        if (sourceDesc.getTensorsList().isEmpty()) {
+        if (!resolved) {
             // Unresolved (cloud / synced-folder) source: tensors are unknown until
             // resolve. Don't return {} -- that conflates "unresolved" with
             // "resolved, no metadata". Steer to the explicit, consented resolve().
             throw unresolvedSourceError(sourceId);
         }
+        return parseMetadataJson(metadataJson);
+    }
 
-        // metadata_json is populated on the descriptor GetFlightInfo returns, so
-        // we fetch it via the source's first tensor. The server wraps it as
-        // {"type": ..., "dim_label": [...], "metadata": {...}}; we return the
-        // inner "metadata" map.
-        TensorDescriptor firstTensor = sourceDesc.getTensorsList().get(0);
-        FlightRequest cmd = FlightRequest.newBuilder()
-                .setTensorRead(TensorReadOption.newBuilder()
-                        .setArrayId(firstTensor.getArrayId())
-                        .setWithMetadata(true)
-                        .build())
-                .build();
-        FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
-        TensorDescriptor responseDesc = TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
-
-        if (responseDesc.getMetadataJson().isEmpty()) {
-            return new HashMap<>();
-        }
-        // Unwrap to return just the metadata dict
-        Map<String, Object> wrapped = parseMetadataJson(responseDesc.getMetadataJson());
-        Object metadataValue = wrapped.get("metadata");
-        if (metadataValue instanceof Map) {
-            return (Map<String, Object>) metadataValue;
-        }
-        return wrapped;
+    /** Quote a string for the catalog's SQL surface, which takes no parameters. */
+    static String sqlLiteral(String value) {
+        return "'" + value.replace("'", "''") + "'";
     }
 
     /**
@@ -603,8 +602,8 @@ public class TensorFlightClient implements AutoCloseable {
      * reads the descriptor a prior {@link #getTensor} already cached -- no extra
      * RPC when it is cached, and it never requests the opt-in {@code metadata_json}
      * field on that same descriptor. (Contrast {@link #getSourceMetadata}, which
-     * forces {@code with_metadata} to ship the whole OME tree; do not dig physical
-     * sizes out of that -- this is the compact projection meant for display scale.)
+     * ships the whole OME tree; do not dig physical sizes out of that -- this is
+     * the compact projection meant for display scale.)
      *
      * @param arrayId Globally-unique tensor id ({@code source_id} or
      *                {@code source_id/field}). A bare source id anchors on the

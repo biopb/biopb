@@ -573,47 +573,31 @@ class CatalogClient:
     def get_source_metadata(self, source_id: str) -> dict:
         """Backs TensorFlightClient.get_source_metadata; see that method for the full
         documentation."""
-
-        if source_id not in self._state.sources:
-            self.list_sources()
-
-        source_desc = self._state.sources.get(source_id)
-        if source_desc is None:
+        # One addressed catalog row. The column IS the answer: get_metadata() is
+        # called once at registration to fill it, and the serve path reads it
+        # back rather than recomputing (biopb/biopb#253). Going through a
+        # tensor-bound GetFlightInfo instead used to overlay the *first* field's
+        # get_tensor_metadata() delta, so a multi-field source reported one
+        # arbitrary field's extras as the source's metadata.
+        table = self._query_table(
+            "SELECT tensors, metadata_json FROM sources "
+            f"WHERE source_id = {sql_literal(source_id)}"
+        )
+        rows = table.to_pylist()
+        if not rows:
             raise ValueError(f"Source not found: {source_id}")
+        row = rows[0]
 
-        if not source_desc.tensors:
+        if not row.get("tensors"):
             # Unresolved (cloud / synced-folder) source: tensors are unknown
             # until resolve. Don't silently return {} -- that conflates
             # "unresolved" with "resolved, no metadata" (the line below). Steer
             # the caller to the explicit, consented resolve() instead, matching
-            # get_physical_scale / get_tensor (#108). Crucially this stays a
-            # cheap read: it must NOT silently recall the whole file the way a
-            # resolve-on-serve probe (get_descriptor) would.
+            # get_physical_scale / get_tensor (#108).
             raise _unresolved_source_error(source_id)
 
-        # metadata_json is populated on the descriptor GetFlightInfo returns, so
-        # we fetch it via the source's first tensor.
-        cmd = _tensor_read_cmd(
-            source_desc.tensors[0].array_id,
-            TensorReadOption(
-                with_metadata=True,
-                # Metadata describe: read only metadata_json, so skip the O(chunks)
-                # read plan (biopb/biopb#563). Pyramid stays off (unneeded here).
-                with_read_plan=False,
-            ),
-        )
-        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._state.client.get_flight_info(
-            flight_desc, options=self._state.call_options
-        )
-        response_desc = TensorDescriptor.FromString(info.descriptor.command)
-
-        if response_desc.metadata_json:
-            # The server wraps it as {"type": ..., "dim_label": [...],
-            # "metadata": {...}}; return just the inner metadata dict.
-            wrapped = json.loads(response_desc.metadata_json)
-            return wrapped.get("metadata", {})
-        return {}
+        raw = row.get("metadata_json")
+        return json.loads(raw) if raw else {}
 
     def get_physical_scale(
         self, array_id: str

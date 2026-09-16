@@ -191,6 +191,43 @@ def test_serve_merges_per_tensor_delta_over_catalog(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_source_metadata_excludes_the_per_tensor_delta(simple_zarr_array):
+    """get_source_metadata() is source-scoped: it reads the source's own catalog
+    row and must NOT carry a field's per-tensor delta. Routing it through a
+    tensor-bound GetFlightInfo used to overlay tensors[0]'s
+    get_tensor_metadata(), so a multi-field source reported one arbitrary
+    field's extras as the source's metadata."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+
+    class _PerTensorZarr(ZarrAdapter):
+        def get_metadata(self):
+            return {"plate": {"rows": ["A"]}}
+
+        def get_tensor_metadata(self):
+            return {"ome": "field"}
+
+    db = MetadataDatabase()
+    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    adapter = _PerTensorZarr(arr, "plate", ["y", "x"])
+    server.register_source("plate", adapter)
+    db.sync_source_added("plate", adapter)
+
+    _serve(server)
+    try:
+        client = TensorFlightClient(f"grpc://localhost:{server.port}")
+        assert client.get_source_metadata("plate") == {"plate": {"rows": ["A"]}}
+        client.close()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_serve_no_delta_serves_catalog_row(simple_zarr_array):
     """get_tensor_metadata() None (the default) means no delta: the tensor is
     fully described by the cached source-level catalog row."""

@@ -181,13 +181,18 @@ class TestSourceMetadataUnresolvedGuard:
     """F2 (#108): get_source_metadata must steer to resolve(), not return {}."""
 
     def test_unresolved_source_raises_instead_of_returning_empty(self, monkeypatch):
-        # An unresolved source has empty tensors; the old behavior returned {},
-        # conflating "unresolved" with "resolved, no metadata". It must instead
-        # raise the directive error -- and without any GetFlightInfo recall.
+        # An unresolved source's row has an empty `tensors` list; the old
+        # behavior returned {}, conflating "unresolved" with "resolved, no
+        # metadata". It must instead raise the directive error -- and without
+        # any GetFlightInfo recall.
+        import pyarrow as pa
+
         client = _bare_client()
-        client._sources = {
-            "cloud_x": DataSourceDescriptor(source_id="cloud_x")  # no tensors
-        }
+        monkeypatch.setattr(
+            client._catalog,
+            "_query_table",
+            lambda sql: pa.table({"tensors": [[]], "metadata_json": [None]}),
+        )
         recalled = []
         client._state.client = type(
             "FakeFlight",

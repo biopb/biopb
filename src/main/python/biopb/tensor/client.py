@@ -346,6 +346,12 @@ class TensorFlightClient:
     def get_source_metadata(self, source_id: str) -> dict:
         """Get source-level OME/vendor metadata as a dict.
 
+        Source-scoped, and read from the source's own catalog row: this is the
+        metadata the format carries for the whole container. A *field's* own
+        extras (an OME-Zarr HCS field's OME block, an EMD signal's
+        ``original_metadata``) are per-tensor and come back on a tensor-bound
+        :meth:`get_descriptor` with ``with_metadata=True``.
+
         Args:
             source_id: Source identifier
 
@@ -372,9 +378,9 @@ class TensorFlightClient:
         server fills on every ``GetFlightInfo`` (issue #31), so this reads the
         descriptor a prior `get_tensor` already cached -- no extra RPC when
         it is cached, and it never requests the opt-in ``metadata_json`` field on
-        that same descriptor. (Contrast `get_source_metadata`, which forces
-        ``with_metadata`` to ship the whole OME tree; do not dig physical sizes
-        out of that -- this is the compact projection meant for display scale.)
+        that same descriptor. (Contrast `get_source_metadata`, which ships the
+        whole OME tree; do not dig physical sizes out of that -- this is the
+        compact projection meant for display scale.)
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
