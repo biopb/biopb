@@ -27,6 +27,8 @@ from biopb_tensor_server.fixtures import (
 )
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
+from tests import catalog_server, register_and_catalog
+
 N_PLANES = 400
 FIELD = "Image:0"
 
@@ -261,18 +263,17 @@ def test_resync_after_release_still_writes_the_same_row(registered):
 
 
 def test_registering_on_a_bare_server_releases_into_its_own_catalog(per_plane_tiff):
-    # A server built with metadata_db=None (the embedded image-base cache)
-    # owns an in-memory catalog and syncs every registration into it, so the
+    # A server built with metadata_db=None (the embedded image-base cache) makes
+    # an in-memory catalog, and its caller syncs registrations into it, so the
     # metadata has somewhere to live and the XML can go.
-    from biopb_tensor_server import TensorFlightServer
 
     adapter = OmeTiffAdapter(per_plane_tiff, "perplane")
     adapter.list_tensor_descriptors()
-    server = TensorFlightServer(location="grpc://localhost:0", writable=False)
+    server = catalog_server(location="grpc://localhost:0", writable=False)
     try:
-        server.register_source("perplane", adapter)
+        register_and_catalog(server, "perplane", adapter)
         assert adapter._raw_ome_xml_released is True
-        assert server._metadata_db.get_metadata_json("perplane")
+        assert server.metadata_db.get_metadata_json("perplane")
     finally:
         server.shutdown()
 

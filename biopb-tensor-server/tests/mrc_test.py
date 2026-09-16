@@ -20,6 +20,8 @@ pytest.importorskip("rsciio")
 
 from biopb.tensor.ticket_pb2 import ChunkBounds  # noqa: E402
 
+from tests import catalog_server, register_and_catalog
+
 # numpy dtype -> MRC MODE code
 _MODE = {
     np.dtype("int8"): 0,
@@ -292,7 +294,6 @@ class TestMrcAdapterIntegration:
 
     def test_server_client_roundtrip(self):
         from biopb.tensor import TensorFlightClient
-        from biopb_tensor_server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "vol.mrc"
@@ -300,8 +301,8 @@ class TestMrcAdapterIntegration:
             adapter = MrcAdapter.create_from_config(SourceConfig(url=str(p)))
             source_id = adapter.source_id
 
-            server = TensorFlightServer("grpc://localhost:0")
-            server.register_source(source_id, adapter)
+            server = catalog_server("grpc://localhost:0")
+            register_and_catalog(server, source_id, adapter)
             server.mark_ready()
             t = threading.Thread(target=server.serve, daemon=True)
             t.start()

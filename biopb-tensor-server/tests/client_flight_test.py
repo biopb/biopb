@@ -17,6 +17,8 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     """Check if zarr is available with working numcodecs."""
@@ -55,8 +57,8 @@ class TestTensorFlightClientRoundTrip:
             zarr_arr = zarr.open_array(zarr_path, mode="r")
             adapter = ZarrAdapter(zarr_arr, "test-tensor", ["y", "x"])
 
-            server = TensorFlightServer("grpc://localhost:8890")
-            server.register_source("test-tensor", adapter)
+            server = catalog_server("grpc://localhost:8890")
+            register_and_catalog(server, "test-tensor", adapter)
 
             # Start server in background
             server_thread = threading.Thread(target=server.serve, daemon=True)

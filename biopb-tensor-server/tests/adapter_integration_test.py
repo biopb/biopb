@@ -17,6 +17,8 @@ from biopb.tensor import (
 )
 from biopb_tensor_server import TensorFlightServer
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     """Check if zarr is available with working numcodecs."""
@@ -77,8 +79,8 @@ class TestZarrIntegration:
         adapter = ZarrAdapter(arr, "zarr-integration", ["y", "x"])
 
         # Start server
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("zarr-integration", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -328,8 +330,8 @@ class TestOmeZarrIntegration:
         root = zarr.open_group(zarr_path, mode="r")
         adapter = OmeZarrAdapter(root["0"], "phys")
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("phys", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "phys", adapter)
         server.mark_ready()
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -586,8 +588,8 @@ class TestMultiSeriesOmeTiffIntegration:
 
         adapter = OmeTiffAdapter(tiff_path, "multi-series-server")
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("multi-series-server", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "multi-series-server", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()

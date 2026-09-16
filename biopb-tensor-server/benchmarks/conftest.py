@@ -16,7 +16,9 @@ import numpy as np
 import pytest
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
+from tests import register_and_catalog
 
 from benchmarks.utils import (
     generate_multiresolution_zarr,
@@ -426,7 +428,9 @@ def bench_server(
     import random
 
     port = random.randint(8900, 8999)
-    server = TensorFlightServer(f"grpc://localhost:{port}")
+    server = TensorFlightServer(
+        f"grpc://localhost:{port}", metadata_db=MetadataDatabase()
+    )
     server._bench_port = port
     server._bench_backend = "file"
     server._bench_cache_dir = temp_cache_dir
@@ -551,7 +555,9 @@ def _register_source_with_server(
         raise ValueError(f"No adapter registered for type: {registry_type}")
 
     adapter = adapter_cls.create_from_config(source_config)
-    server.register_source(source_id, adapter)
+    # Registry + catalog: registration alone leaves a source unbrowsable, and a
+    # benchmark client that opens by descriptor reads the catalog row.
+    register_and_catalog(server, source_id, adapter)
 
     return source_id
 
@@ -643,11 +649,12 @@ def data_source(
 
         # Create adapter from config with anon credentials
         adapter = adapter_cls.create_from_config(source_config, anon_credentials)
-        bench_server.register_source(source_id, adapter)
+        register_and_catalog(bench_server, source_id, adapter)
 
         yield spec
 
         bench_server.unregister_source(source_id)
+        bench_server.metadata_db.sync_source_removed(source_id)
 
     elif is_nfs_source(source_id):
         if not has_nfs_marker:
@@ -674,6 +681,7 @@ def data_source(
         yield spec
 
         bench_server.unregister_source(source_id)
+        bench_server.metadata_db.sync_source_removed(source_id)
 
 
 # =============================================================================

@@ -16,6 +16,8 @@ import time
 
 import pytest
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     return importlib.util.find_spec("zarr") is not None
@@ -111,10 +113,41 @@ def test_serve_null_row_yields_empty_metadata_no_adapter_recompute(simple_zarr_a
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_a_bare_server_serves_metadata_from_its_own_catalog(simple_zarr_array):
-    """A server built without a catalog (the embedded image-base cache) owns an
-    in-memory one and syncs registrations into it: metadata is computed once,
-    at registration, and served from the catalog like everywhere else."""
+def test_the_catalog_row_is_the_metadata_cache(simple_zarr_array):
+    """Metadata is computed once, at registration, and served from the catalog
+    row -- never recomputed on the adapter (biopb/biopb#253)."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    _MetaZarr = _meta_zarr_cls()
+
+    server = catalog_server("grpc://localhost:0")
+    adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
+    register_and_catalog(server, "img", adapter)
+    _serve(server)
+    try:
+        client = TensorFlightClient(f"grpc://localhost:{server.port}")
+        assert client.get_source_metadata("img") == {"ome": {"channel": "GFP"}}
+        client.get_descriptor("img", with_metadata=True)
+        assert adapter.get_metadata_calls == 1  # once, at registration
+        client.close()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_a_catalog_less_server_reads_metadata_off_the_adapter(simple_zarr_array):
+    """With no catalog there is no metadata cache -- and nothing released the
+    adapter's registration copy either, since ``sync_source_added`` is what does
+    that. So the adapter answers, and a descriptor still carries its metadata.
+
+    ``get_source_metadata`` is a catalog query, so that one refuses: the
+    embedded in-process cache serves a result it was asked for by id, it does
+    not offer a browse.
+    """
+    import pyarrow.flight as flight
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
@@ -123,15 +156,16 @@ def test_a_bare_server_serves_metadata_from_its_own_catalog(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
     _MetaZarr = _meta_zarr_cls()
 
-    server = TensorFlightServer("grpc://localhost:0")  # server-owned catalog
+    server = TensorFlightServer("grpc://localhost:0")
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
     server.register_source("img", adapter)
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
-        assert client.get_source_metadata("img") == {"ome": {"channel": "GFP"}}
-        client.get_descriptor("img", with_metadata=True)
-        assert adapter.get_metadata_calls == 1  # once, at registration
+        desc = client.get_descriptor("img", with_metadata=True)
+        assert json.loads(desc.metadata_json)["metadata"] == {"ome": {"channel": "GFP"}}
+        with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
+            client.get_source_metadata("img")
         client.close()
     finally:
         server.shutdown()

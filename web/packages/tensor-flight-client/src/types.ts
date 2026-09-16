@@ -163,6 +163,7 @@ export interface DiagnosticsSnapshot {
 export interface BackendHealth {
   status?: string;
   source_count?: number;
+  /** Whether the server offers a catalog; false means every catalog surface refuses. */
   metadata_db_enabled?: boolean;
   writable?: boolean;
   uptime_seconds?: number;

@@ -34,10 +34,10 @@ Both actions returned descriptors: `ResolveStreamMessage.result` and
 
 The row already exists when either returns. Resolution's `on_resolved` callback
 (`adapters/unresolved.py` → `sources/reconciler.py`) calls `sync_source_added`,
-which overwrites the source's NULL shape/dtype row with the concrete one;
-`_catalog_sync_added` does the same before the add tally is assembled. The
-server built a *second* representation from the adapter instead of returning the
-one it had just written.
+which overwrites the source's NULL shape/dtype row with the concrete one; the
+reconciler does the same before the add tally is assembled. The server built a
+*second* representation from the adapter instead of returning the one it had
+just written.
 
 **`resolve` returns the row**, as an Arrow IPC stream of one `sources` row with
 `SOURCE_ROW_COLUMNS` (`ResolveStreamMessage.source_row`). Each SDK decodes it

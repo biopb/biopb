@@ -121,15 +121,17 @@ def _start_server(zarr_path: str):
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     cache_dir = Path(tempfile.mkdtemp()) / "cache"
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=str(cache_dir)))
 
-    server = TensorFlightServer("grpc://localhost:0")
-    server.register_source(
+    server = TensorFlightServer("grpc://localhost:0", metadata_db=MetadataDatabase())
+    registered = server.register_source(
         "stack", ZarrAdapter(zarr.open_array(zarr_path, mode="r"), "stack", LABELS)
     )
+    server.metadata_db.sync_source_added("stack", registered)
     threading.Thread(target=server.serve, daemon=True).start()
     time.sleep(1.0)
     return server

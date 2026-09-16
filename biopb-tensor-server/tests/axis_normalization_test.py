@@ -33,6 +33,8 @@ from biopb_tensor_server.core.normalize import (
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.server import TensorFlightServer
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     try:
@@ -748,8 +750,8 @@ class TestRemoteProxyRefusesRatherThanPermutes:
         CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
         up = _legacy_upstream(tmp, src, ["x", "y", "z"])
-        down = TensorFlightServer("grpc://localhost:0")
-        down.register_source("m", _proxy_adapter(up.port))
+        down = catalog_server("grpc://localhost:0")
+        register_and_catalog(down, "m", _proxy_adapter(up.port))
         down.mark_ready()
         threading.Thread(target=down.serve, daemon=True).start()
         time.sleep(0.8)
@@ -784,8 +786,8 @@ class TestRemoteProxyRefusesRatherThanPermutes:
         CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
         up = _legacy_upstream(tmp, src, ["x", "y", "z"])
-        down = TensorFlightServer("grpc://localhost:0")
-        down.register_source("m", _proxy_adapter(up.port))
+        down = catalog_server("grpc://localhost:0")
+        register_and_catalog(down, "m", _proxy_adapter(up.port))
         down.mark_ready()
         threading.Thread(target=down.serve, daemon=True).start()
         time.sleep(0.8)
@@ -808,8 +810,8 @@ class TestRemoteProxyRefusesRatherThanPermutes:
         CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = (np.arange(4 * 3 * 8, dtype=np.uint16) % 251).reshape(4, 3, 8)
         up = _legacy_upstream(tmp, src, ["z", "y", "x"])
-        down = TensorFlightServer("grpc://localhost:0")
-        down.register_source("m", _proxy_adapter(up.port))
+        down = catalog_server("grpc://localhost:0")
+        register_and_catalog(down, "m", _proxy_adapter(up.port))
         down.mark_ready()
         threading.Thread(target=down.serve, daemon=True).start()
         time.sleep(0.8)

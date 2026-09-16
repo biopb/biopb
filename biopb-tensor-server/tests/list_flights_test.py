@@ -115,17 +115,38 @@ def test_a_path_descriptor_names_a_table():
         server.get_flight_info(_Context(), flight.FlightDescriptor.for_path("rois"))
 
 
-def test_a_bare_server_advertises_its_own_catalog():
-    """A server built without a catalog makes one and keeps it in step with
-    its registry, so direct registration is browsable too."""
+def test_a_catalog_less_server_serves_its_sources_but_lists_nothing():
+    """``metadata_db=None`` is the embedded in-process cache's shape: the source
+    registers and is addressable by id, and every catalog surface refuses with
+    Unavailable rather than pretending the catalog is empty."""
     server = TensorFlightServer(location="grpc://localhost:0")
     server.register_source("x", _CatalogAdapter("x"))
+    assert server.metadata_db is None
+    assert server.sources.get("x") is not None  # addressable by source_id
+
+    with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
+        list(server.list_flights(_Context(), b""))
+    with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
+        server.get_flight_info(_Context(), flight.FlightDescriptor.for_path("sources"))
+
+
+def test_registration_and_cataloguing_are_two_steps():
+    """``register_source`` is the registry; the row is the registering caller's
+    own second call, and ``unregister_source`` mirrors it."""
+    db = MetadataDatabase()
+    server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+    registered = server.register_source("x", _CatalogAdapter("x"))
     paths = {tuple(i.descriptor.path) for i in server.list_flights(_Context(), b"")}
     assert (b"sources",) in paths
-    rows = server._metadata_db.query("SELECT source_id FROM sources").to_pylist()
+    assert db.query("SELECT source_id FROM sources").num_rows == 0
+
+    db.sync_source_added("x", registered)
+    rows = db.query("SELECT source_id FROM sources").to_pylist()
     assert [r["source_id"] for r in rows] == ["x"]
     server.unregister_source("x")
-    assert server._metadata_db.query("SELECT source_id FROM sources").num_rows == 0
+    assert db.query("SELECT source_id FROM sources").num_rows == 1
+    db.sync_source_removed("x")
+    assert db.query("SELECT source_id FROM sources").num_rows == 0
 
 
 def test_the_catalog_tier_is_the_server_token():

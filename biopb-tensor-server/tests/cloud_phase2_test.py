@@ -28,6 +28,8 @@ from biopb_tensor_server.core.discovery import (
 from biopb_tensor_server.sources import reconciler as rec_mod
 from biopb_tensor_server.sources.tree_scanner import build_entry_signature
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available():
     try:
@@ -968,10 +970,12 @@ class TestResolveAction:
     row in its ``source_row`` arm."""
 
     def _server(self, source_id, adapter):
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source(source_id, adapter)
+        """Registered AND catalogued -- what a SourceManager leaves behind, and
+        what the terminal row read at the end of the resolve stream needs. The
+        action refuses outright on a catalog-less server: the row IS its
+        terminal message."""
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, source_id, adapter)
         return server
 
     @staticmethod
@@ -993,6 +997,8 @@ class TestResolveAction:
         from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as d:
             zpath = os.path.join(d, "img.zarr")
@@ -1000,8 +1006,15 @@ class TestResolveAction:
                 zpath, mode="w", shape=(16, 24), chunks=(8, 12), dtype="uint8"
             )
             cfg = SourceConfig(url=zpath, type="ome-zarr", source_id="cloud1")
-            proxy = UnresolvedSourceAdapter(cfg, get_default_registry())
-            server = self._server("cloud1", proxy)
+            # One catalog, wired into both halves the way cli.py does: the
+            # adapter's on_resolved backfills the row that registration wrote as
+            # a NULL-shape placeholder. Nothing else corrects it.
+            db = MetadataDatabase()
+            proxy = UnresolvedSourceAdapter(
+                cfg, get_default_registry(), on_resolved=db.sync_source_added
+            )
+            server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+            db.sync_source_added("cloud1", server.register_source("cloud1", proxy))
 
             action = flight.Action("resolve", b"cloud1")
             # do_action yields raw bytes (the Flight framework wraps each in a Result).
@@ -1019,10 +1032,9 @@ class TestResolveAction:
             assert proxy.is_resolved() is True
 
             # It IS the catalog row, not a second encoding built beside it. The
-            # backfill matters here: this server owns its catalog, so no
-            # SourceManager fired on_resolved and the placeholder row would
-            # otherwise still read empty.
-            browsed = server._metadata_db.query(
+            # backfill matters here: without on_resolved above, the placeholder
+            # row would still read empty.
+            browsed = db.query(
                 f"SELECT {SOURCE_ROW_COLUMNS} FROM sources WHERE source_id = 'cloud1'"
             ).to_pylist()
             assert browsed == [row]
@@ -1156,15 +1168,19 @@ class TestResolveAction:
         # No second sync: the backfill is downstream of the raise.
         assert _WontHydrate.synced == synced_at_registration
         # ... and the placeholder row is untouched.
-        (row,) = server._metadata_db.query(
+        (row,) = server.metadata_db.query(
             "SELECT tensors FROM sources WHERE source_id = 'cloud1'"
         ).to_pylist()
         assert row["tensors"] == []
 
     def test_resolve_action_unknown_source_errors(self):
         import pyarrow.flight as flight
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
-        server = self._server("cloud1", _SlowSentinel())
+        # Registry only, no catalog row: the sentinel is never described, and
+        # the id under test is a *missing* one.
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("cloud1", _SlowSentinel())
         action = flight.Action("resolve", b"missing")
         with pytest.raises(flight.FlightServerError, match="Source not found"):
             list(server.do_action(None, action))
@@ -1220,6 +1236,10 @@ class TestWarmAction:
     emitting ``WarmStreamMessage`` progress, then one terminal ``done``."""
 
     def _server(self, source_id, adapter):
+        # Catalog-less and registry-only: warm walks the source directory, not
+        # the catalog, and _DirAdapter is a format-agnostic stub with no
+        # metadata to catalogue anyway. The residency test below wires a real
+        # catalog because that one IS about the row.
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer("grpc://localhost:0")
@@ -1376,6 +1396,55 @@ class TestWarmAction:
         server = self._server("s7", _DirAdapter("/nonexistent"))
         with pytest.raises(flight.FlightServerError, match="Source not found"):
             list(server.do_action(_Ctx(), flight.Action("warm", b"missing")))
+
+    def test_warm_refreshes_residency_on_a_catalog_it_was_handed(self, tmp_path):
+        """The refresh is not conditional on where the catalog came from.
+
+        A real deployment hands the server a MetadataDatabase that its
+        SourceManager also writes, and the row's data_resident is frozen at
+        registration -- before warm recalled a byte. Correcting it there is the
+        whole point of the refresh, so it must not skip a supplied catalog.
+        """
+        import pyarrow.flight as flight
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        self._make_files(root, {"a.bin": 8})
+
+        class _Recallable(_DirAdapter):
+            source_type = "zarr"
+            catalog_url = "file:///src"
+
+            def __init__(self, url):
+                super().__init__(url)
+                self.resident = False
+
+            def is_resident(self):
+                return self.resident
+
+            def is_resolved(self):
+                return True
+
+            def list_tensor_descriptors(self):
+                return []
+
+            def get_metadata(self):
+                return {}
+
+        adapter = _Recallable(root)
+        db = MetadataDatabase()  # supplied, the way cli.py supplies one
+        server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+        db.sync_source_added("s8", server.register_source("s8", adapter))
+
+        resident = "SELECT data_resident FROM sources WHERE source_id = 's8'"
+        assert db.query(resident).to_pylist() == [{"data_resident": False}]
+
+        adapter.resident = True  # the recall the warm loop below is doing
+        list(server.do_action(_Ctx(), flight.Action("warm", b"s8")))
+
+        assert db.query(resident).to_pylist() == [{"data_resident": True}]
 
 
 # --------------------------------------------------------------------------- #

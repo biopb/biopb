@@ -25,6 +25,8 @@ from biopb_tensor_server.sources.source_manager import (
     _drop_catalog_url,
 )
 
+from tests import catalog_server
+
 
 def _zarr_available() -> bool:
     try:
@@ -50,13 +52,15 @@ def _make_zarr(parent, name, shape=(4, 8, 8)):
 
 
 def _make_manager():
-    server = TensorFlightServer("grpc://localhost:0")
+    # One catalog, threaded into both halves -- the wiring cli.py does for a
+    # real deployment. The reconciler is the only thing that writes it.
+    server = catalog_server("grpc://localhost:0")
     manager = SourceManager(
         server=server,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
         monitored_dirs=set(),
-        metadata_db=None,
+        metadata_db=server.metadata_db,
     )
     return manager, server
 

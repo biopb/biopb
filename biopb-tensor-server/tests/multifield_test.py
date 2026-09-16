@@ -13,6 +13,8 @@ from biopb_tensor_server.core.adapter_base import (
     strip_source_prefix,
 )
 
+from tests import catalog_server, register_and_catalog
+
 
 class MockMultifieldAdapter(TensorAdapter):
     """Mock adapter simulating a multifield source with different-shaped tensors."""
@@ -209,8 +211,8 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-test", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("multifield-test", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "multifield-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -323,8 +325,8 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multi", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("multi", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "multi", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -407,8 +409,8 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("mf", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("mf", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "mf", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -478,8 +480,8 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("single-source", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("single-source", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "single-source", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()

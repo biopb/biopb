@@ -182,6 +182,8 @@ class EmbeddedTensorCache:
         # embedded server runs writable=False and writes happen in-process, so
         # this token gates read-back without a server-wide secret.
         adapter.capability_token = secrets.token_urlsafe(32)
+        # Registry only: this server is catalog-less, and the id below goes
+        # straight back to the one caller that asked for the result.
         self._server.register_source(source_id, adapter)
         return source_id, array_template, chunk_shape
 
@@ -364,9 +366,11 @@ def _start_embedded_tensor_cache(
     # Read-only over Flight: results are written in-process (adapter.write_chunk),
     # so the Flight write path (do_put / create_source) is pure attack surface here.
     # Read-back is gated by per-source capability tokens (adapter.capability_token).
-    # The server's own in-memory catalog is the browse surface (the `catalog`
-    # flight): a result is listable by anyone who can reach the server,
-    # readable only by the holder of its token.
+    # No catalog (metadata_db=None): a result is addressed by the source_id its
+    # SerializedTensor carries, so there is nothing here to browse and the
+    # catalog flights refuse. That also means an op result is not enumerable by
+    # anyone who merely reaches the port -- only the holder of the id and its
+    # token can read it.
     tensor_server = TensorFlightServer(
         location,
         writable=False,

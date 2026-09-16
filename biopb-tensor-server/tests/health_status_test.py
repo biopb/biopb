@@ -52,6 +52,27 @@ def test_health_payload_shape_unchanged():
         assert key in payload
 
 
+def test_metadata_db_enabled_tracks_whether_there_is_a_catalog():
+    """It is a real signal, not the constant True it was while every server
+    made itself a catalog: it is what a client reads to know that
+    list_sources / query_sources / resolve / annotations will answer at all,
+    rather than calling one and eating the Unavailable.
+    """
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+    catalog_less = TensorFlightServer("grpc://localhost:0")
+    catalog_less.mark_ready()
+    assert _health(catalog_less)["metadata_db_enabled"] is False
+    assert _health(catalog_less)["annotations_persisted"] is False
+    assert _health(catalog_less)["catalog_persisted"] is False
+
+    catalogued = TensorFlightServer(
+        "grpc://localhost:0", metadata_db=MetadataDatabase()
+    )
+    catalogued.mark_ready()
+    assert _health(catalogued)["metadata_db_enabled"] is True
+
+
 def test_health_freshness_fields_default_inert():
     """A fresh server reports no scan running and no full scan yet."""
     server = TensorFlightServer("grpc://localhost:0")

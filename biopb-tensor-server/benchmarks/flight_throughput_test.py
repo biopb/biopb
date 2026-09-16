@@ -102,7 +102,7 @@ def bench_real_server(
     from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
-    from biopb_tensor_server.serving.server import TensorFlightServer
+    from tests import catalog_server, register_and_catalog
 
     location = f"grpc://127.0.0.1:{port}"
     edge = int(np.sqrt(batch.nbytes / 2))  # uint16 = 2 bytes
@@ -148,8 +148,8 @@ def bench_real_server(
         level_arr = grp["0"]
         adapter = OmeZarrAdapter(level_arr, "test")
 
-        server = TensorFlightServer(location)
-        server.register_source("test", adapter)
+        server = catalog_server(location)
+        register_and_catalog(server, "test", adapter)
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(0.3)
