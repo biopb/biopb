@@ -11,7 +11,6 @@ import pyarrow as pa
 import pytest
 from biopb.tensor.client import ResolveCancelled, TensorFlightClient
 from biopb.tensor.descriptor_pb2 import (
-    DataSourceDescriptor,
     ResolveProgress,
     ResolveStreamMessage,
     TensorDescriptor,
@@ -128,8 +127,7 @@ class TestResolve:
         assert out.source_url == "file:///cloud_x"
         assert out.data_resident is True
         assert len(out.tensors) == 2  # complete field set, never truncated
-        assert client._sources["cloud_x"] is out  # cache seeded for reuse
-        # The per-tensor cache is seeded too, so a following read needs no probe.
+        # The per-tensor cache is seeded, so a following read needs no probe.
         assert set(client._descriptors) == {"cloud_x/f0", "cloud_x/f1"}
 
     def test_progress_envelopes_reported_then_terminal_taken(self):
@@ -178,7 +176,7 @@ class TestResolve:
         )
         with pytest.raises(ResolveCancelled):
             client.resolve("cloud_x", should_cancel=lambda: True)
-        assert "cloud_x" not in client._sources  # nothing cached on cancel
+        assert client._descriptors == {}  # nothing cached on cancel
 
     def test_no_terminal_result_raises(self):
         # A stream of only heartbeats (server closed without a row) is an error,
@@ -191,14 +189,27 @@ class TestResolve:
             client.resolve("cloud_x")
 
 
+def _unresolved_row_table():
+    """The catalog row of an unresolved source: no tensors, not resident."""
+    return pa.table(
+        {
+            "source_id": ["cloud_x"],
+            "source_url": ["file:///cloud_x"],
+            "source_type": ["ome-zarr"],
+            "data_resident": [False],
+            "tensors": [[]],
+        }
+    )
+
+
 class TestUnresolvedDirectiveError:
-    def test_get_tensor_context_points_at_resolve(self):
+    def test_get_tensor_context_points_at_resolve(self, monkeypatch):
         # A bare get_tensor() on an unresolved (empty-tensors) source must fail
         # with a directive message naming client.resolve(), not a bare "no tensors".
         client = _bare_client()
-        client._sources = {
-            "cloud_x": DataSourceDescriptor(source_id="cloud_x")  # no tensors
-        }
+        monkeypatch.setattr(
+            client._catalog, "_query_table", lambda sql: _unresolved_row_table()
+        )
         with pytest.raises(ValueError) as exc:
             client._get_tensor_context("cloud_x")
         msg = str(exc.value)
@@ -239,20 +250,25 @@ class TestSourceMetadataUnresolvedGuard:
 class TestPhysicalScaleUnresolvedGuard:
     """F1: get_physical_scale must not silently recall a whole cloud file."""
 
-    def test_unresolved_source_raises_instead_of_recalling(self, monkeypatch):
+    def test_unresolved_source_raises_instead_of_recalling(self):
+        # The probe never resolves on serve: the server refuses an unresolved
+        # source with a retriable "Source unresolved ..." and the SDK restates
+        # that as the directive. The refusal is the server's, so it does not
+        # depend on anything this client happens to have cached.
+        import pyarrow.flight as pf
+
         client = _bare_client()
-        client._sources = {
-            "cloud_x": DataSourceDescriptor(source_id="cloud_x")  # unresolved
-        }
-        recalled = []
-        monkeypatch.setattr(
-            client._catalog,
-            "_fetch_tensor_descriptor",
-            lambda *a, **k: recalled.append(a) or _resolved_tensor("cloud_x"),
-        )
+
+        def _refuse(*a, **k):
+            raise pf.FlightUnavailableError(
+                "Source unresolved (open to resolve): cloud_x"
+            )
+
+        client._state.client = type(
+            "FakeFlight", (), {"get_flight_info": staticmethod(_refuse)}
+        )()
         with pytest.raises(ValueError, match="client.resolve"):
             client.get_physical_scale("cloud_x")
-        assert recalled == []  # no GetFlightInfo / download was triggered
 
     def test_resolved_source_still_fetches_scale(self, monkeypatch):
         # A resolved source is unaffected: the cheap one-shot fetch still runs.
@@ -264,7 +280,6 @@ class TestPhysicalScaleUnresolvedGuard:
             physical_scale=[0.5, 0.25],
             physical_unit=["um", "um"],
         )
-        client._sources = {"r": DataSourceDescriptor(source_id="r", tensors=[td])}
         monkeypatch.setattr(
             client._catalog, "_fetch_tensor_descriptor", lambda *a, **k: td
         )

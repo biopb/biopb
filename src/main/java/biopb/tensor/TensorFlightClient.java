@@ -76,8 +76,8 @@ import static biopb.tensor.TensorChunkCodec.writeChunk;
  * <pre>
  * TensorFlightClient client = new TensorFlightClient("localhost:8815");
  *
- * // List data sources (each may contain multiple tensors)
- * Map&lt;String, DataSourceDescriptor&gt; sources = client.listSources();
+ * // Browse the catalog (SQL over the server's DuckDB)
+ * VectorSchemaRoot rows = client.querySources("SELECT * FROM sources");
  *
  * // Access a tensor by its array_id ("source_id" or "source_id/field")
  * RandomAccessibleInterval&lt;UnsignedByteType&gt; arr = client.getTensor("my-source/tensor-0");
@@ -97,7 +97,6 @@ public class TensorFlightClient implements AutoCloseable {
     private final Location location;
     private final String token;
     private final Map<String, TensorDescriptor> descriptors;
-    private final Map<String, DataSourceDescriptor> sources;
     private final long cacheBytes;
 
     /**
@@ -171,7 +170,6 @@ public class TensorFlightClient implements AutoCloseable {
                 ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token))
                 : null;
         this.descriptors = new HashMap<>();
-        this.sources = new HashMap<>();
         this.cacheBytes = cacheBytes;
     }
 
@@ -202,26 +200,26 @@ public class TensorFlightClient implements AutoCloseable {
         return cacheBytes;
     }
 
+    /** The columns {@link #descriptorsFromRows} reads, as a SELECT list. */
+    static final String SOURCE_ROW_COLUMNS =
+            "source_id, source_url, source_type, data_resident, tensors";
+
     /**
      * List available data sources.
      *
-     * Each data source may contain multiple tensors (for multifield acquisitions
-     * where tensors have different shapes). The returned DataSourceDescriptor
-     * carries the structural entry (array_id, dim_labels, shape, dtype) for every
-     * tensor. The transfer chunk_shape is empty here -- it is answered per tensor
-     * by GetFlightInfo, which is what getTensor()/tensorFromPb() plan on.
-     *
-     * Backed by one catalog query ({@code SELECT ... FROM sources}), so it is
-     * subject to the server's query row cap like {@link #querySources}; a very
-     * large catalog is better browsed with a narrower query.
+     * @deprecated Use {@link #querySources} with {@link #descriptorsFromRows}.
+     *             This is a thin wrapper around {@code SELECT ... FROM sources}
+     *             that inherits the server's query row cap, so a large catalog
+     *             comes back silently truncated -- and a browse is exactly where
+     *             that matters.
      *
      * @return Map of source_id to DataSourceDescriptor
      */
+    @Deprecated
     public Map<String, DataSourceDescriptor> listSources() throws IOException {
         Map<String, DataSourceDescriptor> result = new HashMap<>();
         try (VectorSchemaRoot root = querySources(
-                "SELECT source_id, source_url, source_type, data_resident, tensors "
-                        + "FROM sources ORDER BY source_id")) {
+                "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources ORDER BY source_id")) {
             for (DataSourceDescriptor sourceDesc : descriptorsFromRows(root)) {
                 result.put(sourceDesc.getSourceId(), sourceDesc);
                 for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
@@ -229,9 +227,28 @@ public class TensorFlightClient implements AutoCloseable {
                 }
             }
         }
-        sources.putAll(result);
         LOGGER.info("listSources: returned " + result.size() + " sources");
         return result;
+    }
+
+    /**
+     * One source's descriptor by id, or {@code null} when nothing answers to it.
+     *
+     * <p>One addressed catalog row, so a source past the browse cap still
+     * resolves. Caches the row's per-tensor entries for later addressing.
+     */
+    private DataSourceDescriptor fetchSourceDescriptor(String sourceId) throws IOException {
+        try (VectorSchemaRoot root = querySources(
+                "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources WHERE source_id = "
+                        + sqlLiteral(sourceId))) {
+            for (DataSourceDescriptor sourceDesc : descriptorsFromRows(root)) {
+                for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
+                    descriptors.put(tensorDesc.getArrayId(), tensorDesc);
+                }
+                return sourceDesc;
+            }
+        }
+        return null;
     }
 
     /**
@@ -240,8 +257,11 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>Structural only: per-tensor array_id / dim_labels / shape / dtype from the
      * {@code tensors} LIST&lt;STRUCT&gt; column. The transfer chunk_shape belongs to the
      * tensor-bound adapter and is answered by GetFlightInfo (biopb/biopb#812).
+     *
+     * <p>Public because it is the migration path off {@link #listSources}: query
+     * the catalog yourself, decode the rows with this.
      */
-    static List<DataSourceDescriptor> descriptorsFromRows(VectorSchemaRoot root) {
+    public static List<DataSourceDescriptor> descriptorsFromRows(VectorSchemaRoot root) {
         List<DataSourceDescriptor> out = new ArrayList<>();
         FieldVector sourceIds = root.getVector("source_id");
         FieldVector urls = root.getVector("source_url");
@@ -473,8 +493,7 @@ public class TensorFlightClient implements AutoCloseable {
      * this <b>downloads the whole file</b> -- a recall that can take minutes,
      * consume local disk, and fail when offline -- then reads its real shape,
      * dtype, and field list. This is the heavyweight, <i>consenting</i> operation
-     * that catalog browsing ({@link #listSources} / {@link #querySources})
-     * deliberately avoids; call it only when you intend to read the data.
+     * that catalog browsing ({@link #querySources}) deliberately avoids; call it only when you intend to read the data.
      * Afterwards {@link #getTensor} and friends work normally. Idempotent.
      *
      * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
@@ -517,7 +536,6 @@ public class TensorFlightClient implements AutoCloseable {
             throw new IOException("resolve('" + sourceId
                     + "') returned no catalog row (server closed the stream without a result)");
         }
-        sources.put(sourceId, desc);
         for (TensorDescriptor tensorDesc : desc.getTensorsList()) {
             descriptors.put(tensorDesc.getArrayId(), tensorDesc);
         }
@@ -574,11 +592,11 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>A tensor is identified by its {@code array_id} alone (see the tensor
      * identity policy at the top of {@code proto/biopb/tensor/descriptor.proto}),
      * so this takes that one identifier rather than a {@code (sourceId, tensorId)}
-     * pair. Works even when the source is beyond the (truncatable)
-     * {@link #listSources} cap, and the result is cached. A bare {@code source_id}
-     * (single-tensor source, or to anchor on a multi-tensor source's default/first
-     * tensor) is accepted. To enumerate ALL tensors/scenes of a source, use
-     * {@code listSources().get(sourceId).getTensorsList()} -- NOT this method.
+     * pair. Works even when the source is beyond the server's query row cap, and
+     * the result is cached. A bare {@code source_id} (single-tensor source, or to
+     * anchor on a multi-tensor source's default/first tensor) is accepted. To
+     * enumerate ALL tensors/scenes of a source, read its catalog row's
+     * {@code tensors} column -- NOT this method.
      *
      * <p>This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
      * synced-folder) source it raises an error pointing at {@link #resolve}.
@@ -618,11 +636,11 @@ public class TensorFlightClient implements AutoCloseable {
         TensorDescriptor desc = descriptors.get(arrayId);
         if (desc == null) {
             // Don't silently recall a whole cloud file just to read its pixel
-            // size: if the source is known-unresolved, steer to resolve().
-            DataSourceDescriptor cached = sources.get(sourceId);
-            if (cached != null && cached.getTensorsList().isEmpty()) {
-                throw unresolvedSourceError(sourceId);
-            }
+            // size: the probe below never resolves on serve, so an unresolved
+            // source refuses there and fetchTensorDescriptor restates it as the
+            // steer to resolve(). That refusal is the server's, so it holds for
+            // every id -- where the old local pre-check only fired for a source
+            // a prior listSources() happened to have cached.
             desc = fetchTensorDescriptor(sourceId, arrayId);
         }
         if (desc.getPhysicalScaleCount() == 0) {
@@ -1253,30 +1271,26 @@ public class TensorFlightClient implements AutoCloseable {
 
         LOGGER.fine("getTensor: sourceId=" + sourceId + ", tensorId=" + tensorId);
 
-        // Ensure sources are loaded; fall back to a direct server fetch when
-        // listSources() didn't return this source (e.g. a truncated catalog).
-        if (!sources.containsKey(sourceId)) {
-            try {
-                listSources();
-            } catch (IOException e) {
-                throw new IllegalStateException("Failed to list sources", e);
-            }
+        // One addressed catalog row. No catalog to ask (a capability token reads
+        // one source's pixels, not the catalog) falls through to the per-tensor
+        // probe below, which is the private path.
+        DataSourceDescriptor sourceDesc = null;
+        try {
+            sourceDesc = fetchSourceDescriptor(sourceId);
+        } catch (IOException | RuntimeException ignored) {
+            // fall through to the per-tensor probe
         }
-
-        DataSourceDescriptor sourceDesc = sources.get(sourceId);
         if (sourceDesc == null) {
-            // Not in the (capped) listing -- probe the server directly so sources
-            // beyond the list cap still resolve. Swallow a fetch failure and let
-            // the clean "Source not found" below surface (matches the Python
-            // client). An unresolved source still lists with empty tensors, so its
-            // directive is raised from the tensorId==null branch, not here.
+            // Probe the server directly. Swallow a fetch failure and let the
+            // clean "Source not found" below surface (matches the Python
+            // client). An unresolved source still lists with empty tensors, so
+            // its directive is raised from the tensorId==null branch, not here.
             try {
                 TensorDescriptor td = fetchTensorDescriptor(sourceId, tensorId);
                 sourceDesc = DataSourceDescriptor.newBuilder()
                         .setSourceId(sourceId)
                         .addTensors(td)
                         .build();
-                sources.put(sourceId, sourceDesc);
             } catch (RuntimeException ignored) {
                 // fall through to the clean error below
             }
@@ -1659,7 +1673,7 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>Backs {@link #getDescriptor} and {@link #getPhysicalScale}. Uses the
      * per-tensor GetFlightInfo RPC, which works even when the source is beyond
-     * the (truncatable) {@link #listSources} cap. A null/empty tensorId, or a
+     * the server's query row cap. A null/empty tensorId, or a
      * tensorId equal to the sourceId, anchors on the source's default (first)
      * tensor via the empty-tensor_id path (the server resolves it, #44); a
      * within-source field is sent verbatim. This is a CHEAP probe: it does NOT

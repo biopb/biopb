@@ -11,6 +11,7 @@ Features:
 
 import json
 import logging
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import dask.array as da
@@ -134,8 +135,8 @@ class TensorFlightClient:
         ```python
         client = TensorFlightClient('grpc://localhost:8815')
 
-        # List data sources (each may contain multiple tensors)
-        sources = client.list_sources()
+        # Browse the catalog (SQL over the server's DuckDB)
+        rows = client.query_sources("SELECT * FROM sources", format="records")
 
         # Get source-level metadata
         metadata = client.get_source_metadata('my-source')
@@ -206,9 +207,9 @@ class TensorFlightClient:
         self._tls_trust = tls_trust
         self._client = flight.FlightClient(normalized, **tls_trust.client_kwargs())
         self._call_options = _build_call_options(token)
-        # The connection + the two catalog caches live in one shared _ClientState.
-        # The collaborators (#278 item C) read/write it; this facade exposes the
-        # caches back-compatibly via the _sources/_descriptors properties below.
+        # The connection + the structural descriptor cache live in one shared
+        # _ClientState. The collaborators (#278 item C) read/write it; this
+        # facade exposes the cache via the _descriptors property below.
         self._state = _ClientState(
             raw_client=self._client,
             call_options=self._call_options,
@@ -221,17 +222,9 @@ class TensorFlightClient:
         self._fetcher = ChunkFetcher(self._state, self._catalog)
         self._upload = UploadSession(self._state)
 
-    # The catalog caches live on the shared _ClientState; expose them here so a
-    # caller's reads, in-place mutation, AND reassignment (client._sources = {})
-    # all reach the one shared dict the collaborators use (#278 item C).
-    @property
-    def _sources(self) -> Dict[str, DataSourceDescriptor]:
-        return self._state.sources
-
-    @_sources.setter
-    def _sources(self, value: Dict[str, DataSourceDescriptor]) -> None:
-        self._state.sources = value
-
+    # The descriptor cache lives on the shared _ClientState; expose it here so a
+    # caller's reads, in-place mutation, AND reassignment (client._descriptors =
+    # {}) all reach the one shared dict the collaborators use (#278 item C).
     @property
     def _descriptors(self) -> Dict[str, TensorDescriptor]:
         return self._state.descriptors
@@ -245,6 +238,13 @@ class TensorFlightClient:
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
         """List available data sources.
 
+        .. deprecated::
+            Use :meth:`query_sources`, and `biopb.tensor.descriptors_from_rows`
+            if you want descriptors. This is a thin wrapper around
+            ``SELECT ... FROM sources`` that inherits the server's query row
+            cap, so a large catalog comes back silently truncated -- and a
+            browse is exactly where that matters.
+
         Returns:
             Dictionary mapping source_id to DataSourceDescriptor.
             Each DataSourceDescriptor.tensors carries the *structural* entry for
@@ -252,21 +252,22 @@ class TensorFlightClient:
             The transfer ``chunk_shape`` is empty here by contract; ask
             :meth:`get_descriptor` for the grid of a specific tensor
             (biopb/biopb#812).
-
-        Backed by one catalog query (``SELECT ... FROM sources``), so it is
-        subject to the server's query row cap like :meth:`query_sources`; a
-        very large catalog is better browsed with a narrower query.
         """
+        warnings.warn(
+            "TensorFlightClient.list_sources() is deprecated and is capped by "
+            "the server's query row limit; use query_sources() (with "
+            "biopb.tensor.descriptors_from_rows if you want descriptors).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._catalog.list_sources()
 
     def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
         """One source's ``DataSourceDescriptor`` by id, or ``None``.
 
-        The addressed form of :meth:`list_sources`: same descriptor, same
-        contract (structural ``tensors`` entries, empty ``chunk_shape`` --
-        biopb/biopb#812), but the server answers it with a single-row lookup
-        instead of streaming the catalog for the caller to search. Use this
-        whenever the id is already known; use ``list_sources`` to browse.
+        .. deprecated::
+            Use :meth:`query_sources` with a ``WHERE source_id = ...``, and
+            `biopb.tensor.descriptor_from_row` if you want a descriptor.
 
         The catalog is public: a source whose pixels need a capability token
         still has its descriptor here. Knowing its id is not authority to read
@@ -282,6 +283,12 @@ class TensorFlightClient:
             The ``DataSourceDescriptor``, or ``None`` when nothing answers to
             that id.
         """
+        warnings.warn(
+            "TensorFlightClient.get_source() is deprecated; use query_sources() "
+            "(with biopb.tensor.descriptor_from_row if you want a descriptor).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._catalog.get_source(source_id)
 
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
@@ -407,17 +414,17 @@ class TensorFlightClient:
         A tensor is identified by its ``array_id`` alone (see the tensor identity
         policy at the top of ``proto/biopb/tensor/descriptor.proto``), so this
         takes that one identifier rather than a ``(source_id, tensor_id)`` pair.
-        Works even when the source is beyond the (truncatable) ``list_sources()``
-        cap. **This is the only call that answers the transfer ``chunk_shape``**:
-        the grid belongs to the tensor the server binds here, and ``list_sources``
-        entries carry it empty (biopb/biopb#812). Every call fetches -- the client
+        Works even when the source is beyond the server's query row cap.
+        **This is the only call that answers the transfer ``chunk_shape``**: the
+        grid belongs to the tensor the server binds here, and a catalog row
+        carries it empty (biopb/biopb#812). Every call fetches -- the client
         caches only the *structural* part of the answer (shape/dtype/dim_labels
         plus physical scale) for its own addressing, never ``chunk_shape``,
         ``metadata_json`` or ``pyramid``, so what you get back always reflects the
         masks you passed. Passing a bare
         ``source_id`` (single-tensor source, or to anchor on a multi-tensor
         source's default/first tensor) is accepted. To enumerate ALL
-        tensors/scenes of a source, use ``list_sources()[source_id].tensors``
+        tensors/scenes of a source, read its catalog row's ``tensors`` column
         -- NOT this method.
 
         This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
@@ -469,15 +476,15 @@ class TensorFlightClient:
             resolve, and `warm`) is experimental and its behavior may change.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
-        list are unknown until first access (it lists with ``data_resident`` False
-        and an empty ``list_sources()[source_id].tensors``). The canonical case is
+        list are unknown until first access (its catalog row has
+        ``data_resident`` false and an empty ``tensors``). The canonical case is
         a cloud / synced-folder ("Files-On-Demand") source.
 
         Resolving asks the server to hydrate it. For a dehydrated placeholder this
         **downloads the whole file** -- a recall that can take minutes, consume
         local disk, and fail when offline -- then reads its real shape, dtype, and
         field list. This is the heavyweight, *consenting* operation that catalog
-        browsing (`list_sources` / `query_sources`) deliberately
+        browsing (`query_sources`) deliberately
         avoids; call it only when you intend to read the data. After it returns,
         `get_tensor` and friends work normally.
 

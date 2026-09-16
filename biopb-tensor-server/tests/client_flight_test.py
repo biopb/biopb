@@ -98,20 +98,20 @@ class TestTensorFlightClientRoundTrip:
         assert server_client.get_source("no-such-source") is None
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_source_does_not_pose_as_a_listing(self, server_client):
-        """An addressed answer must not land in the listing cache.
+    def test_the_catalog_is_never_snapshotted_client_side(self, server_client):
+        """Neither call keeps a source-keyed cache.
 
-        Callers read that map's membership as "what the catalog holds", so one
-        lookup folded into it would make an unlisted source -- an upload, or one
-        past the cap -- look like it had been browsed.
+        A local copy of the catalog answered "what does this server hold?",
+        which is a question only the server can answer -- and the answer went
+        stale the moment anything registered. Only the per-array_id addressing
+        cache survives.
         """
         client = server_client
         client.list_sources()
-        before = dict(client._catalog._state.sources)
-
         client.get_source("test-tensor")
 
-        assert client._catalog._state.sources == before
+        assert not hasattr(client._catalog._state, "sources")
+        assert set(client._descriptors) == {"test-tensor"}
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_shape(self, server_client):

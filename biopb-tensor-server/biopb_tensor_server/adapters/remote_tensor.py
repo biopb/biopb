@@ -207,31 +207,19 @@ def list_upstream_source_ids(client, location: str) -> tuple[List[str], bool]:
     another package's private state to recover a value that was in scope
     (biopb/biopb#529).
 
-    Enumerating a catalog with ``list_sources()`` is **unsafe**: it is one
-    catalog query capped at the server's ``max_query_results``, so a large
-    upstream is silently truncated -- mirroring it would drop sources, and
-    reconciling against a truncated list would spuriously *remove* the ones
-    past the cap. Query the ids alone instead (``query_sources`` on one narrow
-    column, the canonical browse surface, biopb/biopb#225). Fall back to
-    ``list_sources()`` only when the query fails, and flag the result
-    ``complete=False`` so a caller (e.g. the monitor re-list) can avoid
-    destructive reconciliation on a partial list.
+    Queries the ids alone (``query_sources`` on one narrow column, the
+    canonical browse surface, biopb/biopb#225). ``complete`` is always True:
+    the server-side catalog is not truncated, so a caller (e.g. the monitor
+    re-list) may reconcile destructively against this list. The flag stays in
+    the signature because the caller pairs it with
+    :func:`fetch_upstream_catalog`'s, which is not.
+
+    An upstream with no readable catalog raises rather than degrading: the only
+    fallback there ever was is ``list_sources()``, which in protocol v2 runs
+    this same query and so fails identically.
     """
-    try:
-        rows = client.query_sources("SELECT source_id FROM sources", format="records")
-        return [row["source_id"] for row in rows], True
-    except Exception as exc:
-        ids = list(client.list_sources().keys())
-        logger.warning(
-            "upstream %s has no SQL catalog (query_sources failed: %s); falling "
-            "back to the capped list_sources() -- the mirror may be incomplete "
-            "(%d sources seen). Enable the upstream's metadata DB for a complete "
-            "mirror.",
-            location,
-            exc,
-            len(ids),
-        )
-        return ids, False
+    rows = client.query_sources("SELECT source_id FROM sources", format="records")
+    return [row["source_id"] for row in rows], True
 
 
 # Transport failures, as opposed to "this upstream has no SQL catalog". The

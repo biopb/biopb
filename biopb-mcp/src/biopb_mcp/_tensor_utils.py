@@ -151,7 +151,7 @@ def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
     advertised levels keeps the client's requests byte-identical to what the
     server serves and precaches.
 
-    The lean catalog descriptor from ``list_sources`` carries no pyramid -- it
+    The lean catalog row carries no pyramid -- it
     is filled only at open time (``get_flight_info``) -- so when the passed
     *tensor_desc* lacks one, fetch the open-time descriptor once via
     ``get_descriptor``. That fetch is a **describe** (biopb/biopb#563): it asks

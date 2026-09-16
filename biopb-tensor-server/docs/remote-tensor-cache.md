@@ -223,11 +223,11 @@ server machinery treats it like any other source. Per-upstream tokens reach the
 adapter via `SourceClaim.extra_config` carrying `credentials_profile`.
 
 **Truncation-safe enumeration.** `list_upstream_source_ids(client) → (ids,
-complete)` prefers the complete `query_sources("SELECT source_id FROM sources")` and
-only falls back to the capped `list_sources()` (flagged `complete=False`) when the
-upstream has no metadata DB — because reconciling against a *truncated* list would
-spuriously remove sources past the cap. The re-list applies **removals only when
-`complete`**.
+complete)` enumerates with `query_sources("SELECT source_id FROM sources")`,
+which the server does not truncate, so `complete` is always True there. The flag
+exists because `fetch_upstream_catalog`'s is not: reconciling against a
+*truncated* list would spuriously remove sources past the cap, so the re-list
+applies **removals only when `complete`**.
 
 **Metadata source.** `get_metadata()` reads the upstream's DuckDB
 `sources.metadata_json` column (the raw dict, no envelope — the method's contract),

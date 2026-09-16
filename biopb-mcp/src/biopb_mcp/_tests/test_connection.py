@@ -38,9 +38,29 @@ def _no_control(monkeypatch):
     monkeypatch.setattr(_connection, "ensure_data_plane", lambda *a, **k: None)
 
 
+def _catalog_rows(sources):
+    """The `sources` rows a server would hand back for these ids.
+
+    The connection browses with ``query_sources`` and decodes the rows itself,
+    so a fake hands back rows, not descriptors.
+    """
+    return [
+        {
+            "source_id": sid,
+            "source_url": f"/data/{sid}",
+            "source_type": "zarr",
+            "data_resident": True,
+            "tensors": [],
+        }
+        for sid in sources
+    ]
+
+
 def _fake_client(sources):
     client = MagicMock()
-    client.list_sources.return_value = sources
+    # `catalog` is the knob: assign a new id set and the next browse sees it.
+    client.catalog = list(sources)
+    client.query_sources.side_effect = lambda sql, **kw: _catalog_rows(client.catalog)
     client.health_check.return_value = {"status": "SERVING"}
     return client
 
@@ -322,9 +342,9 @@ class TestConnect:
         conn = TensorConnection()
         result = conn.connect("grpc://host:9", token="t")
 
-        assert result is sources
+        assert set(result) == set(sources)
         assert conn.client is client
-        assert conn.sources == sources
+        assert conn.sources == result
         assert conn.url == "grpc://host:9"
         assert conn.token == "t"
         assert conn.use_server_query is False
@@ -376,7 +396,7 @@ class TestConnect:
         # connect must still succeed despite a failing hook
         result = conn.connect("grpc://host:9", token="t")
         assert conn.is_connected is True
-        assert result is sources
+        assert set(result) == set(sources)
 
     def test_use_server_query_above_threshold(self, monkeypatch):
         big = {str(i): MagicMock() for i in range(SERVER_QUERY_THRESHOLD + 1)}
@@ -421,7 +441,7 @@ class TestConnect:
 
         conn = TensorConnection()
         conn.connect("grpc://host:9")
-        client.list_sources.return_value = {"a": MagicMock(), "b": MagicMock()}
+        client.catalog = ["a", "b"]
         result = conn.refresh()
         assert len(result) == 2
         assert conn.sources == result
@@ -462,8 +482,7 @@ class TestConnect:
 
         conn = TensorConnection()
         conn.connect("grpc://host:9")
-        full = {"cloud_x": MagicMock(), "other": MagicMock()}
-        client.list_sources.return_value = full
+        client.catalog = ["cloud_x", "other"]
 
         out = conn.resolve_source("cloud_x")
 
@@ -473,7 +492,7 @@ class TestConnect:
             "cloud_x", on_progress=None, should_cancel=None
         )
         assert out is resolved  # the resolved descriptor is returned verbatim
-        assert conn.sources == full  # snapshot refreshed via list_sources()
+        assert set(conn.sources) == {"cloud_x", "other"}  # snapshot refreshed
 
     def test_warm_source_requires_connection(self):
         conn = TensorConnection()
@@ -518,8 +537,7 @@ class TestConnect:
 
         conn = TensorConnection()
         conn.connect("grpc://host:9")
-        after = {"x": MagicMock()}
-        client.list_sources.return_value = after
+        client.catalog = ["x"]
 
         out = conn.add_source("/data/x.zarr")
 
@@ -529,7 +547,7 @@ class TestConnect:
             should_cancel=None,
         )
         assert out is result
-        assert conn.sources == after  # snapshot refreshed via list_sources()
+        assert set(conn.sources) == {"x"}  # snapshot refreshed
 
     def test_remove_source_requires_connection(self):
         conn = TensorConnection()
@@ -548,14 +566,13 @@ class TestConnect:
 
         conn = TensorConnection()
         conn.connect("grpc://host:9")
-        after = {}
-        client.list_sources.return_value = after
+        client.catalog = []
 
         out = conn.remove_source("dnd://exp.zarr")
 
         client.remove_source.assert_called_once_with("dnd://exp.zarr")
         assert out is result
-        assert conn.sources == after  # snapshot refreshed via list_sources()
+        assert conn.sources == {}  # snapshot refreshed
 
 
 class TestIsLocalhost:
@@ -601,11 +618,11 @@ class TestConnectReadiness:
         assert conn.is_connected is False
         assert conn.last_status == "starting"
         assert "scanning" in conn.last_message
-        client.list_sources.assert_not_called()
+        client.query_sources.assert_not_called()
 
     def test_health_probe_error_falls_through(self, monkeypatch):
         # Older server with no health action: the advisory probe raises, but
-        # list_sources() still works -> connect succeeds (backward compatible).
+        # the catalog query still works -> connect succeeds (backward compatible).
         sources = {"a": MagicMock()}
         client = _fake_client(sources)
         client.health_check.side_effect = RuntimeError("no health action")
@@ -616,13 +633,13 @@ class TestConnectReadiness:
         conn = TensorConnection()
         result = conn.connect("grpc://host:9")
 
-        assert result is sources
+        assert set(result) == set(sources)
         assert conn.is_connected is True
         assert conn.last_status == "connected"
 
     def test_down_fails_fast(self, monkeypatch):
         client = _fake_client({})
-        client.list_sources.side_effect = RuntimeError("unavailable")
+        client.query_sources.side_effect = RuntimeError("unavailable")
         monkeypatch.setattr(
             _connection, "TensorFlightClient", lambda url, token=None, **_: client
         )
@@ -789,7 +806,7 @@ def _connected_conn(monkeypatch, sources, health_results):
     """A connected TensorConnection whose client serves *health_results*.
 
     ``connect()`` consumes one ``health_check`` (its readiness probe) and one
-    ``list_sources``; we arm the per-poll health sequence and clear the call
+    catalog query; we arm the per-poll health sequence and clear the call
     history *after* connecting, so the watch-loop assertions see only loop
     activity.
     """
@@ -800,7 +817,7 @@ def _connected_conn(monkeypatch, sources, health_results):
     conn = TensorConnection()
     conn.connect("grpc://host:9")
     client.health_check.reset_mock()
-    client.list_sources.reset_mock()
+    client.query_sources.reset_mock()
     client.health_check.side_effect = list(health_results)
     return conn, client
 
@@ -813,16 +830,15 @@ class TestSourceWatch:
             {"a": MagicMock(), "b": MagicMock()},
             [{"source_count": 2}, {"source_count": 3}],
         )
-        grown = {"a": MagicMock(), "b": MagicMock(), "c": MagicMock()}
-        client.list_sources.return_value = grown
+        client.catalog = ["a", "b", "c"]
         changed = []
         conn.on_sources_changed = changed.append
 
         conn._watch_stop = _FakeStop(allow=2)
         conn._source_watch_loop(0.0, 0.0)
 
-        assert conn.sources is grown
-        assert changed == [grown]
+        assert set(conn.sources) == {"a", "b", "c"}
+        assert changed == [conn.sources]
 
     def test_relists_on_connect_mid_index_partial(self, monkeypatch):
         # Connected mid-index: cached 1 source, server already reports 18 ->
@@ -830,8 +846,7 @@ class TestSourceWatch:
         conn, client = _connected_conn(
             monkeypatch, {"a": MagicMock()}, [{"source_count": 18}]
         )
-        full = {str(i): MagicMock() for i in range(18)}
-        client.list_sources.return_value = full
+        client.catalog = [str(i) for i in range(18)]
 
         conn._watch_stop = _FakeStop(allow=1)
         conn._source_watch_loop(0.0, 0.0)
@@ -847,7 +862,7 @@ class TestSourceWatch:
         conn._watch_stop = _FakeStop(allow=2)
         conn._source_watch_loop(0.0, 0.0)
 
-        client.list_sources.assert_not_called()
+        client.query_sources.assert_not_called()
 
     def test_health_error_is_tolerated(self, monkeypatch):
         conn, client = _connected_conn(
@@ -856,7 +871,7 @@ class TestSourceWatch:
         conn._watch_stop = _FakeStop(allow=1)
         conn._source_watch_loop(0.0, 0.0)  # must not raise
 
-        client.list_sources.assert_not_called()
+        client.query_sources.assert_not_called()
 
     def test_disconnected_does_not_relist(self, monkeypatch):
         conn, client = _connected_conn(monkeypatch, {"a": MagicMock()}, [])
@@ -864,7 +879,7 @@ class TestSourceWatch:
         conn._watch_stop = _FakeStop(allow=1)
         conn._source_watch_loop(0.0, 0.0)
 
-        client.list_sources.assert_not_called()
+        client.query_sources.assert_not_called()
         client.health_check.assert_not_called()
 
     def test_missing_source_count_does_not_relist(self, monkeypatch):
@@ -875,7 +890,7 @@ class TestSourceWatch:
         conn._watch_stop = _FakeStop(allow=1)
         conn._source_watch_loop(0.0, 0.0)
 
-        client.list_sources.assert_not_called()
+        client.query_sources.assert_not_called()
 
     def test_relist_failure_keeps_watcher_alive(self, monkeypatch):
         conn, client = _connected_conn(
@@ -883,7 +898,7 @@ class TestSourceWatch:
             {"a": MagicMock()},
             [{"source_count": 2}, {"source_count": 3}],
         )
-        client.list_sources.side_effect = RuntimeError("list boom")
+        client.query_sources.side_effect = RuntimeError("list boom")
 
         conn._watch_stop = _FakeStop(allow=2)
         conn._source_watch_loop(0.0, 0.0)  # must not raise
@@ -1263,7 +1278,7 @@ def test_connect_passes_the_anchor_to_the_client(monkeypatch, tmp_path):
         captured.update(url=url, tls_fingerprint=tls_fingerprint)
         client = MagicMock()
         client.health_check.return_value = {"status": "SERVING"}
-        client.list_sources.return_value = {}
+        client.query_sources.return_value = []
         return client
 
     monkeypatch.setattr(_connection, "TensorFlightClient", _fake_client)

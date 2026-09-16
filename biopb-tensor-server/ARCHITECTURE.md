@@ -104,9 +104,10 @@ id or a byte-prefix sniff -- and the arm names the flight:
 
 `ListFlights` advertises the catalog only: one flight per table by path, with
 its real Arrow schema and a `SELECT * FROM <table>` ticket, so a stock Flight
-client can browse without a biopb proto. Sources are catalog rows (the SDK's
-`list_sources` is a query); a source's pixels and annotations are addressed,
-not listed.
+client can browse without a biopb proto. A source crosses the wire only as its
+catalog row — `resolve` returns the row it just wrote, and each SDK rebuilds its
+own `DataSourceDescriptor` view from one. A source's pixels and annotations are
+addressed, not listed.
 
 **Two token tiers** (`_authorize`): the catalog tier requires the server-wide
 token when one is configured; the private tiers require a source's capability

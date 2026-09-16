@@ -355,9 +355,11 @@ class TestMultifieldServerClient:
                 16,
                 16,
             ]
-            # Read the _sources cache directly -- re-calling list_sources() would
-            # just refetch.
-            assert len(client._sources["multi"].tensors) == 3
+            (row,) = client.query_sources(
+                "SELECT tensors FROM sources WHERE source_id = 'multi'",
+                format="records",
+            )
+            assert len(row["tensors"]) == 3
 
             client.close()
         finally:

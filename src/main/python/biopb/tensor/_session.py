@@ -87,17 +87,19 @@ logger = logging.getLogger(__name__)
 class _ClientState:
     """Per-connection state shared by CatalogClient / ChunkFetcher / the facade.
 
-    Holds the Flight connection handles plus the two catalog caches. The caches
-    are mutable and shared by reference: every collaborator reads
-    ``state.sources`` / ``state.descriptors`` live, and TensorFlightClient
-    exposes them as its ``_sources`` / ``_descriptors`` (property + setter) so
-    the historical ``client._sources = {...}`` reset semantics still hold.
+    Holds the Flight connection handles plus the structural descriptor cache,
+    which is mutable and shared by reference: every collaborator reads
+    ``state.descriptors`` live, and TensorFlightClient exposes it as its
+    ``_descriptors`` (property + setter).
 
     ``descriptors`` is keyed by ``array_id``, which the identity policy
     (``proto/biopb/tensor/descriptor.proto``) makes globally unique and
     identical across every RPC that reports it. It holds *structural*
     (whole-tensor) descriptors only -- never a request-shaped read response,
-    whose ``shape`` is the sliced/downsampled one.
+    whose ``shape`` is the sliced/downsampled one. It is an *addressing* cache,
+    not a catalog snapshot: there is deliberately no source-keyed twin, because
+    the catalog is the server's and a stale local copy of it answered questions
+    ("what does this server hold?") it could not actually answer.
     """
 
     raw_client: flight.FlightClient
@@ -110,7 +112,6 @@ class _ClientState:
     # graph so every dask worker's FlightClient trusts the same pinned root
     # without re-running TOFU (biopb/biopb#604, biopb/biopb#606).
     tls_trust: Optional[TlsTrust] = None
-    sources: Dict[str, DataSourceDescriptor] = field(default_factory=dict)
     descriptors: Dict[str, TensorDescriptor] = field(default_factory=dict)
     # Set once the server's Flight protocol shape has been checked (or when
     # the check is bypassed, e.g. for a test double).
@@ -471,7 +472,6 @@ class CatalogClient:
             source_desc = descriptor_from_row(row)
             source_descriptors[source_desc.source_id] = source_desc
             self._cache_tensors(source_desc)
-        self._state.sources = source_descriptors
         logger.info(f"list_sources: returned {len(source_descriptors)} sources")
         return source_descriptors
 
@@ -484,10 +484,6 @@ class CatalogClient:
         for row in table.to_pylist():
             source_desc = descriptor_from_row(row)
             self._cache_tensors(source_desc)
-            # Deliberately not written to ``self._state.sources``: that map is
-            # the last *listing*, and callers read its size and membership as
-            # "what the catalog holds". Folding one addressed answer into it
-            # would make a lookup look like a browse result.
             return source_desc
         return None
 
@@ -606,17 +602,14 @@ class CatalogClient:
         documentation."""
         desc = self._state.descriptors.get(array_id)
         if desc is None:
-            source_id, _ = _split_array_id(array_id)
-            # Don't silently recall (download) a whole cloud file just to read its
-            # pixel size: if the source is known-unresolved, steer the caller to
-            # resolve() explicitly -- consistent with get_tensor, and faithful to
-            # resolution being a consented act, not a side effect of a metadata
-            # probe. (Only catches sources already in the catalog cache; a
-            # never-listed id still falls through to the fetch below, same as
-            # every other entry point.)
-            cached = self._state.sources.get(source_id)
-            if cached is not None and not cached.tensors:
-                raise _unresolved_source_error(source_id)
+            # Don't silently recall (download) a whole cloud file just to read
+            # its pixel size: the probe below never resolves on serve, so an
+            # unresolved source refuses there and _fetch_tensor_descriptor
+            # restates it as the directive steer to resolve(). That refusal is
+            # the server's, so it holds for every id -- where the old local
+            # pre-check only fired for a source a prior list_sources() happened
+            # to have cached.
+            #
             # A real fetch error (server unreachable, source not found)
             # propagates to the caller -- it must stay distinguishable from "no
             # physical scale recorded", which is the only case that yields None.
@@ -669,9 +662,6 @@ class CatalogClient:
         the echoed-back array_id) for the readers that want addressing facts --
         see :func:`_structural_descriptor` for what that keeps and why the
         masked-off parts are deliberately not stored (biopb/biopb#795).
-        ``self._state.sources`` is intentionally NOT touched, so
-        a single-tensor probe never clobbers a full enumeration cached by
-        ``list_sources()`` (issue #75).
         """
         cmd = _tensor_read_cmd(
             array_id,
@@ -735,16 +725,14 @@ class CatalogClient:
             return desc
 
         source_id, tensor_id = _split_array_id(array_id)
-        source_desc = self._state.sources.get(source_id)
-        if source_desc is None:
-            try:
-                source_desc = self.get_source(source_id)
-            except flight.FlightError:
-                # No catalog to ask (a capability token reads one source's
-                # pixels, not the catalog; an embedded server may have none):
-                # the per-tensor probe below is the private path, and its
-                # error is the one worth reporting.
-                source_desc = None
+        try:
+            source_desc = self.get_source(source_id)
+        except flight.FlightError:
+            # No catalog to ask (a capability token reads one source's pixels,
+            # not the catalog; an embedded server may have none): the per-tensor
+            # probe below is the private path, and its error is the one worth
+            # reporting.
+            source_desc = None
 
         if source_desc is not None:
             if not source_desc.tensors:
@@ -851,7 +839,6 @@ class CatalogClient:
                 "(server closed the stream without a result)"
             )
         desc = descriptor_from_row(row)
-        self._state.sources[source_id] = desc
         self._cache_tensors(desc)
         return desc
 

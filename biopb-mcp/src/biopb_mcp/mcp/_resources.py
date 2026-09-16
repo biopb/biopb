@@ -554,10 +554,12 @@ client.query_sources(  # sources having ANY uint16 tensor
     "SELECT source_id FROM sources "
     "WHERE len(list_filter(tensors, t -> t.dtype = 'uint16')) > 0", format="pandas")
 
-# Convenience listing (NOTE: capped by the server for large catalogs)
-for sid, src in client.list_sources().items():
-    tensors = [(t.array_id, list(t.shape), t.dtype) for t in src.tensors]
-    print(f"{sid}: {src.source_url} ({src.source_type}) tensors={tensors}")
+# One row per source, with its tensors (query_sources is the only browse)
+for row in client.query_sources(
+    "SELECT source_id, source_url, source_type, tensors FROM sources",
+    format="records"):
+    tensors = [(t["array_id"], t["shape"], t["dtype"]) for t in row["tensors"]]
+    print(f"{row['source_id']}: {row['source_url']} ({row['source_type']}) {tensors}")
 
 # Detailed metadata (OME_JSON) for one source
 meta = client.get_source_metadata("source_id")
@@ -573,8 +575,10 @@ They list with `data_resident == False` and an empty `tensors`, and reading one
 server to **download the whole file** (slow, uses disk, fails offline), so it is
 explicit -- never triggered by browsing.
 ```python
-src = client.list_sources()["source_id"]
-if not src.data_resident:                    # unresolved / not local
+row, = client.query_sources(
+    "SELECT data_resident FROM sources WHERE source_id = 'source_id'",
+    format="records")
+if not row["data_resident"]:                 # unresolved / not local
     src = client.resolve("source_id")        # downloads + resolves (may take minutes)
     tensors = [(t.array_id, list(t.shape)) for t in src.tensors]  # now populated
 ```

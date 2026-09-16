@@ -714,8 +714,8 @@ async def execute_code(
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
-      data_resident (note source_url, not "url"). Prefer this over
-      client.list_sources() (server-capped for large catalogs). Unresolved
+      data_resident (note source_url, not "url"). This is the browse
+      surface; there is no other. Unresolved
       (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
       predicate hides them; use `data_resident` to filter on residency on
       purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).

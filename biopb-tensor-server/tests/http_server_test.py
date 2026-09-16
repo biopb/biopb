@@ -106,6 +106,24 @@ def _make_source_desc(
     )
 
 
+def _source_row(desc) -> dict:
+    """The `sources` catalog row a real ``query_sources`` would hand back."""
+    return {
+        "source_id": desc.source_id,
+        "source_url": desc.source_url,
+        "source_type": desc.source_type,
+        "tensors": [
+            {
+                "array_id": t.array_id,
+                "dim_labels": list(t.dim_labels),
+                "shape": list(t.shape),
+                "dtype": t.dtype,
+            }
+            for t in desc.tensors
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -116,13 +134,20 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     mc = MagicMock()
     src = src_desc or _make_source_desc()
 
-    mc.list_sources.return_value = {src.source_id: src}
-    # The addressed counterpart, which answers None rather than raising for an
-    # id nothing holds -- a MagicMock's default truthy return would otherwise
-    # turn every "source not found" test into a 200.
-    mc.get_source.side_effect = lambda source_id: (
-        src if source_id == src.source_id else None
-    )
+    # The sidecar browses the catalog with SQL: every source route is a
+    # query_sources() over `sources`. The fake answers the two shapes the
+    # routes ask for -- the whole listing, and one `WHERE source_id = '...'`.
+    def query_sources(sql, format="arrow"):  # noqa: A002 - mirrors the real kwarg
+        assert format == "records", sql
+        rows = [_source_row(src)]
+        if "WHERE source_id = " in sql:
+            wanted = sql.split("WHERE source_id = ", 1)[1].strip().strip("'")
+            rows = [r for r in rows if r["source_id"] == wanted]
+        if sql.startswith("SELECT tensors "):
+            return [{"tensors": r["tensors"]} for r in rows]
+        return rows
+
+    mc.query_sources.side_effect = query_sources
 
     def get_descriptor(array_id, **_kwargs):
         """What GetFlightInfo actually does, including the parts that bite.
@@ -157,9 +182,6 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     lazy = MagicMock()
     lazy.compute.return_value = arr
     mc.get_tensor.return_value = lazy
-
-    # _sources is accessed directly in the slice route for dim_labels
-    mc._sources = {src.source_id: src}
 
     return mc
 
@@ -432,7 +454,7 @@ class TestSourcesEndpoints:
     def test_list_sources_calls_flight_client(self, auth_client):
         tc, mock_fc = auth_client
         tc.get("/api/sources", headers=_bearer(_TOKEN))
-        mock_fc.list_sources.assert_called()
+        mock_fc.query_sources.assert_called()
 
 
 # ===========================================================================
@@ -732,11 +754,11 @@ class TestRedact:
     def test_redact_path_in_error(self, auth_client):
         tc, mock_fc = auth_client
         # Trigger an error containing a file path
-        mock_fc.list_sources.side_effect = RuntimeError(
+        mock_fc.query_sources.side_effect = RuntimeError(
             "failed to open /home/user/secret/data.zarr"
         )
         tc.get("/api/sources", headers=_bearer(_TOKEN))
-        mock_fc.list_sources.side_effect = None
+        mock_fc.query_sources.side_effect = None
 
         # The error should be recorded and redacted in diagnostics
         # (reset rate limit by using different session key)
@@ -953,7 +975,9 @@ class TestQuerySourcesEndpoint:
             }
         )
         assert mock_table.schema.metadata is None
-        mock_fc.query_sources.return_value = mock_table
+        # Replaces the fixture's catalog-row fake: this route is the raw
+        # passthrough, so it wants the arrow table back untouched.
+        mock_fc.query_sources.side_effect = lambda sql, **kw: mock_table
 
         r = tc.post(
             "/api/sources/query",
@@ -986,7 +1010,7 @@ class TestQuerySourcesEndpoint:
                 b"returned_sources": "2",
             }
         )
-        mock_fc.query_sources.return_value = mock_table
+        mock_fc.query_sources.side_effect = lambda sql, **kw: mock_table
 
         r = tc.post(
             "/api/sources/query",
@@ -2516,7 +2540,7 @@ class TestTileResolutionCostsOneFetch:
         with _multi_tensor_client() as (tc, mock_fc):
             mock_fc.reset_mock()
             assert tc.get("/api/tile/multi/Image:1").status_code == 200
-            mock_fc.list_sources.assert_not_called()
+            mock_fc.query_sources.assert_not_called()
             # Two describes, no listing: the structural fetch this route makes
             # per request by contract, and the pyramid ladder -- which this
             # source pays for on every tile because it publishes no content
@@ -2534,7 +2558,7 @@ class TestTileResolutionCostsOneFetch:
             mock_fc.reset_mock()
             body = tc.get("/api/tile_info/tiled").json()
             assert body["array_id"].startswith("tiled@")
-            mock_fc.list_sources.assert_not_called()
+            mock_fc.query_sources.assert_not_called()
 
     def test_the_published_id_carries_the_qualified_tensor(self):
         # First contact ends the ambiguity: tile_info hands back the qualified
@@ -2543,7 +2567,7 @@ class TestTileResolutionCostsOneFetch:
             array_id = _published_array_id(tc)
             mock_fc.reset_mock()
             assert tc.get(f"/api/tile/{array_id}").status_code == 200
-            mock_fc.list_sources.assert_not_called()
+            mock_fc.query_sources.assert_not_called()
 
     def test_a_dead_backend_is_a_502_not_a_404(self):
         # The fetch now owns the 404, so its except clause must not swallow a

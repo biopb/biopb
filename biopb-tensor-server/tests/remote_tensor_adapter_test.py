@@ -2449,26 +2449,21 @@ def test_fetch_upstream_catalog_none_on_no_sql_catalog():
     assert complete is False
 
 
-def test_fallback_warning_names_the_upstream_from_its_location_argument(caplog):
-    """The upstream is named from the caller's endpoint, not from the SDK client's
-    private ``_location`` (biopb/biopb#529). The fake declares no such attribute,
-    so a reintroduced probe degrades the warning to "?" and fails this test."""
-    import logging
+def test_id_enumeration_raises_rather_than_degrading():
+    """A catalog-less upstream surfaces as the error it is.
 
+    The only fallback there ever was is ``list_sources()``, which in protocol v2
+    runs this same query -- so it could only fail identically, and pretending
+    otherwise reported a truncated mirror as a complete one.
+    """
     from biopb_tensor_server.adapters.remote_tensor import list_upstream_source_ids
 
     class _FakeClient:
         def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("no metadata DB")
 
-        def list_sources(self):
-            return {"a": object()}
-
-    with caplog.at_level(logging.WARNING):
-        ids, complete = list_upstream_source_ids(_FakeClient(), "grpc://lab:8815")
-
-    assert (ids, complete) == (["a"], False)
-    assert "grpc://lab:8815" in caplog.text
+    with pytest.raises(RuntimeError, match="no metadata DB"):
+        list_upstream_source_ids(_FakeClient(), "grpc://lab:8815")
 
 
 def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeypatch):
@@ -2488,9 +2483,6 @@ def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeyp
             pass
 
         def query_sources(self, *_a, **_k):
-            raise RuntimeError("channel is dead")
-
-        def list_sources(self):
             raise RuntimeError("upstream unreachable")
 
         def close(self):
