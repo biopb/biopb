@@ -259,11 +259,9 @@ try {
     . ([scriptblock]::Create((Resolve-EngineSource)))
 
     $BiopbHome  = $env:USERPROFILE
-    # Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
-    # pre-#34 install still counts as "a config exists" for the keep prompt.
+    # biopb.json is the only config format (biopb/biopb#34).
     $configDir  = Get-BiopbTree "BIOPB_CONFIG_HOME" ".config"
     $configFile = Join-Path $configDir "biopb.json"
-    $legacyConfig = Join-Path $configDir "biopb.toml"
 
     # ----- Resolve component choices (no longer prompted -- biopb/biopb#237) -----
 
@@ -283,7 +281,7 @@ try {
     # samples). Set $env:BIOPB_INSTALL_SAMPLES=0 to seed nothing.
     $dataDir = ""
     $keepConfig = $false
-    $configExists = (Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $legacyConfig)
+    $configExists = Test-Path -LiteralPath $configFile
     if ($configExists -and (-not $env:BIOPB_DATA_DIR)) {
         # Existing config, no override: keep it exactly as-is (upgrade fast path).
         $keepConfig = $true
@@ -291,8 +289,7 @@ try {
     }
     elseif ($configExists) {
         # BIOPB_DATA_DIR is a fresh-install override only; an existing config wins.
-        $existing = if (Test-Path -LiteralPath $configFile) { $configFile } else { $legacyConfig }
-        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $existing to apply it)."
+        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $configFile to apply it)."
         $keepConfig = $true
     }
     elseif ($env:BIOPB_DATA_DIR) {

@@ -174,16 +174,8 @@ alias = sys.argv[5] if len(sys.argv) > 5 else ""
 data = {}
 if prior and os.path.exists(prior):
     try:
-        if prior.endswith(".toml"):
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import tomli as tomllib  # 3.10 fallback
-            with open(prior, "rb") as fh:
-                data = tomllib.load(fh)
-        else:
-            with open(prior, encoding="utf-8") as fh:
-                data = json.load(fh)
+        with open(prior, encoding="utf-8") as fh:
+            data = json.load(fh)
     except Exception:
         # Unreadable/unparseable prior config: start clean rather than abort
         # the install. The new data dir is written either way.
@@ -1543,16 +1535,11 @@ install_biopb() {
     _step "[5/7] Config..."
 
     mkdir -p "$CONFIG_DIR"
-    CONFIG_FILE="$CONFIG_DIR/biopb.json"        # canonical format (biopb/biopb#34)
-    LEGACY_CONFIG="$CONFIG_DIR/biopb.toml"      # pre-#34 installs
+    CONFIG_FILE="$CONFIG_DIR/biopb.json"        # the only config format (biopb/biopb#34)
 
-    # An existing config in either format counts for the keep-vs-rewrite decision.
-    # biopb.json wins when both are present (matches the server's find_config).
     local EXISTING_CONFIG=""
     if [ -f "$CONFIG_FILE" ]; then
         EXISTING_CONFIG="$CONFIG_FILE"
-    elif [ -f "$LEGACY_CONFIG" ]; then
-        EXISTING_CONFIG="$LEGACY_CONFIG"
     fi
 
     # No data-directory prompt: a fresh install seeds the sample-image bundle and
@@ -1600,23 +1587,7 @@ install_biopb() {
     # or the untouched existing file when the user keeps it (shown in the summary).
     local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
-        # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
-        # convert it in place to the canonical JSON via `biopb-tensor-server
-        # migrate-config` (settings preserved verbatim, old file backed up to
-        # biopb.toml.bak) so an upgraded install stops warning about the
-        # deprecated format. A JSON config is already canonical -- nothing to do.
-        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] &&
-            command -v biopb-tensor-server >/dev/null 2>&1; then
-            _info "Migrating legacy TOML config to canonical JSON..."
-            if biopb-tensor-server migrate-config >/dev/null 2>&1; then
-                ACTIVE_CONFIG="$CONFIG_FILE"
-                _ok "Migrated config: $LEGACY_CONFIG -> $CONFIG_FILE (old file backed up)"
-            else
-                _warn "Could not migrate legacy config; keeping $LEGACY_CONFIG"
-            fi
-        else
-            _ok "Keeping current config: $EXISTING_CONFIG"
-        fi
+        _ok "Keeping current config: $EXISTING_CONFIG"
     else
         if [[ "$DATA_DIR" == *$'\n'* ]]; then
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"

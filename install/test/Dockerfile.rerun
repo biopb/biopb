@@ -18,21 +18,21 @@ RUN mkdir -p /root/.local/bin \
        > /root/.local/bin/biopb-tensor-server \
     && chmod +x /root/.local/bin/biopb-tensor-server
 
-# Pre-create config so step 5 says "preserved"
+# Pre-create config so step 5 says "preserved". file_max_total_gb is
+# deliberately NOT the installer default (32) -- assert.sh checks it survives,
+# which is what "keeps an existing config untouched" has to mean.
 RUN mkdir -p /root/.config/biopb && printf '%s\n' \
-    '[server]' \
-    'host = "127.0.0.1"' \
-    'port = 8815' \
-    '' \
-    '[cache]' \
-    'backend = "file"' \
-    'file_max_segment_mb = 256' \
-    'file_max_total_gb = 128' \
-    '' \
-    '[[sources]]' \
-    'url = "/data"' \
-    'monitor = true' \
-    > /root/.config/biopb/biopb.toml
+    '{' \
+    '  "cache": {' \
+    '    "backend": "file",' \
+    '    "file_max_segment_mb": 256,' \
+    '    "file_max_total_gb": 128' \
+    '  },' \
+    '  "sources": [' \
+    '    { "url": "/data", "monitor": true }' \
+    '  ]' \
+    '}' \
+    > /root/.config/biopb/biopb.json
 
 # Pre-create a webapp version marker so step 4 says "already up to date"
 RUN mkdir -p /root/.local/share/biopb/webapp \
