@@ -966,10 +966,37 @@ class TestResolveAction:
             worker.finished.emit()
         assert w._resolve_workers == set()
 
-    def test_multifile_resolve_starts_warm(self, widget, monkeypatch):
-        # Resolving a multi-file (dir-backed) source starts hydrate-ahead directly
-        # -- no confirmation dialog (biopb/biopb#202); a plain single-file one
-        # (test above) does not.
+    def test_multifile_resolve_does_not_start_warm(self, widget, monkeypatch):
+        """Hydrate-ahead (biopb/biopb#202) is gated off, so a resolve that lands
+        on a multi-file source leaves the recall to the read path.
+
+        An unattended bulk recall spends the server's page cache on bytes warm
+        does not use: the chunk cache is mmap-served, so warming a >RAM source
+        evicts the segments serving every other source (biopb/biopb#1043).
+        """
+        w, started = self._arm(
+            widget,
+            monkeypatch,
+            accept=True,
+            outcome=(
+                "resolved",
+                _source("cloud_x", tensors=["cloud_x"], source_type="zarr"),
+            ),
+        )
+        w._warm_source = MagicMock()
+        w._resolve_source("cloud_x")
+        w._warm_source.assert_not_called()
+
+    def test_the_gate_is_the_only_thing_stopping_the_warm(self, widget, monkeypatch):
+        """Flipping _AUTO_WARM_AFTER_RESOLVE back on restores hydrate-ahead.
+
+        Pins that the path is gated, not dismantled: the multi-file check and the
+        call it guards are still wired, so re-enabling is the one-line flip it
+        looks like.
+        """
+        from biopb_mcp.tensor_browser import _widget as widget_mod
+
+        monkeypatch.setattr(widget_mod, "_AUTO_WARM_AFTER_RESOLVE", True)
         w, started = self._arm(
             widget,
             monkeypatch,

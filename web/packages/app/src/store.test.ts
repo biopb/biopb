@@ -1388,10 +1388,11 @@ describe("resolve / warm jobs", () => {
     expect(useAppStore.getState().sourceJobs["warm:cloud0"]?.state).toBe("running");
   });
 
-  it("auto-warms once a resolve lands, with no second confirmation", async () => {
-    // Matching napari: the user already consented to the expensive part. And
-    // unconditionally -- the server answers "is there anything to warm"
-    // structurally, so this side keeps no list of multi-file source types.
+  it("re-reads the catalog when a resolve lands, and warms nothing", async () => {
+    // Hydrate-ahead is gated off (biopb/biopb#1043): the server's chunk cache is
+    // mmap-served, so an unattended warm of a >RAM source evicts the segments
+    // serving every other source. The stale-row reload still runs -- the row
+    // still lists the pre-resolve tensors the moment a resolve lands.
     const listSources = vi.fn().mockResolvedValue([]);
     const startWarm = vi.fn().mockResolvedValue(status({ kind: "warm" }));
     const client = {
@@ -1406,13 +1407,15 @@ describe("resolve / warm jobs", () => {
 
     await useAppStore.getState().startResolve("cloud0");
     await vi.waitFor(
-      () => expect(useAppStore.getState().sourceJobs["warm:cloud0"]).toBeDefined(),
+      () =>
+        expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe(
+          "done",
+        ),
       { timeout: 3000 },
     );
-    // The row is stale the moment a resolve lands -- it still lists the
-    // pre-resolve tensors -- so the catalog is re-read before the warm starts.
     expect(listSources).toHaveBeenCalled();
-    expect(startWarm).toHaveBeenCalledWith("cloud0");
+    expect(startWarm).not.toHaveBeenCalled();
+    expect(useAppStore.getState().sourceJobs["warm:cloud0"]).toBeUndefined();
   });
 
   it("does not auto-warm a resolve that failed or was cancelled", async () => {
