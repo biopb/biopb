@@ -24,6 +24,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -192,6 +193,8 @@ _RESOLVE_HEARTBEAT_SECONDS = 15.0
 # resolve heartbeat cadence.
 _WARM_READ_BLOCK_BYTES = 8 * 1024 * 1024
 _WARM_PROGRESS_MIN_INTERVAL = 0.5
+_WARM_MAX_WORKERS = 4
+_WARM_POLL_SECONDS = 0.1
 
 
 class _AuthMiddleware(flight.ServerMiddleware):
@@ -1119,12 +1122,12 @@ class TensorFlightServer(flight.FlightServerBase):
         cross the wire, only the ``WarmStreamMessage`` progress.
 
         Unlike ``resolve`` (one opaque blocking call wrapped on a daemon thread),
-        warming is our own loop, so it runs inline in this generator: progress is
-        yielded between files (throttled to ``_WARM_PROGRESS_MIN_INTERVAL``) and
-        ``context.is_cancelled()`` is polled between files and read blocks, so a
-        client closing the stream halts the recall promptly. Warming is a pure
-        side-effect (residency), so a cancel genuinely stops -- there is no result
-        to preserve.
+        warming is our own loop, so it runs inline in this generator: a bounded
+        worker pool recalls files concurrently while the generator polls for
+        cancellation and emits progress (throttled to
+        ``_WARM_PROGRESS_MIN_INTERVAL``). Warming is a pure side-effect
+        (residency), so a cancel genuinely stops -- there is no result to
+        preserve.
 
         Properties:
         - **No-op for single-file sources** -- their one file was already
@@ -1174,7 +1177,14 @@ class TensorFlightServer(flight.FlightServerBase):
 
         started = time.monotonic()
         last_yield = 0.0
-        buf = bytearray(_WARM_READ_BLOCK_BYTES)
+        progress_lock = threading.Lock()
+        cancel_event = threading.Event()
+        progress_state = {
+            "files_done": 0,
+            "bytes_done": 0,
+            "current_name": "",
+        }
+        worker_local = threading.local()
 
         def _progress(
             files_total: int,
@@ -1193,6 +1203,52 @@ class TensorFlightServer(flight.FlightServerBase):
                     elapsed_seconds=time.monotonic() - started,
                 )
             ).SerializeToString()
+
+        def _snapshot() -> Tuple[int, int, str]:
+            with progress_lock:
+                return (
+                    progress_state["files_done"],
+                    progress_state["bytes_done"],
+                    progress_state["current_name"],
+                )
+
+        def _read_file(fpath: str) -> None:
+            """Read one file, updating the shared warm progress snapshot."""
+            if cancel_event.is_set():
+                return
+
+            name = os.path.basename(fpath)
+            with progress_lock:
+                # A cancellation can race with a worker being scheduled. Do not
+                # open a new file once the main loop has observed cancellation.
+                if cancel_event.is_set():
+                    return
+                progress_state["current_name"] = name
+
+            try:
+                # Each executor worker owns and reuses its buffer: sharing the
+                # old single buffer would race readinto() calls and corrupt the
+                # byte tally.
+                buf = getattr(worker_local, "buf", None)
+                if buf is None:
+                    buf = bytearray(_WARM_READ_BLOCK_BYTES)
+                    worker_local.buf = buf
+                with open(fpath, "rb", buffering=0) as fh:
+                    while not cancel_event.is_set():
+                        n = fh.readinto(buf)
+                        if not n:
+                            break
+                        # current_name was already set above; re-stamping it on
+                        # every block would retake the lock for no new value and
+                        # serialize the fast path -- already-resident files that
+                        # read fast enough for 4 workers to contend on this lock.
+                        with progress_lock:
+                            progress_state["bytes_done"] += n
+            except OSError as exc:
+                logger.warning("warm: skipping %s: %s", fpath, exc)
+            finally:
+                with progress_lock:
+                    progress_state["files_done"] += 1
 
         try:
             # Warming registers as in-flight activity so the precache worker parks.
@@ -1236,42 +1292,71 @@ class TensorFlightServer(flight.FlightServerBase):
                 yield _progress(files_total, files_done, bytes_total, bytes_done, "")
 
                 # 3. Recall loop: read every file to completion (forces residency).
-                for _size, fpath in entries:
+                # Keep only one batch of work per worker in flight. Besides
+                # bounding threads, fds, and per-worker buffers, this preserves
+                # the existing smallest-files-first launch order without queuing
+                # tens of thousands of futures in the executor.
+                pending = set()
+                next_entry = 0
+
+                def _check_cancel() -> None:
                     if context.is_cancelled():
-                        break
-                    name = os.path.basename(fpath)
+                        cancel_event.set()
+
+                with ThreadPoolExecutor(max_workers=_WARM_MAX_WORKERS) as pool:
+
+                    def _refill() -> None:
+                        nonlocal next_entry
+                        while (
+                            not cancel_event.is_set()
+                            and len(pending) < _WARM_MAX_WORKERS
+                            and next_entry < files_total
+                        ):
+                            fpath = entries[next_entry][1]
+                            next_entry += 1
+                            pending.add(pool.submit(_read_file, fpath))
+
                     try:
-                        with open(fpath, "rb", buffering=0) as fh:
-                            while True:
-                                if context.is_cancelled():
-                                    break
-                                n = fh.readinto(buf)
-                                if not n:
-                                    break
-                                bytes_done += n
-                                now = time.monotonic()
-                                if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
-                                    last_yield = now
-                                    yield _progress(
-                                        files_total,
-                                        files_done,
-                                        bytes_total,
-                                        bytes_done,
-                                        name,
-                                    )
-                    except OSError as exc:
-                        logger.warning("warm: skipping %s: %s", fpath, exc)
-                    files_done += 1
-                    now = time.monotonic()
-                    if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
-                        last_yield = now
-                        yield _progress(
-                            files_total,
-                            files_done,
-                            bytes_total,
-                            bytes_done,
-                            name,
-                        )
+                        _check_cancel()
+                        _refill()
+
+                        while pending:
+                            _check_cancel()
+
+                            completed, pending = wait(
+                                pending,
+                                timeout=_WARM_POLL_SECONDS,
+                                return_when=FIRST_COMPLETED,
+                            )
+                            for future in completed:
+                                future.result()
+
+                            _check_cancel()
+                            _refill()
+
+                            now = time.monotonic()
+                            if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
+                                last_yield = now
+                                done_files, done_bytes, current_name = _snapshot()
+                                yield _progress(
+                                    files_total,
+                                    done_files,
+                                    bytes_total,
+                                    done_bytes,
+                                    current_name,
+                                )
+
+                        # The executor has no queued work here. Shutdown still
+                        # joins any read that was in progress before cancellation.
+                        done_files, done_bytes, current_name = _snapshot()
+                        files_done = done_files
+                        bytes_done = done_bytes
+                    finally:
+                        # A client may close the generator at a progress yield.
+                        # Set the flag before the `with` block joins the
+                        # executor's in-flight workers so they stop before
+                        # opening another file.
+                        cancel_event.set()
 
                 # 4. Terminal done (partial counts if cancelled mid-loop).
                 yield WarmStreamMessage(
