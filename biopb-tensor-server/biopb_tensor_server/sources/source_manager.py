@@ -768,22 +768,37 @@ class SourceManager:
             entry.pending_scan = False
             return True
 
-        age = time.time() - entry.last_changed
-        if age < self._stability_window:
-            return False
-
-        if entry.stable_observations < self._stable_rescans_required:
-            return False
-
-        if (
-            not entry.is_directory
-            and self._probe_open_files
-            and not self._can_open_for_append(Path(resolved_str))
-        ):
+        if self._is_settling(entry, resolved_str):
             return False
 
         entry.pending_scan = False
         return True
+
+    def _is_settling(self, entry: EntryState, resolved_str: str) -> bool:
+        """True while *entry* has not yet passed the stability checks that gate
+        claiming: signature age, repeat-observation count, and (for a file) the
+        append probe.
+
+        Shared by the stability gate (:meth:`_should_scan_resolved`) and the
+        removal shield (:meth:`_get_unstable_paths`) so a claim the gate is
+        still waiting on can never be silently treated as gone for a reason the
+        gate itself considers "not yet, not never" -- see biopb/biopb#1042,
+        where the append probe alone was condition 6 of the gate but was missing
+        from the shield, so a file that failed the probe was deregistered
+        instead of held pending.
+        """
+        age = time.time() - entry.last_changed
+        if age < self._stability_window:
+            return True
+
+        if entry.stable_observations < self._stable_rescans_required:
+            return True
+
+        return (
+            not entry.is_directory
+            and self._probe_open_files
+            and not self._can_open_for_append(Path(resolved_str))
+        )
 
     def _can_open_for_append(self, path: Path) -> bool:
         """Best-effort probe that a file is not obviously blocked for append.
@@ -791,19 +806,31 @@ class SourceManager:
         This is not a reliable active-writer detector on POSIX filesystems.
         Stability gating still primarily relies on signature age and repeated
         unchanged rescans rather than this probe alone.
+
+        A file the server can read but not write (shared storage owned by
+        another user, a read-only mount, deliberately chmod'd archival data)
+        answers ``PermissionError`` here, which is not the busy-writer signal
+        this probe is trying to detect -- treated as open-able (biopb/biopb#1042).
         """
         try:
             with open(path, "a"):
                 return True
+        except PermissionError:
+            return True
         except OSError:
             return False
 
     def _get_unstable_paths(self) -> List[Path]:
-        """Return unstable files/directories observed in the latest refresh."""
-        now = time.time()
+        """Return files/directories the stability gate has not yet admitted.
+
+        Mirrors :meth:`_should_scan_resolved` via the shared :meth:`_is_settling`
+        predicate, rather than re-checking just the signature-age condition, so
+        a claim the gate is withholding for any of its reasons is shielded from
+        removal instead of deregistered.
+        """
         unstable = []
         for path_str, entry in self._entry_states.items():
-            if now - entry.last_changed < self._stability_window:
+            if self._is_settling(entry, path_str):
                 unstable.append(Path(path_str))
         return unstable
 
