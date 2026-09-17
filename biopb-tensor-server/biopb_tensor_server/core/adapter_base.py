@@ -243,10 +243,10 @@ class SourceAdapter(ABC):
     _source_type: Optional[str] = None  # Source type identifier
     _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
 
-    # Optional per-source capability token. When set, the Flight server requires
-    # callers to present a matching Bearer token to read this source (see
-    # ``TensorFlightServer._authorize``). None = no per-source gate (falls
-    # back to the server-wide token). Only the result-cache adapter sets it;
+    # Optional per-source capability token. When set, reading this source takes
+    # either it or the server-wide token (``TensorFlightServer._authorize_read``).
+    # None = no per-source gate (falls back to the server-wide rule). Only the
+    # result-cache adapter sets it;
     # the base default keeps the ``capability_token`` property
     # total for every other adapter.
     _capability_token: Optional[str] = None
@@ -315,9 +315,12 @@ class SourceAdapter(ABC):
     def capability_token(self) -> Optional[str]:
         """Per-source capability token, or None for the server-wide auth fallback.
 
-        When set, the Flight server requires a matching Bearer token to read
-        this source's pixels and annotations (``TensorFlightServer._authorize``);
-        the catalog row stays public. The result-cache adapter sets it -- either from
+        A *narrow grant*, never a replacement: it opens this source's pixels and
+        annotations to a holder with no server-wide token, and the server-wide
+        token still opens them too (``TensorFlightServer._authorize_read``). It
+        grants reads only -- writes, ``resolve`` and ``warm`` take full access,
+        because their cost is not scoped to this source. The catalog row stays
+        public either way. The result-cache adapter sets it -- either from
         inside the adapter or, for an externally-granted capability (the embedded
         tensor cache mints a per-result token), through the setter below. Assign
         via this property, never the backing ``_capability_token`` field: the

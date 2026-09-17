@@ -183,8 +183,12 @@ body and returns a small JSON ack, matching `upload_status`’s convention.
    restriction for v1. (RMW-by-slice via zarr is nearly free, so prefer full
    RMW.)
 3. TTL/eviction policy and default scratch-dir location + disk-budget cap.
-4. Authorization: reuse the per-source capability token
-   (`CachedSourceAdapter.token`) so only the creator can write/delete a scratch
-   source.
+4. Authorization: **not** by reusing the per-source capability token, which was
+   this doc's original suggestion. A capability grants *reads* of one source and
+   nothing else (biopb/biopb#1048): writes take full access, because a narrow
+   grant must not authorize an operation whose cost is not scoped to the object
+   it names. "Only the creator may write" is an upload *session* — a lifecycle
+   object with an explicit `finish`, not a credential — which is that issue's
+   step 3.
 5. Crash cleanup: orphaned scratch dirs after an unclean shutdown — sweep on
    startup using a manifest or dir naming convention.
