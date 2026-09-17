@@ -414,6 +414,80 @@ class TestSourceManagerRegressions:
         assert server.unregistered == [source_id]
         assert server._metadata_db.removed == [source_id]
 
+    def test_probe_open_files_does_not_refuse_a_read_only_file(self, tmp_path):
+        """biopb/biopb#1042: PermissionError from the append probe is not the
+        busy-writer signal it's trying to detect, so a file the server can read
+        but not write must still be discovered."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+        os.chmod(data_path, 0o444)
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=True,
+        )
+
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+
+    def test_probe_open_files_shields_a_newly_read_only_file_from_removal(
+        self, tmp_path, monkeypatch
+    ):
+        """biopb/biopb#1042: the append probe was condition 6 of the stability
+        gate but was missing from the removal shield, so a file that later loses
+        write permission was deregistered instead of held pending forever."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            stability_window=30.0,
+            probe_open_files=True,
+        )
+
+        base_time = time.time()
+        clock = {"now": base_time}
+        monkeypatch.setattr(
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+        clock["now"] = base_time + 31.0
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+
+        os.chmod(data_path, 0o444)
+        # Outlive the chmod's ctime bump so the signature settles again while
+        # the file stays permanently unwritable.
+        clock["now"] = base_time + 62.0
+        manager._handle_rescan()
+        clock["now"] = base_time + 93.0
+        manager._handle_rescan()
+
+        assert source_id in state.claims
+        assert server.unregistered == []
+
     def test_first_rescan_does_not_cycle_unchanged_sources(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
