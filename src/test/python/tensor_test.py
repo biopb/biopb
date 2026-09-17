@@ -24,7 +24,7 @@ class TestTensorFlightClient:
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
         # Upload lifecycle lives in the UploadSession collaborator (#278 item C),
         # so the _pb conveniences resolve status through client._upload -- mock there.
-        client._upload.get_upload_status = Mock(
+        client._catalog.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "PENDING",
@@ -40,12 +40,12 @@ class TestTensorFlightClient:
         finally:
             client.close()
 
-        client._upload.get_upload_status.assert_called_once_with("cache_test")
+        client._catalog.get_upload_status.assert_called_once_with("cache_test")
         assert status["state"] == "PENDING"
 
     def test_wait_for_upload_ready_pb_returns_when_ready(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
+        client._catalog.get_upload_status = Mock(
             side_effect=[
                 {
                     "source_id": "cache_test",
@@ -74,11 +74,11 @@ class TestTensorFlightClient:
             client.close()
 
         assert status["state"] == "READY"
-        assert client._upload.get_upload_status.call_count == 2
+        assert client._catalog.get_upload_status.call_count == 2
 
     def test_wait_for_upload_ready_pb_times_out(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
+        client._catalog.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "PENDING",
@@ -109,7 +109,7 @@ class TestTensorFlightClient:
         full timeout before raising a misleading TimeoutError.
         """
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
+        client._catalog.get_upload_status = Mock(
             return_value={
                 "source_id": "ome-tiff_abc123",
                 "state": "UNKNOWN",
@@ -136,7 +136,7 @@ class TestTensorFlightClient:
             client.close()
 
         assert elapsed < 1.0
-        assert client._upload.get_upload_status.call_count == 1
+        assert client._catalog.get_upload_status.call_count == 1
 
     def test_wait_for_upload_ready_pb_stops_if_the_record_disappears(self):
         """A tracked upload whose record vanishes mid-poll also fails fast.
@@ -146,7 +146,7 @@ class TestTensorFlightClient:
         UNKNOWN on the first poll.
         """
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
+        client._catalog.get_upload_status = Mock(
             side_effect=[
                 {
                     "source_id": "cache_test",
@@ -175,7 +175,7 @@ class TestTensorFlightClient:
         finally:
             client.close()
 
-        assert client._upload.get_upload_status.call_count == 2
+        assert client._catalog.get_upload_status.call_count == 2
 
     def test_get_upload_status_pb_requires_array_id(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
@@ -193,7 +193,7 @@ class TestTensorFlightClient:
         """DISCARDED is terminal, so the poll ends on it -- carrying the reason,
         which is the only thing distinguishing it from a source that failed."""
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
+        client._catalog.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "DISCARDED",

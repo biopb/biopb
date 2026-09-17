@@ -16,6 +16,7 @@ from ``biopb.tensor.client``.
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -77,6 +78,7 @@ from biopb.tensor.descriptor_pb2 import (
     SliceHint,
     TensorDescriptor,
     TensorReadOption,
+    UploadStatus as UploadStatusPb,
     WarmProgress,
     WarmStreamMessage,
 )
@@ -168,6 +170,22 @@ class ResolveCancelled(Exception):
     """
 
 
+def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
+    """The answer for a source the server tracks no upload for.
+
+    Mirrors the server's own ``unknown_upload_status`` so the two ends agree on
+    the shape, and never means "not started yet": the record exists from the
+    moment ``create_source`` hands out the id.
+    """
+    return {
+        "source_id": source_id,
+        "state": "UNKNOWN",
+        "expected_chunks": 0,
+        "uploaded_chunks": 0,
+        "reason": "",
+    }
+
+
 def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
     """Return the cacheable part of ``desc``: structure plus physical scale.
 
@@ -183,6 +201,9 @@ def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
       rich when a caller happened to ask, poor when the entry came from
       ``list_flights``, which never fills it. A reader could not tell a
       genuinely pyramid-less tensor from one cached before anyone asked.
+    - ``upload_status`` is live state, not structure. A cached ``PENDING``
+      would shadow the ``READY`` a later poll came for, turning the one field
+      whose whole purpose is freshness into the stalest thing in the session.
     - ``chunk_shape`` is now exactly the same shape of problem: the server
       answers the transfer grid only on ``GetFlightInfo``, for the tensor it
       bound, and leaves it empty on every ``list_flights`` entry. Caching it
@@ -199,6 +220,7 @@ def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
     lean.ClearField("metadata_json")
     lean.ClearField("pyramid")
     lean.ClearField("chunk_shape")
+    lean.ClearField("upload_status")
     return lean
 
 
@@ -905,6 +927,107 @@ class CatalogClient:
                 "(server closed the stream without a 'done')"
             )
         return done
+
+    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
+        """Backs TensorFlightClient.get_upload_status; see that method for the full
+        documentation.
+
+        A describe-only ``GetFlightInfo``, not an action: ``do_action`` takes
+        the server-wide token, while the caller waiting on a fast-return result
+        holds a per-source read capability and nothing else (biopb/biopb#1048).
+        Describe-only also means the server skips the O(chunks) endpoint
+        enumeration, so a poll is one small round trip.
+
+        Lives here rather than on ``UploadSession`` because it stopped being an
+        upload operation: it is a read of one field of a descriptor, which is
+        this class's primitive.
+        """
+        try:
+            desc = self._fetch_tensor_descriptor(source_id)
+        except flight.FlightError:
+            # An id the server does not serve at all. UNKNOWN already means
+            # "no upload record here -- never was, or it has been reclaimed",
+            # and an unregistered source is the strongest form of that, so it
+            # is the same answer rather than a transport error. `describe`
+            # would raise; this caller asked a narrower question.
+            return _unknown_upload_status(source_id)
+        if not desc.HasField("upload_status"):
+            # Registered, but not an upload -- an ordinary catalog source.
+            # Distinct from PENDING, and no amount of polling moves it
+            # (biopb/biopb#109).
+            return _unknown_upload_status(source_id)
+        status = desc.upload_status
+        return {
+            "source_id": source_id,
+            "state": UploadStatusPb.State.Name(status.state),
+            "expected_chunks": status.expected_chunks,
+            "uploaded_chunks": status.uploaded_chunks,
+            "reason": status.reason,
+        }
+
+    def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
+        """Backs TensorFlightClient.get_upload_status_pb; see that method for the full
+        documentation."""
+        source_id = pb.tensor_descriptor.array_id
+        if not source_id:
+            raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
+        return self.get_upload_status(source_id)
+
+    def wait_for_upload_ready(
+        self,
+        source_id: str,
+        timeout_seconds: float = 60.0,
+        poll_interval_seconds: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Backs TensorFlightClient.wait_for_upload_ready; see that method for the full
+        documentation."""
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            status = self.get_upload_status(source_id)
+            state = status.get("state")
+            if state == "READY":
+                return status
+            if state == "UNKNOWN":
+                # Nothing to wait for, so fail now instead of polling to the
+                # timeout (biopb/biopb#109). The server records upload progress
+                # when create_source() hands out the id, so UNKNOWN never means
+                # "not started yet" -- it means there is no upload record at
+                # all, which no amount of polling will change.
+                raise ValueError(
+                    f"The server tracks no upload for source '{source_id}' "
+                    "(not an upload target, or its record was dropped by a "
+                    "server restart or source removal)."
+                )
+            if state == "DISCARDED":
+                # The owner gave up on this upload (biopb/biopb#1). Terminal, so
+                # it is a prompt answer rather than a poll to the timeout -- and
+                # the reason is the whole point of reporting it.
+                reason = status.get("reason") or "no reason given"
+                raise RuntimeError(
+                    f"Upload discarded for source '{source_id}': {reason}"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for upload readiness for source '{source_id}'"
+                )
+            time.sleep(poll_interval_seconds)
+
+    def wait_for_upload_ready_pb(
+        self,
+        pb: SerializedTensor,
+        timeout_seconds: float = 60.0,
+        poll_interval_seconds: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Backs TensorFlightClient.wait_for_upload_ready_pb; see that method for the full
+        documentation."""
+        source_id = pb.tensor_descriptor.array_id
+        if not source_id:
+            raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
+        return self.wait_for_upload_ready(
+            source_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
 
     def is_resident(
         self, source_ids: Optional[Iterable[str]] = None

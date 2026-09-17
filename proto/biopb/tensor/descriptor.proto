@@ -130,6 +130,15 @@ message TensorDescriptor {
   // aligned 1:1 with physical_scale. "" means unknown.
   repeated string physical_unit = 12;
 
+  // How far the upload backing this tensor has got, when one does; unset for
+  // every ordinary (file-backed) source. Populated only by GetFlightInfo, like
+  // `pyramid` and `physical_scale`, and left empty in the catalog.
+  //
+  // Safe to carry on a descriptor where residency was not (biopb/biopb#1035):
+  // upload state is monotonic and terminal, so a stale copy only lags -- it
+  // never reports READY before it is.
+  UploadStatus upload_status = 15;
+
   // 13 was chunk_array_id, the compact-grid read plan (biopb/biopb#346); removed
   // when the chunk_id codec was made a strictly server-side concern (the client
   // no longer regenerates chunk_ids). Reserved so the field number/name are never
@@ -184,6 +193,39 @@ message PyramidLevel {
 }
 
 // Specifies a sub-region of the tensor for filtered endpoint discovery
+// How far the upload backing a tensor has got.
+//
+// Reported on the descriptor GetFlightInfo returns rather than by an action,
+// because `do_action` takes full access while GetFlightInfo is source-scoped:
+// a holder of the per-source read capability the fast-return path hands out
+// must be able to poll its own result to READY (biopb/biopb#1048).
+message UploadStatus {
+  enum State {
+    // Never sent. Present so a client meeting an unknown state reads it as
+    // "I do not know this" rather than as PENDING.
+    STATE_UNSPECIFIED = 0;
+    // Chunks are still arriving, or the writer has not sealed the upload.
+    PENDING = 1;
+    // Sealed: everything the writer intended to send has landed.
+    READY = 2;
+    // Given up on, terminal. `reason` says why.
+    DISCARDED = 3;
+  }
+  State state = 1;
+
+  // The chunk grid declared at create time.
+  int64 expected_chunks = 2;
+
+  // Distinct chunks that have landed; frozen at the count reached once
+  // DISCARDED.
+  int64 uploaded_chunks = 3;
+
+  // Why the upload was discarded; empty otherwise. Consumer-facing -- it is a
+  // message to whoever was waiting on the result, not a log line, so a
+  // producer should not put a raw traceback in it.
+  string reason = 4;
+}
+
 message SliceHint {
   // Start indices (per dimension)
   repeated int64 start = 1;

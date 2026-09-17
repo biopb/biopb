@@ -58,12 +58,14 @@ from biopb.tensor.descriptor_pb2 import (
     ResolveProgress,
     ResolveStreamMessage,
     TensorDescriptor,
+    UploadStatus as UploadStatusPb,
     WarmProgress,
     WarmStreamMessage,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, PutCommand, TensorTicket
 from google.protobuf.message import DecodeError, Message
 
+from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -246,6 +248,39 @@ class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
         bearer = values[0] if values else ""
         provided = bearer[len("Bearer ") :] if bearer.startswith("Bearer ") else None
         return _AuthMiddleware(provided)
+
+
+def _fill_upload_status(
+    desc: TensorDescriptor, upload: UploadProgress, source_id: str
+) -> None:
+    """Copy an upload's live progress onto the descriptor GetFlightInfo returns.
+
+    Read from the record at response time and stored nowhere: the value is
+    monotonic and terminal, so shipping a copy is safe in a way a persisted
+    residency column was not (biopb/biopb#1035), but there is still no reason
+    for a second home for it.
+
+    An unrecognized state is left unset rather than guessed at, so a client
+    reads "I do not know" instead of a wrong PENDING.
+    """
+    status = upload.as_status_dict(source_id)
+    state = _UPLOAD_STATES.get(status["state"])
+    if state is None:
+        return
+    desc.upload_status.state = state
+    desc.upload_status.expected_chunks = int(status["expected_chunks"])
+    desc.upload_status.uploaded_chunks = int(status["uploaded_chunks"])
+    desc.upload_status.reason = status.get("reason") or ""
+
+
+#: ``UploadStatus.state`` strings -> the wire enum. UNKNOWN is deliberately
+#: absent: it is what the manager says about a source tracking no upload, and
+#: such a source leaves the whole field unset instead.
+_UPLOAD_STATES = {
+    "PENDING": UploadStatusPb.PENDING,
+    "READY": UploadStatusPb.READY,
+    "DISCARDED": UploadStatusPb.DISCARDED,
+}
 
 
 def _roi_source_id(array_id: str) -> str:
@@ -879,7 +914,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 "create_source",
                 "Create a writable source from a TensorDescriptor request",
             ),
-            flight.ActionType("upload_status", "Upload status for a writable source"),
             flight.ActionType(
                 "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
             ),
@@ -978,10 +1012,6 @@ class TensorFlightServer(flight.FlightServerBase):
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
             response_desc = self.uploads.create_source(req_desc)
             yield response_desc.SerializeToString()
-        elif action.type == "upload_status":
-            self._authorize(context)
-            source_id = action.body.to_pybytes().decode("utf-8")
-            yield json.dumps(self.uploads.status(source_id)).encode("utf-8")
         elif action.type == "chunk_locate":
             ticket_bytes = action.body.to_pybytes()
             ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
@@ -1676,6 +1706,21 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightInternalError(
                 f"Metadata error for {source_id}: {e}"
             ) from e
+
+        # Upload progress, for a source that is one. Here rather than in an
+        # action because `do_action` takes full access, and the caller waiting
+        # on a fast-return result holds a per-source read capability and
+        # nothing else (biopb/biopb#1048). Describe-only
+        # (`with_read_plan=false`) makes the poll cheap: no endpoint
+        # enumeration, so this is the only work a poll does.
+        #
+        # A discarded source answers too. The adapter stays registered as a
+        # tombstone and describe is not a chunk read, so it never reaches
+        # `_refuse_if_discarded` -- a poller learns the reason instead of
+        # meeting a dead call.
+        upload = upload_of(self.sources.get(source_id))
+        if upload is not None:
+            _fill_upload_status(read_plan.descriptor, upload, source_id)
 
         # Convert to FlightEndpoints. Each endpoint carries the server-minted
         # chunk_id as an opaque ticket and the chunk's bounds as app_metadata;
