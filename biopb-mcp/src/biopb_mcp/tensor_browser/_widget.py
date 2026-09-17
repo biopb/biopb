@@ -246,13 +246,15 @@ _WARM_INDETERMINATE = -1.0
 # badge and residency glyph render on top unchanged.
 _WARM_FILL = QColor(64, 132, 223, 60)
 
-# Hydrate-ahead after a resolve, off. A resolve means "read this source", not
-# "recall the whole pyramid", and warm only guarantees *disk* residency: on a
-# source larger than RAM the coarse levels it reads first are also the first
-# evicted, so the recall buys a latency it cannot keep (biopb/biopb#1043).
-# Nothing portable holds them either -- Windows has no `posix_fadvise`, and
-# Windows is where the synced-folder sources this serves actually live. The
-# context menu's "Hydrate all files…" is unaffected: named, visible, cancellable.
+# Hydrate-ahead after a resolve, off. The chunk cache serves its segments by
+# mmap, so warming a source larger than RAM walks the whole page-cache LRU and
+# evicts the segments serving every *other* source -- for bytes warm never even
+# uses, since the read only exists to make the sync client write to disk. It
+# does not keep its own coarse levels either, and nothing portable would: there
+# is no `posix_fadvise` on Windows, which is where the synced-folder sources
+# this serves live (biopb/biopb#1043). Flip back once warm has a retention
+# policy. The context menu's "Hydrate all files…" is unaffected -- named,
+# visible, cancellable, and bounded by a user watching it.
 _AUTO_WARM_AFTER_RESOLVE = False
 
 

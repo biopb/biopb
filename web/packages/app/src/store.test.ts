@@ -1389,10 +1389,10 @@ describe("resolve / warm jobs", () => {
   });
 
   it("re-reads the catalog when a resolve lands, and warms nothing", async () => {
-    // Hydrate-ahead is gated off (biopb/biopb#1043): warm guarantees disk
-    // residency, not page-cache warmth, so on a >RAM source the bulk recall
-    // cannot keep the latency it pays for. The stale-row reload still runs --
-    // the row still lists the pre-resolve tensors the moment a resolve lands.
+    // Hydrate-ahead is gated off (biopb/biopb#1043): the server's chunk cache is
+    // mmap-served, so an unattended warm of a >RAM source evicts the segments
+    // serving every other source. The stale-row reload still runs -- the row
+    // still lists the pre-resolve tensors the moment a resolve lands.
     const listSources = vi.fn().mockResolvedValue([]);
     const startWarm = vi.fn().mockResolvedValue(status({ kind: "warm" }));
     const client = {

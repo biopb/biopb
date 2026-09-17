@@ -500,12 +500,13 @@ const JOB_POLL_MS = 1000;
 /**
  * Hydrate-ahead after a resolve, off.
  *
- * A resolve means "read this source", not "recall the whole pyramid", and warm
- * only guarantees *disk* residency: on a source larger than RAM the coarse
- * levels it reads first are also the first evicted, so the recall buys a
- * latency it cannot keep (biopb/biopb#1043). Nothing portable holds them either
- * -- Windows has no `posix_fadvise`, and Windows is where the synced-folder
- * sources this serves actually live.
+ * The server's chunk cache serves its segments by mmap, so warming a source
+ * larger than RAM walks the whole page-cache LRU and evicts the segments
+ * serving every *other* source -- for bytes warm never even uses, since the
+ * read only exists to make the sync client write to disk. It does not keep its
+ * own coarse levels either, and nothing portable would: there is no
+ * `posix_fadvise` on Windows, which is where the synced-folder sources this
+ * serves live (biopb/biopb#1043). Flip back once warm has a retention policy.
  *
  * This is the SPA's only warm trigger, so while it is false `WarmTray` never
  * appears. Both stay wired and tested, ready for the flip.

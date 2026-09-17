@@ -970,9 +970,9 @@ class TestResolveAction:
         """Hydrate-ahead (biopb/biopb#202) is gated off, so a resolve that lands
         on a multi-file source leaves the recall to the read path.
 
-        Unattended bulk recall is what biopb/biopb#1043 makes expensive without
-        making it faster: warm guarantees disk residency, not page-cache warmth,
-        so on a >RAM source the coarse levels do not survive to the viewer.
+        An unattended bulk recall spends the server's page cache on bytes warm
+        does not use: the chunk cache is mmap-served, so warming a >RAM source
+        evicts the segments serving every other source (biopb/biopb#1043).
         """
         w, started = self._arm(
             widget,

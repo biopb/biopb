@@ -185,14 +185,15 @@ cites this §9 for why multi-file monoliths degrade rather than reconstruct.)
 - **No UI auto-warms after a resolve any more.** Both front ends used to start a
   hydrate-ahead as soon as a resolve landed (biopb/biopb#202); both now gate it
   off (`_AUTO_WARM_AFTER_RESOLVE` in the napari widget, `AUTO_WARM_AFTER_RESOLVE`
-  in the SPA store). `warm` guarantees *disk* residency, not page-cache warmth,
-  so on a source larger than RAM the coarse levels it reads first are also the
-  first evicted and the recall buys a latency it cannot keep
-  (biopb/biopb#1043) — and there is no portable way to hold them, Windows having
-  no `posix_fadvise` and Windows being where synced-folder sources actually live.
-  The napari context menu's "Hydrate all files…" still warms on request; the SPA
-  has no other trigger, so it does not warm at all. Reverse once warm has a
-  cache-retention policy that holds on Windows.
+  in the SPA store). The chunk cache serves its segments by mmap, so warming a
+  source larger than RAM walks the whole page-cache LRU and evicts the segments
+  serving every *other* source — for bytes `warm` never uses, since its read only
+  exists to make the sync client write to disk. It does not keep its own coarse
+  levels either (`warm` guarantees *disk* residency, not page-cache warmth), and
+  nothing portable would: Windows has no `posix_fadvise`, and Windows is where
+  synced-folder sources actually live (biopb/biopb#1043). The napari context
+  menu's "Hydrate all files…" still warms on request; the SPA has no other
+  trigger, so it does not warm at all. Reverse once `warm` has a retention policy.
 - **Cloud subtrees are walked only on a `force_full` rescan.**
   `TreeScanner._scan_tree_state` skips a cloud subtree on an incremental rescan
   (carrying cached claims forward) and re-walks it only on the periodic
