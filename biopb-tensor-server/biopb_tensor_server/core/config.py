@@ -240,7 +240,6 @@ _CONSTRAINTS = {
         ),
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
-        "stable_rescans_required": _Range(min=0),
         "handle_reaper_ttl": _Range(min=0),
     },
 }
@@ -888,21 +887,9 @@ class ServerConfig:
         default=30.0,
         metadata={
             "help": "Minimum quiet period before a path is eligible for discovery "
-            "or removal (seconds)."
-        },
-    )
-    stable_rescans_required: int = field(
-        default=0,
-        metadata={
-            "help": "Extra unchanged rescans required before a path is considered "
-            "stable (0 relies on the stability window alone)."
-        },
-    )
-    probe_open_files: bool = field(
-        default=True,
-        metadata={
-            "help": "Best-effort append-open probe to skip files still being "
-            "written (advisory)."
+            "or removal (seconds). Raise it above the interval at which a slow "
+            "acquisition touches its files, or a dataset can be claimed between "
+            "writes; it only ever delays, never drops."
         },
     )
     aggressive_dir_pruning: bool = field(
@@ -1397,13 +1384,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
     _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
-    _carry(
-        server_kwargs,
-        "stable_rescans_required",
-        server_data,
-        cast=lambda v: max(0, int(v)),
-    )
-    _carry(server_kwargs, "probe_open_files", server_data, cast=bool)
     _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)

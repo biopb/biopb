@@ -42,7 +42,8 @@ Each bucket maps to the #56 inventory item it relates to:
     direntry_stat ~1x/entry (was stat+lstat fan-out) -> items 1-2 (reuse stat; scandir)
     claim-walk stat/is_dir/is_file per probe (was    -> items 3-4 (cache is_dir; drive
         ~16x/entry, now ~0)                                claims from the snapshot)
-    builtin open() per stable file                   -> item 5 (scope the append probe)
+    builtin open() per stable file                   -> item 5 (was the append probe,
+        (now adapter reads only)                               since retired)
 
 Run:
     pytest benchmarks/scan_syscalls_test.py -s -v
@@ -191,7 +192,7 @@ class _SyscallCounter:
 
         os.scandir = scandir_wrapper
 
-        # --- builtin open (the append probe, _can_open_for_append) ---
+        # --- builtin open (adapter/sidecar reads in the claim phase) ---
         orig_open = builtins.open
         self._saved[("builtins", "open")] = orig_open
 
@@ -244,11 +245,10 @@ class _SyscallCounter:
 
 
 def _make_manager(root: Path) -> SourceManager:
-    """A SourceManager wired to scan ``root`` and probe everything immediately.
+    """A SourceManager wired to scan ``root`` and claim everything immediately.
 
-    ``stability_window=0`` + ``stable_rescans_required=0`` make every entry pass the
-    discovery gate on the first pass (so the claim walk actually probes the whole
-    tree); ``probe_open_files=True`` exercises the per-file append probe (#56 item 5);
+    ``stability_window=0`` makes every entry pass the discovery gate on the first
+    pass (so the claim walk actually probes the whole tree);
     ``full_rescan_interval=0`` forces the full sweep. ``server=None`` is safe: the two
     measured methods (``TreeScanner.scan`` and the snapshot-driven claim phase)
     never touch it — only reconcile/registration would, and we don't run that here.
@@ -257,12 +257,9 @@ def _make_manager(root: Path) -> SourceManager:
         server=None,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs={root},
         stability_window=0.0,
-        probe_open_files=True,
         full_rescan_interval=0.0,
-        stable_rescans_required=0,
     )
 
 

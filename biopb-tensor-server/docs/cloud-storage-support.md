@@ -198,8 +198,8 @@ cites this §9 for why multi-file monoliths degrade rather than reconstruct.)
   `TreeScanner._scan_tree_state` skips a cloud subtree on an incremental rescan
   (carrying cached claims forward) and re-walks it only on the periodic
   `force_full` pass. When walked, `_should_scan_resolved` **bypasses the stability
-  window and the open-for-append probe** — the probe opens the file (whole-file
-  recall on a placeholder), so skipping it is load-bearing, not an optimization.
+  window** — a placeholder's mtime is untrustworthy, so it could never age into
+  eligibility, and archived dehydrated data is never mid-write anyway.
 - **`cloud` controls gating only, not monitoring.** `cli.py` routes on `monitor`
   alone; a `monitor=false` cloud root is scanned once at startup via the
   static-expand path, which threads `admit_nonresident` + `cloud_root` from

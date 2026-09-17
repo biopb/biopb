@@ -231,7 +231,6 @@ class TestOrphanClockSeam:
             discovery_state=DiscoveryState(),
             monitored_dirs={tmp_path / "data"},
             stability_window=0.0,
-            probe_open_files=False,
             **kwargs,
         )
 
@@ -305,7 +304,6 @@ class TestRescanLoop:
             discovery_state=DiscoveryState(),
             monitored_dirs=monitored_dirs,
             stability_window=0.0,
-            probe_open_files=False,
             **kwargs,
         )
 
@@ -397,7 +395,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         manager._handle_rescan()
@@ -414,10 +411,10 @@ class TestSourceManagerRegressions:
         assert server.unregistered == [source_id]
         assert server._metadata_db.removed == [source_id]
 
-    def test_probe_open_files_does_not_refuse_a_read_only_file(self, tmp_path):
-        """biopb/biopb#1042: PermissionError from the append probe is not the
-        busy-writer signal it's trying to detect, so a file the server can read
-        but not write must still be discovered."""
+    def test_a_read_only_file_is_not_refused(self, tmp_path):
+        """biopb/biopb#1042: the append probe could not tell "not allowed to
+        write" from "still being written", so a file the server can read but not
+        write was never discovered. The gate is now signature age alone."""
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -432,7 +429,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=True,
         )
 
         manager._handle_rescan()
@@ -441,12 +437,10 @@ class TestSourceManagerRegressions:
         source_id = next(iter(state.claims))
         assert server.registered == [source_id]
 
-    def test_probe_open_files_shields_a_newly_read_only_file_from_removal(
-        self, tmp_path, monkeypatch
-    ):
-        """biopb/biopb#1042: the append probe was condition 6 of the stability
-        gate but was missing from the removal shield, so a file that later loses
-        write permission was deregistered instead of held pending forever."""
+    def test_a_newly_read_only_file_is_not_removed(self, tmp_path, monkeypatch):
+        """biopb/biopb#1042: the append probe was a gate condition the removal
+        shield did not know about, so a file that later lost write permission was
+        deregistered. Gate and shield now share one predicate."""
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -460,7 +454,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=True,
         )
 
         base_time = time.time()
@@ -502,7 +495,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(
@@ -543,7 +535,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
         )
 
@@ -583,7 +574,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
         )
 
@@ -616,7 +606,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=10.0,
         )
 
@@ -672,11 +661,10 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         manager._handle_rescan()
-        # Value-level snapshot: EntryState is mutable (pending_scan is cleared in
+        # Value-level snapshot: EntryState records are carried by reference (see
         # place), so a shallow dict() copy would share objects with the live cache
         # and a leaked mutation could silently mutate the snapshot too, making the
         # rollback assertion vacuous. Copy each record so the guarantee is real.
@@ -714,7 +702,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=True,
         )
@@ -751,7 +738,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=False,
         )
@@ -797,7 +783,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=True,
         )
@@ -858,7 +843,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=True,
         )
@@ -942,7 +926,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=False,
         )
@@ -1008,8 +991,9 @@ class TestSourceManagerRegressions:
             registry=_FakeRegistry(),
             discovery_state=state,
             monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
+            # Wide enough that the just-written file is still churning, so the
+            # shield must keep it even though the walk found nothing.
+            stability_window=3600.0,
         )
 
         claim = SourceClaim(
@@ -1022,10 +1006,7 @@ class TestSourceManagerRegressions:
         server.unregistered.clear()
         server._metadata_db.removed.clear()
 
-        manager._reconciler._reconcile_discovered_state(
-            DiscoveryState(),
-            unstable_paths=[data_path.resolve()],
-        )
+        manager._reconciler._reconcile_discovered_state(DiscoveryState())
 
         assert claim.source_id in state.claims
         assert server.unregistered == []
@@ -1045,7 +1026,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(source_type="fake", primary_path=str(data_path.resolve()))
@@ -1071,7 +1051,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         first_claim = SourceClaim(
@@ -1115,7 +1094,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(source_type="fake", primary_path=str(data_path.resolve()))
@@ -1139,7 +1117,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(
@@ -1174,7 +1151,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(
@@ -1210,7 +1186,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         manager._handle_rescan()
@@ -1250,7 +1225,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         _ClosingAdapter.built.clear()
@@ -1284,7 +1258,6 @@ class TestSourceManagerRegressions:
             discovery_state=state,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         manager._handle_rescan()
@@ -1322,7 +1295,6 @@ class TestSourceManagerRegressions:
             discovery_state=DiscoveryState(),
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
         manager._reconciler._path_to_source_id[str(monitored_dir)] = "source-1"
 
@@ -1343,7 +1315,6 @@ class TestSourceManagerRegressions:
             discovery_state=DiscoveryState(),
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         clock = {"now": 100.0}
@@ -1385,7 +1356,6 @@ class TestSourceManagerRegressions:
             discovery_state=DiscoveryState(),
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         clock = {"now": 100.0}
@@ -1427,7 +1397,6 @@ def _make_signature_manager(monitored_dirs):
         discovery_state=DiscoveryState(),
         monitored_dirs=set(monitored_dirs),
         stability_window=0.0,
-        probe_open_files=False,
     )
 
 
@@ -1718,7 +1687,6 @@ class TestProgressiveDiscoveryFreshness:
             discovery_state=DiscoveryState(),
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
         return server, manager
 
@@ -1826,13 +1794,12 @@ class TestProgressiveStreaming:
             (monitored_dir / f"s{i}.dat").write_text(f"data{i}")
 
         server = _FakeServer()
+        kw.setdefault("stability_window", 0.0)
         manager = _make_manager(
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
             monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
             **kw,
         )
         return server, manager
@@ -1846,11 +1813,9 @@ class TestProgressiveStreaming:
         seen_at_reconcile = []
         orig_reconcile = manager._reconciler._reconcile_discovered_state
 
-        def spy(discovered_state, unstable_paths, force_full=False):
+        def spy(discovered_state, force_full=False):
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(
-                discovered_state, unstable_paths, force_full=force_full
-            )
+            return orig_reconcile(discovered_state, force_full=force_full)
 
         monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
 
@@ -1874,13 +1839,11 @@ class TestProgressiveStreaming:
         seen_at_reconcile = []
         orig_reconcile = manager._reconciler._reconcile_discovered_state
 
-        def spy(discovered_state, unstable_paths, force_full=False):
+        def spy(discovered_state, force_full=False):
             # The new source is NOT yet registered when reconcile starts: it is
             # added by reconcile (batch), not streamed during the walk.
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(
-                discovered_state, unstable_paths, force_full=force_full
-            )
+            return orig_reconcile(discovered_state, force_full=force_full)
 
         monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
         manager._handle_rescan()
@@ -1899,13 +1862,11 @@ class TestProgressiveStreaming:
         calls = {"n": 0}
         orig_reconcile = manager._reconciler._reconcile_discovered_state
 
-        def flaky(discovered_state, unstable_paths, force_full=False):
+        def flaky(discovered_state, force_full=False):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("reconcile failed")
-            return orig_reconcile(
-                discovered_state, unstable_paths, force_full=force_full
-            )
+            return orig_reconcile(discovered_state, force_full=force_full)
 
         monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", flaky)
 
@@ -1924,12 +1885,10 @@ class TestProgressiveStreaming:
         assert server.unregistered == []
 
     def test_unstable_first_scan_claim_is_not_streamed(self, tmp_path):
-        # stable_rescans_required=2: a fresh entry needs two unchanged
-        # observations before it is eligible, so the first scan defers it and
-        # streams nothing -- the same stability gate the batch path uses.
-        server, manager = self._manager(
-            tmp_path, n_sources=1, stable_rescans_required=2
-        )
+        # A just-written entry is inside the stability window, so the first scan
+        # defers it and streams nothing -- claiming it would register whatever
+        # half of the file is on disk.
+        server, manager = self._manager(tmp_path, n_sources=1, stability_window=3600.0)
 
         manager._handle_rescan()  # first (force-full) scan
 
@@ -1937,7 +1896,9 @@ class TestProgressiveStreaming:
         assert manager._initial_scan_done is True  # scan still completed
         assert server.last_full_scan_at is not None
 
-        # Not lost: once stable, a later rescan registers it (batch path).
+        # Not lost: once quiet, a later rescan registers it (batch path).
+        manager._stability_window = 0.0
+        manager._scanner._stability_window = 0.0
         for _ in range(5):
             if server.registered:
                 break
@@ -2033,7 +1994,6 @@ class TestRescanCarryForwardPrefix:
             discovery_state=DiscoveryState(),
             monitored_dirs={tmp_path / "data"},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
     def test_copy_cached_subtree_entries_matches_exact_prefix(self, tmp_path):
@@ -2047,10 +2007,8 @@ class TestRescanCarryForwardPrefix:
         unrelated = str(tmp_path / "other" / "y.tif")
         prev = {
             root: EntryState(True, (0, 0), 0.0),
-            child: EntryState(
-                False, (0, 0), 0.0, stable_observations=3, pending_scan=True
-            ),
-            deep: EntryState(False, (0, 0), 0.0, stable_observations=2),
+            child: EntryState(False, (0, 0), 0.0, pending_scan=True),
+            deep: EntryState(False, (0, 0), 0.0),
             decoy: EntryState(False, (0, 0), 0.0),
             unrelated: EntryState(False, (0, 0), 0.0),
         }
@@ -2063,10 +2021,8 @@ class TestRescanCarryForwardPrefix:
         assert set(ctx.next_state) - {root} == {child, deep}
         assert decoy not in ctx.next_state  # exact-prefix guard (root + os.sep)
         assert unrelated not in ctx.next_state
-        # The whole EntryState is carried, stability fields intact.
-        assert ctx.next_state[child].stable_observations == 3
+        # The whole EntryState is carried, the pending-scan flag intact.
         assert ctx.next_state[child].pending_scan is True
-        assert ctx.next_state[deep].stable_observations == 2
         assert ctx.next_state[deep].pending_scan is False
 
     def test_subtree_has_pending_scan_matches_exact_prefix(self, tmp_path):
@@ -2093,3 +2049,75 @@ class TestRescanCarryForwardPrefix:
         # a non-pending descendant does not count
         ctx = _ctx(str(tmp_path / "data" / "sub" / "f.tif"), False)
         assert scanner._subtree_has_pending_scan(root, ctx) is False
+
+
+class TestOneStabilityPredicate:
+    """The claim gate and the removal shield answer one question, one way.
+
+    "Quiet enough to claim" and "quiet enough to have stopped existing" used to
+    be two implementations of the same test, and they drifted: the gate grew an
+    append-open probe the shield knew nothing about, so a file the gate refused
+    was a file the shield let the diff delete (biopb/biopb#1042).
+    """
+
+    @staticmethod
+    def _manager(tmp_path, **kwargs):
+        monitored = tmp_path / "data"
+        monitored.mkdir(exist_ok=True)
+        server = _FakeServer()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs={monitored},
+            **kwargs,
+        )
+        return server, manager, monitored
+
+    def test_a_churning_claim_is_shielded_from_removal(self, tmp_path):
+        # The shield's job: a claim missing from a walk that is still being
+        # written is churning, not gone. Asked of the claim's own paths, so it
+        # needs no walk snapshot -- which is what lets a statically registered
+        # or drag-dropped claim get a real answer too.
+        server, manager, monitored = self._manager(tmp_path, stability_window=0.0)
+        data = monitored / "sample.dat"
+        data.write_text("hello")
+        manager._handle_rescan()
+        (claim,) = manager._reconciler._state.claims.values()
+
+        manager._stability_window = 3600.0
+        manager._reconciler._stability_window = 3600.0
+        data.write_text("still writing")
+        assert manager._reconciler._claim_is_quiet(claim) is False
+
+        manager._reconciler._stability_window = 0.0
+        assert manager._reconciler._claim_is_quiet(claim) is True
+
+    def test_a_vanished_member_reads_as_gone_not_churning(self, tmp_path):
+        # Absence is the case removal exists to act on; it must not be mistaken
+        # for "cannot stat, therefore might be changing".
+        _, manager, monitored = self._manager(tmp_path, stability_window=3600.0)
+        data = monitored / "sample.dat"
+        data.write_text("hello")
+        manager._handle_rescan()
+
+        claim = SourceClaim(
+            source_type="fake",
+            primary_path=str(monitored / "never-existed.dat"),
+            source_id="gone",
+        )
+        assert manager._reconciler._claim_is_quiet(claim) is True
+
+    def test_the_walk_derives_pending_scan_from_the_same_predicate(self, tmp_path):
+        # pending_scan used to be cleared by the claim gate reaching into the
+        # cached record; it is now derived in the walk, so the #53 subtree gate
+        # and the claim gate cannot disagree about what "settling" means.
+        _, manager, monitored = self._manager(tmp_path, stability_window=3600.0)
+        (monitored / "sample.dat").write_text("hello")
+
+        entries = _scan(manager)
+        assert all(entry.pending_scan for entry in entries.values())
+
+        manager._scanner._stability_window = 0.0
+        entries = _scan(manager)
+        assert not any(entry.pending_scan for entry in entries.values())

@@ -33,7 +33,11 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
 from biopb_tensor_server.sources.resolve import _reroot_catalog_url
-from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
+from biopb_tensor_server.sources.tree_scanner import (
+    EntryState,
+    TreeScanner,
+    entry_is_quiet,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
@@ -141,9 +145,7 @@ class SourceManager:
         metadata_db: Optional[MetadataDatabase] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
-        probe_open_files: bool = True,
         full_rescan_interval: float = 3600.0,
-        stable_rescans_required: int = 0,
         aggressive_dir_pruning: bool = False,
         cloud_roots: Optional[Set[Path]] = None,
         monitored_upstreams: Optional[List[SourceConfig]] = None,
@@ -171,18 +173,15 @@ class SourceManager:
         # fresh ScanSnapshot, and this manager publishes, rolls back and
         # partitions that snapshot.
         self._stability_window = stability_window
-        self._probe_open_files = probe_open_files
         self._full_rescan_interval = full_rescan_interval
-        self._stable_rescans_required = max(0, stable_rescans_required)
         self._aggressive_dir_pruning = aggressive_dir_pruning
         self._scanner = TreeScanner(
             stability_window=stability_window,
-            stable_rescans_required=self._stable_rescans_required,
             aggressive_dir_pruning=aggressive_dir_pruning,
         )
 
-        # Scan caches: path -> EntryState (signature + stability counter +
-        # pending-scan flag). Cloud entries sit in their own partition because
+        # Scan caches: path -> EntryState (signature + pending-scan flag).
+        # Cloud entries sit in their own partition because
         # cloud subtrees are walked only on the force_full pass -- keeping them
         # out of ``_entry_states`` is what holds every per-entry rescan loop to
         # O(non-cloud). That partition is rebuilt only at the end of a successful
@@ -266,6 +265,7 @@ class SourceManager:
             cloud_roots=self._cloud_roots,
             entry_for=self._entry_for,
             notify_source_committed=self._notify_source_committed,
+            stability_window=stability_window,
         )
 
     def start(self) -> None:
@@ -593,9 +593,8 @@ class SourceManager:
                     discovered_state, skipped_dirs
                 )
 
-                unstable_paths = self._get_unstable_paths()
                 self._reconciler._reconcile_discovered_state(
-                    discovered_state, unstable_paths, force_full=force_full_rescan
+                    discovered_state, force_full=force_full_rescan
                 )
                 rescan_succeeded = True
             finally:
@@ -732,13 +731,13 @@ class SourceManager:
         return entry
 
     def _should_scan_resolved(self, resolved_str: str) -> bool:
-        """Stability gate for an entry whose resolved path string is already known.
+        """Stability gate: may this path be claimed on this pass?
 
         Discovery iterates ``next_state`` keys, which ``TreeScanner`` already
         stored as resolved path strings, so a per-entry ``Path.resolve()`` would
-        be pure waste. Carries the load-bearing ``pending_scan`` clear-on-pass
-        side effect -- the subtree-pending prune gate depends on it -- by
-        mutating the cached ``EntryState`` in place.
+        be pure waste. A pure read -- the walk derives ``pending_scan`` from the
+        same ``entry_is_quiet`` predicate this applies, so nothing here reaches
+        back into the cached record.
         """
         if os.path.basename(resolved_str).startswith("."):
             return False
@@ -751,88 +750,19 @@ class SourceManager:
             return False
 
         # Cloud/synced-folder entries bypass the stability machinery entirely
-        # (cloud-storage phase 2). Two reasons, both load-bearing:
-        #   * the open-for-append probe below opens the file -- a whole-file recall
-        #     on a dehydrated placeholder, which is exactly what cloud handling must
-        #     avoid; and
-        #   * the mtime/ctime age + stable-rescan gate is unreliable on cloud
-        #     filesystems (doc S1.2), so a placeholder could never stabilize.
-        # Archived dehydrated data is inherently stable (never mid-write), so admit
-        # it immediately. The pending-scan clear side effect is preserved.
+        # (cloud-storage phase 2): the mtime/ctime age is unreliable on cloud
+        # filesystems (doc S1.2), so a placeholder could never stabilize.
+        # Archived dehydrated data is inherently stable (never mid-write), so
+        # admit it immediately.
         #
         # Load-bearing for TreeScanner's cloud inode-backfill skip: under cloud
-        # the entry signature degrades to a constant (0, 0), leaving the
-        # stability counter meaningless -- safe only because this early return
-        # means that counter is never read for a cloud path.
+        # the entry signature degrades to a constant (0, 0), so `last_changed`
+        # never advances -- safe only because this early return means it is
+        # never read for a cloud path.
         if self._is_under_cloud_root(resolved_str):
-            entry.pending_scan = False
             return True
 
-        if self._is_settling(entry, resolved_str):
-            return False
-
-        entry.pending_scan = False
-        return True
-
-    def _is_settling(self, entry: EntryState, resolved_str: str) -> bool:
-        """True while *entry* has not yet passed the stability checks that gate
-        claiming: signature age, repeat-observation count, and (for a file) the
-        append probe.
-
-        Shared by the stability gate (:meth:`_should_scan_resolved`) and the
-        removal shield (:meth:`_get_unstable_paths`) so a claim the gate is
-        still waiting on can never be silently treated as gone for a reason the
-        gate itself considers "not yet, not never" -- see biopb/biopb#1042,
-        where the append probe alone was condition 6 of the gate but was missing
-        from the shield, so a file that failed the probe was deregistered
-        instead of held pending.
-        """
-        age = time.time() - entry.last_changed
-        if age < self._stability_window:
-            return True
-
-        if entry.stable_observations < self._stable_rescans_required:
-            return True
-
-        return (
-            not entry.is_directory
-            and self._probe_open_files
-            and not self._can_open_for_append(Path(resolved_str))
-        )
-
-    def _can_open_for_append(self, path: Path) -> bool:
-        """Best-effort probe that a file is not obviously blocked for append.
-
-        This is not a reliable active-writer detector on POSIX filesystems.
-        Stability gating still primarily relies on signature age and repeated
-        unchanged rescans rather than this probe alone.
-
-        A file the server can read but not write (shared storage owned by
-        another user, a read-only mount, deliberately chmod'd archival data)
-        answers ``PermissionError`` here, which is not the busy-writer signal
-        this probe is trying to detect -- treated as open-able (biopb/biopb#1042).
-        """
-        try:
-            with open(path, "a"):
-                return True
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-
-    def _get_unstable_paths(self) -> List[Path]:
-        """Return files/directories the stability gate has not yet admitted.
-
-        Mirrors :meth:`_should_scan_resolved` via the shared :meth:`_is_settling`
-        predicate, rather than re-checking just the signature-age condition, so
-        a claim the gate is withholding for any of its reasons is shielded from
-        removal instead of deregistered.
-        """
-        unstable = []
-        for path_str, entry in self._entry_states.items():
-            if self._is_settling(entry, path_str):
-                unstable.append(Path(path_str))
-        return unstable
+        return entry_is_quiet(entry.last_changed, time.time(), self._stability_window)
 
     def _is_under_cloud_root(self, path: str) -> bool:
         """True when *path* is a cloud-opted root or lives under one.
@@ -1396,9 +1326,7 @@ def create_source_manager(
     metadata_db: Optional[MetadataDatabase] = None,
     credentials_config: Optional[Any] = None,
     stability_window: float = 30.0,
-    probe_open_files: bool = True,
     full_rescan_interval: float = 3600.0,
-    stable_rescans_required: int = 0,
     aggressive_dir_pruning: bool = False,
     prune_unseen_days: int = 0,
     rescan_interval: float = 30.0,
@@ -1429,12 +1357,8 @@ def create_source_manager(
         credentials_config: CredentialsConfig for remote storage authentication.
         stability_window: Seconds an entry's signature must be unchanged before
             it is eligible to be claimed.
-        probe_open_files: Whether to additionally probe a file for append before
-            claiming it.
         full_rescan_interval: Seconds between full tree walks; the rescans in
             between prune stable and cloud subtrees. <= 0 disables force-full.
-        stable_rescans_required: Consecutive unchanged rescans an entry needs on
-            top of the stability window.
         aggressive_dir_pruning: Whether the scanner may skip a directory whose
             own signature is unchanged without descending into it.
         prune_unseen_days: Days of absence after which annotations for a missing
@@ -1547,9 +1471,7 @@ def create_source_manager(
         metadata_db=metadata_db,
         credentials_config=credentials_config,
         stability_window=stability_window,
-        probe_open_files=probe_open_files,
         full_rescan_interval=full_rescan_interval,
-        stable_rescans_required=stable_rescans_required,
         aggressive_dir_pruning=aggressive_dir_pruning,
         cloud_roots=cloud_roots,
         monitored_upstreams=monitored_upstreams,

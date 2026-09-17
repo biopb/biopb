@@ -268,7 +268,7 @@ See **[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
 
 `PeriodicRescanWatcher` emits a `RESCAN` on a fixed interval; per rescan the
 `SourceManager` delegates the filesystem-signature walk to `TreeScanner` (a fs
-walker gated on stability window, returning an immutable `ScanSnapshot`), runs
+walker gated on the stability window, returning an immutable `ScanSnapshot`), runs
 discovery on the snapshot's paths, and diffs the result against the confirmed
 catalog.
 

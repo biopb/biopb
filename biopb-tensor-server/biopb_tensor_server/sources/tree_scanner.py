@@ -42,20 +42,23 @@ class EntryState:
       * ``is_directory`` / ``signature`` / ``last_changed`` -- the change-detection
         signature (identity + mtime/size tuple, plus the last observed change
         epoch);
-      * ``stable_observations`` -- consecutive unchanged rescans since the last
-        change (the stability-window counter);
-      * ``pending_scan`` -- True until the entry passes one eligible discovery
-        pass; the #53 subtree-pending prune gate keys on it.
+      * ``pending_scan`` -- whether this entry is still settling, i.e.
+        ``entry_is_quiet`` is False for it. The #53 subtree-pending prune gate
+        keys on it: a directory's own signature is blind to a write deep in its
+        subtree, so the gate needs a per-descendant signal.
 
-    Under a cloud root the last two fields are inert -- cloud entries bypass the
+    ``pending_scan`` is computed here, in the walk, from the same predicate the
+    claim gate uses -- it is not a flag the claim phase clears by reaching back
+    into this record.
+
+    Under a cloud root ``pending_scan`` is inert -- cloud entries bypass the
     stability machinery (``_should_scan_resolved`` short-circuits), so nothing
-    reads them; only the signature triplet is meaningful in ``_cloud_entry_states``.
+    reads it; only the signature triplet is meaningful in ``_cloud_entry_states``.
     """
 
     is_directory: bool
     signature: Tuple[Any, ...]
     last_changed: float
-    stable_observations: int = 0
     pending_scan: bool = False
 
 
@@ -157,6 +160,31 @@ def entry_change_time(stat_result: Any, now: float) -> float:
     return now
 
 
+def entry_is_quiet(last_changed: float, now: float, stability_window: float) -> bool:
+    """Has this path been unchanged long enough to be acted on?
+
+    The single stability predicate. Three callers ask the same question of it
+    and must keep getting the same answer:
+
+    * the walk, to decide ``EntryState.pending_scan`` (is a descendant still
+      settling, so its parent subtree must not be pruned -- biopb/biopb#53);
+    * the claim gate (``SourceManager._should_scan_resolved``), to decide
+      whether a path may be claimed -- claiming a half-written file registers a
+      wrong descriptor, and for a format whose type marker is written last
+      (OME-TIFF) a wrong ``source_type``, hence a different ``source_id``;
+    * the removal shield (``Reconciler._claim_is_quiet``), to decide whether a
+      claim missing from a walk is really gone or merely churning.
+
+    Keeping the last two on one predicate is the point: they are the same
+    question asked from two sides, and two implementations of it drifted apart
+    once already (biopb/biopb#1042).
+
+    ``last_changed`` is ``entry_change_time``'s value -- max(mtime, ctime),
+    clamped to now.
+    """
+    return now - last_changed >= stability_window
+
+
 class TreeScanner:
     """Walks the monitored directories and captures a stat-signature snapshot.
 
@@ -170,11 +198,9 @@ class TreeScanner:
         self,
         *,
         stability_window: float,
-        stable_rescans_required: int,
         aggressive_dir_pruning: bool,
     ):
         self._stability_window = stability_window
-        self._stable_rescans_required = stable_rescans_required
         self._aggressive_dir_pruning = aggressive_dir_pruning
 
     def scan(
@@ -373,21 +399,19 @@ class TreeScanner:
             ctx.prev_cloud_entry_states if cloud else ctx.prev_entry_states
         ).get(path_str)
         last_changed = entry_change_time(stat_result, now)
-        stable_observations = 0
         if previous_entry is not None and (
             previous_entry.is_directory,
             previous_entry.signature,
         ) == (is_directory, signature):
+            # Unchanged: keep the first observation of the change, so the quiet
+            # period is measured from when the entry actually settled rather
+            # than restarting every pass.
             last_changed = previous_entry.last_changed
-            stable_observations = previous_entry.stable_observations + 1
-            pending_scan = previous_entry.pending_scan
-        else:
-            pending_scan = True
+        pending_scan = not entry_is_quiet(last_changed, now, self._stability_window)
         ctx.next_state[path_str] = EntryState(
             is_directory=is_directory,
             signature=signature,
             last_changed=last_changed,
-            stable_observations=stable_observations,
             pending_scan=pending_scan,
         )
         # Record cloud-ness once, here, where the walk already knows it (inherited
@@ -436,9 +460,9 @@ class TreeScanner:
             and previous_entry is not None
             and (previous_entry.is_directory, previous_entry.signature)
             == (is_directory, signature)
+            # `not pending_scan` is the quiet test (see EntryState): this entry
+            # has been unchanged for a full stability window.
             and not pending_scan
-            and now - previous_entry.last_changed >= self._stability_window
-            and stable_observations >= self._stable_rescans_required
             and not self._subtree_has_pending_scan(path_str, ctx)
         ):
             ctx.skipped_dirs.add(path_str)
@@ -482,11 +506,10 @@ class TreeScanner:
 
         A directory's own mtime/ctime signature is blind to writes deep in its
         subtree (appending to a file does not bump any ancestor's mtime), so the
-        prune gate cannot rely on the signature alone. `pending_scan` is set on
-        any new/changed entry and cleared only when it passes a discovery walk
-        (age >= stability_window), so a still-settling or undiscovered descendant
-        keeps the flag — which is the signal to keep descending instead of
-        freezing the subtree out (biopb/biopb#53). The directory's own flag is
+        prune gate cannot rely on the signature alone. `pending_scan` is set for
+        any entry that is not yet quiet (`entry_is_quiet`), so a still-settling
+        descendant keeps the flag — which is the signal to keep descending
+        instead of freezing the subtree out (biopb/biopb#53). The directory's own flag is
         already covered by the `not pending_scan` clause in the prune gate, so it
         is skipped here.
         """
@@ -525,14 +548,10 @@ class TreeScanner:
             if not cached_path.startswith(prefix):
                 continue
             # Carried by reference, sharing the previous-generation instance.
-            # WARNING: EntryState is mutable -- `_should_scan_resolved` clears
-            # `pending_scan` in place -- so a mutation of a carried record would
-            # leak across generations and break the swap-then-rollback isolation
-            # `_rescan_monitored_dirs` relies on (the rolled-back "previous" cache
-            # would already carry the mutation). This is safe ONLY because a
-            # carried entry sits under a root just added to `skipped_dirs`, which
-            # the claim walk prunes (`discover_sources_from_entries._under`), so
-            # `_should_scan_resolved` never runs on it -- nothing mutates a carried
-            # record. If you ever mutate carried EntryStates, or decouple this
-            # carry prefix from the skip prefix, copy the record here instead.
+            # Safe because EntryState is now write-once: the walk builds each
+            # record and no one mutates it afterwards (`pending_scan` is derived
+            # here, not cleared later by the claim phase). Were that to change,
+            # a mutation would leak across generations and break the
+            # swap-then-rollback isolation `_rescan_monitored_dirs` relies on --
+            # copy the record here instead.
             ctx.next_state[cached_path] = entry
