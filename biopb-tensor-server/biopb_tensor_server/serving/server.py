@@ -19,6 +19,7 @@ Custom actions (``list_actions``) cover health, uploads, cache locate, cloud
 resolve / warm, runtime source add / remove, and annotation pruning.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -90,6 +91,14 @@ from biopb_tensor_server.serving.metadata_db import (
 from biopb_tensor_server.serving.upload_manager import UploadManager
 
 logger = logging.getLogger(__name__)
+
+#: The reads a narrow grant can cover. Two, not one: pixels and annotations are
+#: separate reads of the same source, and a bare capability token grants both
+#: today -- naming them is what lets that stop being true without touching a
+#: call site (biopb/biopb#1048).
+READ_PIXELS = "read:pixels"
+READ_ANNOTATIONS = "read:annotations"
+_CAPABILITY_ACTIONS = frozenset({READ_PIXELS, READ_ANNOTATIONS})
 
 
 def _ensure_tls_scheme(location: str) -> str:
@@ -200,8 +209,8 @@ _WARM_POLL_SECONDS = 0.1
 class _AuthMiddleware(flight.ServerMiddleware):
     """Per-call middleware that carries the caller's presented Bearer token.
 
-    Handlers retrieve it via ``context.get_middleware("auth")`` to enforce
-    the two-tier token check (see ``TensorFlightServer._authorize``).
+    Handlers retrieve it via ``context.get_middleware("auth")`` and decide what
+    it opens (``TensorFlightServer._authorize`` / ``_authorize_read``).
     """
 
     def __init__(self, token: Optional[str]) -> None:
@@ -218,11 +227,11 @@ class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
     """Capture the caller's presented Bearer token for the handlers.
 
     Deliberately decides nothing: which token a call needs depends on what it
-    is about -- the server-wide token for the public catalog, a source's own
-    capability token for its pixels and annotations -- and only the handler
-    knows that (``TensorFlightServer._authorize``). A factory that rejected
-    every non-server bearer up front would lock a capability holder out of the
-    one source it may read (biopb/biopb#1010).
+    is about -- the server-wide token opens everything, while a source's own
+    capability token opens that source's reads and nothing else -- and only the
+    handler knows which it is asking about. A factory that rejected every
+    non-server bearer up front would lock a capability holder out of the one
+    source it may read (biopb/biopb#1010).
 
     Header value must be exactly ``Bearer <token>`` (case-sensitive).
     """
@@ -565,35 +574,86 @@ class TensorFlightServer(flight.FlightServerBase):
         mw = context.get_middleware("auth") if context is not None else None
         return getattr(mw, "token", None) if mw is not None else None
 
-    def _authorize(
-        self, context: flight.ServerCallContext, source_id: Optional[str] = None
+    def _has_full_access(self, provided: Optional[str]) -> bool:
+        """The server-wide token, which grants everything.
+
+        False in local mode (no token configured): there is no *credential*
+        granting it. The distinction matters one caller up, where a
+        capability-gated source must stay gated in local mode.
+        """
+        if self._server_token is None:
+            return False
+        return provided is not None and hmac.compare_digest(
+            provided, self._server_token
+        )
+
+    def _grants(
+        self, provided: Optional[str], action: str, source_id: str
+    ) -> Optional[bool]:
+        """Does *provided* carry a narrow grant covering (*action*, *source_id*)?
+
+        ``None`` means the source carries no grant at all, which is not a
+        refusal -- it is "this object has opted into nothing, so the ordinary
+        rule applies". ``False`` is a real refusal.
+
+        Today a grant is a token on the adapter covering both reads of its own
+        source, so the body is an equality test. A grant table or a signed
+        token (biopb/biopb#1048) replaces this body and nothing else: call
+        sites ask here rather than comparing tokens themselves.
+        """
+        adapter = self.sources.get(source_id)
+        expected = adapter.capability_token if adapter is not None else None
+        if not expected:
+            return None
+        if provided is None or not hmac.compare_digest(provided, expected):
+            return False
+        return action in _CAPABILITY_ACTIONS
+
+    def _authorize(self, context: flight.ServerCallContext) -> None:
+        """Full access: everything that is not a narrow read.
+
+        The catalog flights and SQL, health, cache stats, every ``do_action``,
+        and every write. Requires the server-wide token when one is configured;
+        open otherwise (local mode -- the machine is the boundary).
+
+        **A capability never reaches this.** Actions are the control surface,
+        and a grant meaning "read this one tensor" must not authorize, say,
+        ``warm`` -- whose cost is not scoped to that tensor at all, since it
+        walks the page-cache LRU and evicts the segments serving every other
+        source (biopb/biopb#1043).
+        """
+        if self._server_token is None:
+            return
+        if not self._has_full_access(self._presented_token(context)):
+            raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
+
+    def _authorize_read(
+        self, context: flight.ServerCallContext, source_id: str, action: str
     ) -> None:
-        """The two-tier token check every handler runs first.
+        """Full access, or a narrow grant covering this read of this source.
 
-        - **Catalog tier** (``source_id`` None): the public surface -- the
-          catalog flights and SQL, health, cache stats, uploads, runtime
-          source add / remove, pruning. Requires the server-wide token when one
-          is configured; open otherwise (local mode).
-        - **Private tier** (a ``source_id``): pixels and annotations of one
-          source. A source carrying a capability token (an embedded result
-          cache) is readable by that token alone, whatever the server-wide
-          token is; any other source falls back to the catalog tier's rule.
+        The server-wide token is checked first and grants everything, so a
+        capability *adds* access rather than replacing it -- do not reorder
+        these (biopb/biopb#1048).
 
-        A private source may still be *catalogued* -- knowing a source_id is
-        allowed, reading its pixels and annotations is what the token gates.
+        A source carrying no grant is as open as the catalog is, so it falls
+        through to :meth:`_authorize`. A source carrying one stays gated even in
+        local mode: that is why the embedded result cache can mint them on a
+        server with no server-wide token at all.
+
+        Knowing a source_id is not what this gates -- a private source may still
+        be catalogued. Reading it is.
         """
         provided = self._presented_token(context)
-        if source_id is not None:
-            adapter = self.sources.get(source_id)
-            expected = adapter.capability_token if adapter is not None else None
-            if expected:
-                if provided != expected:
-                    raise flight.FlightUnauthenticatedError(
-                        "Invalid or missing source token"
-                    )
-                return
-        if self._server_token is not None and provided != self._server_token:
-            raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
+        if self._has_full_access(provided):
+            return
+        granted = self._grants(provided, action, source_id)
+        if granted:
+            return
+        if granted is None:
+            self._authorize(context)
+            return
+        raise flight.FlightUnauthenticatedError("Invalid or missing source token")
 
     @staticmethod
     def _parse(msg: Message, data: bytes, what: str) -> Message:
@@ -928,7 +988,7 @@ class TensorFlightServer(flight.FlightServerBase):
             if ticket.WhichOneof("payload") != "chunk_id":
                 raise flight.FlightServerError("chunk_locate takes a chunk ticket")
             source_id = routing_array_id(ticket.chunk_id).split("/")[0]
-            self._authorize(context, source_id)
+            self._authorize_read(context, source_id, READ_PIXELS)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
             self._authorize(context)
@@ -941,11 +1001,11 @@ class TensorFlightServer(flight.FlightServerBase):
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
         elif action.type == "resolve":
             source_id = action.body.to_pybytes().decode("utf-8")
-            self._authorize(context, source_id)
+            self._authorize(context)
             yield from self._handle_resolve(source_id)
         elif action.type == "warm":
             source_id = action.body.to_pybytes().decode("utf-8")
-            self._authorize(context, source_id)
+            self._authorize(context)
             yield from self._handle_warm(source_id, context)
         elif action.type == "is_resident":
             # Catalog tier: which sources are local is part of browsing, not
@@ -1469,8 +1529,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         A path descriptor names a catalog table (public tier): its schema and
         a ticket that reads it. A command is a ``FlightRequest`` whose
-        ``tensor_read`` binds one tensor and plans its chunk endpoints (private
-        tier, authorized on the tensor's source). An arbitrary catalog query
+        ``tensor_read`` binds one tensor and plans its chunk endpoints (private,
+        authorized as a pixel read of the tensor's source). An arbitrary catalog query
         needs no GetFlightInfo: the SQL rides the DoGet ticket.
         """
         import json
@@ -1489,7 +1549,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if not source_id:
             raise flight.FlightServerError("tensor_read: array_id is required")
 
-        self._authorize(context, source_id)
+        self._authorize_read(context, source_id, READ_PIXELS)
 
         # Reduce the request array_id to the within-source field -- or None =
         # "the source's default (first) tensor" (identity policy: array_id is
@@ -1667,7 +1727,7 @@ class TensorFlightServer(flight.FlightServerBase):
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
             source_id = routing_array_id(tensor_ticket.chunk_id).split("/")[0]
-            self._authorize(context, source_id)
+            self._authorize_read(context, source_id, READ_PIXELS)
 
             adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
 
@@ -1708,7 +1768,9 @@ class TensorFlightServer(flight.FlightServerBase):
         ``sets`` (JSON) ride the stream's schema metadata."""
         db = self._require_annotations()
         try:
-            self._authorize(context, _roi_source_id(req.array_id))
+            self._authorize_read(
+                context, _roi_source_id(req.array_id), READ_ANNOTATIONS
+            )
             rois, truncated = db.list_rois(req.array_id, req.set_name)
             sets = [
                 {"set_name": name, "count": count, "reserved": is_reserved_set(name)}
@@ -1817,21 +1879,21 @@ class TensorFlightServer(flight.FlightServerBase):
         if arm == "chunk":
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
-            self._authorize(context, cmd.chunk.source_id)
+            self._authorize(context)
             self.uploads.write_chunk(cmd.chunk, reader)
             return
 
         db = self._require_annotations()
         try:
             if arm == "roi_put":
-                self._authorize(context, _roi_source_id(cmd.roi_put.array_id))
+                self._authorize(context)
                 rois = table_to_rois(reader.read_all())
                 stored, conflicts = db.put_rois(
                     cmd.roi_put.array_id, rois, check_rev=cmd.roi_put.check_rev
                 )
                 reply = RoiPutResult(stored=stored, conflicts=conflicts)
             else:
-                self._authorize(context, _roi_source_id(cmd.roi_delete.array_id))
+                self._authorize(context)
                 roi_ids = table_to_roi_ids(reader.read_all())
                 deleted = db.delete_rois(
                     cmd.roi_delete.array_id, roi_ids, cmd.roi_delete.set_name

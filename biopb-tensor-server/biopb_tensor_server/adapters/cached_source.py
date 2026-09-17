@@ -175,10 +175,9 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
                 serving stale data). None leaves the source unversioned (legacy bytes).
         """
         self.source_id = source_id
-        # Optional per-source capability token. When set, the Flight server
-        # requires callers to present a matching Bearer token to read this
-        # source (see TensorFlightServer._authorize). None = no per-source
-        # gate (falls back to the server-wide token, if any).
+        # Optional per-source capability token. When set, reading this source
+        # takes either it or the server-wide token (see
+        # TensorFlightServer._authorize_read). None = no per-source gate.
         self._capability_token: Optional[str] = None
         self._shape = tuple(shape)
         self._dtype = dtype
