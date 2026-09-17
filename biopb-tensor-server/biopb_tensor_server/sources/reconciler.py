@@ -320,23 +320,30 @@ class Reconciler:
           -- instead of "does it overlap anything that is";
         * it is O(members), not O(catalog) with a ``Path.resolve()`` per member
           per unstable path;
-        * it needs no snapshot, so a claim registered by the static or drag-drop
-          path -- which have no walk entries at all -- gets a real answer.
+        * it needs no snapshot, so a member the walk skipped this pass (a
+          pruned subtree, or a claim just added) still gets a real answer
+          instead of "not in the snapshot, so not unstable".
 
-        A member that cannot be stat'd is not churning: it is gone, which is the
-        case removal exists to act on.
+        Prefers ``_entry_for``'s cached signature over a live stat, same as
+        ``_build_claim_signatures`` -- the walk that ran this pass already paid
+        for it, and for a cloud member skipping the cache means a network
+        round-trip. A member that cannot be stat'd on a cache miss is not
+        churning: it is gone, which is the case removal exists to act on.
         """
         now = time.time()
         for member_path in {claim.primary_path, *claim.member_paths}:
             if is_remote_url(member_path):
                 continue
-            try:
-                stat_result = os.stat(member_path)
-            except OSError:
-                continue
-            if not entry_is_quiet(
-                entry_change_time(stat_result, now), now, self._stability_window
-            ):
+            entry = self._entry_for(member_path)
+            if entry is not None:
+                last_changed = entry.last_changed
+            else:
+                try:
+                    stat_result = os.stat(member_path)
+                except OSError:
+                    continue
+                last_changed = entry_change_time(stat_result, now)
+            if not entry_is_quiet(last_changed, now, self._stability_window):
                 return False
         return True
 
