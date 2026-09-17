@@ -36,6 +36,7 @@ taken by the commit primitives) lives here.
 from __future__ import annotations
 
 import logging
+import os
 import stat
 import threading
 import time
@@ -56,7 +57,12 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.core.source_registry import close_adapter
-from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
+from biopb_tensor_server.sources.tree_scanner import (
+    EntryState,
+    build_entry_signature,
+    entry_change_time,
+    entry_is_quiet,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (
@@ -143,6 +149,7 @@ class Reconciler:
         cloud_roots: Set[Path],
         entry_for: Callable[[str], Optional[EntryState]],
         notify_source_committed: Callable[[str], None],
+        stability_window: float = 30.0,
     ):
         self._server = server
         self._registry = registry
@@ -156,6 +163,10 @@ class Reconciler:
         # Injected SourceManager seams (see module docstring).
         self._entry_for = entry_for
         self._notify_source_committed = notify_source_committed
+        # Quiet period a claim must have had before this reconcile will remove or
+        # rebuild it -- the same window, and the same predicate, the claim gate
+        # applies on the way in (see ``_claim_is_quiet``).
+        self._stability_window = stability_window
 
         # Fine-grained state RLock: rescan/reconcile helpers re-enter other
         # state-mutating helpers, so nested calls on the same thread must not
@@ -215,7 +226,6 @@ class Reconciler:
     def _reconcile_discovered_state(
         self,
         discovered_state: DiscoveryState,
-        unstable_paths: List[Path],
         force_full: bool = False,
     ) -> None:
         """Apply add/remove/update diffs between the current and discovered states.
@@ -253,9 +263,7 @@ class Reconciler:
         removed_ids = [
             source_id
             for source_id in sorted(current_ids - discovered_ids)
-            if not self._claim_overlaps_unstable(
-                current_claims[source_id], unstable_paths
-            )
+            if self._claim_is_quiet(current_claims[source_id])
         ]
         added_claims = [
             discovered_claims[source_id]
@@ -270,9 +278,7 @@ class Reconciler:
         refreshed_ids = [
             source_id
             for source_id in sorted(changed_ids)
-            if not self._claim_overlaps_unstable(
-                current_claims[source_id], unstable_paths
-            )
+            if self._claim_is_quiet(current_claims[source_id])
             and self._should_retry_source(source_id)
         ]
 
@@ -298,26 +304,48 @@ class Reconciler:
             for monitored_dir in self._monitored_dirs
         )
 
-    def _claim_overlaps_unstable(
-        self,
-        claim: SourceClaim,
-        unstable_paths: List[Path],
-    ) -> bool:
-        """Check if any claimed member path falls in an unstable area."""
-        for member_path in claim.member_paths:
-            try:
-                resolved_member = Path(member_path).resolve(strict=False)
-            except OSError:
-                continue
+    def _claim_is_quiet(self, claim: SourceClaim) -> bool:
+        """Has this claim stopped changing long enough to remove or rebuild it?
 
-            for unstable_path in unstable_paths:
-                if resolved_member == unstable_path:
-                    return True
-                if unstable_path.is_dir() and resolved_member.is_relative_to(
-                    unstable_path
-                ):
-                    return True
-        return False
+        The removal/rebuild side of the stability gate, and deliberately the
+        *same* predicate (``entry_is_quiet``) the claim gate applies on the way
+        in: "quiet enough to claim" and "quiet enough to have stopped existing"
+        are one question asked from two sides, and answering it in two places is
+        what let them drift apart (biopb/biopb#1042).
+
+        Asks the claim's own member paths rather than scanning the walk
+        snapshot for unstable paths. Three reasons:
+
+        * it is the question actually being asked -- is *this source* churning
+          -- instead of "does it overlap anything that is";
+        * it is O(members), not O(catalog) with a ``Path.resolve()`` per member
+          per unstable path;
+        * it needs no snapshot, so a member the walk skipped this pass (a
+          pruned subtree, or a claim just added) still gets a real answer
+          instead of "not in the snapshot, so not unstable".
+
+        Prefers ``_entry_for``'s cached signature over a live stat, same as
+        ``_build_claim_signatures`` -- the walk that ran this pass already paid
+        for it, and for a cloud member skipping the cache means a network
+        round-trip. A member that cannot be stat'd on a cache miss is not
+        churning: it is gone, which is the case removal exists to act on.
+        """
+        now = time.time()
+        for member_path in {claim.primary_path, *claim.member_paths}:
+            if is_remote_url(member_path):
+                continue
+            entry = self._entry_for(member_path)
+            if entry is not None:
+                last_changed = entry.last_changed
+            else:
+                try:
+                    stat_result = os.stat(member_path)
+                except OSError:
+                    continue
+                last_changed = entry_change_time(stat_result, now)
+            if not entry_is_quiet(last_changed, now, self._stability_window):
+                return False
+        return True
 
     def _build_claim_signatures(
         self,

@@ -818,7 +818,7 @@ class TestCloudRescanGating:
     """
 
     def test_rescan_registers_unresolved_without_opening_content(
-        self, tmp_path, force_nonresident, monkeypatch
+        self, tmp_path, force_nonresident
     ):
         root = tmp_path / "cloudroot"
         root.mkdir()
@@ -832,12 +832,11 @@ class TestCloudRescanGating:
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
 
-        # The open-for-append probe would recall a placeholder; the cloud gate must
-        # bypass it entirely. Make it explode if ever reached during the rescan.
-        def _no_probe(path):
-            raise AssertionError(f"cloud rescan must not open-probe {path}")
-
-        monkeypatch.setattr(mgr, "_can_open_for_append", _no_probe)
+        # The cloud gate bypasses the stability machinery outright: a placeholder's
+        # mtime is untrustworthy, so it could never age into eligibility. Set a
+        # window no local entry could satisfy -- the cloud source must still register.
+        mgr._stability_window = 10**9
+        mgr._scanner._stability_window = 10**9
 
         mgr._handle_rescan()
 
