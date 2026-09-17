@@ -246,6 +246,15 @@ _WARM_INDETERMINATE = -1.0
 # badge and residency glyph render on top unchanged.
 _WARM_FILL = QColor(64, 132, 223, 60)
 
+# Hydrate-ahead after a resolve, off. A resolve means "read this source", not
+# "recall the whole pyramid", and warm only guarantees *disk* residency: on a
+# source larger than RAM the coarse levels it reads first are also the first
+# evicted, so the recall buys a latency it cannot keep (biopb/biopb#1043).
+# Nothing portable holds them either -- Windows has no `posix_fadvise`, and
+# Windows is where the synced-folder sources this serves actually live. The
+# context menu's "Hydrate all files…" is unaffected: named, visible, cancellable.
+_AUTO_WARM_AFTER_RESOLVE = False
+
 
 class _WarmProgressDelegate(QStyledItemDelegate):
     """Paints a hydrate-ahead progress fill behind a source row.
@@ -2089,15 +2098,16 @@ class TensorBrowserWidget(QWidget):
             # through _apply_filter so any active search text is preserved and the
             # resolved source now shows its shape badge / field children.
             self._apply_filter()
-            # A multi-file source's member data files are still dehydrated -- they
-            # recall lazily (and slowly) onto the read path. The user just asked
-            # for this source explicitly, so start hydrating ahead in the
-            # background now without a second confirmation (biopb/biopb#202).
-            # _warm_source shows progress as an inline bar on the source's row
-            # (no dialog); a source whose files resolve already recalled (e.g. a
-            # TIFF sequence) warms to a near-instant no-op and the bar barely
-            # appears. Cancel / re-trigger is available via the context menu.
-            if descriptor is not None and _is_multifile_source(descriptor):
+            # A multi-file source's member data files are still dehydrated and
+            # recall lazily (and slowly) onto the read path. Hydrating ahead for
+            # the user here (biopb/biopb#202) is gated off -- see
+            # _AUTO_WARM_AFTER_RESOLVE -- so asking for it is the context menu's
+            # "Hydrate all files…" now.
+            if (
+                _AUTO_WARM_AFTER_RESOLVE
+                and descriptor is not None
+                and _is_multifile_source(descriptor)
+            ):
                 self._warm_source(source_id)
 
         def _on_failed(message):

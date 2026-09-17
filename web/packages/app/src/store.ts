@@ -497,6 +497,21 @@ export function jobKey(kind: SourceJobKind, sourceId: string): string {
  */
 const JOB_POLL_MS = 1000;
 
+/**
+ * Hydrate-ahead after a resolve, off.
+ *
+ * A resolve means "read this source", not "recall the whole pyramid", and warm
+ * only guarantees *disk* residency: on a source larger than RAM the coarse
+ * levels it reads first are also the first evicted, so the recall buys a
+ * latency it cannot keep (biopb/biopb#1043). Nothing portable holds them either
+ * -- Windows has no `posix_fadvise`, and Windows is where the synced-folder
+ * sources this serves actually live.
+ *
+ * This is the SPA's only warm trigger, so while it is false `WarmTray` never
+ * appears. Both stay wired and tested, ready for the flip.
+ */
+const AUTO_WARM_AFTER_RESOLVE: boolean = false;
+
 let _jobPollTimerId: ReturnType<typeof setInterval> | undefined;
 
 /** A job that has stopped moving, whatever the reason. */
@@ -1455,18 +1470,21 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
  * What happens when a job stops.
  *
  * A finished resolve leaves the catalog row stale -- the source is hydrated but
- * the tree still has the listing from before -- so the list is re-read, and
- * then the warm starts automatically.
+ * the tree still has the listing from before -- so the list is re-read.
  *
- * Auto-warm with no second confirmation, matching napari: the user already
- * consented to the expensive part. It is also unconditional, with no check for
- * whether the source is multi-file, because the server answers that
- * structurally -- a single-file source's warm finishes at once with
- * `files_total === 0` and the tray never shows a bar for it. Keeping a list of
- * multi-file source types on this side would be a copy that drifts.
+ * The warm that used to follow it is gated off; see AUTO_WARM_AFTER_RESOLVE.
+ * When on it is unconditional, with no check for whether the source is
+ * multi-file, because the server answers that structurally -- a single-file
+ * source's warm finishes at once with `files_total === 0` and the tray never
+ * shows a bar for it. Keeping a list of multi-file source types on this side
+ * would be a copy that drifts.
  */
 async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
   if (job.kind !== "resolve" || job.state !== "done") return;
+  if (!AUTO_WARM_AFTER_RESOLVE) {
+    await get().loadSources();
+    return;
+  }
   // Independent: the catalog reload and starting the warm hit different
   // endpoints and different store slices, so there is nothing for one to wait
   // on from the other.

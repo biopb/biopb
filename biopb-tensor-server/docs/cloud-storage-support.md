@@ -182,6 +182,17 @@ cites this §9 for why multi-file monoliths degrade rather than reconstruct.)
   subsequent `do_get` reads, not during resolve. `warm` (hydrate-ahead) exists to
   pull that recall server-side up front. For zarr/ome-zarr, resolve reads only the
   metadata and per-chunk reads stay fine-grained (the §9 payoff).
+- **No UI auto-warms after a resolve any more.** Both front ends used to start a
+  hydrate-ahead as soon as a resolve landed (biopb/biopb#202); both now gate it
+  off (`_AUTO_WARM_AFTER_RESOLVE` in the napari widget, `AUTO_WARM_AFTER_RESOLVE`
+  in the SPA store). `warm` guarantees *disk* residency, not page-cache warmth,
+  so on a source larger than RAM the coarse levels it reads first are also the
+  first evicted and the recall buys a latency it cannot keep
+  (biopb/biopb#1043) — and there is no portable way to hold them, Windows having
+  no `posix_fadvise` and Windows being where synced-folder sources actually live.
+  The napari context menu's "Hydrate all files…" still warms on request; the SPA
+  has no other trigger, so it does not warm at all. Reverse once warm has a
+  cache-retention policy that holds on Windows.
 - **Cloud subtrees are walked only on a `force_full` rescan.**
   `TreeScanner._scan_tree_state` skips a cloud subtree on an incremental rescan
   (carrying cached claims forward) and re-walks it only on the periodic
