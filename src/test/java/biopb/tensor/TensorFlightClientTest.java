@@ -510,17 +510,39 @@ public class TensorFlightClientTest {
         }
     }
 
+    /**
+     * A discarded upload is terminal, so the wait says so at once and carries
+     * the reason -- rather than polling to the timeout, which is what it did
+     * before the states were explicit on the wire. There is no FAILED: the
+     * model has two terminal states, and the reason string is what a poller
+     * actually wants (biopb/biopb#1).
+     */
     @Test
-    public void testWaitForUploadReadyRaisesOnFailedState() throws Exception {
+    public void testWaitForUploadReadyRaisesOnDiscarded() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
-            server.setUploadStatusSequence("upload-source",
-                    status("upload-source", "FAILED", 4, 2));
+            Map<String, Object> discarded = status("upload-source", "DISCARDED", 4, 2);
+            discarded.put("reason", "job died");
+            server.setUploadStatusSequence("upload-source", discarded);
 
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 IOException error = Assert.assertThrows(
                         IOException.class,
                         () -> client.waitForUploadReady("upload-source", 100L, 0L));
-                Assert.assertTrue(error.getMessage().contains("Upload failed for source 'upload-source'"));
+                Assert.assertTrue(error.getMessage().contains("Upload discarded for source 'upload-source'"));
+                Assert.assertTrue(error.getMessage().contains("job died"));
+            }
+        }
+    }
+
+    /** No upload record at all: polling cannot change it, so it fails at once. */
+    @Test
+    public void testWaitForUploadReadyRejectsAnUnknownSource() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IOException error = Assert.assertThrows(
+                        IOException.class,
+                        () -> client.waitForUploadReady("no-such-source", 100L, 0L));
+                Assert.assertTrue(error.getMessage().contains("tracks no upload"));
             }
         }
     }
@@ -954,6 +976,23 @@ public class TensorFlightClientTest {
                     ? cmd.getTensorRead()
                     : null;
 
+            // A source with a registered upload sequence answers with the status
+            // on its descriptor -- the poll path, which needs no endpoints.
+            if (readOpt != null && uploadStatusSequences.containsKey(readOpt.getArrayId())) {
+                TensorDescriptor.Builder d = TensorDescriptor.newBuilder()
+                        .setArrayId(readOpt.getArrayId());
+                UploadStatus st = nextUploadStatus(readOpt.getArrayId());
+                if (st != null) {
+                    d.setUploadStatus(st);
+                }
+                return new FlightInfo(
+                        new org.apache.arrow.vector.types.pojo.Schema(new ArrayList<>()),
+                        FlightDescriptor.command(d.build().toByteArray()),
+                        new ArrayList<>(),
+                        -1,
+                        -1);
+            }
+
             // Validate the tensor: "test-tensor" is the sole tensor of "test-source".
             if (readOpt == null
                     || !(readOpt.getArrayId().equals("test-tensor")
@@ -1036,22 +1075,42 @@ public class TensorFlightClientTest {
                 doIsResident(new String(action.getBody(), StandardCharsets.UTF_8), listener);
                 return;
             }
-            if (!"upload_status".equals(action.getType())) {
-                listener.onError(new IllegalArgumentException("Unknown action: " + action.getType()));
-                return;
-            }
+            // `upload_status` is not an action any more: it rides the descriptor
+            // GetFlightInfo returns (biopb/biopb#1048 step 2). See
+            // `nextUploadStatus`, which serves the registered sequence there.
+            listener.onError(new IllegalArgumentException("Unknown action: " + action.getType()));
+        }
 
-            String sourceId = new String(action.getBody(), StandardCharsets.UTF_8);
+        /**
+         * The next status in this source's registered sequence, or null when it
+         * has none -- which the client reads as UNKNOWN, the same as a source
+         * the server does not serve.
+         *
+         * <p>Advances per call, so a polling test still sees its sequence move.
+         */
+        private UploadStatus nextUploadStatus(String sourceId) {
             List<Map<String, Object>> sequence = uploadStatusSequences.get(sourceId);
             if (sequence == null || sequence.isEmpty()) {
-                sequence = Collections.singletonList(status(sourceId, "UNKNOWN", 0, 0));
+                return null;
             }
-
             AtomicInteger calls = uploadStatusCalls.computeIfAbsent(sourceId, ignored -> new AtomicInteger());
             int index = Math.min(calls.getAndIncrement(), sequence.size() - 1);
-            String json = new Gson().toJson(sequence.get(index));
-            listener.onNext(new Result(json.getBytes(StandardCharsets.UTF_8)));
-            listener.onCompleted();
+            Map<String, Object> entry = sequence.get(index);
+            String state = String.valueOf(entry.get("state"));
+            UploadStatus.Builder b = UploadStatus.newBuilder()
+                    .setExpectedChunks(((Number) entry.get("expected_chunks")).longValue())
+                    .setUploadedChunks(((Number) entry.get("uploaded_chunks")).longValue());
+            Object reason = entry.get("reason");
+            if (reason != null) {
+                b.setReason(String.valueOf(reason));
+            }
+            // An UNKNOWN entry means "no upload here", which on the wire is the
+            // field being absent rather than a state value.
+            if ("UNKNOWN".equals(state)) {
+                return null;
+            }
+            b.setState(UploadStatus.State.valueOf(state));
+            return b.build();
         }
 
         /**

@@ -14,9 +14,8 @@ into a dask graph -- which is the read path's arrangement too (``_session``).
 
 import json
 import logging
-import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -26,7 +25,6 @@ import pyarrow.flight as flight
 from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, PutCommand
 
 if TYPE_CHECKING:  # import-time cycle-free; _session never imports this module
@@ -107,14 +105,6 @@ class _UploadTarget:
             start=[s.start for s in index], stop=[s.stop for s in index]
         )
         _put_chunk(client, call_options, self._source_id, bounds, value)
-
-
-def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
-    """Extract upload-status source_id from a registration-first SerializedTensor."""
-    source_id = pb.tensor_descriptor.array_id
-    if not source_id:
-        raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
-    return source_id
 
 
 class UploadSession:
@@ -291,76 +281,4 @@ class UploadSession:
         documentation."""
         _put_chunk(
             self._state.client, self._state.call_options, source_id, bounds, data
-        )
-
-    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
-        """Backs TensorFlightClient.get_upload_status; see that method for the full
-        documentation."""
-        action = flight.Action("upload_status", source_id.encode("utf-8"))
-        results = self._state.client.do_action(action, options=self._state.call_options)
-        for result in results:
-            return json.loads(result.body.to_pybytes())
-        return {
-            "source_id": source_id,
-            "state": "UNKNOWN",
-            "expected_chunks": 0,
-            "uploaded_chunks": 0,
-        }
-
-    def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
-        """Backs TensorFlightClient.get_upload_status_pb; see that method for the full
-        documentation."""
-        return self.get_upload_status(_upload_source_id_from_pb(pb))
-
-    def wait_for_upload_ready(
-        self,
-        source_id: str,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Backs TensorFlightClient.wait_for_upload_ready; see that method for the full
-        documentation."""
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            status = self.get_upload_status(source_id)
-            state = status.get("state")
-            if state == "READY":
-                return status
-            if state == "UNKNOWN":
-                # Nothing to wait for, so fail now instead of polling to the
-                # timeout (biopb/biopb#109). The server records upload progress
-                # when create_source() hands out the id, so UNKNOWN never means
-                # "not started yet" -- it means there is no upload record at
-                # all, which no amount of polling will change.
-                raise ValueError(
-                    f"The server tracks no upload for source '{source_id}' "
-                    "(not an upload target, or its record was dropped by a "
-                    "server restart or source removal)."
-                )
-            if state == "DISCARDED":
-                # The owner gave up on this upload (biopb/biopb#1). Terminal, so
-                # it is a prompt answer rather than a poll to the timeout -- and
-                # the reason is the whole point of reporting it.
-                reason = status.get("reason") or "no reason given"
-                raise RuntimeError(
-                    f"Upload discarded for source '{source_id}': {reason}"
-                )
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for upload readiness for source '{source_id}'"
-                )
-            time.sleep(poll_interval_seconds)
-
-    def wait_for_upload_ready_pb(
-        self,
-        pb: SerializedTensor,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Backs TensorFlightClient.wait_for_upload_ready_pb; see that method for the full
-        documentation."""
-        return self.wait_for_upload_ready(
-            _upload_source_id_from_pb(pb),
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
         )

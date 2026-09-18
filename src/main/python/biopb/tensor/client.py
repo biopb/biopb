@@ -1167,7 +1167,7 @@ class TensorFlightClient:
         Returns:
             Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
         """
-        return self._upload.get_upload_status(source_id)
+        return self._catalog.get_upload_status(source_id)
 
     def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
         """Get upload status for a registration-first SerializedTensor handle.
@@ -1185,7 +1185,7 @@ class TensorFlightClient:
         Returns:
             Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
         """
-        return self._upload.get_upload_status_pb(pb)
+        return self._catalog.get_upload_status_pb(pb)
 
     def wait_for_upload_ready(
         self,
@@ -1221,7 +1221,7 @@ class TensorFlightClient:
             RuntimeError: If the owner discarded the upload (DISCARDED); the
                 reason they gave is included.
         """
-        return self._upload.wait_for_upload_ready(
+        return self._catalog.wait_for_upload_ready(
             source_id, timeout_seconds, poll_interval_seconds
         )
 
@@ -1237,7 +1237,7 @@ class TensorFlightClient:
             Experimental. The upload / writable-source API (source creation, chunk
             upload, and upload-status polling) is experimental and may change.
         """
-        return self._upload.wait_for_upload_ready_pb(
+        return self._catalog.wait_for_upload_ready_pb(
             pb, timeout_seconds, poll_interval_seconds
         )
 

@@ -1310,26 +1310,52 @@ public class TensorFlightClient implements AutoCloseable {
      * @throws IOException If the action fails
      */
     public Map<String, Object> getUploadStatus(String sourceId) throws IOException {
-        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
-                "upload_status",
-                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        // A describe-only GetFlightInfo, not an action: doAction takes the
+        // server-wide token, while the caller waiting on a fast-return result
+        // holds a per-source read capability and nothing else (biopb/biopb#1048).
+        // Deliberately neither reads nor writes `descriptors` -- a cached copy of
+        // the one field whose purpose is freshness would defeat the poll.
+        TensorReadOption readOpt = TensorReadOption.newBuilder()
+                .setArrayId(sourceId)
+                .setWithMetadata(false)
+                .setWithPyramid(false)
+                .setWithReadPlan(false)
+                .build();
+        FlightRequest cmd = FlightRequest.newBuilder().setTensorRead(readOpt).build();
 
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
-        if (iter.hasNext()) {
-            org.apache.arrow.flight.Result result = iter.next();
-            byte[] body = result.getBody();
-            if (body != null && body.length > 0) {
-                return GSON.fromJson(new String(body, java.nio.charset.StandardCharsets.UTF_8),
-                        new TypeToken<Map<String, Object>>() {
-                        }.getType());
-            }
+        TensorDescriptor desc;
+        try {
+            FlightInfo info = client.getInfo(
+                    FlightDescriptor.command(cmd.toByteArray()), authOption);
+            desc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
+        } catch (FlightRuntimeException exc) {
+            // An id the server does not serve. UNKNOWN already means "no upload
+            // record here", and an unregistered source is the strongest form of
+            // that, so it is the same answer rather than a transport error.
+            return unknownUploadStatus(sourceId);
         }
+        if (!desc.hasUploadStatus()) {
+            // Registered, but not an upload -- an ordinary catalog source.
+            return unknownUploadStatus(sourceId);
+        }
+        UploadStatus status = desc.getUploadStatus();
+        Map<String, Object> out = new HashMap<>();
+        out.put("source_id", sourceId);
+        out.put("state", status.getState().name());
+        out.put("expected_chunks", (double) status.getExpectedChunks());
+        out.put("uploaded_chunks", (double) status.getUploadedChunks());
+        out.put("reason", status.getReason());
+        return out;
+    }
 
+    /** The answer for a source the server tracks no upload for. */
+    private static Map<String, Object> unknownUploadStatus(String sourceId) {
         Map<String, Object> unknown = new HashMap<>();
         unknown.put("source_id", sourceId);
         unknown.put("state", "UNKNOWN");
         unknown.put("expected_chunks", 0.0d);
         unknown.put("uploaded_chunks", 0.0d);
+        unknown.put("reason", "");
         return unknown;
     }
 
@@ -1369,8 +1395,23 @@ public class TensorFlightClient implements AutoCloseable {
             if ("READY".equals(state)) {
                 return status;
             }
-            if ("FAILED".equals(state)) {
-                throw new IOException("Upload failed for source '" + sourceId + "'");
+            if ("DISCARDED".equals(state)) {
+                // The owner gave up on it. Terminal, so answer now rather than
+                // poll to the timeout -- and the reason is the whole point of
+                // reporting it (biopb/biopb#1).
+                Object why = status.get("reason");
+                String reason = why == null || String.valueOf(why).isEmpty()
+                        ? "no reason given"
+                        : String.valueOf(why);
+                throw new IOException(
+                        "Upload discarded for source '" + sourceId + "': " + reason);
+            }
+            if ("UNKNOWN".equals(state)) {
+                // No upload record at all: not an upload target, or it was
+                // dropped by a restart or a source removal. Polling cannot
+                // change that, so fail now (biopb/biopb#109).
+                throw new IOException(
+                        "The server tracks no upload for source '" + sourceId + "'");
             }
             if (System.nanoTime() >= deadline) {
                 throw new IOException("Timed out waiting for upload readiness for source '" + sourceId + "'");
@@ -1864,7 +1905,11 @@ public class TensorFlightClient implements AutoCloseable {
             throw exc;
         }
         TensorDescriptor tensorDesc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
-        descriptors.put(tensorDesc.getArrayId(), tensorDesc);
+        // Cache the structure, never the upload status: a cached PENDING would
+        // shadow the READY a later poll came for (biopb/biopb#1048).
+        descriptors.put(
+                tensorDesc.getArrayId(),
+                tensorDesc.toBuilder().clearUploadStatus().build());
         return tensorDesc;
     }
 
