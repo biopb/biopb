@@ -1695,11 +1695,13 @@ class TensorFlightServer(flight.FlightServerBase):
                     read_plan.descriptor.metadata_json = json.dumps(
                         wrapped_metadata, cls=NumpyEncoder
                     )
-        except SourceUnresolvedError as e:
-            # Expected for a not-yet-hydrated source: surface the same retriable
-            # "open to resolve" mapping as the adapter-lookup path (to_flight_error),
-            # rather than burying it in "Metadata error" as a bare ValueError ->
-            # INTERNAL. Must precede the ValueError clause (it subclasses ValueError).
+        except (SourceUnresolvedError, TensorResolutionError) as e:
+            # The typed taxonomy, mapped precisely: a not-yet-hydrated source to
+            # the retriable "open to resolve", and a caller's malformed slice or
+            # scale hint to a terminal INVALID_ARGUMENT. Both would otherwise be
+            # buried in "Metadata error" as a bare ValueError -> INTERNAL, which
+            # blames the server and tells a client nothing it can act on. Must
+            # precede the ValueError clause (both subclass ValueError).
             raise to_flight_error(e) from e
         except (OSError, ValueError, json.JSONDecodeError) as e:
             raise flight.FlightInternalError(

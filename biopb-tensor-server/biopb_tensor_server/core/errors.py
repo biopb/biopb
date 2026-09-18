@@ -54,11 +54,12 @@ class SourceResolveRetriableError(SourceUnresolvedError):
 
 
 class TensorResolutionError(ValueError):
-    """A field/tensor within a source could not be resolved to an adapter.
+    """The read request is the caller's mistake, not a server bug.
 
-    The base for the *terminal client-error* taxonomy on the read path
-    (``get_tensor_adapter``): a bad ``array_id`` is the caller's mistake, not a
-    server bug. Subclasses ``ValueError`` on purpose -- like
+    The base for the *terminal client-error* taxonomy on the read path: a bad
+    ``array_id`` (``get_tensor_adapter``) or a malformed slice/scale hint
+    (:class:`InvalidReadRequest`) is something only the caller can fix.
+    Subclasses ``ValueError`` on purpose -- like
     ``SourceUnresolvedError`` -- so the read paths' existing ``except ValueError``
     guards still catch it and every adapter that has not yet adopted the typed
     taxonomy degrades gracefully.
@@ -100,6 +101,24 @@ class InvalidTensorId(TensorResolutionError):
     (a well-formed id that names no existing tensor): the id itself cannot be
     parsed -- e.g. an HCS field that is not ``well/field`` or whose field index
     is not an integer.
+    """
+
+    grpc_code = "INVALID_ARGUMENT"
+
+
+class InvalidReadRequest(TensorResolutionError):
+    """The request's own slice/scale parameters are malformed for this tensor.
+
+    Canonical gRPC ``INVALID_ARGUMENT``. Distinct from :class:`InvalidTensorId`,
+    which is about the id: here the tensor resolved fine and the caller asked it
+    for something it cannot answer -- a scale hint of the wrong rank, a slice
+    running past the shape.
+
+    Typed because these are raised deep in read planning (``core.chunk``'s
+    ``normalized_slice_bounds`` / ``normalized_scale_hint``), where a bare
+    ``ValueError`` reached the boundary's catch-all and was reported as a
+    ``FlightInternalError`` -- a caller's mistake dressed as a server bug, which
+    a client has no reason to stop retrying.
     """
 
     grpc_code = "INVALID_ARGUMENT"
