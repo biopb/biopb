@@ -101,7 +101,10 @@ from biopb_tensor_server.serving.metadata_db import (
     NumpyEncoder,
     is_reserved_set,
 )
-from biopb_tensor_server.serving.upload_manager import UploadManager
+from biopb_tensor_server.serving.upload_manager import (
+    DEFAULT_UPLOAD_TTL,
+    UploadManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +371,7 @@ class TensorFlightServer(flight.FlightServerBase):
         pyramid_config: Optional[PyramidConfig] = None,
         tls_cert_chain: Optional[bytes] = None,
         tls_private_key: Optional[bytes] = None,
+        upload_ttl: float = DEFAULT_UPLOAD_TTL,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -379,6 +383,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 own). ``None`` disables it.
             writable: Enable write mode for source creation and data upload
             write_dir: Directory for zarr-backed uploaded sources (required if writable)
+            upload_ttl: Seconds before a PENDING upload with no writes is
+                discarded and a discarded one is unregistered
+                (``UploadManager.reap``); 0 disables the sweep.
             metadata_db: The catalog -- the browse surface behind the
                 ``catalog`` and ``roi`` flights. ``None`` builds a catalog-less
                 server: its sources are addressed by ``source_id`` and served,
@@ -446,7 +453,12 @@ class TensorFlightServer(flight.FlightServerBase):
         self._start_time: float = time.time()
         # DoPut upload path: source creation, chunk writes, and per-source upload
         # progress. Registers created sources through the shared registry.
-        self.uploads = UploadManager(self.sources, write_dir, self._metadata_db)
+        self.uploads = UploadManager(
+            self.sources, write_dir, self._metadata_db, ttl=upload_ttl
+        )
+        # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
+        # stopped in ``shutdown``.
+        self.uploads.start_sweep()
         # Readiness gate: the Flight port binds (and gRPC starts serving) in the
         # base __init__ above, *before* the caller scans/registers the data
         # folder -- a scan that can be slow for large catalogs. Until the caller
@@ -620,6 +632,7 @@ class TensorFlightServer(flight.FlightServerBase):
         handles -- required on Windows, where an open file cannot be deleted
         (otherwise a test's TemporaryDirectory cleanup raises WinError 32).
         """
+        self.uploads.stop_sweep()
         self.sources.close_all()
         super().shutdown()
 

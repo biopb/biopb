@@ -11,6 +11,10 @@ here is only what a boundary does:
   errors; this is where they become Flight errors.
 - **Lookup** -- ``status`` / ``finish`` / ``discard`` / ``write_chunk`` find the
   adapter and hand over.
+- **Reclamation** -- ``reap`` sweeps the registry by each upload's
+  ``updated_at``: a PENDING upload quiet past ``ttl`` is discarded (a job that
+  died), and a tombstone older than ``ttl`` is unregistered. The sweep thread
+  is started and stopped by the server that owns the manager.
 
 Progress, completion and disposal are the adapter's own
 (:class:`~biopb_tensor_server.adapters._writable.WritableSource`), so there is no
@@ -26,8 +30,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -50,9 +56,16 @@ from biopb_tensor_server.core.errors import (
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
-__all__ = ["UPLOAD_KINDS", "UploadManager", "UploadStatus"]
+__all__ = ["DEFAULT_UPLOAD_TTL", "UPLOAD_KINDS", "UploadManager", "UploadStatus"]
 
 logger = logging.getLogger(__name__)
+
+#: Seconds a PENDING upload may go without a write, and a tombstone may stand,
+#: before ``reap`` acts. Generous: what it bounds is only how long a dead job's
+#: name stays taken and how long a straggler can still learn why its writes
+#: fail. A live upload touches on every chunk, so the gap it must exceed is one
+#: chunk's compute, not the whole job's. Overridden by ``ServerConfig.upload_ttl``.
+DEFAULT_UPLOAD_TTL = 3600.0
 
 #: ``array_id`` prefix -> the adapter class that builds an upload of that kind.
 #: The prefixes are a wire contract, so the table is closed; what each kind
@@ -89,10 +102,16 @@ class UploadManager:
         registry: SourceRegistry,
         write_dir: Optional[Path],
         metadata_db: Optional[MetadataDatabase],
+        ttl: float = DEFAULT_UPLOAD_TTL,
     ) -> None:
         self._registry = registry
         self._write_dir = write_dir
         self._metadata_db = metadata_db
+        #: Read live by every sweep, so a retune takes effect without a restart.
+        #: 0 disables reclamation.
+        self.ttl = float(ttl)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
     # -- lookup ----------------------------------------------------------------
 
@@ -177,14 +196,16 @@ class UploadManager:
         - "ome_zarr:name" → zarr-backed with given name
         - "ome_zarr:" → zarr-backed with server-generated name
 
-        A name is single-use for the life of the server. A named ``cache:``
-        upload has a deterministic id, so a second create under the same name
-        would land on the first's adapter -- and replacing it would leave the
-        first writer's chunks, and its ``finish``, landing in a source that is
-        no longer its own, with nothing to tell it so (status is keyed by the
-        id it still holds). Refusing the collision is what makes ``source_id``
-        alone name an attempt. Sealed sources are not an exception: a name that
-        could be reclaimed by finishing is a name a straggler can be raced for.
+        A name is taken for as long as its source is registered. A named
+        ``cache:`` upload has a deterministic id, so a second create under the
+        same name would land on the first's adapter -- and replacing it would
+        leave the first writer's chunks, and its ``finish``, landing in a
+        source that is no longer its own, with nothing to tell it so (status
+        is keyed by the id it still holds). Refusing the collision is what
+        makes ``source_id`` alone name an attempt. Sealed sources are not an
+        exception: a name that could be reclaimed by finishing is a name a
+        straggler can be raced for. What does free a name is :meth:`reap`
+        unregistering its tombstone, ``ttl`` seconds after the discard.
         """
         self._require_canonical_axes(req_desc)
 
@@ -216,9 +237,10 @@ class UploadManager:
             close_adapter(adapter)
             raise flight.FlightServerError(
                 f"create_tensor: {req_desc.array_id!r} already exists as "
-                f"{source_id}. A name is taken for the life of the server, "
-                "finished or discarded included; upload under a new name, or "
-                f"'{prefix}:' for a server-minted one."
+                f"{source_id}. A name stays taken while its source is "
+                "registered -- for the life of the server once finished, and "
+                "until the reclaim sweep passes once discarded; upload under a "
+                f"new name, or '{prefix}:' for a server-minted one."
             )
 
         # Only a durable upload belongs in the catalog; a volatile one is
@@ -275,6 +297,88 @@ class UploadManager:
         logger.debug(
             f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"
         )
+
+    # -- reclamation -----------------------------------------------------------
+
+    def reap(self, now: Optional[float] = None) -> Tuple[int, int]:
+        """One sweep over the registry by ``updated_at``; the unit the thread runs.
+
+        Two halves, one clock. A PENDING upload with no write for ``ttl``
+        seconds is discarded with a reason -- the job that owned it died, and
+        a discard is the one terminal transition there is, so a straggler
+        that writes later is refused the same way it would be after an
+        explicit discard. A tombstone that has stood for ``ttl`` seconds is
+        unregistered: its name is free again and its status reads UNKNOWN,
+        which a poller already treats as fail-fast (biopb/biopb#109). An
+        expired upload therefore takes two sweeps to vanish, and is a
+        tombstone in between.
+
+        READY sources are not touched: a finished upload is a published
+        result, and its lifetime is its reader's, not this sweep's. Durable
+        kinds are not touched either -- their bytes are on disk and in the
+        catalog, which discard refuses to disown -- so a quiet ``ome_zarr``
+        upload stays PENDING and writable.
+
+        The chunks a reclaimed tombstone wrote stay in the cache until the
+        LRU evicts them. They are unreachable: a re-created name gets a fresh
+        ``content_version`` namespace, so its chunk ids never collide with
+        the old ones (``CachedSourceAdapter.next_content_version``).
+
+        Returns ``(expired, reclaimed)`` counts. *now* is injectable for tests;
+        it is on the monotonic clock, like ``updated_at``.
+        """
+        ttl = self.ttl
+        if ttl <= 0:
+            return 0, 0
+        if now is None:
+            now = time.monotonic()
+        expired = reclaimed = 0
+        for source_id, adapter in self._registry.snapshot():
+            if upload_of(adapter) is None:
+                continue
+            if adapter.expire_if_idle(now, ttl):
+                expired += 1
+                continue
+            age = adapter.tombstone_age(now)
+            if age is not None and age > ttl:
+                # Safe without a compare-and-remove: a tombstone is terminal
+                # and its id cannot be re-registered while it stands, so this
+                # is still the adapter the snapshot saw.
+                self._registry.unregister(source_id)
+                reclaimed += 1
+                logger.info(f"Reclaimed discarded upload {source_id} after {age:.0f} s")
+        return expired, reclaimed
+
+    def start_sweep(self) -> None:
+        """Run :meth:`reap` on a daemon thread until :meth:`stop_sweep`.
+
+        A no-op when ``ttl`` is 0. The interval is a quarter of the TTL,
+        clamped to [1 s, 60 s] and recomputed each pass, so a retune takes
+        effect without a restart -- the same shape as the handle reaper.
+        """
+        if self.ttl <= 0 or self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="upload-reaper", daemon=True
+        )
+        self._thread.start()
+
+    def stop_sweep(self) -> None:
+        """Stop the sweep thread and wait for it; idempotent."""
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop.set()
+        thread.join()
+        self._thread = None
+
+    def _loop(self) -> None:
+        while not self._stop.wait(max(1.0, min(self.ttl / 4.0, 60.0))):
+            try:
+                self.reap()
+            except Exception:  # pragma: no cover - the sweep must never die
+                logger.debug("upload reap failed", exc_info=True)
 
     @staticmethod
     def _parse_metadata_json(metadata_json: str) -> dict:

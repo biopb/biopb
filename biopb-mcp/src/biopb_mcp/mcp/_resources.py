@@ -646,9 +646,9 @@ desc = client.create_tensor("cache:my_result", arr)   # shape, dtype, chunks fro
 client.upload_array(desc, arr)
 array_id = desc.array_id
 ```
-A name is single-use for the life of the server: creating under a name that
-already exists is refused. Re-running a cell needs a new name, or `"cache:"`
-for a server-minted one.
+A name is taken while its source exists: creating under a name that already
+exists is refused. Re-running a cell needs a new name, or `"cache:"` for a
+server-minted one.
 """
 
 OPS = """\

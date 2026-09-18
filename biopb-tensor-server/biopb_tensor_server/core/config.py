@@ -239,6 +239,7 @@ _CONSTRAINTS = {
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
         "handle_reaper_ttl": _Range(min=0),
+        "upload_ttl": _Range(min=0),
     },
 }
 
@@ -881,6 +882,15 @@ class ServerConfig:
             "unaffected."
         },
     )
+    upload_ttl: float = field(
+        default=3600.0,
+        metadata={
+            "help": "Seconds an upload may sit without a write before it is "
+            "discarded as abandoned, and a discarded upload stays registered "
+            "(so a straggler still learns why its writes fail) before its name "
+            "is freed. Finished uploads are never reclaimed. 0 disables the sweep."
+        },
+    )
     stability_window: float = field(
         default=30.0,
         metadata={
@@ -1316,6 +1326,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
 
     _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
     _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
+    _carry(server_kwargs, "upload_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
     _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
