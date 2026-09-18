@@ -108,6 +108,16 @@ class SourceRegistry:
         anything, a live upload or a sealed one. Atomic, so two concurrent
         creates of one name cannot both be told they own it. The caller still
         owns *adapter* on a refusal and closes it.
+
+        Only an upload's ``create_source`` calls this rather than
+        :meth:`register` directly: an upload name is caller-chosen, so a
+        collision could mean someone else's data getting swapped in under an
+        id already handed out. Discovery and the reconciler still call
+        :meth:`register` (silent overwrite) because their source_id is
+        ``generate_source_id``'s hash of the resolved source URL -- a
+        collision there is definitionally the same source being re-registered
+        (a rescan, a content update at the same path), never a distinct
+        source claiming a name that is not its own.
         """
         with self._lock:
             if source_id in self._sources:

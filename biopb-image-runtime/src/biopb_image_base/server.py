@@ -216,10 +216,7 @@ class EmbeddedTensorCache:
     ) -> None:
         """Write one chunk into a source this process created."""
         import pyarrow.flight as flight
-        from biopb_tensor_server.core.errors import (
-            UploadDiscardedError,
-            UploadSealedError,
-        )
+        from biopb_tensor_server.core.errors import UploadClosedError
 
         adapter = self._server.sources.get(source_id)
         if adapter is None:
@@ -229,7 +226,7 @@ class EmbeddedTensorCache:
         # servicer's job discriminates on it the way a remote client would.
         try:
             adapter.write_chunk(endpoint, chunk)
-        except (UploadDiscardedError, UploadSealedError) as e:
+        except UploadClosedError as e:
             raise flight.FlightCancelledError(str(e)) from e
 
     def finish(self, source_id: str) -> dict:

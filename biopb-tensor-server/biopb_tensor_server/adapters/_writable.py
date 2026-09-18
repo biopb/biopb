@@ -284,7 +284,9 @@ class WritableSource:
         ``CachedSourceAdapter`` takes arbitrary bounds; it now only reports
         progress.
 
-        Idempotent, so a retried ``finish`` is not an error.
+        Idempotent, so a retried ``finish`` is not an error -- and, matching
+        :meth:`discard`, a no-op past the first call: the first seal's touch
+        is the one a reclaim sweep should see, not a retry's.
         """
         progress = self._upload
         if progress is None:
@@ -292,12 +294,13 @@ class WritableSource:
         with progress.lock:
             if progress.is_discarded:
                 raise UploadDiscardedError(self.source_id, progress.reason)
-            progress.status = UploadStatus.READY
-            progress.touch()
-            logger.info(
-                f"Finished upload {self.source_id}: "
-                f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
-            )
+            if progress.status is not UploadStatus.READY:
+                progress.status = UploadStatus.READY
+                progress.touch()
+                logger.info(
+                    f"Finished upload {self.source_id}: "
+                    f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
+                )
             return progress.as_status_dict(self.source_id)
 
     # -- the shared half -------------------------------------------------------
@@ -332,9 +335,18 @@ class WritableSource:
         self._store_chunk(bounds, data, expected_shape, dtype)
         self._mark_chunk(bounds)
 
-    def _refuse_write(self) -> None:
-        """The two ways a write can arrive too late. Discarded first: it
+    def _raise_if_discarded_locked(self, progress: UploadProgress) -> None:
+        """Raise :class:`UploadDiscardedError` if *progress* is discarded.
+
+        Caller holds ``progress.lock``. Shared by :meth:`_refuse_write` and
+        :meth:`_refuse_if_discarded`, discarded checked first in the former: it
         carries a reason, which "already finished" does not.
+        """
+        if progress.is_discarded:
+            raise UploadDiscardedError(self.source_id, progress.reason)
+
+    def _refuse_write(self) -> None:
+        """The two ways a write can arrive too late.
 
         There is no third: a source's id has one adapter for the life of the
         server (``UploadManager.create_source`` refuses a name collision), so
@@ -344,27 +356,25 @@ class WritableSource:
         if progress is None:
             return
         with progress.lock:
-            if progress.is_discarded:
-                raise UploadDiscardedError(self.source_id, progress.reason)
+            self._raise_if_discarded_locked(progress)
             if progress.is_sealed:
                 raise UploadSealedError(self.source_id)
 
     def _refuse_if_discarded(self) -> None:
         """Raise :class:`UploadDiscardedError` if the upload has been given up on.
 
-        Shared by both directions: :meth:`put_chunk` calls it for a write, and
-        a read path (``CachedSourceAdapter.resolve_chunk_data``) calls it too,
-        so a tombstone answers a still-unwinding reader the same reason it
-        gives a writer rather than "no chunk here". Each boundary maps the
-        exception to its own wire error (write -> ``FlightCancelledError``,
-        read -> ``FlightServerError``).
+        The read path's own check (``CachedSourceAdapter.resolve_chunk_data``):
+        a tombstone answers a still-unwinding reader the same reason it gives a
+        writer rather than "no chunk here". The write path's equivalent is
+        :meth:`_refuse_write`, which also refuses a sealed-but-not-discarded
+        upload. Each boundary maps the exception to its own wire error
+        (write -> ``FlightCancelledError``, read -> ``FlightServerError``).
         """
         progress = self._upload
         if progress is None:
             return
         with progress.lock:
-            if progress.is_discarded:
-                raise UploadDiscardedError(self.source_id, progress.reason)
+            self._raise_if_discarded_locked(progress)
 
     def _mark_chunk(self, bounds: ChunkBounds) -> None:
         """Record that the chunk at *bounds* landed.

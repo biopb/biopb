@@ -172,15 +172,24 @@ class WriteNotSupportedError(Exception):
     """
 
 
-class UploadDiscardedError(Exception):
+class UploadClosedError(Exception):
+    """A write to an upload that no longer accepts them -- discarded or sealed.
+
+    The shared base of :class:`UploadDiscardedError` and
+    :class:`UploadSealedError`, so a boundary that maps both to the same wire
+    error (the DoPut path's ``FlightCancelledError``) catches one type instead
+    of enumerating the pair. Off the ``ValueError`` hierarchy for the same
+    reason as :class:`WriteNotSupportedError`. Not raised directly -- catch one
+    of the two subclasses to discriminate why.
+    """
+
+
+class UploadDiscardedError(UploadClosedError):
     """A write to an upload its owner has given up on (biopb/biopb#1).
 
     Raised by ``WritableSource.put_chunk`` once the source is discarded, so a
     job still unwinding learns it was given up on rather than that its source
-    is missing. Off the ``ValueError`` hierarchy for the same reason as
-    :class:`WriteNotSupportedError`. The DoPut boundary maps it to
-    ``FlightCancelledError`` so a client discriminates on the exception type
-    rather than matching a string; the reason rides in the message.
+    is missing. The reason rides in the message.
     """
 
     def __init__(self, source_id: str, reason: str = "") -> None:
@@ -192,7 +201,7 @@ class UploadDiscardedError(Exception):
         self.reason = reason
 
 
-class UploadSealedError(Exception):
+class UploadSealedError(UploadClosedError):
     """A write to an upload its producer has already declared complete.
 
     ``finish`` is a producer's declaration that the source is complete, and

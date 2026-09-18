@@ -43,8 +43,8 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.errors import (
+    UploadClosedError,
     UploadDiscardedError,
-    UploadSealedError,
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
@@ -244,7 +244,7 @@ class UploadManager:
         dtype = table.schema.field(0).type.to_pandas_dtype()
         try:
             adapter.put_chunk(bounds, data_column, expected_shape, dtype)
-        except (UploadDiscardedError, UploadSealedError) as e:
+        except UploadClosedError as e:
             raise flight.FlightCancelledError(str(e)) from e
         except (ValueError, WriteNotSupportedError) as e:
             raise flight.FlightServerError(str(e)) from e
