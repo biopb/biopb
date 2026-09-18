@@ -43,6 +43,7 @@ from dask.highlevelgraph import HighLevelGraph
 from dask.utils import parse_bytes
 
 from biopb.tensor import _diskcache
+from biopb.tensor._location import location_host
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.ticket_pb2 import TensorTicket
 
@@ -170,25 +171,19 @@ def _is_localhost_location(location: str) -> bool:
     Returns:
         True if location resolves to loopback address
     """
-    import re
     import socket
 
-    # Parse location URI - handle various formats
-    # grpc://hostname:port, grpc+tls://hostname:port, hostname:port
-    # IPv6 format: grpc://[::1]:port
-    match = re.match(
-        r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location
-    )
-    if not match:
+    # Shares ``_location``'s parser with the disk-cache key rather than matching
+    # schemes here: a second vocabulary would answer differently for the same
+    # server, and the two gates are mutually exclusive by this very result.
+    hostname = location_host(location)
+    if not hostname:
         return False
 
-    # IPv6 bracketed or regular hostname
-    hostname = match.group(1) or match.group(2)
-
-    # Direct localhost matches (the set is all-lowercase, so lowercasing the
-    # hostname is the only comparison needed).
+    # The set is all-lowercase and location_host lowercases, so no further
+    # normalization is needed.
     localhost_names = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-    if hostname.lower() in localhost_names:
+    if hostname in localhost_names:
         return True
 
     # Resolve hostname via getaddrinfo

@@ -45,6 +45,15 @@ def age(path: Path, seconds: float) -> None:
     os.utime(path, (t, t))
 
 
+def _levels(root: Path, leaf: Path) -> list:
+    """*root* and every directory down to *leaf*, inclusive."""
+    out, cur = [root], root
+    for part in leaf.relative_to(root).parts:
+        cur = cur / part
+        out.append(cur)
+    return out
+
+
 # --- settings ------------------------------------------------------------- #
 
 
@@ -95,6 +104,64 @@ def test_same_chunk_id_on_two_servers_does_not_collide(settings):
     one = dc.chunk_path(settings.root, "grpc://host-a:8815", cid)
     two = dc.chunk_path(settings.root, "grpc://host-b:8815", cid)
     assert one != two
+
+
+def test_the_format_component_leads_the_layout(settings):
+    """A bump has to move the whole tree, not a leaf inside it."""
+    path = dc.chunk_path(settings.root, LOC, b"c")
+    assert path.relative_to(settings.root).parts[0] == dc.FORMAT
+
+
+def test_an_older_format_is_unreachable_rather_than_misread(settings):
+    """The point of naming the format: entries written under a different one are
+    never looked up, so a layout or encoding change cannot serve a stale decode.
+    """
+    cur = dc.chunk_path(settings.root, LOC, b"c")
+    old = settings.root / "v0" / cur.relative_to(settings.root / dc.FORMAT)
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"whatever v0 looked like")
+    assert dc.read_batch(settings, LOC, b"c") is None
+
+
+def test_a_superseded_tree_is_still_swept(tmp_path):
+    """Unreachable is not leaked: nothing re-reads an old generation, so its
+    files keep their original mtimes and oldest-first eviction takes them first.
+    """
+    s = dc.Settings(root=tmp_path, budget=1, ttl=7 * 24 * 3600, min_free=0)
+    stale = tmp_path / "v0" / "aa" / "bb" / f"old{dc._SUFFIX}"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"x" * 4096)
+    age(stale, 3600)
+    dc._sweep(s)
+    assert not stale.exists()
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "grpc+tcp://remote-host:8815",
+        "grpc://REMOTE-HOST:8815",
+        "grpc://remote-host:8815/",
+        "remote-host:8815",
+    ],
+)
+def test_one_server_keys_alike_however_it_is_spelled(settings, other):
+    """The location is a user string, not an identity -- Arrow round-trips
+    whatever it is handed, and each SDK's constructors pick a different form. Key
+    on the raw string and one server gets a tree per spelling.
+    """
+    assert dc.chunk_path(settings.root, LOC, b"c") == dc.chunk_path(
+        settings.root, other, b"c"
+    )
+
+
+def test_tls_and_plaintext_are_not_the_same_server(settings):
+    """Aliasing goes only as far as spelling: grpcs:// is grpc+tls://, and
+    neither is the plaintext endpoint."""
+    plain = dc.chunk_path(settings.root, "grpc://h:8815", b"c")
+    tls = dc.chunk_path(settings.root, "grpc+tls://h:8815", b"c")
+    assert plain != tls
+    assert tls == dc.chunk_path(settings.root, "grpcs://h:8815", b"c")
 
 
 def test_content_version_header_changes_the_key(settings):
@@ -350,7 +417,17 @@ def pool(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "location", ["grpc://localhost:8815", "grpc://127.0.0.1:8815", "grpc://[::1]:8815"]
+    "location",
+    [
+        "grpc://localhost:8815",
+        "grpc://127.0.0.1:8815",
+        "grpc://[::1]:8815",
+        # The scheme Arrow's own Location factories emit. Matched by spelling,
+        # this one read as remote and took the disk cache on a loopback server.
+        "grpc+tcp://localhost:8815",
+        "grpc+tls://localhost:8815",
+        "localhost:8815",
+    ],
 )
 def test_localhost_never_uses_the_disk_cache(pool, location):
     """Writing our own copy would cost several times the ~1 ms miss it saves."""
@@ -490,7 +567,9 @@ def test_every_directory_and_file_is_owner_only(tmp_path):
     dc.write_batch(s, LOC, b"c", unified_batch(np.zeros(8, dtype="u1")))
 
     path = dc.chunk_path(root, LOC, b"c")
-    for d in (root, path.parent.parent, path.parent):
+    # Every level, walked rather than spelled out, so adding one to the layout
+    # cannot leave it unchecked.
+    for d in _levels(root, path.parent):
         assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -498,11 +577,13 @@ def test_every_directory_and_file_is_owner_only(tmp_path):
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
 def test_intermediate_location_dir_is_not_left_at_the_umask_default(tmp_path):
     """Path.mkdir applies `mode` only to the final component, so a parents=True
-    call would leave the location digest dir wide open."""
+    call would leave the levels above the shard wide open."""
     root = tmp_path / "chunks"
     s = dc.load_settings(env={dc.ENV_BUDGET: "1GiB", dc.ENV_DIR: str(root)})
     dc.write_batch(s, LOC, b"c", unified_batch(np.zeros(8, dtype="u1")))
-    assert stat.S_IMODE((root / dc.location_key(LOC)).stat().st_mode) == 0o700
+    loc_dir = root / dc.FORMAT / dc.location_key(LOC)
+    assert stat.S_IMODE(loc_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(loc_dir.parent.stat().st_mode) == 0o700
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
