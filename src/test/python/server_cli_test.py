@@ -5,8 +5,7 @@ argv wiring, mode resolution, and the bind/TLS/token derivations. The lower-leve
 detached-daemon lifecycle helpers those commands call live in
 :mod:`biopb._lifecycle.daemon` (``daemon_test.py``); the data-plane commands that
 used to live under `biopb server` moved with biopb/biopb#615 -- cache-stats to
-``cli_test.py`` (it is a `biopb tensor` command now) and migrate-config to
-biopb-tensor-server's own suite. OS calls are mocked so the tests are
+``cli_test.py`` (it is a `biopb tensor` command now). OS calls are mocked so the tests are
 deterministic and fast on any platform; time.sleep is neutralized.
 """
 
@@ -219,32 +218,6 @@ class TestControlStatus:
         assert res.exit_code == 0, res.output
         for cmd in ("start", "stop", "status", "run"):
             assert cmd in res.output
-
-
-class TestRejectLegacyToml:
-    """`control start` / `run` refuse a pre-#34 `biopb.toml` up front.
-
-    Every config probe further in is best-effort, so without this gate a legacy
-    config surfaces as a plane serving defaults instead of the user's data.
-    """
-
-    def test_legacy_toml_exits_with_the_migration_command(self, tmp_path, capsys):
-        legacy = tmp_path / "biopb.toml"
-        legacy.write_text("[server]\nport = 8815\n")
-        with pytest.raises(typer.Exit) as exc:
-            cli._reject_legacy_toml(legacy)
-        assert exc.value.exit_code == 1
-        assert "migrate-config" in capsys.readouterr().out
-
-    def test_json_config_passes(self, tmp_path):
-        config = tmp_path / "biopb.json"
-        config.write_text('{"server": {"port": 8815}}')
-        cli._reject_legacy_toml(config)  # no raise
-
-    def test_absent_toml_passes(self, tmp_path):
-        # find_config hands back the canonical name when nothing exists; a
-        # never-created .toml path must not be mistaken for a legacy install.
-        cli._reject_legacy_toml(tmp_path / "biopb.toml")
 
 
 class TestControlRunArgv:
@@ -934,7 +907,6 @@ class TestControlTlsMaterial:
         )
         monkeypatch.setattr(cli, "_guard_ports_free", lambda *_a, **_k: None)
         monkeypatch.setattr(cli, "_ensure_dirs", lambda: None)
-        monkeypatch.setattr(cli, "_reject_legacy_toml", lambda _c: None)
 
         with pytest.raises(typer.Exit):
             cli.control_run(

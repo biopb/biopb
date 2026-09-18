@@ -22,17 +22,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Data dir + config so `biopb server start` would discover a ZVI under /data.
 RUN mkdir -p /data \
     && mkdir -p /root/.config/biopb && printf '%s\n' \
-    '[server]' \
-    'host = "127.0.0.1"' \
-    'port = 8815' \
-    '' \
-    '[cache]' \
-    'backend = "file"' \
-    '' \
-    '[[sources]]' \
-    'url = "/data"' \
-    'monitor = true' \
-    > /root/.config/biopb/biopb.toml
+    '{' \
+    '  "cache": { "backend": "file" },' \
+    '  "sources": [' \
+    '    { "url": "/data", "monitor": true }' \
+    '  ]' \
+    '}' \
+    > /root/.config/biopb/biopb.json
 
 # Optional: bake a ZVI sample into the image. Non-fatal if unset/unreachable
 # (offline builds, moved URL) -- mounting via BIOPB_TEST_DATA is preferred.

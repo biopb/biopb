@@ -3,10 +3,9 @@
 Two concerns, one module because they answer the same question ("what path does
 this file have?") and every consumer needs both:
 
-1. **The config file** — *where* the tensor-server config lives and *which*
-   format wins when both exist (JSON is the only format read; a leftover legacy
-   TOML is detected purely to point at the migration command). Imported by
-   ``biopb-tensor-server`` (``config.find_config``) and the umbrella ``biopb`` CLI.
+1. **The config file** — *where* the tensor-server config lives, and its one
+   format. Imported by ``biopb-tensor-server`` (``config.find_config``) and the
+   umbrella ``biopb`` CLI.
 2. **The runtime trees** — the XDG base dirs and every log / session-registry /
    pid / stop-sentinel / asset path derived from them. These used to be
    open-coded as literal strings across five packages (the core CLI, biopb-mcp,
@@ -42,11 +41,7 @@ JSON is the *only* on-disk config format: the config is machine-generated (the
 installer / the admin endpoint write it), and once nobody hand-edits it, TOML's
 hand-editing ergonomics stop paying for its one wart — no stdlib *writer*. JSON
 has a stdlib writer on both ends, unifies the format with biopb-mcp's
-``mcp-config.json``, and pairs with JSON Schema for validation. The TOML read
-path was dropped once the deprecation window closed (biopb/biopb#34); a leftover
-``biopb.toml`` is still *recognized* — by the installers, which convert it, and
-by :func:`find_config`, which names ``biopb-tensor-server migrate-config`` — so an old
-install fails with the fix rather than with a phantom missing file.
+``mcp-config.json``, and pairs with JSON Schema for validation (biopb/biopb#34).
 """
 
 from __future__ import annotations
@@ -215,7 +210,6 @@ def cache_dir() -> Path:
 # ``$XDG_CONFIG_HOME``. ``config_dir()`` is the call-time source.
 DEFAULT_CONFIG_DIR = config_dir()
 CANONICAL_CONFIG_NAME = "biopb.json"
-LEGACY_CONFIG_NAME = "biopb.toml"
 
 # biopb-mcp's own settings file, co-located in the same dir. Distinct from the
 # installer's client-definition ``mcp.json`` (which registers biopb-mcp with MCP
@@ -265,48 +259,14 @@ def mcp_skill_dir() -> Path:
 
 
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
-    """Resolve the config file in *config_dir*: ``biopb.json``, else a legacy
-    ``biopb.toml`` that must be migrated.
+    """Resolve the config file in *config_dir*: ``biopb.json``.
 
-    Returns the first of ``biopb.json`` / ``biopb.toml`` that exists. When
-    neither exists, returns the canonical JSON path so callers seed / print the
-    forward-looking name. Callers that need a guaranteed-existing file should
-    still check ``.exists()`` on the result.
-
-    A legacy TOML is **no longer readable** (biopb/biopb#34) but is still
-    returned when it is the only config present, and both cases log a warning
-    naming ``biopb-tensor-server migrate-config``. Handing the real file back — rather
-    than the canonical name that does not exist — is what lets the caller fail
-    with "this config needs migrating" instead of "no config at all", which
-    every downstream default (a defaulted bind address, a seeded fresh config)
-    would otherwise quietly paper over.
+    Returns the canonical path whether or not it exists, so a caller that is
+    seeding a fresh config and one that is reading an existing one name the same
+    file. Callers that need a guaranteed-existing file should check
+    ``.exists()`` on the result.
     """
-    json_path = config_dir / CANONICAL_CONFIG_NAME
-    toml_path = config_dir / LEGACY_CONFIG_NAME
-    if json_path.exists():
-        if toml_path.exists():
-            logger.warning(
-                "Both %s and %s exist in %s; using %s and ignoring the legacy "
-                "%s. Run `biopb-tensor-server migrate-config` to retire it. "
-                "See biopb/biopb#34.",
-                CANONICAL_CONFIG_NAME,
-                LEGACY_CONFIG_NAME,
-                config_dir,
-                CANONICAL_CONFIG_NAME,
-                LEGACY_CONFIG_NAME,
-            )
-        return json_path
-    if toml_path.exists():
-        logger.warning(
-            "%s in %s is the legacy TOML config format, which is no longer "
-            "read; %s is the only supported format. Run "
-            "`biopb-tensor-server migrate-config` to convert it. See biopb/biopb#34.",
-            LEGACY_CONFIG_NAME,
-            config_dir,
-            CANONICAL_CONFIG_NAME,
-        )
-        return toml_path
-    return json_path
+    return config_dir / CANONICAL_CONFIG_NAME
 
 
 # --- logs (daemon: control + supervised tensor server) ------------------- #

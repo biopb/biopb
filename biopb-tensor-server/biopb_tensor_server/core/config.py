@@ -10,8 +10,7 @@ Reads JSON config files (``biopb.json``) carrying:
 - Data source definitions (explicit files or directory auto-discovery)
 - Credential profiles for remote storage (S3, GCS, etc.)
 
-JSON is the only supported format; a pre-#34 ``biopb.toml`` is converted with
-``biopb-tensor-server migrate-config`` (see biopb/biopb#34).
+JSON is the only supported config format (see biopb/biopb#34).
 
 Example config (explicit):
 ```json
@@ -103,7 +102,6 @@ from biopb._config_validate import (
 from biopb._locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
-    LEGACY_CONFIG_NAME as LEGACY_CONFIG_NAME,
     find_config as find_config,
 )
 
@@ -931,9 +929,8 @@ class ServerConfig:
 def load_config(path: Path) -> ServerConfig:
     """Load configuration from a JSON file.
 
-    JSON is the only format read (biopb/biopb#34); a legacy ``biopb.toml``
-    raises with the migration command. The file is parsed to a plain dict and
-    handed to the format-agnostic :func:`parse_config`.
+    JSON is the only format read (biopb/biopb#34). The file is parsed to a
+    plain dict and handed to the format-agnostic :func:`parse_config`.
 
     Args:
         path: Path to a JSON config file (``biopb.json``)
@@ -943,8 +940,8 @@ def load_config(path: Path) -> ServerConfig:
 
     Raises:
         FileNotFoundError: If config file doesn't exist
-        ValueError: If the file is not valid JSON (including a legacy TOML), or
-            if it carries an out-of-range / bad-enum value
+        ValueError: If the file is not valid JSON, or if it carries an
+            out-of-range / bad-enum value
     """
     if isinstance(path, str):
         path = Path(path)
@@ -971,10 +968,6 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
     ``asdict`` would clobber them (and there is no dataclass->dict projection).
 
     Behavior:
-    - JSON is canonical. If *path* points at a legacy ``biopb.toml`` the write
-      targets the sibling ``biopb.json`` and the old TOML is renamed to
-      ``biopb.toml.bak``, so :func:`find_config`'s both-files shadow warning
-      never fires (biopb/biopb#34).
     - A sibling ``biopb.schema.json`` (the output of ``build_config_schema``) is
       written next to the config and a *relative* ``"$schema":
       "./biopb.schema.json"`` pointer is embedded, so editors validate the
@@ -984,13 +977,6 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
     """
     if isinstance(path, str):
         path = Path(path)
-
-    # JSON is canonical: redirect a .toml target to its sibling biopb.json and
-    # back the legacy file up so find_config's both-files warning never fires.
-    legacy_toml: Optional[Path] = None
-    if path.suffix.lower() == ".toml":
-        legacy_toml = path
-        path = path.with_name(CANONICAL_CONFIG_NAME)
 
     schema_path = path.with_name(SCHEMA_SIDECAR_NAME)
 
@@ -1004,16 +990,6 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
 
     atomic_write_json(schema_path, build_config_schema(), raise_on_error=True)
     atomic_write_json(path, payload, raise_on_error=True)
-
-    if legacy_toml is not None and legacy_toml.exists():
-        backup = legacy_toml.with_name(legacy_toml.name + ".bak")
-        legacy_toml.replace(backup)
-        logger.info(
-            "Migrated legacy %s to %s; backed up the old file to %s (biopb/biopb#34).",
-            legacy_toml.name,
-            path.name,
-            backup.name,
-        )
 
     return path
 
@@ -1081,60 +1057,17 @@ def restore_redacted_secrets(
     return merged
 
 
-# Appended to every read failure: a legacy TOML is the one shape of "not JSON"
-# with a one-command fix, and a user meeting a parse error has no other way to
-# learn the format changed (biopb/biopb#34).
-_MIGRATE_HINT = (
-    "JSON is the only supported config format; convert a legacy "
-    f"{LEGACY_CONFIG_NAME} with `biopb-tensor-server migrate-config`. See biopb/biopb#34."
-)
-
-
 def _read_config_file(path: Path) -> Dict[str, Any]:
     """Read a config file into a plain dict.
 
-    JSON only. A ``.toml`` path is rejected without parsing (the read path was
-    dropped once the deprecation window closed); every other extension --
-    including none -- is read as JSON, so an unconventionally-named config still
-    loads. Both failures name ``biopb-tensor-server migrate-config``.
+    Extension-blind: the file is read as JSON whatever it is called, so an
+    unconventionally-named config still loads.
     """
-    if path.suffix.lower() == ".toml":
-        raise ValueError(
-            f"Config file {path} is in the legacy TOML format. " + _MIGRATE_HINT
-        )
-    return _load_json(path)
-
-
-def _load_json(path: Path) -> Dict[str, Any]:
     try:
         with open(path, "rb") as f:
             return json.load(f)
     except ValueError as e:
-        raise ValueError(
-            f"Invalid JSON in config file {path}: {e}. " + _MIGRATE_HINT
-        ) from e
-
-
-def read_legacy_toml(path: Path) -> Dict[str, Any]:
-    """Read a pre-#34 ``biopb.toml`` into a plain dict.
-
-    The **only** remaining TOML reader, and deliberately not reachable from
-    :func:`load_config`: it exists for `biopb-tensor-server migrate-config`, which
-    converts the old file to canonical JSON. ``tomllib`` is imported lazily so
-    the server's own read path carries no TOML dependency.
-    """
-    import sys
-
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:
-        import tomli as tomllib
-
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        raise ValueError(f"Invalid TOML in config file {path}: {e}") from e
+        raise ValueError(f"Invalid JSON in config file {path}: {e}") from e
 
 
 # The known-key set for the unknown-key warning is the config JSON Schema's

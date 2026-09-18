@@ -86,10 +86,7 @@ are produced.
 
 ## Config & data locations
 
-- Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun; a
-  legacy `biopb.toml` is no longer read and must be migrated to JSON — via
-  `biopb-tensor-server migrate-config`, or automatically when you pick a new data
-  folder)
+- Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun)
 - biopb-mcp config: `~/.config/biopb/mcp-config.json`
 - MCP client definition: `~/.config/biopb/mcp.json`
 - Agent kernel plugins: `~/.config/biopb/kernel/` (drop a `*.py` here to add tools

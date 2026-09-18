@@ -156,15 +156,13 @@ policies still require a *signed* engine — signing is the sole fix there.
 | Finish | `RESULT` records | the console summary |
 
 **Existing config / keep behavior.** On leaving the Options page the wizard
-checks for `%USERPROFILE%\.config\biopb\biopb.json` (canonical, biopb/biopb#34),
-falling back to a legacy `biopb.toml` (fixed paths, so it catches both prior GUI
-*and* `irm|iex` console installs). If present, a Yes/No dialog offers to keep the
+checks for `%USERPROFILE%\.config\biopb\biopb.json` (a fixed path, so it catches
+both prior GUI *and* `irm|iex` console installs). If present, a Yes/No dialog offers to keep the
 current configuration — the GUI equivalent of the console/Linux "Keep my current
 config file (default)". **Yes** passes `-KeepConfig` (engine leaves the existing
 config untouched). **No** passes `-Reset`: the engine re-wires the `sources` list
 to the curated sample bundle — the same end state as a fresh install — while
-preserving the prior server/cache settings (a legacy `biopb.toml` is migrated to
-JSON and backed up). Neither branch prompts for a data folder, matching the
+preserving the prior server/cache settings. Neither branch prompts for a data folder, matching the
 console, which has no re-point path at all. We do not pre-read the existing data
 dir (a config may hold multiple `sources`, so "keep" means *don't touch the
 file*, and "reset" means *replace only the `sources`*).

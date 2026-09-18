@@ -85,19 +85,16 @@ _add_optional_typer(
 _add_optional_typer("image", "biopb.image.cli", "Call ProcessImage algorithm servers.")
 
 # The `biopb server` group is gone (biopb/biopb#615). Its lifecycle commands went
-# first, when the control plane took over the data-plane process; the two that
-# outlived them were not a group: `cache-stats` is a Flight query, so it moved to
-# `biopb tensor cache-stats` beside the other queries, and `migrate-config` needs
-# biopb-tensor-server to do anything at all, so it moved to
-# `biopb-tensor-server migrate-config` and left the SDK.
+# first, when the control plane took over the data-plane process; the one that
+# outlived them was not a group: `cache-stats` is a Flight query, so it moved to
+# `biopb tensor cache-stats` beside the other queries.
 
 # Daemon management constants. On-disk locations come from the shared
 # `_locations` module (XDG-aware): the installed webapp bundle is a portable
 # asset (data tree); logs / pid / sentinels are per-machine state (state tree).
 DEFAULT_WEBAPP = _locations.webapp_dir()
 
-# Default config path, preferring JSON over legacy TOML and warning when both
-# exist. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
+# Default config path. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
 # core module, so resolving this typer Option default does not import the heavy
 # server config module (biopb/biopb#34).
 DEFAULT_CONFIG = find_config()
@@ -348,24 +345,6 @@ def _tail_and_follow(
     finally:
         f.close()
     raise typer.Exit(0)
-
-
-def _reject_legacy_toml(config: Path) -> None:
-    """Refuse to start on a pre-#34 ``biopb.toml``, naming the migration command.
-
-    The server no longer reads TOML (biopb/biopb#34), and every config probe on
-    the start path is best-effort, so a legacy config would otherwise surface as
-    a plane that starts on defaults and serves none of the user's data. Check it
-    once, up front, where the user can act on it.
-    """
-    if config and config.suffix.lower() == ".toml" and config.exists():
-        console.print(f"[red]Config {config} is in the legacy TOML format.[/red]")
-        console.print(
-            "JSON is the only supported format. Convert it with "
-            "[bold]biopb-tensor-server migrate-config[/bold] (settings are "
-            "preserved and the old file is backed up), then retry."
-        )
-        raise typer.Exit(1)
 
 
 def _plane_bind(grpc_bind: str, base_port: int) -> Tuple[str, int]:
@@ -1294,7 +1273,6 @@ def control_start(
         _require_tls_extra()
     _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
-    _reject_legacy_toml(config)
 
     # Serialize concurrent starts so the check-then-spawn below is atomic across
     # processes (see _control_start_lock / biopb._lifecycle.file_lock). Held through the
@@ -1625,7 +1603,6 @@ def control_run(
         _require_tls_extra()
     _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
-    _reject_legacy_toml(config)
     from biopb_control import run_control
     from biopb_control._supervisor import DataPlaneSpec
 

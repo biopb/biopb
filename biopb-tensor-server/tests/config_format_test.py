@@ -1,11 +1,8 @@
-"""JSON-only config loading, and how a pre-#34 TOML is turned away
-(biopb/biopb#34).
+"""JSON-only config loading (biopb/biopb#34).
 
-The legacy TOML read path is gone: a ``.toml`` config is rejected without being
-parsed, and both that refusal and a plain JSON syntax error must name
-``biopb-tensor-server migrate-config`` -- a parse error is the only place a user
-learns the format changed. ``find_config`` still *sees* a legacy file, so the
-failure is "migrate this" rather than "no config here".
+JSON is the only config format, and nothing in the tree knows the word TOML any
+more -- not the reader, not ``find_config``, not the installers. A leftover
+``biopb.toml`` from a pre-#34 install is an ordinary unrelated file.
 """
 
 import json
@@ -16,28 +13,11 @@ from pathlib import Path
 import pytest
 from biopb_tensor_server.core.config import (
     CANONICAL_CONFIG_NAME,
-    LEGACY_CONFIG_NAME,
     find_config,
     generate_source_id,
     load_config,
     parse_config,
-    read_legacy_toml,
 )
-
-# A config exercising server scalars, a nested table (cache), and a [[sources]]
-# array -- the three shapes that differ syntactically between TOML and JSON.
-_TOML = """
-[server]
-host = "127.0.0.1"
-port = 9000
-
-[cache]
-file_max_segment_mb = 128
-
-[[sources]]
-type = "zarr"
-url = "/data/a.zarr"
-"""
 
 _JSON = {
     "server": {"log_level": "DEBUG"},
@@ -74,25 +54,6 @@ def test_extensionless_file_is_read_as_json(tmp_path):
     _assert_expected(load_config(p))
 
 
-def test_toml_config_is_rejected_with_migration_hint(tmp_path):
-    toml_path = tmp_path / "biopb.toml"
-    toml_path.write_text(_TOML)
-    with pytest.raises(ValueError) as exc:
-        load_config(toml_path)
-    assert "migrate-config" in str(exc.value)
-    assert re.search(re.escape(str(toml_path)), str(exc.value))
-
-
-def test_toml_content_under_a_json_name_reports_the_migration_hint(tmp_path):
-    # The extension lies but the bytes are TOML: it fails as invalid JSON, and
-    # that message is the user's only clue that the format changed.
-    p = tmp_path / "biopb.json"
-    p.write_text(_TOML)
-    with pytest.raises(ValueError) as exc:
-        load_config(p)
-    assert "migrate-config" in str(exc.value)
-
-
 def test_invalid_json_raises_value_error_naming_file(tmp_path):
     p = tmp_path / "biopb.json"
     p.write_text("{not valid json")
@@ -107,48 +68,27 @@ def test_missing_file_raises_filenotfound(tmp_path):
         load_config(tmp_path / "nope.json")
 
 
-def test_read_legacy_toml_still_parses_for_migration(tmp_path):
-    # The one surviving TOML reader: `biopb-tensor-server migrate-config`'s input side.
-    toml_path = tmp_path / "biopb.toml"
-    toml_path.write_text(_TOML)
-    data = read_legacy_toml(toml_path)
-    assert data["server"]["port"] == 9000
-    assert data["sources"][0]["url"] == "/data/a.zarr"
+def test_find_config_returns_the_json_beside_a_leftover_toml(tmp_path, caplog):
+    """A pre-#34 ``biopb.toml`` is not config -- it is just a file in the dir.
 
-
-def test_find_config_prefers_json(tmp_path):
-    (tmp_path / LEGACY_CONFIG_NAME).write_text(_TOML)
-    (tmp_path / CANONICAL_CONFIG_NAME).write_text(json.dumps(_JSON))
-    assert find_config(tmp_path) == tmp_path / CANONICAL_CONFIG_NAME
-
-
-def test_find_config_warns_when_both_exist(tmp_path, caplog):
-    (tmp_path / LEGACY_CONFIG_NAME).write_text(_TOML)
+    Nothing reads it, nothing warns about it, and it does not shadow or shift
+    the canonical name. The one thing it must not do is make ``find_config``
+    answer anything other than ``biopb.json``.
+    """
+    (tmp_path / "biopb.toml").write_text("[server]\nport = 9000\n")
     (tmp_path / CANONICAL_CONFIG_NAME).write_text(json.dumps(_JSON))
     with caplog.at_level(logging.WARNING):
-        find_config(tmp_path)
-    assert any(
-        "biopb.toml" in r.message and "ignoring" in r.message.lower()
-        for r in caplog.records
-    )
-
-
-def test_find_config_does_not_warn_with_single_file(tmp_path, caplog):
-    (tmp_path / CANONICAL_CONFIG_NAME).write_text(json.dumps(_JSON))
-    with caplog.at_level(logging.WARNING):
-        find_config(tmp_path)
+        assert find_config(tmp_path) == tmp_path / CANONICAL_CONFIG_NAME
     assert not caplog.records
 
 
-def test_find_config_returns_legacy_toml_with_migration_warning(tmp_path, caplog):
-    # A lone legacy config is still handed back -- returning the (absent)
-    # canonical name instead would read as "no config at all", and every caller
-    # defaults around that silently.
-    (tmp_path / LEGACY_CONFIG_NAME).write_text(_TOML)
+def test_find_config_ignores_a_lone_toml(tmp_path, caplog):
+    # No JSON at all: the answer is still the canonical name, so the caller
+    # seeds a fresh config rather than being handed a file nothing can read.
+    (tmp_path / "biopb.toml").write_text("[server]\nport = 9000\n")
     with caplog.at_level(logging.WARNING):
-        found = find_config(tmp_path)
-    assert found == tmp_path / LEGACY_CONFIG_NAME
-    assert any("migrate-config" in r.message for r in caplog.records)
+        assert find_config(tmp_path) == tmp_path / CANONICAL_CONFIG_NAME
+    assert not caplog.records
 
 
 def test_find_config_defaults_to_canonical_when_absent(tmp_path):

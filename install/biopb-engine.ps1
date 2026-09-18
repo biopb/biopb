@@ -41,8 +41,8 @@
 [CmdletBinding()]
 param(
     # Target microscopy data directory. When empty AND -KeepConfig is not set, the
-    # engine keeps an existing config (biopb.json or legacy biopb.toml) if present,
-    # else falls back to a dedicated data subfolder (never the profile root).
+    # engine keeps an existing biopb.json if present, else falls back to a
+    # dedicated data subfolder (never the profile root).
     [string]$DataDir = "",
 
     # DEPRECATED / accepted-but-ignored: the web interface is always installed now
@@ -265,18 +265,16 @@ function Set-FileUtf8NoBom {
 #
 # When -Prior points at an existing biopb.json its settings (server/cache/...)
 # are loaded and *preserved*; only the `sources` list is replaced with the chosen
-# data dir, so re-running with a new folder no longer discards tuning. PowerShell
-# has no TOML parser, so migrating from a legacy biopb.toml starts from the
-# installer defaults instead (the caller retires the .toml). `metadata_db.enabled`
-# is intentionally omitted -- the DB is on by default and the flag is deprecated
-# (biopb/biopb#225).
+# data dir, so re-running with a new folder no longer discards tuning.
+# `metadata_db.enabled` is intentionally omitted -- the DB is on by default and
+# the flag is deprecated (biopb/biopb#225).
 function Write-ServerConfig {
     param(
         [string]$Path,         # biopb.json to write
         [string]$DataDir,
         [bool]$Cloud,
         [bool]$Monitor = $true, # watch the source (false for the static sample bundle)
-        [string]$Prior = "",   # existing config to preserve (.json) or migrate (.toml)
+        [string]$Prior = "",   # existing biopb.json whose settings to preserve
         [string]$Alias = ""    # catalog tree-root label ("samples" for the sample bundle)
     )
 
@@ -1526,14 +1524,10 @@ function Invoke-BiopbInstall {
     Report-Step 5 "Config..."
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
-    $configFile   = Join-Path $ConfigDir "biopb.json"   # canonical (biopb/biopb#34)
-    $legacyConfig = Join-Path $ConfigDir "biopb.toml"   # pre-#34 installs
+    $configFile   = Join-Path $ConfigDir "biopb.json"   # the only format (biopb/biopb#34)
 
-    # An existing config in either format counts; biopb.json wins when both exist
-    # (matches the server's find_config).
     $existingConfig = ""
-    if (Test-Path -LiteralPath $configFile)        { $existingConfig = $configFile }
-    elseif (Test-Path -LiteralPath $legacyConfig)  { $existingConfig = $legacyConfig }
+    if (Test-Path -LiteralPath $configFile) { $existingConfig = $configFile }
     $configExists = [bool]$existingConfig
 
     # Decide keep-vs-write. The interactive prompt now lives in the front-end; the
@@ -1651,26 +1645,7 @@ function Invoke-BiopbInstall {
     # or the untouched existing file when the user keeps it.
     $activeConfig = $existingConfig
     if ($effectiveKeep) {
-        # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
-        # convert it in place to the canonical JSON via `biopb-tensor-server
-        # migrate-config` (settings preserved verbatim, old file backed up to
-        # biopb.toml.bak) so an upgraded install stops warning about the
-        # deprecated format. A JSON config is already canonical -- nothing to do.
-        if ($existingConfig -eq $legacyConfig -and (Get-Command biopb-tensor-server -ErrorAction SilentlyContinue)) {
-            Report-Info "Migrating legacy TOML config to canonical JSON..."
-            $prevEAP2 = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            try { & biopb-tensor-server migrate-config *> $null } catch { }
-            $ErrorActionPreference = $prevEAP2
-            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $configFile)) {
-                $activeConfig = $configFile
-                Report-Ok "Migrated config: $legacyConfig -> $configFile (old file backed up)"
-            } else {
-                Report-Warn "Could not migrate legacy config; keeping $existingConfig"
-            }
-        } else {
-            Report-Ok "Keeping current config: $existingConfig"
-        }
+        Report-Ok "Keeping current config: $existingConfig"
     } else {
         # Cloud/synced root? Auto-detect from the path so any front-end (GUI,
         # console menu, manual entry, BIOPB_DATA_DIR) gets it right; -Cloud forces
@@ -1697,19 +1672,11 @@ function Invoke-BiopbInstall {
             if (-not (Test-Path -LiteralPath $SamplesDir)) { New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null }
         }
 
-        # Load existing settings (json) / migrate from defaults (toml) and replace
-        # only the sources block -- a new data dir no longer discards tuning (#34).
+        # Load existing settings and replace only the sources block -- a new data
+        # dir no longer discards tuning (#34).
         $sourceAlias = if ($seedSamples) { "samples" } else { "" }
         Write-ServerConfig -Path $configFile -DataDir $effectiveDataDir -Cloud $isCloud -Monitor $isMonitored -Prior $existingConfig -Alias $sourceAlias
         $activeConfig = $configFile
-
-        # Retire a legacy TOML we just superseded so the server does not warn about
-        # both files shadowing (find_config prefers biopb.json).
-        if ($existingConfig -eq $legacyConfig -and (Test-Path -LiteralPath $legacyConfig)) {
-            $backup = "$legacyConfig.bak." + (Get-Date -Format "yyyyMMddHHmmss")
-            Move-Item -LiteralPath $legacyConfig -Destination $backup -Force
-            Report-Info "Migrated legacy TOML config to JSON (old file backed up)"
-        }
 
         $verb = if ($existingConfig) { "Updated" } else { "Created" }
         if ($isCloud) {

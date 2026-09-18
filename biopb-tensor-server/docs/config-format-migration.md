@@ -1,12 +1,14 @@
 # Config format: TOML → JSON
 
-**Status:** complete — JSON is the only format read, value validation runs on one
-shared checker (clamp at load, reject at the strict surfaces), the installers
-write `biopb.json`, and the JSON Schema emitter is in. The
+**Status:** done and swept up — JSON is the only format, value validation runs
+on one shared checker (clamp at load, reject at the strict surfaces), the
+installers write `biopb.json`, and the JSON Schema emitter is in. The
 coexistence window (dual-format read + warn-level validation) ran from the
-initial migration to the read-path removal; what remains of TOML is the one-way
-door out of it: `biopb-tensor-server migrate-config` and the installers' automatic
-conversion. Touches `biopb-tensor-server` (config) and the `biopb` umbrella CLI.
+initial migration to the read-path removal; the one-way door out of it
+(`migrate-config`, the `.toml` refusals, the installers' automatic conversion,
+`find_config`'s legacy branch) stood for another two months and is now gone too.
+Nothing in the tree knows the word TOML. Touches `biopb-tensor-server` (config)
+and the `biopb` umbrella CLI.
 
 ## Why
 
@@ -30,33 +32,20 @@ untouched, and one read-side change covers every code path that loads a config.
 
 ```
 load_config(path)
-  └── _read_config_file(path)        ← the ONLY format-aware step
-        ├── .toml  → refuse: "run `biopb-tensor-server migrate-config`"
-        └── other  → json.load  (an odd extension is still read as JSON)
+  └── _read_config_file(path)        ← json.load, extension-blind
   └── parse_config(dict)             ← unchanged, format-agnostic
-
-read_legacy_toml(path)               ← the last TOML reader, off the load path:
-                                       migrate-config's input side only
 ```
 
 ## Architecture (shipped)
 
-**JSON-only reader.** `core.config.load_config` reads JSON. A `.toml` path is
-rejected *without parsing*, and a JSON syntax error (which is what TOML bytes
-under a `.json` name produce) carries the same hint — a parse error is the only
-place a user learns the format changed, so both name
-`biopb-tensor-server migrate-config`.
+**JSON-only reader.** `core.config.load_config` reads JSON, and does not look at
+the extension to decide — an unconventionally-named config still loads.
 
-**Default-path resolution — one shared impl.** `find_config(dir)` returns the
-first of `biopb.json` → `biopb.toml` that exists, else the canonical
-`biopb.json`. It still *sees* a legacy file, warning in both cases: shadowed by a
-JSON beside it, or returned as the only config present. Returning the real file
-rather than the (absent) canonical name is deliberate — every downstream config
-probe is best-effort (`_read_flight_host` even fails *closed* to a public bind on
-an unreadable config), so "no config at all" would surface as an unrelated
-token/bind refusal or a plane quietly serving defaults. `biopb control start`
-/ `run` therefore reject a `.toml` up front (`_reject_legacy_toml`) with the
-migration command. `find_config` lives once in **`biopb._locations`**
+**Default-path resolution — one shared impl.** `find_config(dir)` returns
+`biopb.json`, present or not, so the caller seeding a fresh config and the one
+reading an existing config name the same file. It has no legacy branch: a
+leftover `biopb.toml` is an ordinary unrelated file. `find_config` lives once in
+**`biopb._locations`**
 (stdlib-only module in the core `biopb` package — no heavy adapter/discovery
 imports, cheap to import per CLI invocation); `core.config` re-exports it
 (`find_config` + name constants) and `biopb.cli` sets
@@ -153,10 +142,9 @@ See `tensor-server-admin-endpoint.md`.
 - **Case-insensitive enums carry no `enum`** — see the admin-endpoint pairing
   above; a schema-only check at save-time would accept a `log_level` /
   `reduction_method` the server then refuses at load.
-- **A legacy TOML fails loudly, not silently** — `tests/config_format_test.py`
-  covers the refusal, the migration hint on both failure shapes, `find_config`
-  handing back the legacy file, and `read_legacy_toml` still parsing for
-  migrate-config; schema drift-guards in `tests/config_schema_test.py`
+- **A leftover TOML is inert** — `tests/config_format_test.py` pins that a
+  `biopb.toml` beside (or instead of) the JSON never shifts what `find_config`
+  answers and never warns; schema drift-guards in `tests/config_schema_test.py`
   assert every `_CONSTRAINTS` entry and every scalar dataclass field is reflected,
   that the runtime warning uses the schema-derived sets, and that the schema
   accepts the installer default while rejecting each known-bad value.
@@ -173,8 +161,9 @@ See `tensor-server-admin-endpoint.md`.
 
 ## Equivalent configs
 
-What `biopb-tensor-server migrate-config` produces — the shape mapping, if you ever
-need to read an old file by eye.
+The shape mapping, for reading a pre-#34 file by eye. Nothing converts one any
+more, so this is the whole of the upgrade path: a config this old is rewritten
+by hand, or discarded and re-seeded by the installer.
 
 ```toml
 [server]
@@ -196,5 +185,6 @@ url = "/data/a.zarr"
 }
 ```
 
-The two produced a byte-identical `ServerConfig` while both were readable; only
-the JSON form loads now.
+The two produced a byte-identical `ServerConfig` while both were readable.
+`server.host` / `port` are themselves gone since biopb/biopb#604 — the bind is a
+CLI flag — so that section of an old file has no JSON counterpart at all.
