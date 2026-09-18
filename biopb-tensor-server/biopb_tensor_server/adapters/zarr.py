@@ -295,7 +295,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
-    def resolve_chunk_data(self, chunk_id: bytes, cache_manager: Any) -> Any:
+    def resolve_chunk_data(self, chunk_id: bytes, cache_manager: Any = None) -> Any:
         """The read path, refused for a tombstone before the cache is consulted.
 
         The store is gone once discarded, and zarr would answer fill values
