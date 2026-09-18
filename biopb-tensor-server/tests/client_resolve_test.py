@@ -8,6 +8,7 @@ opened. The end-to-end resolve-on-serve path is covered by the server suite.
 """
 
 import pyarrow as pa
+import pyarrow.flight as flight
 import pytest
 from biopb.tensor.client import ResolveCancelled, TensorFlightClient
 from biopb.tensor.descriptor_pb2 import (
@@ -133,8 +134,9 @@ class TestResolve:
         assert out["is_resolved"] is True  # the flag the proto had no room for
         assert "data_resident" not in out  # residency is an action, not a row
         assert len(out["tensors"]) == 2  # complete field set, never truncated
-        # The per-tensor cache is seeded, so a following read needs no probe.
-        assert set(client._descriptors) == {"cloud_x/f0", "cloud_x/f1"}
+        # The row IS the result: resolve caches nothing on the client, so what a
+        # caller keeps is what it was handed here.
+        assert [t["array_id"] for t in out["tensors"]] == ["cloud_x/f0", "cloud_x/f1"]
 
     def test_progress_envelopes_reported_then_terminal_taken(self):
         # Progress heartbeats (a ResolveStreamMessage `progress` arm) feed
@@ -182,7 +184,6 @@ class TestResolve:
         )
         with pytest.raises(ResolveCancelled):
             client.resolve("cloud_x", should_cancel=lambda: True)
-        assert client._descriptors == {}  # nothing cached on cancel
 
     def test_no_terminal_result_raises(self):
         # A stream of only heartbeats (server closed without a row) is an error,
@@ -209,20 +210,40 @@ def _unresolved_row_table():
 
 
 class TestUnresolvedDirectiveError:
-    def test_get_tensor_points_at_resolve(self, monkeypatch):
-        # A bare get_tensor() on an unresolved (empty-tensors) source must fail
-        # with a directive message naming client.resolve(), not a bare "no tensors".
-        # The refusal comes from descriptor resolution, before any Flight call:
-        # the bare client has no connection, so reaching one would error differently.
+    def test_get_tensor_points_at_resolve(self):
+        # A bare get_tensor() on an unresolved source must fail with a directive
+        # message naming client.resolve(), not a bare "no tensors". The refusal
+        # is the server's, restated: taken from the GetFlightInfo that plans the
+        # read, so it holds even for a capability-token holder who cannot browse
+        # the catalog.
         client = _bare_client()
-        monkeypatch.setattr(
-            client._catalog, "_query_table", lambda sql: _unresolved_row_table()
-        )
+
+        class _UnresolvedFlight:
+            def get_flight_info(self, descriptor, options=None):
+                raise flight.FlightUnavailableError(
+                    "Source unresolved: cloud_x. Detail: Unavailable"
+                )
+
+        client._state.client = _UnresolvedFlight()
+
         with pytest.raises(ValueError) as exc:
             client.get_tensor("cloud_x")
         msg = str(exc.value)
         assert "unresolved" in msg
         assert "client.resolve('cloud_x')" in msg
+
+    def test_an_open_ended_slice_refuses_from_the_catalog(self, monkeypatch):
+        # The one read shape that resolves before the RPC: an open-ended stop is
+        # filled from the tensor's extent, so the refusal comes off the catalog
+        # row. It must steer identically -- a caller should not be able to tell
+        # which path refused it.
+        client = _bare_client()
+        monkeypatch.setattr(
+            client._catalog, "_query_table", lambda sql: _unresolved_row_table()
+        )
+        with pytest.raises(ValueError) as exc:
+            client.get_tensor("cloud_x", slice_hint=(slice(0, None), slice(0, None)))
+        assert "client.resolve('cloud_x')" in str(exc.value)
 
 
 class TestSourceMetadataUnresolvedGuard:

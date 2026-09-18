@@ -101,19 +101,18 @@ class TestTensorFlightClientRoundTrip:
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_the_catalog_is_never_snapshotted_client_side(self, server_client):
-        """Neither call keeps a source-keyed cache.
+        """Neither call caches anything, source-keyed or otherwise.
 
-        A local copy of the catalog answered "what does this server hold?",
-        which is a question only the server can answer -- and the answer went
-        stale the moment anything registered. Only the per-array_id addressing
-        cache survives.
+        "What does this server hold?" is a question only the server can answer;
+        a local copy goes stale the moment anything registers.
         """
         client = server_client
         client.list_sources()
         client.get_source("test-tensor")
 
         assert not hasattr(client._catalog._state, "sources")
-        assert set(client._descriptors) == {"test-tensor"}
+        assert not hasattr(client._catalog._state, "descriptors")
+        assert not hasattr(client, "_descriptors")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_shape(self, server_client):
@@ -379,9 +378,9 @@ class TestTensorFlightClientRoundTrip:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_not_found_raises(self, server_client):
         """Test that requesting non-existent tensor raises error."""
-        with pytest.raises(
-            ValueError, match="Tensor 'test-tensor/nonexistent' not found"
-        ):
+        # The server's wording: it knows this source exists and has no such
+        # field, which the client could only learn with a catalog round trip.
+        with pytest.raises(ValueError, match="no field 'nonexistent'"):
             server_client.get_tensor("test-tensor/nonexistent")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")

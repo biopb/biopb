@@ -1,13 +1,15 @@
 """Per-connection catalog + read core for TensorFlightClient.
 
 Extracted from :mod:`biopb.tensor.client` (issue #278 item C). The two
-collaborators share the connection and the catalog caches via
-:class:`_ClientState`:
+collaborators share the connection via :class:`_ClientState`:
 
 - :class:`CatalogClient` -- discovery / metadata / resolve / warm / source
   registration (``list_sources`` / ``query_sources`` / ``resolve`` / ... RPCs).
-- :class:`ChunkFetcher` -- tensor reads: plan a read with GetFlightInfo (through
-  the catalog's caches) and build the lazy dask chunk-fetching array.
+- :class:`ChunkFetcher` -- tensor reads: plan a read with GetFlightInfo and
+  build the lazy dask chunk-fetching array.
+
+Neither caches a descriptor: every one is fetched per call, and a caller that
+wants one memoized owns that policy (see :class:`_ClientState`).
 
 ``TensorFlightClient`` holds one of each and delegates its public API to them;
 ``client.py`` re-exports the module helpers that external callers still import
@@ -16,7 +18,7 @@ from ``biopb.tensor.client``.
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -53,6 +55,7 @@ from biopb.tensor._catalog_rows import (
     SOURCE_ROW_COLUMNS,
     _descriptor_from_row,
     sql_literal,
+    tensor_descriptors_from_row,
 )
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
@@ -97,19 +100,10 @@ logger = logging.getLogger(__name__)
 class _ClientState:
     """Per-connection state shared by CatalogClient / ChunkFetcher / the facade.
 
-    Holds the Flight connection handles plus the structural descriptor cache,
-    which is mutable and shared by reference: every collaborator reads
-    ``state.descriptors`` live, and TensorFlightClient exposes it as its
-    ``_descriptors`` (property + setter).
-
-    ``descriptors`` is keyed by ``array_id``, which the identity policy
-    (``proto/biopb/tensor/descriptor.proto``) makes globally unique and
-    identical across every RPC that reports it. It holds *structural*
-    (whole-tensor) descriptors only -- never a request-shaped read response,
-    whose ``shape`` is the sliced/downsampled one. It is an *addressing* cache,
-    not a catalog snapshot: there is deliberately no source-keyed twin, because
-    the catalog is the server's and a stale local copy of it answered questions
-    ("what does this server hold?") it could not actually answer.
+    The Flight connection handles and nothing else. **The SDK caches no
+    descriptors**: every one is fetched per call. Memoizing is a caller's policy,
+    since only the caller knows what invalidates it --
+    ``biopb-tensor-server/docs/source-descriptor-retirement.md``.
     """
 
     raw_client: flight.FlightClient
@@ -122,7 +116,6 @@ class _ClientState:
     # graph so every dask worker's FlightClient trusts the same pinned root
     # without re-running TOFU (biopb/biopb#604, biopb/biopb#606).
     tls_trust: Optional[TlsTrust] = None
-    descriptors: Dict[str, TensorDescriptor] = field(default_factory=dict)
     # Set once the server's Flight protocol shape has been checked (or when
     # the check is bypassed, e.g. for a test double).
     protocol_checked: bool = False
@@ -148,14 +141,6 @@ class _ClientState:
         is how tests inject a double, and a double has no health to probe."""
         self.raw_client = value
         self.protocol_checked = True
-
-    def cache_descriptor(self, desc: TensorDescriptor) -> None:
-        """Store the structural part of ``desc`` under its array_id.
-
-        The single write path into ``descriptors``; see
-        :func:`_structural_descriptor` for what is kept and why.
-        """
-        self.descriptors[desc.array_id] = _structural_descriptor(desc)
 
 
 class ResolveCancelled(Exception):
@@ -194,44 +179,6 @@ def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
         "uploaded_chunks": 0,
         "reason": "",
     }
-
-
-def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
-    """Return the cacheable part of ``desc``: structure plus physical scale.
-
-    Keeps what the cache is read for -- shape, dtype, dim_labels -- plus the
-    ~200-byte physical scale ``GetFlightInfo`` fills unconditionally. Drops the
-    parts that arrive only on some routes (biopb/biopb#795, biopb/biopb#812):
-
-    - ``metadata_json``, the full OME tree, runs to megabytes on a
-      per-plane-annotated file, and nothing reads it back out of here -- the one
-      metadata reader issues its own ``GetFlightInfo``. This dict has no
-      eviction and lives as long as the session.
-    - ``pyramid`` is small, but keeping it would leave entries in two grades:
-      rich when a caller happened to ask, poor when the entry came from
-      ``list_flights``, which never fills it. A reader could not tell a
-      genuinely pyramid-less tensor from one cached before anyone asked.
-    - ``upload_status`` is live state, not structure. A cached ``PENDING``
-      would shadow the ``READY`` a later poll came for, turning the one field
-      whose whole purpose is freshness into the stalest thing in the session.
-    - ``chunk_shape`` is now exactly the same shape of problem: the server
-      answers the transfer grid only on ``GetFlightInfo``, for the tensor it
-      bound, and leaves it empty on every ``list_flights`` entry. Caching it
-      would let an entry seeded from a listing shadow the real grid, and an
-      empty grid is not a fallback anyone may plan on -- so the cache holds none
-      and a caller that needs one describes the tensor.
-
-    So every entry carries exactly what ``list_flights`` provides, whatever
-    route it arrived by. Callers lose nothing: the masks are honoured on the
-    *returned* descriptor, and ``get_descriptor`` fetches on every call.
-    """
-    lean = TensorDescriptor()
-    lean.CopyFrom(desc)
-    lean.ClearField("metadata_json")
-    lean.ClearField("pyramid")
-    lean.ClearField("chunk_shape")
-    lean.ClearField("upload_status")
-    return lean
 
 
 def _request_crop_slices(
@@ -472,6 +419,77 @@ def _check_wire_protocol(schema: pa.Schema) -> None:
         )
 
 
+def extra_info(exc: Exception) -> Optional[Mapping[str, Any]]:
+    """The structured payload the server attaches to a Flight error, or ``None``.
+
+    pyarrow exposes only a subset of gRPC's status codes as typed exceptions --
+    there is no ``FlightNotFoundError`` -- so the server puts the canonical code
+    and a machine ``reason`` in ``extra_info`` for clients to switch on (see its
+    ``to_flight_error``). This is the one place that decode lives.
+    """
+    raw = getattr(exc, "extra_info", None)
+    if not raw:
+        return None
+    try:
+        return json.loads(bytes(raw).decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+class _AddressingError(ValueError):
+    """An id that names no source, or no such tensor within one.
+
+    Its own type so :meth:`CatalogClient.get_upload_status` can absorb it
+    without also swallowing the unresolved steer, which is the other
+    ``ValueError`` a descriptor probe raises.
+    """
+
+
+def _addressing_error(exc: flight.FlightError) -> Optional[_AddressingError]:
+    """The refusal a terminal addressing error deserves, else ``None``.
+
+    Keeps the server's wording: it knows whether the source is missing or the
+    source is there and the field is not, which no client-side reconstruction
+    can tell apart without a catalog round trip.
+    """
+    info = extra_info(exc)
+    if info is None or info.get("code") not in ("NOT_FOUND", "INVALID_ARGUMENT"):
+        return None
+    # pyarrow appends its own ". Detail: ..." to the server's message.
+    return _AddressingError(str(exc).split(". Detail:")[0])
+
+
+def _ambiguous_default_error(source_id: str, count: int) -> ValueError:
+    """The #75 refusal: a bare id naming a source that holds several tensors.
+
+    Two paths reach it -- the pre-RPC resolve an open-ended slice needs, and the
+    post-response check -- and a caller must not be able to tell which refused.
+    """
+    return ValueError(
+        f"Source '{source_id}' has multiple tensors ({count}), "
+        "tensor_id must be specified"
+    )
+
+
+def _raise_read_refusal(exc: flight.FlightError, array_id: str) -> None:
+    """Restate a server refusal as the error this SDK promises, or return.
+
+    Shared by the describe (:meth:`CatalogClient._fetch_tensor_descriptor`) and
+    the plan (:meth:`ChunkFetcher._plan_read`): the same ``GetFlightInfo`` under
+    different masks, so they refuse identically.
+    """
+    if (
+        isinstance(exc, flight.FlightUnavailableError)
+        and "unresolved" in str(exc).lower()
+    ):
+        # Taken from the server rather than a local catalog check, so it also
+        # holds for a capability-token holder, who cannot browse the catalog.
+        raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
+    addressing = _addressing_error(exc)
+    if addressing is not None:
+        raise addressing from exc
+
+
 def _unresolved_source_error(source_id: str) -> ValueError:
     """Directive error for reading an *unresolved* (cloud / synced-folder) source.
 
@@ -572,7 +590,6 @@ class CatalogClient:
         for row in table.to_pylist():
             source_desc = _descriptor_from_row(row)
             source_descriptors[source_desc.source_id] = source_desc
-            self._cache_tensors(source_desc)
         logger.info(f"list_sources: returned {len(source_descriptors)} sources")
         return source_descriptors
 
@@ -583,33 +600,8 @@ class CatalogClient:
             f"{self._SOURCES_SQL} WHERE source_id = {sql_literal(source_id)}"
         )
         for row in table.to_pylist():
-            source_desc = _descriptor_from_row(row)
-            self._cache_tensors(source_desc)
-            return source_desc
+            return _descriptor_from_row(row)
         return None
-
-    def _cache_tensors(self, source_desc: DataSourceDescriptor) -> None:
-        for tensor_desc in source_desc.tensors:
-            self._state.cache_descriptor(tensor_desc)
-
-    def _cache_row_tensors(self, row: Mapping[str, Any]) -> None:
-        """The same cache, seeded straight from a row.
-
-        The cache holds ``TensorDescriptor`` -- the type GetFlightInfo answers
-        with and the read path reads -- so the row's structural fields are
-        copied into one. A catalog entry fills only those, as it always did.
-        Built here rather than by decoding the whole row into a source: that
-        choice is the caller's now (biopb/biopb#1032).
-        """
-        for tensor in row.get("tensors") or []:
-            self._state.cache_descriptor(
-                TensorDescriptor(
-                    array_id=tensor["array_id"],
-                    dim_labels=tensor.get("dim_labels") or [],
-                    shape=tensor.get("shape") or [],
-                    dtype=tensor.get("dtype") or "",
-                )
-            )
 
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Backs TensorFlightClient.query_sources; see that method for the full
@@ -722,24 +714,12 @@ class CatalogClient:
     ) -> Optional[Tuple[List[float], List[str]]]:
         """Backs TensorFlightClient.get_physical_scale; see that method for the full
         documentation."""
-        desc = self._state.descriptors.get(array_id)
-        if desc is None:
-            # Don't silently recall (download) a whole cloud file just to read
-            # its pixel size: the probe below never resolves on serve, so an
-            # unresolved source refuses there and _fetch_tensor_descriptor
-            # restates it as the directive steer to resolve(). That refusal is
-            # the server's, so it holds for every id -- where the old local
-            # pre-check only fired for a source a prior list_sources() happened
-            # to have cached.
-            #
-            # A real fetch error (server unreachable, source not found)
-            # propagates to the caller -- it must stay distinguishable from "no
-            # physical scale recorded", which is the only case that yields None.
-            # physical_scale is filled on every GetFlightInfo, so never request
-            # the opt-in OME tree here (per this method's contract) -- and so a
-            # compact scale probe never depends on the server having a metadata
-            # catalog.
-            desc = self._fetch_tensor_descriptor(array_id, with_metadata=False)
+        # Never the opt-in OME tree, so a compact scale probe does not depend on
+        # the server having a metadata catalog. An unresolved source refuses in
+        # the probe rather than recalling a whole cloud file to read its pixel
+        # size, and a fetch error propagates -- it has to stay distinguishable
+        # from "no physical scale recorded", the only case that yields None.
+        desc = self._fetch_tensor_descriptor(array_id, with_metadata=False)
         if not desc.physical_scale:
             return None
         return list(desc.physical_scale), list(desc.physical_unit)
@@ -752,7 +732,6 @@ class CatalogClient:
         with_read_plan: bool = False,
         with_upload_status: bool = False,
         with_residency: bool = False,
-        cache: bool = True,
     ) -> "TensorDescriptor":
         """Fetch one tensor's descriptor directly from the server (internal).
 
@@ -784,15 +763,8 @@ class CatalogClient:
         the request rather than quietly omitting it, so a caller never plans
         around a field that silently did not arrive.
 
-        This always issues the RPC: it never reads the descriptor cache, so the
-        masks a caller passes are honoured on every call. It *writes* the
-        structural part of the response to ``self._state.descriptors`` (keyed by
-        the echoed-back array_id) for the readers that want addressing facts --
-        see :func:`_structural_descriptor` for what that keeps and why the
-        masked-off parts are deliberately not stored (biopb/biopb#795). Pass
-        ``cache=False`` to skip that write, for a caller (like a poll loop)
-        that has no use for the structural cache and would otherwise pay a
-        protobuf copy plus a dict mutation on every tick.
+        One RPC every call, storing nothing, so the masks are honoured each time
+        and a live field (``upload_status``, ``is_resident``) is current.
         """
         cmd = _tensor_read_cmd(
             array_id,
@@ -809,20 +781,13 @@ class CatalogClient:
             info = self._state.client.get_flight_info(
                 fd, options=self._state.call_options
             )
-        except flight.FlightUnavailableError as exc:
-            # GetFlightInfo no longer resolves on serve: an unresolved (cloud /
-            # synced-folder) source now refuses with FlightUnavailableError
-            # ("Source unresolved ...") instead of silently downloading. Make this
-            # a cheap steering probe -- restate it as the shared directive so
-            # get_descriptor points the caller at the explicit, consented
-            # resolve(), consistent with get_tensor / get_physical_scale.
-            if "unresolved" in str(exc).lower():
-                raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
+        except flight.FlightError as exc:
+            # GetFlightInfo does not resolve on serve, so an unresolved (cloud /
+            # synced-folder) source refuses here instead of silently downloading.
+            # This stays a cheap steering probe.
+            _raise_read_refusal(exc, array_id)
             raise
-        tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
-        if cache:
-            self._state.cache_descriptor(tensor_desc)
-        return tensor_desc
+        return TensorDescriptor.FromString(info.descriptor.command)
 
     def get_descriptor(
         self,
@@ -845,61 +810,95 @@ class CatalogClient:
         )
 
     def _resolve_descriptor(self, array_id: str) -> "TensorDescriptor":
-        """The structural ``TensorDescriptor`` for ``array_id``: cache, then
-        catalog, then a direct per-tensor probe.
+        """The structural ``TensorDescriptor`` for ``array_id``: catalog row
+        first, then a direct per-tensor probe.
 
-        Read-path counterpart to :meth:`get_descriptor`: same identity, but it
-        prefers what is already cached over any RPC, and it owns the two
-        addressing refusals a read must make -- an unresolved source (steer to
-        :meth:`resolve`) and a bare *multi*-tensor id, which is ambiguous and is
-        never silently defaulted (#75).
+        Called only for an open-ended slice ``stop``, which needs the tensor's
+        extent before the request can be built. Holding the row, it also makes
+        the addressing refusals, so the post-response check can be skipped.
 
-        The probe is last because it is the only step that always costs a round
-        trip; it is also the only step open to a capability-token holder, who
-        may read the source but not browse the catalog.
+        The probe is the fallback because it is the only step open to a
+        capability-token holder, who may read the source but not browse the
+        catalog.
         """
-        desc = self._state.descriptors.get(array_id)
-        if desc is not None:
-            return desc
-
         source_id, tensor_id = _split_array_id(array_id)
-        try:
-            source_desc = self.get_source(source_id)
-        except flight.FlightError:
-            # No catalog to ask (a capability token reads one source's pixels,
-            # not the catalog; an embedded server may have none): the per-tensor
-            # probe below is the private path, and its error is the one worth
-            # reporting.
-            source_desc = None
+        row = self._source_tensors_row(source_id)
 
-        if source_desc is not None:
-            if not source_desc.tensors:
+        if row is not None:
+            # The flag, not an empty tensor list: a source can resolve cleanly
+            # and hold nothing readable, and steering that owner to resolve()
+            # sends them round a loop.
+            if not row.get("is_resolved", True):
                 raise _unresolved_source_error(source_id)
+            tensors = tensor_descriptors_from_row(row)
+            if not tensors:
+                raise ValueError(
+                    f"Source '{source_id}' is resolved but lists no readable "
+                    "tensors: nothing in it could be opened as an array."
+                )
             if tensor_id is None:
-                if len(source_desc.tensors) > 1:
-                    raise ValueError(
-                        f"Source '{source_id}' has multiple tensors "
-                        f"({len(source_desc.tensors)}), tensor_id must be specified"
-                    )
-                return source_desc.tensors[0]
-            for candidate in source_desc.tensors:
+                if len(tensors) > 1:
+                    raise _ambiguous_default_error(source_id, len(tensors))
+                return tensors[0]
+            for candidate in tensors:
                 if candidate.array_id == array_id:
                     return candidate
 
+        return self._fetch_tensor_descriptor(array_id, with_metadata=False)
+
+    def _refuse_ambiguous_default(self, array_id: str) -> None:
+        """Raise when a bare id named a source holding more than one tensor.
+
+        The server answers a bare id with the source's default (first) tensor
+        (#44), which is right for a single-tensor source and the #75 ambiguity
+        otherwise. Only the catalog can tell those apart.
+
+        **Costs a query on every bare-id read.** The trigger -- an echoed
+        array_id differing from the one asked for -- is not as narrow as it
+        looks: every scene-based adapter (nd2, lif, czi, bioio, ome_zarr,
+        ome_tiff) qualifies its ids even for a single-scene file. Hence the
+        count rather than the column, which runs to tens of kilobytes on a
+        plate. It goes away once ``GetFlightInfo`` reports the substitution
+        itself, which all four bindings must adopt in step.
+        """
+        source_id = _split_array_id(array_id)[0]
+        count = self._source_tensor_count(source_id)
+        if count is not None and count > 1:
+            raise _ambiguous_default_error(source_id, count)
+
+    def _source_tensor_count(self, source_id: str) -> Optional[int]:
+        """How many tensors the catalog lists for a source, or ``None`` if it
+        cannot say -- no row matched, or there is no catalog to ask."""
+        row = self._addressed_row("len(tensors) AS tensor_count", source_id)
+        return row["tensor_count"] if row else None
+
+    def _source_tensors_row(self, source_id: str) -> Optional[Mapping[str, Any]]:
+        """One source's addressing columns: the resolved flag and the tensor list.
+
+        Not ``SOURCE_ROW_COLUMNS`` -- the source's url and type are bytes on the
+        wire nobody here reads.
+        """
+        return self._addressed_row("is_resolved, tensors", source_id)
+
+    def _addressed_row(
+        self, columns: str, source_id: str
+    ) -> Optional[Mapping[str, Any]]:
+        """One source's row, projected to ``columns``, or ``None``.
+
+        ``None`` covers both "no such row" and "no catalog to ask" (a capability
+        token reads one source's pixels, not the catalog; an embedded server may
+        have none). Every caller here treats them alike: the catalog cannot
+        answer, so the per-tensor probe is the path left.
+        """
         try:
-            return self._fetch_tensor_descriptor(array_id, with_metadata=False)
-        except ValueError:
-            # Already a directive (the unresolved-source steer) -- keep its wording.
-            raise
-        except Exception as exc:
-            # Restate the transport failure as the addressing error it actually
-            # is, distinguishing "no such source" from "source known, no such
-            # tensor" the way the catalog would have.
-            if source_desc is None:
-                raise ValueError(f"Source not found: {source_id}") from exc
-            raise ValueError(
-                f"Tensor '{array_id}' not found in source '{source_id}'"
-            ) from exc
+            table = self._query_table(
+                f"SELECT {columns} FROM sources "
+                f"WHERE source_id = {sql_literal(source_id)}"
+            )
+        except flight.FlightError:
+            return None
+        rows = table.to_pylist()
+        return rows[0] if rows else None
 
     def _iter_action_messages(self, action, msg_cls, *, unknown_action_msg=None):
         """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
@@ -976,7 +975,6 @@ class CatalogClient:
                 f"resolve('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
-        self._cache_row_tensors(row)
         return dict(row)
 
     def warm(
@@ -1027,20 +1025,15 @@ class CatalogClient:
         upload operation: it is a read of one field of a descriptor, which is
         this class's primitive.
 
-        Fetches with ``cache=False``: a cached ``PENDING`` would shadow the
-        ``READY`` a later poll came for, and a poll loop has no use for the
-        structural cache write anyway.
+        Nothing is stored: a poll that answered from a cache would answer with
+        the state it came to replace.
         """
         try:
-            desc = self._fetch_tensor_descriptor(
-                source_id, with_upload_status=True, cache=False
-            )
-        except flight.FlightError:
-            # An id the server does not serve at all. UNKNOWN already means
-            # "no upload record here -- never was, or it has been reclaimed",
-            # and an unregistered source is the strongest form of that, so it
-            # is the same answer rather than a transport error. `describe`
-            # would raise; this caller asked a narrower question.
+            desc = self._fetch_tensor_descriptor(source_id, with_upload_status=True)
+        except (flight.FlightError, _AddressingError):
+            # UNKNOWN means "no upload record here", and an id the server does
+            # not serve at all is the strongest form of that. `describe` raises;
+            # this caller asked a narrower question.
             return _unknown_upload_status(source_id)
         if not desc.HasField("upload_status"):
             # Registered, but not an upload -- an ordinary catalog source.
@@ -1225,37 +1218,48 @@ class ChunkFetcher:
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
     ) -> "flight.FlightInfo":
-        """Plan one read: resolve the tensor, then GetFlightInfo its endpoints.
+        """Plan one read: GetFlightInfo the tensor's endpoints.
 
         The shared body of :meth:`get_tensor` and :meth:`get_tensor_pb`: one
         builds the array from the returned FlightInfo, the other hands the
         FlightInfo on.
 
+        **One RPC for a qualified id with bounded slice bounds** -- the shape
+        the tile route issues: the same ``GetFlightInfo`` both plans the read and
+        supplies the addressing facts.
+
+        Two shapes cost a catalog query on top, each charged to the request that
+        needs it: an open-ended slice ``stop``, which nothing but the tensor can
+        fill, and a *bare* id, whose ambiguity only the catalog can judge. The
+        second is not rare -- scene-based adapters qualify their array_ids even
+        for a single-scene file -- so a caller reading one tensor repeatedly
+        should pass the qualified array_id.
+
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
                 ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``.
             slice_hint: Optional slice tuple to filter chunks. An open-ended
-                ``stop`` is filled from the resolved tensor's shape.
+                ``stop`` is filled from the tensor's shape, which costs a resolve.
             scale_hint: Optional per-dimension downsampling factors
             reduction_method: Optional dynamic reduction method
         """
         logger.debug(f"_plan_read: array_id={array_id}")
 
-        # The whole-tensor descriptor: supplies the shape that fills an
-        # open-ended slice stop, and makes the addressing refusals (#75,
-        # unresolved) before any read is planned.
-        tensor_desc = self._catalog._resolve_descriptor(array_id)
-
-        # Convert slice_hint to SliceHint proto
         slice_hint_proto = None
+        refusals_settled = False
         if slice_hint is not None:
-            starts = []
-            stops = []
-            for s in slice_hint:
-                starts.append(s.start if s.start is not None else 0)
-                stops.append(
-                    s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1]
-                )
+            starts = [s.start if s.start is not None else 0 for s in slice_hint]
+            stops = [s.stop for s in slice_hint]
+            if any(stop is None for stop in stops):
+                # Where the tensor ends is the one thing a request cannot state
+                # about itself. The resolve reads the catalog row, so it also
+                # makes the addressing refusals the check below would.
+                shape = self._catalog._resolve_descriptor(array_id).shape
+                refusals_settled = True
+                stops = [
+                    shape[axis] if stop is None else stop
+                    for axis, stop in enumerate(stops)
+                ]
             slice_hint_proto = SliceHint(start=starts, stop=stops)
 
         # Build TensorReadOption with flattened fields. `endpoints` is explicit:
@@ -1268,26 +1272,27 @@ class ChunkFetcher:
         if reduction_method is not None:
             read_opt.reduction_method = reduction_method
 
-        # Route on the caller's id, not the resolved descriptor's: only the
-        # caller's prefix is guaranteed to name a registered source. A bare id
-        # therefore leaves tensor_id empty and takes the server's default-tensor
-        # path (#44), which lands on the same tensor _resolve_descriptor picked.
+        # Route on the caller's id: only the caller's prefix is guaranteed to
+        # name a registered source. A bare id leaves tensor_id empty and takes
+        # the server's default-tensor path (#44).
         cmd = _tensor_read_cmd(array_id, read_opt)
 
-        # Get flight info
         flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._state.client.get_flight_info(
-            flight_desc, options=self._state.call_options
-        )
-        response_desc = TensorDescriptor.FromString(info.descriptor.command)
+        try:
+            info = self._state.client.get_flight_info(
+                flight_desc, options=self._state.call_options
+            )
+        except flight.FlightError as exc:
+            _raise_read_refusal(exc, array_id)
+            raise
 
-        # Cache the response only when it describes the WHOLE tensor. A full read
-        # is how the cache acquires fields list_flights leaves off (physical_scale
-        # -- see get_physical_scale). A sliced/downsampled response carries the
-        # tensor's array_id but the crop's shape, so caching that one would hand a
-        # later reader a whole-tensor descriptor describing only this request.
-        if not response_desc.HasField("slice_hint") and not response_desc.scale_hint:
-            self._state.cache_descriptor(response_desc)
+        if not refusals_settled:
+            # The server echoes back the tensor it bound, so an array_id that
+            # came back changed means it substituted a default (#44). Checked
+            # after the response so a qualified id costs nothing.
+            response_desc = TensorDescriptor.FromString(info.descriptor.command)
+            if response_desc.array_id != array_id:
+                self._catalog._refuse_ambiguous_default(array_id)
         return info
 
     def get_tensor(

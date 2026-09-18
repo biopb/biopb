@@ -16,6 +16,30 @@ from biopb.tensor import (
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 
+def _offline_client(raw_client=None):
+    """A wired TensorFlightClient with no connection opened.
+
+    Built without ``__init__`` so no socket is created: the shared state plus the
+    collaborators (#278 item C). ``protocol_checked`` skips the health probe a
+    real connect would run.
+    """
+    from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+    client = TensorFlightClient.__new__(TensorFlightClient)
+    state = _ClientState(
+        raw_client=raw_client,
+        call_options=None,
+        location="",
+        token=None,
+        cache_bytes=0,
+        protocol_checked=True,
+    )
+    client._state = state
+    client._catalog = CatalogClient(state)
+    client._fetcher = ChunkFetcher(state, client._catalog)
+    return client
+
+
 class TestQuerySourcesFormat:
     """query_sources output-format conversion (server-free).
 
@@ -106,51 +130,24 @@ class TestQuerySourcesFormat:
     def test_unknown_format_rejected_before_network(self):
         # Validated at the top of query_sources (now on CatalogClient, #278 item
         # C), so a bad format fails fast without a server / connection.
-        from biopb.tensor._session import CatalogClient, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        client._catalog = CatalogClient(
-            _ClientState(
-                raw_client=None,
-                call_options=None,
-                location="",
-                token=None,
-                cache_bytes=0,
-                protocol_checked=True,
-            )
-        )
+        client = _offline_client()
         with pytest.raises(ValueError, match="unknown format"):
             client.query_sources("SELECT 1", format="polars")
 
 
 class TestGetPhysicalScale:
-    """get_physical_scale reads the descriptor summary (server-free).
+    """get_physical_scale describes the tensor, every call.
 
     Exercises the client accessor for the per-dim physical-scale summary the
-    server folds onto the descriptor (issue #31), driving the descriptor /
-    source caches directly so no connection is needed.
+    server folds onto the descriptor (issue #31), stubbing the fetch so no
+    connection is needed.
     """
 
     @staticmethod
     def _client():
-        # Build without __init__ (no connection): wire the shared state + the
-        # CatalogClient collaborator that now owns get_physical_scale (#278 item
-        # C). The method only touches the in-memory descriptor cache and (on a
-        # miss) the catalog's _fetch_tensor_descriptor, which we stub there.
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            raw_client=None,
-            call_options=None,
-            location="",
-            token=None,
-            cache_bytes=0,
-            protocol_checked=True,
-        )
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
+        # get_physical_scale lives on CatalogClient (#278 item C) and reaches
+        # the server only through _fetch_tensor_descriptor, stubbed here.
+        client = _offline_client()
         client._catalog._fetch_tensor_descriptor = Mock()
         return client
 
@@ -162,34 +159,29 @@ class TestGetPhysicalScale:
             desc.physical_unit[:] = unit
         return desc
 
-    def test_reads_cached_descriptor_without_rpc(self):
-        # A descriptor cached by a prior get_tensor() carries the summary, so
-        # get_physical_scale returns it with no extra fetch.
+    def test_it_asks_the_server_every_time(self):
+        # physical_scale is a GetFlightInfo field the catalog leaves empty, so
+        # only a fetched descriptor can answer it.
         client = self._client()
-        desc = self._desc(
-            "t1", [2.0, 0.325, 0.325], ["micrometer", "micrometer", "micrometer"]
+        client._catalog._fetch_tensor_descriptor.return_value = self._desc(
+            "src/t1", [2.0, 0.325, 0.325], ["micrometer"] * 3
         )
-        client._descriptors["src/t1"] = desc
 
-        # Addressed by the qualified array_id; cache hit -> no fetch.
-        scale, unit = client.get_physical_scale("src/t1")
-        assert scale == [2.0, 0.325, 0.325]
-        assert unit == ["micrometer", "micrometer", "micrometer"]
-        client._catalog._fetch_tensor_descriptor.assert_not_called()
+        for _ in range(3):
+            assert client.get_physical_scale("src/t1")[0] == [2.0, 0.325, 0.325]
+        assert client._catalog._fetch_tensor_descriptor.call_count == 3
 
     def test_none_when_summary_empty(self):
         # Old server / no physical sizes -> empty repeated field -> None.
         client = self._client()
-        desc = self._desc("t1")  # no physical_scale set
-        client._descriptors["src/t1"] = desc
+        client._catalog._fetch_tensor_descriptor.return_value = self._desc("src/t1")
 
         assert client.get_physical_scale("src/t1") is None
 
-    def test_fetches_descriptor_when_not_cached(self):
-        # Not in the descriptor cache: a GetFlightInfo fetch (stubbed here via
-        # _fetch_tensor_descriptor) supplies the summary. A bare source id
-        # resolves the source's default tensor. No get_source / _sources fallback
-        # (removed with the array_id-keyed accessor, #75).
+    def test_a_bare_id_fetches_the_sources_default_tensor(self):
+        # The property this holds that the test above does not: a bare source id
+        # is passed through to the server, which answers with the source's
+        # default tensor (#44), and the compact mask is what goes on the wire.
         client = self._client()
         desc = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
         client._catalog._fetch_tensor_descriptor.return_value = desc
@@ -236,17 +228,8 @@ class TestGetDescriptorFieldMasks:
     def _client_capturing_read_opt():
         # Build without __init__ (no connection); mock the flight client so we can
         # decode the FlightRequest the descriptor probe puts on the wire.
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            raw_client=Mock(),
-            call_options=None,
-            location="",
-            token=None,
-            cache_bytes=0,
-            protocol_checked=True,
-        )
+        client = _offline_client(raw_client=Mock())
+        state = client._state
         # get_flight_info returns a FlightInfo whose descriptor.command is a
         # serialized TensorDescriptor (what _fetch_tensor_descriptor parses back).
         info = Mock()
@@ -254,9 +237,6 @@ class TestGetDescriptorFieldMasks:
             array_id="src/A2"
         ).SerializeToString()
         state.client.get_flight_info.return_value = info
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
         return client, state
 
     @staticmethod
@@ -297,33 +277,15 @@ class TestGetDescriptorFieldMasks:
         assert "endpoints" not in set(self._sent_read_opt(state).fields.paths)
 
 
-class TestDescriptorCacheStaysStructural:
-    """The descriptor cache holds addressing facts only (biopb/biopb#795).
-
-    Masked-off parts must never be stored: an entry that carried them would be
-    indistinguishable from one cached before anyone asked, and ``metadata_json``
-    is the full OME tree in a dict with no eviction and session lifetime.
-    """
+class TestDescriptorsAreNotCached:
+    """The SDK stores no descriptor; every describe is a round trip."""
 
     @staticmethod
     def _client(response: TensorDescriptor):
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            raw_client=Mock(),
-            call_options=None,
-            location="",
-            token=None,
-            cache_bytes=0,
-            protocol_checked=True,
-        )
+        client = _offline_client(raw_client=Mock())
         info = Mock()
         info.descriptor.command = response.SerializeToString()
-        state.client.get_flight_info.return_value = info
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
+        client._state.client.get_flight_info.return_value = info
         return client
 
     @staticmethod
@@ -352,49 +314,96 @@ class TestDescriptorCacheStaysStructural:
         assert returned.metadata_json  # the mask is honoured on the return value
         assert len(returned.pyramid) == 2
 
-    def test_heavy_fields_never_enter_the_cache(self):
+    def test_there_is_nowhere_to_cache_one(self):
+        # Gone, not merely unused: nothing can quietly start writing to it.
         client = self._client(self._fat_descriptor())
 
         client.get_descriptor("src/A2", with_metadata=True)
 
-        cached = client._descriptors["src/A2"]
-        assert cached.metadata_json == ""
-        assert list(cached.pyramid) == []
+        assert not hasattr(client, "_descriptors")
+        assert not hasattr(client._state, "descriptors")
 
-    def test_the_transfer_grid_never_enters_the_cache(self):
-        # The server answers a grid only on GetFlightInfo, for the tensor it
-        # bound; a list_flights entry carries none (biopb/biopb#812). Caching it
-        # would leave entries in two grades, and an empty one must never read as
-        # a usable grid -- so the cache keeps none and the caller describes.
+    def test_every_describe_round_trips(self):
         client = self._client(self._fat_descriptor())
 
-        returned = client.get_descriptor("src/A2")
+        for _ in range(3):
+            client.get_descriptor("src/A2")
 
-        assert list(returned.chunk_shape) == [1, 64, 64]  # honoured on the return
-        assert list(client._descriptors["src/A2"].chunk_shape) == []
-
-    def test_addressing_facts_do_enter_the_cache(self):
-        # Stripping must not take the fields the cache exists to serve --
-        # get_physical_scale reads its answer straight out of this entry.
-        client = self._client(self._fat_descriptor())
-
-        client.get_descriptor("src/A2")
-
-        cached = client._descriptors["src/A2"]
-        assert list(cached.shape) == [8, 64, 64]
-        assert cached.dtype == "uint16"
-        assert list(cached.physical_scale) == [2.0, 0.325, 0.325]
+        assert client._state.raw_client.get_flight_info.call_count == 3
 
     def test_masked_fetch_does_not_poison_a_later_full_fetch(self):
         # The regression #795 asks for: a pyramid-less fetch first, then a
         # default one. Every get_descriptor round-trips, so the second caller
-        # sees the pyramid regardless of what the first one cached.
+        # sees the pyramid regardless of what the first one asked for.
         client = self._client(self._fat_descriptor())
 
         client.get_descriptor("src/A2", with_pyramid=False)
         second = client.get_descriptor("src/A2")
 
         assert len(second.pyramid) == 2
+
+
+class TestResolveDescriptorAddressing:
+    """The read path's addressing refusals, read off the catalog row."""
+
+    @staticmethod
+    def _client(row):
+        client = _offline_client(raw_client=Mock())
+        client._catalog._source_tensors_row = Mock(return_value=row)
+        # The row answers every case here; reaching the probe is the failure.
+        client._catalog._fetch_tensor_descriptor = Mock(
+            side_effect=AssertionError("the row should have answered")
+        )
+        return client
+
+    @staticmethod
+    def _row(*array_ids, is_resolved=True):
+        return {
+            "is_resolved": is_resolved,
+            "tensors": [
+                {
+                    "array_id": aid,
+                    "dim_labels": ["y", "x"],
+                    "shape": [4, 4],
+                    "dtype": "uint8",
+                }
+                for aid in array_ids
+            ],
+        }
+
+    def test_unresolved_steers_to_resolve(self):
+        client = self._client(self._row(is_resolved=False))
+
+        with pytest.raises(ValueError, match=r"call client\.resolve"):
+            client._catalog._resolve_descriptor("cloud_x")
+
+    def test_resolved_but_empty_does_not_steer_to_resolve(self):
+        # A source can resolve cleanly and hold nothing readable; the flag
+        # distinguishes that from unresolved, an empty tensor list cannot.
+        client = self._client(self._row())
+
+        with pytest.raises(ValueError, match="no readable tensors") as exc:
+            client._catalog._resolve_descriptor("empty_x")
+        assert "client.resolve(" not in str(exc.value)
+
+    def test_bare_id_on_a_multi_tensor_source_is_refused(self):
+        client = self._client(self._row("m/f0", "m/f1"))
+
+        with pytest.raises(ValueError, match="multiple tensors"):
+            client._catalog._resolve_descriptor("m")
+
+    def test_a_qualified_id_resolves_off_the_row(self):
+        client = self._client(self._row("m/f0", "m/f1"))
+
+        desc = client._catalog._resolve_descriptor("m/f1")
+
+        assert desc.array_id == "m/f1"
+        assert list(desc.shape) == [4, 4]
+
+    def test_a_bare_id_on_a_single_tensor_source_resolves(self):
+        client = self._client(self._row("solo"))
+
+        assert client._catalog._resolve_descriptor("solo").array_id == "solo"
 
 
 if __name__ == "__main__":

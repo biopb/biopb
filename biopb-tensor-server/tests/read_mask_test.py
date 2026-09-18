@@ -102,9 +102,16 @@ class TestResidencyIsOptIn:
         sid = _zarr_source(writable_server, tmp_path)
         arr = client.get_tensor(sid)
         assert arr.shape == (4, 4)
-        cached = client._state.descriptors.get(sid)
-        if cached is not None:
-            assert not cached.HasField("is_resident")
+        assert not client.get_descriptor(sid).HasField("is_resident")
+
+    def test_every_answer_is_freshly_asked_for(self, client, writable_server, tmp_path):
+        """descriptor.proto says residency is not to be cached by a client: a
+        synced folder re-dehydrates with nothing to notify anyone, so no stored
+        answer stays true. Asking once must not make the next caller, who did
+        not ask, see it."""
+        sid = _zarr_source(writable_server, tmp_path)
+        assert client.get_descriptor(sid, with_residency=True).is_resident is True
+        assert not client.get_descriptor(sid).HasField("is_resident")
 
 
 class TestUnknownPathOverTheWire:

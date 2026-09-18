@@ -50,9 +50,15 @@ _DEPRECATION = (
 )
 
 
-def _descriptor_from_row(row: Mapping[str, Any]) -> DataSourceDescriptor:
-    """The legacy decode, unwarned -- for this package's own deprecated paths."""
-    tensors = [
+def tensor_descriptors_from_row(row: Mapping[str, Any]) -> List[TensorDescriptor]:
+    """A row's ``tensors`` STRUCT[] as ``TensorDescriptor``s.
+
+    The structural fields listed in the module docstring are all a row carries;
+    the serving fields stay unset. Not deprecated, unlike the decoders below:
+    this targets the message the read path addresses tensors with, not the
+    source-shaped struct.
+    """
+    return [
         TensorDescriptor(
             array_id=t["array_id"],
             dim_labels=t.get("dim_labels") or [],
@@ -61,11 +67,15 @@ def _descriptor_from_row(row: Mapping[str, Any]) -> DataSourceDescriptor:
         )
         for t in (row.get("tensors") or [])
     ]
+
+
+def _descriptor_from_row(row: Mapping[str, Any]) -> DataSourceDescriptor:
+    """The legacy decode, unwarned -- for this package's own deprecated paths."""
     desc = DataSourceDescriptor(
         source_id=row["source_id"],
         source_url=row.get("source_url") or "",
         source_type=row.get("source_type") or "",
-        tensors=tensors,
+        tensors=tensor_descriptors_from_row(row),
         metadata_json="",
     )
     # No current server sends `data_resident`. Residency is a per-source read on

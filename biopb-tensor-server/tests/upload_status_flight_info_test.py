@@ -141,16 +141,14 @@ class TestTheActionIsGone:
 
 
 class TestNotCached:
-    def test_the_descriptor_cache_does_not_keep_the_status(self, client):
-        """A cached PENDING would shadow the READY a later poll came for --
-        turning the one field whose purpose is freshness into the stalest thing
-        in the session."""
+    def test_there_is_no_descriptor_cache_to_keep_it_in(self, client):
+        """The SDK keeps no descriptor, so there is nowhere for a stale status
+        to live -- a cached PENDING would shadow the READY a poll came for."""
         desc = _make(client, shape=(2, 2), chunk=(2, 2))
-        client.get_descriptor(desc.array_id)  # seeds the structural cache
+        client.get_descriptor(desc.array_id)
 
-        cached = client._state.descriptors.get(desc.array_id)
-        assert cached is not None, "the probe should have seeded the cache"
-        assert not cached.HasField("upload_status")
+        assert not hasattr(client._state, "descriptors")
+        assert not hasattr(client, "_descriptors")
 
     def test_a_second_poll_sees_new_progress(self, client):
         """The end-to-end consequence: polling is live, not memoized."""
@@ -168,10 +166,26 @@ class TestNotCached:
 class TestSdkDictShape:
     def test_unknown_for_a_source_with_no_upload(self, client, writable_server):
         """Distinct from PENDING: no amount of polling moves it, which is what
-        a caller's poll loop stops on at once."""
+        a caller's poll loop stops on at once.
+
+        The descriptor probe under this restates a not-found id as a ValueError,
+        and this caller must absorb that rather than raise as `describe` does.
+        """
         status = client.get_upload_status("cache_does_not_exist")
         assert status["state"] == "UNKNOWN"
         assert status["expected_chunks"] == 0
+
+    def test_an_unresolved_source_still_raises(self, client, monkeypatch):
+        """The other half: only the addressing error is absorbed. Swallowing
+        every ValueError would turn the resolve steer into a bland UNKNOWN."""
+        from biopb.tensor._session import _unresolved_source_error
+
+        def _unresolved(*args, **kwargs):
+            raise _unresolved_source_error("cloud_x")
+
+        monkeypatch.setattr(client._catalog, "_fetch_tensor_descriptor", _unresolved)
+        with pytest.raises(ValueError, match=r"client\.resolve"):
+            client.get_upload_status("cloud_x")
 
     def test_the_dict_keeps_its_shape(self, client):
         """The wire moved; the SDK's answer did not. `biopb_image_base` mirrors

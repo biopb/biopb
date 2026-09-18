@@ -168,9 +168,9 @@ class TensorFlightClient:
         self._tls_trust = tls_trust
         self._client = flight.FlightClient(normalized, **tls_trust.client_kwargs())
         self._call_options = _build_call_options(token)
-        # The connection + the structural descriptor cache live in one shared
-        # _ClientState. The collaborators (#278 item C) read/write it; this
-        # facade exposes the cache via the _descriptors property below.
+        # One shared _ClientState holds the connection, and only the connection:
+        # the collaborators (#278 item C) cache no descriptors, so a caller that
+        # wants one memoized owns that policy.
         self._state = _ClientState(
             raw_client=self._client,
             call_options=self._call_options,
@@ -182,17 +182,6 @@ class TensorFlightClient:
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
         self._upload = UploadSession(self._state)
-
-    # The descriptor cache lives on the shared _ClientState; expose it here so a
-    # caller's reads, in-place mutation, AND reassignment (client._descriptors =
-    # {}) all reach the one shared dict the collaborators use (#278 item C).
-    @property
-    def _descriptors(self) -> Dict[str, TensorDescriptor]:
-        return self._state.descriptors
-
-    @_descriptors.setter
-    def _descriptors(self, value: Dict[str, TensorDescriptor]) -> None:
-        self._state.descriptors = value
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
@@ -344,10 +333,10 @@ class TensorFlightClient:
         are known (an older server, or a format that carries none).
 
         ``physical_scale``/``physical_unit`` are ``TensorDescriptor`` fields the
-        server fills on every ``GetFlightInfo`` (issue #31), so this reads the
-        descriptor a prior `get_tensor` already cached -- no extra RPC when
-        it is cached, and it never requests the opt-in ``metadata_json`` field on
-        that same descriptor. (Contrast `get_source_metadata`, which ships the
+        server fills on every ``GetFlightInfo`` (issue #31), so this describes the
+        tensor and reads them off the answer, never requesting the opt-in
+        ``metadata_json`` field on that same descriptor. (Contrast
+        `get_source_metadata`, which ships the
         whole OME tree; do not dig physical sizes out of that -- this is the
         compact projection meant for display scale.)
 
@@ -381,11 +370,9 @@ class TensorFlightClient:
         Works even when the source is beyond the server's query row cap.
         **This is the only call that answers the transfer ``chunk_shape``**: the
         grid belongs to the tensor the server binds here, and a catalog row
-        carries it empty (biopb/biopb#812). Every call fetches -- the client
-        caches only the *structural* part of the answer (shape/dtype/dim_labels
-        plus physical scale) for its own addressing, never ``chunk_shape``,
-        ``metadata_json`` or ``pyramid``, so what you get back always reflects the
-        masks you passed. Passing a bare
+        carries it empty (biopb/biopb#812). Every call fetches and nothing is
+        stored, so what you get back always reflects the masks you passed.
+        Passing a bare
         ``source_id`` (single-tensor source, or to anchor on a multi-tensor
         source's default/first tensor) is accepted. To enumerate ALL
         tensors/scenes of a source, read its catalog row's ``tensors`` column

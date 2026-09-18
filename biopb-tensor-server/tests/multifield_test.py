@@ -644,14 +644,12 @@ class TestStripSourcePrefix:
         assert strip_source_prefix("src", "") == ""
 
 
-class TestDescriptorCacheCollision:
-    """Regression for #45: cross-source descriptor cache collisions.
+class TestSameBareFieldNameAcrossSources:
+    """Regression for #45: two sources whose fields share a bare name.
 
-    Two single-scene-aicsimageio-like sources share the bare tensor id
-    "Image:0". A descriptor cache keyed by the bare array_id collapses them to
-    one entry, so get_physical_scale / get_source silently return another
-    source's descriptor (wrong shape, dims, physical scale). The cache must be
-    keyed per (source_id, array_id).
+    Two single-scene-aicsimageio-like sources both call their tensor "Image:0".
+    The qualified array_id is globally unique, so each must answer with its own
+    descriptor.
     """
 
     def test_same_bare_array_id_across_sources_returns_own_descriptor(self):
@@ -696,10 +694,10 @@ class TestDescriptorCacheCollision:
             assert scale_b == [4.0, 0.1, 0.1]
             assert unit_b == ["um", "um", "um"]
 
-            # Both sources coexist: the qualified array_id is globally unique,
-            # so the two same-named fields cannot collide.
-            assert "aics_aaa/Image:0" in client._descriptors
-            assert "aics_bbb/Image:0" in client._descriptors
+            # Asked again in the other order: nothing is memoized between
+            # calls, so a collision could only come from the id itself.
+            assert client.get_physical_scale("aics_bbb/Image:0")[0] == [4.0, 0.1, 0.1]
+            assert client.get_physical_scale("aics_aaa/Image:0")[0] == [2.0, 0.5, 0.5]
 
             client.close()
         finally:
