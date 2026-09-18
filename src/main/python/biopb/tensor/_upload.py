@@ -108,12 +108,12 @@ class _UploadTarget:
 
 
 class UploadSession:
-    """Source creation, chunk upload, and upload-status polling over one Flight
-    connection.
+    """Source creation and chunk upload over one Flight connection.
 
     .. note:: Experimental. This whole API -- ``create_source`` / ``upload_array``
-       / ``upload_zarr``, chunk upload, and upload-status polling -- is
-       experimental and its behavior may change.
+       / ``upload_zarr``, and chunk upload -- is experimental and its behavior
+       may change. Upload-status polling lives on ``CatalogClient`` (it is a
+       read of one descriptor field, not an upload operation).
 
     Takes the shared ``_ClientState`` its two sibling collaborators take
     (``CatalogClient``, ``ChunkFetcher``) and reads only the connection fields

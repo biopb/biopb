@@ -1718,7 +1718,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # tombstone and describe is not a chunk read, so it never reaches
         # `_refuse_if_discarded` -- a poller learns the reason instead of
         # meeting a dead call.
-        upload = upload_of(self.sources.get(source_id))
+        upload = upload_of(source_adapter)
         if upload is not None:
             _fill_upload_status(read_plan.descriptor, upload, source_id)
 

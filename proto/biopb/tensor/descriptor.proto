@@ -194,7 +194,6 @@ message PyramidLevel {
   bool native = 4;
 }
 
-// Specifies a sub-region of the tensor for filtered endpoint discovery
 // How far the upload backing a tensor has got.
 //
 // Reported on the descriptor GetFlightInfo returns rather than by an action,
@@ -228,6 +227,7 @@ message UploadStatus {
   string reason = 4;
 }
 
+// Specifies a sub-region of the tensor for filtered endpoint discovery
 message SliceHint {
   // Start indices (per dimension)
   repeated int64 start = 1;
