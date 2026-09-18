@@ -134,9 +134,11 @@ message TensorDescriptor {
   // every ordinary (file-backed) source. Populated only by GetFlightInfo, like
   // `pyramid` and `physical_scale`, and left empty in the catalog.
   //
-  // Safe to carry on a descriptor where residency was not (biopb/biopb#1035):
-  // upload state is monotonic and terminal, so a stale copy only lags -- it
-  // never reports READY before it is.
+  // A live read, computed per request and stored nowhere -- which is what
+  // biopb/biopb#1035 actually requires. It rides the *per-source* surface
+  // because the caller who needs it holds a per-source credential and asks
+  // about one object: that is the fast-return poller. A catalog-shaped
+  // question would belong on a catalog-shaped surface.
   UploadStatus upload_status = 15;
 
   // 13 was chunk_array_id, the compact-grid read plan (biopb/biopb#346); removed

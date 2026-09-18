@@ -255,10 +255,10 @@ def _fill_upload_status(
 ) -> None:
     """Copy an upload's live progress onto the descriptor GetFlightInfo returns.
 
-    Read from the record at response time and stored nowhere: the value is
-    monotonic and terminal, so shipping a copy is safe in a way a persisted
-    residency column was not (biopb/biopb#1035), but there is still no reason
-    for a second home for it.
+    Read from the record at response time and stored nowhere, which is what
+    biopb/biopb#1035 requires of any live per-source fact. Shipping it on the
+    descriptor is not a second home for it -- nothing keeps the copy, and both
+    client caches strip it.
 
     An unrecognized state is left unset rather than guessed at, so a client
     reads "I do not know" instead of a wrong PENDING.
