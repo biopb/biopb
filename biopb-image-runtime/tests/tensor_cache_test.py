@@ -141,11 +141,7 @@ def _flight_info(serialized):
 
 
 def _array_id(serialized) -> str:
-    from biopb.tensor.descriptor_pb2 import TensorDescriptor
-
-    return TensorDescriptor.FromString(
-        _flight_info(serialized).descriptor.command
-    ).array_id
+    return TensorFlightClient.descriptor_from_pb(serialized).array_id
 
 
 def test_embedded_create_array_tracks_upload_status(

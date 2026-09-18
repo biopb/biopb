@@ -362,13 +362,12 @@ public class TensorFlightClientTest {
                 SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
 
                 // The plan is the FlightInfo the server answered, carried whole.
-                FlightInfo info = FlightInfo.deserialize(pb.getFlightInfo().asReadOnlyByteBuffer());
-                TensorDescriptor descriptor = TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
+                TensorDescriptor descriptor = TensorFlightClient.descriptorOf(pb);
                 Assert.assertEquals("test-tensor", descriptor.getArrayId());
                 Assert.assertEquals(Arrays.asList(4L, 4L), descriptor.getShapeList());
                 Assert.assertEquals("float32", descriptor.getDtype());
                 Assert.assertEquals(Arrays.asList(2L, 2L), descriptor.getChunkShapeList());
-                Assert.assertEquals(4, info.getEndpoints().size());
+                Assert.assertEquals(4, TensorFlightClient.flightInfoOf(pb).getEndpoints().size());
 
                 // Verify location is populated
                 Assert.assertTrue(pb.getLocation().contains("localhost"));
@@ -427,8 +426,7 @@ public class TensorFlightClientTest {
                 SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, scaleHint, "nearest");
 
                 // Verify scale_hint in the plan's descriptor
-                TensorDescriptor descriptor = TensorDescriptor.parseFrom(
-                        FlightInfo.deserialize(pb.getFlightInfo().asReadOnlyByteBuffer()).getDescriptor().getCommand());
+                TensorDescriptor descriptor = TensorFlightClient.descriptorOf(pb);
                 Assert.assertEquals(Arrays.asList(2L, 2L), descriptor.getScaleHintList());
 
                 // Reconstruct and verify downscaled shape

@@ -136,13 +136,11 @@ class TestProcessImageLazy:
 
         # Check SerializedTensor structure: a location, and a plan whose
         # descriptor names the result. Describe-only, so no endpoints yet.
-        import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb.tensor.client import TensorFlightClient
 
         serialized = response.image_data.lazy_data
         assert serialized.location.startswith("grpc://")
-        info = flight.FlightInfo.deserialize(serialized.flight_info)
-        assert TensorDescriptor.FromString(info.descriptor.command).array_id
+        assert TensorFlightClient.descriptor_from_pb(serialized).array_id
 
     def test_lazy_location_is_localhost(self, mock_server: str):
         """For --local mode without explicit location, tensor location defaults to localhost."""

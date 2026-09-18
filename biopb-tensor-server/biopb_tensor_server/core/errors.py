@@ -188,10 +188,10 @@ class UploadClosedError(Exception):
     (biopb/biopb#1048 step 7). The gRPC code itself is not part of that
     payload: both subclasses map to ``FlightCancelledError`` unconditionally,
     so it is implied by the exception type, not data a client would switch on.
-    """
 
-    wire_reason = "upload_closed"
-    state = ""
+    Declares no ``wire_reason``/``state`` of its own -- never raised directly,
+    so every instance is one of the subclasses below, which each supply both.
+    """
 
 
 class UploadDiscardedError(UploadClosedError):

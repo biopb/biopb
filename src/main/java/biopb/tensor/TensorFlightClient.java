@@ -1287,7 +1287,7 @@ public class TensorFlightClient implements AutoCloseable {
         int[] cellDimensions = toIntArray(context.descriptor.getChunkShapeList());
 
         ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
-                context.endpoints, dims, cellDimensions,
+                context.info.getEndpoints(), dims, cellDimensions,
                 ep -> parseChunkBounds(ep.getAppMetadata()),
                 ep -> ep);
         if (endpointIndex == null) {
@@ -1315,7 +1315,7 @@ public class TensorFlightClient implements AutoCloseable {
         ArrayImg<T, ?> image = (ArrayImg<T, ?>) new ArrayImgFactory<>(type).create(dims);
         RandomAccess<T> access = image.randomAccess();
 
-        for (FlightEndpoint endpoint : context.endpoints) {
+        for (FlightEndpoint endpoint : context.info.getEndpoints()) {
             TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
             ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
             double[] values = fetchChunkValues(ticket.getChunkId().toByteArray());
@@ -1615,12 +1615,10 @@ public class TensorFlightClient implements AutoCloseable {
     private static class RequestContext {
         final TensorDescriptor descriptor;
         final FlightInfo info;
-        final List<FlightEndpoint> endpoints;
 
         RequestContext(TensorDescriptor descriptor, FlightInfo info) {
             this.descriptor = parseDescriptorUnchecked(descriptor.toByteArray());
             this.info = info;
-            this.endpoints = info.getEndpoints();
         }
     }
 }
