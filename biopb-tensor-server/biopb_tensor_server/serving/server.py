@@ -457,11 +457,8 @@ class TensorFlightServer(flight.FlightServerBase):
             self.sources, write_dir, self._metadata_db, ttl=upload_ttl
         )
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
-        # stopped in ``shutdown``. Only a writable server can ever register an
-        # upload-tracking adapter, so a read-only one leaves this off rather
-        # than sweeping an empty set forever.
-        if self._writable:
-            self.uploads.start_sweep()
+        # stopped in ``shutdown``.
+        self.uploads.start_sweep()
         # Readiness gate: the Flight port binds (and gRPC starts serving) in the
         # base __init__ above, *before* the caller scans/registers the data
         # folder -- a scan that can be slow for large catalogs. Until the caller
