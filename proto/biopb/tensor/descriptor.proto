@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package biopb.tensor;
 
+import "google/protobuf/field_mask.proto";
+
 option java_multiple_files = true;
 option java_package = "biopb.tensor";
 
@@ -141,6 +143,21 @@ message TensorDescriptor {
   // question would belong on a catalog-shaped surface.
   UploadStatus upload_status = 15;
 
+  // Whether this source's bytes are local and cheap to read *right now*.
+  //
+  // Filled only when the read mask asks for "is_resident", because the answer
+  // is a bounded stat walk of the source -- never free, so never default. Unset
+  // means nobody asked, which a UI draws as no indicator rather than as
+  // "remote".
+  //
+  // Volatile: a synced folder re-dehydrates under storage pressure with nothing
+  // to notify anyone, so there is no moment at which a stored answer stays true.
+  // Computed per request, stored nowhere, and not to be cached by a client
+  // (biopb/biopb#1035). It was briefly a catalog-wide action; that made a live
+  // filesystem walk the cost of listing, which is why it is here and per-source
+  // now.
+  optional bool is_resident = 16;
+
   // 13 was chunk_array_id, the compact-grid read plan (biopb/biopb#346); removed
   // when the chunk_id codec was made a strictly server-side concern (the client
   // no longer regenerates chunk_ids). Reserved so the field number/name are never
@@ -263,32 +280,42 @@ message TensorReadOption {
   // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
   string reduction_method = 4;
 
-  // If true, server populates metadata_json with wrapped metadata.
-  // Wrapped structure: {"type": source_type, "dim_label": [...], "metadata": {...}}
-  bool with_metadata = 5;
+  // Which optional parts of the response to fill.
+  //
+  // **Empty means none.** The response then carries this tensor's base
+  // descriptor -- array_id, dim_labels, shape, chunk_shape, dtype, and the
+  // ~200-byte physical_scale/physical_unit, which stay unconditional as the one
+  // cheap describe fact -- and an empty endpoint list.
+  //
+  // Paths name what they fill on the response:
+  //
+  //   "endpoints"     - the per-request chunk read plan. O(chunks); a read asks
+  //                     for this, a describe does not.
+  //   "metadata_json" - the full OME tree. Megabytes on a per-plane-annotated
+  //                     file.
+  //   "pyramid"       - the advertised resolution pyramid. Sizing a native one
+  //                     opens each level's store (network I/O per level on a
+  //                     cloud store).
+  //   "upload_status" - progress of the upload backing this tensor, if any.
+  //                     The one cheap path: an in-memory record read.
+  //   "is_resident"   - whether the bytes are local right now. A bounded stat
+  //                     walk of the source (biopb/biopb#1035).
+  //
+  // Opt-in throughout, and that is the point of replacing the three `with_*`
+  // bools this supersedes: they defaulted the *most* expensive part, the read
+  // plan, to on, so a describe had to remember to turn it off. Nothing here is
+  // free, so nothing here is default.
+  //
+  // An unknown path is refused, not ignored: a client asking for something this
+  // server does not serve should learn so, rather than silently receive a
+  // response missing the field it planned around.
+  google.protobuf.FieldMask fields = 9;
 
-  // If true, server advertises the resolution pyramid on the response
-  // descriptor (TensorDescriptor.pyramid). Opt-in (default false): advertising a
-  // native pyramid opens each level's store to size it (network I/O per level
-  // for a cloud store), so a client that does not consume the pyramid does not
-  // pay for it. physical_scale, the other cheap describe fact, is filled
-  // unconditionally.
-  bool with_pyramid = 7;
-
-  // Whether to enumerate the per-request chunk endpoints (the O(chunks) read
-  // plan). Default true -- a normal read needs the endpoints; an old client that
-  // omits the field is served the full plan, exactly as before. Set false for a
-  // describe-only GetFlightInfo: the response carries the descriptor
-  // (shape/dtype/pyramid/physical_scale/metadata_json, per the other masks) with
-  // an empty endpoint list, skipping the plan. `optional` so the *unset* default
-  // is true (a proto3 bool would default false).
-  optional bool with_read_plan = 8;
-
-  // 6 was compact_grid_ok, the opt-in to a compact-grid read plan
-  // (biopb/biopb#346); removed when the chunk_id codec was made a strictly
-  // server-side concern. Reserved so the field number/name are never reused.
-  reserved 6;
-  reserved "compact_grid_ok";
+  // 5, 7 and 8 were with_metadata / with_pyramid / with_read_plan, and 6 was
+  // compact_grid_ok (biopb/biopb#346). Replaced by `fields` above, within the
+  // v2 wire migration. Reserved so the numbers and names are never reused.
+  reserved 5, 6, 7, 8;
+  reserved "with_metadata", "compact_grid_ok", "with_pyramid", "with_read_plan";
 }
 
 // The GetFlightInfo command. Dispatch is the oneof arm, nothing else: a

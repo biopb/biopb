@@ -81,6 +81,12 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
+from biopb_tensor_server.core.read_mask import (
+    IS_RESIDENT,
+    METADATA_JSON,
+    UPLOAD_STATUS,
+    read_mask,
+)
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
@@ -925,10 +931,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 "Hydrate-ahead: recall a resolved cloud source's member files server-side",
             ),
             flight.ActionType(
-                "is_resident",
-                "Live residency of sources right now (never a stored catalog value)",
-            ),
-            flight.ActionType(
                 "add_source",
                 "Register a local path/dir as a served source at runtime (streams progress)",
             ),
@@ -1037,11 +1039,6 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize(context)
             yield from self._handle_warm(source_id, context)
-        elif action.type == "is_resident":
-            # Catalog tier: which sources are local is part of browsing, not
-            # of reading their pixels.
-            self._authorize(context)
-            yield self._handle_is_resident(action.body.to_pybytes())
         elif action.type == "add_source":
             self._authorize(context)
             req = AddSourceRequest.FromString(action.body.to_pybytes())
@@ -1057,46 +1054,6 @@ class TensorFlightServer(flight.FlightServerBase):
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
-
-    def _handle_is_resident(self, body: bytes) -> bytes:
-        """Residency of the named sources, asked of the adapters right now.
-
-        An action rather than a catalog column because the answer has no shelf
-        life: a synced folder re-dehydrates with no event to refresh a stored
-        value from, so every call re-runs ``adapter.is_resident()``
-        (biopb/biopb#1035). Never cache it here or anywhere.
-
-        Batched because the callers are lists drawing a glyph per row. Body is a
-        JSON array of source ids, or empty for every registered source; the
-        reply is a JSON object of id -> boolean. An id the server does not serve
-        is absent, which reads as "unknown" -- never False, which would send a
-        client to hydrate a file already on disk.
-        """
-        raw = body.decode("utf-8").strip()
-        if raw:
-            try:
-                requested = json.loads(raw)
-            except ValueError as exc:
-                raise flight.FlightServerError(
-                    f"is_resident takes a JSON array of source ids: {exc}"
-                ) from exc
-            if not isinstance(requested, list):
-                raise flight.FlightServerError(
-                    "is_resident takes a JSON array of source ids"
-                )
-            pairs = [(str(sid), self.sources.get(str(sid))) for sid in requested]
-        else:
-            pairs = self.sources.snapshot()
-
-        resident: Dict[str, bool] = {}
-        for source_id, adapter in pairs:
-            if adapter is None:
-                continue
-            try:
-                resident[source_id] = bool(adapter.is_resident())
-            except Exception:  # noqa: BLE001 -- one balky adapter is not the batch
-                logger.debug("is_resident failed for %s", source_id, exc_info=True)
-        return json.dumps(resident).encode("utf-8")
 
     def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
         """Stream the result of resolving a source.
@@ -1580,6 +1537,7 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError("tensor_read: array_id is required")
 
         self._authorize_read(context, source_id, READ_PIXELS)
+        mask = read_mask(read_opt)
 
         # Reduce the request array_id to the within-source field -- or None =
         # "the source's default (first) tensor" (identity policy: array_id is
@@ -1666,7 +1624,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 read_plan.descriptor.content_version = source_adapter.content_version
 
             # Populate metadata_json in response descriptor if requested
-            if read_opt.with_metadata:
+            if METADATA_JSON in mask:
                 # One scheme (biopb/biopb#253): the source-level metadata is
                 # computed once at registration and read back from the catalog --
                 # the cache -- never recomputed on the adapter. A DB read error
@@ -1710,17 +1668,32 @@ class TensorFlightServer(flight.FlightServerBase):
         # Upload progress, for a source that is one. Here rather than in an
         # action because `do_action` takes full access, and the caller waiting
         # on a fast-return result holds a per-source read capability and
-        # nothing else (biopb/biopb#1048). Describe-only
-        # (`with_read_plan=false`) makes the poll cheap: no endpoint
-        # enumeration, so this is the only work a poll does.
+        # nothing else (biopb/biopb#1048). An empty mask makes the poll cheap:
+        # no endpoint enumeration, so this is the only work it does.
         #
         # A discarded source answers too. The adapter stays registered as a
         # tombstone and describe is not a chunk read, so it never reaches
         # `_refuse_if_discarded` -- a poller learns the reason instead of
         # meeting a dead call.
-        upload = upload_of(source_adapter)
-        if upload is not None:
-            _fill_upload_status(read_plan.descriptor, upload, source_id)
+        if UPLOAD_STATUS in mask:
+            upload = upload_of(source_adapter)
+            if upload is not None:
+                _fill_upload_status(read_plan.descriptor, upload, source_id)
+
+        # Residency, only when asked. It is a bounded stat walk of the source,
+        # so it is never free -- which is why it is per-source and opt-in rather
+        # than the catalog-wide action it was: that made a live filesystem walk
+        # the cost of listing, for every source, on every browse
+        # (biopb/biopb#1035, biopb/biopb#1048).
+        #
+        # A source that cannot answer leaves the field unset. Unset reads as
+        # "unknown", never as False -- which would send a client to hydrate what
+        # is already on disk.
+        if IS_RESIDENT in mask:
+            try:
+                read_plan.descriptor.is_resident = bool(source_adapter.is_resident())
+            except Exception:  # noqa: BLE001 -- a balky adapter is not the request
+                logger.debug("is_resident failed for %s", source_id, exc_info=True)
 
         # Convert to FlightEndpoints. Each endpoint carries the server-minted
         # chunk_id as an opaque ticket and the chunk's bounds as app_metadata;

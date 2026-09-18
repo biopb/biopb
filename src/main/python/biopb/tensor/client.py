@@ -12,7 +12,7 @@ Features:
 import json
 import logging
 import warnings
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import dask.array as da
 import numpy as np
@@ -409,6 +409,8 @@ class TensorFlightClient:
         with_metadata: bool = False,
         with_pyramid: bool = True,
         with_read_plan: bool = False,
+        with_residency: bool = False,
+        with_upload_status: bool = False,
     ) -> TensorDescriptor:
         """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
 
@@ -450,6 +452,14 @@ class TensorFlightClient:
                 ``False`` -- opt in when you need it.
             with_pyramid: advertise the resolution pyramid on the descriptor.
                 Default ``True`` (the primary describe consumer reads it).
+            with_upload_status: fill ``upload_status`` for a source backed by
+                an upload. Cheap (an in-memory record read), but off by default
+                like every other optional part.
+            with_residency: ask whether this source's bytes are local right
+                now, answered on ``is_resident``. Off by default: the answer is
+                a bounded stat walk of the source, so ask it for a source you
+                are about to read, never in a loop over a listing
+                (biopb/biopb#1048). Unset on the response means nobody asked.
             with_read_plan: enumerate the per-request chunk endpoints. Default
                 ``False``; a describe discards them, so the plan is skipped.
 
@@ -461,6 +471,8 @@ class TensorFlightClient:
             with_metadata=with_metadata,
             with_pyramid=with_pyramid,
             with_read_plan=with_read_plan,
+            with_residency=with_residency,
+            with_upload_status=with_upload_status,
         )
 
     def resolve(
@@ -587,40 +599,6 @@ class TensorFlightClient:
         return self._catalog.warm(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
-
-    def is_resident(
-        self, source_ids: Optional[Iterable[str]] = None
-    ) -> Dict[str, bool]:
-        """Ask the server, right now, whose content is local and cheap to read.
-
-        Note:
-            Experimental, with the rest of cloud / remote source support.
-
-        Volatile: a synced folder (OneDrive / iCloud Files-On-Demand)
-        re-dehydrates under storage pressure with nothing to notify anyone, so
-        no stored answer stays true -- which is why it is an action and not a
-        catalog column (biopb/biopb#1035). **Do not cache what it returns.**
-
-        Not the same question as a row's ``is_resolved``, which asks whether the
-        server has read the source at all yet. An unresolved source is never
-        resident; a resolved one can stop being.
-
-        Batched: one call answers a whole catalog page.
-
-        Args:
-            source_ids: The sources to ask about; ``None`` (the default) asks
-                about every source the server has registered.
-
-        Returns:
-            ``{source_id: bool}``. A requested id the server does not serve is
-            simply absent -- missing means "no answer", not "not resident".
-
-        Raises:
-            RuntimeError: if the server predates the ``is_resident`` action --
-                residency unknown, which a UI should draw as no indicator
-                rather than guess at.
-        """
-        return self._catalog.is_resident(source_ids)
 
     def add_source(
         self,
