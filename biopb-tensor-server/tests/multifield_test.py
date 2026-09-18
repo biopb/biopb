@@ -432,16 +432,16 @@ class TestMultifieldServerClient:
         finally:
             server.shutdown()
 
-    def test_fetch_endpoints_via_get_flight_info_multi_tensor(self):
-        """The SerializedTensor endpoint-fetch fallback must derive source_id
-        from a multi-tensor qualified array_id ("source_id/field").
+    def test_refetch_flight_info_multi_tensor(self):
+        """The endpoint-less handle's replan must derive source_id from a
+        multi-tensor qualified array_id ("source_id/field").
 
         Regression for the identity-policy alignment: the request carries the
         *whole* array_id "mf-fetch/pos_1", and the server splits on the first
         "/" -> source "mf-fetch", field "pos_1".
         """
-        from biopb.tensor.client import _fetch_endpoints_via_get_flight_info
-        from biopb.tensor.serialized_pb2 import SerializedTensor
+        from biopb.tensor._session import _parse_flight_endpoints, _refetch_flight_info
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
@@ -457,12 +457,14 @@ class TestMultifieldServerClient:
         time.sleep(1)
 
         try:
-            pb = SerializedTensor(location=f"grpc://localhost:{server.port}")
-            # Qualified multi-tensor array_id; endpoints left empty triggers the
-            # GetFlightInfo fallback under test.
-            pb.tensor_descriptor.array_id = "mf-fetch/pos_1"
-
-            chunk_ids, bounds = _fetch_endpoints_via_get_flight_info(pb)
+            # Qualified multi-tensor array_id, as a handle with no endpoints
+            # would carry it.
+            info = _refetch_flight_info(
+                TensorDescriptor(array_id="mf-fetch/pos_1"),
+                f"grpc://localhost:{server.port}",
+                None,
+            )
+            chunk_ids, bounds = _parse_flight_endpoints(info)
 
             assert len(chunk_ids) > 0
             assert len(chunk_ids) == len(bounds)

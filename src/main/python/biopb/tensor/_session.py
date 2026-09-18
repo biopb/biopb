@@ -16,7 +16,6 @@ from ``biopb.tensor.client``.
 
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -81,7 +80,7 @@ from biopb.tensor.descriptor_pb2 import (
     WarmProgress,
     WarmStreamMessage,
 )
-from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
     PutCommand,
@@ -169,12 +168,16 @@ class ResolveCancelled(Exception):
     """
 
 
-def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
-    """Extract upload-status source_id from a registration-first SerializedTensor."""
-    source_id = pb.tensor_descriptor.array_id
-    if not source_id:
-        raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
-    return source_id
+def _upload_status_dict(source_id: str, status: UploadStatusPb) -> Dict[str, Any]:
+    """The one shape an upload status takes on the SDK, for the poll and for
+    ``finish_upload`` alike."""
+    return {
+        "source_id": source_id,
+        "state": UploadStatusPb.State.Name(status.state),
+        "expected_chunks": status.expected_chunks,
+        "uploaded_chunks": status.uploaded_chunks,
+        "reason": status.reason,
+    }
 
 
 def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
@@ -182,7 +185,7 @@ def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
 
     Mirrors the server's own ``unknown_upload_status`` so the two ends agree on
     the shape, and never means "not started yet": the record exists from the
-    moment ``create_source`` hands out the id.
+    moment ``create_tensor`` hands out the id.
     """
     return {
         "source_id": source_id,
@@ -229,23 +232,6 @@ def _structural_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
     lean.ClearField("chunk_shape")
     lean.ClearField("upload_status")
     return lean
-
-
-@dataclass
-class _TensorContext:
-    """Internal context returned by _get_tensor_context().
-
-    Contains all parsed flight info needed to build either a dask array
-    or a SerializedTensor protobuf.
-    """
-
-    descriptor: TensorDescriptor
-    endpoints: List[Tuple[bytes, ChunkBounds]]  # (chunk_id, bounds) pairs
-    read_opt: TensorReadOption
-    original_slice_hint: Optional[SliceHint]
-    schema_metadata: Optional[Dict[str, str]] = (
-        None  # For SHM transfer feature detection
-    )
 
 
 def _request_crop_slices(
@@ -297,25 +283,25 @@ def _parse_flight_endpoints(
     return chunks, chunk_bounds_list
 
 
-def _fetch_endpoints_via_get_flight_info(
-    pb: SerializedTensor,
-) -> Tuple[List[bytes], List[ChunkBounds]]:
-    """Fetch endpoints from server via GetFlightInfo when not provided in SerializedTensor.
+def _refetch_flight_info(
+    descriptor: TensorDescriptor, location: str, token: Optional[str]
+) -> "flight.FlightInfo":
+    """GetFlightInfo for the read a descriptor already describes.
 
-    This is used when the endpoints field in SerializedTensor is empty.
-    The client connects to the server and calls GetFlightInfo to get
-    the endpoint list for the tensor.
+    For a handle that carries no endpoints -- a source declared before its
+    chunks existed, or one whose producer chose not to embed a plan. The
+    request is rebuilt from the descriptor's realized slice, scale and
+    reduction, so the answer is the same plan its producer would have got.
 
-    Args:
-        pb: SerializedTensor protobuf (endpoints field empty)
-
-    Returns:
-        Tuple of (chunk_ids, chunk_bounds) extracted from FlightInfo
+    Reuses the worker's pooled per-thread connection (with its tuned gRPC
+    message-size options) rather than dialing a throwaway client; a later
+    chunk fetch to the same (location, token) then rides the same connection.
+    The TLS resolve is memoized per process, so evaluating it eagerly here --
+    even when the pooled client already exists and discards the value -- costs
+    a dict lookup rather than a handshake.
     """
-    descriptor = pb.tensor_descriptor
-
-    # Build TensorReadOption from descriptor's fields. `endpoints` is explicit:
-    # this call exists to get them, and nothing is implied by the mask any more.
+    # `endpoints` is explicit: this call exists to get them, and nothing is
+    # implied by the mask any more.
     read_opt = _read_option(endpoints=True)
     if descriptor.HasField("slice_hint"):
         read_opt.slice_hint.CopyFrom(descriptor.slice_hint)
@@ -323,29 +309,70 @@ def _fetch_endpoints_via_get_flight_info(
         read_opt.scale_hint[:] = list(descriptor.scale_hint)
     if descriptor.reduction_method:
         read_opt.reduction_method = descriptor.reduction_method
-
     cmd = _tensor_read_cmd(descriptor.array_id, read_opt)
 
-    # Reuse the worker's pooled per-thread connection (with its tuned gRPC
-    # message-size options) rather than dialing a throwaway client; a later chunk
-    # fetch to the same (location, token) then rides the same connection.
-    # The TLS resolve is memoized per process, so evaluating it eagerly here --
-    # even when the pooled client already exists and discards the value -- costs a
-    # dict lookup rather than a handshake.
-    token = pb.auth_token or None
-    client = _get_thread_client(pb.location, token, resolve_tls_trust(pb.location))
-    call_options = _get_shared_call_options(pb.location, token)
-
+    client = _get_thread_client(location, token, resolve_tls_trust(location))
+    call_options = _get_shared_call_options(location, token)
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     info = client.get_flight_info(flight_desc, options=call_options)
+    logger.debug(f"_refetch_flight_info: got {len(info.endpoints)} endpoints")
+    return info
 
-    # Check schema version compatibility
+
+def _requested_slice(info: "flight.FlightInfo") -> Optional[SliceHint]:
+    """The slice a plan was asked for, off ``FlightInfo.app_metadata``.
+
+    The server stamps the request's ``slice_hint`` there verbatim, beside the
+    chunk-aligned realized one in the descriptor. None for an unsliced read.
+    """
+    raw = info.app_metadata
+    return SliceHint.FromString(raw) if raw else None
+
+
+def _dask_from_flight_info(
+    info: "flight.FlightInfo",
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    tls_trust: Optional[TlsTrust],
+    requested: Optional[SliceHint] = None,
+) -> da.Array:
+    """The lazy array a planned read describes.
+
+    The one reconstruction, whether the FlightInfo came from this connection's
+    GetFlightInfo (``get_tensor``) or arrived serialized from another process
+    (``tensor_from_pb``): decode the descriptor and endpoints, build the
+    chunk-fetching array, crop the realized region back to *requested* (the
+    plan's own ``app_metadata`` unless the caller kept an earlier one).
+    """
     _check_wire_protocol(info.schema)
-
-    chunks, chunk_bounds_list = _parse_flight_endpoints(info)
-    logger.debug(f"_fetch_endpoints_via_get_flight_info: got {len(chunks)} endpoints")
-
-    return chunks, chunk_bounds_list
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    chunk_ids, bounds_list = _parse_flight_endpoints(info)
+    shape = tuple(descriptor.shape)
+    chunk_map, grid_shape = _chunk_map_from_endpoints(chunk_ids, bounds_list, shape)
+    dask_arr = _build_dask_array_from_chunk_map(
+        chunk_map,
+        grid_shape,
+        shape,
+        np.dtype(descriptor.dtype),
+        location,
+        token,
+        cache_bytes,
+        _extract_schema_metadata(info.schema),
+        tls_trust,
+    )
+    if requested is None:
+        requested = _requested_slice(info)
+    if requested is not None and descriptor.HasField("slice_hint"):
+        dask_arr = dask_arr[
+            _request_crop_slices(
+                len(shape),
+                requested,
+                descriptor.slice_hint,
+                list(descriptor.scale_hint) if descriptor.scale_hint else None,
+            )
+        ]
+    return dask_arr
 
 
 def _extract_schema_metadata(schema: pa.Schema) -> Optional[Dict[str, str]]:
@@ -1020,72 +1047,7 @@ class CatalogClient:
             # Distinct from PENDING, and no amount of polling moves it
             # (biopb/biopb#109).
             return _unknown_upload_status(source_id)
-        status = desc.upload_status
-        return {
-            "source_id": source_id,
-            "state": UploadStatusPb.State.Name(status.state),
-            "expected_chunks": status.expected_chunks,
-            "uploaded_chunks": status.uploaded_chunks,
-            "reason": status.reason,
-        }
-
-    def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
-        """Backs TensorFlightClient.get_upload_status_pb; see that method for the full
-        documentation."""
-        return self.get_upload_status(_upload_source_id_from_pb(pb))
-
-    def wait_for_upload_ready(
-        self,
-        source_id: str,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Backs TensorFlightClient.wait_for_upload_ready; see that method for the full
-        documentation."""
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            status = self.get_upload_status(source_id)
-            state = status.get("state")
-            if state == "READY":
-                return status
-            if state == "UNKNOWN":
-                # Nothing to wait for, so fail now instead of polling to the
-                # timeout (biopb/biopb#109). The server records upload progress
-                # when create_source() hands out the id, so UNKNOWN never means
-                # "not started yet" -- it means there is no upload record at
-                # all, which no amount of polling will change.
-                raise ValueError(
-                    f"The server tracks no upload for source '{source_id}' "
-                    "(not an upload target, or its record was dropped by a "
-                    "server restart or source removal)."
-                )
-            if state == "DISCARDED":
-                # The owner gave up on this upload (biopb/biopb#1). Terminal, so
-                # it is a prompt answer rather than a poll to the timeout -- and
-                # the reason is the whole point of reporting it.
-                reason = status.get("reason") or "no reason given"
-                raise RuntimeError(
-                    f"Upload discarded for source '{source_id}': {reason}"
-                )
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for upload readiness for source '{source_id}'"
-                )
-            time.sleep(poll_interval_seconds)
-
-    def wait_for_upload_ready_pb(
-        self,
-        pb: SerializedTensor,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Backs TensorFlightClient.wait_for_upload_ready_pb; see that method for the full
-        documentation."""
-        return self.wait_for_upload_ready(
-            _upload_source_id_from_pb(pb),
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
-        )
+        return _upload_status_dict(source_id, desc.upload_status)
 
     def add_source(
         self,
@@ -1256,17 +1218,18 @@ class ChunkFetcher:
         self._state = state
         self._catalog = catalog
 
-    def _get_tensor_context(
+    def _plan_read(
         self,
         array_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-    ) -> _TensorContext:
+    ) -> "flight.FlightInfo":
         """Plan one read: resolve the tensor, then GetFlightInfo its endpoints.
 
-        The shared body of :meth:`get_tensor` and :meth:`get_tensor_pb`, which
-        differ only in what they build from the returned :class:`_TensorContext`.
+        The shared body of :meth:`get_tensor` and :meth:`get_tensor_pb`: one
+        builds the array from the returned FlightInfo, the other hands the
+        FlightInfo on.
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
@@ -1275,11 +1238,8 @@ class ChunkFetcher:
                 ``stop`` is filled from the resolved tensor's shape.
             scale_hint: Optional per-dimension downsampling factors
             reduction_method: Optional dynamic reduction method
-
-        Returns:
-            _TensorContext with descriptor, endpoints, read_opt, and original_slice_hint
         """
-        logger.debug(f"_get_tensor_context: array_id={array_id}")
+        logger.debug(f"_plan_read: array_id={array_id}")
 
         # The whole-tensor descriptor: supplies the shape that fills an
         # open-ended slice stop, and makes the addressing refusals (#75,
@@ -1321,12 +1281,6 @@ class ChunkFetcher:
         )
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
-        # Check schema version compatibility
-        _check_wire_protocol(info.schema)
-
-        # Extract schema metadata for SHM transfer feature detection
-        schema_metadata = _extract_schema_metadata(info.schema)
-
         # Cache the response only when it describes the WHOLE tensor. A full read
         # is how the cache acquires fields list_flights leaves off (physical_scale
         # -- see get_physical_scale). A sliced/downsampled response carries the
@@ -1334,18 +1288,7 @@ class ChunkFetcher:
         # later reader a whole-tensor descriptor describing only this request.
         if not response_desc.HasField("slice_hint") and not response_desc.scale_hint:
             self._state.cache_descriptor(response_desc)
-
-        # Parse endpoints into (chunk_id, bounds) pairs.
-        chunk_ids, bounds_list = _parse_flight_endpoints(info)
-        endpoints = list(zip(chunk_ids, bounds_list, strict=True))
-
-        return _TensorContext(
-            descriptor=response_desc,
-            endpoints=endpoints,
-            read_opt=read_opt,
-            original_slice_hint=slice_hint_proto,
-            schema_metadata=schema_metadata,
-        )
+        return info
 
     def get_tensor(
         self,
@@ -1356,40 +1299,14 @@ class ChunkFetcher:
     ) -> da.Array:
         """Backs TensorFlightClient.get_tensor; see that method for the full
         documentation."""
-        ctx = self._get_tensor_context(
-            array_id,
-            slice_hint=slice_hint,
-            scale_hint=scale_hint,
-            reduction_method=reduction_method,
+        info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
+        return _dask_from_flight_info(
+            info,
+            self._state.location,
+            self._state.token,
+            self._state.cache_bytes,
+            self._state.tls_trust,
         )
-
-        # Build dask array from the explicit (chunk_id, bounds) endpoints.
-        chunks = [ep[0] for ep in ctx.endpoints]
-        chunk_bounds_list = [ep[1] for ep in ctx.endpoints]
-        dask_arr = self._build_dask_array(
-            desc=ctx.descriptor,
-            chunks=chunks,
-            chunk_bounds=chunk_bounds_list,
-            schema_metadata=ctx.schema_metadata,
-        )
-
-        # Crop to the originally requested region.
-        # The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
-        # the returned descriptor.shape may be larger than what was requested.
-        # We crop the dask array back to the exact requested region here.
-        if ctx.original_slice_hint is not None and ctx.descriptor.HasField(
-            "slice_hint"
-        ):
-            dask_arr = dask_arr[
-                _request_crop_slices(
-                    len(ctx.descriptor.shape),
-                    ctx.original_slice_hint,
-                    ctx.descriptor.slice_hint,
-                    list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None,
-                )
-            ]
-
-        return dask_arr
 
     def get_tensor_pb(
         self,
@@ -1400,78 +1317,9 @@ class ChunkFetcher:
     ) -> SerializedTensor:
         """Backs TensorFlightClient.get_tensor_pb; see that method for the full
         documentation."""
-        ctx = self._get_tensor_context(
-            array_id,
-            slice_hint=slice_hint,
-            scale_hint=scale_hint,
-            reduction_method=reduction_method,
-        )
-
-        # Serialize the explicit endpoint list (consumed by tensor_from_pb on
-        # worker processes).
-        endpoints = ctx.endpoints
-        serialized_endpoints = []
-        for chunk_id, bounds in endpoints:
-            ticket = TensorTicket(chunk_id=chunk_id)
-            serialized_ep = SerializedEndpoint(
-                ticket=ticket,
-                chunk_bounds=bounds,
-            )
-            serialized_endpoints.append(serialized_ep)
-
-        # Build SerializedTensor
-        serialized_tensor = SerializedTensor(
-            tensor_descriptor=ctx.descriptor,
+        info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
+        return SerializedTensor(
             location=self._state.location,
             auth_token=self._state.token or "",
-            endpoints=serialized_endpoints,
-        )
-        if ctx.original_slice_hint is not None:
-            serialized_tensor.original_slice_hint.CopyFrom(ctx.original_slice_hint)
-
-        # Add schema metadata for SHM transfer feature detection
-        if ctx.schema_metadata is not None:
-            serialized_tensor.schema_metadata.update(ctx.schema_metadata)
-
-        return serialized_tensor
-
-    def _build_dask_array(
-        self,
-        desc: TensorDescriptor,
-        chunks: List[bytes],
-        chunk_bounds: List[ChunkBounds],
-        schema_metadata: Optional[Dict[str, str]] = None,
-    ) -> da.Array:
-        """Build a dask array from chunk info.
-
-        Args:
-            desc: Tensor descriptor
-            chunks: List of chunk IDs
-            chunk_bounds: List of chunk bounds
-            schema_metadata: Optional schema metadata for SHM transfer feature detection
-
-        Returns:
-            dask.array with lazy chunk loading
-        """
-        shape = tuple(desc.shape)
-        dtype = np.dtype(desc.dtype)
-
-        # Invert the endpoint list into the block-index -> (chunk_id, bounds) map
-        # + grid shape (shared with tensor_from_pb). The actual fetch is done by
-        # _fetch_chunk_distributed which uses module-level pools;
-        # _build_dask_array_from_chunk_map emits a single Blockwise (map_blocks)
-        # layer for a regular grid, falling back to da.block-of-from_delayed for
-        # ragged/sparse grids.
-        chunk_map, grid_shape = _chunk_map_from_endpoints(chunks, chunk_bounds, shape)
-
-        return _build_dask_array_from_chunk_map(
-            chunk_map,
-            grid_shape,
-            shape,
-            dtype,
-            self._state.location,
-            self._state.token,
-            self._state.cache_bytes,
-            schema_metadata,
-            self._state.tls_trust,
+            flight_info=info.serialize(),
         )

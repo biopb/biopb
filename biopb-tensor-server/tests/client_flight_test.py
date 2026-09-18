@@ -162,19 +162,14 @@ class TestTensorFlightClientRoundTrip:
         assert server_client.cache_info()["size_bytes"] == initial_bytes
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_wait_for_upload_ready_rejects_a_catalog_source(self, server_client):
-        """Waiting on a source nobody uploaded fails fast (biopb/biopb#109).
+    def test_a_catalog_source_has_no_upload_status(self, server_client):
+        """A source nobody uploaded reports UNKNOWN, not PENDING (biopb/biopb#109).
 
         "test-tensor" is a registered on-disk source, so the server has no
-        upload record for it and reports UNKNOWN indefinitely. The client must
-        say so rather than poll until its timeout.
+        upload record for it. UNKNOWN is what a caller's poll loop stops on
+        at once, rather than waiting out a timeout on a state no poll moves.
         """
-        started = time.monotonic()
-        with pytest.raises(ValueError, match="tracks no upload"):
-            server_client.wait_for_upload_ready(
-                "test-tensor", timeout_seconds=30.0, poll_interval_seconds=0.5
-            )
-        assert time.monotonic() - started < 5.0
+        assert server_client.get_upload_status("test-tensor")["state"] == "UNKNOWN"
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_stride_view(self, server_client):
@@ -405,23 +400,26 @@ class TestTensorFlightClientRoundTrip:
         # test would have one entry.
         transfer_target(64 * 64)
 
+        import pyarrow.flight as flight
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
         pb = server_client.get_tensor_pb("test-tensor")
 
         # Verify it's a SerializedTensor
         assert isinstance(pb, SerializedTensor)
 
-        # Verify descriptor is populated
-        assert pb.tensor_descriptor.array_id == "test-tensor"
-        assert list(pb.tensor_descriptor.shape) == [128, 128]
+        # The plan is the FlightInfo the server answered, carried whole.
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        desc = TensorDescriptor.FromString(info.descriptor.command)
+        assert desc.array_id == "test-tensor"
+        assert list(desc.shape) == [128, 128]
         # dtype may be uint8 or |u1 depending on server
-        assert pb.tensor_descriptor.dtype in ("uint8", "|u1")
-        assert list(pb.tensor_descriptor.chunk_shape) == [64, 64]
+        assert desc.dtype in ("uint8", "|u1")
+        assert list(desc.chunk_shape) == [64, 64]
+        assert len(info.endpoints) == 4
 
         # Verify location is populated
         assert pb.location == "grpc://localhost:8890"
-
-        # Verify endpoints are populated
-        assert len(pb.endpoints) == 4
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_from_pb(self, server_client):
@@ -478,10 +476,14 @@ class TestTensorFlightClientRoundTrip:
             slice_hint=(slice(0, 64), slice(0, 64)),  # Top-left quadrant
         )
 
-        # Verify original_slice_hint is populated
-        assert pb.HasField("original_slice_hint")
-        assert list(pb.original_slice_hint.start) == [0, 0]
-        assert list(pb.original_slice_hint.stop) == [64, 64]
+        import pyarrow.flight as flight
+        from biopb.tensor.descriptor_pb2 import SliceHint
+
+        # The requested slice rides the plan's app_metadata.
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        requested = SliceHint.FromString(info.app_metadata)
+        assert list(requested.start) == [0, 0]
+        assert list(requested.stop) == [64, 64]
 
         # Reconstruct and verify cropping
         darr = TensorFlightClient.tensor_from_pb(pb)
@@ -497,8 +499,14 @@ class TestTensorFlightClientRoundTrip:
             reduction_method="nearest",
         )
 
-        # Verify scale_hint in descriptor
-        assert list(pb.tensor_descriptor.scale_hint) == [2, 2]
+        import pyarrow.flight as flight
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        # Verify scale_hint in the plan's descriptor
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        assert list(
+            TensorDescriptor.FromString(info.descriptor.command).scale_hint
+        ) == [2, 2]
 
         # Reconstruct and verify downscaled shape
         darr = TensorFlightClient.tensor_from_pb(pb)

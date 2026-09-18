@@ -2,47 +2,36 @@ syntax = "proto3";
 
 package biopb.tensor;
 
-import "biopb/tensor/descriptor.proto";
-import "biopb/tensor/ticket.proto";
-
 option java_multiple_files = true;
 option java_package = "biopb.tensor";
 
-// Serialized tensor for cross-process transfer.
-// Contains connection info + chunk tickets for lazy reconstruction.
+// A tensor handed across processes: the answer a GetFlightInfo gave, and the
+// connection facts to act on it.
+//
+// The structure is Arrow's own. `flight_info` is a serialized
+// `arrow.flight.protocol.FlightInfo`, exactly as the tensor server answers a
+// `tensor_read` GetFlightInfo: its `descriptor.command` is the resolved
+// `TensorDescriptor`; each endpoint is the chunk ticket with its `ChunkBounds`
+// in `app_metadata`; the schema carries the wire-protocol and transfer
+// metadata; and the FlightInfo's own `app_metadata` is the requested
+// `SliceHint` when the read was sliced, so the consumer crops the chunk-aligned
+// realized region back to what was asked for. A FlightInfo with no endpoints
+// is a source declared before its chunks exist (the fast-return handle): the
+// consumer calls GetFlightInfo with the embedded descriptor when it reads.
+//
+// What Arrow does not carry is where and as whom. A FlightInfo with no
+// endpoints names no server, and every endpoint this server mints has an empty
+// location list ("the server you asked"), which a forwarded handle cannot mean.
 message SerializedTensor {
-  // Tensor metadata (shape, dtype, chunk_shape, scale_hint, reduction_method, realized slice_hint)
-  TensorDescriptor tensor_descriptor = 1;
-
-  // Original user-requested slice_hint (before LCM alignment).
-  // Used for cropping after reconstruction.
-  SliceHint original_slice_hint = 2;
+  reserved 1, 2, 5, 6, 100;
+  reserved "tensor_descriptor", "original_slice_hint", "endpoints", "schema_metadata", "debug_pickled_array";
 
   // Flight server location URI (e.g., "grpc://localhost:8815")
   string location = 3;
 
-  // Auth token (empty if no auth)
+  // Per-source capability token or the server token; empty if none.
   string auth_token = 4;
 
-  // Serialized flight endpoints. This is optional field. If not present, client
-  // Should call GetFlightInfo on the server to rebuild endpoint list.
-  repeated SerializedEndpoint endpoints = 5;
-
-  // Schema metadata from GetFlightInfo for SHM transfer feature detection.
-  // Populated by get_tensor_pb() when schema has metadata.
-  map<string, string> schema_metadata = 6;
-
-  // A python-only debugging field carrying pickeled stream of da.array, allowing
-  // integration tests to bypass the Flight server and directly reconstruct the
-  // tensor on the client side.
-  bytes debug_pickled_array = 100;
-}
-
-// Serialized FlightEndpoint for lazy chunk fetching.
-message SerializedEndpoint {
-  // TensorTicket for chunk retrieval
-  TensorTicket ticket = 1;
-
-  // ChunkBounds describing chunk position
-  ChunkBounds chunk_bounds = 2;
+  // Serialized arrow.flight.protocol.FlightInfo; see above.
+  bytes flight_info = 7;
 }

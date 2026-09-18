@@ -303,7 +303,7 @@ that this is narrower than "no side effects", because the tidier model invites
 the stronger reading.
 
 The scratch kernel talks to the same tensor server and the same filesystem as
-the session. `client.upload_array` / `upload_zarr` / `upload_chunk` and
+the session. `client.upload_array` / `upload_chunk` and
 `client.add_source` write through, and so does any cell that writes a file.
 Verify a workflow three times and you have three uploaded arrays and three
 catalog entries. Nothing about a disposable kernel changes that.

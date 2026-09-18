@@ -281,7 +281,7 @@ class SourceAdapter(ABC):
     # rest of their state to it -- today only the remote proxy, whose upstream
     # mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the grid.
     # Permuting behind such an owner is the same desynchronization the write path
-    # already refuses at ``create_source``, so those sources are validated and
+    # already refuses at ``create_tensor``, so those sources are validated and
     # refused at their read boundary instead. See ``core.normalize`` and
     # ``core.axes.noncanonical_order``.
     _normalizable_axes: bool = True

@@ -52,7 +52,7 @@ do not, and both **validate** instead, reporting through the shared
 **Writes** (#596 Decision 3). A writable source carries the uploader's own
 declared order, with ``physical_scale`` and ``chunk_shape`` aligned to it;
 silently permuting reads would desynchronize them from what ``put_chunk`` wrote.
-``serving.upload_manager`` refuses the order at ``create_source``, so a
+``serving.upload_manager`` refuses the order at ``create_tensor``, so a
 non-canonical writable source never exists and this wrapper's ``put_chunk``
 branch is unreachable in practice.
 

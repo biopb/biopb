@@ -2,6 +2,7 @@ package biopb.tensor;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -31,6 +32,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
@@ -933,44 +935,39 @@ public class TensorFlightClient implements AutoCloseable {
         LOGGER.fine("getTensorAsPb: sourceId=" + sourceId + ", tensorId=" + tensorId);
         RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, scaleHint, reductionMethod);
 
-        // Serialize endpoints
-        List<SerializedEndpoint> serializedEndpoints = new ArrayList<>();
-        for (FlightEndpoint endpoint : context.endpoints) {
-            TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
-            ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-            SerializedEndpoint serializedEp = SerializedEndpoint.newBuilder()
-                    .setTicket(ticket)
-                    .setChunkBounds(bounds)
-                    .build();
-            serializedEndpoints.add(serializedEp);
-        }
-
-        // Build SerializedTensor
+        // The plan is Arrow's own FlightInfo, carried whole; only where and as
+        // whom to read it is ours to add.
         SerializedTensor.Builder builder = SerializedTensor.newBuilder()
-                .setTensorDescriptor(context.descriptor)
                 .setLocation(location.getUri().toString())
-                .addAllEndpoints(serializedEndpoints);
-
+                .setFlightInfo(ByteString.copyFrom(context.info.serialize()));
         if (token != null && !token.isEmpty()) {
             builder.setAuthToken(token);
         }
-
-        if (sliceHint != null) {
-            builder.setOriginalSliceHint(sliceHint);
-        }
-
         return builder.build();
     }
 
+    /** The plan a SerializedTensor carries: its serialized Arrow FlightInfo. */
+    public static FlightInfo flightInfoOf(SerializedTensor pb) {
+        try {
+            return FlightInfo.deserialize(pb.getFlightInfo().asReadOnlyByteBuffer());
+        } catch (IOException | URISyntaxException e) {
+            throw new IllegalArgumentException("SerializedTensor.flight_info is not a FlightInfo", e);
+        }
+    }
+
+    /** The resolved descriptor a SerializedTensor's plan names. */
+    public static TensorDescriptor descriptorOf(SerializedTensor pb) {
+        return parseDescriptorUnchecked(flightInfoOf(pb).getDescriptor().getCommand());
+    }
+
     /**
-     * Reconstruct a lazy RandomAccessibleInterval from SerializedTensor protobuf.
+     * The lazy imglib2 array a SerializedTensor describes.
      *
-     * Creates an imglib2 array that fetches chunks from the Flight server
-     * independently. Each worker process maintains its own connection pool
-     * and cache keyed by (location, authToken).
-     *
-     * If endpoints field is empty, calls GetFlightInfo on the server
-     * to rebuild the endpoint list.
+     * The one consumer-side helper. The handle is a FlightInfo plus where and
+     * as whom to read it; this decodes the plan's descriptor and the crop it
+     * was asked for, and returns the same lazily-reconstructing
+     * {@link SerializableTensorImg} a live getTensor returns, which plans its
+     * own GetFlightInfo on first access over a pooled connection.
      *
      * @param pb          SerializedTensor protobuf object
      * @param cacheBytes  Maximum cache size in bytes
@@ -981,236 +978,32 @@ public class TensorFlightClient implements AutoCloseable {
             SerializedTensor pb,
             long cacheBytes) {
 
-        TensorDescriptor descriptor = pb.getTensorDescriptor();
-        T type = (T) createType(descriptor.getDtype());
-        long[] dims = toLongArray(descriptor.getShapeList());
-        int[] cellDimensions = toIntArray(descriptor.getChunkShapeList());
+        FlightInfo info = flightInfoOf(pb);
+        TensorDescriptor descriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
 
-        // Build endpoint index - if endpoints empty, fetch via GetFlightInfo
-        final SerializedTensor pbEffective;
-        if (pb.getEndpointsCount() == 0) {
-            LOGGER.fine("tensorFromPb: endpoints empty, fetching via GetFlightInfo");
-            List<SerializedEndpoint> fetchedEndpoints = fetchEndpointsViaGetFlightInfo(pb);
-            SerializedTensor.Builder pbBuilder = SerializedTensor.newBuilder()
-                    .setTensorDescriptor(descriptor)
-                    .setLocation(pb.getLocation())
-                    .setAuthToken(pb.getAuthToken())
-                    .addAllEndpoints(fetchedEndpoints);
-            if (pb.hasOriginalSliceHint()) {
-                pbBuilder.setOriginalSliceHint(pb.getOriginalSliceHint());
-            }
-            pbEffective = pbBuilder.build();
-        } else {
-            pbEffective = pb;
-        }
-
-        ChunkGridIndex<SerializedEndpointData> endpointIndex = ChunkGridIndex.build(
-                pbEffective.getEndpointsList(), dims, cellDimensions,
-                SerializedEndpoint::getChunkBounds,
-                ep -> new SerializedEndpointData(ep.getTicket(), ep.getChunkBounds()));
-
-        if (endpointIndex == null) {
-            // Materialize array for non-aligned endpoint layout
-            return materializeSerializedArray(pbEffective, cacheBytes);
-        }
-
-        long estimatedChunkBytes = estimateChunkBytes(descriptor);
-        long maxCells = Math.max(1L, cacheBytes / Math.max(estimatedChunkBytes, 1L));
-        ReadOnlyCachedCellImgOptions options = ReadOnlyCachedCellImgOptions.options()
-                .cellDimensions(cellDimensions)
-                .cacheType(CacheType.BOUNDED)
-                .maxCacheSize(maxCells);
-
-        ReadOnlyCachedCellImgFactory factory = new ReadOnlyCachedCellImgFactory(options);
-        return (RandomAccessibleInterval<T>) factory.create(dims, type,
-                cell -> loadCellFromSerialized(cell, endpointIndex, pbEffective));
-    }
-
-    /**
-     * Fetch endpoints from server via GetFlightInfo when not provided in SerializedTensor.
-     */
-    private static List<SerializedEndpoint> fetchEndpointsViaGetFlightInfo(SerializedTensor pb) {
-        TensorDescriptor descriptor = pb.getTensorDescriptor();
-
-        Location location = LocationUris.parse(pb.getLocation());
-
-        // Build TensorReadOption from descriptor's fields
-        // The read path: `endpoints` is what it came for, and nothing is
-        // implied by the mask any more.
-        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setArrayId(descriptor.getArrayId())
-                .setFields(readMask("endpoints"));
-
-        if (descriptor.hasSliceHint()) {
-            readBuilder.setSliceHint(descriptor.getSliceHint());
-        }
-        for (long scale : descriptor.getScaleHintList()) {
-            readBuilder.addScaleHint(scale);
-        }
-        if (!descriptor.getReductionMethod().isEmpty()) {
-            readBuilder.setReductionMethod(descriptor.getReductionMethod());
-        }
-
-        FlightRequest cmd = FlightRequest.newBuilder()
-                .setTensorRead(readBuilder.build())
-                .build();
-
-        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-        CredentialCallOption authOption = (pb.getAuthToken() != null && !pb.getAuthToken().isEmpty())
-                ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + pb.getAuthToken()))
-                : null;
-
-        try (FlightClient client = FlightClient.builder(allocator, location).build()) {
-            FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
-
-            List<SerializedEndpoint> endpoints = new ArrayList<>();
-            for (FlightEndpoint endpoint : info.getEndpoints()) {
-                TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
-                ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-                SerializedEndpoint serializedEp = SerializedEndpoint.newBuilder()
-                        .setTicket(ticket)
-                        .setChunkBounds(bounds)
-                        .build();
-                endpoints.add(serializedEp);
-            }
-
-            LOGGER.fine("fetchEndpointsViaGetFlightInfo: got " + endpoints.size() + " endpoints");
-            return endpoints;
-
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to fetch endpoints via GetFlightInfo", e);
-        } finally {
+        // The requested slice rides the plan's app_metadata (the descriptor's
+        // slice_hint is the chunk-aligned realized one).
+        SliceHint requested = null;
+        byte[] meta = info.getAppMetadata();
+        if (meta != null && meta.length > 0) {
             try {
-                allocator.close();
-            } catch (Exception e) {
-                // Ignore allocator close errors
+                requested = SliceHint.parseFrom(meta);
+            } catch (InvalidProtocolBufferException e) {
+                throw new IllegalArgumentException("FlightInfo.app_metadata is not a SliceHint", e);
             }
         }
-    }
 
-    /**
-     * Load a cell from the Flight server using SerializedEndpoint data.
-     */
-    private static <T extends NativeType<T> & RealType<T>> void loadCellFromSerialized(
-            SingleCellArrayImg<T, ?> cell,
-            ChunkGridIndex<SerializedEndpointData> endpointIndex,
-            SerializedTensor pb) {
-
-        long cellIndex = endpointIndex.indexFor(cell);
-        SerializedEndpointData epData = endpointIndex.get(cellIndex);
-        if (epData == null) {
-            throw new IllegalStateException("No endpoint found for cell index " + cellIndex);
-        }
-
-        TensorTicket ticket = epData.ticket;
-        ChunkBounds bounds = epData.chunkBounds;
-        double[] values = fetchChunkValuesStatic(
-                pb.getLocation(),
-                pb.getAuthToken(),
-                ticket.getChunkId().toByteArray());
-        writeChunk(cell.randomAccess(), bounds, values);
-    }
-
-    /**
-     * Materialize array for non-aligned endpoint layout.
-     */
-    @SuppressWarnings("unchecked")
-    private static <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> materializeSerializedArray(
-            SerializedTensor pb,
-            long cacheBytes) {
-
-        TensorDescriptor descriptor = pb.getTensorDescriptor();
-        T type = (T) createType(descriptor.getDtype());
-        long[] dims = toLongArray(descriptor.getShapeList());
-        ArrayImg<T, ?> image = (ArrayImg<T, ?>) new ArrayImgFactory<>(type).create(dims);
-        RandomAccess<T> access = image.randomAccess();
-
-        for (SerializedEndpoint ep : pb.getEndpointsList()) {
-            TensorTicket ticket = ep.getTicket();
-            ChunkBounds bounds = ep.getChunkBounds();
-            double[] values = fetchChunkValuesStatic(
-                    pb.getLocation(),
-                    pb.getAuthToken(),
-                    ticket.getChunkId().toByteArray());
-            writeChunk(access, bounds, values);
-        }
-
-        if (pb.hasOriginalSliceHint() && descriptor.hasSliceHint()) {
-            return RegionCrop.cropToRequest(image, pb.getOriginalSliceHint(), descriptor.getSliceHint(),
-                    descriptor.getScaleHintList());
-        }
-
-        return image;
-    }
-
-    /**
-     * Helper class to store endpoint message objects.
-     */
-    private static class SerializedEndpointData {
-        final TensorTicket ticket;
-        final ChunkBounds chunkBounds;
-
-        SerializedEndpointData(TensorTicket ticket, ChunkBounds chunkBounds) {
-            this.ticket = ticket;
-            this.chunkBounds = chunkBounds;
-        }
-    }
-
-    /**
-     * Fetch chunk values using pooled FlightClient connection.
-     */
-    private static double[] fetchChunkValuesStatic(String locationStr, String authToken, byte[] chunkId) {
-        LOGGER.fine("fetchChunkStatic: chunkId=" + bytesToHex(chunkId, 16));
-        TensorTicket tensorTicket = TensorTicket.newBuilder()
-                .setChunkId(ByteString.copyFrom(chunkId))
-                .build();
-
-        Location location = LocationUris.parse(locationStr);
-
-        // Get pooled client
-        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-        CredentialCallOption authOption = (authToken != null && !authToken.isEmpty())
-                ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + authToken))
-                : null;
-
-        try (FlightClient client = FlightClient.builder(allocator, location).build()) {
-            try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
-                double[] values = new double[0];
-                while (stream.next()) {
-                    // Unified binary chunk schema (biopb/biopb#293): "data" is one
-                    // opaque byte[] per row, "dtype" names how to reinterpret it.
-                    FieldVector dataVector = stream.getRoot().getVector("data");
-                    FieldVector dtypeVector = stream.getRoot().getVector("dtype");
-                    if (dataVector == null || dtypeVector == null) {
-                        throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
-                    }
-
-                    int rowCount = stream.getRoot().getRowCount();
-                    for (int row = 0; row < rowCount; row++) {
-                        Object rowObj = dataVector.getObject(row);
-                        if (!(rowObj instanceof byte[])) {
-                            throw new IllegalStateException("Data column value is not binary: "
-                                    + (rowObj == null ? "null" : rowObj.getClass()));
-                        }
-                        Object dtypeObj = dtypeVector.getObject(row);
-                        double[] decoded = ChunkDecoder.decodeChunkBytes((byte[]) rowObj,
-                                dtypeObj == null ? "" : dtypeObj.toString());
-                        int offset = values.length;
-                        values = Arrays.copyOf(values, offset + decoded.length);
-                        System.arraycopy(decoded, 0, values, offset, decoded.length);
-                    }
-                }
-                return values;
-            }
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to fetch chunk payload", e);
-        } finally {
-            try {
-                allocator.close();
-            } catch (Exception e) {
-                // Ignore allocator close errors
-            }
-        }
+        return new SerializableTensorImg<>(
+                LocationUris.parse(pb.getLocation()),
+                pb.getAuthToken().isEmpty() ? null : pb.getAuthToken(),
+                cacheBytes,
+                descriptor.getArrayId(),
+                descriptor.getArrayId(),  // tensorId == arrayId; server reduces to field
+                requested,
+                descriptor.getScaleHintList().isEmpty() ? null : toLongArray(descriptor.getScaleHintList()),
+                descriptor.getReductionMethod().isEmpty() ? null : descriptor.getReductionMethod(),
+                descriptor,
+                null);  // reconstructed lazily
     }
 
     @Override
@@ -1263,8 +1056,8 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Get upload status for a writable source.
      *
-     * @param sourceId Source identifier returned by create_source()
-     * @return Map containing source_id, state, expected_chunks, and uploaded_chunks
+     * @param sourceId Source identifier returned by create_tensor()
+     * @return Map containing source_id, state, expected_chunks, uploaded_chunks and reason
      * @throws IOException If the action fails
      */
     public Map<String, Object> getUploadStatus(String sourceId) throws IOException {
@@ -1313,88 +1106,6 @@ public class TensorFlightClient implements AutoCloseable {
         unknown.put("uploaded_chunks", 0.0d);
         unknown.put("reason", "");
         return unknown;
-    }
-
-    /**
-     * Get upload status for a registration-first SerializedTensor handle.
-     *
-     * This helper is intended for cache-backed handles returned before upload
-     * completion, where tensor_descriptor.array_id is the source identifier.
-     *
-     * @param pb SerializedTensor handle from a registration-first flow
-     * @return Map containing source_id, state, expected_chunks, and uploaded_chunks
-     * @throws IOException If the action fails
-     */
-    public Map<String, Object> getUploadStatus(SerializedTensor pb) throws IOException {
-        return getUploadStatus(getUploadSourceId(pb));
-    }
-
-    /**
-     * Poll upload status until the source reports READY.
-     *
-     * @param sourceId Source identifier returned by create_source()
-     * @param timeoutMillis Maximum time to wait before timing out
-     * @param pollIntervalMillis Delay between status checks
-     * @return Final upload status map when READY
-     * @throws IOException If the upload fails, times out, or the action fails
-     */
-    public Map<String, Object> waitForUploadReady(
-            String sourceId,
-            long timeoutMillis,
-            long pollIntervalMillis) throws IOException {
-
-        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
-        while (true) {
-            Map<String, Object> status = getUploadStatus(sourceId);
-            Object stateValue = status.get("state");
-            String state = stateValue != null ? stateValue.toString() : "UNKNOWN";
-            if ("READY".equals(state)) {
-                return status;
-            }
-            if ("DISCARDED".equals(state)) {
-                // The owner gave up on it. Terminal, so answer now rather than
-                // poll to the timeout -- and the reason is the whole point of
-                // reporting it (biopb/biopb#1).
-                Object why = status.get("reason");
-                String reason = why == null || String.valueOf(why).isEmpty()
-                        ? "no reason given"
-                        : String.valueOf(why);
-                throw new IOException(
-                        "Upload discarded for source '" + sourceId + "': " + reason);
-            }
-            if ("UNKNOWN".equals(state)) {
-                // No upload record at all: not an upload target, or it was
-                // dropped by a restart or a source removal. Polling cannot
-                // change that, so fail now (biopb/biopb#109).
-                throw new IOException(
-                        "The server tracks no upload for source '" + sourceId + "'");
-            }
-            if (System.nanoTime() >= deadline) {
-                throw new IOException("Timed out waiting for upload readiness for source '" + sourceId + "'");
-            }
-            try {
-                Thread.sleep(Math.max(0L, pollIntervalMillis));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while waiting for upload readiness", e);
-            }
-        }
-    }
-
-    /**
-     * Poll upload status until a registration-first SerializedTensor is READY.
-     *
-     * @param pb SerializedTensor handle from a registration-first flow
-     * @param timeoutMillis Maximum time to wait before timing out
-     * @param pollIntervalMillis Delay between status checks
-     * @return Final upload status map when READY
-     * @throws IOException If the upload fails, times out, or the action fails
-     */
-    public Map<String, Object> waitForUploadReady(
-            SerializedTensor pb,
-            long timeoutMillis,
-            long pollIntervalMillis) throws IOException {
-        return waitForUploadReady(getUploadSourceId(pb), timeoutMillis, pollIntervalMillis);
     }
 
     // Note: Upload API (uploadCellImg) not yet implemented for Java client.
@@ -1538,7 +1249,7 @@ public class TensorFlightClient implements AutoCloseable {
         // Cache the response descriptor
         descriptors.put(responseDescriptor.getArrayId(), responseDescriptor);
 
-        return new RequestContext(responseDescriptor, info.getEndpoints());
+        return new RequestContext(responseDescriptor, info);
     }
 
     private static String normalizeReductionMethod(String reductionMethod) {
@@ -1576,7 +1287,7 @@ public class TensorFlightClient implements AutoCloseable {
         int[] cellDimensions = toIntArray(context.descriptor.getChunkShapeList());
 
         ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
-                context.endpoints, dims, cellDimensions,
+                context.info.getEndpoints(), dims, cellDimensions,
                 ep -> parseChunkBounds(ep.getAppMetadata()),
                 ep -> ep);
         if (endpointIndex == null) {
@@ -1604,7 +1315,7 @@ public class TensorFlightClient implements AutoCloseable {
         ArrayImg<T, ?> image = (ArrayImg<T, ?>) new ArrayImgFactory<>(type).create(dims);
         RandomAccess<T> access = image.randomAccess();
 
-        for (FlightEndpoint endpoint : context.endpoints) {
+        for (FlightEndpoint endpoint : context.info.getEndpoints()) {
             TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
             ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
             double[] values = fetchChunkValues(ticket.getChunkId().toByteArray());
@@ -1766,16 +1477,6 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    private static String getUploadSourceId(SerializedTensor pb) {
-        String arrayId = pb.getTensorDescriptor().getArrayId();
-        if (arrayId == null || arrayId.isEmpty()) {
-            throw new IllegalArgumentException("SerializedTensor tensor_descriptor.array_id is required");
-        }
-        // Uploaded sources are single-tensor (array_id == source_id), but derive
-        // the prefix anyway so this is correct under the identity policy.
-        return sourceIdFromArrayId(arrayId);
-    }
-
     /**
      * Derive the source_id from a tensor's array_id.
      *
@@ -1913,11 +1614,11 @@ public class TensorFlightClient implements AutoCloseable {
 
     private static class RequestContext {
         final TensorDescriptor descriptor;
-        final List<FlightEndpoint> endpoints;
+        final FlightInfo info;
 
-        RequestContext(TensorDescriptor descriptor, List<FlightEndpoint> endpoints) {
+        RequestContext(TensorDescriptor descriptor, FlightInfo info) {
             this.descriptor = parseDescriptorUnchecked(descriptor.toByteArray());
-            this.endpoints = endpoints;
+            this.info = info;
         }
     }
 }

@@ -9,6 +9,7 @@ import com.google.protobuf.ByteString;
 import biopb.tensor.LocationUris;
 import biopb.tensor.SerializableTensorImg;
 import biopb.tensor.SerializedTensor;
+import biopb.tensor.TensorFlightClient;
 import net.imglib2.RandomAccessibleInterval;
 import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.type.NativeType;
@@ -750,22 +751,7 @@ public final class Utils {
      * @return a SerializableTensorImg wrapping the lazy tensor
      */
     private static RandomAccessibleInterval<?> reconstructFromSerializedTensor(SerializedTensor serializedTensor) {
-        // Use SerializableTensorImg's static reconstruction method
-        // We create a minimal wrapper that reconstructs on first access
-        return new SerializableTensorImg<>(
-                LocationUris.parse(serializedTensor.getLocation()),
-                serializedTensor.getAuthToken().isEmpty() ? null : serializedTensor.getAuthToken(),
-                100_000_000L,  // Default cache size 100MB
-                serializedTensor.getTensorDescriptor().getArrayId(),
-                serializedTensor.getTensorDescriptor().getArrayId(),  // tensorId == arrayId; server reduces to field
-                serializedTensor.hasOriginalSliceHint() ? serializedTensor.getOriginalSliceHint() : null,
-                serializedTensor.getTensorDescriptor().getScaleHintList().isEmpty() ? null
-                        : toLongArray(serializedTensor.getTensorDescriptor().getScaleHintList()),
-                serializedTensor.getTensorDescriptor().getReductionMethod().isEmpty() ? null
-                        : serializedTensor.getTensorDescriptor().getReductionMethod(),
-                serializedTensor.getTensorDescriptor(),
-                null  // delegate reconstructed lazily
-        );
+        return TensorFlightClient.tensorFromPb(serializedTensor, 100_000_000L);
     }
 
     private static long[] toLongArray(java.util.List<Long> values) {
@@ -1016,7 +1002,7 @@ public final class Utils {
             }
             return null;
         } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
-            biopb.tensor.TensorDescriptor descriptor = imageData.getLazyData().getTensorDescriptor();
+            biopb.tensor.TensorDescriptor descriptor = TensorFlightClient.descriptorOf(imageData.getLazyData());
             if (descriptor.getDimLabelsCount() > 0) {
                 return new java.util.ArrayList<>(descriptor.getDimLabelsList());
             }
@@ -1043,7 +1029,7 @@ public final class Utils {
             }
             return shape;
         } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
-            biopb.tensor.TensorDescriptor descriptor = imageData.getLazyData().getTensorDescriptor();
+            biopb.tensor.TensorDescriptor descriptor = TensorFlightClient.descriptorOf(imageData.getLazyData());
             long[] shape = new long[descriptor.getShapeCount()];
             for (int i = 0; i < descriptor.getShapeCount(); i++) {
                 shape[i] = descriptor.getShape(i);

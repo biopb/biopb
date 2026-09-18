@@ -133,11 +133,13 @@ def _build_op(
         if is_id:
             # Symmetric id<->id: consolidate the result onto the agent's
             # tensor server and return its array_id for further lazy chaining
-            # (upload_array creates a single-tensor source, so the id it returns
+            # (a cache: upload is a single-tensor source, so the source's id
             # is that tensor's array_id).
             if not isinstance(result, da.Array):
                 result = da.from_array(result, chunks=result.shape)
-            return client.upload_array(result, "cache:")
+            desc = client.create_tensor("cache:", result)
+            client.upload_array(desc, result)
+            return desc.array_id
 
         # ndarray in -> ndarray out.
         if isinstance(result, da.Array):

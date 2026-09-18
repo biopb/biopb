@@ -114,7 +114,7 @@ token when one is configured; the private tiers require a source's capability
 token when the adapter carries one, else the server-wide token. A private
 source may still be catalogued -- the token gates reading, not knowing.
 
-Custom `do_action` verbs: `health` (reports `protocol`), `create_source`,
+Custom `do_action` verbs: `health` (reports `protocol`), `create_tensor`,
 `finish`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
 `remove_source` (below), and `roi_prune`.
 
@@ -213,7 +213,7 @@ through the shared `core/axes.py::noncanonical_order`:
 
 | | |
 |---|---|
-| **Writes** | `create_source` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
+| **Writes** | `create_tensor` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
 | **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy opts out of wrapping (`_normalizable_axes = False`) and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
 
 ### Adapter file-handle policy (biopb/biopb#71)

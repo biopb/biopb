@@ -209,15 +209,17 @@ def _unresolved_row_table():
 
 
 class TestUnresolvedDirectiveError:
-    def test_get_tensor_context_points_at_resolve(self, monkeypatch):
+    def test_get_tensor_points_at_resolve(self, monkeypatch):
         # A bare get_tensor() on an unresolved (empty-tensors) source must fail
         # with a directive message naming client.resolve(), not a bare "no tensors".
+        # The refusal comes from descriptor resolution, before any Flight call:
+        # the bare client has no connection, so reaching one would error differently.
         client = _bare_client()
         monkeypatch.setattr(
             client._catalog, "_query_table", lambda sql: _unresolved_row_table()
         )
         with pytest.raises(ValueError) as exc:
-            client._get_tensor_context("cloud_x")
+            client.get_tensor("cloud_x")
         msg = str(exc.value)
         assert "unresolved" in msg
         assert "client.resolve('cloud_x')" in msg

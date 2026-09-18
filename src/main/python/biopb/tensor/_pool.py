@@ -1148,9 +1148,9 @@ def _chunk_map_from_endpoints(
     ``block-index -> (chunk_id, bounds)`` map and grid shape the dask builder wants.
 
     The block index along each axis is the rank of a chunk's per-axis start among
-    the distinct starts on that axis, so the endpoint order does not matter. Shared
-    by both read entry points (``ChunkFetcher._build_dask_array`` and
-    ``tensor_from_pb``) so the endpoint->grid inversion lives in one place.
+    the distinct starts on that axis, so the endpoint order does not matter. Used
+    by the one FlightInfo->dask reconstruction (``_dask_from_flight_info``) so
+    the endpoint->grid inversion lives in one place.
     """
     ndim = len(shape)
     axis_index_maps = [
@@ -1183,7 +1183,7 @@ def _build_dask_array_from_chunk_map(
 ) -> da.Array:
     """Build the lazy chunk-fetching dask array from a chunk-index map.
 
-    Shared by ``tensor_from_pb`` and ``_build_dask_array``. For a regular chunk
+    Called from ``_dask_from_flight_info``. For a regular chunk
     grid (the common case) this emits a *single* ``Blockwise`` layer, so slicing
     one chunk culls to O(1) tasks and graph optimization is O(1) rather than
     O(n_chunks). Each block's ``chunk_id`` and bounds are delivered per block via

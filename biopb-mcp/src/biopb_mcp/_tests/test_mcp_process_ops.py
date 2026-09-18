@@ -161,7 +161,7 @@ class TestBuildOpArrayId:
     def test_source_id_in_source_id_out(self):
         client = MagicMock()
         client.get_tensor_pb.return_value = SerializedTensor()
-        client.upload_array.return_value = "cache_99"
+        client.create_tensor.return_value.array_id = "cache_99"
 
         result_arr = np.ones((2, 2), dtype="uint8")
         stub = MagicMock()
@@ -176,10 +176,14 @@ class TestBuildOpArrayId:
         # Sent as lazy_data, not eager.
         sent = stub.Run.call_args[0][0]
         assert sent.image_data.WhichOneof("data") == "lazy_data"
-        # Uploaded result is a dask array to an ephemeral cache source.
-        up_args = client.upload_array.call_args[0]
-        assert isinstance(up_args[0], da.Array)
-        assert up_args[1] == "cache:"
+        # Declared from the result as an ephemeral cache source, then filled
+        # with it: the same dask array on both calls.
+        name, template = client.create_tensor.call_args[0]
+        assert name == "cache:"
+        assert isinstance(template, da.Array)
+        desc, filled = client.upload_array.call_args[0]
+        assert desc is client.create_tensor.return_value
+        assert filled is template
 
     def test_source_id_without_client_raises(self):
         stub = MagicMock()

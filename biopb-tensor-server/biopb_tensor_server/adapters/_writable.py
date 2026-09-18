@@ -219,7 +219,7 @@ class WritableSource:
         raise NotImplementedError
 
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
-        """The descriptor ``create_source`` answers with.
+        """The descriptor ``create_tensor`` answers with.
 
         Echoes the request under the minted ``source_id``. Physical calibration
         is deliberately not echoed here: a kind adds it only if a later read
@@ -349,7 +349,7 @@ class WritableSource:
         """The two ways a write can arrive too late.
 
         There is no third: a source's id has one adapter for the life of the
-        server (``UploadManager.create_source`` refuses a name collision), so
+        server (``UploadManager.create_tensor`` refuses a name collision), so
         a write cannot land in a stranger's source by naming its own.
         """
         progress = self._upload

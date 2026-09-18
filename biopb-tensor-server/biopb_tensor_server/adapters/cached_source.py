@@ -93,7 +93,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """The source_id a ``cache:<name>`` upload lands on.
 
         Deterministic for a name, so the name is single-use for the life of
-        the server (``UploadManager.create_source`` refuses the collision);
+        the server (``UploadManager.create_tensor`` refuses the collision);
         minted for an empty one.
         """
         if name:
@@ -111,7 +111,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         present and declines to overwrite it -- serving stale data
         (biopb/biopb#178). Folding a distinct token into each upload's chunk_ids
         sidesteps that. (Within one server lifetime a name cannot be reused at
-        all: ``UploadManager.create_source`` refuses the collision.)
+        all: ``UploadManager.create_tensor`` refuses the collision.)
 
         Wall-clock ns keeps the token distinct across a restart, where a persisted
         file cache may still hold the prior upload's chunks; ``max(..., last + 1)``
@@ -225,6 +225,27 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         if self._physical_unit_vec:
             response.physical_unit.extend(self._physical_unit_vec)
         return response
+
+    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
+        """The write grid, verbatim -- not re-split at the wire bound.
+
+        The base clamps a declared grid to ``MAX_ARROW_BATCH_BYTES`` so an
+        oversized chunk is fetched in pieces. Here the pieces would not exist:
+        an unscaled read serves only the chunk_ids that were written
+        (:meth:`resolve_chunk_data`), so a plan on any other grid asks for
+        bounds that were never stored and fails on its first chunk. An
+        uploader that wrote one 67 MB chunk -- a whole result in one DoPut is
+        the ordinary runtime case -- is served that chunk whole; the cache
+        keeps an oversized entry in memory rather than on disk, and DoGet
+        streams it as it was put. A consumer that replans a handle (every
+        fast-return consumer, since its handle carries no endpoints) meets
+        this path, where the producer's own embedded endpoints used to hide it.
+        """
+        shape = self._shape
+        return tuple(
+            min(max(1, int(chunk)), int(dim))
+            for chunk, dim in zip(self._chunk_shape, shape, strict=True)
+        )
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this cache source.

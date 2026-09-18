@@ -40,8 +40,6 @@ from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
     _build_call_options,
-    _build_dask_array_from_chunk_map,
-    _chunk_map_from_endpoints,
     _clear_view_cache,
     _default_cache_bytes,
     _resolve_cache_bytes,
@@ -53,15 +51,15 @@ from biopb.tensor._session import (
     ResolveCancelled as ResolveCancelled,
     _check_wire_protocol as _check_wire_protocol,
     _ClientState,
+    _dask_from_flight_info,
     _extract_schema_metadata as _extract_schema_metadata,
-    _fetch_endpoints_via_get_flight_info,
     _parse_version as _parse_version,
-    _request_crop_slices,
+    _refetch_flight_info,
+    _requested_slice,
     _split_array_id as _split_array_id,
-    _TensorContext,
 )
 from biopb.tensor._tls import resolve_tls_trust
-from biopb.tensor._upload import UploadSession
+from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
@@ -69,7 +67,6 @@ from biopb.tensor.descriptor_pb2 import (
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
-    UploadStatus as UploadStatusPb,
     WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
@@ -86,43 +83,6 @@ def _normalize_location(location: str) -> str:
     if location.startswith("grpcs://"):
         return "grpc+tls://" + location[8:]
     return location
-
-
-def _make_debug_serialized_tensor(
-    arr: da.Array, array_id: str = "debug"
-) -> SerializedTensor:
-    """Create a SerializedTensor with debug_pickled_array for testing.
-
-    Eagerly computes the array and pickles it, bypassing Flight server.
-    Preserves original chunk structure for testing chunk-related behavior.
-    Populates inferable tensor_descriptor fields.
-
-    Args:
-        arr: Dask array to serialize
-        array_id: Optional array identifier
-
-    Returns:
-        SerializedTensor with debug_pickled_array populated
-    """
-    import pickle
-
-    # Eager compute
-    np_arr = arr.compute()
-
-    # Rechunk to original chunk structure (preserves chunk boundaries for testing)
-    computed_da = da.from_array(np_arr, chunks=arr.chunksize)
-
-    descriptor = TensorDescriptor(
-        array_id=array_id,
-        shape=list(arr.shape),
-        dtype=np.dtype(arr.dtype).str,
-        chunk_shape=list(arr.chunksize),
-    )
-
-    return SerializedTensor(
-        tensor_descriptor=descriptor,
-        debug_pickled_array=pickle.dumps(computed_da),
-    )
 
 
 class TensorFlightClient:
@@ -782,18 +742,6 @@ class TensorFlightClient:
 
     # ---- Reads (delegated to ChunkFetcher) ----
 
-    def _get_tensor_context(
-        self,
-        array_id: str,
-        slice_hint: Optional[Tuple[slice, ...]] = None,
-        scale_hint: Optional[Sequence[int]] = None,
-        reduction_method: Optional[str] = None,
-    ) -> _TensorContext:
-        """See :meth:`ChunkFetcher._get_tensor_context`."""
-        return self._fetcher._get_tensor_context(
-            array_id, slice_hint, scale_hint, reduction_method
-        )
-
     def get_tensor(
         self,
         array_id: str,
@@ -831,10 +779,10 @@ class TensorFlightClient:
     ) -> SerializedTensor:
         """Get a SerializedTensor protobuf for cross-process transfer.
 
-        Returns a protobuf containing connection info and chunk tickets
-        for lazy reconstruction. The protobuf can be serialized to bytes
-        and broadcast to worker processes, where each worker can call
-        tensor_from_pb() to reconstruct a lazy dask array.
+        The planned read (a serialized Arrow ``FlightInfo``) plus this
+        connection's location and token. It can be serialized to bytes and
+        broadcast to worker processes, where each worker calls
+        ``tensor_from_pb()`` to reconstruct the lazy dask array.
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
@@ -850,33 +798,30 @@ class TensorFlightClient:
             array_id, slice_hint, scale_hint, reduction_method
         )
 
-    def _build_dask_array(
-        self,
-        desc: TensorDescriptor,
-        chunks: List[bytes],
-        chunk_bounds: List[ChunkBounds],
-        schema_metadata: Optional[Dict[str, str]] = None,
-    ) -> da.Array:
-        """See :meth:`ChunkFetcher._build_dask_array`."""
-        return self._fetcher._build_dask_array(
-            desc, chunks, chunk_bounds, schema_metadata
-        )
+    @staticmethod
+    def descriptor_from_pb(pb: SerializedTensor) -> TensorDescriptor:
+        """The resolved descriptor a SerializedTensor's plan names, without
+        building the array: shape, dtype, labels, for a reader that only
+        needs to describe what it was handed."""
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        return TensorDescriptor.FromString(info.descriptor.command)
 
     @staticmethod
     def tensor_from_pb(
         pb: SerializedTensor,
         cache_bytes: Optional[int] = None,
     ) -> da.Array:
-        """Reconstruct a lazy dask array from SerializedTensor protobuf.
+        """The lazy dask array a SerializedTensor describes.
 
-        Creates a dask array that fetches chunks from the Flight server
-        independently. Each worker process maintains its own connection
-        pool and LRU cache keyed by (location, auth_token).
+        The one consumer-side helper: the handle is a FlightInfo plus where and
+        as whom to read it, so this decodes the plan and builds the same
+        chunk-fetching array ``get_tensor`` builds on a live connection. Each
+        worker process maintains its own connection pool and LRU cache keyed
+        by (location, auth_token).
 
-        If endpoints field is empty, calls GetFlightInfo on the server
-        to rebuild the endpoint list.
-
-        If debug_pickled_array is populated, unpickles directly (bypasses server).
+        A handle with no endpoints -- a source declared before its chunks
+        existed -- is planned here with a GetFlightInfo on the embedded
+        descriptor; the crop the producer asked for is kept from the handle.
 
         Args:
             pb: SerializedTensor protobuf object
@@ -888,224 +833,151 @@ class TensorFlightClient:
         Returns:
             dask.array with lazy chunk loading
         """
-        import pickle
-
         if cache_bytes is None:
             cache_bytes = _default_cache_bytes()
-
-        # Debug path: unpickle directly if debug_pickled_array is present
-        if pb.debug_pickled_array:
-            return pickle.loads(pb.debug_pickled_array)
-
-        descriptor = pb.tensor_descriptor
-        shape = tuple(descriptor.shape)
-        dtype = np.dtype(descriptor.dtype)
-
-        # Parse endpoints - if empty, fetch from GetFlightInfo
-        chunks = []
-        chunk_bounds_list = []
-
-        if pb.endpoints:
-            # Use serialized endpoints directly
-            for ep in pb.endpoints:
-                chunks.append(ep.ticket.chunk_id)
-                chunk_bounds_list.append(ep.chunk_bounds)
-        else:
-            # Endpoints not provided - call GetFlightInfo to rebuild
-            logger.debug("tensor_from_pb: endpoints empty, calling GetFlightInfo")
-            chunks, chunk_bounds_list = _fetch_endpoints_via_get_flight_info(pb)
-
-        # Build the block-index -> (chunk_id, bounds) map + grid shape for lazy
-        # chunk fetching (shared with ChunkFetcher._build_dask_array).
-        chunk_map, grid_shape = _chunk_map_from_endpoints(
-            chunks, chunk_bounds_list, shape
-        )
-
-        # Extract schema_metadata from pb for SHM transfer
-        schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
-
-        dask_arr = _build_dask_array_from_chunk_map(
-            chunk_map,
-            grid_shape,
-            shape,
-            dtype,
+        token = pb.auth_token or None
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        requested = _requested_slice(info)
+        if not info.endpoints:
+            logger.debug("tensor_from_pb: no endpoints, calling GetFlightInfo")
+            info = _refetch_flight_info(
+                TensorDescriptor.FromString(info.descriptor.command), pb.location, token
+            )
+        return _dask_from_flight_info(
+            info,
             pb.location,
-            pb.auth_token if pb.auth_token else None,
+            token,
             cache_bytes,
-            schema_metadata,
             resolve_tls_trust(pb.location),
+            requested,
         )
-
-        # Crop to the originally requested region if original_slice_hint present
-        if pb.HasField("original_slice_hint") and descriptor.HasField("slice_hint"):
-            dask_arr = dask_arr[
-                _request_crop_slices(
-                    len(descriptor.shape),
-                    pb.original_slice_hint,
-                    descriptor.slice_hint,
-                    list(descriptor.scale_hint) if descriptor.scale_hint else None,
-                )
-            ]
-
-        return dask_arr
 
     # ====================
     # Upload API (EXPERIMENTAL) -- thin delegators onto the UploadSession
     # collaborator (see biopb.tensor._upload); #278 item C.
     # ====================
 
-    def upload_array(
+    def create_tensor(
         self,
-        arr: da.Array,
         source_name: str,
+        template: Any,
+        *,
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
-    ) -> str:
-        """Upload dask array to server.
+    ) -> TensorDescriptor:
+        """Declare a single-tensor source to fill: the first half of an upload.
 
         Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
+            Experimental. The upload / writable-source API (tensor creation,
+            chunk upload, and upload-status polling) is experimental and may
+            change.
+
+        Declare, then fill. The returned descriptor is the server's echo --
+        ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
+        and is what ``upload_array``, ``upload_chunk`` and ``finish_upload``
+        take. A name is single-use for the life of the server: a second create
+        under a name that exists -- pending, finished or discarded -- is
+        refused. ``finish_upload`` is what marks the upload complete.
 
         Args:
-            arr: Dask array to upload
-            source_name: Source identifier format:
-                - "cache:my-name" → cache-backed (ephemeral)
-                - "cache:" → cache-backed with server-generated name
-                - "ome_zarr:my-name" → zarr-backed (persistent)
-                - "ome_zarr:" → zarr-backed with server-generated name
-            chunk_shape: Override chunk shape. If None, uses arr.chunksize with
-                         automatic rechunking if chunks are non-uniform.
+            source_name: "cache:name" → cache-backed; "ome_zarr:name" →
+                zarr-backed; "cache:" or "ome_zarr:" → server-generated name
+            template: Anything with ``.shape`` and ``.dtype`` -- the array to be
+                uploaded, or one shaped like it. A dask array also supplies the
+                chunk grid (its chunk size per axis).
+            chunk_shape: The upload grid, overriding the template's. Required
+                to get anything but one chunk from a non-dask template.
             dim_labels: Optional dimension labels
             ome_metadata: Optional OME metadata dict
 
         Returns:
-            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
-        """
-        return self._upload.upload_array(
-            arr,
-            source_name,
-            chunk_shape,
-            dim_labels,
-            ome_metadata,
-        )
-
-    def upload_zarr(
-        self,
-        zarr_path: str,
-        source_name: str,
-        chunk_shape: Optional[Sequence[int]] = None,
-        dim_labels: Optional[Sequence[str]] = None,
-        ome_metadata: Optional[dict] = None,
-    ) -> str:
-        """Upload local zarr to server.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        Args:
-            zarr_path: Path to local zarr directory
-            source_name: Source identifier format:
-                - "cache:my-name" → cache-backed (ephemeral)
-                - "cache:" → cache-backed with server-generated name
-                - "ome_zarr:my-name" → zarr-backed (persistent)
-                - "ome_zarr:" → zarr-backed with server-generated name
-            chunk_shape: Override chunk shape. If None, uses zarr's chunk shape.
-            dim_labels: Optional dimension labels (read from zarr if not provided)
-            ome_metadata: Optional OME metadata (read from zarr if not provided)
-
-        Returns:
-            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
-        """
-        return self._upload.upload_zarr(
-            zarr_path,
-            source_name,
-            chunk_shape,
-            dim_labels,
-            ome_metadata,
-        )
-
-    def create_source(
-        self,
-        source_name: str,
-        shape: Sequence[int],
-        dtype: str,
-        chunk_shape: Sequence[int],
-        dim_labels: Optional[Sequence[str]] = None,
-        ome_metadata: Optional[dict] = None,
-    ) -> str:
-        """Open an upload: create the source that ``upload_chunk`` fills.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        A name is single-use for the life of the server: a second create under
-        a name that exists -- pending, finished or discarded -- is refused.
-        ``finish_upload`` is what marks the upload complete.
-
-        Args:
-            source_name: "cache:name" → cache-backed; "ome_zarr:name" → zarr-backed
-                         "cache:" or "ome_zarr:" → server-generated name
-            shape: Array shape
-            dtype: Data type string (numpy format)
-            chunk_shape: Chunk size per dimension
-            dim_labels: Optional dimension labels
-            ome_metadata: Optional OME metadata dict
-
-        Returns:
-            source_id assigned by server
+            The new source's descriptor.
 
         Raises:
             pyarrow.flight.FlightServerError: the name is already taken.
         """
-        return self._upload.create_source(
-            source_name, shape, dtype, chunk_shape, dim_labels, ome_metadata
+        return self._upload.create_tensor(
+            source_name,
+            template,
+            chunk_shape=chunk_shape,
+            dim_labels=dim_labels,
+            ome_metadata=ome_metadata,
         )
+
+    def upload_array(self, desc: TensorDescriptor, arr: Any) -> Dict[str, Any]:
+        """Fill a declared tensor with an array, and seal it.
+
+        Note:
+            Experimental. The upload / writable-source API (tensor creation,
+            chunk upload, and upload-status polling) is experimental and may
+            change.
+
+        *arr* must match the descriptor's shape and dtype; it is rechunked onto
+        the descriptor's chunk grid, every block is sent as one chunk, and the
+        source is finished. A numpy array is accepted and chunked on the grid.
+
+        Args:
+            desc: The descriptor ``create_tensor`` returned
+            arr: The array to upload (dask or numpy)
+
+        Returns:
+            The sealed upload status, as ``get_upload_status`` reports it.
+
+        Raises:
+            ValueError: *arr* does not match the declared shape or dtype.
+            UploadRefused: the upload is over -- sealed or discarded.
+        """
+        return self._upload.upload_array(desc, arr)
 
     def upload_chunk(
         self,
-        source_id: str,
+        desc: TensorDescriptor,
         bounds: ChunkBounds,
         data: np.ndarray,
     ) -> None:
-        """Upload single chunk (internal).
+        """Upload one chunk of a declared tensor.
 
         Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
+            Experimental. The upload / writable-source API (tensor creation,
+            chunk upload, and upload-status polling) is experimental and may
+            change.
+
+        The manual half of ``upload_array``: a caller writing chunks itself
+        calls this per chunk and ``finish_upload`` when done.
 
         Args:
-            source_id: The id ``create_source`` returned
+            desc: The descriptor ``create_tensor`` returned
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data
 
         Raises:
-            pyarrow.flight.FlightCancelledError: this upload is over -- already
-                sealed by ``finish_upload``, or discarded. The message says which.
+            UploadRefused: the upload is over -- sealed or discarded.
         """
-        self._upload.upload_chunk(source_id, bounds, data)
+        self._upload.upload_chunk(desc, bounds, data)
 
-    def finish_upload(self, source_id: str) -> UploadStatusPb:
+    def finish_upload(self, desc: TensorDescriptor) -> Dict[str, Any]:
         """Seal an upload: the source is complete and takes no further chunks.
 
         Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
+            Experimental. The upload / writable-source API (tensor creation,
+            chunk upload, and upload-status polling) is experimental and may
+            change.
 
         The only route to READY, which is the state a consumer waiting on this
         result polls for. ``upload_array``, which writes every chunk itself,
         calls it for you.
 
         Args:
-            source_id: The id ``create_source`` returned
+            desc: The descriptor ``create_tensor`` returned
 
         Returns:
-            The sealed ``UploadStatus``.
+            The sealed upload status, as ``get_upload_status`` reports it.
+
+        Raises:
+            UploadRefused: the upload was discarded.
         """
-        return self._upload.finish_upload(source_id)
+        return self._upload.finish_upload(desc)
 
     def close(self):
         """Close the Flight client."""
@@ -1171,84 +1043,12 @@ class TensorFlightClient:
             upload, and upload-status polling) is experimental and may change.
 
         Args:
-            source_id: Source identifier returned by create_source()
+            source_id: The ``array_id`` of the descriptor ``create_tensor`` returned
 
         Returns:
             Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
         """
         return self._catalog.get_upload_status(source_id)
-
-    def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
-        """Get upload status for a registration-first SerializedTensor handle.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        This helper is intended for cache-backed handles returned before upload
-        completion, where tensor_descriptor.array_id is the source identifier.
-
-        Args:
-            pb: SerializedTensor handle returned by a registration-first flow.
-
-        Returns:
-            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
-        """
-        return self._catalog.get_upload_status_pb(pb)
-
-    def wait_for_upload_ready(
-        self,
-        source_id: str,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Poll upload status until the source reports READY.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        Applies only to sources created by ``create_source()`` /
-        ``upload_array()``. A source the server tracks no upload for reports
-        UNKNOWN, and that is rejected on the first poll rather than waited out:
-        either the source was never an upload target (a catalog source, on disk
-        or in the cloud, has no upload to wait for), or its record was dropped
-        when the source was removed or the server restarted. Neither reading
-        resolves by polling.
-
-        Args:
-            source_id: Source identifier returned by create_source().
-            timeout_seconds: Maximum time to wait before timing out.
-            poll_interval_seconds: Delay between status checks.
-
-        Returns:
-            Final upload status dictionary when READY.
-
-        Raises:
-            ValueError: If the server tracks no upload for the source (UNKNOWN).
-            TimeoutError: If the upload does not reach READY within the timeout.
-            RuntimeError: If the owner discarded the upload (DISCARDED); the
-                reason they gave is included.
-        """
-        return self._catalog.wait_for_upload_ready(
-            source_id, timeout_seconds, poll_interval_seconds
-        )
-
-    def wait_for_upload_ready_pb(
-        self,
-        pb: SerializedTensor,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Poll upload status until a registration-first SerializedTensor is READY.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-        """
-        return self._catalog.wait_for_upload_ready_pb(
-            pb, timeout_seconds, poll_interval_seconds
-        )
 
     def cache_info(self) -> Dict:
         """Return cache statistics for this connection.

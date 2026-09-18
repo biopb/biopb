@@ -91,10 +91,12 @@ def _reset_client_pools(location: str) -> None:
 
 def _first_chunk(client, array_id: str):
     """(chunk_id, start, stop) of a tensor's first chunk, from its endpoint list."""
-    pb = client.get_tensor_pb(array_id)
-    ep = pb.endpoints[0]
-    b = ep.chunk_bounds
-    return ep.ticket.chunk_id, tuple(b.start), tuple(b.stop)
+    from biopb.tensor._session import _parse_flight_endpoints
+
+    info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
+    chunk_ids, bounds = _parse_flight_endpoints(info)
+    b = bounds[0]
+    return chunk_ids[0], tuple(b.start), tuple(b.stop)
 
 
 @pytest.fixture
@@ -1301,9 +1303,10 @@ class TestCachefileIntegration:
 
     def _one_endpoint(self, client):
         """A real (chunk_id, start, stop) triple for source "z"'s first chunk."""
-        ctx = client._get_tensor_context("z")
-        chunk_id, bounds = ctx.endpoints[0]
-        return chunk_id, tuple(bounds.start), tuple(bounds.stop)
+        from biopb.tensor._session import _parse_flight_endpoints
+
+        chunk_ids, bounds = _parse_flight_endpoints(client._fetcher._plan_read("z"))
+        return chunk_ids[0], tuple(bounds[0].start), tuple(bounds[0].stop)
 
     def test_fetched_block_is_read_only_fast_path(self):
         """End-to-end read contract: a chunk pulled through the real fetch leaf

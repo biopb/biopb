@@ -361,17 +361,16 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
 
-                // Verify descriptor is populated
-                Assert.assertEquals("test-tensor", pb.getTensorDescriptor().getArrayId());
-                Assert.assertEquals(Arrays.asList(4L, 4L), pb.getTensorDescriptor().getShapeList());
-                Assert.assertEquals("float32", pb.getTensorDescriptor().getDtype());
-                Assert.assertEquals(Arrays.asList(2L, 2L), pb.getTensorDescriptor().getChunkShapeList());
+                // The plan is the FlightInfo the server answered, carried whole.
+                TensorDescriptor descriptor = TensorFlightClient.descriptorOf(pb);
+                Assert.assertEquals("test-tensor", descriptor.getArrayId());
+                Assert.assertEquals(Arrays.asList(4L, 4L), descriptor.getShapeList());
+                Assert.assertEquals("float32", descriptor.getDtype());
+                Assert.assertEquals(Arrays.asList(2L, 2L), descriptor.getChunkShapeList());
+                Assert.assertEquals(4, TensorFlightClient.flightInfoOf(pb).getEndpoints().size());
 
                 // Verify location is populated
                 Assert.assertTrue(pb.getLocation().contains("localhost"));
-
-                // Verify endpoints are populated
-                Assert.assertEquals(4, pb.getEndpointsCount());
             }
         }
     }
@@ -426,8 +425,9 @@ public class TensorFlightClientTest {
                 long[] scaleHint = new long[] {2, 2};
                 SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, scaleHint, "nearest");
 
-                // Verify scale_hint in descriptor
-                Assert.assertEquals(Arrays.asList(2L, 2L), pb.getTensorDescriptor().getScaleHintList());
+                // Verify scale_hint in the plan's descriptor
+                TensorDescriptor descriptor = TensorFlightClient.descriptorOf(pb);
+                Assert.assertEquals(Arrays.asList(2L, 2L), descriptor.getScaleHintList());
 
                 // Reconstruct and verify downscaled shape
                 RandomAccessibleInterval<FloatType> image = TensorFlightClient.tensorFromPb(pb, 10_000_000L);
@@ -437,112 +437,6 @@ public class TensorFlightClientTest {
                 // Verify data values
                 Assert.assertEquals(1.0f, image.getAt(0, 0).get(), 0.0001f);
                 Assert.assertEquals(11.0f, image.getAt(1, 1).get(), 0.0001f);
-            }
-        }
-    }
-
-    @Test
-    public void testGetUploadStatusFromSerializedTensor() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            server.setUploadStatusSequence("upload-source",
-                    status("upload-source", "PENDING", 4, 1));
-
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                SerializedTensor pb = SerializedTensor.newBuilder()
-                        .setTensorDescriptor(TensorDescriptor.newBuilder().setArrayId("upload-source").build())
-                        .build();
-
-                Map<String, Object> status = client.getUploadStatus(pb);
-                Assert.assertEquals("PENDING", status.get("state"));
-                Assert.assertEquals(1.0d, ((Number) status.get("uploaded_chunks")).doubleValue(), 0.0d);
-            }
-        }
-    }
-
-    @Test
-    public void testWaitForUploadReadyFromSerializedTensor() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            server.setUploadStatusSequence(
-                    "upload-source",
-                    status("upload-source", "PENDING", 4, 1),
-                    status("upload-source", "READY", 4, 4));
-
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                SerializedTensor pb = SerializedTensor.newBuilder()
-                        .setTensorDescriptor(TensorDescriptor.newBuilder().setArrayId("upload-source").build())
-                        .build();
-
-                Map<String, Object> status = client.waitForUploadReady(pb, 100L, 0L);
-                Assert.assertEquals("READY", status.get("state"));
-                Assert.assertEquals(4.0d, ((Number) status.get("uploaded_chunks")).doubleValue(), 0.0d);
-            }
-        }
-    }
-
-    @Test
-    public void testWaitForUploadReadyTimesOut() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            server.setUploadStatusSequence("upload-source",
-                    status("upload-source", "PENDING", 4, 1));
-
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IOException error = Assert.assertThrows(
-                        IOException.class,
-                        () -> client.waitForUploadReady("upload-source", 0L, 0L));
-                Assert.assertTrue(error.getMessage().contains("Timed out waiting for upload readiness"));
-            }
-        }
-    }
-
-    @Test
-    public void testGetUploadStatusRequiresArrayId() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                SerializedTensor pb = SerializedTensor.newBuilder()
-                        .setTensorDescriptor(TensorDescriptor.newBuilder().build())
-                        .build();
-
-                IllegalArgumentException error = Assert.assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.getUploadStatus(pb));
-                Assert.assertTrue(error.getMessage().contains("tensor_descriptor.array_id is required"));
-            }
-        }
-    }
-
-    /**
-     * A discarded upload is terminal, so the wait says so at once and carries
-     * the reason -- rather than polling to the timeout, which is what it did
-     * before the states were explicit on the wire. There is no FAILED: the
-     * model has two terminal states, and the reason string is what a poller
-     * actually wants (biopb/biopb#1).
-     */
-    @Test
-    public void testWaitForUploadReadyRaisesOnDiscarded() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            Map<String, Object> discarded = status("upload-source", "DISCARDED", 4, 2);
-            discarded.put("reason", "job died");
-            server.setUploadStatusSequence("upload-source", discarded);
-
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IOException error = Assert.assertThrows(
-                        IOException.class,
-                        () -> client.waitForUploadReady("upload-source", 100L, 0L));
-                Assert.assertTrue(error.getMessage().contains("Upload discarded for source 'upload-source'"));
-                Assert.assertTrue(error.getMessage().contains("job died"));
-            }
-        }
-    }
-
-    /** No upload record at all: polling cannot change it, so it fails at once. */
-    @Test
-    public void testWaitForUploadReadyRejectsAnUnknownSource() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IOException error = Assert.assertThrows(
-                        IOException.class,
-                        () -> client.waitForUploadReady("no-such-source", 100L, 0L));
-                Assert.assertTrue(error.getMessage().contains("tracks no upload"));
             }
         }
     }
