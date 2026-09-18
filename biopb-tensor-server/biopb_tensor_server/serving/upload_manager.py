@@ -336,10 +336,10 @@ class UploadManager:
         for source_id, adapter in self._registry.snapshot():
             if upload_of(adapter) is None:
                 continue
-            if adapter.expire_if_idle(now, ttl):
+            expired_now, age = adapter.reap_step(now, ttl)
+            if expired_now:
                 expired += 1
                 continue
-            age = adapter.tombstone_age(now)
             if age is not None and age > ttl:
                 # Safe without a compare-and-remove: a tombstone is terminal
                 # and its id cannot be re-registered while it stands, so this

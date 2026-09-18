@@ -287,45 +287,37 @@ class WritableSource:
         progress.touch(now)
         logger.info(f"Discarded upload {self.source_id}: {reason or 'no reason given'}")
 
-    def expire_if_idle(self, now: float, ttl: float) -> bool:
-        """Discard a PENDING upload that has made no progress for *ttl* seconds.
+    def reap_step(self, now: float, ttl: float) -> Tuple[bool, Optional[float]]:
+        """The reclaim sweep's two questions for this upload, one lock hold.
 
-        The reclaim sweep's first half: a job that died without discarding
-        leaves a PENDING upload that nothing will ever finish, and expiry is
-        just a discard with a reason -- one terminal transition, not a second
-        path into oblivion. The check and the transition share one lock hold
-        so a ``finish`` racing the sweep either lands first (and the upload
-        stays READY) or is refused as discarded; it can never be undone.
+        Returns ``(expired, tombstone_age)``:
 
-        Never for a durable kind, whose disposal is not this method's (see
-        :meth:`discard`). Returns whether this call discarded.
-        """
-        progress = self._upload
-        if progress is None or self.durable:
-            return False
-        with progress.lock:
-            if progress.status is not UploadStatus.PENDING:
-                return False
-            if progress.idle_for(now) <= ttl:
-                return False
-            self._discard_locked(progress, f"expired: no write for {ttl:g} s", now)
-            return True
-
-    def tombstone_age(self, now: float) -> Optional[float]:
-        """Seconds since this upload was discarded, or None if it was not.
-
-        The sweep's second half: past the TTL the tombstone has told every
-        straggler it is going to, and the registry entry is what remains.
-        Read under the lock for the timestamp; the state is terminal, so the
-        answer cannot go stale.
+        - *expired*: a PENDING upload with no progress for *ttl* seconds was
+          just discarded here, with a reason -- one terminal transition, not
+          a second path into oblivion. The check and the transition share the
+          lock hold so a ``finish`` racing the sweep either lands first (and
+          the upload stays READY) or is refused as discarded; it can never be
+          undone. Never true for a durable kind, whose disposal is not this
+          method's (see :meth:`discard`).
+        - *tombstone_age*: seconds since this upload was discarded, or
+          ``None`` if it was not -- including right after this call just
+          discarded it, since a fresh tombstone's age is not yet the sweep's
+          concern.
         """
         progress = self._upload
         if progress is None:
-            return None
+            return False, None
         with progress.lock:
-            if not progress.is_discarded:
-                return None
-            return progress.idle_for(now)
+            if (
+                not self.durable
+                and progress.status is UploadStatus.PENDING
+                and progress.idle_for(now) > ttl
+            ):
+                self._discard_locked(progress, f"expired: no write for {ttl:g} s", now)
+                return True, None
+            if progress.is_discarded:
+                return False, progress.idle_for(now)
+            return False, None
 
     def finish(self) -> Dict[str, Any]:
         """Seal this upload: PENDING -> READY, no further chunks.
