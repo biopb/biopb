@@ -93,7 +93,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """The source_id a ``cache:<name>`` upload lands on.
 
         Deterministic for a name, so the name is single-use for the life of
-        the server (``UploadManager.create_source`` refuses the collision);
+        the server (``UploadManager.create_tensor`` refuses the collision);
         minted for an empty one.
         """
         if name:
@@ -111,7 +111,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         present and declines to overwrite it -- serving stale data
         (biopb/biopb#178). Folding a distinct token into each upload's chunk_ids
         sidesteps that. (Within one server lifetime a name cannot be reused at
-        all: ``UploadManager.create_source`` refuses the collision.)
+        all: ``UploadManager.create_tensor`` refuses the collision.)
 
         Wall-clock ns keeps the token distinct across a restart, where a persisted
         file cache may still hold the prior upload's chunks; ``max(..., last + 1)``

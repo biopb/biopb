@@ -6,7 +6,7 @@ whose CI installs it. They were silently skipped here because the client-only CI
 job installs no server (biopb/biopb#579).
 """
 
-import time
+import pickle
 from unittest.mock import Mock
 
 import pytest
@@ -14,209 +14,6 @@ from biopb.tensor import (
     TensorFlightClient,
 )
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.serialized_pb2 import SerializedTensor
-
-
-class TestTensorFlightClient:
-    """Client-side unit tests for TensorFlightClient (mock-backed)."""
-
-    def test_get_upload_status_pb_uses_tensor_descriptor_array_id(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        # Upload lifecycle lives in the UploadSession collaborator (#278 item C),
-        # so the _pb conveniences resolve status through client._upload -- mock there.
-        client._catalog.get_upload_status = Mock(
-            return_value={
-                "source_id": "cache_test",
-                "state": "PENDING",
-                "expected_chunks": 4,
-                "uploaded_chunks": 1,
-            }
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            status = client.get_upload_status_pb(pb)
-        finally:
-            client.close()
-
-        client._catalog.get_upload_status.assert_called_once_with("cache_test")
-        assert status["state"] == "PENDING"
-
-    def test_wait_for_upload_ready_pb_returns_when_ready(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._catalog.get_upload_status = Mock(
-            side_effect=[
-                {
-                    "source_id": "cache_test",
-                    "state": "PENDING",
-                    "expected_chunks": 4,
-                    "uploaded_chunks": 1,
-                },
-                {
-                    "source_id": "cache_test",
-                    "state": "READY",
-                    "expected_chunks": 4,
-                    "uploaded_chunks": 4,
-                },
-            ]
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            status = client.wait_for_upload_ready_pb(
-                pb,
-                timeout_seconds=0.1,
-                poll_interval_seconds=0.0,
-            )
-        finally:
-            client.close()
-
-        assert status["state"] == "READY"
-        assert client._catalog.get_upload_status.call_count == 2
-
-    def test_wait_for_upload_ready_pb_times_out(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._catalog.get_upload_status = Mock(
-            return_value={
-                "source_id": "cache_test",
-                "state": "PENDING",
-                "expected_chunks": 4,
-                "uploaded_chunks": 1,
-            }
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            with pytest.raises(
-                TimeoutError, match="Timed out waiting for upload readiness"
-            ):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    timeout_seconds=0.0,
-                    poll_interval_seconds=0.0,
-                )
-        finally:
-            client.close()
-
-    def test_wait_for_upload_ready_pb_fails_fast_on_unknown(self):
-        """An UNKNOWN state is not an upload in progress -- don't poll to timeout.
-
-        Regression for biopb/biopb#109: a non-upload source (e.g. a catalog or
-        cloud source) reports UNKNOWN forever, so the old loop blocked for the
-        full timeout before raising a misleading TimeoutError.
-        """
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._catalog.get_upload_status = Mock(
-            return_value={
-                "source_id": "ome-tiff_abc123",
-                "state": "UNKNOWN",
-                "expected_chunks": 0,
-                "uploaded_chunks": 0,
-            }
-        )
-
-        pb = SerializedTensor(
-            tensor_descriptor=TensorDescriptor(array_id="ome-tiff_abc123")
-        )
-
-        try:
-            started = time.monotonic()
-            with pytest.raises(ValueError, match="tracks no upload"):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    # Generous timeout: the point is that we return long before it.
-                    timeout_seconds=30.0,
-                    poll_interval_seconds=0.5,
-                )
-            elapsed = time.monotonic() - started
-        finally:
-            client.close()
-
-        assert elapsed < 1.0
-        assert client._catalog.get_upload_status.call_count == 1
-
-    def test_wait_for_upload_ready_pb_stops_if_the_record_disappears(self):
-        """A tracked upload whose record vanishes mid-poll also fails fast.
-
-        The server forgets upload state when a source is unregistered (and loses
-        it entirely on restart), so PENDING -> UNKNOWN is just as terminal as
-        UNKNOWN on the first poll.
-        """
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._catalog.get_upload_status = Mock(
-            side_effect=[
-                {
-                    "source_id": "cache_test",
-                    "state": "PENDING",
-                    "expected_chunks": 4,
-                    "uploaded_chunks": 1,
-                },
-                {
-                    "source_id": "cache_test",
-                    "state": "UNKNOWN",
-                    "expected_chunks": 0,
-                    "uploaded_chunks": 0,
-                },
-            ]
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            with pytest.raises(ValueError, match="tracks no upload"):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    timeout_seconds=30.0,
-                    poll_interval_seconds=0.0,
-                )
-        finally:
-            client.close()
-
-        assert client._catalog.get_upload_status.call_count == 2
-
-    def test_get_upload_status_pb_requires_array_id(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor())
-
-        try:
-            with pytest.raises(
-                ValueError, match="tensor_descriptor.array_id is required"
-            ):
-                client.get_upload_status_pb(pb)
-        finally:
-            client.close()
-
-    def test_wait_for_upload_ready_pb_raises_on_discarded_state(self):
-        """DISCARDED is terminal, so the poll ends on it -- carrying the reason,
-        which is the only thing distinguishing it from a source that failed."""
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._catalog.get_upload_status = Mock(
-            return_value={
-                "source_id": "cache_test",
-                "state": "DISCARDED",
-                "expected_chunks": 4,
-                "uploaded_chunks": 2,
-                "reason": "client disconnected",
-            }
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            with pytest.raises(
-                RuntimeError,
-                match="Upload discarded for source 'cache_test': client disconnected",
-            ):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    timeout_seconds=0.1,
-                    poll_interval_seconds=0.0,
-                )
-        finally:
-            client.close()
 
 
 class TestQuerySourcesFormat:
@@ -602,3 +399,71 @@ class TestDescriptorCacheStaysStructural:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestUploadRefused:
+    """The one typed exception a write path raises (biopb/biopb#1048 step 7)."""
+
+    def test_it_survives_a_trip_through_a_worker(self):
+        """Raised on a dask worker, it comes back as itself with its fields."""
+        from biopb.tensor import UploadRefused
+
+        exc = UploadRefused("cache_x", "DISCARDED", "job died")
+        back = pickle.loads(pickle.dumps(exc))
+        assert isinstance(back, UploadRefused)
+        assert (back.source_id, back.state, back.reason) == (
+            "cache_x",
+            "DISCARDED",
+            "job died",
+        )
+        assert "job died" in str(back)
+
+    def test_it_is_read_off_extra_info_not_the_message(self):
+        import json
+
+        import pyarrow.flight as flight
+        from biopb.tensor._upload import _refused_from
+
+        info = {
+            "code": "CANCELLED",
+            "reason": "upload_sealed",
+            "state": "READY",
+            "source_id": "cache_x",
+            "detail": "",
+        }
+        exc = flight.FlightCancelledError(
+            "whatever the message says", json.dumps(info).encode()
+        )
+        refused = _refused_from(exc)
+        assert refused is not None
+        assert refused.state == "READY"
+        assert refused.source_id == "cache_x"
+
+    def test_another_cancelled_call_passes_through(self):
+        """Only an upload refusal is translated; a cancel from anything else is
+        not this module's to reinterpret."""
+        import pyarrow.flight as flight
+        from biopb.tensor._upload import _refused_from
+
+        assert _refused_from(flight.FlightCancelledError("cancelled")) is None
+        assert _refused_from(flight.FlightCancelledError("x", b"not json")) is None
+        assert (
+            _refused_from(flight.FlightCancelledError("x", b'{"reason": "other"}'))
+            is None
+        )
+
+
+class TestCreateTensorGrid:
+    def test_a_dask_template_supplies_its_grid(self):
+        import dask.array as da
+        from biopb.tensor._upload import _uniform_chunk_shape
+
+        arr = da.zeros((10, 6), chunks=(4, 6))  # ragged trailing chunk on axis 0
+        assert _uniform_chunk_shape(arr) == (4, 6)
+
+    def test_an_irregular_chunking_yields_one_grid(self):
+        import dask.array as da
+        from biopb.tensor._upload import _uniform_chunk_shape
+
+        arr = da.zeros((10,), chunks=((3, 5, 2),))
+        assert _uniform_chunk_shape(arr) == (5,)

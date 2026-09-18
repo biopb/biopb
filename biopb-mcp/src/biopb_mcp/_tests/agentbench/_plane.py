@@ -140,12 +140,14 @@ class TensorPlane:
         array = np.asarray(array)
         chunk_shape = tuple(chunks) if chunks else array.shape
         lazy = da.from_array(array, chunks=chunk_shape)
-        return self.client.upload_array(
-            lazy,
+        desc = self.client.create_tensor(
             f"cache:{self.secret}-{key}",
+            lazy,
             chunk_shape=list(chunk_shape),
             dim_labels=list(dim_labels) if dim_labels else None,
         )
+        self.client.upload_array(desc, lazy)
+        return desc.array_id
 
     def fingerprint(self, array_id: str) -> str:
         """A hash of a corner of what the plane currently serves for *array_id*.

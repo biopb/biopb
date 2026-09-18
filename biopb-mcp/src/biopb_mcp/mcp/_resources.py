@@ -357,8 +357,10 @@ arr = client.get_tensor("raw_data_id")
 # 2. Build the graph: still lazy, still nothing read
 mask_arr = arr > 0.5
 
-# 3. Upload -- the eager step. Computes and sends chunk by chunk.
-array_id = client.upload_array(mask_arr, "cache:thresholded_v1")
+# 3. Declare, then upload -- the eager step. Computes and sends chunk by chunk.
+desc = client.create_tensor("cache:thresholded_v1", mask_arr)
+client.upload_array(desc, mask_arr)
+array_id = desc.array_id
 
 # 4. Back onto the viewer for the user to check. It arrives pyramid-shaped, so
 #    read it back with viewer.tensor(), not .data (trap 1).
@@ -637,12 +639,14 @@ arr = client.get_tensor("source_id/t1")
 ```
 
 ## Upload to Server
-Use `"cache:my_result"` as destination for ephemeral results that don't
-need to be persisted long-term.
+Declare the tensor, then fill it. Use `"cache:my_result"` as destination for
+ephemeral results that don't need to be persisted long-term.
 ```python
-array_id = client.upload_array(arr, "cache:my_result")
+desc = client.create_tensor("cache:my_result", arr)   # shape, dtype, chunks from arr
+client.upload_array(desc, arr)
+array_id = desc.array_id
 ```
-A name is single-use for the life of the server: uploading under a name that
+A name is single-use for the life of the server: creating under a name that
 already exists is refused. Re-running a cell needs a new name, or `"cache:"`
 for a server-minted one.
 """

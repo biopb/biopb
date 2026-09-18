@@ -744,7 +744,7 @@ class RemoteTensorAdapter(TensorAdapter):
         The upstream owns this source's order -- it mints the chunk_ids, plans the
         reads (biopb/biopb#295) and sizes the grid -- so the server validates that
         order instead of permuting it behind the upstream's back, exactly as the
-        write path refuses a non-canonical ``create_source``.
+        write path refuses a non-canonical ``create_tensor``.
 
         Scope of the refusal, deliberately drawn at ``GetFlightInfo``: a describe
         (``with_read_plan=false``) is refused along with a read, because the

@@ -40,5 +40,6 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   per-source reads and ride the descriptor GetFlightInfo returns
 #   (biopb/biopb#1048).
 #   A new ``finish`` action seals an upload against further writes and is the
-#   only route to READY; ``create_source`` refuses a name that exists.
+#   only route to READY; ``create_tensor`` (was ``create_source``) refuses a
+#   name that exists and a refused write carries its state in ``extra_info``.
 FLIGHT_PROTOCOL_VERSION = 2

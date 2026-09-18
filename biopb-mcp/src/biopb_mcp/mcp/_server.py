@@ -840,7 +840,7 @@ async def verify_workflow(document: str, title: str = "") -> str:
 
     **What it does not.** The numbers are right: check them. And a scratch
     *process* is not a scratch *world* — it talks to the same tensor server and
-    the same filesystem, so `client.upload_array` / `upload_zarr` / `add_source`,
+    the same filesystem, so `client.upload_array` / `add_source`,
     and any cell that writes a file, write through for real. Verify a workflow
     three times and you have three uploaded arrays. **Say so before running one
     that writes.**

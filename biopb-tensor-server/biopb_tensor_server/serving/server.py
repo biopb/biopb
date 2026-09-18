@@ -930,8 +930,8 @@ class TensorFlightServer(flight.FlightServerBase):
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType(
-                "create_source",
-                "Create a writable source from a TensorDescriptor request",
+                "create_tensor",
+                "Create a writable single-tensor source from a TensorDescriptor",
             ),
             flight.ActionType(
                 "finish",
@@ -1023,13 +1023,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 "catalog_persisted": db is not None and db.store_path is not None,
             }
             yield json.dumps(health_status).encode("utf-8")
-        elif action.type == "create_source":
+        elif action.type == "create_tensor":
             self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
-            yield self.uploads.create_source(req_desc).SerializeToString()
+            yield self.uploads.create_tensor(req_desc).SerializeToString()
         elif action.type == "finish":
             self._authorize(context)
             if not self._writable:

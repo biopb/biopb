@@ -41,7 +41,7 @@ message ChunkBounds {
 }
 
 // FlightDescriptor.command bytes of a DoPut; what the stream carries is the
-// oneof arm. A source is created by the `create_source` action, not here.
+// oneof arm. A source is created by the `create_tensor` action, not here.
 message PutCommand {
   oneof command {
     // The stream is one pixel chunk (writable servers only).
@@ -66,7 +66,7 @@ message ChunkUpload {
 // Body of the `finish` action: seal an upload against further writes.
 //
 // `source_id` alone names the attempt: a name is single-use for the life of
-// the server (`create_source` refuses a collision), so the source it finds is
+// the server (`create_tensor` refuses a collision), so the source it finds is
 // the one the caller created.
 message FinishUpload {
   string source_id = 1;

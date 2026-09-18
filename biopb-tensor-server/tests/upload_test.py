@@ -18,7 +18,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor import TensorFlightClient, _upload
+from biopb.tensor import TensorFlightClient, UploadRefused, _upload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
@@ -610,7 +610,7 @@ class TestServerDoPutHandler:
         )
 
         # Process creation
-        response_desc = server.uploads.create_source(req_desc)
+        response_desc = server.uploads.create_tensor(req_desc)
 
         # Check response
         assert response_desc is not None
@@ -645,7 +645,7 @@ class TestServerDoPutHandler:
             physical_unit=["µm", "µm", "µm"],
         )
 
-        response_desc = server.uploads.create_source(req_desc)
+        response_desc = server.uploads.create_tensor(req_desc)
 
         # The response echoes the uploader's calibration.
         assert list(response_desc.physical_scale) == [2.0, 0.325, 0.325]
@@ -684,7 +684,7 @@ class TestServerDoPutHandler:
                 physical_unit=["µm", "µm"],
             )
 
-            response_desc = server.uploads.create_source(req_desc)
+            response_desc = server.uploads.create_tensor(req_desc)
 
             # No unpersisted calibration is advertised on the zarr response.
             assert list(response_desc.physical_scale) == []
@@ -706,7 +706,7 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        response_desc = server.uploads.create_source(req_desc)
+        response_desc = server.uploads.create_tensor(req_desc)
         assert response_desc.array_id.startswith("cache_")
 
     def test_create_source_not_writable_raises(self):
@@ -728,7 +728,7 @@ class TestServerDoPutHandler:
         # The writable check is in do_put, not the UploadManager. This test
         # verifies create_source itself works on a non-writable server (the check
         # happens at the do_put boundary).
-        response_desc = server.uploads.create_source(req_desc)
+        response_desc = server.uploads.create_tensor(req_desc)
         # Source should be created (do_put would reject before reaching this).
         assert response_desc is not None
 
@@ -750,7 +750,7 @@ class TestServerDoPutHandler:
         )
 
         with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
-            server.uploads.create_source(req_desc)
+            server.uploads.create_tensor(req_desc)
 
     def test_create_source_ome_zarr_with_write_dir(self):
         """Create zarr-backed source with write_dir."""
@@ -771,7 +771,7 @@ class TestServerDoPutHandler:
                 dim_labels=["y", "x"],
             )
 
-            response_desc = server.uploads.create_source(req_desc)
+            response_desc = server.uploads.create_tensor(req_desc)
             assert response_desc.array_id.startswith("ome_zarr_")
 
             # Check zarr directory was created
@@ -799,7 +799,7 @@ class TestServerDoPutHandler:
                 chunk_shape=[32, 32],
                 dim_labels=["y", "x"],
             )
-            response_desc = server.uploads.create_source(req_desc)
+            response_desc = server.uploads.create_tensor(req_desc)
 
             # The durable upload appears in the catalog.
             assert response_desc.array_id in _catalog_ids(db)
@@ -820,7 +820,7 @@ class TestServerDoPutHandler:
             dtype="uint8",
             chunk_shape=[32, 32],
         )
-        response_desc = server.uploads.create_source(req_desc)
+        response_desc = server.uploads.create_tensor(req_desc)
 
         # Not enumerable via the catalog...
         assert response_desc.array_id not in _catalog_ids(db)
@@ -846,9 +846,9 @@ class TestServerDoPutHandler:
         )
 
         with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
-            server.uploads.create_source(req_desc)
+            server.uploads.create_tensor(req_desc)
 
-    def test_create_source_action_round_trip(self, tmp_path):
+    def test_create_tensor_action_round_trip(self, tmp_path):
         """Live client create_source should return the server-assigned source_id."""
         from biopb.tensor import TensorFlightClient
         from biopb_tensor_server.serving.server import TensorFlightServer
@@ -866,12 +866,9 @@ class TestServerDoPutHandler:
 
         client = TensorFlightClient(f"grpc://127.0.0.1:{server.port}")
         try:
-            source_id = client.create_source(
-                "cache:test-action",
-                shape=(10, 10),
-                dtype="uint8",
-                chunk_shape=(5, 5),
-            )
+            source_id = client.create_tensor(
+                "cache:test-action", np.empty((10, 10), np.uint8), chunk_shape=(5, 5)
+            ).array_id
             assert source_id.startswith("cache_")
             assert source_id in server.sources
         finally:
@@ -883,7 +880,7 @@ class TestServerDoPutHandler:
 class TestDoPutErrorTranslation:
     """A create-source failure must surface as itself (biopb/biopb#354).
 
-    A source is created by the ``create_source`` action only; DoPut takes a
+    A source is created by the ``create_tensor`` action only; DoPut takes a
     ``PutCommand`` and refuses anything else up front, so the historical
     parse-and-guess discrimination (which mis-reported a genuine create error
     as "Invalid upload command") has no path left. ``_do_put`` here is the
@@ -909,7 +906,7 @@ class TestDoPutErrorTranslation:
         )
 
     def _do_put(self, server, req_desc):
-        action = flight.Action("create_source", req_desc.SerializeToString())
+        action = flight.Action("create_tensor", req_desc.SerializeToString())
         return list(server.do_action(None, action))
 
     def test_do_put_refuses_a_bare_descriptor(self):
@@ -922,8 +919,8 @@ class TestDoPutErrorTranslation:
         with pytest.raises(flight.FlightServerError, match="PutCommand"):
             server.do_put(None, descriptor, None, self._MockWriter())
 
-    def _create_source_action(self, server, req_desc):
-        action = flight.Action("create_source", req_desc.SerializeToString())
+    def _create_tensor_action(self, server, req_desc):
+        action = flight.Action("create_tensor", req_desc.SerializeToString())
         list(server.do_action(None, action))
 
     # -- invalid array_id prefix ------------------------------------------------
@@ -944,7 +941,7 @@ class TestDoPutErrorTranslation:
             array_id="bogus:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
         )
         with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
-            self._create_source_action(server, req_desc)
+            self._create_tensor_action(server, req_desc)
 
     # -- missing write_dir ------------------------------------------------------
 
@@ -964,7 +961,7 @@ class TestDoPutErrorTranslation:
             array_id="ome_zarr:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
         )
         with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
-            self._create_source_action(server, req_desc)
+            self._create_tensor_action(server, req_desc)
 
     # -- malformed metadata_json ------------------------------------------------
 
@@ -992,7 +989,7 @@ class TestDoPutErrorTranslation:
             metadata_json="{not valid json",
         )
         with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
-            self._create_source_action(server, req_desc)
+            self._create_tensor_action(server, req_desc)
 
     def test_do_put_malformed_metadata_json_ome_zarr(self):
         """The ome_zarr branch's metadata_json is validated too, not just cache --
@@ -1095,7 +1092,7 @@ class TestChunkUpload:
             dtype="uint8",
             chunk_shape=[50, 50],
         )
-        response_desc = server.uploads.create_source(req_desc)
+        response_desc = server.uploads.create_tensor(req_desc)
         source_id = response_desc.array_id
 
         # Upload chunk
@@ -1141,7 +1138,7 @@ class TestChunkUpload:
             dtype="uint8",
             chunk_shape=[50, 50],
         )
-        response_desc = server.uploads.create_source(req_desc)
+        response_desc = server.uploads.create_tensor(req_desc)
         source_id = response_desc.array_id
 
         bounds = ChunkBounds(start=[10, 20], stop=[40, 60])
@@ -1224,7 +1221,7 @@ class TestOmeZarrChunkAlignment:
                 dtype="uint8",
                 chunk_shape=[50, 50],
             )
-            response_desc = server.uploads.create_source(req_desc)
+            response_desc = server.uploads.create_tensor(req_desc)
             source_id = response_desc.array_id
 
             # Upload aligned chunk
@@ -1265,7 +1262,7 @@ class TestOmeZarrChunkAlignment:
                 dtype="uint8",
                 chunk_shape=[50, 50],
             )
-            response_desc = server.uploads.create_source(req_desc)
+            response_desc = server.uploads.create_tensor(req_desc)
             source_id = response_desc.array_id
 
             # Upload unaligned chunk (start not on grid)
@@ -1462,6 +1459,13 @@ class TestCachedSourceContentVersion:
         assert a1.content_version != a2.content_version  # a fresh namespace each
 
 
+def _upload_whole(client, arr, name):
+    """Declare from the array, fill it, seal it; the id for reading back."""
+    desc = client.create_tensor(name, arr)
+    client.upload_array(desc, arr)
+    return desc.array_id
+
+
 class TestConcurrentChunkUpload:
     """`upload_array` ships several chunks at once, via `da.store` (#590).
 
@@ -1504,11 +1508,11 @@ class TestConcurrentChunkUpload:
         visible -- a uniform array would round-trip through almost any bug.
         """
         source = np.arange(12 * 40 * 40, dtype=np.uint16).reshape(12, 40, 40)
-        source_id = client.upload_array(
-            da.from_array(source, chunks=(1, 40, 40)), "cache:fanout"
+        source_id = _upload_whole(
+            client, da.from_array(source, chunks=(1, 40, 40)), "cache:fanout"
         )
 
-        client.wait_for_upload_ready(source_id, timeout_seconds=30)
+        assert client.get_upload_status(source_id)["state"] == "READY"
         np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
 
     def test_the_chunks_really_do_overlap(self, client, monkeypatch):
@@ -1523,7 +1527,7 @@ class TestConcurrentChunkUpload:
         arr = da.from_array(np.zeros((16, 20, 20), dtype=np.uint8), chunks=(1, 20, 20))
 
         with dask.config.set(scheduler="threads", num_workers=4):
-            client.upload_array(arr, "cache:overlap")
+            _upload_whole(client, arr, "cache:overlap")
 
         assert state["peak"] > 1, "uploads ran one at a time"
         assert state["peak"] <= 4, f"asked for 4 at once, ran {state['peak']}"
@@ -1540,10 +1544,10 @@ class TestConcurrentChunkUpload:
         arr = da.from_array(source, chunks=(1, 20, 20))
 
         with dask.config.set(scheduler="threads", num_workers=1):
-            source_id = client.upload_array(arr, "cache:serial")
+            source_id = _upload_whole(client, arr, "cache:serial")
 
         assert state["peak"] == 1
-        client.wait_for_upload_ready(source_id, timeout_seconds=30)
+        assert client.get_upload_status(source_id)["state"] == "READY"
         np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
 
     def test_a_failed_chunk_surfaces_as_itself(self, client, monkeypatch):
@@ -1571,7 +1575,7 @@ class TestConcurrentChunkUpload:
         arr = da.from_array(np.zeros((10, 20, 20), dtype=np.uint8), chunks=(1, 20, 20))
 
         with pytest.raises(ChunkRefused):
-            client.upload_array(arr, "cache:doomed")
+            _upload_whole(client, arr, "cache:doomed")
 
     def test_out_of_order_arrival_still_completes_the_upload(self, client):
         """Readiness counts chunks into a set, so order is not observable.
@@ -1582,22 +1586,19 @@ class TestConcurrentChunkUpload:
         """
         session = client._upload
         source = np.arange(5 * 20 * 20, dtype=np.uint16).reshape(5, 20, 20)
-        source_id = session.create_source(
-            source_name="cache:backwards",
-            shape=source.shape,
-            dtype=source.dtype.str,
+        desc = session.create_tensor(
+            "cache:backwards",
+            source,
             chunk_shape=(1, 20, 20),
             dim_labels=["z", "y", "x"],
         )
         for z in reversed(range(5)):
             session.upload_chunk(
-                source_id,
+                desc,
                 ChunkBounds(start=[z, 0, 0], stop=[z + 1, 20, 20]),
                 source[z : z + 1],
             )
-        session.finish_upload(source_id)
-
-        status = client.wait_for_upload_ready(source_id, timeout_seconds=30)
+        status = session.finish_upload(desc)
         assert status["state"] == "READY"
         assert status["uploaded_chunks"] == 5
 
@@ -1629,8 +1630,8 @@ class TestConcurrentChunkUpload:
         coarse = da.from_array(
             np.zeros((32, 64, 64), dtype=np.uint16), chunks=(4, 64, 64)
         )
-        client.upload_array(
-            coarse.map_blocks(count).rechunk((1, 64, 64)), "cache:shared"
+        _upload_whole(
+            client, coarse.map_blocks(count).rechunk((1, 64, 64)), "cache:shared"
         )
 
         # Eight source blocks; dask's rechunk splits two, hence ten. What
@@ -1647,18 +1648,14 @@ class TestConcurrentChunkUpload:
         """
         session = client._upload
         source = np.arange(4 * 8 * 8, dtype=np.uint16).reshape(4, 8, 8)
-        source_id = session.create_source(
-            source_name="cache:revived",
-            shape=source.shape,
-            dtype=source.dtype.str,
-            chunk_shape=(1, 8, 8),
-            dim_labels=["z", "y", "x"],
+        desc = session.create_tensor(
+            "cache:revived", source, chunk_shape=(1, 8, 8), dim_labels=["z", "y", "x"]
         )
         target = _upload._UploadTarget(
             session._state.location,
             session._state.token,
             session._state.tls_trust,
-            source_id,
+            desc.array_id,
             source.shape,
             source.dtype,
         )
@@ -1668,12 +1665,10 @@ class TestConcurrentChunkUpload:
         for z in range(4):
             revived[(slice(z, z + 1), slice(0, 8), slice(0, 8))] = source[z : z + 1]
 
-        session.finish_upload(source_id)
-        assert (
-            client.wait_for_upload_ready(source_id, timeout_seconds=30)["state"]
-            == "READY"
+        assert session.finish_upload(desc)["state"] == "READY"
+        np.testing.assert_array_equal(
+            client.get_tensor(desc.array_id).compute(), source
         )
-        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
 
 
 class TestDiscard:
@@ -1696,37 +1691,37 @@ class TestDiscard:
 
     @staticmethod
     def _make_source(client, name="cache:discard-me", shape=(4, 4), chunk=(2, 2)):
-        return client.create_source(
-            source_name=name, shape=shape, dtype="<u2", chunk_shape=chunk
+        return client.create_tensor(
+            name, np.empty(shape, dtype=np.uint16), chunk_shape=chunk
         )
 
     @staticmethod
-    def _put(client, source_id, start, stop, fill=7):
+    def _put(client, desc, start, stop, fill=7):
         data = np.full(
             [b - a for a, b in zip(start, stop, strict=True)], fill, dtype=np.uint16
         )
-        client.upload_chunk(
-            source_id, ChunkBounds(start=list(start), stop=list(stop)), data
-        )
+        client.upload_chunk(desc, ChunkBounds(start=list(start), stop=list(stop)), data)
 
     def test_discard_leaves_a_tombstone_that_refuses_reads_too(
         self, writable_server, client
     ):
         """The adapter stays registered, terminal, so both a writer and a
         reader still unwinding learn the reason instead of "not found"."""
-        source_id = self._make_source(client, shape=(2, 2), chunk=(2, 2))
-        self._put(client, source_id, (0, 0), (2, 2))
-        adapter = writable_server.sources.get(source_id)
+        desc = self._make_source(client, shape=(2, 2), chunk=(2, 2))
+        self._put(client, desc, (0, 0), (2, 2))
+        adapter = writable_server.sources.get(desc.array_id)
 
-        status = writable_server.uploads.discard(source_id, "client went away")
+        status = writable_server.uploads.discard(desc.array_id, "client went away")
 
         assert status["state"] == "DISCARDED"
         assert status["reason"] == "client went away"
-        assert writable_server.sources.get(source_id) is adapter
-        assert client.get_upload_status(source_id)["state"] == "DISCARDED"
+        assert writable_server.sources.get(desc.array_id) is adapter
+        assert client.get_upload_status(desc.array_id)["state"] == "DISCARDED"
         # It is a tombstone, not a source: not listed, and its bytes are gone.
-        assert source_id not in client.list_sources()
-        chunk_id = encode_chunk_id(source_id, ChunkBounds(start=[0, 0], stop=[2, 2]))
+        assert desc.array_id not in client.list_sources()
+        chunk_id = encode_chunk_id(
+            desc.array_id, ChunkBounds(start=[0, 0], stop=[2, 2])
+        )
         with pytest.raises(flight.FlightServerError, match="client went away"):
             adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
@@ -1739,23 +1734,25 @@ class TestDiscard:
         tell a job unwinding after its own discard that the source never
         existed.
         """
-        source_id = self._make_source(client)
-        writable_server.uploads.discard(source_id, "superseded")
+        desc = self._make_source(client)
+        writable_server.uploads.discard(desc.array_id, "superseded")
 
-        with pytest.raises(flight.FlightCancelledError) as exc:
-            self._put(client, source_id, (0, 0), (2, 2))
+        with pytest.raises(UploadRefused) as exc:
+            self._put(client, desc, (0, 0), (2, 2))
 
-        # Type discriminates, so a client never has to match on the message;
-        # the reason rides along for a human.
-        assert "superseded" in str(exc.value)
+        # Type discriminates, and the state and reason are fields, so a client
+        # never has to match on the message.
+        assert exc.value.state == "DISCARDED"
+        assert exc.value.reason == "superseded"
+        assert exc.value.source_id == desc.array_id
 
     def test_a_forgotten_source_is_missing_not_discarded(self, writable_server, client):
         """An unregistered source still means "not found" -- the states are distinct."""
-        source_id = self._make_source(client)
-        writable_server.unregister_source(source_id)
+        desc = self._make_source(client)
+        writable_server.unregister_source(desc.array_id)
 
         with pytest.raises(flight.FlightError) as exc:
-            self._put(client, source_id, (0, 0), (2, 2))
+            self._put(client, desc, (0, 0), (2, 2))
 
         assert not isinstance(exc.value, flight.FlightCancelledError)
         assert "not found" in str(exc.value).lower()
@@ -1770,7 +1767,7 @@ class TestDiscard:
         it stands rather than rewinding it -- the chunk already written stays
         counted on the tombstone.
         """
-        source_id = self._make_source(client, shape=(8, 2), chunk=(2, 2))
+        desc = self._make_source(client, shape=(8, 2), chunk=(2, 2))
         real = _upload._put_chunk
         written = []
 
@@ -1778,22 +1775,25 @@ class TestDiscard:
             real(*args, **kwargs)
             written.append(1)
             if len(written) == 1:
-                writable_server.uploads.discard(source_id, "stopped early")
+                writable_server.uploads.discard(desc.array_id, "stopped early")
 
         monkeypatch.setattr(_upload, "_put_chunk", put_then_discard)
 
         arr = da.from_array(np.arange(16, dtype=np.uint16).reshape(8, 2), chunks=(2, 2))
-        with pytest.raises(flight.FlightCancelledError, match="stopped early"):
+        with pytest.raises(UploadRefused, match="stopped early"):
             with dask.config.set(scheduler="threads", num_workers=1):
-                client._upload._store_chunks(source_id, arr)
+                client._upload._store_chunks(desc.array_id, arr)
 
-        status = client.get_upload_status(source_id)
+        status = client.get_upload_status(desc.array_id)
         assert status["state"] == "DISCARDED"
         assert status["uploaded_chunks"] == 1
         assert len(written) == 1
         # How far it got is reported, but the chunk ids behind that number are
         # not kept: a tombstone outlives its upload and must not scale with it.
-        assert writable_server.sources.get(source_id).upload.uploaded_chunk_ids == set()
+        assert (
+            writable_server.sources.get(desc.array_id).upload.uploaded_chunk_ids
+            == set()
+        )
 
     def test_a_straggler_does_not_walk_the_tombstone_back(self):
         """A write that passed the refusal check before the discard landed still
@@ -1809,10 +1809,10 @@ class TestDiscard:
     def test_discard_is_idempotent_and_keeps_the_first_reason(
         self, writable_server, client
     ):
-        source_id = self._make_source(client)
-        writable_server.uploads.discard(source_id, "first")
+        desc = self._make_source(client)
+        writable_server.uploads.discard(desc.array_id, "first")
 
-        again = writable_server.uploads.discard(source_id, "second")
+        again = writable_server.uploads.discard(desc.array_id, "second")
 
         assert again["state"] == "DISCARDED"
         assert again["reason"] == "first"
@@ -1839,7 +1839,7 @@ class TestDiscard:
         """A tombstone holds its name like any other source.
 
         A named cache source's id is a hash of that name, so a retry would land
-        on the tombstone -- and `create_source` refuses every collision rather
+        on the tombstone -- and `create_tensor` refuses every collision rather
         than replacing what holds the id (`upload_session_test.py` has why).
         The retry goes under a new name; the tombstone keeps answering for the
         old one with its reason.
@@ -1847,47 +1847,46 @@ class TestDiscard:
         first = self._make_source(
             client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2)
         )
-        writable_server.uploads.discard(first, "gave up")
+        writable_server.uploads.discard(first.array_id, "gave up")
 
         with pytest.raises(flight.FlightServerError, match="already exists"):
             self._make_source(client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2))
 
-        assert client.get_upload_status(first)["state"] == "DISCARDED"
-        assert client.get_upload_status(first)["reason"] == "gave up"
+        assert client.get_upload_status(first.array_id)["state"] == "DISCARDED"
+        assert client.get_upload_status(first.array_id)["reason"] == "gave up"
 
     def test_a_completed_upload_can_still_be_discarded(self, writable_server, client):
         """Disposal is not only for failures: dropping a finished result is the
         same operation."""
-        source_id = self._make_source(client, shape=(2, 2), chunk=(2, 2))
-        self._put(client, source_id, (0, 0), (2, 2))
-        client.finish_upload(source_id)
-        assert client.get_upload_status(source_id)["state"] == "READY"
+        desc = self._make_source(client, shape=(2, 2), chunk=(2, 2))
+        self._put(client, desc, (0, 0), (2, 2))
+        client.finish_upload(desc)
+        assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
-        assert writable_server.uploads.discard(source_id, "done with it")["state"] == (
-            "DISCARDED"
-        )
+        assert writable_server.uploads.discard(desc.array_id, "done with it")[
+            "state"
+        ] == ("DISCARDED")
 
     def test_zarr_backed_uploads_are_refused(self, writable_server, client):
         """A .zarr on disk and a catalog row are not this call's to release."""
-        source_id = client.create_source(
-            source_name="ome_zarr:keepme", shape=(4, 4), dtype="<u2", chunk_shape=(2, 2)
-        )
+        source_id = client.create_tensor(
+            "ome_zarr:keepme", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+        ).array_id
 
         with pytest.raises(ValueError, match="not a cache-backed upload"):
             writable_server.uploads.discard(source_id, "nope")
 
         assert client.get_upload_status(source_id)["state"] == "PENDING"
 
-    def test_the_poll_loop_fails_promptly_with_the_reason(
-        self, writable_server, client
-    ):
-        """A discarded upload is terminal, so `wait_for_upload_ready` says so
-        instead of polling to its timeout."""
-        source_id = self._make_source(client)
-        writable_server.uploads.discard(source_id, "client disconnected")
+    def test_the_poll_sees_the_reason(self, writable_server, client):
+        """A discarded upload is terminal and the status says why, which is
+        what a caller's poll loop stops on instead of running to a timeout."""
+        desc = self._make_source(client)
+        writable_server.uploads.discard(desc.array_id, "client disconnected")
 
-        with pytest.raises(RuntimeError, match="client disconnected"):
-            client.wait_for_upload_ready(source_id, timeout_seconds=30)
+        status = client.get_upload_status(desc.array_id)
+        assert status["state"] == "DISCARDED"
+        assert status["reason"] == "client disconnected"
 
     def test_the_record_tracks_when_it_last_moved(self, writable_server, client):
         """`updated_at` is what will bound a tombstone's life, and what tells a
@@ -1899,29 +1898,29 @@ class TestDiscard:
         CPython 3.13 (GetTickCount64), and both operations finish well inside one
         tick -- so `after > before` is not merely flaky there, it is false.
         """
-        source_id = self._make_source(client, shape=(4, 2), chunk=(2, 2))
-        state = writable_server.sources.get(source_id).upload
+        desc = self._make_source(client, shape=(4, 2), chunk=(2, 2))
+        state = writable_server.sources.get(desc.array_id).upload
         assert state.updated_at > 0  # stamped at creation
 
         state.updated_at = -1.0
-        self._put(client, source_id, (0, 0), (2, 2))
+        self._put(client, desc, (0, 0), (2, 2))
         assert state.updated_at > 0
 
         state.updated_at = -1.0
-        writable_server.uploads.discard(source_id, "enough")
+        writable_server.uploads.discard(desc.array_id, "enough")
         assert state.updated_at > 0
 
     def test_a_second_discard_does_not_extend_the_tombstone(
         self, writable_server, client
     ):
         """Otherwise a retrying caller could keep a tombstone alive forever."""
-        source_id = self._make_source(client)
-        writable_server.uploads.discard(source_id, "first")
-        first = writable_server.sources.get(source_id).upload.updated_at
+        desc = self._make_source(client)
+        writable_server.uploads.discard(desc.array_id, "first")
+        first = writable_server.sources.get(desc.array_id).upload.updated_at
 
-        writable_server.uploads.discard(source_id, "second")
+        writable_server.uploads.discard(desc.array_id, "second")
 
-        assert writable_server.sources.get(source_id).upload.updated_at == first
+        assert writable_server.sources.get(desc.array_id).upload.updated_at == first
 
     def test_a_straggler_does_not_extend_the_tombstone(self):
         """The mark guard returns before touching the clock."""
@@ -1936,10 +1935,10 @@ class TestDiscard:
         """A monotonic reading means nothing in another process, so it is not in
         the status contract. A client-facing "discarded at" would be a wall clock
         and a separate field."""
-        source_id = self._make_source(client)
-        writable_server.uploads.discard(source_id, "x")
+        desc = self._make_source(client)
+        writable_server.uploads.discard(desc.array_id, "x")
 
-        assert "updated_at" not in client.get_upload_status(source_id)
+        assert "updated_at" not in client.get_upload_status(desc.array_id)
 
 
 def _durable_upload(server):
@@ -1950,7 +1949,7 @@ def _durable_upload(server):
         chunk_shape=[4, 4],
         dim_labels=["y", "x"],
     )
-    return server.uploads.create_source(req_desc)
+    return server.uploads.create_tensor(req_desc)
 
 
 def test_a_durable_upload_lands_in_the_servers_catalog():

@@ -109,7 +109,7 @@ class SourceRegistry:
         creates of one name cannot both be told they own it. The caller still
         owns *adapter* on a refusal and closes it.
 
-        Only an upload's ``create_source`` calls this rather than
+        Only an upload's ``create_tensor`` calls this rather than
         :meth:`register` directly: an upload name is caller-chosen, so a
         collision could mean someone else's data getting swapped in under an
         id already handed out. Discovery and the reconciler still call

@@ -162,19 +162,14 @@ class TestTensorFlightClientRoundTrip:
         assert server_client.cache_info()["size_bytes"] == initial_bytes
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_wait_for_upload_ready_rejects_a_catalog_source(self, server_client):
-        """Waiting on a source nobody uploaded fails fast (biopb/biopb#109).
+    def test_a_catalog_source_has_no_upload_status(self, server_client):
+        """A source nobody uploaded reports UNKNOWN, not PENDING (biopb/biopb#109).
 
         "test-tensor" is a registered on-disk source, so the server has no
-        upload record for it and reports UNKNOWN indefinitely. The client must
-        say so rather than poll until its timeout.
+        upload record for it. UNKNOWN is what a caller's poll loop stops on
+        at once, rather than waiting out a timeout on a state no poll moves.
         """
-        started = time.monotonic()
-        with pytest.raises(ValueError, match="tracks no upload"):
-            server_client.wait_for_upload_ready(
-                "test-tensor", timeout_seconds=30.0, poll_interval_seconds=0.5
-            )
-        assert time.monotonic() - started < 5.0
+        assert server_client.get_upload_status("test-tensor")["state"] == "UNKNOWN"
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_stride_view(self, server_client):

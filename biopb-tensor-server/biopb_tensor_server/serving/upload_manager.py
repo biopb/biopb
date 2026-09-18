@@ -63,6 +63,24 @@ UPLOAD_KINDS: Dict[str, Type[WritableSource]] = {
 }
 
 
+def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
+    """An upload-closed error as the wire sees it.
+
+    ``FlightCancelledError`` for both kinds -- the one thing a writer must act
+    on is *this upload is over* -- with the terminal state in ``extra_info`` on
+    the ``{"code", "reason"}`` convention the read path uses, so the client
+    switches on a field, not a substring. ``detail`` is the discard's reason.
+    """
+    payload = {
+        "code": exc.grpc_code,
+        "reason": exc.wire_reason,
+        "state": exc.state,
+        "source_id": exc.source_id,
+        "detail": getattr(exc, "reason", ""),
+    }
+    return flight.FlightCancelledError(str(exc), json.dumps(payload).encode())
+
+
 class UploadManager:
     """The DoPut boundary: picks the kind, registers, translates errors."""
 
@@ -115,7 +133,7 @@ class UploadManager:
         try:
             return adapter.finish()
         except UploadDiscardedError as e:
-            raise flight.FlightCancelledError(str(e)) from e
+            raise _refused(e) from e
 
     # -- write path ------------------------------------------------------------
 
@@ -141,13 +159,17 @@ class UploadManager:
         if why is None:
             return
         raise flight.FlightServerError(
-            f"create_source: {why}. The data plane advertises canonical order on "
+            f"create_tensor: {why}. The data plane advertises canonical order on "
             f"every source (biopb/biopb#596); transpose the array before "
             f"uploading."
         )
 
-    def create_source(self, req_desc: TensorDescriptor) -> TensorDescriptor:
-        """Create a source from a TensorDescriptor, return its resolved descriptor.
+    def create_tensor(self, req_desc: TensorDescriptor) -> TensorDescriptor:
+        """Create a single-tensor source from a TensorDescriptor, return its
+        resolved descriptor.
+
+        Named for what it declares -- one tensor -- so ``create_tensor`` stays
+        free for a multi-tensor source API.
 
         array_id format in request:
         - "cache:name" → cache-backed with given name
@@ -193,7 +215,7 @@ class UploadManager:
         if registered is None:
             close_adapter(adapter)
             raise flight.FlightServerError(
-                f"create_source: {req_desc.array_id!r} already exists as "
+                f"create_tensor: {req_desc.array_id!r} already exists as "
                 f"{source_id}. A name is taken for the life of the server, "
                 "finished or discarded included; upload under a new name, or "
                 f"'{prefix}:' for a server-minted one."
@@ -225,10 +247,11 @@ class UploadManager:
         sealed refuses. Adapters stay transport-agnostic, so their errors
         become Flight errors here.
 
-        Both refusals map to ``FlightCancelledError``: they share the one thing
-        a writer must act on -- this upload is over, stop sending -- and a
-        client discriminates on the type rather than the message
-        (biopb/biopb#1). Which of the two it was rides in the message.
+        Both refusals map to ``FlightCancelledError`` (:func:`_refused`): they
+        share the one thing a writer must act on -- this upload is over, stop
+        sending -- and a client discriminates on the type rather than the
+        message (biopb/biopb#1). Which of the two it was rides in
+        ``extra_info``.
         """
         table = reader.read_all()
         data_column = table.column(0)
@@ -245,7 +268,7 @@ class UploadManager:
         try:
             adapter.put_chunk(bounds, data_column, expected_shape, dtype)
         except UploadClosedError as e:
-            raise flight.FlightCancelledError(str(e)) from e
+            raise _refused(e) from e
         except (ValueError, WriteNotSupportedError) as e:
             raise flight.FlightServerError(str(e)) from e
 
@@ -261,7 +284,7 @@ class UploadManager:
 
         A bare ``json.loads`` would raise ``JSONDecodeError``: on the DoPut path
         it is swallowed by the command-discrimination try (mis-surfaced as
-        "Invalid upload command"), and on the ``create_source`` Flight action it
+        "Invalid upload command"), and on the ``create_tensor`` Flight action it
         escapes as a generic internal error. Either way the client gets no
         actionable signal, so map it to ``FlightServerError`` here (biopb/biopb#354).
 

@@ -379,7 +379,7 @@ def _start_embedded_tensor_cache(
     location = f"grpc://{tensor_host}:{tensor_port}"
 
     # Read-only over Flight: results are written in-process (adapter.write_chunk),
-    # so the Flight write path (do_put / create_source) is pure attack surface here.
+    # so the Flight write path (do_put / create_tensor) is pure attack surface here.
     # Read-back is gated by per-source capability tokens (adapter.capability_token).
     # No catalog (metadata_db=None): a result is addressed by the source_id its
     # SerializedTensor carries, so there is nothing here to browse and the

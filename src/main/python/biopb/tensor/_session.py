@@ -16,7 +16,6 @@ from ``biopb.tensor.client``.
 
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -169,12 +168,16 @@ class ResolveCancelled(Exception):
     """
 
 
-def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
-    """Extract upload-status source_id from a registration-first SerializedTensor."""
-    source_id = pb.tensor_descriptor.array_id
-    if not source_id:
-        raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
-    return source_id
+def _upload_status_dict(source_id: str, status: UploadStatusPb) -> Dict[str, Any]:
+    """The one shape an upload status takes on the SDK, for the poll and for
+    ``finish_upload`` alike."""
+    return {
+        "source_id": source_id,
+        "state": UploadStatusPb.State.Name(status.state),
+        "expected_chunks": status.expected_chunks,
+        "uploaded_chunks": status.uploaded_chunks,
+        "reason": status.reason,
+    }
 
 
 def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
@@ -182,7 +185,7 @@ def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
 
     Mirrors the server's own ``unknown_upload_status`` so the two ends agree on
     the shape, and never means "not started yet": the record exists from the
-    moment ``create_source`` hands out the id.
+    moment ``create_tensor`` hands out the id.
     """
     return {
         "source_id": source_id,
@@ -1020,72 +1023,7 @@ class CatalogClient:
             # Distinct from PENDING, and no amount of polling moves it
             # (biopb/biopb#109).
             return _unknown_upload_status(source_id)
-        status = desc.upload_status
-        return {
-            "source_id": source_id,
-            "state": UploadStatusPb.State.Name(status.state),
-            "expected_chunks": status.expected_chunks,
-            "uploaded_chunks": status.uploaded_chunks,
-            "reason": status.reason,
-        }
-
-    def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
-        """Backs TensorFlightClient.get_upload_status_pb; see that method for the full
-        documentation."""
-        return self.get_upload_status(_upload_source_id_from_pb(pb))
-
-    def wait_for_upload_ready(
-        self,
-        source_id: str,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Backs TensorFlightClient.wait_for_upload_ready; see that method for the full
-        documentation."""
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            status = self.get_upload_status(source_id)
-            state = status.get("state")
-            if state == "READY":
-                return status
-            if state == "UNKNOWN":
-                # Nothing to wait for, so fail now instead of polling to the
-                # timeout (biopb/biopb#109). The server records upload progress
-                # when create_source() hands out the id, so UNKNOWN never means
-                # "not started yet" -- it means there is no upload record at
-                # all, which no amount of polling will change.
-                raise ValueError(
-                    f"The server tracks no upload for source '{source_id}' "
-                    "(not an upload target, or its record was dropped by a "
-                    "server restart or source removal)."
-                )
-            if state == "DISCARDED":
-                # The owner gave up on this upload (biopb/biopb#1). Terminal, so
-                # it is a prompt answer rather than a poll to the timeout -- and
-                # the reason is the whole point of reporting it.
-                reason = status.get("reason") or "no reason given"
-                raise RuntimeError(
-                    f"Upload discarded for source '{source_id}': {reason}"
-                )
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for upload readiness for source '{source_id}'"
-                )
-            time.sleep(poll_interval_seconds)
-
-    def wait_for_upload_ready_pb(
-        self,
-        pb: SerializedTensor,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Backs TensorFlightClient.wait_for_upload_ready_pb; see that method for the full
-        documentation."""
-        return self.wait_for_upload_ready(
-            _upload_source_id_from_pb(pb),
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
-        )
+        return _upload_status_dict(source_id, desc.upload_status)
 
     def add_source(
         self,

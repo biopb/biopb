@@ -181,7 +181,16 @@ class UploadClosedError(Exception):
     of enumerating the pair. Off the ``ValueError`` hierarchy for the same
     reason as :class:`WriteNotSupportedError`. Not raised directly -- catch one
     of the two subclasses to discriminate why.
+
+    ``wire_reason`` and ``state`` are what the boundary puts in the Flight
+    error's ``extra_info`` (beside the canonical ``CANCELLED`` code), so a
+    client raises one typed exception with the terminal state as a field
+    rather than parsing it out of the message (biopb/biopb#1048 step 7).
     """
+
+    grpc_code = "CANCELLED"
+    wire_reason = "upload_closed"
+    state = ""
 
 
 class UploadDiscardedError(UploadClosedError):
@@ -191,6 +200,9 @@ class UploadDiscardedError(UploadClosedError):
     job still unwinding learns it was given up on rather than that its source
     is missing. The reason rides in the message.
     """
+
+    wire_reason = "upload_discarded"
+    state = "DISCARDED"
 
     def __init__(self, source_id: str, reason: str = "") -> None:
         super().__init__(
@@ -209,6 +221,9 @@ class UploadSealedError(UploadClosedError):
     already have read what is there. Accepting a later write would change bytes
     someone has seen.
     """
+
+    wire_reason = "upload_sealed"
+    state = "READY"
 
     def __init__(self, source_id: str) -> None:
         super().__init__(

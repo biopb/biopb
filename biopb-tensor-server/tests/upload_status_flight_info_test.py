@@ -19,33 +19,30 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 
 def _make(client, name="cache:status", shape=(4, 4), chunk=(2, 2)):
-    return client.create_source(
-        source_name=name, shape=shape, dtype="<u2", chunk_shape=chunk
+    return client.create_tensor(
+        name, np.empty(shape, dtype=np.uint16), chunk_shape=chunk
     )
 
 
-def _put(client, source_id, start, stop):
+def _put(client, desc, start, stop):
     data = np.full(
         [b - a for a, b in zip(start, stop, strict=True)], 7, dtype=np.uint16
     )
-    client.upload_chunk(
-        source_id, ChunkBounds(start=list(start), stop=list(stop)), data
-    )
+    client.upload_chunk(desc, ChunkBounds(start=list(start), stop=list(stop)), data)
 
 
 class TestOnTheDescriptor:
     def test_a_fresh_upload_reports_pending_with_its_grid(self, client):
-        source_id = _make(client)
-        desc = client.get_descriptor(source_id, with_upload_status=True)
+        desc = client.get_descriptor(_make(client).array_id, with_upload_status=True)
         assert desc.HasField("upload_status")
         assert desc.upload_status.state == UploadStatusPb.PENDING
         assert desc.upload_status.expected_chunks == 4  # 4x4 in 2x2
         assert desc.upload_status.uploaded_chunks == 0
 
     def test_it_advances_as_chunks_land(self, client):
-        source_id = _make(client)
-        _put(client, source_id, (0, 0), (2, 2))
-        desc = client.get_descriptor(source_id, with_upload_status=True)
+        desc = _make(client)
+        _put(client, desc, (0, 0), (2, 2))
+        desc = client.get_descriptor(desc.array_id, with_upload_status=True)
         assert desc.upload_status.uploaded_chunks == 1
         assert desc.upload_status.state == UploadStatusPb.PENDING
 
@@ -86,33 +83,29 @@ class TestCapabilityHolderCanPoll:
     """
 
     def test_the_capability_opens_the_status(self, writable_server):
-        source_id = _make(
-            TensorFlightClient(f"grpc://localhost:{writable_server.port}")
-        )
-        adapter = writable_server.sources.get(source_id)
+        desc = _make(TensorFlightClient(f"grpc://localhost:{writable_server.port}"))
+        adapter = writable_server.sources.get(desc.array_id)
         adapter.capability_token = "cap-token"
 
         holder = TensorFlightClient(
             f"grpc://localhost:{writable_server.port}", token="cap-token"
         )
         try:
-            desc = holder.get_descriptor(source_id, with_upload_status=True)
+            desc = holder.get_descriptor(desc.array_id, with_upload_status=True)
             assert desc.upload_status.state == UploadStatusPb.PENDING
         finally:
             holder.close()
 
     def test_a_stranger_is_refused(self, writable_server):
-        source_id = _make(
-            TensorFlightClient(f"grpc://localhost:{writable_server.port}")
-        )
-        writable_server.sources.get(source_id).capability_token = "cap-token"
+        desc = _make(TensorFlightClient(f"grpc://localhost:{writable_server.port}"))
+        writable_server.sources.get(desc.array_id).capability_token = "cap-token"
 
         stranger = TensorFlightClient(
             f"grpc://localhost:{writable_server.port}", token="wrong"
         )
         try:
             with pytest.raises(flight.FlightUnauthenticatedError):
-                stranger.get_descriptor(source_id)
+                stranger.get_descriptor(desc.array_id)
         finally:
             stranger.close()
 
@@ -122,10 +115,10 @@ class TestDiscarded:
         """Describe is not a chunk read, so it never reaches
         `_refuse_if_discarded` -- a poller learns why instead of meeting a dead
         call. Its bytes stay unreadable; only the status is."""
-        source_id = _make(client, shape=(2, 2), chunk=(2, 2))
-        writable_server.uploads.discard(source_id, "job died")
+        desc = _make(client, shape=(2, 2), chunk=(2, 2))
+        writable_server.uploads.discard(desc.array_id, "job died")
 
-        desc = client.get_descriptor(source_id, with_upload_status=True)
+        desc = client.get_descriptor(desc.array_id, with_upload_status=True)
         assert desc.upload_status.state == UploadStatusPb.DISCARDED
         assert desc.upload_status.reason == "job died"
 
@@ -134,7 +127,7 @@ class TestTheActionIsGone:
     def test_upload_status_is_not_advertised(self, client):
         advertised = {a.type for a in client._state.client.list_actions()}
         assert "upload_status" not in advertised
-        assert "create_source" in advertised  # the listing itself still works
+        assert "create_tensor" in advertised  # the listing itself still works
 
     def test_calling_it_fails(self, client):
         """Deleted rather than gated: the policy is satisfied by removing the
@@ -152,19 +145,19 @@ class TestNotCached:
         """A cached PENDING would shadow the READY a later poll came for --
         turning the one field whose purpose is freshness into the stalest thing
         in the session."""
-        source_id = _make(client, shape=(2, 2), chunk=(2, 2))
-        client.get_descriptor(source_id)  # seeds the structural cache
+        desc = _make(client, shape=(2, 2), chunk=(2, 2))
+        client.get_descriptor(desc.array_id)  # seeds the structural cache
 
-        cached = client._state.descriptors.get(source_id)
+        cached = client._state.descriptors.get(desc.array_id)
         assert cached is not None, "the probe should have seeded the cache"
         assert not cached.HasField("upload_status")
 
     def test_a_second_poll_sees_new_progress(self, client):
         """The end-to-end consequence: polling is live, not memoized."""
-        source_id = _make(client, shape=(2, 2), chunk=(2, 2))
-        assert client.get_upload_status(source_id)["uploaded_chunks"] == 0
-        _put(client, source_id, (0, 0), (2, 2))
-        status = client.get_upload_status(source_id)
+        desc = _make(client, shape=(2, 2), chunk=(2, 2))
+        assert client.get_upload_status(desc.array_id)["uploaded_chunks"] == 0
+        _put(client, desc, (0, 0), (2, 2))
+        status = client.get_upload_status(desc.array_id)
         assert status["uploaded_chunks"] == 1
         # Still PENDING with its grid full: the count reports progress and
         # decides nothing, since `finish` is the only route to READY
@@ -175,7 +168,7 @@ class TestNotCached:
 class TestSdkDictShape:
     def test_unknown_for_a_source_with_no_upload(self, client, writable_server):
         """Distinct from PENDING: no amount of polling moves it, which is what
-        `wait_for_upload_ready` rejects on the first pass."""
+        a caller's poll loop stops on at once."""
         status = client.get_upload_status("cache_does_not_exist")
         assert status["state"] == "UNKNOWN"
         assert status["expected_chunks"] == 0
@@ -183,8 +176,8 @@ class TestSdkDictShape:
     def test_the_dict_keeps_its_shape(self, client):
         """The wire moved; the SDK's answer did not. `biopb_image_base` mirrors
         this dict in-process, and the two should stay the same shape."""
-        source_id = _make(client)
-        status = client.get_upload_status(source_id)
+        desc = _make(client)
+        status = client.get_upload_status(desc.array_id)
         assert set(status) == {
             "source_id",
             "state",
@@ -192,5 +185,5 @@ class TestSdkDictShape:
             "uploaded_chunks",
             "reason",
         }
-        assert status["source_id"] == source_id
+        assert status["source_id"] == desc.array_id
         assert status["state"] == "PENDING"
