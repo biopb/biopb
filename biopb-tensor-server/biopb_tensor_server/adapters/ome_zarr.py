@@ -13,7 +13,12 @@ from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
-from biopb_tensor_server.adapters.zarr import ZarrAdapter
+from biopb_tensor_server.adapters.zarr import (
+    UPLOAD_PENDING,
+    ZarrAdapter,
+    is_unfinished_upload,
+    with_upload_state,
+)
 from biopb_tensor_server.core.adapter_base import catalog_entry
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
@@ -282,6 +287,8 @@ class OmeZarrAdapter(ZarrAdapter):
         zattrs_ctx = ctx.join(".zattrs")
         if not zattrs_ctx.exists():
             return None
+        if is_unfinished_upload(ctx):
+            return None
 
         # Cloud-storage phase 2: if the .zattrs sidecar is a non-resident cloud
         # placeholder, reading it would trigger a whole-file recall (or block
@@ -478,12 +485,19 @@ class OmeZarrAdapter(ZarrAdapter):
         request must not leave a partial store behind, since ``zarr.create``
         refuses an existing one and the orphan would block a corrected retry
         under the same name (biopb/biopb#354).
+
+        The store is born carrying the ``pending`` upload marker, so a crash
+        before ``finish`` leaves something a restart recognizes and removes
+        rather than a partial store discovery would serve (biopb/biopb#1059).
         """
         import zarr
 
         if write_dir is None:
             raise ValueError("write_dir not configured for zarr-backed sources")
-        zattrs = metadata if metadata is not None else minimal_ome_metadata(desc)
+        zattrs = with_upload_state(
+            metadata if metadata is not None else minimal_ome_metadata(desc),
+            UPLOAD_PENDING,
+        )
 
         zarr_name = name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
         zarr_path = write_dir / f"{zarr_name}.zarr"
@@ -501,6 +515,7 @@ class OmeZarrAdapter(ZarrAdapter):
         adapter = cls(
             arr, source_id, list(desc.dim_labels) if desc.dim_labels else None
         )
+        adapter._upload_store_path = zarr_path
         adapter.begin_upload(desc.shape, desc.chunk_shape)
         return adapter
 

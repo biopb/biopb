@@ -923,7 +923,9 @@ class ServerConfig:
         default=None,
         metadata={
             "help": "Directory for zarr-backed uploaded sources (unset = no zarr "
-            "uploads)."
+            "uploads). Keep it outside every source directory: an uploaded "
+            "store is registered by the upload path, and discovery walking it "
+            "too would catalog it a second time."
         },
     )
     cache: CacheConfig = field(default_factory=CacheConfig)

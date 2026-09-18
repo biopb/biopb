@@ -12,12 +12,12 @@ consulted before every write, by hand, in three places.
 :class:`WritableSource` is a mixin for the two writable formats
 (``CachedSourceAdapter``, ``ZarrAdapter``). It owns the shared half --
 progress, status, disposal -- and leaves the format its own half: how a chunk
-is stored (``_store_chunk``) and how an upload of this kind is created
-(``create_upload``). Disposal (``discard``) is shared too, gated by the
-``durable`` flag: a durable kind (a real store on disk, catalogued) refuses it
-outright rather than overriding the method. The DoPut boundary
-(``serving.upload_manager``) picks the kind, registers the result and
-translates exceptions; nothing else about an upload lives there.
+is stored (``_store_chunk``), how an upload of this kind is created
+(``create_upload``), and what its store needs told when the upload ends
+(``_dispose_store`` on discard, ``_mark_store_finished`` on finish). The DoPut
+boundary (``serving.upload_manager``) picks the kind, registers the result,
+keeps the catalog row of a ``durable`` kind in step, and translates
+exceptions; nothing else about an upload lives there.
 
 Wrappers: ``SourceRegistry.register`` may wrap an adapter (``normalize_adapter``),
 and a wrapper forwards attributes rather than inheriting this class. Uploads are
@@ -175,9 +175,11 @@ class WritableSource:
     #: A durable upload owns bytes that outlive the process (a store on disk)
     #: and belongs in the catalog. A volatile one is readable by its returned id
     #: only: it has no removal hook, so a catalog row would dangle after
-    #: eviction (biopb/biopb#265). Durable uploads also own something disposal
-    #: can't release (a store on disk, a catalog row), so the base ``discard``
-    #: below refuses for them.
+    #: eviction (biopb/biopb#265). The flag is the boundary's cue to keep the
+    #: catalog row in step -- written at create, dropped at discard -- and the
+    #: store itself is the kind's own to release (``_dispose_store``): it was
+    #: minted under the server's ``write_dir``, so it is the server's to throw
+    #: away (biopb/biopb#1059).
     durable: bool = False
 
     #: Every host class sets this before ``begin_upload`` is reachable; declared
@@ -222,6 +224,25 @@ class WritableSource:
         """
         raise NotImplementedError
 
+    def _dispose_store(self) -> None:  # noqa: B027 - concrete no-op default
+        """Release the backing store once the upload is discarded.
+
+        Called after the DISCARDED transition, **outside** ``progress.lock``,
+        exactly once per upload. A kind whose bytes live only in the chunk
+        cache has nothing to do (the LRU reclaims them); a kind with a store on
+        disk removes it here. Must be safe against a write that passed
+        :meth:`_refuse_write` a moment earlier -- the kind serializes the two.
+        """
+
+    def _mark_store_finished(self) -> None:  # noqa: B027 - concrete no-op default
+        """Persist that the upload is complete, once it is READY.
+
+        Called after the READY transition, outside ``progress.lock``, once. A
+        durable store carries a pending marker from creation so a crash leaves
+        something a restart can recognize and remove; this is where the marker
+        is cleared.
+        """
+
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
         """The descriptor ``create_tensor`` answers with.
 
@@ -251,33 +272,31 @@ class WritableSource:
         first reason wins, and with it the first timestamp -- a second discard
         must not extend the tombstone's life.
 
-        Refuses for a durable kind (``ZarrAdapter``): a real ``.zarr`` on disk
-        and a catalog row are not this call's to release.
+        A durable kind releases its store on the first discard
+        (:meth:`_dispose_store`); its catalog row is the boundary's to drop.
         """
         source_id = self.source_id
-        if self.durable:
-            raise ValueError(
-                f"discard: {source_id} is not a cache-backed upload. A "
-                "zarr-backed source owns a .zarr directory and a catalog row, "
-                "which this does not remove."
-            )
         progress = self._upload
         if progress is None:
             return unknown_upload_status(source_id)
         with progress.lock:
-            self._discard_locked(progress, reason)
-            return progress.as_status_dict(source_id)
+            transitioned = self._discard_locked(progress, reason)
+            status = progress.as_status_dict(source_id)
+        if transitioned:
+            self._dispose_store()
+        return status
 
     def _discard_locked(
         self, progress: UploadProgress, reason: str, now: Optional[float] = None
-    ) -> None:
+    ) -> bool:
         """The DISCARDED transition; caller holds ``progress.lock``.
 
-        *now* stamps the tombstone on the sweep's clock when expiry is the
-        cause, so its age is measured from the same instant the sweep judged
-        the upload dead."""
+        Returns whether this call made the transition, so the caller can run
+        :meth:`_dispose_store` once, after releasing the lock. *now* stamps the
+        tombstone on the sweep's clock when expiry is the cause, so its age is
+        measured from the same instant the sweep judged the upload dead."""
         if progress.is_discarded:
-            return
+            return False
         progress.status = UploadStatus.DISCARDED
         progress.reason = reason
         # No more chunks will arrive, so the ids are dead weight for as long
@@ -286,6 +305,7 @@ class WritableSource:
         progress.uploaded_chunk_ids = set()
         progress.touch(now)
         logger.info(f"Discarded upload {self.source_id}: {reason or 'no reason given'}")
+        return True
 
     def reap_step(self, now: float, ttl: float) -> Tuple[bool, Optional[float]]:
         """The reclaim sweep's two questions for this upload, one lock hold.
@@ -297,8 +317,7 @@ class WritableSource:
           a second path into oblivion. The check and the transition share the
           lock hold so a ``finish`` racing the sweep either lands first (and
           the upload stays READY) or is refused as discarded; it can never be
-          undone. Never true for a durable kind, whose disposal is not this
-          method's (see :meth:`discard`).
+          undone. A durable kind's store goes with it (:meth:`_dispose_store`).
         - *tombstone_age*: seconds since this upload was discarded, or
           ``None`` if it was not -- including right after this call just
           discarded it, since a fresh tombstone's age is not yet the sweep's
@@ -308,16 +327,16 @@ class WritableSource:
         if progress is None:
             return False, None
         with progress.lock:
-            if (
-                not self.durable
-                and progress.status is UploadStatus.PENDING
-                and progress.idle_for(now) > ttl
-            ):
+            if progress.status is UploadStatus.PENDING and progress.idle_for(now) > ttl:
                 self._discard_locked(progress, f"expired: no write for {ttl:g} s", now)
-                return True, None
-            if progress.is_discarded:
-                return False, progress.idle_for(now)
-            return False, None
+                expired = True
+            else:
+                expired = False
+            age = progress.idle_for(now) if progress.is_discarded else None
+        if expired:
+            self._dispose_store()
+            return True, None
+        return False, age
 
     def finish(self) -> Dict[str, Any]:
         """Seal this upload: PENDING -> READY, no further chunks.
@@ -339,14 +358,18 @@ class WritableSource:
         with progress.lock:
             if progress.is_discarded:
                 raise UploadDiscardedError(self.source_id, progress.reason)
-            if progress.status is not UploadStatus.READY:
+            sealed_now = progress.status is not UploadStatus.READY
+            if sealed_now:
                 progress.status = UploadStatus.READY
                 progress.touch()
                 logger.info(
                     f"Finished upload {self.source_id}: "
                     f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
                 )
-            return progress.as_status_dict(self.source_id)
+            status = progress.as_status_dict(self.source_id)
+        if sealed_now:
+            self._mark_store_finished()
+        return status
 
     # -- the shared half -------------------------------------------------------
 

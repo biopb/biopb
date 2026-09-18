@@ -7,8 +7,9 @@
 - a tombstone that has stood for ``ttl`` seconds is **unregistered**: its
   status reads UNKNOWN and its name is free again.
 
-Finished uploads are published results and are never reclaimed; durable kinds
-are on disk and in the catalog, which the sweep does not disown.
+Finished uploads are published results and are never reclaimed. A durable kind
+is swept like any other: the store and the catalog row were the server's own
+(biopb/biopb#1059), so a discard takes both with it.
 """
 
 import time
@@ -84,9 +85,11 @@ class TestAQuietUploadExpires:
         assert uploads.reap(now=_past_ttl()) == (0, 0)
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
-    def test_a_durable_upload_is_left_alone(self, uploads, client):
-        """A zarr upload owns a store on disk and a catalog row, which discard
-        refuses to disown -- so the sweep leaves it PENDING and writable."""
+    def test_a_quiet_durable_upload_is_discarded_and_its_store_removed(
+        self, uploads, client, writable_server, tmp_path
+    ):
+        """A zarr upload's store and catalog row were the server's own, so the
+        sweep disposes of both (biopb/biopb#1059)."""
         desc = uploads.create_tensor(
             TensorDescriptor(
                 array_id="ome_zarr:quiet",
@@ -96,9 +99,19 @@ class TestAQuietUploadExpires:
                 dim_labels=["y", "x"],
             )
         )
+        assert (tmp_path / "quiet.zarr").is_dir()
 
-        assert uploads.reap(now=_past_ttl()) == (0, 0)
-        assert client.get_upload_status(desc.array_id)["state"] == "PENDING"
+        assert uploads.reap(now=_past_ttl()) == (1, 0)
+
+        status = client.get_upload_status(desc.array_id)
+        assert status["state"] == "DISCARDED"
+        assert "expired" in status["reason"]
+        assert not (tmp_path / "quiet.zarr").exists()
+        rows = writable_server.metadata_db.query("SELECT source_id FROM sources")
+        assert desc.array_id not in rows.column(0).to_pylist()
+
+        assert uploads.reap(now=_past_ttl(margin=2 * TTL)) == (0, 1)
+        assert desc.array_id not in writable_server.sources
 
     def test_a_zero_ttl_disables_the_sweep(self, uploads, client):
         desc = _make(client)

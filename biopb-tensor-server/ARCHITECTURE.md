@@ -89,7 +89,7 @@ in three collaborators it composes:
 |---|---|---|
 | `server.sources` | `SourceRegistry` |  The `source_id → SourceAdapter` map and adapter-lifecycle |
 | `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
-| `server.uploads` | `UploadManager` | The writable-server DoPut boundary: picks the upload kind by `array_id` prefix (`cache:`/`ome_zarr:`), registers what the adapter class builds, translates adapter errors to Flight errors. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a registered tombstone, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet and unregisters aged tombstones |
+| `server.uploads` | `UploadManager` | The writable-server DoPut boundary: picks the upload kind by `array_id` prefix (`cache:`/`ome_zarr:`), registers what the adapter class builds, translates adapter errors to Flight errors. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a registered tombstone, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet and unregisters aged tombstones. A durable (`ome_zarr:`) upload is swept like any other: its store is the server's own under `write_dir`, so discard removes it and drops the catalog row, and a store still marked pending at startup is a crashed upload and is deleted before discovery runs |
 
 ### Flight protocol (v2)
 

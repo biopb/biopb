@@ -46,6 +46,7 @@ from biopb_tensor_server.serving.http_server import run as run_http_server
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
+from biopb_tensor_server.serving.upload_manager import write_dir_under_root
 from biopb_tensor_server.sources.resolve import resolve_all_sources
 from biopb_tensor_server.sources.source_manager import create_source_manager
 
@@ -921,6 +922,20 @@ def _setup_flight_server(
     monitored_dirs = {
         ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
     }
+    # An uploaded store is registered by the upload path; a write_dir that
+    # discovery also walks gets it claimed a second time under another id.
+    discovered_dirs = monitored_dirs | {
+        s.local_path
+        for s in static_sources
+        if not s.is_remote and s.local_path and s.local_path.is_dir()
+    }
+    inside = write_dir_under_root(write_dir, discovered_dirs)
+    if inside is not None:
+        console.print(
+            f"[yellow]⚠ write_dir {write_dir} lies inside the discovered "
+            f"directory {inside}: uploaded stores will be catalogued twice. "
+            "Point write_dir outside every source directory.[/yellow]"
+        )
     rescan_interval = (
         0.0 if server_config.monitor_mode == "off" else server_config.rescan_interval
     )

@@ -11,6 +11,11 @@ here is only what a boundary does:
   errors; this is where they become Flight errors.
 - **Lookup** -- ``status`` / ``finish`` / ``discard`` / ``write_chunk`` find the
   adapter and hand over.
+- **Reclamation** -- ``reap`` sweeps the registry by ``updated_at`` on a
+  daemon thread (``upload_ttl``), and ``discard_unfinished_stores`` removes at
+  startup what a crashed server left behind. The catalog row of a ``durable``
+  kind is dropped here when its upload is discarded, by either route; the
+  store itself is the adapter's own to release.
 - **Reclamation** -- ``reap`` sweeps the registry by each upload's
   ``updated_at``: a PENDING upload quiet past ``ttl`` is discarded (a job that
   died), and a tombstone older than ``ttl`` is unregistered. The sweep thread
@@ -30,10 +35,11 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, Dict, Iterable, Optional, Tuple, Type
 
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -47,6 +53,7 @@ from biopb_tensor_server.adapters._writable import (
 )
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.errors import (
     UploadClosedError,
@@ -56,7 +63,13 @@ from biopb_tensor_server.core.errors import (
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
-__all__ = ["DEFAULT_UPLOAD_TTL", "UPLOAD_KINDS", "UploadManager", "UploadStatus"]
+__all__ = [
+    "DEFAULT_UPLOAD_TTL",
+    "UPLOAD_KINDS",
+    "UploadManager",
+    "UploadStatus",
+    "write_dir_under_root",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +87,29 @@ UPLOAD_KINDS: Dict[str, Type[WritableSource]] = {
     "cache": CachedSourceAdapter,
     "ome_zarr": OmeZarrAdapter,
 }
+
+
+def write_dir_under_root(
+    write_dir: Optional[Path], roots: Iterable[Path]
+) -> Optional[Path]:
+    """The discovery root that contains *write_dir*, if any.
+
+    A store minted under ``write_dir`` is registered by the upload path under
+    its own id. If discovery also walks that directory, a finished store is
+    claimed a second time under discovery's id -- listed twice, served twice --
+    and an unfinished one is only kept out by the claims checking the upload
+    marker. So ``write_dir`` belongs outside every discovered directory; the
+    launcher warns when it is not (biopb/biopb#1059). Compared resolved, so a
+    symlinked root still matches.
+    """
+    if write_dir is None:
+        return None
+    target = write_dir.resolve()
+    for root in roots:
+        resolved = root.resolve()
+        if target == resolved or resolved in target.parents:
+            return root
+    return None
 
 
 def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
@@ -127,13 +163,62 @@ class UploadManager:
 
         Total: a source that is not tracking an upload -- never was, or has
         since been reclaimed -- reads UNKNOWN rather than raising, so a retry
-        after the tombstone is gone is not an error. A kind that refuses raises
-        ``ValueError``; callers today are in-process, so it is not translated.
+        after the tombstone is gone is not an error. A durable kind's store
+        goes with the discard (the adapter's own), and its catalog row here.
         """
         adapter = self._registry.get(source_id)
         if upload_of(adapter) is None:
             return unknown_upload_status(source_id)
-        return adapter.discard(reason)
+        status = adapter.discard(reason)
+        self._drop_catalog_row(adapter, source_id)
+        return status
+
+    def _drop_catalog_row(self, adapter: WritableSource, source_id: str) -> None:
+        """Take a discarded durable upload out of the catalog.
+
+        The row was written at create (a durable upload is listed while it
+        fills), so a tombstone would otherwise stay browsable with nothing
+        behind it. Idempotent, like the discard it follows. Best-effort for
+        the same reason the write was: the catalog must not fail the upload.
+        """
+        if not getattr(adapter, "durable", False) or self._metadata_db is None:
+            return
+        try:
+            self._metadata_db.sync_source_removed(source_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to drop discarded upload {source_id} from catalog: {e}"
+            )
+
+    def discard_unfinished_stores(self) -> int:
+        """Delete the stores of uploads a previous server never finished.
+
+        A durable store is born ``pending`` and marked ``ready`` by ``finish``
+        (``adapters.zarr`` upload marker). One still pending when this server
+        starts belonged to an upload whose progress died with the process;
+        nothing can finish it, so it is removed rather than left for
+        discovery to serve as a partial source. Runs from the server's
+        constructor, before any source is registered. Returns the count.
+
+        Top-level ``*.zarr`` directories of ``write_dir`` only, which is where
+        ``OmeZarrAdapter.create_upload`` mints them.
+        """
+        write_dir = self._write_dir
+        if write_dir is None or not write_dir.is_dir():
+            return 0
+        removed = 0
+        for store in sorted(write_dir.glob("*.zarr")):
+            zattrs = store / ".zattrs"
+            try:
+                state = upload_state(json.loads(zattrs.read_text()))
+            except (OSError, ValueError):
+                continue
+            if state != UPLOAD_PENDING:
+                continue
+            shutil.rmtree(store, ignore_errors=True)
+            removed += 1
+            logger.info(f"Removed unfinished upload store {store}")
+        return removed
 
     def finish(self, source_id: str) -> Dict[str, Any]:
         """Seal an upload; see ``WritableSource.finish``.
@@ -314,10 +399,10 @@ class UploadManager:
         tombstone in between.
 
         READY sources are not touched: a finished upload is a published
-        result, and its lifetime is its reader's, not this sweep's. Durable
-        kinds are not touched either -- their bytes are on disk and in the
-        catalog, which discard refuses to disown -- so a quiet ``ome_zarr``
-        upload stays PENDING and writable.
+        result, and its lifetime is its reader's, not this sweep's. A durable
+        kind is swept like any other: its store goes with the discard and its
+        catalog row is dropped here, since both were the server's own
+        (biopb/biopb#1059).
 
         The chunks a reclaimed tombstone wrote stay in the cache until the
         LRU evicts them. They are unreachable: a re-created name gets a fresh
@@ -338,6 +423,7 @@ class UploadManager:
                 continue
             expired_now, age = adapter.reap_step(now, ttl)
             if expired_now:
+                self._drop_catalog_row(adapter, source_id)
                 expired += 1
                 continue
             if age is not None and age > ttl:
