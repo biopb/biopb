@@ -32,10 +32,10 @@ copy would cost more than the miss it saves. ``_pool`` owns that gate.
 
 Security boundary: the OS user, not the token
 ---------------------------------------------
-The cache key is ``sha256(chunk_id)`` under a *location* digest. The bearer
-token is deliberately NOT part of it, unlike the in-process pools, which are
-keyed ``(location, token)``. So two tokens used by one OS user against one
-server share cached chunks.
+The cache key is ``sha256(chunk_id)`` under a digest of the *canonical* location
+(``_location``). The bearer token is deliberately NOT part of it, unlike the
+in-process pools, which are keyed ``(location, token)``. So two tokens used by
+one OS user against one server share cached chunks.
 
 That is sound only because the isolation is enforced one level down, by the
 filesystem: the tree is created owner-only (``0o700``), so the unit of
@@ -71,6 +71,7 @@ from dask.utils import parse_bytes
 from biopb._fs_detect import unsafe_cache_dir_reason
 from biopb._lifecycle.file_lock import ExclusiveFileLock
 from biopb._locations import cache_dir
+from biopb.tensor._location import canonical_location
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,21 @@ def _ensure_owner_only(root: Path) -> None:
         )
 
 
+def _mkdir_owner_only(leaf: Path, root: Path) -> None:
+    """Create *leaf* and every level of it below *root*, each owner-only.
+
+    ``Path.mkdir(parents=True)`` applies ``mode`` to the final component only, so
+    one call would leave the levels above it at the umask default. The 0o700 root
+    blocks traversal either way, but the tree should not depend on one
+    directory's mode for the whole boundary.
+    """
+    root.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
+    cur = root
+    for part in leaf.relative_to(root).parts:
+        cur = cur / part
+        cur.mkdir(mode=_DIR_MODE, exist_ok=True)
+
+
 def _parse_bytes_or(raw: Optional[str], default: Optional[int]) -> Optional[int]:
     if raw is None or not raw.strip():
         return default
@@ -262,12 +278,21 @@ def load_settings(env=None) -> Optional[Settings]:
 # Layout
 # ==============================================================================
 #
-# <root>/<location digest>/<ab>/<full digest>.arrow
+# <root>/<format>/<location digest>/<ab>/<full digest>.arrow
+#
+# The format component makes the entry layout and file encoding a named, bumpable
+# contract rather than an implicit one. A bump changes the directory, so entries
+# in the old form become unreachable rather than misread, and the sweeper reclaims
+# them on their own mtimes -- nothing re-reads them, so oldest-first eviction
+# takes them first. Bump on any change to the path shape or the stored bytes.
 #
 # The location digest is not optional: chunk_id embeds array_id, which is
 # server-*local*, not server-*unique*. In-process that is covered incidentally --
 # _CACHE_POOL is keyed (location, token), so the flat chunk_id.hex() cache key
-# never needed it -- but a persistent directory must put it back.
+# never needed it -- but a persistent directory must put it back. It hashes the
+# *canonical* spelling, so the same server keys alike however a caller wrote it
+# (``_location``); the raw string would give `grpc://h:1` and `grpc+tcp://h:1`
+# separate trees for one server.
 #
 # The chunk digest is sha256 of the WHOLE opaque chunk_id, deliberately not the
 # server's cache_key_for_chunk_id normalisation (which is server-side by design
@@ -278,14 +303,19 @@ def load_settings(env=None) -> Optional[Settings]:
 # One byte of sharding keeps getdents cheap on a large cache and lets a future
 # sweeper sample shards instead of ordering every file globally.
 
+# Entry layout + stored encoding. v1: one Arrow IPC stream per file holding a
+# single record batch in the server's unified chunk schema, [data: binary,
+# shape: list<int64>, dtype: string].
+FORMAT = "v1"
+
 
 def location_key(location: str) -> str:
-    return hashlib.sha256(location.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(canonical_location(location).encode("utf-8")).hexdigest()[:16]
 
 
 def chunk_path(root: Path, location: str, chunk_id: bytes) -> Path:
     digest = hashlib.sha256(chunk_id).hexdigest()
-    return root / location_key(location) / digest[:2] / f"{digest}{_SUFFIX}"
+    return root / FORMAT / location_key(location) / digest[:2] / f"{digest}{_SUFFIX}"
 
 
 # ==============================================================================
@@ -361,13 +391,7 @@ def write_batch(
     path = chunk_path(settings.root, location, chunk_id)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        # One level at a time: Path.mkdir applies `mode` only to the FINAL
-        # component, so a parents=True call would leave the location dir at the
-        # umask default. The 0o700 root blocks traversal either way, but the
-        # tree should not depend on one directory's mode for the whole boundary.
-        shard = path.parent
-        shard.parent.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
-        shard.mkdir(mode=_DIR_MODE, exist_ok=True)
+        _mkdir_owner_only(path.parent, settings.root)
         with pa.OSFile(str(tmp), "wb") as sink:
             with pa.ipc.new_stream(sink, batch.schema) as writer:
                 writer.write_batch(batch)

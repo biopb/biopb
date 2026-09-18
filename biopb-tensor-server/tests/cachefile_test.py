@@ -797,6 +797,18 @@ class TestLocalhostDetection:
 
         assert _is_localhost_location("grpc+tls://localhost:8815") is True
 
+    def test_grpc_tcp_scheme(self):
+        """The spelling Arrow's own Location factories emit. Read as remote, a
+        loopback server loses the fast path and gets the disk cache instead."""
+        from biopb.tensor._pool import _is_localhost_location
+
+        assert _is_localhost_location("grpc+tcp://localhost:8815") is True
+
+    def test_scheme_less_authority(self):
+        from biopb.tensor._pool import _is_localhost_location
+
+        assert _is_localhost_location("localhost:8815") is True
+
     def test_not_localhost_remote_ip(self):
         from biopb.tensor._pool import _is_localhost_location
 

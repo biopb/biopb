@@ -74,7 +74,17 @@ Two notes on why this exact key:
   server-local, not server-unique. Today that is covered incidentally, because
   `_CACHE_POOL` is keyed `(location, token)` and so the flat `chunk_id.hex()`
   cache key never needed it. A persistent dir must put it back, as the directory
-  name.
+  name — under the *canonical* spelling of the location, not the raw string.
+  Arrow round-trips whatever location string it is handed (`pyarrow.flight
+  .Location` preserves the input verbatim) and each binding's constructors pick
+  their own form: Java's `Location.forGrpcInsecure` emits `grpc+tcp://` where a
+  Python caller writes `grpc://`. Keyed raw, one server gets a tree per
+  spelling, and the cost is invisible — a permanent miss that looks exactly like
+  a cold cache. `biopb/tensor/_location.py` is the canonicalization, and its
+  rules are a contract, not an implementation detail: any SDK that shares this
+  tree has to derive the same string. Names are deliberately *not* resolved —
+  `localhost` and `127.0.0.1` stay distinct rather than put a DNS lookup on the
+  fetch path, and this cache never serves loopback anyway.
 - **Hash the whole `chunk_id`, not `cache_key_for_chunk_id`'s normalisation.**
   That function is server-side by design and unavailable here. Hashing the raw
   token over-keys relative to it (a legacy trailing method suffix keys
@@ -143,14 +153,29 @@ rm -rf ~/.cache/biopb/chunks     # %LOCALAPPDATA%\biopb\Cache\chunks on Windows
 
 ### Layout and location
 
-`<cache_root>/<hash(location)>/<ab>/<cdef…>.arrow`, one Arrow IPC message per
-file, written to `.tmp.<pid>.<tid>` then `os.rename` (atomic on the same
+`<cache_root>/<format>/<hash(location)>/<ab>/<cdef…>.arrow`, one Arrow IPC message
+per file, written to `.tmp.<pid>.<tid>` then `os.rename` (atomic on the same
 filesystem) so a reader never sees a torn file. No lockfiles on the write path: N
 workers racing the same miss cost N `do_get`s, which is exactly what happens today
 anyway.
 
 Two levels of hash-prefix sharding keep `getdents` cheap and let the sweeper work
 over sampled shards instead of globally ordering every file.
+
+**The leading `<format>` component** (`_diskcache.FORMAT`, currently `v1`) names
+the entry layout and the stored encoding — today, one Arrow IPC stream holding a
+single record batch in the server's unified chunk schema, `[data: binary, shape:
+list<int64>, dtype: string]`. Bump it on any change to either. A bump moves the
+whole tree, so entries in the old form become unreachable rather than misread,
+and no migration code is needed: nothing re-reads them, so their mtimes stay old
+and oldest-first eviction reclaims them first.
+
+This costs nothing while there is one reader and one writer shipping in the same
+wheel. It stops being free the moment a second SDK reads this tree on its own
+release schedule — a Fiji update is not a `pip install -U` — which is exactly the
+lockstep co-upgrade trap that got biopb/biopb#346 reverted. Naming the format is
+cheap now, before the cache is on by default and has an installed base, and
+awkward afterwards.
 
 **`/tmp` is the wrong default.** On many systems it is `tmpfs`, which would turn
 "unbounded disk" into unevictable RAM plus an mmap that is also RAM — strictly
@@ -470,6 +495,34 @@ plainly at the config surface.
 
 - **Config surface.** Environment variables only so far; nothing plumbs this
   through biopb-mcp's `dask.*` config the way `cache_budget` is plumbed.
+
+## A second SDK sharing this tree
+
+Undecided, and deliberately not built. The payoff of this cache is entirely
+cross-process and cross-session — the process taking the miss gains nothing — so
+two SDKs on one workstation reading one server want one tree, not two. Nothing in
+the design resists that: the stored file is the server's unified chunk batch,
+byte-identical to what `do_get` streams and already decoded by the Java client;
+the key is two hashes of opaque inputs, so it stays inside the #346 opacity
+contract; eviction needs no reader coordination, because `unlink`-while-mapped is
+safe and a miss is only a refetch; and the security boundary is the OS user and
+`0o700`, which is language-independent.
+
+It is not built because the premise is absent: Python and Java clients do not
+currently coexist on one machine. The two things that would be expensive to
+retrofit — a named format and a canonical location key — are done (above), so the
+option stays open at no ongoing cost. What is deliberately deferred is the rest:
+porting the eviction policy, cross-language golden vectors for the key, and
+plumbing `BIOPB_CHUNK_CACHE*` into a second runtime.
+
+The prior question is whether a second SDK should have this cache at all.
+`biopb-tensor-server/docs/remote-tensor-cache.md`'s proxy-first model — a local tensor server proxying the
+remote upstream — already solves remote chunk caching in the server, for any
+client, in one language; `RemoteTensorAdapter` inherits the persistent segment
+cache for free. A client paired with a local server is never really remote, and
+wants the `chunk_locate` fast path (`localhost-fast-path.md`) instead. This cache
+exists for the persona that refuses to stand one up, which Python has and Java
+may not. Settle that before building anything.
 
 ## Open questions
 
