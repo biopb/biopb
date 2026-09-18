@@ -141,16 +141,16 @@ class TestTheActionIsGone:
 
 
 class TestNotCached:
-    def test_the_descriptor_cache_does_not_keep_the_status(self, client):
+    def test_there_is_no_descriptor_cache_to_keep_it_in(self, client):
         """A cached PENDING would shadow the READY a later poll came for --
         turning the one field whose purpose is freshness into the stalest thing
-        in the session."""
+        in the session. The SDK keeps no descriptor at all now, so there is
+        nowhere for a stale status to live."""
         desc = _make(client, shape=(2, 2), chunk=(2, 2))
-        client.get_descriptor(desc.array_id)  # seeds the structural cache
+        client.get_descriptor(desc.array_id)
 
-        cached = client._state.descriptors.get(desc.array_id)
-        assert cached is not None, "the probe should have seeded the cache"
-        assert not cached.HasField("upload_status")
+        assert not hasattr(client._state, "descriptors")
+        assert not hasattr(client, "_descriptors")
 
     def test_a_second_poll_sees_new_progress(self, client):
         """The end-to-end consequence: polling is live, not memoized."""

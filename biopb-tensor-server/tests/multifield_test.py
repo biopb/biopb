@@ -696,10 +696,11 @@ class TestDescriptorCacheCollision:
             assert scale_b == [4.0, 0.1, 0.1]
             assert unit_b == ["um", "um", "um"]
 
-            # Both sources coexist: the qualified array_id is globally unique,
-            # so the two same-named fields cannot collide.
-            assert "aics_aaa/Image:0" in client._descriptors
-            assert "aics_bbb/Image:0" in client._descriptors
+            # Asked again, in the other order: each still answers with its own.
+            # Nothing is memoized between these calls, so a collision would have
+            # to come from the id itself, which is what this guards.
+            assert client.get_physical_scale("aics_bbb/Image:0")[0] == [4.0, 0.1, 0.1]
+            assert client.get_physical_scale("aics_aaa/Image:0")[0] == [2.0, 0.5, 0.5]
 
             client.close()
         finally:

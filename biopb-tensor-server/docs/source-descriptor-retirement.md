@@ -103,8 +103,27 @@ both first-party consumers keep their own (`TensorConnection.sources`, the SPA's
 be cached**. That check is now the server's, on the probe the call already
 makes, so it holds for every id.
 
-`_state.descriptors` stays: the per-array_id structural cache from GetFlightInfo
-(#795) is addressing facts, a different thing.
+`_state.descriptors` has since gone the same way, for the same reason one level
+down. The per-array_id structural cache (#795) held two grades of entry — rich
+from a GetFlightInfo response, poor from a catalog row — so an absent field meant
+either "the server says none" or "nobody has asked yet". That made
+`get_physical_scale` report no scale for a tensor whose scale the server had,
+whenever `resolve()` had seeded the entry first. It also had no invalidation at
+all, so a source rebuilt in place kept its old shape for the process's life.
+
+It turned out not to be buying anything: it existed to spare the read path a
+catalog lookup that the read path only needed because it resolved a descriptor
+before planning. `GetFlightInfo` already returns the tensor it bound, so the
+addressing refusals are read off that answer instead — the ambiguous-bare-id
+check (#75) fires only when the server's echoed `array_id` shows it substituted
+a default, and the unresolved steer is the server's refusal restated. A
+tile-shaped read now costs one RPC and no catalog query, which is one *fewer*
+round trip than the cached version managed. Only an open-ended slice `stop`
+still resolves first, because nothing but the tensor knows where it ends.
+
+Callers that want a descriptor memoized own that policy, and do it better: the
+sidecar keys its pyramid memo on `content_version`, bounds it, and declines to
+memoize a tensor with no version at all.
 
 Migrated consumers: the sidecar's `GET /api/sources`, `GET /api/sources/{id}`
 and `_tensor_candidates` (which listed the *whole* catalog to name alternatives

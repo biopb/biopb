@@ -342,18 +342,27 @@ class TestOmeZarrIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            # list_flights stays lean: no physical scale advertised there.
-            sources = client.list_sources()
-            listed = sources["phys"].tensors[0]
-            assert not listed.physical_scale
+            # The catalog stays lean: a row carries the structural fields only.
+            row = client.query_sources(
+                "SELECT is_resolved, tensors FROM sources WHERE source_id = 'phys'",
+                format="records",
+            )[0]
+            assert "physical_scale" not in row["tensors"][0]
 
-            # A normal get_tensor (with_metadata=False) populates the cached
-            # descriptor's summary; get_physical_scale reads it with no extra
-            # full-OME fetch.
-            client.get_tensor("phys")
+            # The summary rides the descriptor GetFlightInfo answers with, and
+            # get_physical_scale asks for it without the full OME tree.
             scale, unit = client.get_physical_scale("phys")
             assert list(scale) == [0.5, 0.25]
             assert list(unit) == ["micrometer", "micrometer"]
+
+            # Asked again after a catalog browse, which is what resolve() hands
+            # back. The SDK stores none of it, so a row -- which carries no
+            # scale -- cannot shadow the answer. It once did: resolve is
+            # mandatory on the cloud path, and a cache seeded from its row made
+            # this report "no scale recorded" for a tensor that had one.
+            client.query_sources("SELECT * FROM sources")
+            scale, _ = client.get_physical_scale("phys")
+            assert list(scale) == [0.5, 0.25]
 
             client.close()
         finally:

@@ -101,7 +101,7 @@ def _init_process_worker(location: str, use_cachefile: bool, barrier=None) -> No
 
     global _PROCESS_WORKER_CLIENT, _PROCESS_BARRIER
     _PROCESS_WORKER_CLIENT = TensorFlightClient(location, cache_bytes=0)
-    _PROCESS_WORKER_CLIENT.list_sources()
+    _PROCESS_WORKER_CLIENT.query_sources("SELECT source_id FROM sources")
     _PROCESS_BARRIER = barrier
     atexit.register(_cleanup_worker_client)
 
