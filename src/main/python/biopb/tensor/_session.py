@@ -170,6 +170,14 @@ class ResolveCancelled(Exception):
     """
 
 
+def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
+    """Extract upload-status source_id from a registration-first SerializedTensor."""
+    source_id = pb.tensor_descriptor.array_id
+    if not source_id:
+        raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
+    return source_id
+
+
 def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
     """The answer for a source the server tracks no upload for.
 
@@ -681,6 +689,7 @@ class CatalogClient:
         with_metadata: bool = False,
         with_pyramid: bool = False,
         with_read_plan: bool = False,
+        cache: bool = True,
     ) -> "TensorDescriptor":
         """Fetch one tensor's descriptor directly from the server (internal).
 
@@ -714,7 +723,10 @@ class CatalogClient:
         structural part of the response to ``self._state.descriptors`` (keyed by
         the echoed-back array_id) for the readers that want addressing facts --
         see :func:`_structural_descriptor` for what that keeps and why the
-        masked-off parts are deliberately not stored (biopb/biopb#795).
+        masked-off parts are deliberately not stored (biopb/biopb#795). Pass
+        ``cache=False`` to skip that write, for a caller (like a poll loop)
+        that has no use for the structural cache and would otherwise pay a
+        protobuf copy plus a dict mutation on every tick.
         """
         cmd = _tensor_read_cmd(
             array_id,
@@ -740,7 +752,8 @@ class CatalogClient:
                 raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
             raise
         tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
-        self._state.cache_descriptor(tensor_desc)
+        if cache:
+            self._state.cache_descriptor(tensor_desc)
         return tensor_desc
 
     def get_descriptor(
@@ -941,9 +954,13 @@ class CatalogClient:
         Lives here rather than on ``UploadSession`` because it stopped being an
         upload operation: it is a read of one field of a descriptor, which is
         this class's primitive.
+
+        Fetches with ``cache=False``: a cached ``PENDING`` would shadow the
+        ``READY`` a later poll came for, and a poll loop has no use for the
+        structural cache write anyway.
         """
         try:
-            desc = self._fetch_tensor_descriptor(source_id)
+            desc = self._fetch_tensor_descriptor(source_id, cache=False)
         except flight.FlightError:
             # An id the server does not serve at all. UNKNOWN already means
             # "no upload record here -- never was, or it has been reclaimed",
@@ -968,10 +985,7 @@ class CatalogClient:
     def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
         """Backs TensorFlightClient.get_upload_status_pb; see that method for the full
         documentation."""
-        source_id = pb.tensor_descriptor.array_id
-        if not source_id:
-            raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
-        return self.get_upload_status(source_id)
+        return self.get_upload_status(_upload_source_id_from_pb(pb))
 
     def wait_for_upload_ready(
         self,
@@ -1020,11 +1034,8 @@ class CatalogClient:
     ) -> Dict[str, Any]:
         """Backs TensorFlightClient.wait_for_upload_ready_pb; see that method for the full
         documentation."""
-        source_id = pb.tensor_descriptor.array_id
-        if not source_id:
-            raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
         return self.wait_for_upload_ready(
-            source_id,
+            _upload_source_id_from_pb(pb),
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
