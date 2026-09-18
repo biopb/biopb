@@ -1,20 +1,14 @@
 """What one read costs in round trips.
 
-The SDK caches no descriptors, so what keeps a tile burst cheap is that planning
-a read does not *need* one: ``GetFlightInfo`` both plans the read and reports
-the tensor it bound, and the addressing refusals are taken from that answer
-rather than from a catalog lookup done beforehand.
+Counted rather than asserted indirectly: a pre-resolve added back to the read
+path would fail no correctness test while the tile path quietly paid a catalog
+query per tile.
 
-These count calls because nothing else will notice if that stops being true.
-Re-introducing a pre-resolve would fail no correctness test — every other test
-here would still pass while the tile path quietly paid a catalog query per tile.
-
-The shape of the id matters as much as the shape of the slice, which is the
-thing a zarr-only test misses: a zarr source's ``array_id`` *is* its
-``source_id``, so a bare id comes back from the server unchanged. Every
-scene-based adapter (nd2, lif, czi, bioio, ome_zarr, ome_tiff) qualifies its ids
-even for a single-scene file, so there a bare id comes back *changed* and the
-#75 ambiguity check has to ask the catalog which case it was.
+The id shape matters as much as the slice shape. A zarr source's ``array_id``
+*is* its ``source_id``, so a bare id echoes back unchanged; scene-based adapters
+(nd2, lif, czi, bioio, ome_zarr, ome_tiff) qualify their ids even for a
+single-scene file, so there a bare id comes back changed and the #75 check has
+to ask the catalog which case it was.
 """
 
 import threading
@@ -32,12 +26,10 @@ from tests.multifield_test import MockMultifieldAdapter
 class _QualifiedIdAdapter(MockMultifieldAdapter):
     """A scene adapter that obeys the identity policy.
 
-    ``array_id`` is "IDENTICAL across the catalog, GetFlightInfo, and the
-    adapter -- always the full source_id[/field] form"
-    (``proto/biopb/tensor/descriptor.proto``). ``MockMultifieldAdapter`` publishes
-    the bare field name instead, which makes a qualified read miss its own
-    catalog row; the real adapters all qualify, so these counts need one that
-    does.
+    ``array_id`` is the full ``source_id[/field]`` form everywhere
+    (``proto/biopb/tensor/descriptor.proto``), as the real adapters emit it.
+    ``MockMultifieldAdapter`` publishes the bare field name, which makes a
+    qualified read miss its own catalog row.
     """
 
     def list_tensor_descriptors(self):
@@ -56,9 +48,8 @@ class _QualifiedIdAdapter(MockMultifieldAdapter):
 def counted_server(tmp_path):
     """Three sources covering the id shapes a read can address.
 
-    Its own server rather than conftest's ``writable_server``: these tests need
-    the catalog rows ``register_and_catalog`` writes, and they need more than one
-    source registered up front.
+    Its own server rather than conftest's ``writable_server``, which registers
+    no catalog rows and only one source.
     """
     path = tmp_path / "t.zarr"
     arr = zarr.open_array(
@@ -98,10 +89,8 @@ def counted_server(tmp_path):
 class _CountingFlight:
     """Wraps a FlightClient, counting the two calls a read can make.
 
-    ``get_flight_info`` plans the read. ``do_get`` is how the catalog is queried,
-    so a non-zero count means a catalog lookup happened on the read path — on
-    this client, which is catalog-only, because dask chunk fetches go through the
-    thread-local pool client instead.
+    ``get_flight_info`` plans the read; ``do_get`` queries the catalog. Chunk
+    fetches do not show up here -- they go through the thread-local pool client.
     """
 
     def __init__(self, inner):
@@ -143,12 +132,7 @@ OPEN_ENDED = (slice(0, 16), slice(None))
 class TestReadRoundTrips:
     def test_a_tile_burst_costs_one_call_per_tile(self, counted):
         """Qualified id, bounded start/stop: the shape the HTTP tile route
-        issues, and the one that must stay at one RPC.
-
-        With the descriptor cache this cost an extra catalog query on the first
-        tile — the cache then hid it from the rest of the burst. Not planning
-        against a descriptor at all removes the query instead of memoizing it.
-        """
+        issues, and the one that must stay at one RPC."""
         client, counter = counted
         for i in range(8):
             client.get_tensor(
@@ -169,12 +153,11 @@ class TestReadRoundTrips:
     def test_a_bare_id_the_server_qualified_asks_once_per_read(self, counted):
         """The cost this file exists to keep visible.
 
-        A single-scene nd2/czi/lif publishes ``source_id/Position:0``, so a bare
-        read comes back changed and only the catalog can say whether that was a
-        one-tensor default (fine) or a silent pick among many (#75). There is no
-        cache to amortise it, so it is once per read — cheap (a ``len(tensors)``
-        count, not the struct column), but not free. A caller reading one tensor
-        repeatedly should pass the qualified array_id, as the tile route does.
+        A bare read of a scene-based source comes back changed, and only the
+        catalog can say whether that was a one-tensor default or a silent pick
+        among many (#75). Nothing amortises it, so it is once per read -- cheap
+        (a ``len(tensors)`` count, not the struct column) but not free. A caller
+        reading one tensor repeatedly should pass the qualified array_id.
         """
         client, counter = counted
         for _ in range(8):
@@ -186,9 +169,8 @@ class TestReadRoundTrips:
     def test_an_open_ended_stop_resolves_once_not_twice(self, counted):
         """``slice(None)`` has no stop, and only the tensor knows where it ends.
 
-        That resolve reads the catalog row, so it settles the #75 question too —
-        the post-response check must not re-ask. It did once: this same read cost
-        two queries, one to fill the stop and one to re-count the tensors.
+        The resolve that fills it reads the catalog row, which settles the #75
+        question too, so the post-response check must not re-ask.
         """
         client, counter = counted
         for _ in range(8):
@@ -204,9 +186,8 @@ class TestReadRoundTrips:
         assert (counter.plans, counter.catalog_queries) == (1, 0)
 
     def test_the_ambiguous_bare_id_is_still_refused(self, counted):
-        """The refusal the post-response check exists for, on the same fixture —
-        so a change that makes the counts above cheaper by dropping the check
-        fails here."""
+        """The refusal the post-response check exists for, so a change that
+        makes the counts above cheaper by dropping it fails here."""
         client, _ = counted
         with pytest.raises(ValueError, match="multiple tensors"):
             client.get_tensor("plate", slice_hint=BOUNDED)

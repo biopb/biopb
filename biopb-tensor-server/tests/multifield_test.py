@@ -648,10 +648,8 @@ class TestSameBareFieldNameAcrossSources:
     """Regression for #45: two sources whose fields share a bare name.
 
     Two single-scene-aicsimageio-like sources both call their tensor "Image:0".
-    What originally collapsed them was a descriptor cache keyed by the bare name;
-    that cache is gone, but the property it broke is a property of the *id*, not
-    of any cache — the qualified array_id is globally unique, so each source must
-    answer with its own descriptor however the SDK stores (or does not store) it.
+    The qualified array_id is globally unique, so each must answer with its own
+    descriptor.
     """
 
     def test_same_bare_array_id_across_sources_returns_own_descriptor(self):
@@ -696,9 +694,8 @@ class TestSameBareFieldNameAcrossSources:
             assert scale_b == [4.0, 0.1, 0.1]
             assert unit_b == ["um", "um", "um"]
 
-            # Asked again, in the other order: each still answers with its own.
-            # Nothing is memoized between these calls, so a collision would have
-            # to come from the id itself, which is what this guards.
+            # Asked again in the other order: nothing is memoized between
+            # calls, so a collision could only come from the id itself.
             assert client.get_physical_scale("aics_bbb/Image:0")[0] == [4.0, 0.1, 0.1]
             assert client.get_physical_scale("aics_aaa/Image:0")[0] == [2.0, 0.5, 0.5]
 

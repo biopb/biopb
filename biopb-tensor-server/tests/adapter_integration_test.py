@@ -355,11 +355,9 @@ class TestOmeZarrIntegration:
             assert list(scale) == [0.5, 0.25]
             assert list(unit) == ["micrometer", "micrometer"]
 
-            # Asked again after a catalog browse, which is what resolve() hands
-            # back. The SDK stores none of it, so a row -- which carries no
-            # scale -- cannot shadow the answer. It once did: resolve is
-            # mandatory on the cloud path, and a cache seeded from its row made
-            # this report "no scale recorded" for a tensor that had one.
+            # Asked again after a catalog browse, which is the shape resolve()
+            # hands back. A row carries no scale, and nothing stores it, so it
+            # cannot shadow the answer.
             client.query_sources("SELECT * FROM sources")
             scale, _ = client.get_physical_scale("phys")
             assert list(scale) == [0.5, 0.25]

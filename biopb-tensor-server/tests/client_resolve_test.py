@@ -212,13 +212,10 @@ def _unresolved_row_table():
 class TestUnresolvedDirectiveError:
     def test_get_tensor_points_at_resolve(self):
         # A bare get_tensor() on an unresolved source must fail with a directive
-        # message naming client.resolve(), not a bare "no tensors".
-        #
-        # The refusal is the SERVER's, restated here. It used to be a local
-        # pre-check off the catalog, which meant it only fired for an id the
-        # client had happened to look up; taking it from the GetFlightInfo that
-        # plans the read makes it hold for every id, including one belonging to
-        # a capability-token holder who cannot browse the catalog at all.
+        # message naming client.resolve(), not a bare "no tensors". The refusal
+        # is the server's, restated: taken from the GetFlightInfo that plans the
+        # read, so it holds even for a capability-token holder who cannot browse
+        # the catalog.
         client = _bare_client()
 
         class _UnresolvedFlight:
@@ -236,10 +233,10 @@ class TestUnresolvedDirectiveError:
         assert "client.resolve('cloud_x')" in msg
 
     def test_an_open_ended_slice_refuses_from_the_catalog(self, monkeypatch):
-        # The one read shape that still resolves before the RPC: an open-ended
-        # stop has to be filled from the tensor's extent, so this refusal comes
-        # off the catalog row rather than the server. It must steer identically
-        # -- a caller should not be able to tell which path refused it.
+        # The one read shape that resolves before the RPC: an open-ended stop is
+        # filled from the tensor's extent, so the refusal comes off the catalog
+        # row. It must steer identically -- a caller should not be able to tell
+        # which path refused it.
         client = _bare_client()
         monkeypatch.setattr(
             client._catalog, "_query_table", lambda sql: _unresolved_row_table()

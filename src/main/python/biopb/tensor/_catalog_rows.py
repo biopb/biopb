@@ -54,10 +54,9 @@ def tensor_descriptors_from_row(row: Mapping[str, Any]) -> List[TensorDescriptor
     """A row's ``tensors`` STRUCT[] as ``TensorDescriptor``s.
 
     The structural fields listed in the module docstring are all a row carries;
-    the serving fields stay unset. This one is *not* deprecated: it decodes the
-    row into the message the read path addresses tensors with, which is the
-    thing the row genuinely is, rather than into the source-shaped struct
-    biopb/biopb#1032 removed.
+    the serving fields stay unset. Not deprecated, unlike the decoders below:
+    this targets the message the read path addresses tensors with, not the
+    source-shaped struct.
     """
     return [
         TensorDescriptor(

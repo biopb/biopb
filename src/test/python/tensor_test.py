@@ -20,9 +20,8 @@ def _offline_client(raw_client=None):
     """A wired TensorFlightClient with no connection opened.
 
     Built without ``__init__`` so no socket is created: the shared state plus the
-    three collaborators (#278 item C), which is all any of these tests need
-    before they bolt their own stubs on. ``protocol_checked`` skips the health
-    probe a real connect would run.
+    collaborators (#278 item C). ``protocol_checked`` skips the health probe a
+    real connect would run.
     """
     from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
 
@@ -161,11 +160,8 @@ class TestGetPhysicalScale:
         return desc
 
     def test_it_asks_the_server_every_time(self):
-        # The regression this replaces: physical_scale is a GetFlightInfo field
-        # the catalog leaves empty, so when this read a descriptor cache, an
-        # entry seeded from a row (which is what resolve() does, and resolve is
-        # mandatory on the cloud path) made it answer "no scale recorded" for a
-        # tensor whose scale the server had. There is no cache to consult now.
+        # physical_scale is a GetFlightInfo field the catalog leaves empty, so
+        # only a fetched descriptor can answer it.
         client = self._client()
         client._catalog._fetch_tensor_descriptor.return_value = self._desc(
             "src/t1", [2.0, 0.325, 0.325], ["micrometer"] * 3
@@ -176,9 +172,7 @@ class TestGetPhysicalScale:
         assert client._catalog._fetch_tensor_descriptor.call_count == 3
 
     def test_none_when_summary_empty(self):
-        # Old server / no physical sizes -> empty repeated field -> None. It has
-        # to come from a fetched descriptor: that is the only answer that means
-        # "the server reports none" rather than "nobody has asked yet".
+        # Old server / no physical sizes -> empty repeated field -> None.
         client = self._client()
         client._catalog._fetch_tensor_descriptor.return_value = self._desc("src/t1")
 
@@ -284,15 +278,7 @@ class TestGetDescriptorFieldMasks:
 
 
 class TestDescriptorsAreNotCached:
-    """The SDK stores no descriptor; every describe is a round trip.
-
-    There was an array_id-keyed cache here (biopb/biopb#795 trimmed what it
-    kept). It was unbounded, session-lived and never invalidated, and it held
-    two grades of entry -- rich from a GetFlightInfo response, poor from a
-    catalog row -- which is how it came to answer questions with the wrong half
-    of itself. Callers that want a descriptor memoized own that policy, because
-    they are the ones who know what invalidates it.
-    """
+    """The SDK stores no descriptor; every describe is a round trip."""
 
     @staticmethod
     def _client(response: TensorDescriptor):
@@ -329,8 +315,7 @@ class TestDescriptorsAreNotCached:
         assert len(returned.pyramid) == 2
 
     def test_there_is_nowhere_to_cache_one(self):
-        # The attribute is gone, not merely unused: nothing can quietly start
-        # writing to it again.
+        # Gone, not merely unused: nothing can quietly start writing to it.
         client = self._client(self._fat_descriptor())
 
         client.get_descriptor("src/A2", with_metadata=True)
@@ -359,14 +344,7 @@ class TestDescriptorsAreNotCached:
 
 
 class TestResolveDescriptorAddressing:
-    """The read path's addressing refusals, read off the catalog row.
-
-    ``_resolve_descriptor`` used to decode the row into a
-    ``DataSourceDescriptor`` and read the refusals off that. The proto has no
-    field for ``is_resolved``, so the read path had to infer "unresolved" from
-    an empty tensor list -- biopb/biopb#1032's own motivating example, on the
-    hot path.
-    """
+    """The read path's addressing refusals, read off the catalog row."""
 
     @staticmethod
     def _client(row):
@@ -400,9 +378,8 @@ class TestResolveDescriptorAddressing:
             client._catalog._resolve_descriptor("cloud_x")
 
     def test_resolved_but_empty_does_not_steer_to_resolve(self):
-        # A source can resolve cleanly and hold nothing readable. Steering its
-        # owner to resolve() sends them round a loop: resolve, succeed, get told
-        # to resolve. The flag distinguishes the two; an empty list cannot.
+        # A source can resolve cleanly and hold nothing readable; the flag
+        # distinguishes that from unresolved, an empty tensor list cannot.
         client = self._client(self._row())
 
         with pytest.raises(ValueError, match="no readable tensors") as exc:
