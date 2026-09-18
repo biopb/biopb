@@ -208,44 +208,6 @@ def _unresolved_row_table():
     )
 
 
-class TestIsResident:
-    """The SDK side of the live residency action."""
-
-    def test_sends_a_json_array_and_decodes_the_map(self):
-        client = _bare_client()
-        client._state.client = _FakeFlight([_FakeResult(b'{"a": true, "b": false}')])
-
-        out = client.is_resident(["a", "b"])
-
-        assert client._state.client.action.type == "is_resident"
-        assert bytes(client._state.client.action.body) == b'["a", "b"]'
-        assert out == {"a": True, "b": False}
-
-    def test_no_argument_asks_about_everything(self):
-        # An empty body is the server's "every registered source", so a browser
-        # need not enumerate a catalog back at the server that owns it.
-        client = _bare_client()
-        client._state.client = _FakeFlight([_FakeResult(b"{}")])
-
-        assert client.is_resident() == {}
-        assert bytes(client._state.client.action.body) == b""
-
-    def test_an_old_server_gets_a_named_error(self):
-        # Not a False: residency unknown is not residency absent, and a UI told
-        # "not resident" would offer a hydrate for a file already on disk.
-        import pyarrow.flight as flight
-
-        class _Refuses:
-            def do_action(self, action, options=None):
-                raise flight.FlightServerError("Unknown action: is_resident")
-
-        client = _bare_client()
-        client._state.client = _Refuses()
-
-        with pytest.raises(RuntimeError, match="Live residency is unavailable"):
-            client.is_resident(["a"])
-
-
 class TestUnresolvedDirectiveError:
     def test_get_tensor_context_points_at_resolve(self, monkeypatch):
         # A bare get_tensor() on an unresolved (empty-tensors) source must fail

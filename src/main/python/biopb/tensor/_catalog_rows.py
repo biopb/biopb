@@ -68,9 +68,9 @@ def _descriptor_from_row(row: Mapping[str, Any]) -> DataSourceDescriptor:
         tensors=tensors,
         metadata_json="",
     )
-    # No current server sends `data_resident` -- residency is the `is_resident()`
-    # action now (biopb/biopb#1035) -- but an older one does, and this decode
-    # still answers it identically against that server.
+    # No current server sends `data_resident`. Residency is a per-source read on
+    # the descriptor GetFlightInfo returns (biopb/biopb#1048); an older server
+    # still sends the column, and this decode answers it identically there.
     resident = row.get("data_resident")
     if resident is not None:
         desc.data_resident = bool(resident)

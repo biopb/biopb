@@ -194,9 +194,15 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         FlightClient client = conn.getClient();
         CredentialCallOption authOption = conn.getAuthOption();
 
-        // Build TensorReadOption with flattened fields
+        // Build TensorReadOption with flattened fields. `endpoints` is explicit:
+        // this is the read path, and under the field mask nothing is implied by
+        // omission -- an empty mask is a describe, which would hand back no plan
+        // at all (biopb/biopb#1048).
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setArrayId(tensorId == null || tensorId.isEmpty() ? sourceId : tensorId);
+                .setArrayId(tensorId == null || tensorId.isEmpty() ? sourceId : tensorId)
+                .setFields(com.google.protobuf.FieldMask.newBuilder()
+                        .addPaths("endpoints")
+                        .build());
 
         if (sliceHint != null) {
             readBuilder.setSliceHint(sliceHint);

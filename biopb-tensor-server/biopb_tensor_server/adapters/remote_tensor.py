@@ -65,6 +65,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
+from biopb_tensor_server.core.read_mask import IS_RESIDENT, METADATA_JSON, read_mask
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -917,15 +918,13 @@ class RemoteTensorAdapter(TensorAdapter):
         the mirror catalog (biopb/biopb#253).
         """
         upstream_array_id = self._to_upstream_array_id(self.array_id)
-        up_read_opt = TensorReadOption(
-            array_id=upstream_array_id,
-            with_metadata=False,
-            with_pyramid=read_opt.with_pyramid,
-        )
-        # with_read_plan is an optional bool: forward it only when the caller set
-        # it, so an unset field keeps defaulting true at the upstream as well.
-        if read_opt.HasField("with_read_plan"):
-            up_read_opt.with_read_plan = read_opt.with_read_plan
+        up_read_opt = TensorReadOption(array_id=upstream_array_id)
+        # Forward the mask minus what this server answers itself: metadata_json
+        # comes from the mirror catalog (biopb/biopb#253), and residency is a
+        # fact about *this* machine's filesystem -- a mirror's bytes are on
+        # another one, so asking the upstream would answer a different question.
+        forwarded = read_mask(read_opt) - {METADATA_JSON, IS_RESIDENT}
+        up_read_opt.fields.paths.extend(sorted(forwarded))
         if read_opt.HasField("slice_hint"):
             up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
         if read_opt.scale_hint:

@@ -66,7 +66,7 @@ def _put(client, source_id, start, stop):
 class TestOnTheDescriptor:
     def test_a_fresh_upload_reports_pending_with_its_grid(self, client):
         source_id = _make(client)
-        desc = client.get_descriptor(source_id)
+        desc = client.get_descriptor(source_id, with_upload_status=True)
         assert desc.HasField("upload_status")
         assert desc.upload_status.state == UploadStatusPb.PENDING
         assert desc.upload_status.expected_chunks == 4  # 4x4 in 2x2
@@ -75,7 +75,7 @@ class TestOnTheDescriptor:
     def test_it_advances_as_chunks_land(self, client):
         source_id = _make(client)
         _put(client, source_id, (0, 0), (2, 2))
-        desc = client.get_descriptor(source_id)
+        desc = client.get_descriptor(source_id, with_upload_status=True)
         assert desc.upload_status.uploaded_chunks == 1
         assert desc.upload_status.state == UploadStatusPb.PENDING
 
@@ -101,7 +101,7 @@ class TestOnTheDescriptor:
             ZarrAdapter(zarr.open_array(str(path), mode="r"), "plain", ["y", "x"]),
         )
 
-        desc = client.get_descriptor("plain")
+        desc = client.get_descriptor("plain", with_upload_status=True)
         assert desc.shape == [4, 4]  # a real, readable source
         assert not desc.HasField("upload_status")
 
@@ -126,7 +126,7 @@ class TestCapabilityHolderCanPoll:
             f"grpc://localhost:{writable_server.port}", token="cap-token"
         )
         try:
-            desc = holder.get_descriptor(source_id)
+            desc = holder.get_descriptor(source_id, with_upload_status=True)
             assert desc.upload_status.state == UploadStatusPb.PENDING
         finally:
             holder.close()
@@ -155,7 +155,7 @@ class TestDiscarded:
         source_id = _make(client, shape=(2, 2), chunk=(2, 2))
         writable_server.uploads.discard(source_id, "job died")
 
-        desc = client.get_descriptor(source_id)
+        desc = client.get_descriptor(source_id, with_upload_status=True)
         assert desc.upload_status.state == UploadStatusPb.DISCARDED
         assert desc.upload_status.reason == "job died"
 

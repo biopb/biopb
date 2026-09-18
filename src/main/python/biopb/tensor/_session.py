@@ -22,7 +22,6 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Iterable,
     List,
     Mapping,
     Optional,
@@ -315,8 +314,9 @@ def _fetch_endpoints_via_get_flight_info(
     """
     descriptor = pb.tensor_descriptor
 
-    # Build TensorReadOption from descriptor's fields
-    read_opt = TensorReadOption(with_metadata=False)
+    # Build TensorReadOption from descriptor's fields. `endpoints` is explicit:
+    # this call exists to get them, and nothing is implied by the mask any more.
+    read_opt = _read_option(endpoints=True)
     if descriptor.HasField("slice_hint"):
         read_opt.slice_hint.CopyFrom(descriptor.slice_hint)
     if descriptor.scale_hint:
@@ -476,6 +476,40 @@ def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     if "/" in array_id:
         return array_id.split("/", 1)[0], array_id
     return array_id, None
+
+
+def _read_option(
+    *,
+    endpoints: bool = False,
+    metadata_json: bool = False,
+    pyramid: bool = False,
+    upload_status: bool = False,
+    is_resident: bool = False,
+) -> TensorReadOption:
+    """A ``TensorReadOption`` whose field mask names the parts asked for.
+
+    The wire takes a ``FieldMask``; this keeps the SDK's
+    own surface named booleans, because hand-assembling paths is a poor API and
+    a mistyped one is a server-side refusal rather than a type error.
+
+    Every part is opt-in, including ``endpoints`` -- the O(chunks) read plan.
+    The bools this replaced defaulted that one *on*, so a describe had to
+    remember to switch it off and a read got it by saying nothing. Now the read
+    path asks, and saying nothing is the cheap call.
+    """
+    opt = TensorReadOption()
+    opt.fields.paths.extend(
+        name
+        for name, wanted in (
+            ("endpoints", endpoints),
+            ("metadata_json", metadata_json),
+            ("pyramid", pyramid),
+            ("upload_status", upload_status),
+            ("is_resident", is_resident),
+        )
+        if wanted
+    )
+    return opt
 
 
 def _tensor_read_cmd(array_id: str, read_opt: TensorReadOption) -> FlightRequest:
@@ -689,6 +723,8 @@ class CatalogClient:
         with_metadata: bool = False,
         with_pyramid: bool = False,
         with_read_plan: bool = False,
+        with_upload_status: bool = False,
+        with_residency: bool = False,
         cache: bool = True,
     ) -> "TensorDescriptor":
         """Fetch one tensor's descriptor directly from the server (internal).
@@ -707,16 +743,19 @@ class CatalogClient:
         - ``with_metadata`` -- fill ``metadata_json`` (the full OME tree).
         - ``with_pyramid`` -- advertise the resolution pyramid on the descriptor.
         - ``with_read_plan`` -- enumerate the per-request chunk endpoints.
+        - ``with_upload_status`` -- progress of the upload backing this tensor.
+        - ``with_residency`` -- whether the bytes are local right now. A bounded
+          stat walk of the source, so never ask for it in a loop over a
+          catalog: that is the shape biopb/biopb#1048 removed.
 
         This primitive returns only the ``TensorDescriptor`` (never the endpoints),
         so all three masks **default off** -- the cheapest structural probe. With
         ``with_read_plan=False`` the O(chunks) plan the caller would discard is
         skipped; ``with_pyramid=False`` skips the (per-level, potentially remote)
         pyramid sizing; ``with_metadata=False`` skips the heavy OME tree. Callers
-        that need any of those parts opt in. An old server ignores the unknown
-        ``with_pyramid``/``with_read_plan`` masks and fills everything, so the
-        result is never *missing* a field the caller asked for -- at worst it
-        carries extra the caller drops.
+        that need any of those parts opt in. A server too old for a path refuses
+        the request rather than quietly omitting it, so a caller never plans
+        around a field that silently did not arrive.
 
         This always issues the RPC: it never reads the descriptor cache, so the
         masks a caller passes are honoured on every call. It *writes* the
@@ -730,10 +769,12 @@ class CatalogClient:
         """
         cmd = _tensor_read_cmd(
             array_id,
-            TensorReadOption(
-                with_metadata=with_metadata,
-                with_pyramid=with_pyramid,
-                with_read_plan=with_read_plan,
+            _read_option(
+                endpoints=with_read_plan,
+                metadata_json=with_metadata,
+                pyramid=with_pyramid,
+                upload_status=with_upload_status,
+                is_resident=with_residency,
             ),
         )
         fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
@@ -762,12 +803,16 @@ class CatalogClient:
         with_metadata: bool = False,
         with_pyramid: bool = True,
         with_read_plan: bool = False,
+        with_residency: bool = False,
+        with_upload_status: bool = False,
     ) -> "TensorDescriptor":
         """Backs TensorFlightClient.get_descriptor; see that method for the full
         documentation."""
         return self._fetch_tensor_descriptor(
             array_id,
             with_metadata=with_metadata,
+            with_residency=with_residency,
+            with_upload_status=with_upload_status,
             with_pyramid=with_pyramid,
             with_read_plan=with_read_plan,
         )
@@ -960,7 +1005,9 @@ class CatalogClient:
         structural cache write anyway.
         """
         try:
-            desc = self._fetch_tensor_descriptor(source_id, cache=False)
+            desc = self._fetch_tensor_descriptor(
+                source_id, with_upload_status=True, cache=False
+            )
         except flight.FlightError:
             # An id the server does not serve at all. UNKNOWN already means
             # "no upload record here -- never was, or it has been reclaimed",
@@ -1039,18 +1086,6 @@ class CatalogClient:
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
-
-    def is_resident(
-        self, source_ids: Optional[Iterable[str]] = None
-    ) -> Dict[str, bool]:
-        """Backs TensorFlightClient.is_resident; see that method for the full
-        documentation."""
-        body = b"" if source_ids is None else json.dumps(list(source_ids)).encode()
-        result_bytes = self._do_action_one_result(
-            flight.Action("is_resident", body),
-            unavailable_hint="Live residency is unavailable",
-        )
-        return {k: bool(v) for k, v in json.loads(result_bytes.decode("utf-8")).items()}
 
     def add_source(
         self,
@@ -1263,8 +1298,9 @@ class ChunkFetcher:
                 )
             slice_hint_proto = SliceHint(start=starts, stop=stops)
 
-        # Build TensorReadOption with flattened fields.
-        read_opt = TensorReadOption(with_metadata=False)
+        # Build TensorReadOption with flattened fields. `endpoints` is explicit:
+        # this is the read path, and the plan is what it came for.
+        read_opt = _read_option(endpoints=True)
         if slice_hint_proto is not None:
             read_opt.slice_hint.CopyFrom(slice_hint_proto)
         if scale_hint is not None:

@@ -421,18 +421,18 @@ class TestGetPhysicalScale:
 
 
 class TestGetDescriptorFieldMasks:
-    """get_descriptor sends describe-shaped GetFlightInfo field masks (#563).
+    """get_descriptor sends a describe-shaped field mask (#563).
 
-    The three response masks (with_metadata / with_pyramid / with_read_plan) are
-    opt-in per part. get_descriptor is a *describe* -- the stable per-tensor
-    facts, not a read -- so it defaults to with_metadata=False (opt in for the
-    heavy OME tree), with_pyramid=True (the describe consumer reads the levels),
-    and with_read_plan=False (skip the per-request plan a describe discards).
+    Every optional part is opt-in, so the mask on the wire *is* the request --
+    nothing is implied by omission any more. get_descriptor is a describe (the
+    stable per-tensor facts, not a read), so it asks for the pyramid its
+    consumer reads and nothing else: no `endpoints` (the per-request plan it
+    would discard), no `metadata_json` (the heavy OME tree).
 
-    The with_metadata default flip (True -> False) is the one intentional break
-    from the old always-metadata behavior, so guard the exact masks on the wire
-    here -- callers that need metadata now opt in, so a silent revert of the
-    default would otherwise go uncaught.
+    Guarded exactly, because both defaults are silent when wrong. A revert of
+    the metadata opt-in would quietly ship megabytes per call, and an
+    `endpoints` path creeping back in would turn every describe into an
+    O(chunks) enumeration.
     """
 
     @staticmethod
@@ -472,17 +472,32 @@ class TestGetDescriptorFieldMasks:
     def test_defaults_are_describe_shaped(self):
         client, state = self._client_capturing_read_opt()
         client.get_descriptor("src/A2")
-        read_opt = self._sent_read_opt(state)
-        assert read_opt.with_metadata is False  # the intentional opt-in break
-        assert read_opt.with_pyramid is True
-        assert read_opt.HasField("with_read_plan")  # optional bool set explicitly
-        assert read_opt.with_read_plan is False
+        assert set(self._sent_read_opt(state).fields.paths) == {"pyramid"}
 
     def test_with_metadata_opt_in_is_forwarded(self):
         client, state = self._client_capturing_read_opt()
         client.get_descriptor("src/A2", with_metadata=True)
-        read_opt = self._sent_read_opt(state)
-        assert read_opt.with_metadata is True
+        assert "metadata_json" in set(self._sent_read_opt(state).fields.paths)
+
+    def test_residency_is_never_asked_for_by_default(self):
+        """The expensive one. It is a stat walk of the source, so a describe
+        that did not ask must not get it -- and must not pay for it."""
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2")
+        assert "is_resident" not in set(self._sent_read_opt(state).fields.paths)
+
+    def test_residency_opt_in_is_forwarded(self):
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2", with_residency=True)
+        assert "is_resident" in set(self._sent_read_opt(state).fields.paths)
+
+    def test_a_describe_never_asks_for_the_read_plan(self):
+        """`endpoints` is the O(chunks) enumeration. Under the bools this
+        replaced it was ON unless explicitly disabled, so a describe had to
+        remember to opt *out*; the default now costs nothing."""
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2")
+        assert "endpoints" not in set(self._sent_read_opt(state).fields.paths)
 
 
 class TestDescriptorCacheStaysStructural:

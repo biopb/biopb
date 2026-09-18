@@ -342,9 +342,10 @@ public class TensorFlightClient implements AutoCloseable {
                     .setSourceType(text(types, i))
                     .setMetadataJson("")
                     .addAllTensors(tensorsFromRow(root, i));
-            // No current server sends data_resident -- residency is isResident()
-            // now (biopb/biopb#1035) -- but an older one does, and this decode
-            // still answers it identically against that server.
+            // No current server sends data_resident. Residency is a per-source
+            // read on the descriptor GetFlightInfo returns (biopb/biopb#1048);
+            // an older server still sends the column, and this decode answers
+            // it identically against that server.
             Boolean res = nullableBool(resident, i);
             if (res != null) {
                 desc.setDataResident(res);
@@ -679,51 +680,6 @@ public class TensorFlightClient implements AutoCloseable {
                     + "') returned no terminal status (server closed the stream without a 'done')");
         }
         return done;
-    }
-
-    /**
-     * Ask the server, right now, whose content is local and cheap to read.
-     *
-     * <p>Volatile: a synced folder (OneDrive / iCloud Files-On-Demand)
-     * re-dehydrates under storage pressure with nothing to notify anyone, so no
-     * stored answer stays true -- which is why it is an action and not a catalog
-     * column (biopb/biopb#1035). Do not cache the result.
-     *
-     * <p>Not the same question as a row's {@code is_resolved}, which asks
-     * whether the server has read the source at all yet. An unresolved source
-     * is never resident; a resolved one can stop being.
-     *
-     * @param sourceIds The sources to ask about, or {@code null} for every
-     *                  source the server has registered.
-     * @return {@code source_id -> resident}. A requested id the server does not
-     *         serve is absent: missing means "no answer", not "not resident".
-     * @throws IOException If the server closes the stream without a reply. A
-     *         server too old for the action fails with the Flight layer's own
-     *         unchecked error, as {@link #warm} does.
-     */
-    public Map<String, Boolean> isResident(List<String> sourceIds) throws IOException {
-        // Empty body means "every registered source"; otherwise a JSON array.
-        byte[] body = sourceIds == null
-                ? new byte[0]
-                : GSON.toJson(sourceIds).getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        org.apache.arrow.flight.Action action =
-                new org.apache.arrow.flight.Action("is_resident", body);
-
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
-        if (!iter.hasNext()) {
-            throw new IOException("is_resident returned no result");
-        }
-        byte[] reply = iter.next().getBody();
-        Map<String, Boolean> out = reply == null || reply.length == 0
-                ? new HashMap<>()
-                : GSON.fromJson(new String(reply, java.nio.charset.StandardCharsets.UTF_8),
-                        new TypeToken<Map<String, Boolean>>() {
-                        }.getType());
-        // Drain, so the server sees the stream consumed rather than cancelled.
-        while (iter.hasNext()) {
-            iter.next();
-        }
-        return out;
     }
 
     /**
@@ -1079,9 +1035,11 @@ public class TensorFlightClient implements AutoCloseable {
         Location location = LocationUris.parse(pb.getLocation());
 
         // Build TensorReadOption from descriptor's fields
+        // The read path: `endpoints` is what it came for, and nothing is
+        // implied by the mask any more.
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
                 .setArrayId(descriptor.getArrayId())
-                .setWithMetadata(false);
+                .setFields(readMask("endpoints"));
 
         if (descriptor.hasSliceHint()) {
             readBuilder.setSliceHint(descriptor.getSliceHint());
@@ -1317,9 +1275,7 @@ public class TensorFlightClient implements AutoCloseable {
         // the one field whose purpose is freshness would defeat the poll.
         TensorReadOption readOpt = TensorReadOption.newBuilder()
                 .setArrayId(sourceId)
-                .setWithMetadata(false)
-                .setWithPyramid(false)
-                .setWithReadPlan(false)
+                .setFields(readMask("upload_status"))
                 .build();
         FlightRequest cmd = FlightRequest.newBuilder().setTensorRead(readOpt).build();
 
@@ -1555,9 +1511,10 @@ public class TensorFlightClient implements AutoCloseable {
         String normalizedReductionMethod = normalizeReductionMethod(reductionMethod);
 
         // Build TensorReadOption with flattened fields
+        // The read path: `endpoints` is what it came for.
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
                 .setArrayId(tensorId)
-                .setWithMetadata(false);
+                .setFields(readMask("endpoints"));
 
         if (sliceHint != null) {
             readBuilder.setSliceHint(sliceHint);
@@ -1883,9 +1840,25 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>The descriptor is cached in {@code descriptors}, keyed by the
      * echoed-back array_id.
      */
+    /**
+     * A read mask naming the optional parts wanted.
+     *
+     * <p>The wire takes a {@link com.google.protobuf.FieldMask} (Flight protocol
+     * v3). Every part is opt-in, including {@code endpoints} -- the O(chunks)
+     * read plan -- so an empty mask is a describe. The {@code with_*} bools this
+     * replaced defaulted that most expensive part to on.
+     */
+    private static com.google.protobuf.FieldMask readMask(String... paths) {
+        com.google.protobuf.FieldMask.Builder b = com.google.protobuf.FieldMask.newBuilder();
+        for (String path : paths) {
+            b.addPaths(path);
+        }
+        return b.build();
+    }
+
     private TensorDescriptor fetchTensorDescriptor(String sourceId, String tensorId) {
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setWithMetadata(true)
+                .setFields(readMask("metadata_json"))
                 .setArrayId(tensorId == null || tensorId.isEmpty() ? sourceId : tensorId);
         FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(readBuilder.build())

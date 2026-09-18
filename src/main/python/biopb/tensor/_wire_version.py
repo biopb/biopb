@@ -33,4 +33,10 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   ROI annotations over DoAction (retired).
 # - ``v2`` -- ``FlightRequest`` / ``TensorTicket`` / ``PutCommand`` oneofs; the
 #   catalog is SQL over DoGet, ROI annotations ride DoGet / DoPut.
+#   ``TensorReadOption`` carries a ``FieldMask`` rather than ``with_*`` bools,
+#   and every optional part of the response is opt-in -- an empty mask is a
+#   describe, where an unset ``with_read_plan`` briefly meant the full plan.
+#   The ``upload_status`` and ``is_resident`` actions are gone: both are live
+#   per-source reads and ride the descriptor GetFlightInfo returns
+#   (biopb/biopb#1048).
 FLIGHT_PROTOCOL_VERSION = 2

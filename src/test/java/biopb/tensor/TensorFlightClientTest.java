@@ -575,49 +575,6 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testIsResidentAsksTheServerEveryTime() throws Exception {
-        // The point of the action: no caching, on either side. A source that
-        // re-dehydrates between two calls answers differently, which a catalog
-        // column could never do (biopb/biopb#1035).
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Assert.assertEquals(
-                        Boolean.TRUE,
-                        client.isResident(Collections.singletonList("test-source")).get("test-source"));
-                server.setSourceResident(false);
-                Assert.assertEquals(
-                        Boolean.FALSE,
-                        client.isResident(Collections.singletonList("test-source")).get("test-source"));
-                Assert.assertEquals(2, server.getResidencyCalls());
-            }
-        }
-    }
-
-    @Test
-    public void testIsResidentWithNullAsksAboutEverything() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, Boolean> all = client.isResident(null);
-                Assert.assertEquals(Boolean.TRUE, all.get("test-source"));
-            }
-        }
-    }
-
-    @Test
-    public void testIsResidentOmitsUnknownSources() throws Exception {
-        // Absent, not false: the server cannot say where the bytes of a source
-        // it does not serve are, and a false would send a UI to hydrate it.
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, Boolean> out =
-                        client.isResident(Arrays.asList("test-source", "nope"));
-                Assert.assertTrue(out.containsKey("test-source"));
-                Assert.assertFalse(out.containsKey("nope"));
-            }
-        }
-    }
-
-    @Test
     public void testCatalogRowsCarryNoResidency() throws Exception {
         // The column is gone from SOURCE_ROW_COLUMNS, so the deprecated decoder
         // leaves the proto's field unset rather than asserting a stale false.
@@ -868,14 +825,6 @@ public class TensorFlightClientTest {
             producer.sourceHasTensors = has;
         }
 
-        void setSourceResident(boolean resident) {
-            producer.sourceResident = resident;
-        }
-
-        int getResidencyCalls() {
-            return producer.residencyCalls.get();
-        }
-
         @Override
         public void close() throws Exception {
             server.close();
@@ -906,8 +855,6 @@ public class TensorFlightClientTest {
         private volatile boolean sourceHasTensors = true;
         // Residency is asked per call, never stored, so the fake counts the
         // asks as well as answering them (biopb/biopb#1035).
-        private volatile boolean sourceResident = true;
-        private final AtomicInteger residencyCalls = new AtomicInteger();
 
         TensorTestProducer(BufferAllocator allocator) {
             this.allocator = allocator;
@@ -1071,10 +1018,6 @@ public class TensorFlightClientTest {
                 doWarm(listener);
                 return;
             }
-            if ("is_resident".equals(action.getType())) {
-                doIsResident(new String(action.getBody(), StandardCharsets.UTF_8), listener);
-                return;
-            }
             // `upload_status` is not an action any more: it rides the descriptor
             // GetFlightInfo returns (biopb/biopb#1048 step 2). See
             // `nextUploadStatus`, which serves the registered sequence there.
@@ -1113,30 +1056,6 @@ public class TensorFlightClientTest {
             return b.build();
         }
 
-        /**
-         * The `is_resident` action: a JSON array of source ids in (empty for
-         * all), a JSON object of id to boolean out. Answered fresh each time --
-         * there is nothing stored to answer from.
-         */
-        private void doIsResident(String body, FlightProducer.StreamListener<Result> listener) {
-            residencyCalls.incrementAndGet();
-            Map<String, Boolean> out = new java.util.LinkedHashMap<>();
-            java.util.List<String> ids;
-            if (body.trim().isEmpty()) {
-                ids = Collections.singletonList("test-source");
-            } else {
-                ids = new Gson().fromJson(body, new TypeToken<java.util.List<String>>() {
-                }.getType());
-            }
-            for (String id : ids) {
-                // An id this fake does not serve is absent, like the server's.
-                if ("test-source".equals(id)) {
-                    out.put(id, sourceResident);
-                }
-            }
-            listener.onNext(new Result(new Gson().toJson(out).getBytes(StandardCharsets.UTF_8)));
-            listener.onCompleted();
-        }
 
         /**
          * The `resolve` action: zero or more progress heartbeats, then one
