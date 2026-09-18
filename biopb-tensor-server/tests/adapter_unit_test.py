@@ -143,6 +143,15 @@ class TestTensorConfig:
         config = parse_config({"server": {}, "sources": []})
         assert config.handle_reaper_ttl == 150.0
 
+    def test_upload_ttl_defaults_to_an_hour(self):
+        config = parse_config({"server": {}, "sources": []})
+        assert config.upload_ttl == 3600.0
+
+    def test_parse_upload_ttl(self):
+        config = parse_config({"server": {"upload_ttl": 90}, "sources": []})
+        assert config.upload_ttl == 90.0
+        assert parse_config({"server": {"upload_ttl": 0}}).upload_ttl == 0.0
+
     def test_parse_handle_reaper_ttl(self):
         # Carried and coerced to float; 0 is the documented "disable" sentinel.
         config = parse_config({"server": {"handle_reaper_ttl": 45}, "sources": []})

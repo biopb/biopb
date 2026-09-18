@@ -92,9 +92,9 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
     def upload_source_id(name: str) -> str:
         """The source_id a ``cache:<name>`` upload lands on.
 
-        Deterministic for a name, so the name is single-use for the life of
-        the server (``UploadManager.create_tensor`` refuses the collision);
-        minted for an empty one.
+        Deterministic for a name, so the name is taken while its source is
+        registered (``UploadManager.create_tensor`` refuses the collision, and
+        only the reclaim sweep frees a discarded one); minted for an empty one.
         """
         if name:
             return f"cache_{hashlib.sha256(name.encode()).hexdigest()[:12]}"
@@ -110,8 +110,9 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         namespace, ``CacheManager.put`` finds the prior upload's chunk already
         present and declines to overwrite it -- serving stale data
         (biopb/biopb#178). Folding a distinct token into each upload's chunk_ids
-        sidesteps that. (Within one server lifetime a name cannot be reused at
-        all: ``UploadManager.create_tensor`` refuses the collision.)
+        sidesteps that. The same token is what makes reclaiming a discarded
+        name safe within one server lifetime: the re-created source's chunk
+        ids never collide with the tombstone's, still sitting in the cache.
 
         Wall-clock ns keeps the token distinct across a restart, where a persisted
         file cache may still hold the prior upload's chunks; ``max(..., last + 1)``

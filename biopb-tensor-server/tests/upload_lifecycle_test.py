@@ -2,10 +2,11 @@
 
 Three rules (biopb/biopb#1048 steps 4 and 5):
 
-- a name is **single-use** for the life of the server: ``create_tensor``
+- a name is **single-use** while its source is registered: ``create_tensor``
   refuses a collision -- pending, finished or discarded alike -- so
   ``source_id`` alone names an attempt, and a writer's chunks can only land
-  in the source it created;
+  in the source it created (step 6's sweep, ``upload_reclaim_test.py``, is
+  what frees a discarded name);
 - ``finish`` is the **only** route to READY, replacing a chunk count that was
   never a completeness check;
 - reading is **not** gated on either: an early read of a half-filled upload is
@@ -41,7 +42,7 @@ def _fill(client, desc, shape=(4, 4), chunk=(2, 2)):
 
 
 class TestOneNameOneAdapter:
-    """Step 4: a name is taken by whoever created it, for the life of the server.
+    """Step 4: a name is taken by whoever created it, for as long as it stands.
 
     A named ``cache:`` upload has a deterministic id. Were a second create to
     replace the first's adapter, the first writer's chunks -- and its

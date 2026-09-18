@@ -901,6 +901,7 @@ def _setup_flight_server(
         pyramid_config=server_config.pyramid,
         tls_cert_chain=tls_cert_chain,
         tls_private_key=tls_private_key,
+        upload_ttl=server_config.upload_ttl,
     )
 
     if tls_cert_chain is not None:

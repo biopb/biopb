@@ -108,11 +108,11 @@ class UploadProgress:
     tombstone so a writer still unwinding learns *why* its write failed rather
     than that its source never existed.
 
-    ``updated_at`` is what will bound that afterlife. One field serves both
-    halves of reclamation, because for a discarded upload the last touch *is*
-    the discard: a tombstone's age is how long since it was written, and a
-    PENDING upload's is how long since it last made progress -- the signal for
-    a job that died without discarding. ``time.monotonic``, matching
+    ``updated_at`` bounds that afterlife (``UploadManager.reap``). One field
+    serves both halves of reclamation, because for a discarded upload the last
+    touch *is* the discard: a tombstone's age is how long since it was written,
+    and a PENDING upload's is how long since it last made progress -- the
+    signal for a job that died without discarding. ``time.monotonic``, matching
     :mod:`~biopb_tensor_server.adapters._handle_reaper`: these are intervals, so
     a wall clock that steps would corrupt them, and nothing outside this process
     reads it.
@@ -145,8 +145,12 @@ class UploadProgress:
         """No further chunk will be accepted -- finished, or given up on."""
         return self.status in (UploadStatus.READY, UploadStatus.DISCARDED)
 
-    def touch(self) -> None:
-        self.updated_at = time.monotonic()
+    def touch(self, now: Optional[float] = None) -> None:
+        self.updated_at = time.monotonic() if now is None else now
+
+    def idle_for(self, now: float) -> float:
+        """Seconds since the last touch, on the monotonic clock."""
+        return now - self.updated_at
 
     def as_status_dict(self, source_id: str) -> Dict[str, Any]:
         return {
@@ -240,8 +244,8 @@ class WritableSource:
         to whoever runs it; this is only the fate of the output. The adapter
         stays registered as a tombstone, so a job still unwinding reaches it
         and learns the reason, rather than reaching nothing and concluding the
-        source never existed. Reclaiming the tombstone is a sweep over the
-        registry by ``updated_at``, not this method's concern.
+        source never existed. Reclaiming the tombstone is the sweep's job
+        (``UploadManager.reap``, by ``updated_at``), not this method's.
 
         Total and idempotent: returns the resulting status either way. The
         first reason wins, and with it the first timestamp -- a second discard
@@ -261,18 +265,59 @@ class WritableSource:
         if progress is None:
             return unknown_upload_status(source_id)
         with progress.lock:
-            if not progress.is_discarded:
-                progress.status = UploadStatus.DISCARDED
-                progress.reason = reason
-                # No more chunks will arrive, so the ids are dead weight for as
-                # long as the tombstone lives. The count outlives them.
-                progress.final_chunk_count = progress.uploaded_chunks
-                progress.uploaded_chunk_ids = set()
-                progress.touch()
-                logger.info(
-                    f"Discarded upload {source_id}: {reason or 'no reason given'}"
-                )
+            self._discard_locked(progress, reason)
             return progress.as_status_dict(source_id)
+
+    def _discard_locked(
+        self, progress: UploadProgress, reason: str, now: Optional[float] = None
+    ) -> None:
+        """The DISCARDED transition; caller holds ``progress.lock``.
+
+        *now* stamps the tombstone on the sweep's clock when expiry is the
+        cause, so its age is measured from the same instant the sweep judged
+        the upload dead."""
+        if progress.is_discarded:
+            return
+        progress.status = UploadStatus.DISCARDED
+        progress.reason = reason
+        # No more chunks will arrive, so the ids are dead weight for as long
+        # as the tombstone lives. The count outlives them.
+        progress.final_chunk_count = progress.uploaded_chunks
+        progress.uploaded_chunk_ids = set()
+        progress.touch(now)
+        logger.info(f"Discarded upload {self.source_id}: {reason or 'no reason given'}")
+
+    def reap_step(self, now: float, ttl: float) -> Tuple[bool, Optional[float]]:
+        """The reclaim sweep's two questions for this upload, one lock hold.
+
+        Returns ``(expired, tombstone_age)``:
+
+        - *expired*: a PENDING upload with no progress for *ttl* seconds was
+          just discarded here, with a reason -- one terminal transition, not
+          a second path into oblivion. The check and the transition share the
+          lock hold so a ``finish`` racing the sweep either lands first (and
+          the upload stays READY) or is refused as discarded; it can never be
+          undone. Never true for a durable kind, whose disposal is not this
+          method's (see :meth:`discard`).
+        - *tombstone_age*: seconds since this upload was discarded, or
+          ``None`` if it was not -- including right after this call just
+          discarded it, since a fresh tombstone's age is not yet the sweep's
+          concern.
+        """
+        progress = self._upload
+        if progress is None:
+            return False, None
+        with progress.lock:
+            if (
+                not self.durable
+                and progress.status is UploadStatus.PENDING
+                and progress.idle_for(now) > ttl
+            ):
+                self._discard_locked(progress, f"expired: no write for {ttl:g} s", now)
+                return True, None
+            if progress.is_discarded:
+                return False, progress.idle_for(now)
+            return False, None
 
     def finish(self) -> Dict[str, Any]:
         """Seal this upload: PENDING -> READY, no further chunks.
@@ -348,9 +393,12 @@ class WritableSource:
     def _refuse_write(self) -> None:
         """The two ways a write can arrive too late.
 
-        There is no third: a source's id has one adapter for the life of the
-        server (``UploadManager.create_tensor`` refuses a name collision), so
-        a write cannot land in a stranger's source by naming its own.
+        There is no third: a source's id has one adapter for as long as it is
+        registered (``UploadManager.create_tensor`` refuses a name collision),
+        so a write cannot land in a stranger's source by naming its own. The
+        one exception is by design: a discarded name is reclaimed after
+        ``upload_ttl`` seconds, and a straggler quiet for that long writes
+        into whoever took the name next.
         """
         progress = self._upload
         if progress is None:

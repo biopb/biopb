@@ -876,9 +876,10 @@ class TensorFlightClient:
         Declare, then fill. The returned descriptor is the server's echo --
         ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
         and is what ``upload_array``, ``upload_chunk`` and ``finish_upload``
-        take. A name is single-use for the life of the server: a second create
-        under a name that exists -- pending, finished or discarded -- is
-        refused. ``finish_upload`` is what marks the upload complete.
+        take. A name is taken while its source exists: a second create under
+        it -- pending, finished or discarded -- is refused. Only the server's
+        reclaim sweep frees one, after a discarded upload's ``upload_ttl``.
+        ``finish_upload`` is what marks the upload complete.
 
         Args:
             source_name: "cache:name" → cache-backed; "ome_zarr:name" →
