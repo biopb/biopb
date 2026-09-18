@@ -333,10 +333,10 @@ class TensorFlightClient:
         are known (an older server, or a format that carries none).
 
         ``physical_scale``/``physical_unit`` are ``TensorDescriptor`` fields the
-        server fills on every ``GetFlightInfo`` (issue #31), so this reads the
-        descriptor a prior `get_tensor` already cached -- no extra RPC when
-        it is cached, and it never requests the opt-in ``metadata_json`` field on
-        that same descriptor. (Contrast `get_source_metadata`, which ships the
+        server fills on every ``GetFlightInfo`` (issue #31), so this describes the
+        tensor and reads them off the answer, never requesting the opt-in
+        ``metadata_json`` field on that same descriptor. (Contrast
+        `get_source_metadata`, which ships the
         whole OME tree; do not dig physical sizes out of that -- this is the
         compact projection meant for display scale.)
 
@@ -370,11 +370,9 @@ class TensorFlightClient:
         Works even when the source is beyond the server's query row cap.
         **This is the only call that answers the transfer ``chunk_shape``**: the
         grid belongs to the tensor the server binds here, and a catalog row
-        carries it empty (biopb/biopb#812). Every call fetches -- the client
-        caches only the *structural* part of the answer (shape/dtype/dim_labels
-        plus physical scale) for its own addressing, never ``chunk_shape``,
-        ``metadata_json`` or ``pyramid``, so what you get back always reflects the
-        masks you passed. Passing a bare
+        carries it empty (biopb/biopb#812). Every call fetches and nothing is
+        stored, so what you get back always reflects the masks you passed.
+        Passing a bare
         ``source_id`` (single-tensor source, or to anchor on a multi-tensor
         source's default/first tensor) is accepted. To enumerate ALL
         tensors/scenes of a source, read its catalog row's ``tensors`` column

@@ -16,6 +16,31 @@ from biopb.tensor import (
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 
+def _offline_client(raw_client=None):
+    """A wired TensorFlightClient with no connection opened.
+
+    Built without ``__init__`` so no socket is created: the shared state plus the
+    three collaborators (#278 item C), which is all any of these tests need
+    before they bolt their own stubs on. ``protocol_checked`` skips the health
+    probe a real connect would run.
+    """
+    from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+    client = TensorFlightClient.__new__(TensorFlightClient)
+    state = _ClientState(
+        raw_client=raw_client,
+        call_options=None,
+        location="",
+        token=None,
+        cache_bytes=0,
+        protocol_checked=True,
+    )
+    client._state = state
+    client._catalog = CatalogClient(state)
+    client._fetcher = ChunkFetcher(state, client._catalog)
+    return client
+
+
 class TestQuerySourcesFormat:
     """query_sources output-format conversion (server-free).
 
@@ -106,19 +131,7 @@ class TestQuerySourcesFormat:
     def test_unknown_format_rejected_before_network(self):
         # Validated at the top of query_sources (now on CatalogClient, #278 item
         # C), so a bad format fails fast without a server / connection.
-        from biopb.tensor._session import CatalogClient, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        client._catalog = CatalogClient(
-            _ClientState(
-                raw_client=None,
-                call_options=None,
-                location="",
-                token=None,
-                cache_bytes=0,
-                protocol_checked=True,
-            )
-        )
+        client = _offline_client()
         with pytest.raises(ValueError, match="unknown format"):
             client.query_sources("SELECT 1", format="polars")
 
@@ -133,24 +146,9 @@ class TestGetPhysicalScale:
 
     @staticmethod
     def _client():
-        # Build without __init__ (no connection): wire the shared state + the
-        # CatalogClient collaborator that now owns get_physical_scale (#278 item
-        # C). The method only touches the in-memory descriptor cache and (on a
-        # miss) the catalog's _fetch_tensor_descriptor, which we stub there.
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            raw_client=None,
-            call_options=None,
-            location="",
-            token=None,
-            cache_bytes=0,
-            protocol_checked=True,
-        )
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
+        # get_physical_scale lives on CatalogClient (#278 item C) and reaches
+        # the server only through _fetch_tensor_descriptor, stubbed here.
+        client = _offline_client()
         client._catalog._fetch_tensor_descriptor = Mock()
         return client
 
@@ -186,11 +184,10 @@ class TestGetPhysicalScale:
 
         assert client.get_physical_scale("src/t1") is None
 
-    def test_fetches_descriptor_when_not_cached(self):
-        # Not in the descriptor cache: a GetFlightInfo fetch (stubbed here via
-        # _fetch_tensor_descriptor) supplies the summary. A bare source id
-        # resolves the source's default tensor. No get_source / _sources fallback
-        # (removed with the array_id-keyed accessor, #75).
+    def test_a_bare_id_fetches_the_sources_default_tensor(self):
+        # The property this holds that the test above does not: a bare source id
+        # is passed through to the server, which answers with the source's
+        # default tensor (#44), and the compact mask is what goes on the wire.
         client = self._client()
         desc = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
         client._catalog._fetch_tensor_descriptor.return_value = desc
@@ -237,17 +234,8 @@ class TestGetDescriptorFieldMasks:
     def _client_capturing_read_opt():
         # Build without __init__ (no connection); mock the flight client so we can
         # decode the FlightRequest the descriptor probe puts on the wire.
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            raw_client=Mock(),
-            call_options=None,
-            location="",
-            token=None,
-            cache_bytes=0,
-            protocol_checked=True,
-        )
+        client = _offline_client(raw_client=Mock())
+        state = client._state
         # get_flight_info returns a FlightInfo whose descriptor.command is a
         # serialized TensorDescriptor (what _fetch_tensor_descriptor parses back).
         info = Mock()
@@ -255,9 +243,6 @@ class TestGetDescriptorFieldMasks:
             array_id="src/A2"
         ).SerializeToString()
         state.client.get_flight_info.return_value = info
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
         return client, state
 
     @staticmethod
@@ -311,23 +296,10 @@ class TestDescriptorsAreNotCached:
 
     @staticmethod
     def _client(response: TensorDescriptor):
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            raw_client=Mock(),
-            call_options=None,
-            location="",
-            token=None,
-            cache_bytes=0,
-            protocol_checked=True,
-        )
+        client = _offline_client(raw_client=Mock())
         info = Mock()
         info.descriptor.command = response.SerializeToString()
-        state.client.get_flight_info.return_value = info
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
+        client._state.client.get_flight_info.return_value = info
         return client
 
     @staticmethod
@@ -398,20 +370,7 @@ class TestResolveDescriptorAddressing:
 
     @staticmethod
     def _client(row):
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            raw_client=Mock(),
-            call_options=None,
-            location="",
-            token=None,
-            cache_bytes=0,
-            protocol_checked=True,
-        )
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
+        client = _offline_client(raw_client=Mock())
         client._catalog._source_tensors_row = Mock(return_value=row)
         # The row answers every case here; reaching the probe is the failure.
         client._catalog._fetch_tensor_descriptor = Mock(

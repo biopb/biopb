@@ -2,8 +2,7 @@
 
 Extracted from :mod:`biopb.tensor.client` (issue #278 item C): declaring a
 tensor and writing its chunks are a self-contained concern that reads the
-shared ``_ClientState`` for its connection and touches none of the catalog /
-descriptor caches the read path keeps there. :class:`UploadSession` owns that
+shared ``_ClientState`` for its connection. :class:`UploadSession` owns that
 concern; ``TensorFlightClient`` holds one and delegates its public upload
 methods to it. Status polling is a read of one descriptor field and lives on
 ``CatalogClient``.
@@ -23,7 +22,7 @@ import pyarrow as pa
 import pyarrow.flight as flight
 
 from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
-from biopb.tensor._session import _upload_status_dict
+from biopb.tensor._session import _upload_status_dict, extra_info
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, UploadStatus as UploadStatusPb
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, FinishUpload, PutCommand
@@ -66,14 +65,8 @@ def _refused_from(exc: flight.FlightCancelledError) -> Optional[UploadRefused]:
     in ``extra_info`` for a discarded or sealed upload; any other cancelled
     call is somebody else's and passes through untouched.
     """
-    raw = getattr(exc, "extra_info", None)
-    if not raw:
-        return None
-    try:
-        info = json.loads(bytes(raw).decode())
-    except (ValueError, UnicodeDecodeError):
-        return None
-    if not str(info.get("reason", "")).startswith("upload_"):
+    info = extra_info(exc)
+    if info is None or not str(info.get("reason", "")).startswith("upload_"):
         return None
     return UploadRefused(
         str(info.get("source_id", "")),
@@ -190,9 +183,8 @@ class UploadSession:
     the new source, and that descriptor is what every write takes.
 
     Takes the shared ``_ClientState`` its two sibling collaborators take
-    (``CatalogClient``, ``ChunkFetcher``) and reads only the connection fields
-    from it -- never the catalog / descriptor caches. ``TensorFlightClient``
-    constructs one in its ``__init__`` and delegates its public upload API here.
+    (``CatalogClient``, ``ChunkFetcher``). ``TensorFlightClient`` constructs one
+    in its ``__init__`` and delegates its public upload API here.
     """
 
     def __init__(self, state: "_ClientState"):

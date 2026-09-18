@@ -101,20 +101,15 @@ class _ClientState:
     """Per-connection state shared by CatalogClient / ChunkFetcher / the facade.
 
     The Flight connection handles and nothing else. **The SDK caches no
-    descriptors.** It held an array_id-keyed dict of them once; it was unbounded,
-    session-lived, and had no invalidation at all, so a source rebuilt in place
-    (``add_source`` reports that as ``refreshed``) kept its old shape for the
-    life of the process. It also held two grades of entry -- rich from a
-    ``GetFlightInfo`` response, poor from a catalog row -- which made
-    ``get_physical_scale`` answer "no scale recorded" for a tensor whose scale
-    the server had.
+    descriptors**: every one is fetched per call, which is the only freshness
+    policy this layer can honestly promise, since it cannot know what
+    invalidates one. A caller that wants memoization owns it -- and does it
+    better, the way the HTTP sidecar keys its pyramid memo on
+    ``content_version``, bounds it, and declines to memoize a tensor that has no
+    version at all.
 
-    Callers that need one cache it themselves, and better, because they know
-    what invalidates it: the HTTP sidecar keys its pyramid memo on
-    ``content_version`` and bounds it, and declines to memoize a tensor that has
-    no version at all; the caching proxy adapter keeps its own. A descriptor is
-    fetch-per-call here by contract, which is the only policy this layer can
-    honestly promise.
+    Why the array_id-keyed cache that used to live here was removed, and what it
+    got wrong: ``biopb-tensor-server/docs/source-descriptor-retirement.md``.
     """
 
     raw_client: flight.FlightClient
@@ -430,31 +425,83 @@ def _check_wire_protocol(schema: pa.Schema) -> None:
         )
 
 
-def _addressing_error(exc: flight.FlightError) -> Optional[ValueError]:
-    """The ``ValueError`` a terminal addressing refusal deserves, else ``None``.
+def extra_info(exc: Exception) -> Optional[Mapping[str, Any]]:
+    """The structured payload the server attaches to a Flight error, or ``None``.
 
-    A read whose id names nothing has always raised ``ValueError``, not a Flight
-    error. pyarrow exposes no ``FlightNotFoundError``, so the server carries the
-    canonical code in ``extra_info`` for exactly this purpose (see the server's
-    ``to_flight_error``) -- switching on that is what it is for, and it beats
-    matching on the message.
-
-    The server's own wording is kept because it is more specific than anything
-    this layer could rebuild: it knows whether the source is missing or the
-    source is there and the field is not. Reconstructing that distinction
-    client-side is what used to cost a catalog round trip on every read.
+    pyarrow exposes only a subset of gRPC's status codes as typed exceptions --
+    there is no ``FlightNotFoundError`` -- so the server puts the canonical code
+    and a machine ``reason`` in ``extra_info`` for clients to switch on (see its
+    ``to_flight_error``). This is the one place that decode lives.
     """
     raw = getattr(exc, "extra_info", None)
     if not raw:
         return None
     try:
-        info = json.loads(bytes(raw).decode())
+        return json.loads(bytes(raw).decode())
     except (ValueError, UnicodeDecodeError):
         return None
-    if info.get("code") not in ("NOT_FOUND", "INVALID_ARGUMENT"):
+
+
+class _AddressingError(ValueError):
+    """An id that names no source, or no such tensor within one.
+
+    A ``ValueError`` because that is what a bad id has always raised here, but
+    its own type so a caller that has a narrower question can tell it apart --
+    :meth:`CatalogClient.get_upload_status` answers UNKNOWN for an id the server
+    does not serve, and must not swallow the unresolved steer alongside it.
+    """
+
+
+def _addressing_error(exc: flight.FlightError) -> Optional[_AddressingError]:
+    """The ``ValueError`` a terminal addressing refusal deserves, else ``None``.
+
+    A read whose id names nothing has always raised ``ValueError``, not a Flight
+    error. The server's own wording is kept because it is more specific than
+    anything this layer could rebuild: it knows whether the source is missing or
+    the source is there and the field is not. Reconstructing that distinction
+    client-side is what used to cost a catalog round trip on every read.
+    """
+    info = extra_info(exc)
+    if info is None or info.get("code") not in ("NOT_FOUND", "INVALID_ARGUMENT"):
         return None
     # pyarrow appends its own ". Detail: ..." to the server's message.
-    return ValueError(str(exc).split(". Detail:")[0])
+    return _AddressingError(str(exc).split(". Detail:")[0])
+
+
+def _ambiguous_default_error(source_id: str, count: int) -> ValueError:
+    """The #75 refusal: a bare id naming a source that holds several tensors.
+
+    One wording, because two paths can reach it -- the pre-RPC resolve an
+    open-ended slice needs, and the post-response check every other read makes.
+    A caller must not be able to tell which one refused it.
+    """
+    return ValueError(
+        f"Source '{source_id}' has multiple tensors ({count}), "
+        "tensor_id must be specified"
+    )
+
+
+def _raise_read_refusal(exc: flight.FlightError, array_id: str) -> None:
+    """Restate a server refusal as the error this SDK promises, or return.
+
+    The describe (:meth:`CatalogClient._fetch_tensor_descriptor`) and the plan
+    (:meth:`ChunkFetcher._plan_read`) are the same ``GetFlightInfo`` under
+    different masks, so they have to refuse identically. They did not: only one
+    translated the not-found code, so ``get_tensor`` raised ``ValueError`` on an
+    id that names nothing while ``get_descriptor`` leaked a ``FlightServerError``.
+    """
+    if (
+        isinstance(exc, flight.FlightUnavailableError)
+        and "unresolved" in str(exc).lower()
+    ):
+        # The server's refusal, restated as the directive steer. It holds for
+        # every id this way, where a local catalog pre-check only fired for one
+        # the client had happened to look up -- and a capability-token holder
+        # cannot browse the catalog at all.
+        raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
+    addressing = _addressing_error(exc)
+    if addressing is not None:
+        raise addressing from exc
 
 
 def _unresolved_source_error(source_id: str) -> ValueError:
@@ -757,15 +804,11 @@ class CatalogClient:
             info = self._state.client.get_flight_info(
                 fd, options=self._state.call_options
             )
-        except flight.FlightUnavailableError as exc:
-            # GetFlightInfo no longer resolves on serve: an unresolved (cloud /
-            # synced-folder) source now refuses with FlightUnavailableError
-            # ("Source unresolved ...") instead of silently downloading. Make this
-            # a cheap steering probe -- restate it as the shared directive so
-            # get_descriptor points the caller at the explicit, consented
-            # resolve(), consistent with get_tensor / get_physical_scale.
-            if "unresolved" in str(exc).lower():
-                raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
+        except flight.FlightError as exc:
+            # GetFlightInfo does not resolve on serve, so an unresolved (cloud /
+            # synced-folder) source refuses here instead of silently downloading.
+            # This stays a cheap steering probe.
+            _raise_read_refusal(exc, array_id)
             raise
         return TensorDescriptor.FromString(info.descriptor.command)
 
@@ -790,23 +833,19 @@ class CatalogClient:
         )
 
     def _resolve_descriptor(self, array_id: str) -> "TensorDescriptor":
-        """The structural ``TensorDescriptor`` for ``array_id``: cache, then
-        catalog, then a direct per-tensor probe.
+        """The structural ``TensorDescriptor`` for ``array_id``: catalog row
+        first, then a direct per-tensor probe.
 
-        Read-path counterpart to :meth:`get_descriptor`: same identity, but it
-        answers from the catalog row where it can, and it owns the addressing
-        refusals a read must make -- an unresolved source (steer to
-        :meth:`resolve`) and a bare *multi*-tensor id, which is ambiguous and is
-        never silently defaulted (#75).
+        :meth:`_plan_read` calls this for the one request shape that cannot be
+        planned without it -- an open-ended slice ``stop`` needs the tensor's
+        extent up front. Everything else is planned in a single ``GetFlightInfo``.
+        Because it holds the row, it also makes the addressing refusals for that
+        path, so the post-response check does not have to re-query.
 
-        :meth:`_plan_read` calls this only for the one request shape that cannot
-        be planned without it -- an open-ended slice ``stop`` needs the tensor's
-        extent up front. Everything else it plans in a single ``GetFlightInfo``.
-
-        The row is read directly, for its ``tensors`` and its ``is_resolved``.
-        The per-tensor probe is the fallback because it is the only step open to
-        a capability-token holder, who may read the source but not browse the
-        catalog.
+        The probe is the fallback because it is the only step open to a
+        capability-token holder, who may read the source but not browse the
+        catalog. Its refusals are the server's, already restated by
+        :func:`_raise_read_refusal`.
         """
         source_id, tensor_id = _split_array_id(array_id)
         row = self._source_tensors_row(source_id)
@@ -828,70 +867,68 @@ class CatalogClient:
                 )
             if tensor_id is None:
                 if len(tensors) > 1:
-                    raise ValueError(
-                        f"Source '{source_id}' has multiple tensors "
-                        f"({len(tensors)}), tensor_id must be specified"
-                    )
+                    raise _ambiguous_default_error(source_id, len(tensors))
                 return tensors[0]
             for candidate in tensors:
                 if candidate.array_id == array_id:
                     return candidate
 
-        try:
-            return self._fetch_tensor_descriptor(array_id, with_metadata=False)
-        except ValueError:
-            # Already a directive (the unresolved-source steer) -- keep its wording.
-            raise
-        except Exception as exc:
-            # Restate the transport failure as the addressing error it actually
-            # is, distinguishing "no such source" from "source known, no such
-            # tensor" the way the catalog would have.
-            if row is None:
-                raise ValueError(f"Source not found: {source_id}") from exc
-            raise ValueError(
-                f"Tensor '{array_id}' not found in source '{source_id}'"
-            ) from exc
+        return self._fetch_tensor_descriptor(array_id, with_metadata=False)
 
     def _refuse_ambiguous_default(self, array_id: str) -> None:
         """Raise when a bare id named a source holding more than one tensor.
 
         The server answers a bare id with the source's default (first) tensor
-        (#44). That is right for a single-tensor source, where the bare id *is*
-        the tensor's id, and wrong for a multi-tensor one, where it silently
-        picks a field the caller never named (#75). Only the catalog can tell
-        those apart: one ``GetFlightInfo`` just serves the default.
+        (#44). That is right for a single-tensor source and wrong for a
+        multi-tensor one, where it silently picks a field the caller never named
+        (#75). Only the catalog can tell those apart: one ``GetFlightInfo`` just
+        serves the default.
 
-        Called after the response, and only when the server's echoed array_id
-        shows a default was actually taken -- so a source with one tensor never
-        reaches here and never pays the query.
+        **This costs a query on every bare-id read**, and the trigger -- the
+        server echoing back an array_id that differs from the one asked for --
+        does not narrow it as much as it looks. Every scene-based adapter (nd2,
+        lif, czi, bioio, ome_zarr, ome_tiff) qualifies its ids even for a
+        single-scene file, so ``get_tensor("my_nd2")`` lands here too. Hence the
+        count, not the column: a plate row's ``tensors`` struct list runs to tens
+        of kilobytes and this reads one integer from it.
+
+        The query goes away entirely once ``GetFlightInfo`` says whether it
+        substituted a default; that is a server change every binding must take
+        in step, since all four re-derive this rule today.
         """
         source_id = _split_array_id(array_id)[0]
-        row = self._source_tensors_row(source_id)
-        if row is None:
-            # No catalog to ask; the server's answer is the only one there is.
-            return
-        count = len(row.get("tensors") or [])
-        if count > 1:
-            raise ValueError(
-                f"Source '{source_id}' has multiple tensors ({count}), "
-                "tensor_id must be specified"
-            )
+        count = self._source_tensor_count(source_id)
+        if count is not None and count > 1:
+            raise _ambiguous_default_error(source_id, count)
+
+    def _source_tensor_count(self, source_id: str) -> Optional[int]:
+        """How many tensors the catalog lists for a source, or ``None`` if it
+        cannot say -- no row matched, or there is no catalog to ask."""
+        row = self._addressed_row("len(tensors) AS tensor_count", source_id)
+        return row["tensor_count"] if row else None
 
     def _source_tensors_row(self, source_id: str) -> Optional[Mapping[str, Any]]:
-        """One source's addressing columns, or ``None`` when the catalog has no
-        answer -- whether because no row matched or because there is no catalog
-        to ask (a capability token reads one source's pixels, not the catalog;
-        an embedded server may have none). Both mean the same thing to the
-        caller: the per-tensor probe is the path left, and its error is the one
-        worth reporting.
+        """One source's addressing columns: the resolved flag and the tensor list.
 
-        Two columns, not ``SOURCE_ROW_COLUMNS``: resolving a tensor needs the
-        resolved flag and the tensor list, and the source's url/type are bytes
-        on the wire nobody here reads.
+        Not ``SOURCE_ROW_COLUMNS`` -- the source's url and type are bytes on the
+        wire nobody here reads.
+        """
+        return self._addressed_row("is_resolved, tensors", source_id)
+
+    def _addressed_row(
+        self, columns: str, source_id: str
+    ) -> Optional[Mapping[str, Any]]:
+        """One source's row, projected to ``columns``, or ``None``.
+
+        ``None`` covers both "no such row" and "no catalog to ask" (a capability
+        token reads one source's pixels, not the catalog; an embedded server may
+        have none). Both mean the same thing to every caller here: the catalog
+        cannot answer, so the per-tensor probe is the path left and its error is
+        the one worth reporting.
         """
         try:
             table = self._query_table(
-                "SELECT is_resolved, tensors FROM sources "
+                f"SELECT {columns} FROM sources "
                 f"WHERE source_id = {sql_literal(source_id)}"
             )
         except flight.FlightError:
@@ -1030,7 +1067,7 @@ class CatalogClient:
         """
         try:
             desc = self._fetch_tensor_descriptor(source_id, with_upload_status=True)
-        except flight.FlightError:
+        except (flight.FlightError, _AddressingError):
             # An id the server does not serve at all. UNKNOWN already means
             # "no upload record here -- never was, or it has been reclaimed",
             # and an unregistered source is the strongest form of that, so it
@@ -1226,12 +1263,18 @@ class ChunkFetcher:
         builds the array from the returned FlightInfo, the other hands the
         FlightInfo on.
 
-        **One RPC in the ordinary case.** The addressing facts this used to
-        resolve up front are answered by the same ``GetFlightInfo`` that plans
-        the read, so a fully-bounded request costs one round trip and no cached
-        state. Only two things still need the catalog, and each asks for itself:
-        an open-ended slice ``stop`` (below), and a bare id the server defaulted
-        (after the response). The tile path hits neither.
+        **One RPC for a qualified id with bounded slice bounds** -- the shape the
+        tile route issues. The addressing facts this used to resolve up front are
+        answered by the same ``GetFlightInfo`` that plans the read, so such a
+        request costs one round trip and no cached state.
+
+        Two shapes still need the catalog, and each asks for itself rather than
+        charging every read: an open-ended slice ``stop``, which nothing but the
+        tensor can fill, and a *bare* id, whose ambiguity only the catalog can
+        judge. Note that the second is not rare -- every scene-based adapter
+        qualifies its array_ids even for a single-scene file, so a bare id
+        usually comes back changed. A caller reading one tensor repeatedly should
+        pass the qualified array_id.
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
@@ -1244,13 +1287,18 @@ class ChunkFetcher:
         logger.debug(f"_plan_read: array_id={array_id}")
 
         slice_hint_proto = None
+        refusals_settled = False
         if slice_hint is not None:
             starts = [s.start if s.start is not None else 0 for s in slice_hint]
             stops = [s.stop for s in slice_hint]
             if any(stop is None for stop in stops):
                 # The one thing a request cannot state about itself: where the
-                # tensor ends. Resolved only when a stop is actually open.
+                # tensor ends. Resolved only when a stop is actually open -- and
+                # that resolve reads the catalog row, so it makes the addressing
+                # refusals too and the post-response check below would only
+                # re-ask the same question.
                 shape = self._catalog._resolve_descriptor(array_id).shape
+                refusals_settled = True
                 stops = [
                     shape[axis] if stop is None else stop
                     for axis, stop in enumerate(stops)
@@ -1277,31 +1325,19 @@ class ChunkFetcher:
             info = self._state.client.get_flight_info(
                 flight_desc, options=self._state.call_options
             )
-        except flight.FlightUnavailableError as exc:
-            # The unresolved-source refusal is the server's now, not a local
-            # pre-check, so it holds for every id rather than only for one the
-            # catalog happened to have been asked about. Restate it as the
-            # directive steer, as the describe path does.
-            if "unresolved" in str(exc).lower():
-                raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
-            raise
         except flight.FlightError as exc:
-            # An id that names nothing raises ValueError, as it always has.
-            addressing = _addressing_error(exc)
-            if addressing is not None:
-                raise addressing from exc
+            _raise_read_refusal(exc, array_id)
             raise
 
-        response_desc = TensorDescriptor.FromString(info.descriptor.command)
-        if response_desc.array_id != array_id:
-            # The server substituted the source's default (first) tensor for a
-            # bare id, and echoed which one it picked. That echo is the only
-            # signal a default was taken: right for a single-tensor source, where
-            # the bare id IS the tensor's id and the echo comes back unchanged,
-            # and the #75 ambiguity when the source has more than one. Checked
-            # here rather than before the RPC so the qualified and single-tensor
-            # reads that dominate the tile path pay nothing for it.
-            self._catalog._refuse_ambiguous_default(array_id)
+        if not refusals_settled:
+            # The server substitutes a source's default (first) tensor for a bare
+            # id (#44) and echoes which one it picked, so an array_id that came
+            # back changed is the signal a default was taken. Checked after the
+            # response, not before it, so a qualified id -- which the tile path
+            # always has -- costs nothing.
+            response_desc = TensorDescriptor.FromString(info.descriptor.command)
+            if response_desc.array_id != array_id:
+                self._catalog._refuse_ambiguous_default(array_id)
         return info
 
     def get_tensor(

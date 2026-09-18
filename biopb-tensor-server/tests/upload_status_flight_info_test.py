@@ -168,10 +168,29 @@ class TestNotCached:
 class TestSdkDictShape:
     def test_unknown_for_a_source_with_no_upload(self, client, writable_server):
         """Distinct from PENDING: no amount of polling moves it, which is what
-        a caller's poll loop stops on at once."""
+        a caller's poll loop stops on at once.
+
+        Also guards a seam: the descriptor probe under this now restates a
+        not-found id as a ValueError rather than letting the Flight error
+        through, and this caller asked a narrower question than `describe` does
+        -- it must still answer UNKNOWN rather than raise.
+        """
         status = client.get_upload_status("cache_does_not_exist")
         assert status["state"] == "UNKNOWN"
         assert status["expected_chunks"] == 0
+
+    def test_an_unresolved_source_still_raises(self, client, monkeypatch):
+        """The other half of that seam: swallowing every ValueError would turn
+        the resolve steer into a bland UNKNOWN, which tells a cloud-source owner
+        nothing about what to do next. Only the addressing error is absorbed."""
+        from biopb.tensor._session import _unresolved_source_error
+
+        def _unresolved(*args, **kwargs):
+            raise _unresolved_source_error("cloud_x")
+
+        monkeypatch.setattr(client._catalog, "_fetch_tensor_descriptor", _unresolved)
+        with pytest.raises(ValueError, match=r"client\.resolve"):
+            client.get_upload_status("cloud_x")
 
     def test_the_dict_keeps_its_shape(self, client):
         """The wire moved; the SDK's answer did not. `biopb_image_base` mirrors

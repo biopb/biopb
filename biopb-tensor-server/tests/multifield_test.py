@@ -644,14 +644,14 @@ class TestStripSourcePrefix:
         assert strip_source_prefix("src", "") == ""
 
 
-class TestDescriptorCacheCollision:
-    """Regression for #45: cross-source descriptor cache collisions.
+class TestSameBareFieldNameAcrossSources:
+    """Regression for #45: two sources whose fields share a bare name.
 
-    Two single-scene-aicsimageio-like sources share the bare tensor id
-    "Image:0". A descriptor cache keyed by the bare array_id collapses them to
-    one entry, so get_physical_scale / get_source silently return another
-    source's descriptor (wrong shape, dims, physical scale). The cache must be
-    keyed per (source_id, array_id).
+    Two single-scene-aicsimageio-like sources both call their tensor "Image:0".
+    What originally collapsed them was a descriptor cache keyed by the bare name;
+    that cache is gone, but the property it broke is a property of the *id*, not
+    of any cache — the qualified array_id is globally unique, so each source must
+    answer with its own descriptor however the SDK stores (or does not store) it.
     """
 
     def test_same_bare_array_id_across_sources_returns_own_descriptor(self):
