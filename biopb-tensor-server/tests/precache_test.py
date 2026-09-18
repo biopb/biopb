@@ -13,6 +13,7 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
+from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server, register_and_catalog
 
@@ -1497,7 +1498,8 @@ class TestAdvertisedPyramidDescriptor:
             # Pyramid advertisement is opt-in (biopb/biopb#563); this class asserts
             # get_flight_info fills it, so request it.
             tensor_read=TensorReadOption(
-                array_id=tensor_id or source_id, with_pyramid=True
+                array_id=tensor_id or source_id,
+                fields=FieldMask(paths=["endpoints", "pyramid"]),
             ),
         )
         desc = flight.FlightDescriptor.for_command(req.SerializeToString())
@@ -1617,23 +1619,33 @@ class TestAdvertisedPyramidDescriptor:
             assert len(bare.pyramid) == 0
             asked = self._descriptor(
                 self._flight_info_opt(
-                    server, TensorReadOption(array_id="big", with_pyramid=True)
+                    server,
+                    TensorReadOption(
+                        array_id="big", fields=FieldMask(paths=["endpoints", "pyramid"])
+                    ),
                 )
             )
             assert len(asked.pyramid) >= 2
         finally:
             server.shutdown()
 
-    def test_read_plan_defaults_on_when_unset(self, tmp_path):
-        # with_read_plan is optional/default-true: an unset field (old client or a
-        # plain read) still enumerates the chunk endpoints, exactly as before.
+    def test_an_empty_mask_enumerates_nothing(self, tmp_path):
+        # The inversion. `with_read_plan` unset used to mean *true*, so the
+        # O(chunks) enumeration was what a request got by saying nothing and a
+        # describe had to opt out. Under the mask nothing is implied, so the
+        # cheap call is the default and a read asks for "endpoints".
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
         server = TensorFlightServer("grpc://localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             info = self._flight_info_opt(server, TensorReadOption(array_id="big"))
-            assert len(info.endpoints) >= 1
+            assert len(info.endpoints) == 0
+            asked = self._flight_info_opt(
+                server,
+                TensorReadOption(array_id="big", fields=FieldMask(paths=["endpoints"])),
+            )
+            assert len(asked.endpoints) >= 1
         finally:
             server.shutdown()
 
@@ -1647,9 +1659,7 @@ class TestAdvertisedPyramidDescriptor:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             info = self._flight_info_opt(
                 server,
-                TensorReadOption(
-                    array_id="big", with_read_plan=False, with_pyramid=True
-                ),
+                TensorReadOption(array_id="big", fields=FieldMask(paths=["pyramid"])),
             )
             assert len(info.endpoints) == 0
             desc = self._descriptor(info)

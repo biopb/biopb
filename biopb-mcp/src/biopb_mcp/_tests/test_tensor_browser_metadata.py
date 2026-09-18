@@ -8,13 +8,11 @@ unlike the viewer-dependent ``test_tensor_browser_widget.py``.
 
 from types import SimpleNamespace
 
-from biopb_mcp._catalog import CatalogSource
 from biopb_mcp.tensor_browser._widget import (
     _build_tree,
     _filter_empty_metadata,
     _get_path_parts,
     _is_empty_for_display,
-    _residency_state,
 )
 
 
@@ -155,22 +153,3 @@ class TestBuildTreeWindowsPaths:
         leaf_names = sorted(c.name for c in folder.children)
         assert leaf_names == ["one.png", "two.png"]
         assert all(c.node_type == "source" for c in folder.children)
-
-
-class TestResidencyState:
-    """Tri-state residency indicator: resident / remote / unknown (unset)."""
-
-    def test_unset_is_unknown(self):
-        # Server didn't report it -> None, so the UI shows no indicator.
-        src = CatalogSource(source_id="s")
-        assert src.data_resident is None
-        assert _residency_state(src) is None
-
-    def test_true_is_resident(self):
-        src = CatalogSource(source_id="s", data_resident=True)
-        assert _residency_state(src) == "resident"
-
-    def test_false_is_remote(self):
-        # Explicitly false -- reported, and remote, not unknown.
-        src = CatalogSource(source_id="s", data_resident=False)
-        assert _residency_state(src) == "remote"

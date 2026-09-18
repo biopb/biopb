@@ -32,6 +32,7 @@ from biopb_tensor_server.core.normalize import (
 )
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.server import TensorFlightServer
+from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server, register_and_catalog
 
@@ -268,7 +269,8 @@ class TestNormalizeAdapter:
             adapter = registry.register("src", _zarr_adapter(tmp, src, ["x", "y", "z"]))
             assert isinstance(adapter, NormalizingAdapter)
             plan = adapter.get_tensor_adapter(None).plan_flight_info(
-                TensorReadOption(array_id="src"), PyramidConfig()
+                TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
+                PyramidConfig(),
             )
             assert len(plan.chunk_endpoints) > 1
 
@@ -355,7 +357,8 @@ class TestNormalizedDescriptorAndData:
         with tempfile.TemporaryDirectory() as tmp:
             adapter, _ = self._wrapped(tmp)
             plan = adapter.plan_flight_info(
-                TensorReadOption(array_id="src"), PyramidConfig()
+                TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
+                PyramidConfig(),
             )
             assert list(plan.descriptor.dim_labels) == ["z", "y", "x"]
             assert list(plan.descriptor.shape) == [4, 3, 2]
@@ -372,7 +375,8 @@ class TestNormalizedDescriptorAndData:
         with tempfile.TemporaryDirectory() as tmp:
             adapter, src = self._wrapped(tmp)
             plan = adapter.plan_flight_info(
-                TensorReadOption(array_id="src"), PyramidConfig()
+                TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
+                PyramidConfig(),
             )
             out = np.zeros(tuple(plan.descriptor.shape), dtype=np.uint16)
             for ce in plan.chunk_endpoints:
@@ -395,7 +399,9 @@ class TestNormalizedDescriptorAndData:
         transfer_target(4)
         with tempfile.TemporaryDirectory() as tmp:
             adapter, src = self._wrapped(tmp)
-            read_opt = TensorReadOption(array_id="src")
+            read_opt = TensorReadOption(
+                array_id="src", fields=FieldMask(paths=["endpoints"])
+            )
             read_opt.slice_hint.start[:] = [0, 0, 0]
             read_opt.slice_hint.stop[:] = [2, 3, 2]
             plan = adapter.plan_flight_info(read_opt, PyramidConfig())
@@ -415,7 +421,9 @@ class TestNormalizedDescriptorAndData:
             adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
             canonical = src.transpose(2, 1, 0)
 
-            read_opt = TensorReadOption(array_id="src")
+            read_opt = TensorReadOption(
+                array_id="src", fields=FieldMask(paths=["endpoints"])
+            )
             read_opt.scale_hint[:] = [2, 2, 1]  # canonical: z/2, y/2, x untouched
             # Asked for explicitly: this test is about the permutation agreeing
             # across scale_hint / chunk_id / result, and the expected value below
@@ -445,7 +453,9 @@ class TestNormalizedDescriptorAndData:
             src = np.zeros((128, 64, 4), np.uint16)  # x, y, z
             adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
             plan = adapter.plan_flight_info(
-                TensorReadOption(array_id="src", with_pyramid=True),
+                TensorReadOption(
+                    array_id="src", fields=FieldMask(paths=["endpoints", "pyramid"])
+                ),
                 PyramidConfig(threshold=32),
             )
             assert list(plan.descriptor.shape) == [4, 64, 128]
@@ -545,7 +555,10 @@ class TestNormalizedCaching:
                 src = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
                 adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
                 plan = adapter.plan_flight_info(
-                    TensorReadOption(array_id="src"), PyramidConfig()
+                    TensorReadOption(
+                        array_id="src", fields=FieldMask(paths=["endpoints"])
+                    ),
+                    PyramidConfig(),
                 )
                 ce = plan.chunk_endpoints[0]
                 first = adapter.resolve_chunk_data(ce.chunk_id, cache)

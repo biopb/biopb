@@ -76,6 +76,7 @@ from biopb_tensor_server.core.errors import (
     TensorNotFound,
     WriteNotSupportedError,
 )
+from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
 from biopb_tensor_server.core.retention import (
     computed_ladder,
     record_decode,
@@ -1424,30 +1425,28 @@ class TensorAdapter(SourceAdapter):
         stays lean). ``metadata_json`` itself is still filled by the server from
         the catalog, not here.
 
-        ``read_opt`` carries two field masks over this response (biopb/biopb#563):
+        ``read_opt.fields`` selects the optional parts (biopb/biopb#563, a
+        a ``FieldMask``):
 
-        - ``with_read_plan`` (default true, an *unset* ``optional`` bool) gates the
-          per-request chunk endpoints. When false this is a **describe-only** call:
-          the request's slice/scale/reduction hints do not apply (describe is the
-          stable per-tensor fact, not a per-request read), so the descriptor is
-          this tensor's base descriptor and the endpoint list is empty --
-          ``get_read_plan`` (the O(chunks) enumeration) is skipped entirely.
-        - ``with_pyramid`` (default false) gates the pyramid advertisement, whose
-          native-level sizing is the expensive part; ``physical_scale`` is the
-          cheap describe fact and is filled unconditionally.
+        - ``endpoints`` gates the per-request chunk plan. Without it this is a
+          **describe-only** call: the request's slice/scale/reduction hints do
+          not apply (describe is the stable per-tensor fact, not a per-request
+          read), the descriptor is this tensor's base descriptor, and
+          ``get_read_plan`` -- the O(chunks) enumeration -- is skipped entirely.
+        - ``pyramid`` gates the advertisement, whose native-level sizing is the
+          expensive part; ``physical_scale`` is the cheap describe fact and is
+          filled unconditionally.
 
         The default plans locally. A remote-proxy adapter overrides this to
         forward the upstream's authoritative plan instead (biopb/biopb#295).
         """
         base_desc = self.get_tensor_descriptor()
 
-        # with_read_plan is an optional bool defaulting true: an unset field (an
-        # old client, or a plain read) still gets the full plan, as before.
-        with_read_plan = (
-            read_opt.with_read_plan if read_opt.HasField("with_read_plan") else True
-        )
+        # Opt-in: an empty mask is a describe, and the O(chunks) plan is the
+        # most expensive thing here, so it is never what saying nothing buys.
+        mask = read_mask(read_opt)
 
-        if with_read_plan:
+        if ENDPOINTS in mask:
             request_desc = self._base_structural_descriptor(base_desc)
             if read_opt.HasField("slice_hint"):
                 request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
@@ -1473,7 +1472,7 @@ class TensorAdapter(SourceAdapter):
         # sizing is the costly part), then the compact physical scale (cheap,
         # always filled) -- both open-time only (never in list_flights).
         read_plan.descriptor.ClearField("pyramid")
-        if read_opt.with_pyramid:
+        if PYRAMID in mask:
             read_plan.descriptor.pyramid.extend(
                 self._advertised_pyramid(base_desc, pyramid_config)
             )

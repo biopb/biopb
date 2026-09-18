@@ -29,6 +29,7 @@ from biopb_tensor_server.fixtures import (
     create_multifile_embedded_ome_tiff,
     create_tiled_ome_tiff,
 )
+from google.protobuf.field_mask_pb2 import FieldMask
 
 
 class TestTczyxShape:
@@ -728,7 +729,8 @@ class TestReadPathTifffileAuthoritative:
         assert not hasattr(scene, "_bio_image")
 
         plan = scene.plan_flight_info(
-            TensorReadOption(with_pyramid=True), PyramidConfig()
+            TensorReadOption(fields=FieldMask(paths=["endpoints", "pyramid"])),
+            PyramidConfig(),
         )
         assert list(plan.descriptor.shape) == [1, 3, 1, 64, 64]
         assert len(plan.descriptor.pyramid) >= 1  # computed pyramid (opt-in)

@@ -20,7 +20,7 @@ GetFlightInfo against a bound tensor (biopb/biopb#812), never by a listing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Iterable, List, Mapping, Tuple
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,29 +47,17 @@ class CatalogSource:
     tensors: Tuple[CatalogTensor, ...] = ()
     #: Whether the server has hydrated this source enough to know its tensors.
     #: Monotonic -- false to true once, never back -- which is what makes it safe
-    #: to read off a stored row. Not to be confused with :attr:`data_resident`.
+    #: to read off a stored row.
     #:
     #: An unresolved source lists with an empty :attr:`tensors`, and that
     #: emptiness used to be the only signal a client had; it conflates "never
     #: resolved" with "resolved, and there was nothing readable in it"
     #: (biopb/biopb#1032).
     is_resolved: bool = True
-    #: Whether the content was local and cheap to read *at the moment this
-    #: catalog was listed*. Not a row column: it comes from the server's live
-    #: ``is_resident`` action (biopb/biopb#1035), which makes this a snapshot
-    #: -- fine for a badge redrawn with the list, wrong for a read path, which
-    #: should ask the server again. ``None`` when nobody answered.
-    data_resident: Optional[bool] = None
 
 
-def source_from_row(
-    row: Mapping[str, Any], resident: Optional[bool] = None
-) -> CatalogSource:
-    """One ``sources`` row (as ``query_sources(format="records")`` yields it).
-
-    *resident* is the live residency answer for this source, when the caller
-    has one; residency is not in the row.
-    """
+def source_from_row(row: Mapping[str, Any]) -> CatalogSource:
+    """One ``sources`` row (as ``query_sources(format="records")`` yields it)."""
     tensors = tuple(
         CatalogTensor(
             array_id=t["array_id"],
@@ -88,20 +76,15 @@ def source_from_row(
         # it costs a resolve the UI does not offer, never a browse that silently
         # treats a real source as a placeholder.
         is_resolved=bool(row.get("is_resolved", True)),
-        # Not in the row; the caller passes the live answer in.
-        data_resident=resident,
     )
 
 
-def sources_from_rows(
-    rows: Iterable[Mapping[str, Any]],
-    resident_by_id: Optional[Mapping[str, bool]] = None,
-) -> List[CatalogSource]:
-    """Decode rows, optionally stamping each with a live residency answer.
+def sources_from_rows(rows: Iterable[Mapping[str, Any]]) -> List[CatalogSource]:
+    """Decode a listing's rows.
 
-    *resident_by_id* is what the server's ``is_resident`` action returned; a
-    source missing from it keeps ``None`` (unknown), which is what an older
-    server or a failed call leaves too.
+    Residency is deliberately not among them. It is a live filesystem check,
+    and asking it per row made a browse cost a stat walk per source
+    (biopb/biopb#1048); it is a per-source read on GetFlightInfo now, for a
+    caller opening one source rather than listing many.
     """
-    lookup = resident_by_id or {}
-    return [source_from_row(r, lookup.get(r["source_id"])) for r in rows]
+    return [source_from_row(r) for r in rows]

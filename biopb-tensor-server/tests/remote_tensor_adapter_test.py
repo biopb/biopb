@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import pytest
+from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server, register_and_catalog
 
@@ -232,7 +233,13 @@ class TestRemoteTensorProxy:
                     # its native grid because it is already below the endpoint
                     # parallelism floor.
                     sl = SliceHint(start=[1, 0, 0], stop=[2, 40, 50])
-                    read_opt = TensorReadOption(array_id="hpc__aics", slice_hint=sl)
+                    # `endpoints` is explicit: the slice hint only applies when
+                    # a read plan is being built -- a describe ignores it.
+                    read_opt = TensorReadOption(
+                        array_id="hpc__aics",
+                        slice_hint=sl,
+                        fields=FieldMask(paths=["endpoints"]),
+                    )
                     cmd = FlightRequest(tensor_read=read_opt)
                     fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
                     info = pc._client.get_flight_info(fd, options=pc._call_options)
@@ -391,7 +398,10 @@ class TestRemoteTensorProxy:
                     indexed_at="2026-07-19 00:00:00",
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(array_id="hpc__aics", with_pyramid=True)
+                    TensorReadOption(
+                        array_id="hpc__aics",
+                        fields=FieldMask(paths=["endpoints", "pyramid"]),
+                    )
                 )
 
                 assert plan is not None
@@ -459,7 +469,10 @@ class TestRemoteTensorProxy:
                     is_resolved=True,
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(array_id="hpc__ome", with_pyramid=True)
+                    TensorReadOption(
+                        array_id="hpc__ome",
+                        fields=FieldMask(paths=["endpoints", "pyramid"]),
+                    )
                 )
 
                 assert plan is not None
@@ -517,7 +530,7 @@ class TestRemoteTensorProxy:
                     is_resolved=True,
                 )
                 plan = adapter.forward_flight_info(
-                    TensorReadOption(array_id="hpc__ome", with_read_plan=False)
+                    TensorReadOption(array_id="hpc__ome")
                 )
 
                 assert plan is not None
@@ -1214,7 +1227,8 @@ def test_server_get_flight_info_uses_proxy_forward():
             try:
                 cmd = FlightRequest(
                     tensor_read=TensorReadOption(
-                        array_id="hpc__ome", with_pyramid=True
+                        array_id="hpc__ome",
+                        fields=FieldMask(paths=["endpoints", "pyramid"]),
                     ),
                 )
                 fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
@@ -1278,7 +1292,9 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
         _serve(proxy)
         try:
             cmd = FlightRequest(
-                tensor_read=TensorReadOption(array_id="lab__img"),
+                tensor_read=TensorReadOption(
+                    array_id="lab__img", fields=FieldMask(paths=["endpoints"])
+                ),
             )
             fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
             info = proxy.get_flight_info(None, fd)  # must not raise

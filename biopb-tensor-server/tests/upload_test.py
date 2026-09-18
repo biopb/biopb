@@ -31,6 +31,7 @@ from biopb_tensor_server.core.chunk import (
     wrap_content_version,
 )
 from biopb_tensor_server.core.config import CacheConfig
+from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server
 
@@ -552,7 +553,7 @@ class TestScaledReads:
         adapter, _ = self._upload(cache)
 
         plan = adapter.plan_flight_info(
-            TensorReadOption(with_pyramid=True, with_read_plan=False), PyramidConfig()
+            TensorReadOption(fields=FieldMask(paths=["pyramid"])), PyramidConfig()
         )
         rungs = [tuple(level.scale_hint) for level in plan.descriptor.pyramid]
         assert len(rungs) > 1, "fixture too small to cover the regression"

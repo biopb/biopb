@@ -144,17 +144,6 @@ def _tensor_short_name(array_id: str) -> str:
     return parts[-1] if parts else array_id
 
 
-# Leading glyph and tooltip for the per-source residency indicator. A cloud
-# marks a source whose content is not local; resident sources stay unadorned.
-_RESIDENCY_GLYPH = "☁"
-_REMOTE_TOOLTIP = (
-    "Not resident — content is remote or not yet local; "
-    "reading it may be slow or block until it is hydrated. "
-    "(Cloud / remote source support is experimental.)"
-)
-_RESIDENT_TOOLTIP = "Resident — content is local and cheap to read"
-
-
 def _is_unresolved(src: CatalogSource) -> bool:
     """A source whose content has not been resolved yet, so shape/dtype are
     unknown until the server hydrates it (the cloud / synced-folder case).
@@ -242,8 +231,8 @@ def _is_multifile_source(src: CatalogSource) -> bool:
 # (biopb/biopb#202); cancel is offered from the context menu.
 _WARM_ROLE = Qt.ItemDataRole.UserRole + 10
 _WARM_INDETERMINATE = -1.0
-# Translucent accent painted behind a hydrating row; the row's normal text, shape
-# badge and residency glyph render on top unchanged.
+# Translucent accent painted behind a hydrating row; the row's normal text and
+# shape badge render on top unchanged.
 _WARM_FILL = QColor(64, 132, 223, 60)
 
 # Hydrate-ahead after a resolve, off. The chunk cache serves its segments by
@@ -265,8 +254,8 @@ class _WarmProgressDelegate(QStyledItemDelegate):
     normally. A determinate fraction (0..1) fills the left portion of the row; the
     indeterminate sentinel tints the whole row faintly until the first server
     count arrives. The fill is drawn *under* the default item paint so the
-    existing name / shape badge / residency glyph stay legible -- the bar is the
-    only progress affordance (no percentage text). biopb/biopb#202.
+    existing name / shape badge stay legible -- the bar is the only progress
+    affordance (no percentage text). biopb/biopb#202.
     """
 
     def paint(self, painter, option, index):
@@ -496,22 +485,6 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f} TB"
 
 
-def _residency_state(src: CatalogSource) -> str | None:
-    """Residency of a source's content, or ``None`` when nobody answered.
-
-    Returns ``"resident"`` (content local, cheap to read), ``"remote"`` (not
-    local -- remote or dehydrated, slow or blocking to read), or ``None`` when
-    residency is unknown (an old server, or a failed call), in which case the UI
-    shows no indicator rather than guessing.
-
-    Only as live as the listing that produced *src* -- a badge, not a read-path
-    gate (biopb/biopb#1035).
-    """
-    if src.data_resident is None:
-        return None
-    return "resident" if src.data_resident else "remote"
-
-
 def _build_tree(sources: Dict[str, CatalogSource]) -> _TreeNode:
     """Build hierarchical tree from sources based on source_url paths."""
     root = _TreeNode(node_id="", name="", node_type="folder", depth=0)
@@ -694,8 +667,7 @@ def _make_selectable(label: QLabel):
 
     A QLabel is ``NoTextInteraction`` by default, which is right for a caption
     and wrong for anything a reader has to get out of the window intact
-    (biopb/biopb#972). The residency badge is deliberately not given this: it is
-    a status glyph, not a value.
+    (biopb/biopb#972).
     """
     label.setTextInteractionFlags(
         Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
@@ -808,19 +780,6 @@ class MetadataDialog(QDialog):
             dtype_label.setStyleSheet("color: #fbbf24;")
             _make_selectable(dtype_label)
             header_layout.addWidget(dtype_label)
-
-        # Source-level residency badge (omitted when residency is unknown)
-        residency = _residency_state(source)
-        if residency == "remote":
-            res_label = QLabel(f"{_RESIDENCY_GLYPH} remote")
-            res_label.setStyleSheet("color: #888;")
-            res_label.setToolTip(_REMOTE_TOOLTIP)
-            header_layout.addWidget(res_label)
-        elif residency == "resident":
-            res_label = QLabel("● local")
-            res_label.setStyleSheet("color: #34d399;")
-            res_label.setToolTip(_RESIDENT_TOOLTIP)
-            header_layout.addWidget(res_label)
 
         header_layout.addStretch()
         layout.addLayout(header_layout)
@@ -1730,27 +1689,16 @@ class TensorBrowserWidget(QWidget):
                 # Show tensor count
                 display_name = f"{node.name}  [{len(src.tensors)} tensors]"
 
-            # Residency indicator: flag non-resident (remote/dehydrated) sources
-            # with a leading cloud glyph and greyed text; resident sources stay
-            # plain. Both known states get an explanatory note; an unknown state
-            # (no answer from the server) is left unmarked.
-            residency = _residency_state(src)
-            residency_note = None
-            if residency == "remote":
-                display_name = f"{_RESIDENCY_GLYPH} {display_name}"
-                item.setForeground(0, QColor("#888"))
-                residency_note = _REMOTE_TOOLTIP
-            elif residency == "resident":
-                residency_note = _RESIDENT_TOOLTIP
-
+            # No residency indicator. Drawing one cost a live stat walk per
+            # source on every browse, and it was painted from a listing
+            # snapshot that never refreshed -- so it went stale exactly after a
+            # warm, the one action that changes residency, offered from this
+            # widget's own context menu (biopb/biopb#1048).
             item.setText(0, display_name)
             # The horizontal scrollbar is pinned off (biopb/biopb#367), so the
             # full label -- which elides when it outgrows the panel -- is only
-            # readable on hover; carry the residency note on a second line.
-            item.setToolTip(
-                0,
-                f"{display_name}\n{residency_note}" if residency_note else display_name,
-            )
+            # readable on hover.
+            item.setToolTip(0, display_name)
 
             # Add nested tensor items for multi-tensor sources
             if len(src.tensors) > 1:
