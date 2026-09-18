@@ -23,6 +23,7 @@ from biopb_tensor_server.core.downsample import (
     ceil_div,
     normalize_reduction_method,
 )
+from biopb_tensor_server.core.errors import InvalidReadRequest
 
 logger = logging.getLogger(__name__)
 
@@ -522,7 +523,9 @@ def normalized_slice_bounds(
         Tuple of (start, stop) coordinates
 
     Raises:
-        ValueError: If slice hint dimensionality mismatch or invalid bounds
+        InvalidReadRequest: If slice hint dimensionality mismatch or invalid
+            bounds. Typed, not a bare ValueError: the boundary maps it to a
+            terminal INVALID_ARGUMENT instead of a "server bug" INTERNAL.
     """
     if slice_hint is None:
         return tuple(0 for _ in shape), tuple(int(dim) for dim in shape)
@@ -531,20 +534,30 @@ def normalized_slice_bounds(
     stop = tuple(int(value) for value in slice_hint.stop)
 
     if len(start) != len(shape) or len(stop) != len(shape):
-        raise ValueError(
+        raise InvalidReadRequest(
             f"Slice hint dimensionality mismatch: expected {len(shape)}, "
-            f"got start={len(start)} stop={len(stop)}"
+            f"got start={len(start)} stop={len(stop)}",
+            reason="slice_rank",
         )
 
     for axis, (axis_start, axis_stop, axis_shape) in enumerate(
         zip(start, stop, shape, strict=True)
     ):
         if axis_start < 0 or axis_stop < 0:
-            raise ValueError(f"Slice bounds must be non-negative on axis {axis}")
+            raise InvalidReadRequest(
+                f"Slice bounds must be non-negative on axis {axis}",
+                reason="slice_negative",
+            )
         if axis_start > axis_stop:
-            raise ValueError(f"Slice start must be <= stop on axis {axis}")
+            raise InvalidReadRequest(
+                f"Slice start must be <= stop on axis {axis}",
+                reason="slice_inverted",
+            )
         if axis_stop > axis_shape:
-            raise ValueError(f"Slice stop exceeds tensor shape on axis {axis}")
+            raise InvalidReadRequest(
+                f"Slice stop exceeds tensor shape on axis {axis}",
+                reason="slice_out_of_range",
+            )
 
     return start, stop
 
@@ -563,20 +576,26 @@ def normalized_scale_hint(
         Scale hint tuple if valid and non-trivial, None otherwise
 
     Raises:
-        ValueError: If scale hint dimensionality mismatch or invalid values
+        InvalidReadRequest: If scale hint dimensionality mismatch or invalid
+            values. Typed for the same reason as the slice bounds above.
     """
     if scale_hint is None or len(scale_hint) == 0:
         return None
 
     scale_hint_tuple = tuple(int(value) for value in scale_hint)
     if len(scale_hint_tuple) != len(shape):
-        raise ValueError(
-            f"Scale hint dimensionality mismatch: expected {len(shape)}, got {len(scale_hint_tuple)}"
+        raise InvalidReadRequest(
+            f"Scale hint dimensionality mismatch: expected {len(shape)}, "
+            f"got {len(scale_hint_tuple)}",
+            reason="scale_rank",
         )
 
     for axis, scale in enumerate(scale_hint_tuple):
         if scale <= 0:
-            raise ValueError(f"Scale hint must be positive on axis {axis}")
+            raise InvalidReadRequest(
+                f"Scale hint must be positive on axis {axis}",
+                reason="scale_not_positive",
+            )
 
     if all(scale == 1 for scale in scale_hint_tuple):
         return None
