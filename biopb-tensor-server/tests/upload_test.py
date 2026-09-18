@@ -437,6 +437,25 @@ class TestCachedSourceAdapter:
             CacheManager.reset()
             shutil.rmtree(cache_dir, ignore_errors=True)
 
+    def test_the_write_grid_is_not_resplit_at_the_wire_bound(self):
+        """A chunk over MAX_ARROW_BATCH_BYTES is served whole, because the
+        pieces the base planner would fetch instead were never written.
+
+        A consumer that replans a handle -- every fast-return consumer, whose
+        handle carries no endpoints -- meets this; the producer's own embedded
+        endpoints used to hide it.
+        """
+        from biopb_tensor_server.cache import MAX_ARROW_BATCH_BYTES
+
+        side = int((MAX_ARROW_BATCH_BYTES * 2) ** 0.5) + 1  # > 64 MiB of uint8
+        adapter = CachedSourceAdapter(
+            source_id="whole", shape=[side, side], dtype="|u1", chunk_shape=[side, side]
+        )
+
+        assert adapter.get_transfer_chunk_size() == (side, side)
+        plan = adapter.get_read_plan(adapter.get_tensor_descriptor())
+        assert len(plan.chunk_endpoints) == 1
+
 
 class TestScaledReads:
     """A cache source serves the pyramid it advertises (biopb/biopb#265).

@@ -416,29 +416,10 @@ def test_deserialize_image_data_eager_data():
 def test_deserialize_image_data_lazy_data():
     """Test deserialize_image_data with lazy_data (SerializedTensor)."""
     from biopb.image import ImageData
-    from biopb.tensor.descriptor_pb2 import TensorDescriptor
-    from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
-    from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+    from biopb.tensor.serialized_pb2 import SerializedTensor
 
-    # Create a mock SerializedTensor
-    descriptor = TensorDescriptor(
-        array_id="test-tensor",
-        shape=[64, 64],
-        dtype="uint8",
-        chunk_shape=[32, 32],
-    )
-
-    serialized_tensor = SerializedTensor(
-        tensor_descriptor=descriptor,
-        location="grpc://localhost:8815",
-        auth_token="",
-        endpoints=[
-            SerializedEndpoint(
-                ticket=TensorTicket(chunk_id=b"chunk-0"),
-                chunk_bounds=ChunkBounds(start=[0, 0], stop=[32, 32]),
-            ),
-        ],
-    )
+    # A handle; its plan is opaque here since reconstruction is mocked below.
+    serialized_tensor = SerializedTensor(location="grpc://localhost:8815")
 
     image_data = ImageData(lazy_data=serialized_tensor)
 
@@ -603,19 +584,9 @@ def test_pb_from_np_and_np_from_pb():
 def test_deserialize_image_data_cache_bytes_parameter():
     """Test deserialize_image_data with cache_bytes parameter for lazy_data."""
     from biopb.image import ImageData
-    from biopb.tensor.descriptor_pb2 import TensorDescriptor
     from biopb.tensor.serialized_pb2 import SerializedTensor
 
-    descriptor = TensorDescriptor(
-        array_id="test-tensor",
-        shape=[64, 64],
-        dtype="uint8",
-    )
-
-    serialized_tensor = SerializedTensor(
-        tensor_descriptor=descriptor,
-        location="grpc://localhost:8815",
-    )
+    serialized_tensor = SerializedTensor(location="grpc://localhost:8815")
 
     image_data = ImageData(lazy_data=serialized_tensor)
 

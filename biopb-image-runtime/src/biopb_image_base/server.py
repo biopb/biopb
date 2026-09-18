@@ -60,15 +60,6 @@ def _resolve_tensor_external_location(
     return f"grpc://{ip}:{tensor_port}"
 
 
-def _normalize_dim_labels(
-    dim_labels: Optional[Sequence[str]],
-    ndim: int,
-) -> list[str]:
-    if dim_labels is not None:
-        return list(dim_labels)
-    return [f"dim{i}" for i in range(ndim)]
-
-
 def _as_dask_array(array: Union[np.ndarray, da.Array]) -> da.Array:
     if isinstance(array, da.Array):
         return array
@@ -104,27 +95,28 @@ def _bounds_to_slices(bounds: ChunkBounds) -> tuple[slice, ...]:
     )
 
 
-def _build_registration_tensor(
-    source_id: str,
-    shape: Sequence[int],
-    dtype: str,
-    chunk_shape: Sequence[int],
-    dim_labels: Optional[Sequence[str]],
-    location: str,
-    auth_token: str = "",
+def _handle(
+    descriptor: TensorDescriptor, location: str, auth_token: str
 ) -> SerializedTensor:
-    descriptor = TensorDescriptor(
-        array_id=source_id,
-        dim_labels=_normalize_dim_labels(dim_labels, len(shape)),
-        shape=list(shape),
-        chunk_shape=list(chunk_shape),
-        dtype=dtype,
+    """A SerializedTensor for a source this process serves.
+
+    Describe-only: a FlightInfo carrying the descriptor and no endpoints, which
+    the consumer plans with its own GetFlightInfo when it reads. One shape for
+    a result still being filled and a finished one, and no second copy of the
+    read plan to keep in step with the server's.
+    """
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    info = flight.FlightInfo(
+        schema=pa.schema([]),
+        descriptor=flight.FlightDescriptor.for_command(descriptor.SerializeToString()),
+        endpoints=[],
+        total_records=-1,
+        total_bytes=-1,
     )
     return SerializedTensor(
-        tensor_descriptor=descriptor,
-        location=location,
-        auth_token=auth_token,
-        endpoints=[],
+        location=location, auth_token=auth_token, flight_info=info.serialize()
     )
 
 
@@ -198,14 +190,11 @@ class EmbeddedTensorCache:
             source_name=source_name,
             dim_labels=dim_labels,
         )
-        return _build_registration_tensor(
-            source_id=source_id,
-            shape=normalized_array.shape,
-            dtype=normalized_array.dtype.str,
-            chunk_shape=chunk_shape,
-            dim_labels=dim_labels,
-            location=self._external_location,
-            auth_token=self._server.sources.get(source_id).capability_token,
+        adapter = self._server.sources.get(source_id)
+        return _handle(
+            adapter.get_tensor_descriptor(),
+            self._external_location,
+            adapter.capability_token or "",
         )
 
     def upload_array_chunks(
@@ -298,6 +287,9 @@ class EmbeddedTensorCache:
     ) -> tensor_proto.SerializedTensor:
         """Get SerializedTensor for a source with rewritten location.
 
+        auth_token carries the per-source capability token so only this caller
+        can read the result.
+
         Args:
             source_id: Source identifier
             tensor_id: Tensor ID (optional for single-tensor sources)
@@ -305,34 +297,14 @@ class EmbeddedTensorCache:
         Returns:
             SerializedTensor protobuf with external location
         """
-        from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
-        from biopb.tensor.ticket_pb2 import TensorTicket
-
-        # Get adapter from server
         adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
-
-        # Get descriptor
-        descriptor = adapter.get_tensor_descriptor()
-
-        # Build endpoints from written chunks
-        endpoints = []
-        for chunk_id, bounds in adapter._written_chunks.items():
-            ticket = TensorTicket(chunk_id=chunk_id)
-            ep = SerializedEndpoint(ticket=ticket, chunk_bounds=bounds)
-            endpoints.append(ep)
-
-        # Build SerializedTensor with external location. auth_token carries the
-        # per-source capability token so only this caller can read the result.
-        serialized = SerializedTensor(
-            tensor_descriptor=descriptor,
-            location=self._external_location,
-            auth_token=adapter.capability_token or "",
-            endpoints=endpoints,
+        return _handle(
+            adapter.get_tensor_descriptor(),
+            self._external_location,
+            adapter.capability_token or "",
         )
-
-        return serialized
 
 
 def _start_embedded_tensor_cache(

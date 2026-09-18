@@ -40,8 +40,6 @@ from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
     _build_call_options,
-    _build_dask_array_from_chunk_map,
-    _chunk_map_from_endpoints,
     _clear_view_cache,
     _default_cache_bytes,
     _resolve_cache_bytes,
@@ -53,12 +51,12 @@ from biopb.tensor._session import (
     ResolveCancelled as ResolveCancelled,
     _check_wire_protocol as _check_wire_protocol,
     _ClientState,
+    _dask_from_flight_info,
     _extract_schema_metadata as _extract_schema_metadata,
-    _fetch_endpoints_via_get_flight_info,
     _parse_version as _parse_version,
-    _request_crop_slices,
+    _refetch_flight_info,
+    _requested_slice,
     _split_array_id as _split_array_id,
-    _TensorContext,
 )
 from biopb.tensor._tls import resolve_tls_trust
 from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
@@ -85,43 +83,6 @@ def _normalize_location(location: str) -> str:
     if location.startswith("grpcs://"):
         return "grpc+tls://" + location[8:]
     return location
-
-
-def _make_debug_serialized_tensor(
-    arr: da.Array, array_id: str = "debug"
-) -> SerializedTensor:
-    """Create a SerializedTensor with debug_pickled_array for testing.
-
-    Eagerly computes the array and pickles it, bypassing Flight server.
-    Preserves original chunk structure for testing chunk-related behavior.
-    Populates inferable tensor_descriptor fields.
-
-    Args:
-        arr: Dask array to serialize
-        array_id: Optional array identifier
-
-    Returns:
-        SerializedTensor with debug_pickled_array populated
-    """
-    import pickle
-
-    # Eager compute
-    np_arr = arr.compute()
-
-    # Rechunk to original chunk structure (preserves chunk boundaries for testing)
-    computed_da = da.from_array(np_arr, chunks=arr.chunksize)
-
-    descriptor = TensorDescriptor(
-        array_id=array_id,
-        shape=list(arr.shape),
-        dtype=np.dtype(arr.dtype).str,
-        chunk_shape=list(arr.chunksize),
-    )
-
-    return SerializedTensor(
-        tensor_descriptor=descriptor,
-        debug_pickled_array=pickle.dumps(computed_da),
-    )
 
 
 class TensorFlightClient:
@@ -781,18 +742,6 @@ class TensorFlightClient:
 
     # ---- Reads (delegated to ChunkFetcher) ----
 
-    def _get_tensor_context(
-        self,
-        array_id: str,
-        slice_hint: Optional[Tuple[slice, ...]] = None,
-        scale_hint: Optional[Sequence[int]] = None,
-        reduction_method: Optional[str] = None,
-    ) -> _TensorContext:
-        """See :meth:`ChunkFetcher._get_tensor_context`."""
-        return self._fetcher._get_tensor_context(
-            array_id, slice_hint, scale_hint, reduction_method
-        )
-
     def get_tensor(
         self,
         array_id: str,
@@ -830,10 +779,10 @@ class TensorFlightClient:
     ) -> SerializedTensor:
         """Get a SerializedTensor protobuf for cross-process transfer.
 
-        Returns a protobuf containing connection info and chunk tickets
-        for lazy reconstruction. The protobuf can be serialized to bytes
-        and broadcast to worker processes, where each worker can call
-        tensor_from_pb() to reconstruct a lazy dask array.
+        The planned read (a serialized Arrow ``FlightInfo``) plus this
+        connection's location and token. It can be serialized to bytes and
+        broadcast to worker processes, where each worker calls
+        ``tensor_from_pb()`` to reconstruct the lazy dask array.
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
@@ -849,33 +798,30 @@ class TensorFlightClient:
             array_id, slice_hint, scale_hint, reduction_method
         )
 
-    def _build_dask_array(
-        self,
-        desc: TensorDescriptor,
-        chunks: List[bytes],
-        chunk_bounds: List[ChunkBounds],
-        schema_metadata: Optional[Dict[str, str]] = None,
-    ) -> da.Array:
-        """See :meth:`ChunkFetcher._build_dask_array`."""
-        return self._fetcher._build_dask_array(
-            desc, chunks, chunk_bounds, schema_metadata
-        )
+    @staticmethod
+    def descriptor_from_pb(pb: SerializedTensor) -> TensorDescriptor:
+        """The resolved descriptor a SerializedTensor's plan names, without
+        building the array: shape, dtype, labels, for a reader that only
+        needs to describe what it was handed."""
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        return TensorDescriptor.FromString(info.descriptor.command)
 
     @staticmethod
     def tensor_from_pb(
         pb: SerializedTensor,
         cache_bytes: Optional[int] = None,
     ) -> da.Array:
-        """Reconstruct a lazy dask array from SerializedTensor protobuf.
+        """The lazy dask array a SerializedTensor describes.
 
-        Creates a dask array that fetches chunks from the Flight server
-        independently. Each worker process maintains its own connection
-        pool and LRU cache keyed by (location, auth_token).
+        The one consumer-side helper: the handle is a FlightInfo plus where and
+        as whom to read it, so this decodes the plan and builds the same
+        chunk-fetching array ``get_tensor`` builds on a live connection. Each
+        worker process maintains its own connection pool and LRU cache keyed
+        by (location, auth_token).
 
-        If endpoints field is empty, calls GetFlightInfo on the server
-        to rebuild the endpoint list.
-
-        If debug_pickled_array is populated, unpickles directly (bypasses server).
+        A handle with no endpoints -- a source declared before its chunks
+        existed -- is planned here with a GetFlightInfo on the embedded
+        descriptor; the crop the producer asked for is kept from the handle.
 
         Args:
             pb: SerializedTensor protobuf object
@@ -887,66 +833,24 @@ class TensorFlightClient:
         Returns:
             dask.array with lazy chunk loading
         """
-        import pickle
-
         if cache_bytes is None:
             cache_bytes = _default_cache_bytes()
-
-        # Debug path: unpickle directly if debug_pickled_array is present
-        if pb.debug_pickled_array:
-            return pickle.loads(pb.debug_pickled_array)
-
-        descriptor = pb.tensor_descriptor
-        shape = tuple(descriptor.shape)
-        dtype = np.dtype(descriptor.dtype)
-
-        # Parse endpoints - if empty, fetch from GetFlightInfo
-        chunks = []
-        chunk_bounds_list = []
-
-        if pb.endpoints:
-            # Use serialized endpoints directly
-            for ep in pb.endpoints:
-                chunks.append(ep.ticket.chunk_id)
-                chunk_bounds_list.append(ep.chunk_bounds)
-        else:
-            # Endpoints not provided - call GetFlightInfo to rebuild
-            logger.debug("tensor_from_pb: endpoints empty, calling GetFlightInfo")
-            chunks, chunk_bounds_list = _fetch_endpoints_via_get_flight_info(pb)
-
-        # Build the block-index -> (chunk_id, bounds) map + grid shape for lazy
-        # chunk fetching (shared with ChunkFetcher._build_dask_array).
-        chunk_map, grid_shape = _chunk_map_from_endpoints(
-            chunks, chunk_bounds_list, shape
-        )
-
-        # Extract schema_metadata from pb for SHM transfer
-        schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
-
-        dask_arr = _build_dask_array_from_chunk_map(
-            chunk_map,
-            grid_shape,
-            shape,
-            dtype,
+        token = pb.auth_token or None
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        requested = _requested_slice(info)
+        if not info.endpoints:
+            logger.debug("tensor_from_pb: no endpoints, calling GetFlightInfo")
+            info = _refetch_flight_info(
+                TensorDescriptor.FromString(info.descriptor.command), pb.location, token
+            )
+        return _dask_from_flight_info(
+            info,
             pb.location,
-            pb.auth_token if pb.auth_token else None,
+            token,
             cache_bytes,
-            schema_metadata,
             resolve_tls_trust(pb.location),
+            requested,
         )
-
-        # Crop to the originally requested region if original_slice_hint present
-        if pb.HasField("original_slice_hint") and descriptor.HasField("slice_hint"):
-            dask_arr = dask_arr[
-                _request_crop_slices(
-                    len(descriptor.shape),
-                    pb.original_slice_hint,
-                    descriptor.slice_hint,
-                    list(descriptor.scale_hint) if descriptor.scale_hint else None,
-                )
-            ]
-
-        return dask_arr
 
     # ====================
     # Upload API (EXPERIMENTAL) -- thin delegators onto the UploadSession

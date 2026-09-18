@@ -31,7 +31,7 @@ from biopb.tensor.descriptor_pb2 import (
     TensorReadOption,
     WarmProgress,
 )
-from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 # Import client lazily. biopb.tensor.client imports pyarrow at module load, and
@@ -68,7 +68,6 @@ __all__ = [
     "ResolveProgress",
     "WarmProgress",
     "SerializedTensor",
-    "SerializedEndpoint",
     # Deprecated: `sources` rows as DataSourceDescriptor (biopb/biopb#1032).
     # There is no replacement -- a row is the data structure.
     "descriptor_from_row",

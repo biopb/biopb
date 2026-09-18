@@ -474,7 +474,11 @@ def get_image_data_dim_labels(
     if data_type == "eager_data":
         dim_labels = image_data.eager_data.dim_labels
     elif data_type == "lazy_data":
-        dim_labels = image_data.lazy_data.tensor_descriptor.dim_labels
+        from biopb.tensor.client import TensorFlightClient
+
+        dim_labels = TensorFlightClient.descriptor_from_pb(
+            image_data.lazy_data
+        ).dim_labels
     else:
         dim_labels = None
 
@@ -509,7 +513,9 @@ def get_image_data_shape(image_data: ImageData) -> Optional[Tuple[int]]:
     if data_type == "eager_data":
         return tuple(image_data.eager_data.dims)
     elif data_type == "lazy_data":
-        return tuple(image_data.lazy_data.tensor_descriptor.shape)
+        from biopb.tensor.client import TensorFlightClient
+
+        return tuple(TensorFlightClient.descriptor_from_pb(image_data.lazy_data).shape)
     else:
         return None
 

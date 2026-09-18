@@ -134,14 +134,29 @@ def _non_uniform_template() -> da.Array:
     return da.zeros((4, 4), chunks=((2, 2), (1, 3)), dtype=np.float32)
 
 
+def _flight_info(serialized):
+    import pyarrow.flight as flight
+
+    return flight.FlightInfo.deserialize(serialized.flight_info)
+
+
+def _array_id(serialized) -> str:
+    from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+    return TensorDescriptor.FromString(
+        _flight_info(serialized).descriptor.command
+    ).array_id
+
+
 def test_embedded_create_array_tracks_upload_status(
     embedded_cache: EmbeddedTensorCache,
 ):
     serialized = embedded_cache.create_array("cache:", ["Y", "X"], _uniform_template())
 
-    source_id = serialized.tensor_descriptor.array_id
+    source_id = _array_id(serialized)
     assert serialized.location == "grpc://127.0.0.1:9999"
-    assert len(serialized.endpoints) == 0
+    # Describe-only: the consumer plans its own read once the result is READY.
+    assert len(_flight_info(serialized).endpoints) == 0
 
     status = embedded_cache.get_upload_status(source_id)
     assert status == {
@@ -217,7 +232,7 @@ def test_discard_refuses_later_writes_with_the_reason(
     import pyarrow.flight as flight
 
     serialized = embedded_cache.create_array("cache:", ["Y", "X"], _uniform_template())
-    source_id = serialized.tensor_descriptor.array_id
+    source_id = _array_id(serialized)
 
     status = embedded_cache.discard(source_id, "client disconnected")
 

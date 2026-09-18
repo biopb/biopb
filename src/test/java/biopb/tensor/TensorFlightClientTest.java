@@ -361,17 +361,17 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
 
-                // Verify descriptor is populated
-                Assert.assertEquals("test-tensor", pb.getTensorDescriptor().getArrayId());
-                Assert.assertEquals(Arrays.asList(4L, 4L), pb.getTensorDescriptor().getShapeList());
-                Assert.assertEquals("float32", pb.getTensorDescriptor().getDtype());
-                Assert.assertEquals(Arrays.asList(2L, 2L), pb.getTensorDescriptor().getChunkShapeList());
+                // The plan is the FlightInfo the server answered, carried whole.
+                FlightInfo info = FlightInfo.deserialize(pb.getFlightInfo().asReadOnlyByteBuffer());
+                TensorDescriptor descriptor = TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
+                Assert.assertEquals("test-tensor", descriptor.getArrayId());
+                Assert.assertEquals(Arrays.asList(4L, 4L), descriptor.getShapeList());
+                Assert.assertEquals("float32", descriptor.getDtype());
+                Assert.assertEquals(Arrays.asList(2L, 2L), descriptor.getChunkShapeList());
+                Assert.assertEquals(4, info.getEndpoints().size());
 
                 // Verify location is populated
                 Assert.assertTrue(pb.getLocation().contains("localhost"));
-
-                // Verify endpoints are populated
-                Assert.assertEquals(4, pb.getEndpointsCount());
             }
         }
     }
@@ -426,8 +426,10 @@ public class TensorFlightClientTest {
                 long[] scaleHint = new long[] {2, 2};
                 SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, scaleHint, "nearest");
 
-                // Verify scale_hint in descriptor
-                Assert.assertEquals(Arrays.asList(2L, 2L), pb.getTensorDescriptor().getScaleHintList());
+                // Verify scale_hint in the plan's descriptor
+                TensorDescriptor descriptor = TensorDescriptor.parseFrom(
+                        FlightInfo.deserialize(pb.getFlightInfo().asReadOnlyByteBuffer()).getDescriptor().getCommand());
+                Assert.assertEquals(Arrays.asList(2L, 2L), descriptor.getScaleHintList());
 
                 // Reconstruct and verify downscaled shape
                 RandomAccessibleInterval<FloatType> image = TensorFlightClient.tensorFromPb(pb, 10_000_000L);

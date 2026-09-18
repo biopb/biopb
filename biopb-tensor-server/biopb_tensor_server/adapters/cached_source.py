@@ -226,6 +226,27 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             response.physical_unit.extend(self._physical_unit_vec)
         return response
 
+    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
+        """The write grid, verbatim -- not re-split at the wire bound.
+
+        The base clamps a declared grid to ``MAX_ARROW_BATCH_BYTES`` so an
+        oversized chunk is fetched in pieces. Here the pieces would not exist:
+        an unscaled read serves only the chunk_ids that were written
+        (:meth:`resolve_chunk_data`), so a plan on any other grid asks for
+        bounds that were never stored and fails on its first chunk. An
+        uploader that wrote one 67 MB chunk -- a whole result in one DoPut is
+        the ordinary runtime case -- is served that chunk whole; the cache
+        keeps an oversized entry in memory rather than on disk, and DoGet
+        streams it as it was put. A consumer that replans a handle (every
+        fast-return consumer, since its handle carries no endpoints) meets
+        this path, where the producer's own embedded endpoints used to hide it.
+        """
+        shape = self._shape
+        return tuple(
+            min(max(1, int(chunk)), int(dim))
+            for chunk, dim in zip(self._chunk_shape, shape, strict=True)
+        )
+
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this cache source.
 

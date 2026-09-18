@@ -42,4 +42,7 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   A new ``finish`` action seals an upload against further writes and is the
 #   only route to READY; ``create_tensor`` (was ``create_source``) refuses a
 #   name that exists and a refused write carries its state in ``extra_info``.
+#   ``SerializedTensor`` is a serialized ``FlightInfo`` plus location and
+#   token; GetFlightInfo stamps the requested ``slice_hint`` on the
+#   FlightInfo's ``app_metadata``.
 FLIGHT_PROTOCOL_VERSION = 2
