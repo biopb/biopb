@@ -1038,7 +1038,7 @@ class TensorFlightServer(flight.FlightServerBase):
             req = self._parse(
                 FinishUpload(), action.body.to_pybytes(), "finish request"
             )
-            status = self.uploads.finish(req.source_id, req.session_id)
+            status = self.uploads.finish(req.source_id)
             reply = UploadStatusPb()
             _copy_upload_status(reply, status)
             yield reply.SerializeToString()

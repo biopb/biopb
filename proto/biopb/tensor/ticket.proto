@@ -61,41 +61,15 @@ message ChunkUpload {
   string source_id = 1;
   // Chunk bounds (start/stop coordinates)
   ChunkBounds bounds = 2;
-  // The upload session this write belongs to, from `create_source`.
-  //
-  // `source_id` names the object; this names the *attempt* at filling it. A
-  // second `create_source` for the same `cache:name` opens a new session and
-  // displaces the first, so a straggler from the old one would otherwise land
-  // in the new source undetected. The server refuses a write whose session is
-  // not the current one, and says superseded rather than "not found" -- which
-  // is the only way a displaced producer learns what happened, since status is
-  // keyed by `source_id` and reports the new session's progress.
-  string session_id = 3;
 }
 
 // Body of the `finish` action: seal an upload against further writes.
 //
-// Both ids, because they answer different questions: `source_id` finds the
-// upload, `session_id` says which attempt is claiming to have completed it.
+// `source_id` alone names the attempt: a name is single-use for the life of
+// the server (`create_source` refuses a collision), so the source it finds is
+// the one the caller created.
 message FinishUpload {
   string source_id = 1;
-  string session_id = 2;
-}
-
-// Reply to the `create_source` action.
-//
-// Not a bare TensorDescriptor (which is what it was): a create both names the
-// object and opens the session that may write to it, and the descriptor has no
-// business carrying a write-path identity -- readers get descriptors too.
-message CreateSourceResult {
-  // The resolved descriptor, echoing the request under the minted `array_id`.
-  //
-  // NOT named `descriptor`: that generates a `getDescriptor()` colliding with
-  // the static one every generated Java message already has, and the Java
-  // build is the only place that shows it.
-  TensorDescriptor tensor_descriptor = 1;
-  // The session `ChunkUpload` and `FinishUpload` must carry.
-  string session_id = 2;
 }
 
 // Create-or-update a batch of annotations, applied in one transaction.

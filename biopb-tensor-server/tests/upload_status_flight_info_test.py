@@ -24,17 +24,18 @@ def _make(client, name="cache:status", shape=(4, 4), chunk=(2, 2)):
     )
 
 
-def _put(client, handle, start, stop):
+def _put(client, source_id, start, stop):
     data = np.full(
         [b - a for a, b in zip(start, stop, strict=True)], 7, dtype=np.uint16
     )
-    client.upload_chunk(handle, ChunkBounds(start=list(start), stop=list(stop)), data)
+    client.upload_chunk(
+        source_id, ChunkBounds(start=list(start), stop=list(stop)), data
+    )
 
 
 class TestOnTheDescriptor:
     def test_a_fresh_upload_reports_pending_with_its_grid(self, client):
-        handle = _make(client)
-        source_id = handle.source_id
+        source_id = _make(client)
         desc = client.get_descriptor(source_id, with_upload_status=True)
         assert desc.HasField("upload_status")
         assert desc.upload_status.state == UploadStatusPb.PENDING
@@ -42,9 +43,8 @@ class TestOnTheDescriptor:
         assert desc.upload_status.uploaded_chunks == 0
 
     def test_it_advances_as_chunks_land(self, client):
-        handle = _make(client)
-        source_id = handle.source_id
-        _put(client, handle, (0, 0), (2, 2))
+        source_id = _make(client)
+        _put(client, source_id, (0, 0), (2, 2))
         desc = client.get_descriptor(source_id, with_upload_status=True)
         assert desc.upload_status.uploaded_chunks == 1
         assert desc.upload_status.state == UploadStatusPb.PENDING
@@ -88,7 +88,7 @@ class TestCapabilityHolderCanPoll:
     def test_the_capability_opens_the_status(self, writable_server):
         source_id = _make(
             TensorFlightClient(f"grpc://localhost:{writable_server.port}")
-        ).source_id
+        )
         adapter = writable_server.sources.get(source_id)
         adapter.capability_token = "cap-token"
 
@@ -104,7 +104,7 @@ class TestCapabilityHolderCanPoll:
     def test_a_stranger_is_refused(self, writable_server):
         source_id = _make(
             TensorFlightClient(f"grpc://localhost:{writable_server.port}")
-        ).source_id
+        )
         writable_server.sources.get(source_id).capability_token = "cap-token"
 
         stranger = TensorFlightClient(
@@ -122,8 +122,7 @@ class TestDiscarded:
         """Describe is not a chunk read, so it never reaches
         `_refuse_if_discarded` -- a poller learns why instead of meeting a dead
         call. Its bytes stay unreadable; only the status is."""
-        handle = _make(client, shape=(2, 2), chunk=(2, 2))
-        source_id = handle.source_id
+        source_id = _make(client, shape=(2, 2), chunk=(2, 2))
         writable_server.uploads.discard(source_id, "job died")
 
         desc = client.get_descriptor(source_id, with_upload_status=True)
@@ -153,8 +152,7 @@ class TestNotCached:
         """A cached PENDING would shadow the READY a later poll came for --
         turning the one field whose purpose is freshness into the stalest thing
         in the session."""
-        handle = _make(client, shape=(2, 2), chunk=(2, 2))
-        source_id = handle.source_id
+        source_id = _make(client, shape=(2, 2), chunk=(2, 2))
         client.get_descriptor(source_id)  # seeds the structural cache
 
         cached = client._state.descriptors.get(source_id)
@@ -163,10 +161,9 @@ class TestNotCached:
 
     def test_a_second_poll_sees_new_progress(self, client):
         """The end-to-end consequence: polling is live, not memoized."""
-        handle = _make(client, shape=(2, 2), chunk=(2, 2))
-        source_id = handle.source_id
+        source_id = _make(client, shape=(2, 2), chunk=(2, 2))
         assert client.get_upload_status(source_id)["uploaded_chunks"] == 0
-        _put(client, handle, (0, 0), (2, 2))
+        _put(client, source_id, (0, 0), (2, 2))
         status = client.get_upload_status(source_id)
         assert status["uploaded_chunks"] == 1
         # Still PENDING with its grid full: the count reports progress and
@@ -186,8 +183,7 @@ class TestSdkDictShape:
     def test_the_dict_keeps_its_shape(self, client):
         """The wire moved; the SDK's answer did not. `biopb_image_base` mirrors
         this dict in-process, and the two should stay the same shape."""
-        handle = _make(client)
-        source_id = handle.source_id
+        source_id = _make(client)
         status = client.get_upload_status(source_id)
         assert set(status) == {
             "source_id",

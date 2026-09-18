@@ -14,7 +14,6 @@ into a dask graph -- which is the read path's arrangement too (``_session``).
 
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
@@ -26,39 +25,12 @@ import pyarrow.flight as flight
 from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, UploadStatus as UploadStatusPb
-from biopb.tensor.ticket_pb2 import (
-    ChunkBounds,
-    ChunkUpload,
-    CreateSourceResult,
-    FinishUpload,
-    PutCommand,
-)
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, FinishUpload, PutCommand
 
 if TYPE_CHECKING:  # import-time cycle-free; _session never imports this module
     from biopb.tensor._session import _ClientState
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class UploadHandle:
-    """What ``create_source`` returns: the source, and the attempt at filling it.
-
-    Two ids because they answer different questions. ``source_id`` names the
-    object and is what a *reader* is given; ``session_id`` names this attempt
-    and is what a write must carry, so that a second ``create_source`` for the
-    same ``cache:`` name -- which takes the name over -- makes this session's
-    writes fail loudly instead of landing in someone else's source
-    (biopb/biopb#1048).
-
-    Plain data, so it pickles into a dask graph with the rest of the target.
-    """
-
-    source_id: str
-    session_id: str
-
-    def __str__(self) -> str:
-        return self.source_id
 
 
 def _put_chunk(
@@ -67,7 +39,6 @@ def _put_chunk(
     source_id: str,
     bounds: ChunkBounds,
     data: np.ndarray,
-    session_id: str = "",
 ) -> None:
     """One ``do_put``: open, write the batch, close, read the ack.
 
@@ -75,9 +46,7 @@ def _put_chunk(
     :meth:`UploadSession.upload_chunk` and a target that has been unpickled in a
     dask worker with no session to hand.
     """
-    cmd = PutCommand(
-        chunk=ChunkUpload(source_id=source_id, bounds=bounds, session_id=session_id)
-    )
+    cmd = PutCommand(chunk=ChunkUpload(source_id=source_id, bounds=bounds))
     desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     schema = pa.schema([pa.field("data", pa.from_numpy_dtype(data.dtype))])
 
@@ -110,30 +79,21 @@ class _UploadTarget:
     produced the block.
     """
 
-    __slots__ = (
-        "_location",
-        "_token",
-        "_trust",
-        "_source_id",
-        "_session_id",
-        "shape",
-        "dtype",
-    )
+    __slots__ = ("_location", "_token", "_trust", "_source_id", "shape", "dtype")
 
     def __init__(
         self,
         location: str,
         token: Optional[str],
         trust: Optional[TlsTrust],
-        handle: "UploadHandle",
+        source_id: str,
         shape: Sequence[int],
         dtype: np.dtype,
     ):
         self._location = location
         self._token = token
         self._trust = trust or NO_TLS
-        self._source_id = handle.source_id
-        self._session_id = handle.session_id
+        self._source_id = source_id
         # ``store`` reads these off the target to check it can hold the array.
         self.shape = tuple(shape)
         self.dtype = dtype
@@ -144,9 +104,7 @@ class _UploadTarget:
         bounds = ChunkBounds(
             start=[s.start for s in index], stop=[s.stop for s in index]
         )
-        _put_chunk(
-            client, call_options, self._source_id, bounds, value, self._session_id
-        )
+        _put_chunk(client, call_options, self._source_id, bounds, value)
 
 
 class UploadSession:
@@ -197,7 +155,7 @@ class UploadSession:
                 arr = arr.rechunk(tuple(chunk_shape))
 
         # Create source
-        handle = self.create_source(
+        source_id = self.create_source(
             source_name=source_name,
             shape=arr.shape,
             dtype=arr.dtype.str,
@@ -206,17 +164,17 @@ class UploadSession:
             ome_metadata=ome_metadata,
         )
 
-        self._store_chunks(handle, arr)
-        # Sealing is what makes the source readable, so a whole-array upload
+        self._store_chunks(source_id, arr)
+        # Sealing is what marks the source complete, so a whole-array upload
         # does it on the caller's behalf -- it is the one caller that knows,
         # from having written every block itself, that there is nothing more to
         # send. A caller driving `create_source` / `upload_chunk` by hand does
         # not, and finishes explicitly.
-        self.finish_upload(handle)
+        self.finish_upload(source_id)
 
-        return handle.source_id
+        return source_id
 
-    def _store_chunks(self, handle: UploadHandle, arr: da.Array) -> None:
+    def _store_chunks(self, source_id: str, arr: da.Array) -> None:
         """Hand the whole upload to dask as one graph.
 
         ``upload_array`` has already rechunked *arr* onto the upload grid, so
@@ -244,7 +202,7 @@ class UploadSession:
             self._state.location,
             self._state.token,
             self._state.tls_trust,
-            handle,
+            source_id,
             arr.shape,
             arr.dtype,
         )
@@ -296,7 +254,7 @@ class UploadSession:
         chunk_shape: Sequence[int],
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
-    ) -> UploadHandle:
+    ) -> str:
         """Backs TensorFlightClient.create_source; see that method for the full
         documentation."""
         req_desc = TensorDescriptor(
@@ -315,14 +273,14 @@ class UploadSession:
         except StopIteration as exc:
             raise RuntimeError("create_source: server returned no result") from exc
 
-        created = CreateSourceResult.FromString(result.body.to_pybytes())
-        logger.info(f"create_source: created {created.tensor_descriptor.array_id}")
-        return UploadHandle(created.tensor_descriptor.array_id, created.session_id)
+        response_desc = TensorDescriptor.FromString(result.body.to_pybytes())
+        logger.info(f"create_source: created {response_desc.array_id}")
+        return response_desc.array_id
 
-    def finish_upload(self, handle: UploadHandle) -> UploadStatusPb:
+    def finish_upload(self, source_id: str) -> UploadStatusPb:
         """Backs TensorFlightClient.finish_upload; see that method for the full
         documentation."""
-        req = FinishUpload(source_id=handle.source_id, session_id=handle.session_id)
+        req = FinishUpload(source_id=source_id)
         action = flight.Action("finish", req.SerializeToString())
         results = self._state.client.do_action(action, options=self._state.call_options)
         try:
@@ -330,22 +288,17 @@ class UploadSession:
         except StopIteration as exc:
             raise RuntimeError("finish: server returned no result") from exc
         status = UploadStatusPb.FromString(result.body.to_pybytes())
-        logger.info(f"finish: sealed {handle.source_id}")
+        logger.info(f"finish: sealed {source_id}")
         return status
 
     def upload_chunk(
         self,
-        handle: UploadHandle,
+        source_id: str,
         bounds: ChunkBounds,
         data: np.ndarray,
     ) -> None:
         """Backs TensorFlightClient.upload_chunk; see that method for the full
         documentation."""
         _put_chunk(
-            self._state.client,
-            self._state.call_options,
-            handle.source_id,
-            bounds,
-            data,
-            handle.session_id,
+            self._state.client, self._state.call_options, source_id, bounds, data
         )

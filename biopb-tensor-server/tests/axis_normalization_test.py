@@ -621,8 +621,7 @@ class TestCreateSourceValidation:
         assert "['y', 'x']" in str(exc.value)
 
     def _create(self, desc):
-        """The descriptor half of the create result; the session is step 4's."""
-        return self._manager().create_source(desc).tensor_descriptor
+        return self._manager().create_source(desc)
 
     def test_canonical_upload_is_accepted(self):
         desc = self._create(

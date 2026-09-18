@@ -13,10 +13,10 @@ argument is *checked* rather than argued:
     source_id = f"cache_{sha256(source_name)[:12]}"
 
 the id is a one-way hash of a name the harness never sends, so an agent holding
-the id cannot reach the fixture. `test_a_reupload_under_the_same_name_is_seen`
-demonstrates both halves of that at once — the name *does* let you replace the
-data, and the fingerprint check notices — which is what makes the flag in
-`bench/_engine` a mechanism instead of a comment.
+the id cannot reach the fixture. `test_a_reupload_under_the_same_name_is_refused`
+checks the server's half: a name is single-use, so even the name would not let
+you swap the data out from under the id. The fingerprint check in
+`bench/_engine` stays as the mechanism that would notice if either ever gave.
 """
 
 from __future__ import annotations
@@ -115,18 +115,16 @@ def test_an_agent_holding_the_id_cannot_name_the_source(plane):
 
 
 @pytest.mark.bench
-def test_a_reupload_under_the_same_name_is_seen(plane):
-    """Both halves of the argument at once.
+def test_a_reupload_under_the_same_name_is_refused(plane):
+    """The id is deterministic in the name, and the name is taken for the life
+    of the server: a second upload under it is refused rather than replacing
+    the fixture in place, and what the id serves is unchanged."""
+    import pyarrow.flight as flight
 
-    Knowing the *name* does let you replace a fixture in place — the registry
-    is a dict assignment and the id is deterministic — which is exactly why the
-    name is a per-run secret. And when it happens, the fingerprint notices, so
-    the row is flagged rather than silently scored against different data.
-    """
     original = np.zeros((4, 4), np.float32)
     array_id = plane.upload("overwrite-me", original)
     before = plane.fingerprint(array_id)
 
-    again = plane.upload("overwrite-me", np.ones((4, 4), np.float32))
-    assert again == array_id, "a re-upload under one name is the same source"
-    assert plane.fingerprint(array_id) != before
+    with pytest.raises(flight.FlightServerError, match="already exists"):
+        plane.upload("overwrite-me", np.ones((4, 4), np.float32))
+    assert plane.fingerprint(array_id) == before

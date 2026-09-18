@@ -31,7 +31,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
@@ -42,11 +41,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import encode_chunk_id
-from biopb_tensor_server.core.errors import (
-    UploadDiscardedError,
-    UploadSealedError,
-    UploadSupersededError,
-)
+from biopb_tensor_server.core.errors import UploadDiscardedError, UploadSealedError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -124,12 +119,6 @@ class UploadProgress:
     """
 
     expected_chunks: int
-    #: Names this *attempt*, where ``source_id`` names the object. Minted per
-    #: ``begin_upload``, so a re-create under the same deterministic ``cache:``
-    #: id gets a new one and the displaced writer's chunks are refused rather
-    #: than landing in a source that is no longer its own. Not a credential: it
-    #: is carried in the clear and grants nothing (biopb/biopb#1048).
-    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: UploadStatus = UploadStatus.PENDING
     uploaded_chunk_ids: Set[bytes] = field(default_factory=set)
     reason: str = ""
@@ -285,19 +274,17 @@ class WritableSource:
                 )
             return progress.as_status_dict(source_id)
 
-    def finish(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+    def finish(self) -> Dict[str, Any]:
         """Seal this upload: PENDING -> READY, no further chunks.
 
         The only route to READY, and it replaced a count-derived one that could
-        not coexist with it: a source that counted its way to READY kept a live
-        session and stayed writable, where a finished one is sealed -- two
-        security states under one state name. The count was never a
-        completeness check anyway, since ``CachedSourceAdapter`` takes
-        arbitrary bounds; it now only reports progress.
+        not coexist with it: a source that counted its way to READY stayed
+        writable, where a finished one is sealed -- two security states under
+        one state name. The count was never a completeness check anyway, since
+        ``CachedSourceAdapter`` takes arbitrary bounds; it now only reports
+        progress.
 
-        *session_id* is checked when given; ``None`` is an in-process producer
-        holding this adapter (see :meth:`put_chunk`). Idempotent for the
-        session that sealed it, so a retried ``finish`` is not an error.
+        Idempotent, so a retried ``finish`` is not an error.
         """
         progress = self._upload
         if progress is None:
@@ -305,8 +292,6 @@ class WritableSource:
         with progress.lock:
             if progress.is_discarded:
                 raise UploadDiscardedError(self.source_id, progress.reason)
-            if session_id is not None and session_id != progress.session_id:
-                raise UploadSupersededError(self.source_id)
             progress.status = UploadStatus.READY
             progress.touch()
             logger.info(
@@ -328,12 +313,6 @@ class WritableSource:
         """The upload's progress, or None if this adapter is not tracking one."""
         return self._upload
 
-    @property
-    def session_id(self) -> str:
-        """The current upload session, or "" if this adapter is not tracking one."""
-        progress = self._upload
-        return progress.session_id if progress is not None else ""
-
     def upload_status(self) -> Dict[str, Any]:
         progress = self._upload
         if progress is None:
@@ -347,29 +326,19 @@ class WritableSource:
         data: pa.Array | pa.ChunkedArray,
         expected_shape: Tuple[int, ...],
         dtype: Any,
-        session_id: Optional[str] = None,
     ) -> None:
-        """Store one chunk and count it, if this upload still accepts writes.
-
-        *session_id* is the attempt the write belongs to. ``None`` means an
-        in-process producer that holds this adapter object directly
-        (``CachedSourceAdapter.write_chunk``) rather than naming it; there is
-        nothing to supersede, because a swap in the registry does not reach
-        into a reference someone already has. A wire caller always names one,
-        and an empty string is a name that matches nothing.
-        """
-        self._refuse_write(session_id)
+        """Store one chunk and count it, if this upload still accepts writes."""
+        self._refuse_write()
         self._store_chunk(bounds, data, expected_shape, dtype)
         self._mark_chunk(bounds)
 
-    def _refuse_write(self, session_id: Optional[str]) -> None:
-        """The three ways a write can arrive too late, in the order that tells
-        its sender the most.
+    def _refuse_write(self) -> None:
+        """The two ways a write can arrive too late. Discarded first: it
+        carries a reason, which "already finished" does not.
 
-        Discarded first: it carries a reason, which outranks either of the
-        others. Superseded before sealed, because a displaced writer whose
-        successor has since finished must hear that it was displaced -- "already
-        finished" would send it looking at a source that was never its own.
+        There is no third: a source's id has one adapter for the life of the
+        server (``UploadManager.create_source`` refuses a name collision), so
+        a write cannot land in a stranger's source by naming its own.
         """
         progress = self._upload
         if progress is None:
@@ -377,8 +346,6 @@ class WritableSource:
         with progress.lock:
             if progress.is_discarded:
                 raise UploadDiscardedError(self.source_id, progress.reason)
-            if session_id is not None and session_id != progress.session_id:
-                raise UploadSupersededError(self.source_id)
             if progress.is_sealed:
                 raise UploadSealedError(self.source_id)
 

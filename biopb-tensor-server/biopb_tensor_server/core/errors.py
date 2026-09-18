@@ -192,37 +192,13 @@ class UploadDiscardedError(Exception):
         self.reason = reason
 
 
-class UploadSupersededError(Exception):
-    """A write carrying a session that is no longer the source's current one.
-
-    A second ``create_source`` for the same ``cache:name`` opens a new session
-    and displaces the first; the registry swaps the adapter, so a straggler
-    from the old attempt would otherwise write into the new source undetected
-    (the residual biopb/biopb#1 noted and left for a generation counter -- the
-    session id is that counter).
-
-    This is the **only** channel by which a displaced producer learns what
-    happened: status is keyed by ``source_id``, so polling it reports the new
-    session's progress and never mentions the old one.
-    """
-
-    def __init__(self, source_id: str) -> None:
-        super().__init__(
-            f"Upload session superseded for source '{source_id}': another "
-            "create_source has taken this name. Writes from this session are "
-            "no longer accepted; the source now belongs to a later attempt."
-        )
-        self.source_id = source_id
-
-
 class UploadSealedError(Exception):
-    """A write to an upload its own producer has already declared complete.
+    """A write to an upload its producer has already declared complete.
 
     ``finish`` is a producer's declaration that the source is complete, and
     reads are not gated on it -- so by the time it lands, a consumer may
     already have read what is there. Accepting a later write would change bytes
-    someone has seen. Distinct from :class:`UploadSupersededError`: nobody took
-    this source away, its own writer said it was done.
+    someone has seen.
     """
 
     def __init__(self, source_id: str) -> None:

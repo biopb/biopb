@@ -99,6 +99,21 @@ class SourceRegistry:
         logger.debug(f"Registered source: {source_id}")
         return adapter
 
+    def register_new(
+        self, source_id: str, adapter: SourceAdapter
+    ) -> Optional[SourceAdapter]:
+        """:meth:`register`, refused if *source_id* is already taken.
+
+        Returns the registered adapter, or ``None`` when the id is held -- by
+        anything, a live upload or a sealed one. Atomic, so two concurrent
+        creates of one name cannot both be told they own it. The caller still
+        owns *adapter* on a refusal and closes it.
+        """
+        with self._lock:
+            if source_id in self._sources:
+                return None
+            return self.register(source_id, adapter)
+
     def unregister(self, source_id: str) -> Optional[SourceAdapter]:
         """Remove a source and release its adapter's resources.
 

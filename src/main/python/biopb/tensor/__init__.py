@@ -42,7 +42,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 _LAZY_CLIENT_EXPORTS = (
     "TensorFlightClient",
     "ResolveCancelled",
-    "UploadHandle",
 )
 
 
@@ -76,5 +75,4 @@ __all__ = [
     # Client
     "TensorFlightClient",
     "ResolveCancelled",
-    "UploadHandle",
 ]

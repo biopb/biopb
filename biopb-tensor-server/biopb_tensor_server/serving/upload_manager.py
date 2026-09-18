@@ -31,7 +31,7 @@ from typing import Any, Dict, Optional, Type
 
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.ticket_pb2 import ChunkUpload, CreateSourceResult
+from biopb.tensor.ticket_pb2 import ChunkUpload
 
 from biopb_tensor_server.adapters._writable import (
     UploadStatus,
@@ -45,7 +45,6 @@ from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.errors import (
     UploadDiscardedError,
     UploadSealedError,
-    UploadSupersededError,
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
@@ -99,7 +98,7 @@ class UploadManager:
             return unknown_upload_status(source_id)
         return adapter.discard(reason)
 
-    def finish(self, source_id: str, session_id: str) -> Dict[str, Any]:
+    def finish(self, source_id: str) -> Dict[str, Any]:
         """Seal an upload; see ``WritableSource.finish``.
 
         Unlike ``discard``, a source that is tracking no upload is an error
@@ -114,10 +113,8 @@ class UploadManager:
                 f"finish: {source_id} is not an upload in progress"
             )
         try:
-            return adapter.finish(session_id)
+            return adapter.finish()
         except UploadDiscardedError as e:
-            raise flight.FlightCancelledError(str(e)) from e
-        except UploadSupersededError as e:
             raise flight.FlightCancelledError(str(e)) from e
 
     # -- write path ------------------------------------------------------------
@@ -149,14 +146,23 @@ class UploadManager:
             f"uploading."
         )
 
-    def create_source(self, req_desc: TensorDescriptor) -> CreateSourceResult:
-        """Create a source from a TensorDescriptor, return it and its session.
+    def create_source(self, req_desc: TensorDescriptor) -> TensorDescriptor:
+        """Create a source from a TensorDescriptor, return its resolved descriptor.
 
         array_id format in request:
         - "cache:name" → cache-backed with given name
         - "cache:" → cache-backed with server-generated name
         - "ome_zarr:name" → zarr-backed with given name
         - "ome_zarr:" → zarr-backed with server-generated name
+
+        A name is single-use for the life of the server. A named ``cache:``
+        upload has a deterministic id, so a second create under the same name
+        would land on the first's adapter -- and replacing it would leave the
+        first writer's chunks, and its ``finish``, landing in a source that is
+        no longer its own, with nothing to tell it so (status is keyed by the
+        id it still holds). Refusing the collision is what makes ``source_id``
+        alone name an attempt. Sealed sources are not an exception: a name that
+        could be reclaimed by finishing is a name a straggler can be raced for.
         """
         self._require_canonical_axes(req_desc)
 
@@ -182,12 +188,16 @@ class UploadManager:
         except ValueError as e:
             raise flight.FlightServerError(str(e)) from e
 
-        # A deterministic id (a named cache: upload) lands on whatever holds the
-        # name now -- a prior upload, or its tombstone. Replace rather than
-        # overwrite so the displaced adapter is released, not leaked.
         source_id = adapter.source_id
-        registered, displaced = self._registry.swap(source_id, adapter)
-        close_adapter(displaced)
+        registered = self._registry.register_new(source_id, adapter)
+        if registered is None:
+            close_adapter(adapter)
+            raise flight.FlightServerError(
+                f"create_source: {req_desc.array_id!r} already exists as "
+                f"{source_id}. A name is taken for the life of the server, "
+                "finished or discarded included; upload under a new name, or "
+                f"'{prefix}:' for a server-minted one."
+            )
 
         # Only a durable upload belongs in the catalog; a volatile one is
         # readable by its returned id but not enumerable (biopb/biopb#265).
@@ -202,13 +212,7 @@ class UploadManager:
                 )
 
         logger.info(f"Created {prefix} upload: {source_id}")
-        # The session is the adapter's own, minted by ``begin_upload``, so the
-        # swap above has already decided which attempt owns the name: whatever
-        # this returns is current, and any earlier session for this id is not.
-        return CreateSourceResult(
-            tensor_descriptor=adapter.upload_response(req_desc),
-            session_id=adapter.session_id,
-        )
+        return adapter.upload_response(req_desc)
 
     def write_chunk(
         self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
@@ -217,16 +221,14 @@ class UploadManager:
 
         Each source format owns its write contract: OmeZarr/Zarr enforce
         chunk-grid alignment; cache-backed sources accept arbitrary bounds;
-        read-only formats reject the write; an upload that is discarded,
-        superseded or sealed refuses. Adapters stay transport-agnostic, so
-        their errors become Flight errors here.
+        read-only formats reject the write; an upload that is discarded or
+        sealed refuses. Adapters stay transport-agnostic, so their errors
+        become Flight errors here.
 
-        All three refusals map to ``FlightCancelledError``: they share the one
-        thing a writer must act on -- this attempt is over, stop sending -- and
-        a client discriminates on the type rather than the message
-        (biopb/biopb#1). Which of the three it was rides in the message,
-        because it has nowhere else to go: status is keyed by ``source_id``, so
-        a superseded producer polling it would read its successor's progress.
+        Both refusals map to ``FlightCancelledError``: they share the one thing
+        a writer must act on -- this upload is over, stop sending -- and a
+        client discriminates on the type rather than the message
+        (biopb/biopb#1). Which of the two it was rides in the message.
         """
         table = reader.read_all()
         data_column = table.column(0)
@@ -241,14 +243,8 @@ class UploadManager:
         )
         dtype = table.schema.field(0).type.to_pandas_dtype()
         try:
-            adapter.put_chunk(
-                bounds, data_column, expected_shape, dtype, upload.session_id
-            )
-        except (
-            UploadDiscardedError,
-            UploadSupersededError,
-            UploadSealedError,
-        ) as e:
+            adapter.put_chunk(bounds, data_column, expected_shape, dtype)
+        except (UploadDiscardedError, UploadSealedError) as e:
             raise flight.FlightCancelledError(str(e)) from e
         except (ValueError, WriteNotSupportedError) as e:
             raise flight.FlightServerError(str(e)) from e
