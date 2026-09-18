@@ -10,20 +10,14 @@ unconditionally it would put a stat walk of the source on every tensor open
 (biopb/biopb#1048).
 """
 
-import threading
 from pathlib import Path
 
 import numpy as np
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import FlightRequest, TensorReadOption
-from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.read_mask import READ_MASK_PATHS, read_mask
 from google.protobuf.field_mask_pb2 import FieldMask
-
-from tests import catalog_server
 
 
 class TestReadMaskReader:
@@ -73,30 +67,7 @@ class TestReadMaskReader:
         } == READ_MASK_PATHS
 
 
-@pytest.fixture
-def server(tmp_path):
-    CacheManager.reset()
-    CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
-    srv = catalog_server(
-        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
-    )
-    srv.mark_ready()
-    threading.Thread(target=srv.serve, daemon=True).start()
-    try:
-        yield srv
-    finally:
-        srv.shutdown()
-        CacheManager.reset()
-
-
-@pytest.fixture
-def client(server):
-    c = TensorFlightClient(f"grpc://localhost:{server.port}")
-    yield c
-    c.close()
-
-
-def _zarr_source(server, tmp_path, name="plain", value=3):
+def _zarr_source(writable_server, tmp_path, name="plain", value=3):
     import zarr
     from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
@@ -105,7 +76,7 @@ def _zarr_source(server, tmp_path, name="plain", value=3):
         str(path), mode="w", shape=(4, 4), chunks=(2, 2), dtype="uint8"
     )
     arr[:] = value
-    server.register_source(
+    writable_server.register_source(
         name, ZarrAdapter(zarr.open_array(str(path), mode="r"), name, ["y", "x"])
     )
     return name
@@ -114,21 +85,21 @@ def _zarr_source(server, tmp_path, name="plain", value=3):
 class TestResidencyIsOptIn:
     """The field this mask exists for."""
 
-    def test_unset_when_nobody_asked(self, client, server, tmp_path):
-        sid = _zarr_source(server, tmp_path)
+    def test_unset_when_nobody_asked(self, client, writable_server, tmp_path):
+        sid = _zarr_source(writable_server, tmp_path)
         desc = client.get_descriptor(sid)
         assert not desc.HasField("is_resident")
 
-    def test_answered_when_asked(self, client, server, tmp_path):
-        sid = _zarr_source(server, tmp_path)
+    def test_answered_when_asked(self, client, writable_server, tmp_path):
+        sid = _zarr_source(writable_server, tmp_path)
         desc = client.get_descriptor(sid, with_residency=True)
         assert desc.HasField("is_resident")
         assert desc.is_resident is True  # a real local zarr
 
-    def test_a_plain_read_does_not_ask(self, client, server, tmp_path):
+    def test_a_plain_read_does_not_ask(self, client, writable_server, tmp_path):
         """The regression this guards: residency filled on every open would be
         the catalog-wide stat walk again, one source at a time."""
-        sid = _zarr_source(server, tmp_path)
+        sid = _zarr_source(writable_server, tmp_path)
         arr = client.get_tensor(sid)
         assert arr.shape == (4, 4)
         cached = client._state.descriptors.get(sid)
@@ -137,10 +108,10 @@ class TestResidencyIsOptIn:
 
 
 class TestUnknownPathOverTheWire:
-    def test_the_server_refuses_it(self, client, server, tmp_path):
+    def test_the_server_refuses_it(self, client, writable_server, tmp_path):
         """End to end, not just the reader: a bad path must not reach an
         adapter and come back as a confusing partial response."""
-        sid = _zarr_source(server, tmp_path)
+        sid = _zarr_source(writable_server, tmp_path)
         cmd = FlightRequest(
             tensor_read=TensorReadOption(
                 array_id=sid, fields=FieldMask(paths=["not_a_path"])
@@ -152,15 +123,15 @@ class TestUnknownPathOverTheWire:
 
 
 class TestEndpointsAreOptIn:
-    def test_a_describe_gets_no_endpoints(self, client, server, tmp_path):
-        sid = _zarr_source(server, tmp_path)
+    def test_a_describe_gets_no_endpoints(self, client, writable_server, tmp_path):
+        sid = _zarr_source(writable_server, tmp_path)
         cmd = FlightRequest(tensor_read=TensorReadOption(array_id=sid))
         fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
         info = client._state.client.get_flight_info(fd)
         assert list(info.endpoints) == []
 
-    def test_asking_for_them_gets_them(self, client, server, tmp_path):
-        sid = _zarr_source(server, tmp_path)
+    def test_asking_for_them_gets_them(self, client, writable_server, tmp_path):
+        sid = _zarr_source(writable_server, tmp_path)
         cmd = FlightRequest(
             tensor_read=TensorReadOption(
                 array_id=sid, fields=FieldMask(paths=["endpoints"])
@@ -172,10 +143,10 @@ class TestEndpointsAreOptIn:
         # property here is that a plan arrived at all.
         assert list(info.endpoints)
 
-    def test_the_read_path_still_reads(self, client, server, tmp_path):
+    def test_the_read_path_still_reads(self, client, writable_server, tmp_path):
         """The SDK had to start asking for `endpoints` explicitly; if it ever
         stops, a read returns an empty plan rather than an error."""
-        sid = _zarr_source(server, tmp_path, value=7)
+        sid = _zarr_source(writable_server, tmp_path, value=7)
         assert np.asarray(client.get_tensor(sid))[0, 0] == 7
 
 

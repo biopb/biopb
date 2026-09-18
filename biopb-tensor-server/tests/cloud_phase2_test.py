@@ -1286,25 +1286,6 @@ class _Ctx:
         return None  # no bearer presented; the servers here have no token
 
 
-class _ResidencyProbeAdapter:
-    """Registered adapter that counts residency questions and answers a knob."""
-
-    capability_token = None
-
-    def __init__(self, resident=True):
-        self.resident = resident
-        self.asked = 0
-        self._source_url = "/data/probe"
-
-    @property
-    def source_url(self):
-        return self._source_url
-
-    def is_resident(self):
-        self.asked += 1
-        return self.resident
-
-
 class TestWarmAction:
     """The dedicated streaming `warm` do_action: server-side hydrate-ahead. It
     walks the resolved source directory and reads every file (forcing recall),

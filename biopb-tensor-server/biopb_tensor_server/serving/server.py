@@ -1689,7 +1689,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # A source that cannot answer leaves the field unset. Unset reads as
         # "unknown", never as False -- which would send a client to hydrate what
         # is already on disk.
-        if IS_RESIDENT in mask and source_adapter is not None:
+        if IS_RESIDENT in mask:
             try:
                 read_plan.descriptor.is_resident = bool(source_adapter.is_resident())
             except Exception:  # noqa: BLE001 -- a balky adapter is not the request

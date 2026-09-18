@@ -44,6 +44,14 @@ READ_MASK_PATHS: FrozenSet[str] = frozenset(
     {ENDPOINTS, METADATA_JSON, PYRAMID, UPLOAD_STATUS, IS_RESIDENT}
 )
 
+#: Paths that answer a question about *this* machine and so are never
+#: forwarded to an upstream by a remote-proxy adapter: metadata_json comes
+#: from the local mirror catalog (biopb/biopb#253), and residency is a fact
+#: about this machine's filesystem, not the upstream's. Everything else in
+#: READ_MASK_PATHS -- including upload_status, which tracks the *origin*
+#: source's own ingest -- is the upstream's to answer.
+LOCAL_ONLY: FrozenSet[str] = frozenset({METADATA_JSON, IS_RESIDENT})
+
 
 def read_mask(read_opt: TensorReadOption) -> FrozenSet[str]:
     """The paths *read_opt* asked for, validated.

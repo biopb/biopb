@@ -4,8 +4,11 @@ Imports fixture factory functions from fixtures module and wraps them as pytest 
 """
 
 import tempfile
+import threading
+from pathlib import Path
 
 import pytest
+from biopb.tensor.client import TensorFlightClient
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.fixtures import (
@@ -19,6 +22,8 @@ from biopb_tensor_server.fixtures import (
     create_tiled_ome_tiff,
     create_zarr_array,
 )
+
+from tests import catalog_server
 
 # =============================================================================
 # pytest fixtures using the factory functions
@@ -137,6 +142,36 @@ def transfer_target(monkeypatch):
         return int(nbytes)
 
     return _set
+
+
+@pytest.fixture
+def writable_server(tmp_path):
+    """A live, writable server on an OS-assigned port.
+
+    No wait after `serve()`: `FlightServerBase` binds and starts serving in
+    `__init__`, so the port is live before this returns -- the thread only parks
+    on it.
+    """
+    CacheManager.reset()
+    CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
+    server = catalog_server(
+        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+    )
+    server.mark_ready()
+    threading.Thread(target=server.serve, daemon=True).start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        CacheManager.reset()
+
+
+@pytest.fixture
+def client(writable_server):
+    """A client connected to `writable_server`."""
+    c = TensorFlightClient(f"grpc://localhost:{writable_server.port}")
+    yield c
+    c.close()
 
 
 @pytest.fixture

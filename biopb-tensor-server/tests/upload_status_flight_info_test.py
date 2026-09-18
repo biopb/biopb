@@ -10,42 +10,12 @@ The test that carries the point is `TestCapabilityHolderCanPoll`: everything
 else here is mechanism.
 """
 
-import threading
-from pathlib import Path
-
 import numpy as np
 import pyarrow.flight as flight
 import pytest
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import UploadStatus as UploadStatusPb
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.config import CacheConfig
-
-from tests import catalog_server
-
-
-@pytest.fixture
-def writable_server(tmp_path):
-    CacheManager.reset()
-    CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
-    server = catalog_server(
-        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
-    )
-    server.mark_ready()
-    threading.Thread(target=server.serve, daemon=True).start()
-    try:
-        yield server
-    finally:
-        server.shutdown()
-        CacheManager.reset()
-
-
-@pytest.fixture
-def client(writable_server):
-    c = TensorFlightClient(f"grpc://localhost:{writable_server.port}")
-    yield c
-    c.close()
 
 
 def _make(client, name="cache:status", shape=(4, 4), chunk=(2, 2)):

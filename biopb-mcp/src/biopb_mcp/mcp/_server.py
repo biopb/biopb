@@ -722,8 +722,8 @@ async def execute_code(
     - "are the bytes local right now" is a different question, not a column,
       and not one to ask of a catalog: it is a live filesystem check. Ask it of
       the one source you are about to read --
-      client.get_descriptor(array_id, with_residency=True).is_resident -- and
-      don't cache the answer.
+      client.get_descriptor(array_id, with_pyramid=False, with_residency=True)
+      .is_resident -- and don't cache the answer.
     - viewer.add_tensor(array_id) loads a tensor as a layer (auto-handles the
       multiscale pyramid); client.get_tensor(array_id) returns a lazy dask
       array without adding a layer. Both take the same id: "source_id/t1"

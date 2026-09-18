@@ -592,7 +592,7 @@ it live in a row. Whether the bytes are local is true only right now -- a synced
 folder re-dehydrates under storage pressure -- so it is checked live, per
 source, on the descriptor:
 ```python
-client.get_descriptor(array_id, with_residency=True).is_resident
+client.get_descriptor(array_id, with_pyramid=False, with_residency=True).is_resident
 ```
 Ask it of a source you are about to read, never in a loop over a listing: the
 answer is a stat walk of the source, so asking it per row made a browse scale
