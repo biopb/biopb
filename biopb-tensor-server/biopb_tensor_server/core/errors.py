@@ -183,12 +183,13 @@ class UploadClosedError(Exception):
     of the two subclasses to discriminate why.
 
     ``wire_reason`` and ``state`` are what the boundary puts in the Flight
-    error's ``extra_info`` (beside the canonical ``CANCELLED`` code), so a
-    client raises one typed exception with the terminal state as a field
-    rather than parsing it out of the message (biopb/biopb#1048 step 7).
+    error's ``extra_info``, so a client raises one typed exception with the
+    terminal state as a field rather than parsing it out of the message
+    (biopb/biopb#1048 step 7). The gRPC code itself is not part of that
+    payload: both subclasses map to ``FlightCancelledError`` unconditionally,
+    so it is implied by the exception type, not data a client would switch on.
     """
 
-    grpc_code = "CANCELLED"
     wire_reason = "upload_closed"
     state = ""
 

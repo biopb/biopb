@@ -67,12 +67,12 @@ def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
     """An upload-closed error as the wire sees it.
 
     ``FlightCancelledError`` for both kinds -- the one thing a writer must act
-    on is *this upload is over* -- with the terminal state in ``extra_info`` on
-    the ``{"code", "reason"}`` convention the read path uses, so the client
-    switches on a field, not a substring. ``detail`` is the discard's reason.
+    on is *this upload is over* -- with the terminal state in ``extra_info``,
+    so the client switches on a field, not a substring. No ``code``: both kinds
+    map to the same exception class, so the gRPC code is implied by the class,
+    not data. ``detail`` is the discard's reason.
     """
     payload = {
-        "code": exc.grpc_code,
         "reason": exc.wire_reason,
         "state": exc.state,
         "source_id": exc.source_id,
