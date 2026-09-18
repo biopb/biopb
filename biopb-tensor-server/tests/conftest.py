@@ -3,9 +3,26 @@
 Imports fixture factory functions from fixtures module and wraps them as pytest fixtures.
 """
 
+import os
 import tempfile
 import threading
 from pathlib import Path
+
+# Neutralise terminal colour before anything builds a Rich Console. Several
+# tests assert on the *text* a CLI prints, and Rich emits ANSI escapes into
+# captured output whenever it believes colour is wanted -- turning
+# `assert "Deleted 1" in captured` into a comparison against "\x1b[3m...".
+#
+# `FORCE_COLOR` is the one that bites: Rich checks it *before* `NO_COLOR`, so
+# setting `NO_COLOR` alone does not help, and several terminal tools and agent
+# harnesses export it. CI has neither set, which is why these tests pass there
+# and fail on a developer's machine -- the worst place for a test to disagree
+# with CI. Duplicated from the repo-root conftest because this package sets its
+# own `[tool.pytest.ini_options]`, which makes it pytest's rootdir, so the root
+# conftest is never collected for these tests.
+os.environ.pop("FORCE_COLOR", None)
+os.environ["NO_COLOR"] = "1"
+os.environ.setdefault("TERM", "dumb")
 
 import pytest
 from biopb.tensor.client import TensorFlightClient
