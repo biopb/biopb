@@ -289,20 +289,31 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             f"none. Uploaded chunks are served by chunk_id."
         )
 
-    def write_chunk(self, bounds: ChunkBounds, data: np.ndarray) -> None:
+    def write_chunk(
+        self,
+        bounds: ChunkBounds,
+        data: np.ndarray,
+        session_id: Optional[str] = None,
+    ) -> None:
         """Write a NumPy chunk: the in-process producer's entry to ``put_chunk``.
 
         For cache-backed sources, arbitrary bounds allowed. Goes through
-        ``put_chunk`` so the write is counted, and refused once discarded, the
-        same as one arriving over the wire.
+        ``put_chunk`` so the write is counted, and refused once the attempt is
+        over, the same as one arriving over the wire.
 
         Args:
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data (any shape matching bounds)
+            session_id: The upload session this write belongs to. ``None``
+                skips the check, which is right only for a producer holding
+                *this* adapter object -- one that looked the source up by name
+                can be handed a successor's adapter and should name its session.
         """
         # Pass the flat element values (a primitive Arrow array), NOT a list<T>
         # wrapper -- write_chunk_arrow stores the raw value buffer directly.
-        self.put_chunk(bounds, pa.array(data.ravel()), data.shape, data.dtype)
+        self.put_chunk(
+            bounds, pa.array(data.ravel()), data.shape, data.dtype, session_id
+        )
 
     def _store_chunk(self, bounds, data, expected_shape, dtype) -> None:
         """Arbitrary-bounds write: cache-backed sources accept any bounds.

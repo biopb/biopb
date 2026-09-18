@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
@@ -41,7 +42,11 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import encode_chunk_id
-from biopb_tensor_server.core.errors import UploadDiscardedError
+from biopb_tensor_server.core.errors import (
+    UploadDiscardedError,
+    UploadSealedError,
+    UploadSupersededError,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -100,9 +105,13 @@ def _expected_chunk_count(shape: Sequence[int], chunk_shape: Sequence[int]) -> i
 class UploadProgress:
     """How far an upload has got, and whether anyone still wants it.
 
-    ``READY`` once every expected chunk arrives. ``DISCARDED`` is terminal: the
-    adapter stays registered as a tombstone so a writer still unwinding learns
-    *why* its write failed rather than that its source never existed.
+    ``READY`` once the producer calls ``finish``, and only then: the chunk
+    count is a coverage *proxy*, and a cache-backed source accepts arbitrary
+    bounds, so off-grid writes can reach the expected count without tiling the
+    array or never reach it at all. Both terminal states seal the source
+    against further writes. ``DISCARDED`` keeps the adapter registered as a
+    tombstone so a writer still unwinding learns *why* its write failed rather
+    than that its source never existed.
 
     ``updated_at`` is what will bound that afterlife. One field serves both
     halves of reclamation, because for a discarded upload the last touch *is*
@@ -115,6 +124,12 @@ class UploadProgress:
     """
 
     expected_chunks: int
+    #: Names this *attempt*, where ``source_id`` names the object. Minted per
+    #: ``begin_upload``, so a re-create under the same deterministic ``cache:``
+    #: id gets a new one and the displaced writer's chunks are refused rather
+    #: than landing in a source that is no longer its own. Not a credential: it
+    #: is carried in the clear and grants nothing (biopb/biopb#1048).
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: UploadStatus = UploadStatus.PENDING
     uploaded_chunk_ids: Set[bytes] = field(default_factory=set)
     reason: str = ""
@@ -135,6 +150,11 @@ class UploadProgress:
     @property
     def is_discarded(self) -> bool:
         return self.status is UploadStatus.DISCARDED
+
+    @property
+    def is_sealed(self) -> bool:
+        """No further chunk will be accepted -- finished, or given up on."""
+        return self.status in (UploadStatus.READY, UploadStatus.DISCARDED)
 
     def touch(self) -> None:
         self.updated_at = time.monotonic()
@@ -265,6 +285,36 @@ class WritableSource:
                 )
             return progress.as_status_dict(source_id)
 
+    def finish(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Seal this upload: PENDING -> READY, no further chunks.
+
+        The only route to READY, and it replaced a count-derived one that could
+        not coexist with it: a source that counted its way to READY kept a live
+        session and stayed writable, where a finished one is sealed -- two
+        security states under one state name. The count was never a
+        completeness check anyway, since ``CachedSourceAdapter`` takes
+        arbitrary bounds; it now only reports progress.
+
+        *session_id* is checked when given; ``None`` is an in-process producer
+        holding this adapter (see :meth:`put_chunk`). Idempotent for the
+        session that sealed it, so a retried ``finish`` is not an error.
+        """
+        progress = self._upload
+        if progress is None:
+            return unknown_upload_status(self.source_id)
+        with progress.lock:
+            if progress.is_discarded:
+                raise UploadDiscardedError(self.source_id, progress.reason)
+            if session_id is not None and session_id != progress.session_id:
+                raise UploadSupersededError(self.source_id)
+            progress.status = UploadStatus.READY
+            progress.touch()
+            logger.info(
+                f"Finished upload {self.source_id}: "
+                f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
+            )
+            return progress.as_status_dict(self.source_id)
+
     # -- the shared half -------------------------------------------------------
 
     def begin_upload(self, shape: Sequence[int], chunk_shape: Sequence[int]) -> None:
@@ -277,6 +327,12 @@ class WritableSource:
     def upload(self) -> Optional[UploadProgress]:
         """The upload's progress, or None if this adapter is not tracking one."""
         return self._upload
+
+    @property
+    def session_id(self) -> str:
+        """The current upload session, or "" if this adapter is not tracking one."""
+        progress = self._upload
+        return progress.session_id if progress is not None else ""
 
     def upload_status(self) -> Dict[str, Any]:
         progress = self._upload
@@ -291,11 +347,40 @@ class WritableSource:
         data: pa.Array | pa.ChunkedArray,
         expected_shape: Tuple[int, ...],
         dtype: Any,
+        session_id: Optional[str] = None,
     ) -> None:
-        """Store one chunk and count it. Refused once the upload is discarded."""
-        self._refuse_if_discarded()
+        """Store one chunk and count it, if this upload still accepts writes.
+
+        *session_id* is the attempt the write belongs to. ``None`` means an
+        in-process producer that holds this adapter object directly
+        (``CachedSourceAdapter.write_chunk``) rather than naming it; there is
+        nothing to supersede, because a swap in the registry does not reach
+        into a reference someone already has. A wire caller always names one,
+        and an empty string is a name that matches nothing.
+        """
+        self._refuse_write(session_id)
         self._store_chunk(bounds, data, expected_shape, dtype)
         self._mark_chunk(bounds)
+
+    def _refuse_write(self, session_id: Optional[str]) -> None:
+        """The three ways a write can arrive too late, in the order that tells
+        its sender the most.
+
+        Discarded first: it carries a reason, which outranks either of the
+        others. Superseded before sealed, because a displaced writer whose
+        successor has since finished must hear that it was displaced -- "already
+        finished" would send it looking at a source that was never its own.
+        """
+        progress = self._upload
+        if progress is None:
+            return
+        with progress.lock:
+            if progress.is_discarded:
+                raise UploadDiscardedError(self.source_id, progress.reason)
+            if session_id is not None and session_id != progress.session_id:
+                raise UploadSupersededError(self.source_id)
+            if progress.is_sealed:
+                raise UploadSealedError(self.source_id)
 
     def _refuse_if_discarded(self) -> None:
         """Raise :class:`UploadDiscardedError` if the upload has been given up on.
@@ -315,23 +400,22 @@ class WritableSource:
                 raise UploadDiscardedError(self.source_id, progress.reason)
 
     def _mark_chunk(self, bounds: ChunkBounds) -> None:
-        """Record that the chunk at *bounds* landed (flips to READY when full).
+        """Record that the chunk at *bounds* landed.
 
-        A discard between :meth:`_refuse_if_discarded` and here leaves the
-        chunk stored but uncounted: a tombstone must not be walked back into
-        PENDING by a write nobody is waiting for, nor have its clock touched.
+        Counting only: reaching ``expected_chunks`` no longer flips anything,
+        because :meth:`finish` is the only route to READY. What the count is
+        still for is the progress a poller watches.
+
+        A seal between :meth:`_refuse_write` and here leaves the chunk stored
+        but uncounted: a sealed upload must not be walked back into PENDING by
+        a write nobody is waiting for, nor have its clock touched.
         """
         progress = self._upload
         if progress is None:
             return
         chunk_id = encode_chunk_id(self.source_id, bounds)
         with progress.lock:
-            if progress.is_discarded:
+            if progress.is_sealed:
                 return
             progress.uploaded_chunk_ids.add(chunk_id)
             progress.touch()
-            progress.status = (
-                UploadStatus.READY
-                if progress.uploaded_chunks >= progress.expected_chunks
-                else UploadStatus.PENDING
-            )

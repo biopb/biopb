@@ -61,7 +61,7 @@ from biopb.tensor._session import (
     _TensorContext,
 )
 from biopb.tensor._tls import resolve_tls_trust
-from biopb.tensor._upload import UploadSession
+from biopb.tensor._upload import UploadHandle, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
@@ -69,6 +69,7 @@ from biopb.tensor.descriptor_pb2 import (
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
+    UploadStatus as UploadStatusPb,
     WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
@@ -1034,12 +1035,15 @@ class TensorFlightClient:
         chunk_shape: Sequence[int],
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
-    ) -> str:
-        """Create source on server (internal).
+    ) -> UploadHandle:
+        """Open an upload: create the source, and the session that may fill it.
 
         Note:
             Experimental. The upload / writable-source API (source creation, chunk
             upload, and upload-status polling) is experimental and may change.
+
+        The returned handle is what ``upload_chunk`` and ``finish_upload``
+        take, and ``finish_upload`` is what marks the upload complete.
 
         Args:
             source_name: "cache:name" → cache-backed; "ome_zarr:name" → zarr-backed
@@ -1051,7 +1055,8 @@ class TensorFlightClient:
             ome_metadata: Optional OME metadata dict
 
         Returns:
-            source_id assigned by server
+            An :class:`UploadHandle` carrying the server-assigned ``source_id``
+            and the ``session_id`` its writes must quote.
         """
         return self._upload.create_source(
             source_name, shape, dtype, chunk_shape, dim_labels, ome_metadata
@@ -1059,7 +1064,7 @@ class TensorFlightClient:
 
     def upload_chunk(
         self,
-        source_id: str,
+        handle: UploadHandle,
         bounds: ChunkBounds,
         data: np.ndarray,
     ) -> None:
@@ -1070,11 +1075,35 @@ class TensorFlightClient:
             upload, and upload-status polling) is experimental and may change.
 
         Args:
-            source_id: Source identifier
+            handle: The handle ``create_source`` returned
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data
+
+        Raises:
+            pyarrow.flight.FlightCancelledError: this attempt is over -- the
+                upload was superseded by a later ``create_source`` for the same
+                name, already sealed, or discarded. The message says which.
         """
-        self._upload.upload_chunk(source_id, bounds, data)
+        self._upload.upload_chunk(handle, bounds, data)
+
+    def finish_upload(self, handle: UploadHandle) -> UploadStatusPb:
+        """Seal an upload: the source is complete and takes no further chunks.
+
+        Note:
+            Experimental. The upload / writable-source API (source creation, chunk
+            upload, and upload-status polling) is experimental and may change.
+
+        The only route to READY, which is the state a consumer waiting on this
+        result polls for. ``upload_array``, which writes every chunk itself,
+        calls it for you.
+
+        Args:
+            handle: The handle ``create_source`` returned
+
+        Returns:
+            The sealed ``UploadStatus``.
+        """
+        return self._upload.finish_upload(handle)
 
     def close(self):
         """Close the Flight client."""

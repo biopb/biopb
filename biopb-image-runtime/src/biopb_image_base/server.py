@@ -213,20 +213,58 @@ class EmbeddedTensorCache:
         source_id: str,
         endpoint: ChunkBounds,
         chunk: np.ndarray,
+        session_id: Optional[str] = None,
     ) -> None:
+        """Write one chunk into a source this process created.
+
+        *session_id* is what ``create_array`` handed back. Pass it: this looks
+        the source up **by name**, so after a second ``create_array`` took that
+        name the lookup returns the new adapter and an unnamed write lands in
+        someone else's source. Naming the session is what turns that into a
+        refusal (biopb/biopb#1048).
+        """
         import pyarrow.flight as flight
-        from biopb_tensor_server.core.errors import UploadDiscardedError
+        from biopb_tensor_server.core.errors import (
+            UploadDiscardedError,
+            UploadSealedError,
+            UploadSupersededError,
+        )
 
         adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
-        # The adapter counts the chunk and refuses once discarded; a discard
-        # surfaces as the same exception type the wire path raises, so a
-        # servicer's job discriminates on it the way a remote client would.
+        # The adapter counts the chunk and refuses once the attempt is over; all
+        # three refusals surface as the exception type the wire path raises, so
+        # a servicer's job discriminates on it the way a remote client would.
         try:
-            adapter.write_chunk(endpoint, chunk)
-        except UploadDiscardedError as e:
+            adapter.write_chunk(endpoint, chunk, session_id)
+        except (
+            UploadDiscardedError,
+            UploadSupersededError,
+            UploadSealedError,
+        ) as e:
             raise flight.FlightCancelledError(str(e)) from e
+
+    def finish(self, source_id: str, session_id: Optional[str] = None) -> dict:
+        """Seal a result: the output is complete and takes no further chunks.
+
+        The counterpart to :meth:`discard`, and the only route to READY, which
+        is what a consumer polling for the result waits on. A fast-return
+        servicer calls this when its job succeeds, exactly as it calls
+        ``discard`` when the job dies (biopb/biopb#1048).
+        """
+        return self._server.uploads.finish(source_id, session_id)
+
+    def upload_session_id(self, source_id: str) -> str:
+        """The session currently allowed to write to *source_id*.
+
+        A fast-return servicer takes this right after ``create_array`` and
+        quotes it on every write and on ``finish``, so that if a later
+        ``create_array`` takes the name over, its own writes are refused rather
+        than silently filling the newcomer.
+        """
+        adapter = self._server.sources.get(source_id)
+        return getattr(adapter, "session_id", "")
 
     def get_upload_status(self, source_id: str) -> dict:
         return self._server.uploads.status(source_id)
@@ -263,10 +301,15 @@ class EmbeddedTensorCache:
             source_name=source_name,
             dim_labels=dim_labels,
         )
+        session_id = self.upload_session_id(source_id)
 
         for bounds in _iter_chunk_bounds(normalized_array.shape, chunk_shape):
             chunk_data = normalized_array[_bounds_to_slices(bounds)].compute()
-            self.upload_array_chunks(source_id, bounds, chunk_data)
+            self.upload_array_chunks(source_id, bounds, chunk_data, session_id)
+        # Synchronous: every chunk is written by the time we get here, so this
+        # is the one caller that can seal on its own behalf. `create_array`'s
+        # producer fills the source later and finishes for itself.
+        self.finish(source_id, session_id)
 
         logger.debug(
             "Created cache source %s: shape=%s, dtype=%s",

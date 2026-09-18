@@ -39,4 +39,8 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   The ``upload_status`` and ``is_resident`` actions are gone: both are live
 #   per-source reads and ride the descriptor GetFlightInfo returns
 #   (biopb/biopb#1048).
+#   An upload is a session: ``create_source`` answers with a
+#   ``CreateSourceResult`` (descriptor + ``session_id``) rather than a bare
+#   descriptor, ``ChunkUpload`` carries that session, a new ``finish`` action
+#   seals the source against further writes.
 FLIGHT_PROTOCOL_VERSION = 2

@@ -620,8 +620,12 @@ class TestCreateSourceValidation:
             )
         assert "['y', 'x']" in str(exc.value)
 
+    def _create(self, desc):
+        """The descriptor half of the create result; the session is step 4's."""
+        return self._manager().create_source(desc).tensor_descriptor
+
     def test_canonical_upload_is_accepted(self):
-        desc = self._manager().create_source(
+        desc = self._create(
             TensorDescriptor(
                 array_id="cache:good",
                 dim_labels=["z", "y", "x"],
@@ -634,7 +638,7 @@ class TestCreateSourceValidation:
 
     def test_unlabeled_upload_is_accepted(self):
         """An uploader that declares no semantics is not forced to invent any."""
-        desc = self._manager().create_source(
+        desc = self._create(
             TensorDescriptor(
                 array_id="cache:plain",
                 shape=[4, 5, 6],
