@@ -166,7 +166,10 @@ class TestNotCached:
         _put(client, source_id, (0, 0), (2, 2))
         status = client.get_upload_status(source_id)
         assert status["uploaded_chunks"] == 1
-        assert status["state"] == "READY"
+        # Still PENDING with its grid full: the count reports progress and
+        # decides nothing, since `finish` is the only route to READY
+        # (biopb/biopb#1048 step 5).
+        assert status["state"] == "PENDING"
 
 
 class TestSdkDictShape:

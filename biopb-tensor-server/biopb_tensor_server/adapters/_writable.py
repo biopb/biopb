@@ -41,7 +41,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import encode_chunk_id
-from biopb_tensor_server.core.errors import UploadDiscardedError
+from biopb_tensor_server.core.errors import UploadDiscardedError, UploadSealedError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -100,9 +100,13 @@ def _expected_chunk_count(shape: Sequence[int], chunk_shape: Sequence[int]) -> i
 class UploadProgress:
     """How far an upload has got, and whether anyone still wants it.
 
-    ``READY`` once every expected chunk arrives. ``DISCARDED`` is terminal: the
-    adapter stays registered as a tombstone so a writer still unwinding learns
-    *why* its write failed rather than that its source never existed.
+    ``READY`` once the producer calls ``finish``, and only then: the chunk
+    count is a coverage *proxy*, and a cache-backed source accepts arbitrary
+    bounds, so off-grid writes can reach the expected count without tiling the
+    array or never reach it at all. Both terminal states seal the source
+    against further writes. ``DISCARDED`` keeps the adapter registered as a
+    tombstone so a writer still unwinding learns *why* its write failed rather
+    than that its source never existed.
 
     ``updated_at`` is what will bound that afterlife. One field serves both
     halves of reclamation, because for a discarded upload the last touch *is*
@@ -135,6 +139,11 @@ class UploadProgress:
     @property
     def is_discarded(self) -> bool:
         return self.status is UploadStatus.DISCARDED
+
+    @property
+    def is_sealed(self) -> bool:
+        """No further chunk will be accepted -- finished, or given up on."""
+        return self.status in (UploadStatus.READY, UploadStatus.DISCARDED)
 
     def touch(self) -> None:
         self.updated_at = time.monotonic()
@@ -265,6 +274,35 @@ class WritableSource:
                 )
             return progress.as_status_dict(source_id)
 
+    def finish(self) -> Dict[str, Any]:
+        """Seal this upload: PENDING -> READY, no further chunks.
+
+        The only route to READY, and it replaced a count-derived one that could
+        not coexist with it: a source that counted its way to READY stayed
+        writable, where a finished one is sealed -- two security states under
+        one state name. The count was never a completeness check anyway, since
+        ``CachedSourceAdapter`` takes arbitrary bounds; it now only reports
+        progress.
+
+        Idempotent, so a retried ``finish`` is not an error -- and, matching
+        :meth:`discard`, a no-op past the first call: the first seal's touch
+        is the one a reclaim sweep should see, not a retry's.
+        """
+        progress = self._upload
+        if progress is None:
+            return unknown_upload_status(self.source_id)
+        with progress.lock:
+            if progress.is_discarded:
+                raise UploadDiscardedError(self.source_id, progress.reason)
+            if progress.status is not UploadStatus.READY:
+                progress.status = UploadStatus.READY
+                progress.touch()
+                logger.info(
+                    f"Finished upload {self.source_id}: "
+                    f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
+                )
+            return progress.as_status_dict(self.source_id)
+
     # -- the shared half -------------------------------------------------------
 
     def begin_upload(self, shape: Sequence[int], chunk_shape: Sequence[int]) -> None:
@@ -292,46 +330,69 @@ class WritableSource:
         expected_shape: Tuple[int, ...],
         dtype: Any,
     ) -> None:
-        """Store one chunk and count it. Refused once the upload is discarded."""
-        self._refuse_if_discarded()
+        """Store one chunk and count it, if this upload still accepts writes."""
+        self._refuse_write()
         self._store_chunk(bounds, data, expected_shape, dtype)
         self._mark_chunk(bounds)
 
-    def _refuse_if_discarded(self) -> None:
-        """Raise :class:`UploadDiscardedError` if the upload has been given up on.
+    def _raise_if_discarded_locked(self, progress: UploadProgress) -> None:
+        """Raise :class:`UploadDiscardedError` if *progress* is discarded.
 
-        Shared by both directions: :meth:`put_chunk` calls it for a write, and
-        a read path (``CachedSourceAdapter.resolve_chunk_data``) calls it too,
-        so a tombstone answers a still-unwinding reader the same reason it
-        gives a writer rather than "no chunk here". Each boundary maps the
-        exception to its own wire error (write -> ``FlightCancelledError``,
-        read -> ``FlightServerError``).
+        Caller holds ``progress.lock``. Shared by :meth:`_refuse_write` and
+        :meth:`_refuse_if_discarded`, discarded checked first in the former: it
+        carries a reason, which "already finished" does not.
+        """
+        if progress.is_discarded:
+            raise UploadDiscardedError(self.source_id, progress.reason)
+
+    def _refuse_write(self) -> None:
+        """The two ways a write can arrive too late.
+
+        There is no third: a source's id has one adapter for the life of the
+        server (``UploadManager.create_source`` refuses a name collision), so
+        a write cannot land in a stranger's source by naming its own.
         """
         progress = self._upload
         if progress is None:
             return
         with progress.lock:
-            if progress.is_discarded:
-                raise UploadDiscardedError(self.source_id, progress.reason)
+            self._raise_if_discarded_locked(progress)
+            if progress.is_sealed:
+                raise UploadSealedError(self.source_id)
+
+    def _refuse_if_discarded(self) -> None:
+        """Raise :class:`UploadDiscardedError` if the upload has been given up on.
+
+        The read path's own check (``CachedSourceAdapter.resolve_chunk_data``):
+        a tombstone answers a still-unwinding reader the same reason it gives a
+        writer rather than "no chunk here". The write path's equivalent is
+        :meth:`_refuse_write`, which also refuses a sealed-but-not-discarded
+        upload. Each boundary maps the exception to its own wire error
+        (write -> ``FlightCancelledError``, read -> ``FlightServerError``).
+        """
+        progress = self._upload
+        if progress is None:
+            return
+        with progress.lock:
+            self._raise_if_discarded_locked(progress)
 
     def _mark_chunk(self, bounds: ChunkBounds) -> None:
-        """Record that the chunk at *bounds* landed (flips to READY when full).
+        """Record that the chunk at *bounds* landed.
 
-        A discard between :meth:`_refuse_if_discarded` and here leaves the
-        chunk stored but uncounted: a tombstone must not be walked back into
-        PENDING by a write nobody is waiting for, nor have its clock touched.
+        Counting only: reaching ``expected_chunks`` no longer flips anything,
+        because :meth:`finish` is the only route to READY. What the count is
+        still for is the progress a poller watches.
+
+        A seal between :meth:`_refuse_write` and here leaves the chunk stored
+        but uncounted: a sealed upload must not be walked back into PENDING by
+        a write nobody is waiting for, nor have its clock touched.
         """
         progress = self._upload
         if progress is None:
             return
         chunk_id = encode_chunk_id(self.source_id, bounds)
         with progress.lock:
-            if progress.is_discarded:
+            if progress.is_sealed:
                 return
             progress.uploaded_chunk_ids.add(chunk_id)
             progress.touch()
-            progress.status = (
-                UploadStatus.READY
-                if progress.uploaded_chunks >= progress.expected_chunks
-                else UploadStatus.PENDING
-            )

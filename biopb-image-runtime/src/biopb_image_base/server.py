@@ -214,19 +214,30 @@ class EmbeddedTensorCache:
         endpoint: ChunkBounds,
         chunk: np.ndarray,
     ) -> None:
+        """Write one chunk into a source this process created."""
         import pyarrow.flight as flight
-        from biopb_tensor_server.core.errors import UploadDiscardedError
+        from biopb_tensor_server.core.errors import UploadClosedError
 
         adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
-        # The adapter counts the chunk and refuses once discarded; a discard
-        # surfaces as the same exception type the wire path raises, so a
+        # The adapter counts the chunk and refuses once the upload is over; both
+        # refusals surface as the exception type the wire path raises, so a
         # servicer's job discriminates on it the way a remote client would.
         try:
             adapter.write_chunk(endpoint, chunk)
-        except UploadDiscardedError as e:
+        except UploadClosedError as e:
             raise flight.FlightCancelledError(str(e)) from e
+
+    def finish(self, source_id: str) -> dict:
+        """Seal a result: the output is complete and takes no further chunks.
+
+        The counterpart to :meth:`discard`, and the only route to READY, which
+        is what a consumer polling for the result waits on. A fast-return
+        servicer calls this when its job succeeds, exactly as it calls
+        ``discard`` when the job dies (biopb/biopb#1048).
+        """
+        return self._server.uploads.finish(source_id)
 
     def get_upload_status(self, source_id: str) -> dict:
         return self._server.uploads.status(source_id)
@@ -267,6 +278,10 @@ class EmbeddedTensorCache:
         for bounds in _iter_chunk_bounds(normalized_array.shape, chunk_shape):
             chunk_data = normalized_array[_bounds_to_slices(bounds)].compute()
             self.upload_array_chunks(source_id, bounds, chunk_data)
+        # Synchronous: every chunk is written by the time we get here, so this
+        # is the one caller that can seal on its own behalf. `create_array`'s
+        # producer fills the source later and finishes for itself.
+        self.finish(source_id)
 
         logger.debug(
             "Created cache source %s: shape=%s, dtype=%s",

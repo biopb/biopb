@@ -115,7 +115,7 @@ token when the adapter carries one, else the server-wide token. A private
 source may still be catalogued -- the token gates reading, not knowing.
 
 Custom `do_action` verbs: `health` (reports `protocol`), `create_source`,
-`upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
+`finish`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
 `remove_source` (below), and `roi_prune`.
 
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)

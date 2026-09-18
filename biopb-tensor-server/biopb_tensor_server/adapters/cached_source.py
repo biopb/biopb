@@ -92,8 +92,9 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
     def upload_source_id(name: str) -> str:
         """The source_id a ``cache:<name>`` upload lands on.
 
-        Deterministic for a name, so a re-upload under the same name reuses the
-        id (and replaces the source); minted for an empty one.
+        Deterministic for a name, so the name is single-use for the life of
+        the server (``UploadManager.create_source`` refuses the collision);
+        minted for an empty one.
         """
         if name:
             return f"cache_{hashlib.sha256(name.encode()).hexdigest()[:12]}"
@@ -104,10 +105,13 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """A process-monotonic generation token for a biopb-written cache: source.
 
         cache: sources have deterministic ids (``cache:<name>`` -> a fixed
-        ``source_id``), so a re-upload reuses the id. Without a fresh namespace,
-        ``CacheManager.put`` finds the prior upload's chunk already present and
-        declines to overwrite it -- serving stale data (biopb/biopb#178). Folding a
-        distinct token into each upload's chunk_ids sidesteps that.
+        ``source_id``), so an upload after a restart reuses the id of one the
+        persisted file cache may still hold chunks for. Without a fresh
+        namespace, ``CacheManager.put`` finds the prior upload's chunk already
+        present and declines to overwrite it -- serving stale data
+        (biopb/biopb#178). Folding a distinct token into each upload's chunk_ids
+        sidesteps that. (Within one server lifetime a name cannot be reused at
+        all: ``UploadManager.create_source`` refuses the collision.)
 
         Wall-clock ns keeps the token distinct across a restart, where a persisted
         file cache may still hold the prior upload's chunks; ``max(..., last + 1)``
@@ -168,11 +172,12 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             physical_unit: Optional per-dimension unit string for
                 ``physical_scale``, aligned 1:1 with ``dim_labels``.
             content_version: Optional per-upload generation token (biopb/biopb#178).
-                cache: sources have deterministic ids, so a re-upload reuses the id;
-                wrapping every written chunk_id with this token gives the new upload a
-                fresh cache namespace instead of colliding with the prior upload's
-                chunks (which ``CacheManager.put`` would decline to overwrite,
-                serving stale data). None leaves the source unversioned (legacy bytes).
+                cache: sources have deterministic ids, so an upload after a restart
+                reuses the id; wrapping every written chunk_id with this token gives
+                the new upload a fresh cache namespace instead of colliding with the
+                prior upload's persisted chunks (which ``CacheManager.put`` would
+                decline to overwrite, serving stale data). None leaves the source
+                unversioned (legacy bytes).
         """
         self.source_id = source_id
         # Optional per-source capability token. When set, reading this source
@@ -194,10 +199,10 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         # Track actually-written chunks: start coords -> full bounds
         self._written_chunks: Dict[bytes, ChunkBounds] = {}
 
-        # Per-upload generation token folded into every written chunk_id so a
-        # re-upload under the same (deterministic) source_id lands in a fresh
-        # cache namespace (biopb/biopb#178). The base read plan folds the same
-        # token into minted endpoints, so reads and writes agree.
+        # Per-upload generation token folded into every written chunk_id so an
+        # upload reusing a (deterministic) source_id after a restart lands in a
+        # fresh cache namespace (biopb/biopb#178). The base read plan folds the
+        # same token into minted endpoints, so reads and writes agree.
         self._content_version = content_version
 
         # Required fields for the adapter interface
@@ -293,8 +298,8 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """Write a NumPy chunk: the in-process producer's entry to ``put_chunk``.
 
         For cache-backed sources, arbitrary bounds allowed. Goes through
-        ``put_chunk`` so the write is counted, and refused once discarded, the
-        same as one arriving over the wire.
+        ``put_chunk`` so the write is counted, and refused once the upload is
+        over, the same as one arriving over the wire.
 
         Args:
             bounds: Chunk start/stop coordinates

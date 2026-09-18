@@ -24,8 +24,8 @@ import pyarrow.flight as flight
 
 from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
 from biopb.tensor._tls import NO_TLS, TlsTrust
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, PutCommand
+from biopb.tensor.descriptor_pb2 import TensorDescriptor, UploadStatus as UploadStatusPb
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, FinishUpload, PutCommand
 
 if TYPE_CHECKING:  # import-time cycle-free; _session never imports this module
     from biopb.tensor._session import _ClientState
@@ -165,6 +165,12 @@ class UploadSession:
         )
 
         self._store_chunks(source_id, arr)
+        # Sealing is what marks the source complete, so a whole-array upload
+        # does it on the caller's behalf -- it is the one caller that knows,
+        # from having written every block itself, that there is nothing more to
+        # send. A caller driving `create_source` / `upload_chunk` by hand does
+        # not, and finishes explicitly.
+        self.finish_upload(source_id)
 
         return source_id
 
@@ -270,6 +276,20 @@ class UploadSession:
         response_desc = TensorDescriptor.FromString(result.body.to_pybytes())
         logger.info(f"create_source: created {response_desc.array_id}")
         return response_desc.array_id
+
+    def finish_upload(self, source_id: str) -> UploadStatusPb:
+        """Backs TensorFlightClient.finish_upload; see that method for the full
+        documentation."""
+        req = FinishUpload(source_id=source_id)
+        action = flight.Action("finish", req.SerializeToString())
+        results = self._state.client.do_action(action, options=self._state.call_options)
+        try:
+            result = next(results)
+        except StopIteration as exc:
+            raise RuntimeError("finish: server returned no result") from exc
+        status = UploadStatusPb.FromString(result.body.to_pybytes())
+        logger.info(f"finish: sealed {source_id}")
+        return status
 
     def upload_chunk(
         self,

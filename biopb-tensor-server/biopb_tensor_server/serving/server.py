@@ -62,7 +62,12 @@ from biopb.tensor.descriptor_pb2 import (
     WarmProgress,
     WarmStreamMessage,
 )
-from biopb.tensor.ticket_pb2 import ChunkBounds, PutCommand, TensorTicket
+from biopb.tensor.ticket_pb2 import (
+    ChunkBounds,
+    FinishUpload,
+    PutCommand,
+    TensorTicket,
+)
 from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
@@ -269,14 +274,22 @@ def _fill_upload_status(
     An unrecognized state is left unset rather than guessed at, so a client
     reads "I do not know" instead of a wrong PENDING.
     """
-    status = upload.as_status_dict(source_id)
+    _copy_upload_status(desc.upload_status, upload.as_status_dict(source_id))
+
+
+def _copy_upload_status(pb: UploadStatusPb, status: Dict[str, Any]) -> None:
+    """The manager's status dict onto the wire message.
+
+    Shared by the descriptor field and the ``finish`` reply so the two cannot
+    drift into describing the same upload differently.
+    """
     state = _UPLOAD_STATES.get(status["state"])
     if state is None:
         return
-    desc.upload_status.state = state
-    desc.upload_status.expected_chunks = int(status["expected_chunks"])
-    desc.upload_status.uploaded_chunks = int(status["uploaded_chunks"])
-    desc.upload_status.reason = status.get("reason") or ""
+    pb.state = state
+    pb.expected_chunks = int(status["expected_chunks"])
+    pb.uploaded_chunks = int(status["uploaded_chunks"])
+    pb.reason = status.get("reason") or ""
 
 
 #: ``UploadStatus.state`` strings -> the wire enum. UNKNOWN is deliberately
@@ -921,6 +934,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "Create a writable source from a TensorDescriptor request",
             ),
             flight.ActionType(
+                "finish",
+                "Seal an upload session: the source is complete and takes no further chunks",
+            ),
+            flight.ActionType(
                 "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
             ),
             flight.ActionType(
@@ -1012,8 +1029,19 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
-            response_desc = self.uploads.create_source(req_desc)
-            yield response_desc.SerializeToString()
+            yield self.uploads.create_source(req_desc).SerializeToString()
+        elif action.type == "finish":
+            self._authorize(context)
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+
+            req = self._parse(
+                FinishUpload(), action.body.to_pybytes(), "finish request"
+            )
+            status = self.uploads.finish(req.source_id)
+            reply = UploadStatusPb()
+            _copy_upload_status(reply, status)
+            yield reply.SerializeToString()
         elif action.type == "chunk_locate":
             ticket_bytes = action.body.to_pybytes()
             ticket = self._parse_ticket(flight.Ticket(ticket_bytes))

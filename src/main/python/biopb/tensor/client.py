@@ -69,6 +69,7 @@ from biopb.tensor.descriptor_pb2 import (
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
+    UploadStatus as UploadStatusPb,
     WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
@@ -1035,11 +1036,15 @@ class TensorFlightClient:
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> str:
-        """Create source on server (internal).
+        """Open an upload: create the source that ``upload_chunk`` fills.
 
         Note:
             Experimental. The upload / writable-source API (source creation, chunk
             upload, and upload-status polling) is experimental and may change.
+
+        A name is single-use for the life of the server: a second create under
+        a name that exists -- pending, finished or discarded -- is refused.
+        ``finish_upload`` is what marks the upload complete.
 
         Args:
             source_name: "cache:name" → cache-backed; "ome_zarr:name" → zarr-backed
@@ -1052,6 +1057,9 @@ class TensorFlightClient:
 
         Returns:
             source_id assigned by server
+
+        Raises:
+            pyarrow.flight.FlightServerError: the name is already taken.
         """
         return self._upload.create_source(
             source_name, shape, dtype, chunk_shape, dim_labels, ome_metadata
@@ -1070,11 +1078,34 @@ class TensorFlightClient:
             upload, and upload-status polling) is experimental and may change.
 
         Args:
-            source_id: Source identifier
+            source_id: The id ``create_source`` returned
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data
+
+        Raises:
+            pyarrow.flight.FlightCancelledError: this upload is over -- already
+                sealed by ``finish_upload``, or discarded. The message says which.
         """
         self._upload.upload_chunk(source_id, bounds, data)
+
+    def finish_upload(self, source_id: str) -> UploadStatusPb:
+        """Seal an upload: the source is complete and takes no further chunks.
+
+        Note:
+            Experimental. The upload / writable-source API (source creation, chunk
+            upload, and upload-status polling) is experimental and may change.
+
+        The only route to READY, which is the state a consumer waiting on this
+        result polls for. ``upload_array``, which writes every chunk itself,
+        calls it for you.
+
+        Args:
+            source_id: The id ``create_source`` returned
+
+        Returns:
+            The sealed ``UploadStatus``.
+        """
+        return self._upload.finish_upload(source_id)
 
     def close(self):
         """Close the Flight client."""

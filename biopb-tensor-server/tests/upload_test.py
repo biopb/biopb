@@ -1434,11 +1434,14 @@ class TestCachedSourceContentVersion:
         gens = [int(t.split(b":")[1]) for t in tokens]
         assert gens == sorted(gens)  # strictly increasing even under a rapid loop
 
-    def test_create_source_reupload_bumps_generation(self):
-        """Re-creating the same-named cache source reuses the id but bumps the gen."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
+    def test_each_upload_of_a_name_gets_its_own_generation(self):
+        """Two adapters built for one name share the id and differ in gen.
 
-        server = TensorFlightServer(location="grpc://localhost:0", writable=True)
+        Built directly rather than through ``create_source``, which refuses the
+        second: the case this guards is an upload after a *restart*, where the
+        registry is empty but the persisted file cache may still hold the
+        prior upload's chunks under the same deterministic id.
+        """
         req = TensorDescriptor(
             array_id="cache:reupload",
             shape=[8, 8],
@@ -1446,15 +1449,17 @@ class TestCachedSourceContentVersion:
             chunk_shape=[8, 8],
             dim_labels=["y", "x"],
         )
-        r1 = server.uploads.create_source(req)
-        cv1 = server.sources.get(r1.array_id).content_version
-        r2 = server.uploads.create_source(req)
-        cv2 = server.sources.get(r2.array_id).content_version
+        a1 = CachedSourceAdapter.create_upload(
+            "reupload", req, metadata=None, write_dir=None
+        )
+        a2 = CachedSourceAdapter.create_upload(
+            "reupload", req, metadata=None, write_dir=None
+        )
 
-        assert r1.array_id == r2.array_id  # deterministic id -> same source
-        assert cv1 is not None and cv2 is not None
-        assert cv1.startswith(b"gen:") and cv2.startswith(b"gen:")
-        assert cv1 != cv2  # a fresh namespace per upload session
+        assert a1.source_id == a2.source_id  # deterministic id -> same source
+        assert a1.content_version is not None and a2.content_version is not None
+        assert a1.content_version.startswith(b"gen:")
+        assert a1.content_version != a2.content_version  # a fresh namespace each
 
 
 class TestConcurrentChunkUpload:
@@ -1590,6 +1595,7 @@ class TestConcurrentChunkUpload:
                 ChunkBounds(start=[z, 0, 0], stop=[z + 1, 20, 20]),
                 source[z : z + 1],
             )
+        session.finish_upload(source_id)
 
         status = client.wait_for_upload_ready(source_id, timeout_seconds=30)
         assert status["state"] == "READY"
@@ -1662,6 +1668,7 @@ class TestConcurrentChunkUpload:
         for z in range(4):
             revived[(slice(z, z + 1), slice(0, 8), slice(0, 8))] = source[z : z + 1]
 
+        session.finish_upload(source_id)
         assert (
             client.wait_for_upload_ready(source_id, timeout_seconds=30)["state"]
             == "READY"
@@ -1828,39 +1835,32 @@ class TestDiscard:
         assert writable_server.uploads.status(source_id)["state"] == "UNKNOWN"
         assert writable_server.uploads.discard(source_id, "x")["state"] == "UNKNOWN"
 
-    def test_the_same_name_can_be_uploaded_again_after_a_discard(
-        self, writable_server, client
-    ):
-        """Retrying under the same name, which giving up has to leave possible.
+    def test_a_discarded_name_stays_taken(self, writable_server, client):
+        """A tombstone holds its name like any other source.
 
-        A named cache source's id is a hash of that name, so the retry lands on
-        the tombstone rather than beside it. What clears it is `create_source`
-        replacing the registered adapter outright; were that ever made to keep
-        an existing one, a discard would poison the name for the life of the
-        server and every other test here would still pass.
+        A named cache source's id is a hash of that name, so a retry would land
+        on the tombstone -- and `create_source` refuses every collision rather
+        than replacing what holds the id (`upload_session_test.py` has why).
+        The retry goes under a new name; the tombstone keeps answering for the
+        old one with its reason.
         """
         first = self._make_source(
             client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2)
         )
         writable_server.uploads.discard(first, "gave up")
 
-        second = self._make_source(
-            client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2)
-        )
+        with pytest.raises(flight.FlightServerError, match="already exists"):
+            self._make_source(client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2))
 
-        # Same name, same id: the retry really is reusing the discarded record.
-        assert second == first
-        assert client.get_upload_status(second)["state"] == "PENDING"
-
-        # And the write goes through rather than being refused as discarded.
-        self._put(client, second, (0, 0), (2, 2))
-        assert client.get_upload_status(second)["state"] == "READY"
+        assert client.get_upload_status(first)["state"] == "DISCARDED"
+        assert client.get_upload_status(first)["reason"] == "gave up"
 
     def test_a_completed_upload_can_still_be_discarded(self, writable_server, client):
         """Disposal is not only for failures: dropping a finished result is the
         same operation."""
         source_id = self._make_source(client, shape=(2, 2), chunk=(2, 2))
         self._put(client, source_id, (0, 0), (2, 2))
+        client.finish_upload(source_id)
         assert client.get_upload_status(source_id)["state"] == "READY"
 
         assert writable_server.uploads.discard(source_id, "done with it")["state"] == (

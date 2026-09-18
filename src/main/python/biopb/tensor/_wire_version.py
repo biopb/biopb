@@ -39,4 +39,6 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   The ``upload_status`` and ``is_resident`` actions are gone: both are live
 #   per-source reads and ride the descriptor GetFlightInfo returns
 #   (biopb/biopb#1048).
+#   A new ``finish`` action seals an upload against further writes and is the
+#   only route to READY; ``create_source`` refuses a name that exists.
 FLIGHT_PROTOCOL_VERSION = 2

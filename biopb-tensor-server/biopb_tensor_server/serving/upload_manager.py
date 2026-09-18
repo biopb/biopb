@@ -9,8 +9,8 @@ here is only what a boundary does:
   the kind is durable.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
-- **Lookup** -- ``status`` / ``discard`` / ``write_chunk`` find the adapter
-  and hand over.
+- **Lookup** -- ``status`` / ``finish`` / ``discard`` / ``write_chunk`` find the
+  adapter and hand over.
 
 Progress, completion and disposal are the adapter's own
 (:class:`~biopb_tensor_server.adapters._writable.WritableSource`), so there is no
@@ -42,7 +42,11 @@ from biopb_tensor_server.adapters._writable import (
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.core.axes import noncanonical_order
-from biopb_tensor_server.core.errors import UploadDiscardedError, WriteNotSupportedError
+from biopb_tensor_server.core.errors import (
+    UploadClosedError,
+    UploadDiscardedError,
+    WriteNotSupportedError,
+)
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
@@ -94,6 +98,25 @@ class UploadManager:
             return unknown_upload_status(source_id)
         return adapter.discard(reason)
 
+    def finish(self, source_id: str) -> Dict[str, Any]:
+        """Seal an upload; see ``WritableSource.finish``.
+
+        Unlike ``discard``, a source that is tracking no upload is an error
+        rather than UNKNOWN: ``discard`` is total because a retry after the
+        tombstone is reclaimed must not fail, whereas a ``finish`` naming
+        nothing means the caller believes it has been writing somewhere it has
+        not.
+        """
+        adapter = self._registry.get(source_id)
+        if upload_of(adapter) is None:
+            raise flight.FlightServerError(
+                f"finish: {source_id} is not an upload in progress"
+            )
+        try:
+            return adapter.finish()
+        except UploadDiscardedError as e:
+            raise flight.FlightCancelledError(str(e)) from e
+
     # -- write path ------------------------------------------------------------
 
     @staticmethod
@@ -131,6 +154,15 @@ class UploadManager:
         - "cache:" → cache-backed with server-generated name
         - "ome_zarr:name" → zarr-backed with given name
         - "ome_zarr:" → zarr-backed with server-generated name
+
+        A name is single-use for the life of the server. A named ``cache:``
+        upload has a deterministic id, so a second create under the same name
+        would land on the first's adapter -- and replacing it would leave the
+        first writer's chunks, and its ``finish``, landing in a source that is
+        no longer its own, with nothing to tell it so (status is keyed by the
+        id it still holds). Refusing the collision is what makes ``source_id``
+        alone name an attempt. Sealed sources are not an exception: a name that
+        could be reclaimed by finishing is a name a straggler can be raced for.
         """
         self._require_canonical_axes(req_desc)
 
@@ -156,12 +188,16 @@ class UploadManager:
         except ValueError as e:
             raise flight.FlightServerError(str(e)) from e
 
-        # A deterministic id (a named cache: upload) lands on whatever holds the
-        # name now -- a prior upload, or its tombstone. Replace rather than
-        # overwrite so the displaced adapter is released, not leaked.
         source_id = adapter.source_id
-        registered, displaced = self._registry.swap(source_id, adapter)
-        close_adapter(displaced)
+        registered = self._registry.register_new(source_id, adapter)
+        if registered is None:
+            close_adapter(adapter)
+            raise flight.FlightServerError(
+                f"create_source: {req_desc.array_id!r} already exists as "
+                f"{source_id}. A name is taken for the life of the server, "
+                "finished or discarded included; upload under a new name, or "
+                f"'{prefix}:' for a server-minted one."
+            )
 
         # Only a durable upload belongs in the catalog; a volatile one is
         # readable by its returned id but not enumerable (biopb/biopb#265).
@@ -185,10 +221,14 @@ class UploadManager:
 
         Each source format owns its write contract: OmeZarr/Zarr enforce
         chunk-grid alignment; cache-backed sources accept arbitrary bounds;
-        read-only formats reject the write; a discarded upload refuses with its
-        reason. Adapters stay transport-agnostic, so their errors become Flight
-        errors here -- a discard as ``FlightCancelledError``, so a client
-        discriminates on the type rather than the message (biopb/biopb#1).
+        read-only formats reject the write; an upload that is discarded or
+        sealed refuses. Adapters stay transport-agnostic, so their errors
+        become Flight errors here.
+
+        Both refusals map to ``FlightCancelledError``: they share the one thing
+        a writer must act on -- this upload is over, stop sending -- and a
+        client discriminates on the type rather than the message
+        (biopb/biopb#1). Which of the two it was rides in the message.
         """
         table = reader.read_all()
         data_column = table.column(0)
@@ -204,7 +244,7 @@ class UploadManager:
         dtype = table.schema.field(0).type.to_pandas_dtype()
         try:
             adapter.put_chunk(bounds, data_column, expected_shape, dtype)
-        except UploadDiscardedError as e:
+        except UploadClosedError as e:
             raise flight.FlightCancelledError(str(e)) from e
         except (ValueError, WriteNotSupportedError) as e:
             raise flight.FlightServerError(str(e)) from e

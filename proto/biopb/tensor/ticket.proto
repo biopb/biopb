@@ -63,6 +63,15 @@ message ChunkUpload {
   ChunkBounds bounds = 2;
 }
 
+// Body of the `finish` action: seal an upload against further writes.
+//
+// `source_id` alone names the attempt: a name is single-use for the life of
+// the server (`create_source` refuses a collision), so the source it finds is
+// the one the caller created.
+message FinishUpload {
+  string source_id = 1;
+}
+
 // Create-or-update a batch of annotations, applied in one transaction.
 message RoiPut {
   // The tensor every annotation in this batch belongs to (unversioned

@@ -642,6 +642,9 @@ need to be persisted long-term.
 ```python
 array_id = client.upload_array(arr, "cache:my_result")
 ```
+A name is single-use for the life of the server: uploading under a name that
+already exists is refused. Re-running a cell needs a new name, or `"cache:"`
+for a server-minted one.
 """
 
 OPS = """\
