@@ -1,0 +1,304 @@
+# Label tensors — backend design
+
+Status: proposal — not implemented. Companion to `roi-annotations.md`, which
+scoped instance segmentation *out* of the annotation store and into "a label
+tensor the server already serves as pixels". This is that tensor.
+
+Scope: `biopb-tensor-server`, the Python SDK, and the two viewers only as far as
+naming what they consume.
+
+## Goal
+
+Serve pixel-wise labels for an image — a segmentation, a mask, a class map — as
+tensors alongside the image, from three origins:
+
+- **file-embedded**: an OME-TIFF's `<Mask>` ROI shapes, today counted and
+  dropped by the ROI import (`_ome_rois.py`, `dropped_masks`); an OME-Zarr's
+  NGFF `labels/` group, today not enumerated at all;
+- **uploaded**: a client sends a whole label set over the existing upload path;
+- and **several of each per image**: the file's own set and a user's alternative
+  are both readable, side by side, under different names.
+
+## Non-goals
+
+**No per-instance edits.** A label set is written once, whole, and replaced
+whole. There is no chunk-level mutation of a finished set, no undo, and no
+merge. This is what keeps every set an ordinary write-once tensor and keeps the
+one-name-one-adapter rule from biopb/biopb#1048 without exceptions.
+
+**No sub-extent labels.** A set always spans the image (see Extent). Positioning
+a smaller array would need an origin the descriptor does not carry, a proto
+change, and a transform in every viewer; the fill value already makes a sparse
+set cost nothing, so the shape rule is enforced instead.
+
+**No volatile flavour.** One durable kind. A label set is small next to its
+image, and one lifecycle is simpler than two.
+
+**No label semantics.** The server carries integer ids and, where the origin
+has them, NGFF `image-label` colours and properties. What an id *means* is the
+producer's.
+
+## Model
+
+A label set is one integer tensor whose `array_id` is
+
+```
+<image array_id>/labels/<name>
+```
+
+`src_ab12/labels/nuclei` on a single-tensor source, `src_ab12/Image:0/labels/nuclei`
+or `src_ab12/A/1/labels/nuclei` on a multi-tensor one. This is the NGFF layout
+(`labels/<name>` under the image group), so an on-disk OME-Zarr set, an
+uploaded set and a rasterized OME-TIFF set all present identically, and the
+tensor identity policy already allows it (a field may contain `/`; HCS uses
+`well/field`). The parent image is recovered by splitting at the **last**
+`/labels/`; `name` is therefore non-empty and slash-free.
+
+**Reserved names.** A name starting with `@` is server-owned, in the same
+spirit as the `@ome` ROI set: `labels/@ome` is the set rasterized from an
+OME-TIFF's masks, and a native NGFF set keeps its on-disk name. Clients can read
+a reserved set and never create or delete one.
+
+**Dtype.** Unsigned integer; `0` is background. The upload refuses anything
+else. `uint32` is the recommendation, `uint16` is fine for small counts.
+
+### Extent
+
+A set's axes are the image's canonical axes with the channel axis dropped, each
+at the image's full length. A label pixel and its image pixel share an index,
+which is the contract the ROI store already runs on ("level-0 pixels, the
+server never rescales geometry") and what lets a viewer overlay a set with no
+transform.
+
+Sparse coverage — one labelled frame of a thousand — is a storage question, not
+a shape one, and every layer already answers it with zeros:
+
+- the sidecar zarr is created with fill value `0` and never materializes an
+  unwritten chunk, so a frame-0-only set on a 1000-frame timelapse costs one
+  frame on disk;
+- `finish` seals whatever landed (it logs uploaded-of-expected; it does not
+  require the grid), so the client sends only the chunks it has;
+- an unwritten zarr chunk reads back as zeros at no I/O; the rasterized OME set
+  yields a zero block for any chunk no mask touches.
+
+The one relaxation this leaves open — a set carrying a *subset* of the image's
+axes, absent meaning broadcast — is additive but not in the first version: a
+plain 2-D array on a timelapse is ambiguous between "frame 0" and "every
+frame", and the fill rule makes the explicit full-extent upload cheap enough
+that the ambiguity is not worth resolving yet.
+
+A mask pinned to one channel (OME `TheC`) rasterizes into the shared set; the
+channel distinction is not carried.
+
+## Three origins, one tensor shape
+
+| origin | backing | writable | content_version |
+|---|---|---|---|
+| NGFF `labels/<name>` in an OME-Zarr source | the array in place, own pyramid if it ships one | no | the parent's |
+| OME-TIFF `<Mask>` shapes | rasterized on read from the metadata dict | no | the parent's |
+| uploaded | a zarr array the server minted under `write_dir` | write-once | its own, minted at create |
+
+The first two derive from the file, so they share its stat-signature
+`content_version` and go stale with it. An uploaded set is its own content: it
+mints a random token at create, persists it in the sidecar's attrs, and its
+adapter wraps chunk ids with it — the gen-token pattern `cache:` uploads use —
+so a name reused after a delete can never hit a stale cache entry.
+
+**Never inside the source.** An uploaded set is not written into the user's
+OME-Zarr even when it could be: discovery rescans the tree, and the
+reconciler's stat-based `content_version` would flip and invalidate the
+*image's* cache. The sidecar lives at
+
+```
+<write_dir>/labels/<parent source_id>/<name>.zarr
+```
+
+one array per set, `.zattrs` carrying the NGFF `image-label` block plus a
+`biopb` block (`content_version`, upload state, parent `array_id`). `write_dir`
+must not be a discovery root: `ZarrAdapter.claim` takes any `.zarr` with a
+`.zattrs`, and a sidecar claimed as a source of its own would be listed twice
+under two ids. The `ome_zarr:` kind has the same exposure today; step 1 below
+makes it a documented configuration rule and a startup check.
+
+### Attachment to the parent
+
+Sets are tensors *of the parent source*, not sources. The registry keeps one
+entry per source, so the parent adapter has to answer for them. Rather than
+teaching every adapter class about sidecars, the registration chokepoint wraps
+each source in a label attachment — the same seam `normalize_adapter` uses —
+that:
+
+- extends `list_tensor_descriptors` with the parent's own sets (the adapter
+  supplies file-embedded ones through a hook alongside `get_embedded_rois`) and
+  the **finished** sidecar sets found under its `source_id`;
+- routes `get_tensor_adapter` for a `.../labels/<name>` field to that set's
+  adapter, and delegates everything else;
+- orders image tensors first. The catalog's scalar `dtype` / `shape_summary`
+  columns describe `tensors[0]`, so a set must never be first.
+
+The wrapper's set table is what the upload kind adds to and what `delete`
+removes from; no registry swap is involved.
+
+## Reads
+
+Every set reads through the ordinary path and the ordinary chunk cache. The
+chunk id is a pure function of `array_id`, bounds, scale and method under the
+content_version wrapper, so a set has its own cache namespace for free, and the
+cache is what makes rasterizing or downsampling a large set affordable.
+
+**Nearest, per tensor.** The advertised pyramid takes its reduction method from
+the server-wide `PyramidConfig`; averaging label ids produces ids that exist
+nowhere. A set's adapter forces `nearest` on every computed level in
+`_advertised_pyramid`, so the precache and clients follow the same ladder. A
+native NGFF set that ships its own multiscales serves them as `precompute`.
+
+**Rasterizing OME masks.** A `<Mask>` is `x, y, width, height`, optional
+`TheZ/TheT/TheC` pins, and a `BinData` bitmap (1 bit per pixel, row-major,
+possibly compressed). The `@ome` set for an image is one tensor over the
+image's extent; the label value of a mask is the 1-based index of its ROI in
+the image's `roi_refs` order, which is stable because it comes from the
+metadata. Overlaps: later wins. A chunk read decodes the masks whose bounding
+box and pin intersect the chunk and paints them; decoded bitmaps are memoized
+per adapter, and the cache holds the painted output. Mask bitmaps then leave
+`metadata_json` the way `rois` do — stripped once the import has completed,
+since only empty `BinData` is stripped on the fast path today and a real bitmap
+currently sits base64-encoded in the catalog row.
+
+**Precache.** A set is on the ladder like any tensor. Coarse levels of a mostly
+empty set are small and nearest over zeros is trivial, so the precache is not
+special-cased.
+
+## Upload
+
+The step 7 SDK from biopb/biopb#1048 is reused unchanged:
+
+```python
+desc = client.create_tensor(TensorDescriptor(
+    array_id="src_ab12/labels/nuclei", shape=..., dim_labels=..., dtype="uint32",
+    chunk_shape=...))
+client.upload_array(desc, labels)        # skips all-zero chunks for this kind
+client.finish_upload(desc)
+```
+
+Server side this is a third upload kind, selected by the request `array_id`
+carrying no `cache:` / `ome_zarr:` prefix and a `/labels/` segment. Unlike the
+other two, the request's `array_id` *is* the final one. The kind:
+
+- resolves the parent by splitting at the last `/labels/` and refuses if the
+  parent is absent, unresolved, or does not serve pixels;
+- refuses a non-integer dtype, a reserved name, or a shape / `dim_labels` that
+  is not the parent's canonical non-channel extent;
+- refuses a name already attached, finished or pending — the biopb/biopb#1054
+  rule, now per parent;
+- creates the sidecar array with the pending marker and the minted
+  content_version, and registers the set as **pending** on the parent's
+  attachment: routable for `get_flight_info` (so the poll to READY works from
+  create) but not listed.
+
+`finish` clears the pending marker, lists the set, and re-syncs the parent's
+catalog row (`sync_source_added` is an upsert; the ROI re-import it triggers is
+already idempotent). The status and TTL machinery apply as they stand, with two
+plumbing changes in `UploadManager`: `status` / `finish` / `discard` /
+`write_chunk` receive a set's `array_id` where they receive a `source_id`
+today, and resolve it through the parent's attachment; and `reap` visits each
+attachment's pending sets as well as registered upload sources.
+
+**Skipping zeros is per kind.** `upload_array` may drop all-zero chunks only for
+the label kind, where an unwritten chunk reads as fill. A `cache:` source
+answers a read of an unwritten chunk with "holds no chunk", so the skip is not
+a general SDK behaviour.
+
+**Replacement.** A set is replaced by uploading under a new name, or by
+deleting the old one first. Delete is the one new action.
+
+## Lifecycle: durable uploads get the whole of it
+
+The `durable` flag currently gates three things: `discard` raises for a durable
+upload, the reap sweep skips it, and the catalog row is written at create. An
+abandoned `ome_zarr:` upload is therefore PENDING for the life of the server,
+listed, with a partial store on disk — and after a restart the partial store
+comes back through discovery as an ordinary source with no upload state at all.
+A label set would inherit all of that, with the sidecar as its only backing.
+
+biopb/biopb#1048 recorded the refusal's reason: a `.zarr` on disk and a catalog
+row "are not this call's to release", and deleting a directory "is a genuinely
+destructive act whose auth story is its own decision". Both hold for a user's
+file. Neither holds for a store the server minted under `write_dir`, which is
+where the `ome_zarr:` uploads and the label sidecars both live: the server owns
+those bytes, the act is bounded to what it created, and the auth is the one
+every other mutation already has — `do_put` and `do_action` are full access.
+
+So, for both kinds:
+
+- **Discard removes the store.** Under the progress lock: mark DISCARDED,
+  delete the array, drop it from the listing (the attachment, or the catalog
+  row for `ome_zarr:`). The tombstone then behaves exactly as the cache kind's,
+  and `reap` stops skipping durable uploads — a quiet pending set is discarded
+  after `upload_ttl`, and its tombstone reclaimed after another.
+- **The upload state is persisted.** A pending marker is written into the
+  store's attrs at create and cleared at `finish`. At startup, a sidecar still
+  carrying it is a crashed upload and is deleted rather than served; the
+  `ome_zarr:` equivalent is deleted before discovery can claim it. The cache
+  kind never needed this because nothing of it survives a restart.
+- **`delete_labels`** (`do_action`, full access) removes a *finished* uploaded
+  set: drop it from the attachment, delete the sidecar, re-sync the parent's
+  catalog row. Refused for a reserved or native set. Its cache chunks become
+  unreachable and fall to LRU, as after a reindex. The name is free again at
+  once, safely, because the next set under it mints a new content_version.
+
+A set's lifetime otherwise follows its parent's. `source_id` is a hash of the
+resolved URL, so a moved image loses its sidecar sets exactly as it loses its
+ROIs today; the `unseen_rois` / `prune_unseen` orphan clock extends to sidecar
+directories whose parent has not been seen.
+
+## Discovery
+
+The catalog is the surface. It is the only browse surface, the SPA source tree
+is built from it, and the identity policy requires the catalog and
+`get_flight_info` to carry identical `array_id`s. A set is an ordinary entry in
+`sources.tensors`, found by its path:
+
+```sql
+SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t)
+WHERE t.array_id LIKE 'src_ab12/labels/%'
+```
+
+The typed signal rides in the descriptor `get_flight_info` returns: an NGFF
+`image-label` block in the tensor's `metadata_json`, which is documented as
+NGFF-compatible, with `source.image` set to the parent's `array_id` (the sidecar
+is not adjacent to the image, so NGFF's relative path would be meaningless).
+No proto change, no Java build. A `role` column in the `tensors` struct is a
+later addition only if filtering on the path proves fragile.
+
+**Authorization.** A set is part of its parent object: a read capability on
+the parent covers its sets, and nothing else changes. Create, write, finish and
+delete are full access like every other mutation.
+
+## Clients
+
+- **SDK**: `create_tensor` / `upload_array` / `finish_upload` as above;
+  `delete_labels(array_id)`; a `label_sets(image_array_id)` convenience over
+  the catalog query.
+- **MCP / napari**: `add_tensor` builds a `Labels` layer when the descriptor
+  carries `image-label`; `viewer.tensor(layer)` plus `upload_array` is the
+  round trip. The guide text stops describing masks as a client-only artefact.
+- **SPA**: the source tree lists a tensor's sets under it; one is drawn as an
+  overlay with nearest sampling and a categorical colormap.
+
+## Implementation order
+
+Each step is independently mergeable.
+
+1. **Durable upload lifecycle** on `ome_zarr:`: discard removes the store,
+   reap covers durable, persisted pending marker and boot cleanup, `write_dir`
+   outside discovery roots as a checked rule. Revisits the #1048 decision.
+2. **Label attachment**: wrapper at the registration seam, sidecar
+   enumeration, routing, listing after finish and image-first ordering,
+   per-set content_version, nearest ladder, `image-label` metadata. The native
+   NGFF `labels/` group in `OmeZarrAdapter` rides on this.
+3. **Labels upload kind**: create / write / finish / delete through
+   `UploadManager` keyed by `array_id`; `reap` over attachments; SDK zero-skip
+   and `delete_labels`.
+4. **OME-TIFF masks**: rasterizing adapter, the `@ome` set, `BinData` stripped
+   from `metadata_json`.
+5. **Clients**: MCP `add_tensor` and guide text; SPA tree and overlay.
