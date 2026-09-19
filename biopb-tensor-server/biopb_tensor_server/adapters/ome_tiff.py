@@ -28,7 +28,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -39,6 +39,7 @@ from biopb_tensor_server.adapters._handle_reaper import (
     IdleHandleReaper,
 )
 from biopb_tensor_server.adapters._ome_rois import (
+    OME_SET_NAME,
     imported_annotations,
     tensors_by_field,
 )
@@ -294,6 +295,30 @@ _STRIP_EMPTY_BINDATA = re.compile(
 )
 
 
+def _b64_encode_mask_bindata(ome: Any) -> None:
+    """Base64-encode every ``<Mask>``'s ``bin_data.value`` in place.
+
+    A mask's bitmap is arbitrary binary, and pydantic's ``mode="json"`` dump of
+    a ``bytes`` field decodes it as UTF-8 -- which raises on the overwhelming
+    majority of real bitmaps (they are not valid UTF-8) and, since there is no
+    partial ``model_dump``, would fail the WHOLE metadata parse over one mask,
+    silently costing the file every other piece of its OME metadata too. Base64
+    is ASCII, so it survives the dump intact; the label rasterizer
+    (``adapters/ome_masks.py``) decodes it back off the resulting dict.
+
+    Best-effort: a shape this cannot walk is left alone, and the dump either
+    succeeds anyway (no real bitmap) or fails exactly as it would have without
+    this call -- never worse.
+    """
+    import base64
+
+    for roi in getattr(ome, "rois", None) or ():
+        for mask in getattr(getattr(roi, "union", None), "masks", None) or ():
+            value = getattr(getattr(mask, "bin_data", None), "value", None)
+            if isinstance(value, (bytes, bytearray)):
+                mask.bin_data.value = base64.b64encode(bytes(value))
+
+
 def _fast_ome_metadata(
     ome_xml: str, *, already_reduced: bool = False
 ) -> Optional[dict]:
@@ -303,8 +328,9 @@ def _fast_ome_metadata(
     with the real ome-types parser, so the result is structurally identical to
     ``ome_metadata.model_dump(mode="json")`` EXCEPT that ``planes`` and
     ``tiff_data_blocks`` come back empty -- the deliberate accuracy trade for
-    making registration O(structure) instead of O(plane-count) (biopb/biopb#168).
-    Returns ``None`` on any failure.
+    making registration O(structure) instead of O(plane-count) (biopb/biopb#168)
+    -- and that a ``<Mask>``'s ``bin_data.value`` is base64 text rather than raw
+    bytes (:func:`_b64_encode_mask_bindata`). Returns ``None`` on any failure.
     """
     try:
         from ome_types import from_xml
@@ -316,6 +342,7 @@ def _fast_ome_metadata(
         )
         ome = from_xml(reduced)
         if hasattr(ome, "model_dump"):
+            _b64_encode_mask_bindata(ome)
             return ome.model_dump(mode="json")
         if hasattr(ome, "dict"):
             return ome.dict(by_alias=False, exclude_none=False)
@@ -672,6 +699,48 @@ class OmeTiffAdapter(TensorAdapter):
             content_version=self.content_version,
             max_per_tensor=max_per_tensor,
         )
+
+    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
+        """The ``@ome`` set: this file's own ``<Mask>`` ROI shapes, rasterized.
+
+        One tensor per scene that carries at least one mask, keyed
+        ``[<scene field>/]labels/@ome`` (see ``adapters/ome_masks.py``). Same
+        OME-image-id join as :meth:`get_embedded_rois` (``tensors_by_field``):
+        the field half of a scene's ``array_id`` IS the OME image id for this
+        format, so the match is string equality, not inference.
+        """
+        from biopb_tensor_server.adapters.ome_masks import (
+            RasterizedMaskAdapter,
+            masks_by_image,
+        )
+        from biopb_tensor_server.core.labels import label_extent, label_field
+
+        descriptors = self._scene_descriptors()
+        by_image = masks_by_image(
+            self.get_metadata(),
+            tensors_by_field([(d.array_id, list(d.dim_labels)) for d in descriptors]),
+        )
+        if not by_image:
+            return {}
+        sets: Dict[str, TensorAdapter] = {}
+        for desc in descriptors:
+            masks = by_image.get(desc.array_id)
+            if not masks:
+                continue
+            dim_labels, shape = label_extent(list(desc.dim_labels), list(desc.shape))
+            field = label_field(
+                self._within_source_field(desc.array_id) or "", OME_SET_NAME
+            )
+            sets[field] = RasterizedMaskAdapter(
+                self.source_id,
+                field,
+                dim_labels=dim_labels,
+                shape=shape,
+                masks=masks,
+                parent_array_id=desc.array_id,
+                content_version=self.content_version,
+            )
+        return sets
 
     def _reduced_ome_xml_cached(self) -> Optional[str]:
         """The plane-stripped OME-XML, computed once and kept for the adapter's life.

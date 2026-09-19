@@ -53,6 +53,7 @@ UNQUANTIZED = {
     "QptiffAdapter": "source-level; serves levels through _QptiffLevelAdapter",
     "DeltaVisionAdapter": "one np.memmap (mrc.DVFile); indexing computes byte offsets",
     "TensorAdapter": "the base class itself",
+    "RasterizedMaskAdapter": "computed, not stored; a read paints only its own bounds",
 }
 
 

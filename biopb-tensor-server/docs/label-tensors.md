@@ -1,6 +1,6 @@
 # Label tensors — backend design
 
-Status: steps 1–3 implemented; 4 (OME-TIFF masks) and 5 (clients) remain. The
+Status: steps 1–4 implemented; 5 (clients) remains. The
 sequence is biopb/biopb#1059. Companion to `roi-annotations.md`, which
 scoped instance segmentation *out* of the annotation store and into "a label
 tensor the server already serves as pixels". This is that tensor.
@@ -191,15 +191,29 @@ native NGFF set that ships its own multiscales serves them as `precompute`.
 
 **Rasterizing OME masks.** A `<Mask>` is `x, y, width, height`, optional
 `TheZ/TheT/TheC` pins, and a `BinData` bitmap (1 bit per pixel, row-major,
-possibly compressed). The `@ome` set for an image is one tensor over the
-image's extent; the label value of a mask is the 1-based index of its ROI in
-the image's `roi_refs` order, which is stable because it comes from the
-metadata. Overlaps: later wins. A chunk read decodes the masks whose bounding
-box and pin intersect the chunk and paints them; decoded bitmaps are memoized
-per adapter, and the cache holds the painted output. Mask bitmaps then leave
-`metadata_json` the way `rois` do — stripped once the import has completed,
-since only empty `BinData` is stripped on the fast path today and a real bitmap
-currently sits base64-encoded in the catalog row.
+possibly zlib/bzip2-compressed). The `@ome` set for an image is one tensor
+over the image's extent (`adapters/ome_masks.py`); the label value of a mask
+is the 1-based index of its ROI in the image's `roi_refs` order, which is
+stable because it comes from the metadata. Overlaps: later wins, which
+`roi_refs` order gives for free — masks paint in that order. A chunk read
+decodes the masks whose bounding box and pin intersect the chunk and paints
+them; decoded bitmaps are memoized per adapter, and the ordinary chunk cache
+holds the painted output. `TheC` is inert here (design, "Extent" — the channel
+distinction is never carried), and a pin naming an axis the image does not
+have is inert the same way.
+
+OME-TIFF only, via `OmeTiffAdapter.get_embedded_labels`; a bioio-backed format
+carrying OME-XML (a legacy multi-file OME-TIFF) does not rasterize its masks
+in this step. The fast metadata path (`_fast_ome_metadata`) used to crash
+outright on a real (non-UTF-8) bitmap — `model_dump(mode="json")` decodes a
+`bytes` field as UTF-8, and there is no partial dump — silently costing the
+file its *entire* OME metadata, not just the mask; `_b64_encode_mask_bindata`
+base64-encodes a `Mask`'s `bin_data.value` in place before the dump so it
+survives. That base64 form is also what makes stripping it cheap: a real
+bitmap must never reach the SQL-queryable `metadata_json` regardless of
+whether ROI *annotations* import ran (masks are not annotations, so they are
+outside that gate) — `strip_mask_bindata` drops `bin_data.value` unconditionally
+in `sync_source_added`, leaving the rest of the shape (extent, pins) in place.
 
 **Precache.** A set is on the ladder like any tensor. Coarse levels of a mostly
 empty set are small and nearest over zeros is trivial, so the precache is not
