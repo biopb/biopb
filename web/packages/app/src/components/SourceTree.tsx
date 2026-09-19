@@ -258,6 +258,17 @@ export function TreeRow({
   setLabelOverlay,
 }: TreeRowProps) {
   const indent = node.depth * 12 + 12;
+  // Label sets filed under the image they annotate, rather than listed beside
+  // it: a set is a tensor of the source, but it is *about* one of the others.
+  //
+  // Memoized: an unrelated store change (e.g. toggling the overlay) re-renders
+  // every row, and re-sorting every source's tensors on each one adds up.
+  //
+  // Hoisted above the folder branch because that branch returns: a hook after
+  // it runs only for source rows, which is the hook-order rule React enforces
+  // and eslint refuses to build. A folder has no tensors, so it memoizes an
+  // empty list and pays nothing.
+  const groups = useMemo(() => groupTensors(node.source?.tensors ?? []), [node.source]);
 
   if (node.type === "folder") {
     const expanded = expandedFolders.has(node.id);
@@ -300,11 +311,6 @@ export function TreeRow({
   // Source node
   const src = node.source!;
   const isActive = src.source_id === activeSourceId;
-  // Label sets filed under the image they annotate, rather than listed beside
-  // it: a set is a tensor of the source, but it is *about* one of the others.
-  // Memoized: an unrelated store change (e.g. toggling the overlay) re-renders
-  // every row, and re-sorting every source's tensors on each one adds up.
-  const groups = useMemo(() => groupTensors(src.tensors), [src.tensors]);
   const hasMultipleTensors = src.tensors.length > 1;
   const firstTensor = src.tensors[0];
   // An unresolved source has no tensor to read, so selecting it would send the
