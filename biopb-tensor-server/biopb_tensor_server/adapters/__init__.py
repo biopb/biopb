@@ -13,6 +13,10 @@ from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
+
+# Not a format: a label set bound as a tensor of its image (biopb/biopb#1059).
+# Imported here so the class is part of the package like every adapter class.
+from .labels import LabelSetAdapter
 from .ome_tiff import OmeTiffAdapter
 from .ome_zarr import OmeZarrAdapter
 from .remote_tensor import RemoteTensorAdapter
@@ -131,6 +135,7 @@ __all__ = [
     "SourceAdapter",
     "TensorAdapter",
     "ZarrAdapter",
+    "LabelSetAdapter",
     "Hdf5Adapter",
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",

@@ -2210,14 +2210,15 @@ class TestGetData:
 
 
 class TestOmeZarrStorePathResolution:
-    """One store->path resolver for both call sites (biopb/biopb#530).
+    """One store->path resolution, at construction (biopb/biopb#530).
 
     ``__init__`` (find the group/plate ``.zattrs``) and ``_open_level_array``
     (find the group root a pyramid level hangs off) used to enumerate different
     store shapes. A store with ``root`` but no ``path`` -- the zarr-3
     ``LocalStore`` shape -- resolved in the first and fell through to
     ``str(store)`` in the second, which silently degrades a level read into a
-    CWD-relative open.
+    CWD-relative open. The level open now reuses the root ``__init__`` kept, so
+    there is one resolution rather than two that must agree.
     """
 
     def test_resolver_covers_every_store_shape(self):
@@ -2241,8 +2242,13 @@ class TestOmeZarrStorePathResolution:
         assert _store_filesystem_path(_Store("<Weird>")) == "<Weird>"
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_both_call_sites_use_the_one_resolver(self, monkeypatch):
-        """Structural: neither site may grow its own store-shape enumeration."""
+    def test_level_open_reuses_the_root_resolved_at_construction(self, monkeypatch):
+        """Structural: the store shape is read once, and a level hangs off that
+        root rather than re-deriving one.
+
+        The second derivation was a walk that stopped at the first ``.zattrs``
+        it met, so a level of an array carrying its own attrs opened one
+        directory too deep (biopb/biopb#1059)."""
         import json
 
         import zarr
@@ -2295,7 +2301,7 @@ class TestOmeZarrStorePathResolution:
             assert len(calls) == 1  # __init__
 
             level = adapter.get_level_adapter("1")
-            assert len(calls) == 2  # _open_level_array
+            assert len(calls) == 1  # the level rode on __init__'s root
             assert list(level.get_tensor_descriptor().shape) == [20, 20]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")

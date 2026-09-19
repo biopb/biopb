@@ -29,7 +29,7 @@ A resolution failure (offline / declined / unrecognized) raises
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.errors import (
@@ -134,6 +134,18 @@ class UnresolvedSourceAdapter(SourceAdapter):
             if descriptors:
                 tensor_id = descriptors[0].array_id
         return self._resolved.get_tensor_adapter(tensor_id)
+
+    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
+        """Forward the file's label sets once there is a file (biopb/biopb#1059).
+
+        The base's ``label_sets`` runs on this proxy -- its attached sidecars
+        live here -- and reads the embedded half through this hook, so a
+        resolved cloud OME-Zarr's ``labels/`` group is visible; before
+        resolution there is nothing to read.
+        """
+        if self._resolved is not None:
+            return self._resolved.get_embedded_labels()
+        return {}
 
     def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
         """Forward a native-pyramid level lookup to the resolved adapter.

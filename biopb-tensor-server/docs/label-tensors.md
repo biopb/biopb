@@ -1,6 +1,7 @@
 # Label tensors — backend design
 
-Status: proposal — not implemented. Companion to `roi-annotations.md`, which
+Status: steps 1–3 implemented; 4 (OME-TIFF masks) and 5 (clients) remain. The
+sequence is biopb/biopb#1059. Companion to `roi-annotations.md`, which
 scoped instance segmentation *out* of the annotation store and into "a label
 tensor the server already serves as pixels". This is that tensor.
 
@@ -90,6 +91,13 @@ that the ambiguity is not worth resolving yet.
 A mask pinned to one channel (OME `TheC`) rasterizes into the shared set; the
 channel distinction is not carried.
 
+The rule is checked twice: the upload refuses a set that would not span its
+image at create, and `SourceAdapter.label_sets` checks every set again where
+the origins meet (`extent_mismatch`, on normalized descriptors), so a native
+set of another shape, a sidecar that reached the directory by other means, or
+a store whose image changed shape under it is dropped with a warning rather
+than served misaligned.
+
 ## Three origins, one tensor shape
 
 | origin | backing | writable | content_version |
@@ -104,6 +112,16 @@ mints a random token at create, persists it in the sidecar's attrs, and its
 adapter wraps chunk ids with it — the gen-token pattern `cache:` uploads use —
 so a name reused after a delete can never hit a stale cache entry.
 
+**The name is a path, so it is checked as one.** A store's directory is named
+after what the client asked for, and discard removes that directory whole, so
+the name must stay inside the directory the server chose: `ome_zarr:../../x`
+otherwise mints and later deletes a store two levels above `write_dir`. Both
+separators and `:` are refused on every platform, not just the host's, and the
+name is refused rather than sanitized — it is an identity as well as a path
+(it is what `create_tensor` refuses a collision on), so folding two requests
+onto one store would trade a traversal for a mix-up. `cache:` needs none of
+this: it hashes the name into a `source_id` and never reaches a filesystem.
+
 **Never inside the source.** An uploaded set is not written into the user's
 OME-Zarr even when it could be: discovery rescans the tree, and the
 reconciler's stat-based `content_version` would flip and invalidate the
@@ -113,8 +131,9 @@ reconciler's stat-based `content_version` would flip and invalidate the
 <write_dir>/labels/<parent source_id>/<name>.zarr
 ```
 
-one array per set, `.zattrs` carrying the NGFF `image-label` block plus a
-`biopb` block (`content_version`, upload state, parent `array_id`). `write_dir`
+one NGFF label group per set (`.zattrs` with `multiscales` + `image-label`, a
+`0/` array), the `.zattrs` also carrying a `biopb` block: the upload marker and
+`labels: {image_field, content_version}`. `write_dir`
 must not be a discovery root: `ZarrAdapter.claim` takes any `.zarr` with a
 `.zattrs`, and a sidecar claimed as a source of its own would be listed twice
 under two ids. The `ome_zarr:` kind has the same exposure today; step 1 below
@@ -123,21 +142,39 @@ makes it a documented configuration rule and a startup check.
 ### Attachment to the parent
 
 Sets are tensors *of the parent source*, not sources. The registry keeps one
-entry per source, so the parent adapter has to answer for them. Rather than
-teaching every adapter class about sidecars, the registration chokepoint wraps
-each source in a label attachment — the same seam `normalize_adapter` uses —
-that:
+entry per source, so the parent adapter has to answer for them — and it does so
+through the base class, not a wrapper (the codebase already carries one
+forwarding wrapper at that seam, `NormalizingAdapter`, and a second layer of
+`__getattr__` forwarding is the objection). `SourceAdapter` owns the concept;
+the format's own `list_tensor_descriptors` / `get_tensor_adapter` stay
+ignorant of sidecars:
 
-- extends `list_tensor_descriptors` with the parent's own sets (the adapter
-  supplies file-embedded ones through a hook alongside `get_embedded_rois`) and
-  the **finished** sidecar sets found under its `source_id`;
-- routes `get_tensor_adapter` for a `.../labels/<name>` field to that set's
-  adapter, and delegates everything else;
-- orders image tensors first. The catalog's scalar `dtype` / `shape_summary`
-  columns describe `tensors[0]`, so a set must never be first.
+- `get_embedded_labels()` is the hook a format overrides, beside
+  `get_embedded_rois` (`OmeZarrAdapter` reads its NGFF `labels/` group there);
+  `attach_label_set` / `detach_label_set` are what the registry's
+  `on_register` hook (finished sidecars, `sidecar_attacher`) and the upload
+  kind (at `finish`; `delete`) use; `label_sets` is the merged view, every
+  set normalized like any tensor and checked against the image it binds to
+  (`label_binding_error`, which the upload's create calls too, so one rule
+  answers for every origin).
+- `label_uploads` is the second, smaller index: sets the upload path is still
+  filling, and the tombstones of ones it gave up on. Routable but never
+  listed — the bytes have not all arrived, or are gone — and it is what the
+  DoPut boundary looks an upload up in and what the reclaim sweep walks.
+- `resolve_tensor(tensor_id)` and `resolve_chunk_adapter(field)` are the two
+  lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
+  `.../labels/<name>[/<level>]` field answers from `label_sets`, everything
+  else delegates to the format. A label-shaped id the source has no set for is
+  handed to the format anyway — a proxy's upstream may serve it.
+- `catalog_tensors` appends the sets after `list_tensor_descriptors`. The
+  catalog's scalar `dtype` / `shape_summary` columns describe `tensors[0]`, so
+  a set is never first.
 
-The wrapper's set table is what the upload kind adds to and what `delete`
-removes from; no registry swap is involved.
+A set's adapter is `LabelSetAdapter` (`adapters/labels.py`): `OmeZarrAdapter`
+opened on the label group, bound under the parent's `source_id` with the set's
+field as its tensor name, so its chunk ids and native levels ride under
+`<image>/labels/<name>` (a level's name and `content_version` compose from its
+adapter's, for images and sets alike).
 
 ## Reads
 
@@ -170,14 +207,12 @@ special-cased.
 
 ## Upload
 
-The step 7 SDK from biopb/biopb#1048 is reused unchanged:
+The step 7 SDK from biopb/biopb#1048 is reused as it stands, plus one verb:
 
 ```python
-desc = client.create_tensor(TensorDescriptor(
-    array_id="src_ab12/labels/nuclei", shape=..., dim_labels=..., dtype="uint32",
-    chunk_shape=...))
+desc = client.create_tensor("src_ab12/labels/nuclei", labels, chunk_shape=...)
 client.upload_array(desc, labels)        # skips all-zero chunks for this kind
-client.finish_upload(desc)
+client.delete_labels("src_ab12/labels/nuclei")   # frees the name again
 ```
 
 Server side this is a third upload kind, selected by the request `array_id`
@@ -186,8 +221,12 @@ other two, the request's `array_id` *is* the final one. The kind:
 
 - resolves the parent by splitting at the last `/labels/` and refuses if the
   parent is absent, unresolved, or does not serve pixels;
-- refuses a non-integer dtype, a reserved name, or a shape / `dim_labels` that
-  is not the parent's canonical non-channel extent;
+- refuses a non-unsigned-integer dtype, a reserved name, a name that would not
+  stay inside the sidecar directory (`unsafe_store_name` — the name becomes a
+  directory the server creates and, on discard, removes whole), or a shape /
+  `dim_labels` that is not the parent's canonical non-channel extent — a
+  request naming no `dim_labels` is filled in from the image rather than
+  refused, since the extent rule leaves exactly one legal answer;
 - refuses a name already attached, finished or pending — the biopb/biopb#1054
   rule, now per parent;
 - creates the sidecar array with the pending marker and the minted
@@ -195,13 +234,17 @@ other two, the request's `array_id` *is* the final one. The kind:
   attachment: routable for `get_flight_info` (so the poll to READY works from
   create) but not listed.
 
-`finish` clears the pending marker, lists the set, and re-syncs the parent's
-catalog row (`sync_source_added` is an upsert; the ROI re-import it triggers is
-already idempotent). The status and TTL machinery apply as they stand, with two
-plumbing changes in `UploadManager`: `status` / `finish` / `discard` /
-`write_chunk` receive a set's `array_id` where they receive a `source_id`
-today, and resolve it through the parent's attachment; and `reap` visits each
-attachment's pending sets as well as registered upload sources.
+`finish` seals the pending marker, lists the set (`attach_label_set`) and
+re-syncs the parent's catalog row (`sync_source_added` is an upsert; the ROI
+re-import it triggers is already idempotent), in that order — the catalog must
+not name a set a restart would sweep away. The status and TTL machinery apply
+as they stand, with two plumbing changes in `UploadManager`: `status` /
+`finish` / `discard` / `write_chunk` receive a set's `array_id` where they
+receive a `source_id` today, and resolve it through the parent's
+`label_uploads` (`_locate`); and
+`reap` walks that index on every source as well as the registered upload
+sources — a quiet pending set is discarded with its sidecar and unlisted, and
+its tombstone detached a TTL later, which is what frees the name.
 
 **Skipping zeros is per kind.** `upload_array` may drop all-zero chunks only for
 the label kind, where an unwritten chunk reads as fill. A `cache:` source
@@ -239,8 +282,13 @@ So, for both kinds:
 - **The upload state is persisted.** A pending marker is written into the
   store's attrs at create and cleared at `finish`. At startup, a sidecar still
   carrying it is a crashed upload and is deleted rather than served; the
-  `ome_zarr:` equivalent is deleted before discovery can claim it. The cache
-  kind never needed this because nothing of it survives a restart.
+  `ome_zarr:` equivalent is deleted before discovery can claim it, together
+  with its catalog row — a persisted catalog outlives the process, and
+  `write_dir` is outside every discovery root, so the reconciler never sees
+  that id and nothing else would drop it. A sidecar has no row of its own: it
+  is a tensor of its parent, whose row is rebuilt when that parent registers.
+  The cache kind never needed any of this because nothing of it survives a
+  restart.
 - **`delete_labels`** (`do_action`, full access) removes a *finished* uploaded
   set: drop it from the attachment, delete the sidecar, re-sync the parent's
   catalog row. Refused for a reserved or native set. Its cache chunks become

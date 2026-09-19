@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.normalize import normalize_adapter
@@ -50,9 +50,17 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, on_register: Optional[Callable[[str, SourceAdapter], None]] = None
+    ) -> None:
+        """*on_register* runs on every registered adapter before it is
+        published, for what has to happen at the one chokepoint but is not
+        the registry's to know -- attaching a source's uploaded label sets
+        (``adapters.labels.sidecar_attacher``). Its failure is logged, never
+        the registration's: a source is its pixels first."""
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
+        self._on_register = on_register
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -94,6 +102,13 @@ class SourceRegistry:
                 f"by splitting on the first '/'."
             )
         adapter = normalize_adapter(adapter)
+        if self._on_register is not None:
+            try:
+                self._on_register(source_id, adapter)
+            except Exception:
+                logger.warning(
+                    f"on_register hook failed for {source_id}", exc_info=True
+                )
         with self._lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")

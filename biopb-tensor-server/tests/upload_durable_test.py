@@ -160,6 +160,85 @@ class TestCreateOwnsItsDirectory:
         assert writable_server.uploads.status("ome_zarr_x")["state"] == "UNKNOWN"
 
 
+class TestTheNameCannotEscapeWriteDir:
+    """The name becomes a directory the server creates and, on discard,
+    removes whole, so it must stay inside the one the server chose."""
+
+    @pytest.mark.parametrize(
+        "name", ["../../escaped", "..", ".", "a/b", "a\\b", "C:evil"]
+    )
+    def test_refused_and_nothing_is_written_anywhere(self, tmp_path, name):
+        """write_dir is nested inside tmp_path, so an escape would land under
+        tmp_path too -- one glob then covers the whole surface."""
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        write_dir = tmp_path / "a" / "b" / "w"
+        write_dir.mkdir(parents=True)
+        desc = TensorDescriptor(
+            array_id=f"ome_zarr:{name}",
+            shape=[4, 4],
+            dtype="uint16",
+            chunk_shape=[2, 2],
+        )
+        with pytest.raises(ValueError, match="cannot name a store"):
+            OmeZarrAdapter.create_upload(name, desc, metadata=None, write_dir=write_dir)
+        assert not list(tmp_path.glob("**/*.zarr"))
+
+    def test_the_refusal_reaches_the_client(self, writable_server, client, tmp_path):
+        with pytest.raises(flight.FlightServerError, match="cannot name a store"):
+            client.create_tensor(
+                "ome_zarr:..", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+            )
+        assert not list(tmp_path.glob("**/*.zarr"))
+
+    def test_ordinary_names_are_still_accepted(self):
+        from biopb_tensor_server.adapters._writable import unsafe_store_name
+
+        for name in ["nuclei", "my data (1)", "run-2026.09.19", "_x", "..hidden"]:
+            assert unsafe_store_name(name) is None
+
+
+class TestTheBootSweepDropsTheRow:
+    """A persisted catalog outlives the process, so the row an ``ome_zarr:``
+    upload wrote at create is still there when the next server finds its store
+    unfinished -- and nothing else will drop it, since write_dir is outside
+    every discovery root and the reconciler never sees this id."""
+
+    @staticmethod
+    def _manager(write_dir, db):
+        from biopb_tensor_server.core.source_registry import SourceRegistry
+        from biopb_tensor_server.serving.upload_manager import UploadManager
+
+        return UploadManager(SourceRegistry(), write_dir, db)
+
+    def test_a_crashed_upload_leaves_no_row_behind(self, tmp_path):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+        write_dir = tmp_path / "w"
+        write_dir.mkdir()
+        db = MetadataDatabase()
+        first = self._manager(write_dir, db)
+        for name in ("crashed", "done"):
+            first.create_tensor(
+                TensorDescriptor(
+                    array_id=f"ome_zarr:{name}",
+                    shape=[4, 4],
+                    dtype="uint16",
+                    chunk_shape=[2, 2],
+                )
+            )
+        first.finish(OmeZarrAdapter.upload_source_id(write_dir / "done.zarr"))
+        assert len(_catalog_ids(db)) == 2
+
+        # The process dies here. The stores and the rows both survive it.
+        assert self._manager(write_dir, db).discard_unfinished_stores() == 1
+        assert not (write_dir / "crashed.zarr").exists()
+        assert _catalog_ids(db) == {
+            OmeZarrAdapter.upload_source_id(write_dir / "done.zarr")
+        }
+
+
 class TestTheMarker:
     def test_ready_is_announced_only_after_the_seal(
         self, writable_server, client, tmp_path

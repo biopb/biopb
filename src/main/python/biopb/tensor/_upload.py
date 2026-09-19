@@ -75,6 +75,20 @@ def _refused_from(exc: flight.FlightCancelledError) -> Optional[UploadRefused]:
     )
 
 
+def _is_label_set(array_id: str) -> bool:
+    """Whether *array_id* names a label set rather than a source of its own.
+
+    The one upload kind whose unwritten chunks are meaningful: a label set is
+    a zarr with fill value 0, so a chunk that never arrives reads back as
+    background and skipping it is free (biopb/biopb#1059). A ``cache:`` source
+    answers a read of an unwritten chunk with "holds no chunk", so the skip
+    must never be a general behaviour -- hence the check on the shape of the
+    id rather than a flag the caller could set on anything.
+    """
+    prefixed = ":" in array_id.partition("/")[0]
+    return not prefixed and "/labels/" in array_id
+
+
 def _uniform_chunk_shape(arr: da.Array) -> Tuple[int, ...]:
     """The upload grid a dask array implies: its chunk size, per axis.
 
@@ -144,7 +158,15 @@ class _UploadTarget:
     produced the block.
     """
 
-    __slots__ = ("_location", "_token", "_trust", "_source_id", "shape", "dtype")
+    __slots__ = (
+        "_location",
+        "_token",
+        "_trust",
+        "_source_id",
+        "_skip_empty",
+        "shape",
+        "dtype",
+    )
 
     def __init__(
         self,
@@ -154,16 +176,22 @@ class _UploadTarget:
         source_id: str,
         shape: Sequence[int],
         dtype: np.dtype,
+        skip_empty: bool = False,
     ):
         self._location = location
         self._token = token
         self._trust = trust or NO_TLS
         self._source_id = source_id
+        # Drop an all-zero block instead of sending it -- only for a label
+        # set, where an unwritten chunk reads back as background.
+        self._skip_empty = skip_empty
         # ``store`` reads these off the target to check it can hold the array.
         self.shape = tuple(shape)
         self.dtype = dtype
 
     def __setitem__(self, index: Tuple[slice, ...], value: np.ndarray) -> None:
+        if self._skip_empty and not value.any():
+            return
         client = _get_thread_client(self._location, self._token, self._trust)
         call_options = _get_shared_call_options(self._location, self._token)
         bounds = ChunkBounds(
@@ -249,6 +277,9 @@ class UploadSession:
         else:
             arr = arr.rechunk(chunk_shape)  # a no-op when already on the grid
 
+        # An all-zero block of a label set is not sent at all: the sidecar's
+        # fill value already reads as background, so one labelled frame of a
+        # thousand costs one frame (biopb/biopb#1059).
         self._store_chunks(desc.array_id, arr)
         # Sealing is what marks the source complete, so a whole-array upload
         # does it on the caller's behalf -- it is the one caller that knows,
@@ -288,6 +319,7 @@ class UploadSession:
             source_id,
             arr.shape,
             arr.dtype,
+            skip_empty=_is_label_set(source_id),
         )
         da.store(arr, target, lock=False)
 

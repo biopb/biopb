@@ -36,6 +36,7 @@ NOT_DECIMATING = {
     "ZarrAdapter": "a chunk decodes whole; a stride inside it saves no read",
     "OmeZarrAdapter": "inherits ZarrAdapter",
     "_HcsFieldAdapter": "inherits ZarrAdapter",
+    "LabelSetAdapter": "inherits ZarrAdapter (via OmeZarrAdapter)",
     "_QptiffLevelAdapter": "inherits ZarrAdapter",
     "Hdf5Adapter": "h5py hyperslab still reads whole chunks",
     "OmeTiffAdapter": "a page decodes whole (aszarr chunkmode='page')",
