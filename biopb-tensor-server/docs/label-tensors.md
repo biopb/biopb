@@ -90,6 +90,12 @@ that the ambiguity is not worth resolving yet.
 A mask pinned to one channel (OME `TheC`) rasterizes into the shared set; the
 channel distinction is not carried.
 
+The rule is checked twice: the upload refuses a set that would not span its
+image at create, and the registry checks a sidecar again when it reads it
+(`extent_mismatch`), so a store that reached the directory by other means, or
+whose image changed shape under it, is skipped with a warning rather than
+served misaligned.
+
 ## Three origins, one tensor shape
 
 | origin | backing | writable | content_version |

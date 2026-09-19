@@ -38,7 +38,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
@@ -49,6 +49,7 @@ from biopb_tensor_server.adapters.zarr import (
     upload_state,
     with_upload_state,
 )
+from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.chunk import build_pyramid_plan
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
@@ -56,6 +57,7 @@ from biopb_tensor_server.core.labels import label_field
 
 __all__ = [
     "LabelSetAdapter",
+    "extent_mismatch",
     "native_label_sets",
     "open_label_set",
     "sidecar_attrs",
@@ -233,6 +235,46 @@ def _parent_array_id(source_id: str, image_field: str) -> str:
     return f"{source_id}/{image_field}" if image_field else source_id
 
 
+def _axis_key(label: str) -> str:
+    """What two axes must agree on: the canonical name where the label has
+    one, else the label itself (an unrecognized axis matches only itself)."""
+    return canonical_axis(label) or str(label).lower()
+
+
+def extent_mismatch(
+    label_labels: Sequence[str],
+    label_shape: Sequence[int],
+    image_labels: Sequence[str],
+    image_shape: Sequence[int],
+) -> Optional[str]:
+    """Why a set of *label_shape* over *label_labels* does not span the image,
+    or None when it does.
+
+    The extent rule (design, "Extent"): a set's axes are the image's canonical
+    axes with the channel axis dropped, each at the image's full length, so a
+    label pixel and its image pixel share an index. Both sides are compared
+    in canonical order -- the caller hands in normalized descriptors -- by
+    canonical axis name, so ``"Z"`` and ``"depth"`` agree.
+    """
+    expected = [
+        (_axis_key(lab), int(size))
+        for lab, size in zip(image_labels, image_shape, strict=True)
+        if canonical_axis(lab) != "c"
+    ]
+    actual = [
+        (_axis_key(lab), int(size))
+        for lab, size in zip(label_labels, label_shape, strict=True)
+    ]
+    if [a for a, _ in actual] != [e for e, _ in expected]:
+        return (
+            f"axes {list(label_labels)} do not match the image's non-channel "
+            f"axes {[lab for lab, _ in expected]}"
+        )
+    if [n for _, n in actual] != [n for _, n in expected]:
+        return f"shape {list(label_shape)} does not match the image's {[n for _, n in expected]}"
+    return None
+
+
 def native_label_sets(
     parent: Any, image_group: Path, image_field: str
 ) -> Dict[str, LabelSetAdapter]:
@@ -291,16 +333,29 @@ def sidecar_attrs(image_field: str, content_version: bytes) -> dict:
     return attrs
 
 
-def sidecar_label_sets(source_id: str, labels_dir: Path) -> Dict[str, LabelSetAdapter]:
+def sidecar_label_sets(
+    source_id: str, labels_dir: Path, parent: Any
+) -> Dict[str, LabelSetAdapter]:
     """The finished sidecar sets of *source_id* under *labels_dir*, keyed by field.
 
     ``<name>.zarr`` groups whose upload marker reads ``ready``; a pending one
     is an upload still filling (or one that died, which the boot sweep takes),
     and is not a tensor yet.
+
+    Each set is checked against *parent* -- the registered (normalized)
+    adapter -- before it is attached: its image field must name a tensor of
+    the parent, and its axes and shape must span that image
+    (:func:`extent_mismatch`). The upload path refuses such a set at create,
+    so this guards what reached the directory by other means, and a store
+    whose image changed shape under it. A set that fails is skipped with a
+    warning; it never costs the source its registration.
     """
     root = sidecar_dir(labels_dir, source_id)
     if not root.is_dir():
         return {}
+    from biopb_tensor_server.core.normalize import normalize_adapter
+
+    images = {d.array_id: d for d in parent.list_tensor_descriptors()}
     sets: Dict[str, LabelSetAdapter] = {}
     for store in sorted(root.glob("*.zarr")):
         zattrs = _read_zattrs(store)
@@ -315,13 +370,31 @@ def sidecar_label_sets(source_id: str, labels_dir: Path) -> Dict[str, LabelSetAd
             content_version = None
         name = store.name[: -len(".zarr")]
         field = label_field(image_field, name)
+        parent_array_id = _parent_array_id(source_id, image_field)
+        image = images.get(parent_array_id)
+        if image is None:
+            logger.warning(
+                f"labels: {store} binds to {parent_array_id!r}, which is not a "
+                f"tensor of {source_id}; skipped"
+            )
+            continue
         label_set = open_label_set(
             store,
             source_id=source_id,
             field=field,
             content_version=content_version,
-            parent_array_id=_parent_array_id(source_id, image_field),
+            parent_array_id=parent_array_id,
         )
-        if label_set is not None:
-            sets[field] = label_set
+        if label_set is None:
+            continue
+        desc = normalize_adapter(label_set).get_tensor_descriptor()
+        why = extent_mismatch(
+            desc.dim_labels, desc.shape, image.dim_labels, image.shape
+        )
+        if why is not None:
+            logger.warning(
+                f"labels: {store} does not span {parent_array_id}: {why}; skipped"
+            )
+            continue
+        sets[field] = label_set
     return sets

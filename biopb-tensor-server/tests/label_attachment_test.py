@@ -66,12 +66,19 @@ def _ngff_label_attrs(axes=("y", "x"), levels=2, extra=None):
 
 
 def _write_label_group(
-    group: Path, *, dtype="uint32", axes=("y", "x"), levels=2, fill=7, extra=None
+    group: Path,
+    *,
+    dtype="uint32",
+    axes=("y", "x"),
+    levels=2,
+    fill=7,
+    extra=None,
+    shape=SHAPE,
 ):
     """An NGFF label image at *group*: ``levels`` arrays plus its ``.zattrs``."""
     g = zarr.open_group(str(group), mode="w")
     for i in range(levels):
-        shape = tuple(s // 2**i for s in SHAPE)
+        shape = tuple(s // 2**i for s in shape)
         arr = g.create_dataset(str(i), shape=shape, chunks=CHUNK, dtype=dtype)
         arr[:] = fill if i == 0 else fill + i
     (group / ".zattrs").write_text(json.dumps(_ngff_label_attrs(axes, levels, extra)))
@@ -267,14 +274,56 @@ class TestASidecarIsAttachedAtRegistration:
         state=None,
         image_field="",
         token=b"\x01\x02",
+        shape=SHAPE,
+        axes=("y", "x"),
     ):
         group = sidecar_dir(labels_dir, source_id) / f"{name}.zarr"
         group.parent.mkdir(parents=True, exist_ok=True)
         extra = sidecar_attrs(image_field, token)
         if state is not None:
             extra = with_upload_state(extra, state)
-        _write_label_group(group, levels=1, fill=4, extra=extra)
+        _write_label_group(group, levels=1, fill=4, extra=extra, shape=shape, axes=axes)
         return group
+
+    def test_a_sidecar_that_does_not_span_its_image_is_skipped(self, image, tmp_path):
+        """The upload refuses such a set at create; the read checks again for
+        what reached the directory by other means."""
+        labels_dir = tmp_path / "w" / "labels"
+        self._sidecar(labels_dir, "oz1", "small", shape=(32, 32))
+        self._sidecar(
+            labels_dir, "oz1", "extra", shape=(2, 64, 64), axes=("z", "y", "x")
+        )
+        self._sidecar(labels_dir, "oz1", "orphan", image_field="Image:9")
+        self._sidecar(labels_dir, "oz1", "fits")
+
+        adapter = SourceRegistry(labels_dir=labels_dir).register("oz1", _adapter(image))
+
+        sidecars = {
+            f
+            for f in adapter.label_sets
+            if f.split("/")[-1] not in ("nuclei", "flat", "xy")
+        }
+        assert sidecars == {"labels/fits"}
+
+    def test_extent_mismatch_says_why(self):
+        from biopb_tensor_server.adapters.labels import extent_mismatch
+
+        assert (
+            extent_mismatch(["y", "x"], [64, 64], ["c", "y", "x"], [3, 64, 64]) is None
+        )
+        assert (
+            extent_mismatch(
+                ["Z", "y", "x"], [2, 64, 64], ["depth", "y", "x"], [2, 64, 64]
+            )
+            is None
+        )
+        assert "shape" in extent_mismatch(["y", "x"], [32, 64], ["y", "x"], [64, 64])
+        assert "axes" in extent_mismatch(
+            ["y", "x"], [64, 64], ["z", "y", "x"], [2, 64, 64]
+        )
+        assert "axes" in extent_mismatch(
+            ["c", "y", "x"], [3, 64, 64], ["c", "y", "x"], [3, 64, 64]
+        )
 
     def test_a_ready_sidecar_is_a_set_a_pending_one_is_not(self, image, tmp_path):
         labels_dir = tmp_path / "w" / "labels"

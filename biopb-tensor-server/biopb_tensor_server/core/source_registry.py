@@ -119,7 +119,7 @@ class SourceRegistry:
             from biopb_tensor_server.adapters.labels import sidecar_label_sets
 
             for field, label_set in sidecar_label_sets(
-                source_id, self._labels_dir
+                source_id, self._labels_dir, adapter
             ).items():
                 adapter.attach_label_set(field, label_set)
         except Exception:
