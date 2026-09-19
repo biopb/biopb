@@ -427,7 +427,11 @@ class TensorFlightServer(flight.FlightServerBase):
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory())
         super().__init__(location, middleware=middleware, **kwargs)
-        self.sources = SourceRegistry()
+        # Uploaded label sets live under write_dir/labels/<source_id>/ and are
+        # attached to their source at registration (biopb/biopb#1059).
+        self.sources = SourceRegistry(
+            labels_dir=Path(write_dir) / "labels" if write_dir is not None else None
+        )
         self._writable = writable
         # The catalog, or None for a catalog-less server. The server never
         # writes it: registering a source and cataloguing it are two steps, and
@@ -826,7 +830,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if source_adapter is None:
             return None
 
-        return source_adapter.get_tensor_adapter(tensor_id)
+        return source_adapter.resolve_tensor(tensor_id)
 
     def _get_adapter_for_chunk(self, chunk_id: bytes) -> TensorAdapter:
         """Get the adapter responsible for a chunk, by its chunk_id.
@@ -865,16 +869,10 @@ class TensorFlightServer(flight.FlightServerBase):
             adapter = None
             source_adapter = self.sources.get(source_id)
             if source_adapter is not None:
-                # A within-source suffix names either a native pyramid level
-                # (OME-Zarr / QPTIFF precompute) or a tensor field (an HCS
-                # well/field, a multi-scene file). Ask through the contract, not
-                # by sniffing for the method (biopb/biopb#557): a native-pyramid
-                # adapter returns the level's backend; every other adapter (and a
-                # bare suffix) returns None and the read routes to the tensor field.
-                if rest is not None:
-                    adapter = source_adapter.get_level_adapter(rest)
-                if adapter is None:
-                    adapter = source_adapter.get_tensor_adapter(rest)
+                # A within-source suffix names a native pyramid level, a tensor
+                # field, or a label set (and a level under it); the source
+                # decides which (``SourceAdapter.resolve_chunk_adapter``).
+                adapter = source_adapter.resolve_chunk_adapter(rest)
         except (
             SourceUnresolvedError,
             TensorResolutionError,

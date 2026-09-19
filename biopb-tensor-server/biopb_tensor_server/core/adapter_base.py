@@ -198,9 +198,16 @@ def catalog_tensors(adapter: Any) -> List[TensorDescriptor]:
     source that forgets must not be able to publish a grid it guessed.
 
     Duck-typed on ``list_tensor_descriptors`` alone, like the rest of the
-    registration surface ``sync_source_added`` reads.
+    registration surface ``sync_source_added`` reads -- plus ``label_sets``
+    when the adapter has it, listed **after** the image tensors: the catalog's
+    scalar ``dtype`` / ``shape_summary`` describe ``tensors[0]``, and a label
+    set must never be that (biopb/biopb#1059).
     """
-    return [catalog_entry(t) for t in adapter.list_tensor_descriptors()]
+    tensors = [catalog_entry(t) for t in adapter.list_tensor_descriptors()]
+    sets = getattr(adapter, "label_sets", None) or {}
+    for label_set in sets.values():
+        tensors.append(catalog_entry(label_set.get_tensor_descriptor()))
+    return tensors
 
 
 @dataclass
@@ -504,6 +511,122 @@ class SourceAdapter(ABC):
         and an imported set is rebuilt on the next registration anyway.
         """
         return {}, None
+
+    # -- label sets (biopb/biopb#1059) -----------------------------------------
+    # A label set is a tensor of this source that the format did not
+    # necessarily produce: an NGFF ``labels/`` group it did, a sidecar the
+    # server minted for an upload it did not. The base owns the concept so the
+    # format's own ``list_tensor_descriptors`` / ``get_tensor_adapter`` stay
+    # ignorant of sidecars, and the consumers -- the server's two resolution
+    # sites, the precache, the catalog -- go through the two ``resolve_*``
+    # methods below, which try the sets first and delegate the rest.
+    #
+    # Not chained through __init__ (adapters set their own attributes), so the
+    # two slots are class-level None and materialized on first use.
+    _attached_label_sets: Optional[Dict[str, TensorAdapter]] = None
+    _embedded_label_sets: Optional[Dict[str, TensorAdapter]] = None
+
+    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
+        """Label sets this source's own file carries, keyed by within-source field.
+
+        The pixel counterpart of :meth:`get_embedded_rois`: a format that stores
+        labels beside its image -- an OME-Zarr's NGFF ``labels/`` group -- says
+        here how to read them. Called once and memoized by :attr:`label_sets`.
+        Default: none. Keys are ``[<image field>/]labels/<name>``
+        (:func:`~biopb_tensor_server.core.labels.label_field`); values are
+        tensor adapters bound to the set, in the format's own axis order --
+        the base normalizes them.
+        """
+        return {}
+
+    @property
+    def label_sets(self) -> Dict[str, TensorAdapter]:
+        """Every label set of this source, keyed by within-source field.
+
+        The file's own (:meth:`get_embedded_labels`, read once) under whatever
+        was attached since (:meth:`attach_label_set`), each presented in
+        canonical axis order like any registered tensor.
+        """
+        if self._embedded_label_sets is None:
+            from biopb_tensor_server.core.normalize import normalize_adapter
+
+            self._embedded_label_sets = {
+                field: normalize_adapter(adapter)
+                for field, adapter in self.get_embedded_labels().items()
+            }
+        merged = dict(self._embedded_label_sets)
+        if self._attached_label_sets:
+            merged.update(self._attached_label_sets)
+        return merged
+
+    def attach_label_set(self, field: str, adapter: TensorAdapter) -> None:
+        """Make *adapter* answer for label field *field* on this source.
+
+        The registry attaches a finished sidecar set at registration; the
+        label upload kind attaches one at ``finish``. Normalized here, so a
+        caller hands over the adapter in its own axis order.
+        """
+        from biopb_tensor_server.core.normalize import normalize_adapter
+
+        if self._attached_label_sets is None:
+            self._attached_label_sets = {}
+        self._attached_label_sets[field] = normalize_adapter(adapter)
+
+    def detach_label_set(self, field: str) -> Optional[TensorAdapter]:
+        """Stop answering for *field*; returns what was attached, or None."""
+        if not self._attached_label_sets:
+            return None
+        return self._attached_label_sets.pop(field, None)
+
+    def resolve_tensor(self, tensor_id: Optional[str]) -> TensorAdapter:
+        """The adapter bound to *tensor_id*: a label set of this source, else
+        whatever :meth:`get_tensor_adapter` answers.
+
+        The one lookup the serve path uses (``get_flight_info``, the precache),
+        so a label set is reachable by its ``array_id`` like any tensor while
+        the format's own routing is untouched. A label-shaped id that names no
+        set of this source is handed to the format anyway rather than refused
+        here: a proxy's upstream may serve it, and a format that does not
+        raises its own ``TensorNotFound``.
+        """
+        from biopb_tensor_server.core.labels import split_label_field
+
+        field = self._within_source_field(tensor_id)
+        parsed = split_label_field(field)
+        if parsed is not None and parsed.level is None:
+            label_set = self.label_sets.get(parsed.set_field)
+            if label_set is not None:
+                return label_set
+        return self.get_tensor_adapter(tensor_id)
+
+    def resolve_chunk_adapter(self, field: Optional[str]) -> TensorAdapter:
+        """The adapter that serves a chunk whose route carries *field*.
+
+        A within-source suffix on a chunk names either a native pyramid level
+        (OME-Zarr / QPTIFF precompute) or a tensor field, and for a label set
+        either of those *under* the set: ``labels/nuclei/1`` is level ``1`` of
+        set ``nuclei``. Asked through the contract rather than by sniffing for
+        the method (biopb/biopb#557): a native-pyramid adapter returns the
+        level's backend, every other adapter (and a bare suffix) returns None
+        and the read routes to the tensor.
+        """
+        from biopb_tensor_server.core.labels import split_label_field
+
+        parsed = split_label_field(field)
+        if parsed is not None:
+            label_set = self.label_sets.get(parsed.set_field)
+            if label_set is not None:
+                if parsed.level is not None:
+                    level = label_set.get_level_adapter(parsed.level)
+                    if level is not None:
+                        return level
+                return label_set
+        if field is not None:
+            get_level = getattr(self, "get_level_adapter", None)
+            level = get_level(field) if get_level is not None else None
+            if level is not None:
+                return level
+        return self.get_tensor_adapter(field)
 
     def is_resolved(self) -> bool:
         """Deterministic: is there a hydrated adapter backing this source?
@@ -1636,6 +1759,13 @@ _SOURCE_SCOPED_API = frozenset(
         "put_chunk",
         "close",
         "release_registration_cache",
+        # label sets (biopb/biopb#1059)
+        "get_embedded_labels",
+        "label_sets",
+        "attach_label_set",
+        "detach_label_set",
+        "resolve_tensor",
+        "resolve_chunk_adapter",
     }
 )
 _TENSOR_SCOPED_API = frozenset(

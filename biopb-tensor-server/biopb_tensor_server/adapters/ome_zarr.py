@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
@@ -583,6 +583,8 @@ class OmeZarrAdapter(ZarrAdapter):
             plate_root_path, zattrs = self._find_group_root(
                 _store_filesystem_path(zarr_array.store)
             )
+        # The image (or plate) group, where an NGFF ``labels/`` group would sit.
+        self._group_root_path = plate_root_path
 
         if zattrs is not None:
             self.ome_metadata = zattrs
@@ -804,6 +806,30 @@ class OmeZarrAdapter(ZarrAdapter):
                 )
 
         return descriptors
+
+    def get_embedded_labels(self) -> Dict[str, "TensorAdapter"]:
+        """The NGFF ``labels/`` group of the image, or of every plate field.
+
+        Each set binds to the tensor whose group it sits under: ``labels/<name>``
+        on a single image, ``<well>/<field>/labels/<name>`` on a plate. Local
+        stores only, like the plate's own field serving.
+        """
+        from biopb_tensor_server.adapters.labels import native_label_sets
+
+        root = getattr(self, "_group_root_path", None)
+        if root is None:
+            return {}
+        if not self._is_hcs_plate:
+            return native_label_sets(self, Path(root), "")
+        sets: Dict[str, TensorAdapter] = {}
+        for well_name, well_path in self._hcs_well_paths.items():
+            well_meta = self._hcs_well_metadata.get(well_name, {})
+            images = well_meta.get("well", {}).get("images", [])
+            for field_idx, image_info in enumerate(images):
+                field_path = image_info.get("path", str(field_idx))
+                group = Path(self._field_array_path(well_path, field_path, ""))
+                sets.update(native_label_sets(self, group, f"{well_name}/{field_idx}"))
+        return sets
 
     def get_ome_metadata(self) -> dict:
         """Return OME-Zarr metadata."""

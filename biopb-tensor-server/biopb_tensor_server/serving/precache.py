@@ -47,6 +47,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.chunk import (
     compute_warm_selection,
     compute_warm_targets,
@@ -331,7 +332,8 @@ class PrecacheWorker:
             return False
 
         try:
-            descriptors = source_adapter.list_tensor_descriptors()
+            # The catalog's view: image tensors and label sets alike.
+            descriptors = catalog_tensors(source_adapter)
         except Exception:
             logger.exception(
                 "precache: list_tensor_descriptors failed for %s", source_id
@@ -360,9 +362,9 @@ class PrecacheWorker:
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
         try:
-            tensor_adapter = source_adapter.get_tensor_adapter(tensor_id)
+            tensor_adapter = source_adapter.resolve_tensor(tensor_id)
         except Exception:
-            logger.exception("precache: get_tensor_adapter failed for %s", tensor_id)
+            logger.exception("precache: resolve_tensor failed for %s", tensor_id)
             return False
         # Skip a tensor that ships its own multi-resolution pyramid (e.g. a
         # well-formed OME-Zarr image, or a pyramidal qptiff/ndtiff series): it

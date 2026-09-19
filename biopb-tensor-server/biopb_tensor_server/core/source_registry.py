@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -50,9 +51,13 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
 
-    def __init__(self) -> None:
+    def __init__(self, labels_dir: Optional[Path] = None) -> None:
+        """*labels_dir* is ``<write_dir>/labels``: where uploaded label sets
+        live, one directory per source_id. None on a server with no
+        ``write_dir``, which then has no sidecars to attach."""
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
+        self._labels_dir = labels_dir
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -94,10 +99,33 @@ class SourceRegistry:
                 f"by splitting on the first '/'."
             )
         adapter = normalize_adapter(adapter)
+        self._attach_sidecar_labels(source_id, adapter)
         with self._lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
         return adapter
+
+    def _attach_sidecar_labels(self, source_id: str, adapter: SourceAdapter) -> None:
+        """Attach the finished uploaded label sets this source has on disk.
+
+        Here, at the one registration chokepoint, because a sidecar is keyed
+        by ``source_id`` and no format knows about it (biopb/biopb#1059). A
+        sidecar that will not open costs the set, never the source: a source
+        is its pixels first.
+        """
+        if self._labels_dir is None:
+            return
+        try:
+            from biopb_tensor_server.adapters.labels import sidecar_label_sets
+
+            for field, label_set in sidecar_label_sets(
+                source_id, self._labels_dir
+            ).items():
+                adapter.attach_label_set(field, label_set)
+        except Exception:
+            logger.warning(
+                f"labels: could not attach sidecar sets of {source_id}", exc_info=True
+            )
 
     def register_new(
         self, source_id: str, adapter: SourceAdapter

@@ -73,7 +73,7 @@ order to fix -- which is the trade the write path already makes.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -330,6 +330,24 @@ class NormalizingAdapter(TensorAdapter):
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
         return self._view(self._inner.get_tensor_adapter(tensor_id))
+
+    # Label sets live on the wrapped adapter, already normalized one by one
+    # when they were read or attached (SourceAdapter.label_sets); the base's
+    # resolve_* methods, inherited here, find them through this property and
+    # route everything else through the normalizing get_tensor_adapter /
+    # get_level_adapter above and below.
+    @property
+    def label_sets(self) -> Dict[str, TensorAdapter]:
+        return self._inner.label_sets
+
+    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
+        return self._inner.get_embedded_labels()
+
+    def attach_label_set(self, field: str, adapter: TensorAdapter) -> None:
+        self._inner.attach_label_set(field, adapter)
+
+    def detach_label_set(self, field: str) -> Optional[TensorAdapter]:
+        return self._inner.detach_label_set(field)
 
     def _view(self, inner: SourceAdapter) -> SourceAdapter:
         """Wrap a tensor-level view of this source, deciding nothing.

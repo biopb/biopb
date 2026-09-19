@@ -113,8 +113,9 @@ reconciler's stat-based `content_version` would flip and invalidate the
 <write_dir>/labels/<parent source_id>/<name>.zarr
 ```
 
-one array per set, `.zattrs` carrying the NGFF `image-label` block plus a
-`biopb` block (`content_version`, upload state, parent `array_id`). `write_dir`
+one NGFF label group per set (`.zattrs` with `multiscales` + `image-label`, a
+`0/` array), the `.zattrs` also carrying a `biopb` block: the upload marker and
+`labels: {image_field, content_version}`. `write_dir`
 must not be a discovery root: `ZarrAdapter.claim` takes any `.zarr` with a
 `.zattrs`, and a sidecar claimed as a source of its own would be listed twice
 under two ids. The `ome_zarr:` kind has the same exposure today; step 1 below
@@ -123,21 +124,31 @@ makes it a documented configuration rule and a startup check.
 ### Attachment to the parent
 
 Sets are tensors *of the parent source*, not sources. The registry keeps one
-entry per source, so the parent adapter has to answer for them. Rather than
-teaching every adapter class about sidecars, the registration chokepoint wraps
-each source in a label attachment — the same seam `normalize_adapter` uses —
-that:
+entry per source, so the parent adapter has to answer for them — and it does so
+through the base class, not a wrapper (the codebase already carries one
+forwarding wrapper at that seam, `NormalizingAdapter`, and a second layer of
+`__getattr__` forwarding is the objection). `SourceAdapter` owns the concept;
+the format's own `list_tensor_descriptors` / `get_tensor_adapter` stay
+ignorant of sidecars:
 
-- extends `list_tensor_descriptors` with the parent's own sets (the adapter
-  supplies file-embedded ones through a hook alongside `get_embedded_rois`) and
-  the **finished** sidecar sets found under its `source_id`;
-- routes `get_tensor_adapter` for a `.../labels/<name>` field to that set's
-  adapter, and delegates everything else;
-- orders image tensors first. The catalog's scalar `dtype` / `shape_summary`
-  columns describe `tensors[0]`, so a set must never be first.
+- `get_embedded_labels()` is the hook a format overrides, beside
+  `get_embedded_rois` (`OmeZarrAdapter` reads its NGFF `labels/` group there);
+  `attach_label_set` / `detach_label_set` are what the registry (finished
+  sidecars, at registration) and the upload kind (at `finish`; `delete`) use;
+  `label_sets` is the merged view, every set normalized like any tensor.
+- `resolve_tensor(tensor_id)` and `resolve_chunk_adapter(field)` are the two
+  lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
+  `.../labels/<name>[/<level>]` field answers from `label_sets`, everything
+  else delegates to the format. A label-shaped id the source has no set for is
+  handed to the format anyway — a proxy's upstream may serve it.
+- `catalog_tensors` appends the sets after `list_tensor_descriptors`. The
+  catalog's scalar `dtype` / `shape_summary` columns describe `tensors[0]`, so
+  a set is never first.
 
-The wrapper's set table is what the upload kind adds to and what `delete`
-removes from; no registry swap is involved.
+A set's adapter is `LabelSetAdapter` (`adapters/labels.py`): `OmeZarrAdapter`
+opened on the label group, bound under the parent's `source_id` with the set's
+field as its tensor name, so its chunk ids and native levels ride under
+`<image>/labels/<name>`.
 
 ## Reads
 
