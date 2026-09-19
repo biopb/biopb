@@ -9,7 +9,9 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import List, Tuple
 
+import numpy as np
 from biopb.tensor import TensorFlightClient
+from biopb.tensor._labels import label_image_axes, split_label_array_id
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +360,178 @@ def _to_native_byteorder(levels):
     ]
 
 
+def _label_binding(client, tensor_id: str, tensor_desc):
+    """What a label set needs to line up with its image, or ``None``.
+
+    ``None`` when *tensor_id* names no set -- the path is the only thing that
+    marks one (``biopb.tensor._labels``). Otherwise
+    ``(label_desc, image_desc, image_axes)``: the set's own descriptor, its
+    image's, and for each axis of the set the index of the image axis it
+    indexes. Either of the last two is ``None`` when the image cannot be
+    described or the set does not span it, which leaves the set a Labels layer
+    at its own rank rather than a failure.
+
+    The set's descriptor is re-fetched because the lean catalog row carries
+    neither the pyramid ``build_pyramid_levels`` needs nor the metadata holding
+    the server's stated axis mapping -- one call answers both, where letting
+    each ask separately would open the tensor twice.
+    """
+    address = split_label_array_id(tensor_id)
+    if address is None:
+        return None
+    try:
+        label_desc = client.get_descriptor(
+            tensor_id, with_pyramid=True, with_metadata=True
+        )
+    except Exception:  # noqa: BLE001 - advisory; the catalog row still draws
+        logger.warning("Label descriptor lookup failed for %s", tensor_id)
+        return tensor_desc, None, None
+    try:
+        image_desc = client.get_descriptor(address.image_array_id)
+    except Exception:  # noqa: BLE001 - advisory; see the docstring
+        logger.warning(
+            "Label set %s: image %s could not be described",
+            tensor_id,
+            address.image_array_id,
+        )
+        return label_desc, None, None
+    axes = label_image_axes(label_desc, image_desc)
+    if axes is not None and list(axes) != sorted(axes):
+        # Alignment inserts the missing axes and never permutes, which the
+        # extent rule makes sufficient: a set's axes are the image's in the
+        # image's own order. A mapping that says otherwise is a server the rule
+        # no longer describes, and inserting into it would mislay every axis
+        # silently -- so nothing is aligned and the warning says why.
+        logger.warning(
+            "Label set %s states a reordering axis mapping %s; not aligning",
+            tensor_id,
+            list(axes),
+        )
+        axes = None
+    return label_desc, image_desc, axes
+
+
+def align_label_levels(levels, image_shape, image_axes, *, drop_samples=False):
+    """Each level of a label set, reshaped onto its image layer's axes.
+
+    napari aligns layers of differing rank from the **right**, so a ``T Z Y X``
+    set added beside a ``T C Z Y X`` image would slide its T onto the image's
+    channel axis -- frame 0 shown where frame 40 was asked for, a picture rather
+    than an error. Giving the layer the image's own rank makes napari's
+    positional alignment the correct one, and *image_axes* says where the set's
+    axes land. It must be **ascending** -- this inserts, it does not permute,
+    which the extent rule makes sufficient; :func:`_label_binding` rejects a
+    mapping that would need a transpose.
+
+    The image axes a set does not have are its channel axes, and they are
+    **broadcast, not left singleton**: a singleton puts the layer outside its
+    own extent at every channel but the first, where napari draws nothing rather
+    than clamping -- the mask blanks as you flip channels. A broadcast axis is a
+    view, mapping the whole span onto the one underlying chunk, so the mask
+    shows on every channel for a single read.
+
+    *drop_samples* for an image whose layer is ``rgb``: napari does not count
+    the interleaved samples axis as a layer dimension, so the set's copy of it
+    (the extent rule keeps S at full length) goes too.
+    """
+    missing = [i for i in range(len(image_shape)) if i not in set(image_axes)]
+    aligned = []
+    for level in levels:
+        out = level
+        # Ascending, so each insert lands at its own index in image space:
+        # earlier inserts have already shifted what follows.
+        for axis in missing:
+            out = np.expand_dims(out, axis)
+        target = list(out.shape)
+        for axis in missing:
+            target[axis] = int(image_shape[axis])
+        out = np.broadcast_to(out, tuple(target))
+        if drop_samples:
+            out = out[..., 0]
+        aligned.append(out)
+    return aligned
+
+
+def _add_label_layer(
+    viewer,
+    client,
+    source_id: str,
+    levels,
+    label_desc,
+    image_desc,
+    image_axes,
+    *,
+    name: str,
+    compute_scheduler: str | None,
+):
+    """Add a label set's levels to *viewer* as a ``Labels`` layer.
+
+    The pyramid is the server's, exactly as for an image. That is safe for ids
+    because a set's computed levels are advertised ``nearest`` -- the server
+    refuses to average label values (``adapters/labels.py``) -- and napari never
+    downsamples the data itself, it only picks a level. napari also sets
+    ``editable = not multiscale``, so a multiscale set is already read-only.
+    """
+    from ._viewer_compute import wrap_levels
+
+    if image_axes is not None and image_desc is not None:
+        _, _, _, s_idx = _resolve_axes(image_desc.shape, image_desc.dim_labels)
+        levels = align_label_levels(
+            levels,
+            image_desc.shape,
+            image_axes,
+            drop_samples=s_idx is not None,
+        )
+        # An aligned set has the image's axes, and by the extent rule the image's
+        # grid, so the image's physical sizes are the layer's scale vector and
+        # its names are the layer's axis names.
+        scale_desc = image_desc
+    else:
+        logger.warning(
+            "Label set %s is not bound to its image's axes; adding it at its own rank",
+            getattr(label_desc, "array_id", "?"),
+        )
+        scale_desc = label_desc
+
+    out_ndim = levels[0].ndim
+    levels = wrap_levels(levels, compute_scheduler)
+
+    add_kwargs = {"name": name}
+    scale, phys = build_layer_scale(
+        client,
+        source_id,
+        out_ndim,
+        tensor_id=scale_desc.array_id,
+        tensor_desc=scale_desc,
+    )
+    if scale is not None:
+        add_kwargs["scale"] = scale
+    metadata = {"array_id": label_desc.array_id}
+    if image_desc is not None:
+        # Which image this set annotates. The layer name is a display stem the
+        # user can rename, and an aligned set's axes are the image's, so without
+        # this the pair cannot be recovered from the layer.
+        metadata["image_array_id"] = image_desc.array_id
+    if phys is not None:
+        metadata["ome_physical_size"] = phys
+    dim_labels = canonical_dim_labels(scale_desc)
+    if dim_labels:
+        metadata["dim_labels"] = dim_labels
+    add_kwargs["metadata"] = metadata
+
+    with _origin_initial_view(viewer):
+        if len(levels) > 1:
+            layer = viewer.add_labels(levels, multiscale=True, **add_kwargs)
+        else:
+            layer = viewer.add_labels(levels[0], **add_kwargs)
+    # Said out loud for the single-level case, where napari would leave it True:
+    # a set is a write-once server tensor, and the brush on a dask-backed layer
+    # raises out of napari rather than refusing, so an editable one offers an
+    # edit that cannot land. (Multiscale is already read-only.)
+    layer.editable = False
+    return layer
+
+
 def add_tensor_layer(
     viewer,
     client: TensorFlightClient,
@@ -383,13 +557,28 @@ def add_tensor_layer(
     originating ``metadata['array_id']``, then ``add_image``
     (``multiscale=True`` when there is more than one level).
 
+    **A label set becomes a ``Labels`` layer**, not an image one. The set is an
+    ordinary tensor and its ``array_id`` is the only thing that says so
+    (``<image array_id>/labels/<name>``), so the decision is made here rather
+    than at each call site -- the Tensor Browser and the MCP ``add_tensor``
+    would otherwise have to agree about it separately. Everything up to the add
+    is the same pipeline; what differs is the colour model and that the levels
+    are first aligned onto the image's axes (:func:`align_label_levels`).
+    Nothing is added implicitly: a set is a layer only when it is asked for.
+
     Source resolution, layer *name*, and any cursor/logging/error handling stay
-    with the caller; everything from building levels through ``add_image`` is
-    uniform here so the three call sites can't drift.
+    with the caller; everything from building levels through the add is uniform
+    here so the three call sites can't drift.
 
     Returns the created napari layer.
     """
     from ._viewer_compute import wrap_levels
+
+    # First, because a set's descriptor comes back with the pyramid on it and
+    # so build_pyramid_levels needs no second open.
+    binding = _label_binding(client, tensor_id, tensor_desc)
+    if binding is not None:
+        tensor_desc = binding[0]
 
     levels = build_pyramid_levels(
         client,
@@ -405,6 +594,18 @@ def add_tensor_layer(
     # affects what napari sees; the wire/source bytes stay faithful. Remove once
     # napari handles non-native byte order (tracked upstream from #296).
     levels = _to_native_byteorder(levels)
+
+    if binding is not None:
+        return _add_label_layer(
+            viewer,
+            client,
+            source_id,
+            levels,
+            *binding,
+            name=name,
+            compute_scheduler=compute_scheduler,
+        )
+
     # An interleaved samples axis is trailing (the server's guarantee). napari
     # composites a trailing size-3/4 axis into colour only when
     # told to: rgb is left unset otherwise so napari's own auto-detection still

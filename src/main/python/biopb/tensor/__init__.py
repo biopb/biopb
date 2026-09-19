@@ -20,6 +20,14 @@ Note: Server components have been moved to the biopb-tensor-server package.
 """
 
 from biopb.tensor._catalog_rows import descriptor_from_row, descriptors_from_rows
+from biopb.tensor._labels import (
+    LABELS_SEGMENT,
+    RESERVED_LABEL_PREFIX,
+    LabelAddress,
+    is_reserved_label_name,
+    label_image_axes,
+    split_label_array_id,
+)
 
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
@@ -72,6 +80,14 @@ __all__ = [
     # There is no replacement -- a row is the data structure.
     "descriptor_from_row",
     "descriptors_from_rows",
+    # Label sets: what an array_id says, and how a set lines up with its
+    # image. Pure string/shape rules -- no client needed to ask them.
+    "LABELS_SEGMENT",
+    "RESERVED_LABEL_PREFIX",
+    "LabelAddress",
+    "is_reserved_label_name",
+    "label_image_axes",
+    "split_label_array_id",
     # Client
     "TensorFlightClient",
     "ResolveCancelled",

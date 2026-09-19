@@ -478,6 +478,22 @@ reloaded with `add_tensor`. That one is a server layer like any other, pyramid
 and all, so read it with `viewer.tensor()` rather than `.data` whenever you did
 not add the array yourself.
 
+**A mask can live on the server.** A *label set* is a tensor of its image, named
+`<image array_id>/labels/<name>`, so a segmentation is not necessarily something
+a client made and holds:
+
+```python
+client.label_sets("src0")            # -> ['src0/labels/@ome', 'src0/labels/nuclei']
+viewer.add_tensor("src0/labels/nuclei")   # a Labels layer, not an Image one
+```
+
+`add_tensor` reads the name and builds the right kind of layer, with the image's
+pyramid, scale and axes — so unlike a layer you built, it measures in physical
+units already. It is added on its own, never alongside its image; add both when
+you want both. A `@`-prefixed name is the server's own (`@ome` is rasterized
+from an OME-TIFF's masks); it is read-only, and so is every set — replacing one
+means uploading a new name.
+
 Points and shapes follow the same shape; read the signatures rather than
 guessing them:
 ```python

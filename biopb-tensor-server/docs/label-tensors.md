@@ -355,8 +355,8 @@ delete are full access like every other mutation.
 - **SDK**: `create_tensor` / `upload_array` / `finish_upload` as above;
   `delete_labels(array_id)`; a `label_sets(image_array_id)` convenience over
   the catalog query.
-- **MCP / napari**: `add_tensor` builds a `Labels` layer when the descriptor
-  carries `image-label`; `viewer.tensor(layer)` plus `upload_array` is the
+- **MCP / napari** (implemented): `add_tensor` builds a `Labels` layer when the
+  `array_id` names a set; `viewer.tensor(layer)` plus `upload_array` is the
   round trip. The guide text stops describing masks as a client-only artefact.
 - **SPA** (implemented): the source tree lists a tensor's sets under it; one is
   drawn as an overlay with nearest sampling and a categorical colormap.
@@ -427,6 +427,41 @@ costs the overlay a badge, never the image its viewer.
 A link carries the overlay as `lb=<the set's array_id>` and its alpha as `lo`.
 The whole address, not the bare name, so the parameter is self-checking — a link
 that names one image's set and another image's `id` draws nothing.
+
+### The napari half, as built
+
+Same shape as the SPA's: no new route, no new call. The routing sits in the one
+shared pipeline (`_tensor_utils.add_tensor_layer`), so the Tensor Browser and
+the MCP `add_tensor` cannot disagree about what a set is — and **nothing is
+added implicitly**. A set becomes a layer when it is asked for, never alongside
+its image.
+
+**The path is what says a tensor is a set**, here as in the browser:
+`biopb.tensor._labels` is the Python mirror of `core/labels.py`, the SDK's copy
+because biopb-tensor-server is not an installable dependency of a client. The
+Tensor Browser's `_group_tensors` files each set under its image, which is also
+what keeps a plain image that gained an `@ome` set from reading as a two-tensor
+source — it would lose its shape badge and stop opening on double-click.
+
+**The pyramid is the server's**, exactly as for an image. That is safe for ids
+because a set's computed levels are advertised `nearest`, and napari only
+*picks* a level, it never downsamples the data itself. Two properties come free:
+a multiscale `Labels` layer is `editable = False` in napari, which is what a
+write-once set should be, and building the layer touches one block of the
+coarsest level and nothing else.
+
+**The set is given the image's rank before it is added.** napari aligns layers
+of differing rank from the **right**, so a `T Z Y X` set added beside a
+`T C Z Y X` image lands its `T` on the image's `C` — the same silently-wrong
+picture `labelSelection` avoids in the SPA, arrived at from the other end. The
+channel axes the set does not have are inserted from `image_axes` and
+**broadcast to the image's length, not left singleton**: a singleton axis puts
+the layer outside its own extent at every channel but the first, where napari
+draws nothing rather than clamping, so the mask would blank as the channel
+slider moves. A broadcast axis is a view onto the one underlying chunk, so the
+mask shows on every channel for a single read. Alignment inserts and never
+permutes, which the extent rule makes sufficient; a mapping that would need a
+transpose is refused (the layer is added at its own rank) rather than mislaid.
 
 ## Implementation order
 

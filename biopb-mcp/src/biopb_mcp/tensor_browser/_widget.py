@@ -14,10 +14,11 @@ import os
 import re
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Set
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Sequence, Set
 from urllib.parse import urlparse
 
 from biopb.tensor import ResolveCancelled
+from biopb.tensor._labels import split_label_array_id
 from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -133,6 +134,11 @@ def _get_path_parts(url: str) -> List[str]:
     return parts
 
 
+# Marks a label-set row. A filled ring rather than a word: the row already
+# carries the set's name and shape, and the tree elides long labels.
+_LABEL_GLYPH = "\u25c9"
+
+
 def _format_shape(shape: List[int]) -> str:
     """Format shape as compact string."""
     return "×".join(str(s) for s in shape)
@@ -142,6 +148,61 @@ def _tensor_short_name(array_id: str) -> str:
     """Get short name for tensor from its array_id."""
     parts = [p for p in array_id.split("/") if p]
     return parts[-1] if parts else array_id
+
+
+class _TensorGroup(NamedTuple):
+    """An image tensor and the label sets addressed under it."""
+
+    image: object  #: the image's catalog descriptor
+    label_sets: List[object]  #: its sets, by array_id; empty for a plain tensor
+
+
+def _group_tensors(tensors: Sequence) -> List[_TensorGroup]:
+    """A source's tensors, with each label set filed under the image it annotates.
+
+    The catalog lists a set as an ordinary tensor of the source -- there is no
+    ``role`` column, by decision (biopb/biopb#1059) -- so the path is what says
+    a tensor is one, and this is where the tree reads it.
+
+    Grouping is what keeps "how many tensors" from becoming the wrong question
+    for a browser: an ordinary image that gained an ``@ome`` set would otherwise
+    read as a two-tensor source, lose its shape badge and stop opening on
+    double-click. A set whose image the source does not list keeps a group of
+    its own rather than vanishing -- it should not happen, but a tensor the
+    catalog lists and the tree hides is the worse of the two failures.
+
+    Mirror of the SPA's ``groupTensors`` (``web/packages/app/src/utils/sourceTree.ts``).
+    """
+    groups: Dict[str, _TensorGroup] = {}
+    sets = []
+    for tensor in tensors:
+        address = split_label_array_id(tensor.array_id)
+        if address is not None:
+            sets.append((tensor, address.image_array_id))
+            continue
+        # dict order is insertion order, which leaves images in the order the
+        # server listed them -- it puts image tensors first on purpose.
+        groups.setdefault(tensor.array_id, _TensorGroup(tensor, []))
+    for tensor, image_array_id in sets:
+        group = groups.get(image_array_id)
+        if group is not None:
+            group.label_sets.append(tensor)
+        else:
+            groups[tensor.array_id] = _TensorGroup(tensor, [])
+    for group in groups.values():
+        group.label_sets.sort(key=lambda t: t.array_id)
+    return list(groups.values())
+
+
+def _sole_image(src: CatalogSource):
+    """The source's one image tensor, or ``None`` when it has several.
+
+    What ``len(src.tensors) == 1`` used to answer: whether this source opens as
+    a single layer. Its label sets do not count -- they are added on their own
+    rows, never implicitly with the image.
+    """
+    groups = _group_tensors(src.tensors)
+    return groups[0].image if len(groups) == 1 else None
 
 
 def _is_unresolved(src: CatalogSource) -> bool:
@@ -1680,14 +1741,17 @@ class TensorBrowserWidget(QWidget):
             # Source node
             src = node.source
             assert src is not None
+            # Label sets ride under their image rather than counting as
+            # tensors of the source; see _group_tensors.
+            groups = _group_tensors(src.tensors)
             display_name = node.name
-            if len(src.tensors) == 1:
+            if len(groups) == 1:
                 # Show shape badge for single tensor
-                shape_str = _format_shape(src.tensors[0].shape)
+                shape_str = _format_shape(groups[0].image.shape)
                 display_name = f"{node.name}  [{shape_str}]"
-            elif len(src.tensors) > 1:
+            elif len(groups) > 1:
                 # Show tensor count
-                display_name = f"{node.name}  [{len(src.tensors)} tensors]"
+                display_name = f"{node.name}  [{len(groups)} tensors]"
 
             # No residency indicator. Drawing one cost a live stat walk per
             # source on every browse, and it was painted from a listing
@@ -1700,16 +1764,35 @@ class TensorBrowserWidget(QWidget):
             # readable on hover.
             item.setToolTip(0, display_name)
 
-            # Add nested tensor items for multi-tensor sources
-            if len(src.tensors) > 1:
-                for tensor in src.tensors:
-                    tensor_item = QTreeWidgetItem(item)
-                    tensor_item.setData(0, Qt.ItemDataRole.UserRole, tensor.array_id)
-                    tensor_item.setData(0, Qt.ItemDataRole.UserRole + 1, "tensor")
-                    tensor_item.setData(0, Qt.ItemDataRole.UserRole + 2, src.source_id)
-                    tensor_name = _tensor_short_name(tensor.array_id)
-                    shape_str = _format_shape(tensor.shape)
-                    tensor_item.setText(0, f"{tensor_name}  [{shape_str}]")
+            # Nested rows: one per image when the source has several, and one
+            # per label set under the image it annotates. A set is always its
+            # own row -- it is added as its own layer, never with the image
+            # (the parent row's double-click opens the image alone).
+            for group in groups:
+                parent = item
+                if len(groups) > 1:
+                    parent = self._add_tensor_row(item, src, group.image)
+                for label_set in group.label_sets:
+                    self._add_tensor_row(parent, src, label_set, is_label=True)
+
+    def _add_tensor_row(self, parent, src, tensor, *, is_label=False):
+        """One tensor row under *parent*. Returns it, so sets can nest under it."""
+        row = QTreeWidgetItem(parent)
+        row.setData(0, Qt.ItemDataRole.UserRole, tensor.array_id)
+        row.setData(0, Qt.ItemDataRole.UserRole + 1, "tensor")
+        row.setData(0, Qt.ItemDataRole.UserRole + 2, src.source_id)
+        shape_str = _format_shape(tensor.shape)
+        if is_label:
+            address = split_label_array_id(tensor.array_id)
+            # The set's own name, not the last path segment: a native pyramid
+            # level would otherwise be what the row reads.
+            name = address.name if address else _tensor_short_name(tensor.array_id)
+            text = f"{_LABEL_GLYPH} {name}  [{shape_str}]"
+            row.setToolTip(0, f"Label set “{name}” — adds as a Labels layer")
+        else:
+            text = f"{_tensor_short_name(tensor.array_id)}  [{shape_str}]"
+        row.setText(0, text)
+        return row
 
     def _make_remove_button(self, remove_root: str, display_name: str) -> QPushButton:
         """A small [x] button that removes a drag-dropped branch at its root."""
@@ -1859,10 +1942,8 @@ class TensorBrowserWidget(QWidget):
             source_id = item.data(0, Qt.ItemDataRole.UserRole)
             self._selected_source_id = source_id
             src = self._sources.get(source_id)
-            if src and len(src.tensors) == 1:
-                self._selected_tensor_id = src.tensors[0].array_id
-            else:
-                self._selected_tensor_id = None
+            sole = _sole_image(src) if src else None
+            self._selected_tensor_id = sole.array_id if sole else None
 
             # Multi-tensor source: toggle its field list on click, like a folder
             if item.childCount() > 0:
@@ -1897,12 +1978,12 @@ class TensorBrowserWidget(QWidget):
                 # consented resolve (downloads the file), not a viewer add.
                 self._resolve_source(source_id)
                 return
-            if src and len(src.tensors) == 1:
-                self._selected_source_id = source_id
-                self._selected_tensor_id = src.tensors[0].array_id
-            else:
-                # Multi-tensor source - don't add on double-click
+            sole = _sole_image(src) if src else None
+            if sole is None:
+                # Several images to choose from - don't add on double-click
                 return
+            self._selected_source_id = source_id
+            self._selected_tensor_id = sole.array_id
 
         self._add_to_viewer()
 
@@ -1928,13 +2009,17 @@ class TensorBrowserWidget(QWidget):
             source_id = item.data(0, Qt.ItemDataRole.UserRole)
             src = self._sources.get(source_id)
             is_unresolved_source = src is not None and _is_unresolved(src)
-            if src and len(src.tensors) == 1:
-                tensor_id = src.tensors[0].array_id
+            sole = _sole_image(src) if src else None
+            if sole is not None:
+                tensor_id = sole.array_id
                 is_multi_tensor_source = False
             else:
-                # Multi-tensor or unresolved source
+                # Several images, or an unresolved source. "View all" is
+                # offered for the images, so it is their count that decides.
                 tensor_id = None
-                is_multi_tensor_source = src is not None and len(src.tensors) > 1
+                is_multi_tensor_source = (
+                    src is not None and len(_group_tensors(src.tensors)) > 1
+                )
 
         menu = QMenu(self)
 
@@ -2227,7 +2312,11 @@ class TensorBrowserWidget(QWidget):
         QApplication.setOverrideCursor(Qt.BusyCursor)
 
         try:
-            for tensor in src.tensors:
+            # Images only. A label set is added on its own row, never with the
+            # image: "View all" means every picture this source holds, and a
+            # mask silently laid over one is not that.
+            for group in _group_tensors(src.tensors):
+                tensor = group.image
                 try:
                     tensor_name = _tensor_short_name(tensor.array_id)
                     layer_name = f"{stem}/{tensor_name}"
@@ -2401,7 +2490,8 @@ class TensorBrowserWidget(QWidget):
             url_parts = _get_path_parts(src.source_url)
             stem = url_parts[-1] if url_parts else self._selected_source_id
 
-            if len(src.tensors) == 1:
+            sole = _sole_image(src)
+            if sole is not None and sole.array_id == self._selected_tensor_id:
                 layer_name = stem
             else:
                 tensor_name = _tensor_short_name(self._selected_tensor_id)
