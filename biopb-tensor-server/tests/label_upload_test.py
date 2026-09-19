@@ -24,6 +24,7 @@ from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
 from tests import register_and_catalog
+from tests.label_attachment_test import _write_label_group
 
 SHAPE = (64, 64)
 CHUNK = (32, 32)
@@ -292,31 +293,11 @@ class TestDelete:
     def test_a_native_set_is_the_file_s(self, writable_server, client, tmp_path):
         """An NGFF ``labels/`` group inside the user's store is never deleted."""
         import pyarrow.flight as flight
-        import zarr
 
         zarr_path, _, _ = create_multiresolution_ome_zarr(
             str(tmp_path / "native"), n_levels=1, base_shape=SHAPE, chunk_size=CHUNK
         )
-        group = Path(zarr_path) / "labels" / "own"
-        g = zarr.open_group(str(group), mode="w")
-        g.create_dataset("0", shape=SHAPE, chunks=CHUNK, dtype="uint32")
-        (group / ".zattrs").write_text(
-            json.dumps(
-                {
-                    "multiscales": [
-                        {
-                            "version": "0.4",
-                            "axes": [
-                                {"name": "y", "type": "space"},
-                                {"name": "x", "type": "space"},
-                            ],
-                            "datasets": [{"path": "0"}],
-                        }
-                    ],
-                    "image-label": {"version": "0.4"},
-                }
-            )
-        )
+        group = _write_label_group(Path(zarr_path) / "labels" / "own", levels=1)
         register_and_catalog(
             writable_server, "oz2", _adapter(Path(zarr_path), source_id="oz2")
         )

@@ -643,6 +643,30 @@ class SourceAdapter(ABC):
             images = self._normalized_tensors()
         return images.get(join_fields(self.source_id, parsed.image_field))
 
+    def _attach(
+        self, attr: str, field: str, adapter: TensorAdapter, *, invalidate: bool = False
+    ) -> None:
+        """Set *field* -> *adapter* in the dict named *attr*, lazily created."""
+        d = getattr(self, attr)
+        if d is None:
+            d = {}
+            setattr(self, attr, d)
+        d[field] = adapter
+        if invalidate:
+            self._label_sets_view = None
+
+    def _detach(
+        self, attr: str, field: str, *, invalidate: bool = False
+    ) -> Optional[TensorAdapter]:
+        """Pop *field* from the dict named *attr*; returns it, or None."""
+        d = getattr(self, attr)
+        if not d:
+            return None
+        removed = d.pop(field, None)
+        if removed is not None and invalidate:
+            self._label_sets_view = None
+        return removed
+
     def attach_label_set(self, field: str, adapter: TensorAdapter) -> None:
         """Make *adapter* answer for label field *field* on this source.
 
@@ -652,22 +676,14 @@ class SourceAdapter(ABC):
         has no tensors to check against yet, and the upload kind validates at
         create anyway.
         """
-        if self._attached_label_sets is None:
-            self._attached_label_sets = {}
-        self._attached_label_sets[field] = adapter
-        self._label_sets_view = None
+        self._attach("_attached_label_sets", field, adapter, invalidate=True)
 
     def detach_label_set(self, field: str) -> Optional[TensorAdapter]:
         """Stop answering for an attached *field*; returns it, or None.
 
         Only what was attached: a set the file carries is the file's.
         """
-        if not self._attached_label_sets:
-            return None
-        removed = self._attached_label_sets.pop(field, None)
-        if removed is not None:
-            self._label_sets_view = None
-        return removed
+        return self._detach("_attached_label_sets", field, invalidate=True)
 
     @property
     def label_uploads(self) -> Dict[str, TensorAdapter]:
@@ -682,9 +698,7 @@ class SourceAdapter(ABC):
 
     def attach_label_upload(self, field: str, adapter: TensorAdapter) -> None:
         """Route *field* to an upload in flight; see :attr:`label_uploads`."""
-        if self._label_uploads is None:
-            self._label_uploads = {}
-        self._label_uploads[field] = adapter
+        self._attach("_label_uploads", field, adapter)
 
     def detach_label_upload(self, field: str) -> Optional[TensorAdapter]:
         """Stop routing *field* to an upload; returns it, or None.
@@ -692,9 +706,7 @@ class SourceAdapter(ABC):
         The reclaim sweep's half of the lifecycle: a tombstone stops being
         addressable here, exactly as a discarded source stops being registered.
         """
-        if not self._label_uploads:
-            return None
-        return self._label_uploads.pop(field, None)
+        return self._detach("_label_uploads", field)
 
     def resolve_tensor(self, tensor_id: Optional[str]) -> TensorAdapter:
         """The adapter bound to *tensor_id*: a label set of this source, else

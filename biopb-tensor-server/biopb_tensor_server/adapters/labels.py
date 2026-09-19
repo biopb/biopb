@@ -201,16 +201,20 @@ def open_label_set(
     image_field: str,
     name: str,
     content_version: Optional[bytes],
+    zattrs: Optional[dict] = None,
 ) -> Optional[LabelSetAdapter]:
     """A :class:`LabelSetAdapter` on the NGFF label group at *group*, or None.
 
     None, with a warning, for anything that cannot be opened as labels: no
     readable ``.zattrs``, no level-0 array, or a dtype that is not an integer
-    (a label is an id; there is nothing a float set could mean here).
+    (a label is an id; there is nothing a float set could mean here). Pass an
+    already-parsed *zattrs* when the caller has one, so *group*'s root file
+    is not read twice.
     """
     import zarr
 
-    zattrs = read_zattrs(group)
+    if zattrs is None:
+        zattrs = read_zattrs(group)
     if zattrs is None:
         logger.warning(f"labels: {group} has no readable .zattrs; skipped")
         return None
@@ -333,6 +337,7 @@ def sidecar_label_sets(source_id: str, labels_dir: Path) -> Dict[str, LabelSetAd
             image_field=image_field,
             name=name,
             content_version=content_version,
+            zattrs=zattrs,
         )
         if label_set is not None:
             # Minted by an earlier life of this server, under its own
@@ -407,16 +412,17 @@ def create_label_upload(
             f"{array_id!r} already exists. A set's name is taken for as long "
             f"as it is served; delete it first, or upload under another name."
         )
+    images = parent._normalized_tensors()
     if not desc.dim_labels:
         # The extent rule leaves exactly one legal set of axes for this image,
         # so a request that named none is filled in rather than refused. In
         # place, so the descriptor ``create_tensor`` echoes back carries them:
         # everything downstream (the sidecar's NGFF, the chunk grid, the
         # client's own later calls) is built from that descriptor.
-        image = parent.label_image_descriptor(field)
+        image = parent.label_image_descriptor(field, images=images)
         if image is not None:
             desc.dim_labels.extend(label_extent(image.dim_labels, image.shape)[0])
-    why = parent.label_binding_error(field, desc)
+    why = parent.label_binding_error(field, desc, images=images)
     if why is not None:
         raise ValueError(f"{array_id!r} {why}")
 

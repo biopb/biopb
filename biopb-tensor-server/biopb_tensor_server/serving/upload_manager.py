@@ -158,6 +158,20 @@ def _reap_step(adapter: Any, now: float, ttl: float) -> Tuple[bool, bool]:
     return expired, age is not None and age > ttl
 
 
+def _reap_outcome(expired_now: bool, stale: bool) -> Optional[str]:
+    """``"expired"``, ``"reclaimed"``, or None, for one entity's sweep step.
+
+    The registered kinds and a source's label uploads take the identical
+    decision in :meth:`reap`; only what each does about it -- a different
+    namespace, registry vs. a source's own dict -- differs per loop.
+    """
+    if expired_now:
+        return "expired"
+    if stale:
+        return "reclaimed"
+    return None
+
+
 class UploadManager:
     """The DoPut boundary: picks the kind, registers, translates errors."""
 
@@ -638,10 +652,11 @@ class UploadManager:
         for source_id, adapter in self._registry.snapshot():
             if upload_of(adapter) is not None:
                 expired_now, stale = _reap_step(adapter, now, ttl)
-                if expired_now:
+                outcome = _reap_outcome(expired_now, stale)
+                if outcome == "expired":
                     self._drop_catalog_row(adapter, source_id)
                     expired += 1
-                elif stale:
+                elif outcome == "reclaimed":
                     # Safe without a compare-and-remove: a tombstone is
                     # terminal and its id cannot be re-registered while it
                     # stands, so this is still the adapter the snapshot saw.
@@ -652,10 +667,11 @@ class UploadManager:
             # on the source rather than in the registry.
             for field, label_set in list(_label_uploads(adapter).items()):
                 expired_now, stale = _reap_step(label_set, now, ttl)
-                if expired_now:
+                outcome = _reap_outcome(expired_now, stale)
+                if outcome == "expired":
                     self._unlist_label_set(adapter, field)
                     expired += 1
-                elif stale:
+                elif outcome == "reclaimed":
                     adapter.detach_label_upload(field)
                     reclaimed += 1
                     logger.info(f"Reclaimed discarded label upload {source_id}/{field}")
