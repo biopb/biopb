@@ -335,9 +335,7 @@ class PrecacheWorker:
             # The catalog's view: image tensors and label sets alike.
             descriptors = catalog_tensors(source_adapter)
         except Exception:
-            logger.exception(
-                "precache: list_tensor_descriptors failed for %s", source_id
-            )
+            logger.exception("precache: catalog_tensors failed for %s", source_id)
             return False
 
         for td in descriptors:

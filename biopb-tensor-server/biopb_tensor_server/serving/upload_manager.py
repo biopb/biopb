@@ -53,7 +53,7 @@ from biopb_tensor_server.adapters._writable import (
 )
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
+from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, read_zattrs, upload_state
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.errors import (
     UploadClosedError,
@@ -200,20 +200,19 @@ class UploadManager:
         discovery to serve as a partial source. Runs from the server's
         constructor, before any source is registered. Returns the count.
 
-        Top-level ``*.zarr`` directories of ``write_dir`` only, which is where
-        ``OmeZarrAdapter.create_upload`` mints them.
+        The two layouts the server mints: ``write_dir/*.zarr``
+        (``OmeZarrAdapter.create_upload``) and the label sidecars
+        ``write_dir/labels/<source_id>/*.zarr``.
         """
         write_dir = self._write_dir
         if write_dir is None or not write_dir.is_dir():
             return 0
         removed = 0
-        for store in sorted(write_dir.glob("*.zarr")):
-            zattrs = store / ".zattrs"
-            try:
-                state = upload_state(json.loads(zattrs.read_text()))
-            except (OSError, ValueError):
-                continue
-            if state != UPLOAD_PENDING:
+        stores = list(write_dir.glob("*.zarr")) + list(
+            write_dir.glob("labels/*/*.zarr")
+        )
+        for store in sorted(stores):
+            if upload_state(read_zattrs(store)) != UPLOAD_PENDING:
                 continue
             shutil.rmtree(store, ignore_errors=True)
             removed += 1

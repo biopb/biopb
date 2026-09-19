@@ -7,7 +7,8 @@ a sidecar the server minted for an upload. :class:`LabelSetAdapter` is
 group and bound as a tensor of the *parent* source -- same ``source_id``, field
 ``[<image field>/]labels/<name>`` -- so its chunk ids, catalog entry and
 ``get_flight_info`` answer are the parent's, and its native levels ride under
-its own field.
+its own field (``OmeZarrAdapter.get_level_adapter`` composes the level's name
+from the set's).
 
 What a set adds over a plain OME-Zarr image:
 
@@ -24,42 +25,41 @@ What a set adds over a plain OME-Zarr image:
 
 Two readers build sets: :func:`native_label_sets` for an image group's
 ``labels/`` (called from ``OmeZarrAdapter.get_embedded_labels``) and
-:func:`sidecar_label_sets` for ``<write_dir>/labels/<source_id>/`` (called by
-the registry at registration). Both skip what they cannot serve -- a set with
-a float dtype, an unreadable ``.zattrs`` -- with a warning rather than costing
-the image its registration.
+:func:`sidecar_label_sets` for ``<write_dir>/labels/<source_id>/``, which
+:func:`sidecar_attacher` runs at registration. Both skip only what they cannot
+*open* -- a float dtype, an unreadable ``.zattrs`` -- with a warning; whether
+a set spans its image is checked once for every origin where the sets meet
+(``SourceAdapter.label_sets``).
 
 Design: ``biopb-tensor-server/docs/label-tensors.md``.
 """
 
 from __future__ import annotations
 
-import json
+import dataclasses
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter, _first_dataset_path
 from biopb_tensor_server.adapters.zarr import (
     UPLOAD_READY,
-    ZarrAdapter,
+    read_zattrs,
     upload_state,
     with_upload_state,
 )
-from biopb_tensor_server.core.axes import canonical_axis
-from biopb_tensor_server.core.chunk import build_pyramid_plan
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
-from biopb_tensor_server.core.labels import label_field
+from biopb_tensor_server.core.labels import join_fields, label_field
 
 __all__ = [
     "LabelSetAdapter",
-    "extent_mismatch",
     "native_label_sets",
     "open_label_set",
+    "sidecar_attacher",
     "sidecar_attrs",
     "sidecar_dir",
     "sidecar_label_sets",
@@ -102,63 +102,16 @@ class LabelSetAdapter(OmeZarrAdapter):
         self._content_version = content_version
         self._parent_array_id = parent_array_id
 
-    # -- identity --------------------------------------------------------------
-
-    @property
-    def parent_array_id(self) -> str:
-        return self._parent_array_id
-
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        from biopb_tensor_server.core.adapter_base import catalog_entry
-
-        return [catalog_entry(self.get_tensor_descriptor())]
-
     def get_embedded_labels(self) -> Dict[str, Any]:
-        return {}  # a set has no sets
-
-    # -- serving ---------------------------------------------------------------
-
-    def get_level_adapter(self, path: str) -> Optional[ZarrAdapter]:
-        """A native level of this set, routed under the set's own field.
-
-        ``labels/nuclei/1`` is level ``1`` of set ``nuclei``, so the level's
-        chunk ids carry that full field and
-        ``SourceAdapter.resolve_chunk_adapter`` finds its way back here. The
-        level shares the set's ``content_version``: it is the same content,
-        and a level minting its own directory-stat token would let a level
-        chunk outlive a re-upload of the set.
-        """
-        if path in self._level_adapters:
-            return self._level_adapters[path]
-        level = ZarrAdapter(
-            self._open_level_array(path),
-            source_id=self.source_id,
-            dim_labels=self.dim_labels,
-        )
-        level._tensor_name = f"{self._tensor_name}/{path}"
-        level._content_version = self._content_version
-        self._level_adapters[path] = level
-        return level
+        return {}  # a set has no sets, and never looks for a labels/ of its own
 
     def _advertised_pyramid(
         self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
     ) -> List[PyramidLevel]:
         """Native levels as they are; computed levels always ``nearest``."""
-        levels = None
-        try:
-            levels = self.get_native_pyramid_levels()
-        except Exception:
-            logger.exception(
-                "labels: native enumeration failed for %s", base_desc.array_id
-            )
-        if levels is None:
-            levels = build_pyramid_plan(
-                list(base_desc.shape),
-                list(base_desc.dim_labels),
-                reduction_method="nearest",
-                **pyramid_config.level_kwargs(),
-            )
-        return levels
+        return super()._advertised_pyramid(
+            base_desc, dataclasses.replace(pyramid_config, reduction_method="nearest")
+        )
 
     def get_tensor_metadata(self) -> Optional[dict]:
         """The set's own NGFF metadata, with ``image-label`` naming its image.
@@ -183,31 +136,23 @@ class LabelSetAdapter(OmeZarrAdapter):
 # -- readers ------------------------------------------------------------------
 
 
-def _read_zattrs(group: Path) -> Optional[dict]:
-    try:
-        parsed = json.loads((group / ".zattrs").read_text())
-    except (OSError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
 def open_label_set(
     group: Path,
     *,
     source_id: str,
-    field: str,
+    image_field: str,
+    name: str,
     content_version: Optional[bytes],
-    parent_array_id: str,
 ) -> Optional[LabelSetAdapter]:
     """A :class:`LabelSetAdapter` on the NGFF label group at *group*, or None.
 
-    None, with a warning, for anything that cannot be served as labels: no
+    None, with a warning, for anything that cannot be opened as labels: no
     readable ``.zattrs``, no level-0 array, or a dtype that is not an integer
     (a label is an id; there is nothing a float set could mean here).
     """
     import zarr
 
-    zattrs = _read_zattrs(group)
+    zattrs = read_zattrs(group)
     if zattrs is None:
         logger.warning(f"labels: {group} has no readable .zattrs; skipped")
         return None
@@ -223,56 +168,12 @@ def open_label_set(
     return LabelSetAdapter(
         arr,
         source_id,
-        field,
+        label_field(image_field, name),
         zattrs=zattrs,
         root_path=str(group),
         content_version=content_version,
-        parent_array_id=parent_array_id,
+        parent_array_id=join_fields(source_id, image_field),
     )
-
-
-def _parent_array_id(source_id: str, image_field: str) -> str:
-    return f"{source_id}/{image_field}" if image_field else source_id
-
-
-def _axis_key(label: str) -> str:
-    """What two axes must agree on: the canonical name where the label has
-    one, else the label itself (an unrecognized axis matches only itself)."""
-    return canonical_axis(label) or str(label).lower()
-
-
-def extent_mismatch(
-    label_labels: Sequence[str],
-    label_shape: Sequence[int],
-    image_labels: Sequence[str],
-    image_shape: Sequence[int],
-) -> Optional[str]:
-    """Why a set of *label_shape* over *label_labels* does not span the image,
-    or None when it does.
-
-    The extent rule (design, "Extent"): a set's axes are the image's canonical
-    axes with the channel axis dropped, each at the image's full length, so a
-    label pixel and its image pixel share an index. Both sides are compared
-    in canonical order -- the caller hands in normalized descriptors -- by
-    canonical axis name, so ``"Z"`` and ``"depth"`` agree.
-    """
-    expected = [
-        (_axis_key(lab), int(size))
-        for lab, size in zip(image_labels, image_shape, strict=True)
-        if canonical_axis(lab) != "c"
-    ]
-    actual = [
-        (_axis_key(lab), int(size))
-        for lab, size in zip(label_labels, label_shape, strict=True)
-    ]
-    if [a for a, _ in actual] != [e for e, _ in expected]:
-        return (
-            f"axes {list(label_labels)} do not match the image's non-channel "
-            f"axes {[lab for lab, _ in expected]}"
-        )
-    if [n for _, n in actual] != [n for _, n in expected]:
-        return f"shape {list(label_shape)} does not match the image's {[n for _, n in expected]}"
-    return None
 
 
 def native_label_sets(
@@ -288,8 +189,7 @@ def native_label_sets(
     labels_dir = image_group / "labels"
     if not labels_dir.is_dir():
         return {}
-    zattrs = _read_zattrs(labels_dir) or {}
-    names = zattrs.get("labels")
+    names = (read_zattrs(labels_dir) or {}).get("labels")
     if not isinstance(names, list):
         names = sorted(d.name for d in labels_dir.iterdir() if (d / ".zattrs").exists())
     sets: Dict[str, LabelSetAdapter] = {}
@@ -299,16 +199,15 @@ def native_label_sets(
                 f"labels: {labels_dir} lists unusable name {name!r}; skipped"
             )
             continue
-        field = label_field(image_field, name)
         label_set = open_label_set(
             labels_dir / name,
             source_id=parent.source_id,
-            field=field,
+            image_field=image_field,
+            name=name,
             content_version=parent.content_version,
-            parent_array_id=_parent_array_id(parent.source_id, image_field),
         )
         if label_set is not None:
-            sets[field] = label_set
+            sets[label_field(image_field, name)] = label_set
     return sets
 
 
@@ -333,68 +232,55 @@ def sidecar_attrs(image_field: str, content_version: bytes) -> dict:
     return attrs
 
 
-def sidecar_label_sets(
-    source_id: str, labels_dir: Path, parent: Any
-) -> Dict[str, LabelSetAdapter]:
+def sidecar_label_sets(source_id: str, labels_dir: Path) -> Dict[str, LabelSetAdapter]:
     """The finished sidecar sets of *source_id* under *labels_dir*, keyed by field.
 
     ``<name>.zarr`` groups whose upload marker reads ``ready``; a pending one
     is an upload still filling (or one that died, which the boot sweep takes),
-    and is not a tensor yet.
-
-    Each set is checked against *parent* -- the registered (normalized)
-    adapter -- before it is attached: its image field must name a tensor of
-    the parent, and its axes and shape must span that image
-    (:func:`extent_mismatch`). The upload path refuses such a set at create,
-    so this guards what reached the directory by other means, and a store
-    whose image changed shape under it. A set that fails is skipped with a
-    warning; it never costs the source its registration.
+    and is not a tensor yet. The token is server-minted, so a store without a
+    readable one is corrupt and skipped rather than served unversioned.
     """
     root = sidecar_dir(labels_dir, source_id)
     if not root.is_dir():
         return {}
-    from biopb_tensor_server.core.normalize import normalize_adapter
-
-    images = {d.array_id: d for d in parent.list_tensor_descriptors()}
     sets: Dict[str, LabelSetAdapter] = {}
     for store in sorted(root.glob("*.zarr")):
-        zattrs = _read_zattrs(store)
+        zattrs = read_zattrs(store)
         if zattrs is None or upload_state(zattrs) != UPLOAD_READY:
             continue
         block = (zattrs.get("biopb") or {}).get(SIDECAR_ATTR) or {}
-        image_field = block.get("image_field") or ""
-        token = block.get("content_version")
         try:
-            content_version = bytes.fromhex(token) if isinstance(token, str) else None
-        except ValueError:
-            content_version = None
-        name = store.name[: -len(".zarr")]
-        field = label_field(image_field, name)
-        parent_array_id = _parent_array_id(source_id, image_field)
-        image = images.get(parent_array_id)
-        if image is None:
+            content_version = bytes.fromhex(block["content_version"])
+        except (KeyError, TypeError, ValueError):
             logger.warning(
-                f"labels: {store} binds to {parent_array_id!r}, which is not a "
-                f"tensor of {source_id}; skipped"
+                f"labels: {store} carries no usable content_version; skipped"
             )
             continue
+        image_field = block.get("image_field") or ""
+        name = store.name[: -len(".zarr")]
         label_set = open_label_set(
             store,
             source_id=source_id,
-            field=field,
+            image_field=image_field,
+            name=name,
             content_version=content_version,
-            parent_array_id=parent_array_id,
         )
-        if label_set is None:
-            continue
-        desc = normalize_adapter(label_set).get_tensor_descriptor()
-        why = extent_mismatch(
-            desc.dim_labels, desc.shape, image.dim_labels, image.shape
-        )
-        if why is not None:
-            logger.warning(
-                f"labels: {store} does not span {parent_array_id}: {why}; skipped"
-            )
-            continue
-        sets[field] = label_set
+        if label_set is not None:
+            sets[label_field(image_field, name)] = label_set
     return sets
+
+
+def sidecar_attacher(labels_dir: Path) -> Callable[[str, Any], None]:
+    """The registry's ``on_register`` hook: attach a source's finished sidecars.
+
+    Runs at the one registration chokepoint, because a sidecar is keyed by
+    ``source_id`` and no format knows about it. The registry stays ignorant of
+    the layout; this module owns it. A sidecar that will not open costs the
+    set, never the source.
+    """
+
+    def attach(source_id: str, adapter: Any) -> None:
+        for field, label_set in sidecar_label_sets(source_id, labels_dir).items():
+            adapter.attach_label_set(field, label_set)
+
+    return attach

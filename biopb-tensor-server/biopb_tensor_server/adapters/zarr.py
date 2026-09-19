@@ -45,6 +45,19 @@ UPLOAD_PENDING = "pending"
 UPLOAD_READY = "ready"
 
 
+def read_zattrs(store: Path) -> Optional[dict]:
+    """The root ``.zattrs`` of a local store as a dict, or None if unreadable.
+
+    The one reader for the server's own stores (uploads, label sidecars);
+    discovery reads through ``ClaimContext`` because its paths may be remote.
+    """
+    try:
+        parsed = json.loads((store / ".zattrs").read_text())
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def upload_state(zattrs: Any) -> Optional[str]:
     """The upload marker's state from a parsed ``.zattrs``, or None if unmarked."""
     if not isinstance(zattrs, dict):

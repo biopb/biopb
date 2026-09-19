@@ -71,6 +71,7 @@ from biopb.tensor.ticket_pb2 import (
 from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
+from biopb_tensor_server.adapters.labels import sidecar_attacher
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -430,7 +431,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # Uploaded label sets live under write_dir/labels/<source_id>/ and are
         # attached to their source at registration (biopb/biopb#1059).
         self.sources = SourceRegistry(
-            labels_dir=Path(write_dir) / "labels" if write_dir is not None else None
+            on_register=sidecar_attacher(Path(write_dir) / "labels")
+            if write_dir is not None
+            else None
         )
         self._writable = writable
         # The catalog, or None for a catalog-less server. The server never

@@ -738,6 +738,19 @@ class OmeZarrAdapter(ZarrAdapter):
                         ch.get("label", f"ch{i}") for i, ch in enumerate(channels)
                     ]
 
+    def _iter_hcs_fields(self):
+        """``(well_name, well_path, field_idx, field_path)`` for every plate field."""
+        for well_name, well_path in self._hcs_well_paths.items():
+            well_meta = self._hcs_well_metadata.get(well_name, {})
+            images = well_meta.get("well", {}).get("images", [])
+            for field_idx, image_info in enumerate(images):
+                yield (
+                    well_name,
+                    well_path,
+                    field_idx,
+                    image_info.get("path", str(field_idx)),
+                )
+
     def _enumerate_hcs_fields(self) -> List[TensorDescriptor]:
         """Enumerate all fields in HCS plate as flattened tensor list.
 
@@ -757,53 +770,47 @@ class OmeZarrAdapter(ZarrAdapter):
 
         descriptors = []
 
-        for well_name, well_path in self._hcs_well_paths.items():
-            well_meta = self._hcs_well_metadata.get(well_name, {})
-            well_info = well_meta.get("well", {})
-            images = well_info.get("images", [])
+        for well_name, well_path, field_idx, field_path in self._iter_hcs_fields():
+            field_key = f"{well_name}/{field_idx}"
 
-            for field_idx, image_info in enumerate(images):
-                field_path = image_info.get("path", str(field_idx))
-                field_key = f"{well_name}/{field_idx}"
+            shape = []
+            dtype = ""
+            dim_labels = self.dim_labels
 
-                shape = []
-                dtype = ""
-                dim_labels = self.dim_labels
-
-                field_zattrs = self._read_zattrs_at(well_path, field_path)
-                multiscales = (field_zattrs or {}).get("multiscales", [])
-                res = _first_dataset_path(multiscales)
-                if res is not None:
-                    # Open the level-0 array for actual shape/dtype.
-                    try:
-                        arr = zarr.open_array(
-                            self._field_array_path(well_path, field_path, res),
-                            mode="r",
-                        )
-                        shape = list(arr.shape)
-                        dtype = arr.dtype.str
-                    except Exception:
-                        # Fallback: leave shape/dtype unfilled (metadata-only).
-                        pass
-                if multiscales:
-                    dim_labels = (
-                        _axes_to_dim_labels(multiscales[0].get("axes", []))
-                        or self.dim_labels
+            field_zattrs = self._read_zattrs_at(well_path, field_path)
+            multiscales = (field_zattrs or {}).get("multiscales", [])
+            res = _first_dataset_path(multiscales)
+            if res is not None:
+                # Open the level-0 array for actual shape/dtype.
+                try:
+                    arr = zarr.open_array(
+                        self._field_array_path(well_path, field_path, res),
+                        mode="r",
                     )
-
-                descriptors.append(
-                    TensorDescriptor(
-                        # Globally-unique array_id = source_id/field (identity
-                        # policy). The HCS field is itself hierarchical
-                        # ("well_name/field_index"), so array_id is
-                        # "source_id/well_name/field_index"; source_id is slash-free
-                        # and recovered by splitting on the first '/'.
-                        array_id=f"{self.source_id}/{field_key}",
-                        dim_labels=dim_labels,
-                        shape=shape,
-                        dtype=dtype,
-                    )
+                    shape = list(arr.shape)
+                    dtype = arr.dtype.str
+                except Exception:
+                    # Fallback: leave shape/dtype unfilled (metadata-only).
+                    pass
+            if multiscales:
+                dim_labels = (
+                    _axes_to_dim_labels(multiscales[0].get("axes", []))
+                    or self.dim_labels
                 )
+
+            descriptors.append(
+                TensorDescriptor(
+                    # Globally-unique array_id = source_id/field (identity
+                    # policy). The HCS field is itself hierarchical
+                    # ("well_name/field_index"), so array_id is
+                    # "source_id/well_name/field_index"; source_id is slash-free
+                    # and recovered by splitting on the first '/'.
+                    array_id=f"{self.source_id}/{field_key}",
+                    dim_labels=dim_labels,
+                    shape=shape,
+                    dtype=dtype,
+                )
+            )
 
         return descriptors
 
@@ -816,19 +823,15 @@ class OmeZarrAdapter(ZarrAdapter):
         """
         from biopb_tensor_server.adapters.labels import native_label_sets
 
-        root = getattr(self, "_group_root_path", None)
+        root = self._group_root_path
         if root is None:
             return {}
         if not self._is_hcs_plate:
             return native_label_sets(self, Path(root), "")
         sets: Dict[str, TensorAdapter] = {}
-        for well_name, well_path in self._hcs_well_paths.items():
-            well_meta = self._hcs_well_metadata.get(well_name, {})
-            images = well_meta.get("well", {}).get("images", [])
-            for field_idx, image_info in enumerate(images):
-                field_path = image_info.get("path", str(field_idx))
-                group = Path(self._field_array_path(well_path, field_path, ""))
-                sets.update(native_label_sets(self, group, f"{well_name}/{field_idx}"))
+        for well_name, well_path, field_idx, field_path in self._iter_hcs_fields():
+            group = Path(self._field_array_path(well_path, field_path, ""))
+            sets.update(native_label_sets(self, group, f"{well_name}/{field_idx}"))
         return sets
 
     def get_ome_metadata(self) -> dict:
@@ -1161,8 +1164,15 @@ class OmeZarrAdapter(ZarrAdapter):
             source_id=self.source_id,
             dim_labels=self.dim_labels,
         )
-        # Set tensor name for multi-tensor context
-        level_adapter._tensor_name = path
+        # The level rides under this adapter's own field -- ``1`` for an
+        # image, ``labels/nuclei/1`` for a label set -- and carries the same
+        # content_version: it is the same content, and a level minting its own
+        # directory-stat token would let level chunks outlive a re-registration
+        # that invalidated the base ones (biopb/biopb#1059).
+        level_adapter._tensor_name = (
+            path if self._tensor_name is None else f"{self._tensor_name}/{path}"
+        )
+        level_adapter._content_version = self._content_version
 
         self._level_adapters[path] = level_adapter
         return level_adapter
@@ -1170,6 +1180,12 @@ class OmeZarrAdapter(ZarrAdapter):
     def _open_level_array(self, path: str):
         """Open the Zarr array at the given level path (relative to group root)."""
         import zarr
+
+        # The group root was found (or threaded) at construction; walk only
+        # when it was not, which is the remote-store shape. The walk would
+        # otherwise stop early at an array that carries its own ``.zattrs``.
+        if self._group_root_path is not None:
+            return zarr.open_array(os.path.join(self._group_root_path, path), mode="r")
 
         store_path = _store_filesystem_path(self.zarr_array.store)
 

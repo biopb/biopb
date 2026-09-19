@@ -331,6 +331,7 @@ class TestHcsTotality:
         obj._hcs_well_metadata = {"A01": {"well": {"images": [{"path": "0"}]}}}
         # __init__ is bypassed here, so mirror the per-instance caches it sets.
         obj._field_adapters = {}
+        obj._group_root_path = None
         return obj
 
     def test_unknown_well_raises_not_found(self):

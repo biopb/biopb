@@ -91,10 +91,11 @@ A mask pinned to one channel (OME `TheC`) rasterizes into the shared set; the
 channel distinction is not carried.
 
 The rule is checked twice: the upload refuses a set that would not span its
-image at create, and the registry checks a sidecar again when it reads it
-(`extent_mismatch`), so a store that reached the directory by other means, or
-whose image changed shape under it, is skipped with a warning rather than
-served misaligned.
+image at create, and `SourceAdapter.label_sets` checks every set again where
+the origins meet (`extent_mismatch`, on normalized descriptors), so a native
+set of another shape, a sidecar that reached the directory by other means, or
+a store whose image changed shape under it is dropped with a warning rather
+than served misaligned.
 
 ## Three origins, one tensor shape
 
@@ -139,9 +140,10 @@ ignorant of sidecars:
 
 - `get_embedded_labels()` is the hook a format overrides, beside
   `get_embedded_rois` (`OmeZarrAdapter` reads its NGFF `labels/` group there);
-  `attach_label_set` / `detach_label_set` are what the registry (finished
-  sidecars, at registration) and the upload kind (at `finish`; `delete`) use;
-  `label_sets` is the merged view, every set normalized like any tensor.
+  `attach_label_set` / `detach_label_set` are what the registry's
+  `on_register` hook (finished sidecars, `sidecar_attacher`) and the upload
+  kind (at `finish`; `delete`) use; `label_sets` is the merged view, every
+  set normalized like any tensor and checked against the image it binds to.
 - `resolve_tensor(tensor_id)` and `resolve_chunk_adapter(field)` are the two
   lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
   `.../labels/<name>[/<level>]` field answers from `label_sets`, everything
@@ -154,7 +156,8 @@ ignorant of sidecars:
 A set's adapter is `LabelSetAdapter` (`adapters/labels.py`): `OmeZarrAdapter`
 opened on the label group, bound under the parent's `source_id` with the set's
 field as its tensor name, so its chunk ids and native levels ride under
-`<image>/labels/<name>`.
+`<image>/labels/<name>` (a level's name and `content_version` compose from its
+adapter's, for images and sets alike).
 
 ## Reads
 

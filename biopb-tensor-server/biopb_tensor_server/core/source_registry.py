@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.normalize import normalize_adapter
@@ -51,13 +50,17 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
 
-    def __init__(self, labels_dir: Optional[Path] = None) -> None:
-        """*labels_dir* is ``<write_dir>/labels``: where uploaded label sets
-        live, one directory per source_id. None on a server with no
-        ``write_dir``, which then has no sidecars to attach."""
+    def __init__(
+        self, on_register: Optional[Callable[[str, SourceAdapter], None]] = None
+    ) -> None:
+        """*on_register* runs on every registered adapter before it is
+        published, for what has to happen at the one chokepoint but is not
+        the registry's to know -- attaching a source's uploaded label sets
+        (``adapters.labels.sidecar_attacher``). Its failure is logged, never
+        the registration's: a source is its pixels first."""
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
-        self._labels_dir = labels_dir
+        self._on_register = on_register
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -99,33 +102,17 @@ class SourceRegistry:
                 f"by splitting on the first '/'."
             )
         adapter = normalize_adapter(adapter)
-        self._attach_sidecar_labels(source_id, adapter)
+        if self._on_register is not None:
+            try:
+                self._on_register(source_id, adapter)
+            except Exception:
+                logger.warning(
+                    f"on_register hook failed for {source_id}", exc_info=True
+                )
         with self._lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
         return adapter
-
-    def _attach_sidecar_labels(self, source_id: str, adapter: SourceAdapter) -> None:
-        """Attach the finished uploaded label sets this source has on disk.
-
-        Here, at the one registration chokepoint, because a sidecar is keyed
-        by ``source_id`` and no format knows about it (biopb/biopb#1059). A
-        sidecar that will not open costs the set, never the source: a source
-        is its pixels first.
-        """
-        if self._labels_dir is None:
-            return
-        try:
-            from biopb_tensor_server.adapters.labels import sidecar_label_sets
-
-            for field, label_set in sidecar_label_sets(
-                source_id, self._labels_dir, adapter
-            ).items():
-                adapter.attach_label_set(field, label_set)
-        except Exception:
-            logger.warning(
-                f"labels: could not attach sidecar sets of {source_id}", exc_info=True
-            )
 
     def register_new(
         self, source_id: str, adapter: SourceAdapter
