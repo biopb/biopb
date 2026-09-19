@@ -140,6 +140,25 @@ class TestRasterizedMaskAdapter:
         out2 = adapter.get_data(ChunkBounds(start=[3, 3], stop=[6, 6]))
         assert (out2 == 0).all()  # bbox ends exactly at 3, this chunk starts there
 
+    def test_y_x_are_found_by_label_not_position(self):
+        """An interleaved RGB(A) source keeps its trailing samples axis (``S``)
+        here -- ``label_extent`` drops only the channel axis -- so Y/X are NOT
+        reliably the last two axes, and locating them positionally paints the
+        wrong plane entirely."""
+        bmp = np.zeros((4, 4))
+        bmp[1:3, 1:3] = 1
+        meta = _meta({"Image:0": [_mask(0, 0, 4, 4, bmp)]})
+        adapter = self._adapter(
+            self._shapes(meta, dims=("Z", "Y", "X", "S")),
+            dim_labels=("Z", "Y", "X", "S"),
+            shape=(1, 4, 4, 3),
+        )
+        out = adapter.get_data(ChunkBounds(start=[0, 0, 0, 0], stop=[1, 4, 4, 3]))
+        assert out.shape == (1, 4, 4, 3)
+        assert out[0, 2, 2, 0] == 1
+        assert out[0, 0, 0, 0] == 0
+        assert (out[0, 2, 2, :] == 1).all()  # broadcasts across the samples axis
+
     def test_z_pin_applies_only_to_its_own_plane(self):
         bmp = np.ones((3, 3))
         meta = _meta({"Image:0": [_mask(0, 0, 3, 3, bmp, the_z=1)]})

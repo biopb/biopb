@@ -35,7 +35,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._ome_rois import Tensor
 from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
-from biopb_tensor_server.core.axes import canonical_axis
+from biopb_tensor_server.core.axes import labeled_axis_index
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
@@ -219,15 +219,6 @@ def masks_by_image(
     return out
 
 
-def _axis_positions(dim_labels: Sequence[str]) -> Dict[str, int]:
-    index: Dict[str, int] = {}
-    for i, label in enumerate(dim_labels):
-        axis = canonical_axis(label)
-        if axis is not None and axis not in index:
-            index[axis] = i
-    return index
-
-
 class RasterizedMaskAdapter(TensorAdapter):
     """The ``@ome`` label set: OME ``<Mask>`` shapes painted into one tensor.
 
@@ -241,10 +232,14 @@ class RasterizedMaskAdapter(TensorAdapter):
     ``dim_labels`` / ``shape`` are the image's own canonical axes with the
     channel axis dropped (design, "Extent") -- already canonical, since they
     come from the image's own descriptor, so this adapter never needs
-    permuting (:attr:`_normalizable_axes`), and Y/X are always its last two
-    axes. A pin (``TheZ``/``TheT``) that names an axis this image does not
-    have is inert, exactly like ``TheC`` -- the channel distinction is never
-    carried here (design, "Extent").
+    permuting (:attr:`_normalizable_axes`). Y/X are located by *label*
+    (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`), never by
+    position: an interleaved RGB(A) source keeps its trailing samples axis
+    (``S``) here (``label_extent`` drops only the channel axis), so Y/X are
+    NOT reliably the last two axes. A pin (``TheZ``/``TheT``) that names an
+    axis this image does not have is inert, exactly like ``TheC`` -- the
+    channel distinction is never carried here (design, "Extent") -- and so is
+    an ``S`` axis, which no mask pins and every mask therefore paints across.
     """
 
     _normalizable_axes = False
@@ -267,7 +262,10 @@ class RasterizedMaskAdapter(TensorAdapter):
         self._masks = list(masks)
         self._parent_array_id = parent_array_id
         self._content_version = content_version
-        self._axis = _axis_positions(self._dim_labels[:-2])
+        self._axis = {
+            axis: labeled_axis_index(self._dim_labels, axis)
+            for axis in ("t", "z", "y", "x")
+        }
         self._bitmaps: Dict[int, np.ndarray] = {}
 
     @property
@@ -342,7 +340,12 @@ class RasterizedMaskAdapter(TensorAdapter):
         out = np.zeros(
             tuple(e - s for s, e in zip(starts, stops, strict=True)), dtype=np.uint32
         )
-        y_axis, x_axis = out.ndim - 2, out.ndim - 1
+        y_axis, x_axis = self._axis["y"], self._axis["x"]
+        if y_axis is None or x_axis is None:
+            logger.warning(
+                "ome masks: %s has no y/x axis; serving an empty set", self.array_id
+            )
+            return out
         for shape in self._masks:
             self._paint(out, starts, stops, shape, y_axis, x_axis)
         return out
@@ -357,7 +360,15 @@ class RasterizedMaskAdapter(TensorAdapter):
         x_axis: int,
     ) -> None:
         """Paint *shape* into *out* wherever its bbox and plane pin intersect
-        the requested bounds; a no-op if either misses entirely."""
+        the requested bounds; a no-op if either misses entirely.
+
+        Every axis stays a ``slice`` (never an int index), including a pinned
+        one collapsed to a single position -- so ``region`` always keeps
+        *out*'s full rank and axis order, and the bitmap's ``(y, x)`` plane
+        can be reshaped straight into *y_axis* / *x_axis* by position,
+        wherever they actually sit (never assumed to trail: see the class
+        docstring).
+        """
         index: List[Any] = [slice(None)] * out.ndim
         for attr, pin in (("z", shape.the_z), ("t", shape.the_t)):
             axis = self._axis.get(attr)
@@ -365,7 +376,8 @@ class RasterizedMaskAdapter(TensorAdapter):
                 continue  # no such axis here, or unpinned: every plane
             if not (starts[axis] <= pin < stops[axis]):
                 return  # this chunk holds none of the pinned plane
-            index[axis] = pin - starts[axis]
+            rel = pin - starts[axis]
+            index[axis] = slice(rel, rel + 1)
 
         mx0, my0 = int(math.floor(shape.x)), int(math.floor(shape.y))
         mx1 = mx0 + int(round(shape.width))
@@ -378,9 +390,9 @@ class RasterizedMaskAdapter(TensorAdapter):
         bitmap = self._bitmap_of(shape)[y0 - my0 : y1 - my0, x0 - mx0 : x1 - mx0]
         index[y_axis] = slice(y0 - starts[y_axis], y1 - starts[y_axis])
         index[x_axis] = slice(x0 - starts[x_axis], x1 - starts[x_axis])
-        region = out[tuple(index)]
-        # region's leading axes (if any survived as slices above) are whatever
-        # this chunk spans on an axis the mask did not pin; the mask applies to
-        # all of them alike, which is what the reshape-and-broadcast gives.
-        painted = bitmap.reshape((1,) * (region.ndim - 2) + bitmap.shape)
+        region = out[tuple(index)]  # full rank: no axis was int-indexed above
+        broadcast_shape = [1] * region.ndim
+        broadcast_shape[y_axis] = bitmap.shape[0]
+        broadcast_shape[x_axis] = bitmap.shape[1]
+        painted = bitmap.reshape(broadcast_shape)
         region[...] = np.where(painted, shape.label, region)
