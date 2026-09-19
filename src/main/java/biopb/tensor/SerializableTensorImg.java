@@ -90,7 +90,16 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         session = null;
     }
 
-    private void ensureDelegate() {
+    /**
+     * Build the delegate on first access.
+     *
+     * <p>Synchronized because reconstruction opens a {@link FlightSession}, and
+     * every accessor below funnels through here: two threads reading the same
+     * image -- the ordinary case once a cell cache is loading chunks in
+     * parallel -- would otherwise each open one, and the loser's is orphaned
+     * with no reference left to close it.
+     */
+    private synchronized void ensureDelegate() {
         if (delegate == null) {
             delegate = reconstructDelegate();
         }
@@ -158,7 +167,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (session != null) {
             session.close();
             session = null;

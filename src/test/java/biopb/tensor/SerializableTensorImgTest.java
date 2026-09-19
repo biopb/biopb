@@ -36,6 +36,55 @@ public class SerializableTensorImgTest {
         assertNotNull(LocationUris.parse("localhost:8815"));
     }
 
+    @Test
+    public void testConcurrentFirstAccessBuildsOneDelegate() throws Exception {
+        // Reconstruction opens a FlightSession, so a racing first access would
+        // open two and orphan one -- with no reference left to close it. The
+        // plan here carries its own endpoints, so building the delegate needs
+        // no server; what is under test is that it happens once.
+        SerializableTensorImg<?> image = new SerializableTensorImg<>(
+                plannedHandle("grpc+tcp://localhost:8815"), 1_000L, null);
+
+        int threads = 8;
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.List<Object> delegates =
+                java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.List<Exception> failures =
+                java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.List<Thread> workers = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            Thread worker = new Thread(() -> {
+                try {
+                    start.await();
+                    image.numDimensions();
+                    delegates.add(delegateOf(image));
+                } catch (Exception error) {
+                    failures.add(error);
+                }
+            });
+            worker.start();
+            workers.add(worker);
+        }
+        start.countDown();
+        for (Thread worker : workers) {
+            worker.join(10_000);
+        }
+
+        assertEquals("workers failed: " + failures, 0, failures.size());
+        assertEquals(threads, delegates.size());
+        // Same instance for every thread: exactly one reconstruction happened.
+        for (Object seen : delegates) {
+            assertEquals(delegates.get(0), seen);
+        }
+        image.close();
+    }
+
+    private static Object delegateOf(SerializableTensorImg<?> image) throws Exception {
+        java.lang.reflect.Field field = SerializableTensorImg.class.getDeclaredField("delegate");
+        field.setAccessible(true);
+        return field.get(image);
+    }
+
     private static SerializableTensorImg<?> roundTrip(SerializableTensorImg<?> image) throws Exception {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
@@ -44,6 +93,44 @@ public class SerializableTensorImgTest {
         try (ObjectInputStream input = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
             return (SerializableTensorImg<?>) input.readObject();
         }
+    }
+
+    /**
+     * A handle whose plan already carries its endpoints, so reconstruction
+     * needs no server: the cell image is lazy and a gRPC channel does not dial
+     * until a call is made.
+     */
+    private static SerializedTensor plannedHandle(String location) {
+        TensorDescriptor descriptor = TensorDescriptor.newBuilder()
+                .setArrayId("test-tensor")
+                .addShape(4).addShape(4)
+                .addChunkShape(2).addChunkShape(2)
+                .setDtype("float32")
+                .build();
+        java.util.List<org.apache.arrow.flight.FlightEndpoint> endpoints = new ArrayList<>();
+        for (long y = 0; y < 4; y += 2) {
+            for (long x = 0; x < 4; x += 2) {
+                TensorTicket ticket = TensorTicket.newBuilder()
+                        .setChunkId(ByteString.copyFromUtf8("c-" + y + "-" + x))
+                        .build();
+                ChunkBounds bounds = ChunkBounds.newBuilder()
+                        .addStart(y).addStart(x)
+                        .addStop(y + 2).addStop(x + 2)
+                        .build();
+                endpoints.add(org.apache.arrow.flight.FlightEndpoint
+                        .builder(new org.apache.arrow.flight.Ticket(ticket.toByteArray()))
+                        .setAppMetadata(bounds.toByteArray())
+                        .build());
+            }
+        }
+        FlightInfo plan = new FlightInfo(
+                new Schema(new ArrayList<>()),
+                FlightDescriptor.command(descriptor.toByteArray()),
+                endpoints, -1, -1);
+        return SerializedTensor.newBuilder()
+                .setLocation(location)
+                .setFlightInfo(ByteString.copyFrom(plan.serialize()))
+                .build();
     }
 
     private static SerializedTensor handle(String location, String token) {
