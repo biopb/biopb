@@ -27,17 +27,17 @@ import dataclasses
 import logging
 import math
 import zlib
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._ome_rois import Tensor
+from biopb_tensor_server.adapters.labels import NearestPyramidMixin
 from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
 from biopb_tensor_server.core.axes import labeled_axis_index
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
-from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 
 __all__ = ["RasterizedMaskAdapter", "masks_by_image", "strip_mask_bindata"]
@@ -73,6 +73,17 @@ def _decompress(raw: bytes, compression: str) -> bytes:
     return raw
 
 
+def _bbox(shape: _MaskShape) -> Tuple[int, int, int, int]:
+    """*shape*'s pixel-space bounding box, half-open: ``(x0, y0, x1, y1)``.
+
+    The one place ``x``/``y``/``width``/``height`` become integers, so
+    :func:`_bitmap`'s shape and the region a read paints (``_paint``) can
+    never disagree on it.
+    """
+    x0, y0 = int(math.floor(shape.x)), int(math.floor(shape.y))
+    return x0, y0, x0 + int(round(shape.width)), y0 + int(round(shape.height))
+
+
 def _bitmap(shape: _MaskShape) -> np.ndarray:
     """*shape*'s own ``(height, width)`` boolean bitmap, unpacked once.
 
@@ -81,7 +92,8 @@ def _bitmap(shape: _MaskShape) -> np.ndarray:
     ``(r, c)``. A bitstream short of ``height * width`` bits (a producer that
     rounds byte-aligned) reads as unset past its end rather than raising.
     """
-    h, w = max(0, int(round(shape.height))), max(0, int(round(shape.width)))
+    x0, y0, x1, y1 = _bbox(shape)
+    h, w = max(0, y1 - y0), max(0, x1 - x0)
     n = h * w
     if n == 0:
         return np.zeros((h, w), dtype=bool)
@@ -117,7 +129,7 @@ def _mask_shape(shape: Mapping[str, Any], label: int) -> Optional[_MaskShape]:
     )
 
 
-def strip_mask_bindata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+def strip_mask_bindata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
     """*metadata* with every ``rois[].union.masks[].bin_data.value`` dropped.
 
     A mask's bitmap is arbitrary binary -- base64 text on the fast metadata
@@ -135,7 +147,7 @@ def strip_mask_bindata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
     """
     rois = metadata.get("rois")
     if not isinstance(rois, list) or not rois:
-        return dict(metadata)
+        return metadata
     changed = False
     new_rois = []
     for roi in rois:
@@ -156,7 +168,7 @@ def strip_mask_bindata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
             new_masks.append(mask)
         new_rois.append({**roi, "union": {**union, "masks": new_masks}})
     if not changed:
-        return dict(metadata)
+        return metadata
     return {**metadata, "rois": new_rois}
 
 
@@ -219,7 +231,7 @@ def masks_by_image(
     return out
 
 
-class RasterizedMaskAdapter(TensorAdapter):
+class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     """The ``@ome`` label set: OME ``<Mask>`` shapes painted into one tensor.
 
     Computed, not stored -- there is no backend to read again, only the
@@ -301,15 +313,6 @@ class RasterizedMaskAdapter(TensorAdapter):
             dtype=_DTYPE,
         )
 
-    def _advertised_pyramid(
-        self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
-    ) -> List[PyramidLevel]:
-        """Every computed level is ``nearest``: there is no native pyramid here,
-        and averaging label ids would produce ids that exist nowhere."""
-        return super()._advertised_pyramid(
-            base_desc, dataclasses.replace(pyramid_config, reduction_method="nearest")
-        )
-
     def get_tensor_metadata(self) -> Optional[dict]:
         """``image-label`` naming the parent image; no colours -- OME's
         per-shape ``fill_color`` has no NGFF-wide LUT equivalent here."""
@@ -379,9 +382,7 @@ class RasterizedMaskAdapter(TensorAdapter):
             rel = pin - starts[axis]
             index[axis] = slice(rel, rel + 1)
 
-        mx0, my0 = int(math.floor(shape.x)), int(math.floor(shape.y))
-        mx1 = mx0 + int(round(shape.width))
-        my1 = my0 + int(round(shape.height))
+        mx0, my0, mx1, my1 = _bbox(shape)
         x0, x1 = max(mx0, starts[x_axis]), min(mx1, stops[x_axis])
         y0, y1 = max(my0, starts[y_axis]), min(my1, stops[y_axis])
         if x0 >= x1 or y0 >= y1:

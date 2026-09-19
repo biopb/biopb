@@ -19,6 +19,7 @@ Chunk ID format: array_id + bounds encoding (start, stop coordinates). Relies on
 the OS page cache for raw-data caching.
 """
 
+import base64
 import io
 import logging
 import os
@@ -43,6 +44,7 @@ from biopb_tensor_server.adapters._ome_rois import (
     imported_annotations,
     tensors_by_field,
 )
+from biopb_tensor_server.adapters.ome_masks import RasterizedMaskAdapter, masks_by_image
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     catalog_entry,
@@ -53,6 +55,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.labels import label_extent, label_field
 
 logger = logging.getLogger(__name__)
 
@@ -310,8 +313,6 @@ def _b64_encode_mask_bindata(ome: Any) -> None:
     succeeds anyway (no real bitmap) or fails exactly as it would have without
     this call -- never worse.
     """
-    import base64
-
     for roi in getattr(ome, "rois", None) or ():
         for mask in getattr(getattr(roi, "union", None), "masks", None) or ():
             value = getattr(getattr(mask, "bin_data", None), "value", None)
@@ -480,6 +481,13 @@ class OmeTiffAdapter(TensorAdapter):
         self._raw_ome_xml_released = False
         self._reduced_ome_xml = None
         self._reduced_ome_xml_probed = False
+        # The dict _reduced_ome_xml parses into (biopb/biopb#1059 step 4): a pure
+        # function of that already-cached string, so caching it costs nothing in
+        # correctness and saves a second ome-types parse when both get_metadata
+        # and get_embedded_labels run in the same registration (metadata_db.py
+        # calls the former directly; the latter is label_sets' one-time call).
+        self._parsed_metadata: Optional[dict] = None
+        self._parsed_metadata_probed = False
 
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -678,14 +686,19 @@ class OmeTiffAdapter(TensorAdapter):
 
         Goes through ``_reduced_ome_xml_cached()``, not the raw string, so a re-sync
         (an unresolved source resolving) re-parses the stripped form already in
-        hand rather than re-opening the file for a string it would strip again.
+        hand rather than re-opening the file for a string it would strip again --
+        and the *dict* that parse produces is itself cached (``_parsed_metadata``),
+        since it is a pure function of that same string: a caller that also
+        touches ``get_embedded_labels`` in the same registration (``label_sets``)
+        gets the one parse already done, not a second one.
         """
+        if self._parsed_metadata_probed:
+            return self._parsed_metadata or {}
+        self._parsed_metadata_probed = True
         reduced = self._reduced_ome_xml_cached()
         if reduced:
-            fast = _fast_ome_metadata(reduced, already_reduced=True)
-            if fast is not None:
-                return fast
-        return {}
+            self._parsed_metadata = _fast_ome_metadata(reduced, already_reduced=True)
+        return self._parsed_metadata or {}
 
     def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
         """The OME-XML ``<ROI>`` elements this file carries (see the base).
@@ -709,12 +722,6 @@ class OmeTiffAdapter(TensorAdapter):
         the field half of a scene's ``array_id`` IS the OME image id for this
         format, so the match is string equality, not inference.
         """
-        from biopb_tensor_server.adapters.ome_masks import (
-            RasterizedMaskAdapter,
-            masks_by_image,
-        )
-        from biopb_tensor_server.core.labels import label_extent, label_field
-
         descriptors = self._scene_descriptors()
         by_image = masks_by_image(
             self.get_metadata(),

@@ -228,10 +228,11 @@ class TestStripMaskBindata:
             "images": [{"id": "Image:0", "roi_refs": [{"id": "ROI:0"}]}],
             "rois": [{"id": "ROI:0", "union": {"points": [{"x": 1, "y": 1}]}}],
         }
-        assert strip_mask_bindata(meta) == meta
+        assert strip_mask_bindata(meta) is meta  # the same object, per the docstring
 
     def test_no_rois_at_all_is_a_no_op(self):
-        assert strip_mask_bindata({"creator": "tifffile"}) == {"creator": "tifffile"}
+        meta = {"creator": "tifffile"}
+        assert strip_mask_bindata(meta) is meta
 
     def test_original_metadata_is_not_mutated(self):
         meta = _meta({"Image:0": [_mask(0, 0, 2, 2, np.ones((2, 2)))]})
@@ -306,3 +307,28 @@ class TestFastMetadataRealBitmap:
 
         # And through the base SourceAdapter machinery: extent must match.
         assert "Image:0/labels/@ome" in adapter.label_sets
+
+    def test_get_metadata_parses_the_ome_xml_only_once(self, tmp_path, monkeypatch):
+        """get_embedded_labels() calls get_metadata() internally, and so does
+        the registration path (metadata_db.py) -- the parsed dict is cached so
+        that doesn't cost a second ome-types parse."""
+        import biopb_tensor_server.adapters.ome_tiff as ome_tiff_module
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        path = self._write(tmp_path, b"\x00" * 2)
+        adapter = OmeTiffAdapter(path, "src1")
+
+        calls = []
+        original = ome_tiff_module._fast_ome_metadata
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ome_tiff_module, "_fast_ome_metadata", counting)
+
+        adapter.get_metadata()
+        adapter.get_embedded_labels()  # calls self.get_metadata() again internally
+        adapter.get_metadata()
+
+        assert len(calls) == 1
