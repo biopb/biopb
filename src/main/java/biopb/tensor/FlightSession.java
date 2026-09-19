@@ -14,6 +14,7 @@ import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
 
 /**
  * Owns one Flight connection's allocator, authentication and error boundary.
@@ -60,6 +61,36 @@ public final class FlightSession implements AutoCloseable {
         } catch (FlightRuntimeException error) {
             throw TensorErrorMapper.map(error);
         }
+    }
+
+    /**
+     * Open a DoPut and send {@code root}'s schema; the caller writes the
+     * batches and drains {@code listener}.
+     */
+    public FlightClient.ClientStreamListener startPut(
+            FlightDescriptor descriptor, VectorSchemaRoot root, FlightClient.PutListener listener) {
+        try {
+            return client.startPut(descriptor, root, listener, authOption);
+        } catch (FlightRuntimeException error) {
+            throw TensorErrorMapper.map(error);
+        }
+    }
+
+    /**
+     * The typed exception behind a failure surfaced through a future.
+     *
+     * <p>A DoPut reports its error on the listener rather than from the call
+     * that started it, so the boundary the other methods here draw has to be
+     * reachable from the unwrapped cause as well.
+     */
+    public static RuntimeException mapped(Throwable cause) {
+        if (cause instanceof FlightRuntimeException) {
+            return TensorErrorMapper.map((FlightRuntimeException) cause);
+        }
+        if (cause instanceof RuntimeException) {
+            return (RuntimeException) cause;
+        }
+        return new IllegalStateException(cause == null ? "Flight call failed" : cause.getMessage(), cause);
     }
 
     public Iterator<Result> doAction(Action action) {

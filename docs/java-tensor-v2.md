@@ -14,7 +14,29 @@ disk caching are deliberately out of scope until the core protocol is stable.
 - [x] Rebuild the lazy Imglib2 read adapter from immutable `FlightInfo` plans.
 - [x] Make `SerializedTensor` the only cross-process tensor-handle format.
 - [x] Implement catalog/metadata/resolve/warm parity.
-- [ ] Implement source lifecycle, upload and ROI parity.
-- [ ] Deprecate legacy `(sourceId, tensorId)` entry points and update examples.
+- [x] Implement source lifecycle, upload and ROI parity.
+- [x] Remove the legacy `(sourceId, tensorId)` entry points and the
+  `DataSourceDescriptor` row decoders they fed.
 - [ ] Consider remote cache-file/mmap and persistent caching separately, after
   protocol parity is covered by shared integration fixtures.
+
+## What "parity" covers
+
+| Python | Java |
+| --- | --- |
+| `add_source` / `remove_source` | `addSource` / `removeSource` |
+| `label_sets` / `delete_labels` | `labelSets` / `deleteLabels` |
+| `list_rois` / `put_rois` / `delete_rois` / `prune_rois` | `listRois` / `putRois` / `deleteRois` / `pruneRois` |
+| `create_tensor` / `upload_array` / `upload_chunk` / `finish_upload` | `createTensor` / `uploadArray` / `uploadChunk` / `finishUpload` |
+
+Two things do not transfer, and are not gaps:
+
+- **No dask.** Python's `upload_array` hands the whole upload to `da.store`, so
+  blocks ship from whichever worker computed them. `TensorUploads.uploadArray`
+  walks the descriptor's chunk grid on the calling thread. The grid, the bounds
+  and the empty-chunk skip for a label set are the same.
+- **No `RoiAnnotation` wire codec to share.** `biopb.image._roi_rows` is one
+  module serving both the Python SDK and the server; Java has only a client, so
+  `RoiRowCodec` is a second implementation of that row schema and has to track
+  it column for column. Its Arrow schema compares equal to pyarrow's, which is
+  what keeps the two honest.

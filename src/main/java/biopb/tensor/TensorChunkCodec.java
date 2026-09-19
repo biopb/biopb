@@ -185,7 +185,12 @@ final class TensorChunkCodec {
         }
     }
 
-    private static void rowMajorPosition(int index, long[] shape, long[] position) {
+    /**
+     * The row-major (C-order) position of {@code index} in a block of
+     * {@code shape}: the last axis varies fastest, which is the order every
+     * chunk payload is laid out in, read or written.
+     */
+    static void rowMajorPosition(long index, long[] shape, long[] position) {
         long remaining = index;
         for (int axis = shape.length - 1; axis >= 0; axis--) {
             position[axis] = remaining % shape[axis];

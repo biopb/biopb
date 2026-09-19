@@ -48,22 +48,6 @@ import net.imglib2.type.numeric.real.FloatType;
 public class TensorFlightClientTest {
 
     @Test
-    public void testListSourcesAndTensorLookup() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                @SuppressWarnings("deprecation")
-                Map<String, DataSourceDescriptor> sources = client.listSources();
-                Assert.assertTrue(sources.containsKey("test-source"));
-
-                DataSourceDescriptor sourceDesc = sources.get("test-source");
-                Assert.assertEquals(1, sourceDesc.getTensorsCount());
-                Assert.assertEquals("test-tensor", sourceDesc.getTensors(0).getArrayId());
-                Assert.assertEquals(Arrays.asList(4L, 4L), sourceDesc.getTensors(0).getShapeList());
-            }
-        }
-    }
-
-    @Test
     public void testCatalogRowCarriesIsResolvedForCallersToRead() throws Exception {
         // What a caller actually gets: a row. `is_resolved` is a column on it,
         // read without any type this SDK picked -- which is the whole point of
@@ -84,17 +68,13 @@ public class TensorFlightClientTest {
                     Map<?, ?> tensor = (Map<?, ?>) ((List<?>) tensors).get(0);
                     Assert.assertEquals("test-tensor",
                             String.valueOf(tensor.get("array_id")));
-                }
-
-                // The deprecated decoder still answers, and still cannot carry
-                // the flag -- the message has no field for it.
-                try (VectorSchemaRoot root = client.querySources(
-                        "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
-                    @SuppressWarnings("deprecation")
-                    List<DataSourceDescriptor> descs =
-                            TensorFlightClient.descriptorsFromRows(root);
-                    Assert.assertEquals(1, descs.size());
-                    Assert.assertEquals("test-source", descs.get(0).getSourceId());
+                    // Every tensor of the source is enumerated on the row, which
+                    // is the browse surface -- there is no second decode of it
+                    // into a message that has no field for `is_resolved`.
+                    Assert.assertEquals(Arrays.asList(4L, 4L),
+                            ((List<?>) tensor.get("shape")).stream()
+                                    .map(dim -> ((Number) dim).longValue())
+                                    .collect(java.util.stream.Collectors.toList()));
                 }
             }
         }
@@ -104,7 +84,7 @@ public class TensorFlightClientTest {
     public void testMaterializesBaseArrayFromFlightChunks() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                RandomAccessibleInterval<FloatType> image = client.getTensor("test-source", "test-tensor");
+                RandomAccessibleInterval<FloatType> image = client.getTensor("test-tensor");
                 // The lazy adapter consumes the FlightInfo returned by planning;
                 // accessing cells must not initiate a replacement read plan.
                 Assert.assertEquals(1, server.getFlightInfoRequestCount());
@@ -144,7 +124,7 @@ public class TensorFlightClientTest {
                 String reductionMethod = "nearest";
 
                 RandomAccessibleInterval<FloatType> scaled = client.getTensor(
-                        "test-source", "test-tensor", scaleHint, reductionMethod);
+                        "test-tensor", scaleHint, reductionMethod);
                 Assert.assertEquals(0, server.getTotalChunkRequestCount());
 
                 Assert.assertEquals(2, scaled.dimension(0));
@@ -181,7 +161,7 @@ public class TensorFlightClientTest {
                 String reductionMethod = "linear";
 
                 RandomAccessibleInterval<FloatType> scaled = client.getTensor(
-                        "test-source", "test-tensor", scaleHint, reductionMethod);
+                        "test-tensor", scaleHint, reductionMethod);
                 Assert.assertEquals(0, server.getTotalChunkRequestCount());
 
                 Assert.assertEquals(3, scaled.dimension(0));
@@ -213,7 +193,7 @@ public class TensorFlightClientTest {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 RandomAccessibleInterval<FloatType> image = client.getTensor(
-                        "test-source", "test-tensor", new long[] {2, 2}, null);
+                        "test-tensor", new long[] {2, 2}, null);
                 Assert.assertEquals(2, image.dimension(0));
                 Assert.assertEquals(2, image.dimension(1));
                 Assert.assertEquals("nearest", server.getLastReductionMethod());
@@ -227,7 +207,7 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 InvalidTensorRequestException error = Assert.assertThrows(
                         InvalidTensorRequestException.class,
-                        () -> client.getTensor("test-source", "test-tensor", new long[] {2}, "nearest"));
+                        () -> client.getTensor("test-tensor", new long[] {2}, "nearest"));
                 Assert.assertEquals("scale_rank", error.getReason());
                 Assert.assertEquals("nearest", server.getLastReductionMethod());
             }
@@ -240,7 +220,7 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 InvalidTensorRequestException error = Assert.assertThrows(
                         InvalidTensorRequestException.class,
-                        () -> client.getTensor("test-source", "test-tensor", new long[] {2, 0}, "nearest"));
+                        () -> client.getTensor("test-tensor", new long[] {2, 0}, "nearest"));
                 Assert.assertEquals("scale_not_positive", error.getReason());
                 Assert.assertEquals("nearest", server.getLastReductionMethod());
             }
@@ -253,7 +233,7 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 IllegalArgumentException error = Assert.assertThrows(
                         IllegalArgumentException.class,
-                        () -> client.getTensor("test-source", "test-tensor", new long[] {2, 2}, "median"));
+                        () -> client.getTensor("test-tensor", new long[] {2, 2}, "median"));
                 Assert.assertTrue(error.getMessage().contains("Unsupported reduction method"));
                 Assert.assertNull(server.getLastReductionMethod());
             }
@@ -266,7 +246,7 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorNotFoundException error = Assert.assertThrows(
                         TensorNotFoundException.class,
-                        () -> client.getTensor("test-source", "nonexistent"));
+                        () -> client.getTensor("nonexistent"));
                 Assert.assertTrue(error.getMessage().contains("not found"));
             }
         }
@@ -278,7 +258,7 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorNotFoundException error = Assert.assertThrows(
                         TensorNotFoundException.class,
-                        () -> client.getTensor("nonexistent-source", "some-tensor"));
+                        () -> client.getTensor("nonexistent-source/some-tensor"));
                 Assert.assertEquals("unknown_field", error.getReason());
             }
         }
@@ -289,7 +269,7 @@ public class TensorFlightClientTest {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 // Get tensor - should return SerializableTensorImg
-                RandomAccessibleInterval<FloatType> image = client.getTensor("test-source", "test-tensor");
+                RandomAccessibleInterval<FloatType> image = client.getTensor("test-tensor");
                 Assert.assertTrue(image instanceof SerializableTensorImg);
 
                 // Verify initial data access
@@ -330,7 +310,7 @@ public class TensorFlightClientTest {
     public void testSerializableTensorImgMultipleDeserialization() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                RandomAccessibleInterval<FloatType> image = client.getTensor("test-source", "test-tensor");
+                RandomAccessibleInterval<FloatType> image = client.getTensor("test-tensor");
 
                 // Serialize
                 java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
@@ -361,7 +341,7 @@ public class TensorFlightClientTest {
     public void testGetTensorAsPb() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
+                SerializedTensor pb = client.getTensorAsPb("test-tensor", null, null, null);
 
                 // The plan is the FlightInfo the server answered, carried whole.
                 TensorDescriptor descriptor = TensorFlightClient.descriptorOf(pb);
@@ -381,7 +361,7 @@ public class TensorFlightClientTest {
     public void testTensorFromPb() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
+                SerializedTensor pb = client.getTensorAsPb("test-tensor", null, null, null);
 
                 // Reconstruct array
                 RandomAccessibleInterval<FloatType> image = TensorFlightClient.tensorFromPb(pb, 10_000_000L);
@@ -402,7 +382,7 @@ public class TensorFlightClientTest {
     public void testTensorPbSerialization() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
+                SerializedTensor pb = client.getTensorAsPb("test-tensor", null, null, null);
 
                 // Serialize to bytes
                 byte[] serializedBytes = pb.toByteArray();
@@ -425,7 +405,7 @@ public class TensorFlightClientTest {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 long[] scaleHint = new long[] {2, 2};
-                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, scaleHint, "nearest");
+                SerializedTensor pb = client.getTensorAsPb("test-tensor", null, scaleHint, "nearest");
 
                 // Verify scale_hint in the plan's descriptor
                 TensorDescriptor descriptor = TensorFlightClient.descriptorOf(pb);
@@ -472,15 +452,14 @@ public class TensorFlightClientTest {
 
     @Test
     public void testCatalogRowsCarryNoResidency() throws Exception {
-        // The column is gone from SOURCE_ROW_COLUMNS, so the deprecated decoder
-        // leaves the proto's field unset rather than asserting a stale false.
+        // Residency is asked per call, never stored: the column is gone from
+        // SOURCE_ROW_COLUMNS, so a browse cannot report a stale one
+        // (biopb/biopb#1035).
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 try (VectorSchemaRoot root = client.querySources(
                         "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
                     Assert.assertNull(root.getVector("data_resident"));
-                    DataSourceDescriptor desc = TensorFlightClient.descriptorsFromRows(root).get(0);
-                    Assert.assertFalse(desc.hasDataResident());
                 }
             }
         }
