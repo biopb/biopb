@@ -261,8 +261,10 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         # Inherited by OmeZarrAdapter / _HcsFieldAdapter via super().__init__.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
-        # The directory ``create_upload`` minted, for the two store hooks; None
-        # on a discovered store, which is not this adapter's to remove or mark.
+        # The directory the server minted for this adapter, for the two store
+        # hooks (and ``LabelSetAdapter.delete_store``); None on a store the
+        # server merely reads -- a discovered zarr, a label group inside a
+        # user's file -- which is not this adapter's to remove or mark.
         self._upload_store_path: Optional[Path] = None
         # Serializes chunk writes against store disposal. Taken by ``put_chunk``
         # around refuse-and-store, so a write that passed ``_refuse_write``

@@ -6,26 +6,31 @@ here is only what a boundary does:
 - **Kind selection** -- the ``cache:`` / ``ome_zarr:`` ``array_id`` prefix names
   the adapter class (``UPLOAD_KINDS``); the class builds its own upload
   (``create_upload``) and the manager registers it, syncing the catalog when
-  the kind is durable.
+  the kind is durable. An ``array_id`` with no prefix and a ``/labels/``
+  segment is the third kind (biopb/biopb#1059): it creates no source, but a
+  tensor of one that already exists, so it is attached to its parent rather
+  than registered and the catalog row it keeps in step is the parent's.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
 - **Lookup** -- ``status`` / ``finish`` / ``discard`` / ``write_chunk`` find the
-  adapter and hand over.
-- **Reclamation** -- ``reap`` sweeps the registry by ``updated_at`` on a
-  daemon thread (``upload_ttl``), and ``discard_unfinished_stores`` removes at
-  startup what a crashed server left behind. The catalog row of a ``durable``
-  kind is dropped here when its upload is discarded, by either route; the
-  store itself is the adapter's own to release.
-- **Reclamation** -- ``reap`` sweeps the registry by each upload's
-  ``updated_at``: a PENDING upload quiet past ``ttl`` is discarded (a job that
-  died), and a tombstone older than ``ttl`` is unregistered. The sweep thread
-  is started and stopped by the server that owns the manager.
+  adapter and hand over (``_locate``: the registry, or a parent's
+  ``label_uploads``).
+- **Reclamation** -- ``reap`` sweeps every upload by its ``updated_at``, in
+  the registry and in each source's ``label_uploads``: one quiet past ``ttl``
+  is discarded (a job that died) and a tombstone older than ``ttl`` is
+  dropped, freeing the name. The sweep runs on a daemon thread started and
+  stopped by the server that owns the manager, and
+  ``discard_unfinished_stores`` removes at startup what a crashed server left
+  behind. The catalog row of a ``durable`` kind is dropped here when its
+  upload is discarded, by either route; the store itself is the adapter's own
+  to release.
 
 Progress, completion and disposal are the adapter's own
 (:class:`~biopb_tensor_server.adapters._writable.WritableSource`), so there is no
 second registry to keep in step with ``SourceRegistry``: an upload's state is
-created with its adapter, lives as long as it is registered, and a discarded
-one stays registered as a tombstone until reclaimed.
+created with its adapter, lives as long as that adapter is reachable -- from
+the registry, or from its parent source for a label set -- and a discarded one
+stays reachable as a tombstone until reclaimed.
 
 The manager registers created sources through the shared ``SourceRegistry`` and
 never holds a back-reference to the server, so the collaborators stay acyclic.
@@ -52,6 +57,7 @@ from biopb_tensor_server.adapters._writable import (
     upload_of,
 )
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, read_zattrs, upload_state
 from biopb_tensor_server.core.axes import noncanonical_order
@@ -60,6 +66,7 @@ from biopb_tensor_server.core.errors import (
     UploadDiscardedError,
     WriteNotSupportedError,
 )
+from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
@@ -130,6 +137,27 @@ def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
     return flight.FlightCancelledError(str(exc), json.dumps(payload).encode())
 
 
+def _label_uploads(adapter: Any) -> Dict[str, Any]:
+    """The label sets an adapter is still filling, or none.
+
+    By attribute, like :func:`upload_of`: the registry also holds adapters
+    from outside this package, and one that knows nothing about labels has
+    none of them.
+    """
+    return getattr(adapter, "label_uploads", None) or {}
+
+
+def _reap_step(adapter: Any, now: float, ttl: float) -> Tuple[bool, bool]:
+    """One upload's turn in the sweep: ``(just expired, tombstone is stale)``.
+
+    Both halves come from ``WritableSource.reap_step``; this only turns the
+    tombstone's age into the sweep's yes/no, so the registered kinds and the
+    label sets attached to a source take the identical step.
+    """
+    expired, age = adapter.reap_step(now, ttl)
+    return expired, age is not None and age > ttl
+
+
 class UploadManager:
     """The DoPut boundary: picks the kind, registers, translates errors."""
 
@@ -151,9 +179,31 @@ class UploadManager:
 
     # -- lookup ----------------------------------------------------------------
 
+    def _locate(self, upload_id: str) -> Tuple[Any, Any, Optional[str]]:
+        """The adapter tracking upload *upload_id*, and its parent if it is a set.
+
+        Two namespaces, one id: a ``cache:`` / ``ome_zarr:`` upload *is* a
+        source and answers from the registry, while a label set is a tensor of
+        a registered source and answers from that source's ``label_uploads``.
+        Returns ``(adapter, parent, field)`` -- ``parent`` and ``field`` are
+        None for the registered kinds -- with ``adapter`` None when nothing
+        holds the id, which every caller already has to handle.
+        """
+        adapter = self._registry.get(upload_id)
+        if adapter is not None:
+            return adapter, None, None
+        source_id, _, field = upload_id.partition("/")
+        if not field:
+            return None, None, None
+        parent = self._registry.get(source_id)
+        if parent is None:
+            return None, None, None
+        return _label_uploads(parent).get(field), parent, field
+
     def status(self, source_id: str) -> Dict[str, Any]:
         """The ``upload_status`` answer: UNKNOWN for anything not tracking an upload."""
-        upload = upload_of(self._registry.get(source_id))
+        adapter, _, _ = self._locate(source_id)
+        upload = upload_of(adapter)
         if upload is None:
             return unknown_upload_status(source_id)
         return upload.as_status_dict(source_id)
@@ -164,14 +214,135 @@ class UploadManager:
         Total: a source that is not tracking an upload -- never was, or has
         since been reclaimed -- reads UNKNOWN rather than raising, so a retry
         after the tombstone is gone is not an error. A durable kind's store
-        goes with the discard (the adapter's own), and its catalog row here.
+        goes with the discard (the adapter's own), and its listing here: the
+        catalog row for the registered kinds, the parent's attachment for a
+        label set.
         """
-        adapter = self._registry.get(source_id)
+        adapter, parent, field = self._locate(source_id)
         if upload_of(adapter) is None:
             return unknown_upload_status(source_id)
         status = adapter.discard(reason)
-        self._drop_catalog_row(adapter, source_id)
+        if parent is None:
+            self._drop_catalog_row(adapter, source_id)
+        else:
+            self._unlist_label_set(parent, field)
         return status
+
+    # -- label sets ------------------------------------------------------------
+
+    def _sync_parent_row(self, parent: Any) -> None:
+        """Re-publish a parent's catalog row after its sets changed.
+
+        ``sync_source_added`` is an upsert and ``catalog_tensors`` reads the
+        sets off the adapter, so re-registering the parent is the whole of it
+        (the ROI re-import it triggers is idempotent). Best-effort for the
+        same reason every other catalog write on this path is: the catalog
+        must not fail the upload.
+        """
+        if self._metadata_db is None:
+            return
+        try:
+            self._metadata_db.sync_source_added(parent.source_id, parent)
+        except Exception as e:
+            logger.warning(
+                f"Failed to re-sync {parent.source_id} to the catalog after a "
+                f"label set changed (served, listing stale until reindex): {e}"
+            )
+
+    def _unlist_label_set(self, parent: Any, field: Optional[str]) -> None:
+        """Take a set out of its parent's listing, if it was in it.
+
+        A set that never finished was never listed, so this is a no-op for
+        the ordinary discard of an upload in flight and a catalog write only
+        where one is owed.
+        """
+        if field is None:
+            return
+        if parent.detach_label_set(field) is not None:
+            self._sync_parent_row(parent)
+
+    def _create_label_set(self, req_desc: TensorDescriptor) -> TensorDescriptor:
+        """The third upload kind: a new set on a source that already exists.
+
+        Reached when the request ``array_id`` carries no ``kind:`` prefix, so
+        this is also where an unrecognized id is refused. The set is attached
+        to its parent as an upload -- routable from here on, so its producer
+        can poll it to READY, but not listed until ``finish``
+        (``SourceAdapter.label_uploads``). No catalog write happens at create,
+        which is the one place this kind differs from ``ome_zarr:``: there is
+        no row of its own to write, and the parent's must not advertise a set
+        whose bytes have not arrived.
+        """
+        source_id, _, field = req_desc.array_id.partition("/")
+        if split_label_field(field) is None:
+            raise flight.FlightServerError(
+                f"Invalid array_id format: {req_desc.array_id}. Use a 'cache:' or "
+                f"'ome_zarr:' prefix to create a source, or "
+                f"'<image array_id>/labels/<name>' to upload a label set."
+            )
+        if self._write_dir is None:
+            raise flight.FlightServerError(
+                "create_tensor: write_dir is not configured, so there is nowhere "
+                "to put a label set's sidecar"
+            )
+        parent = self._registry.get(source_id)
+        if parent is None:
+            raise flight.FlightServerError(
+                f"create_tensor: {req_desc.array_id!r} names no registered source "
+                f"{source_id!r}. A label set is a tensor of an image the server "
+                f"already serves; it does not create one."
+            )
+        metadata = (
+            self._parse_metadata_json(req_desc.metadata_json)
+            if req_desc.metadata_json
+            else None
+        )
+        try:
+            adapter = create_label_upload(
+                parent,
+                field,
+                req_desc,
+                labels_dir=labels_root(self._write_dir),
+                metadata=metadata,
+            )
+        except ValueError as e:
+            raise flight.FlightServerError(f"create_tensor: {e}") from e
+        parent.attach_label_upload(field, adapter)
+        logger.info(f"Created label upload: {adapter.array_id}")
+        return adapter.upload_response(req_desc)
+
+    def delete_labels(self, array_id: str) -> Dict[str, Any]:
+        """Remove a finished uploaded set: unlist it, then delete its sidecar.
+
+        The one new action of biopb/biopb#1059, and the only way a set is ever
+        removed short of its parent going. Unlisted first, so no read can be
+        routed to a store that is about to go; the store then goes through the
+        adapter, which owns it (``LabelSetAdapter.delete_store``). The name is
+        free again at once and safely, because the next set under it mints its
+        own ``content_version`` and so cannot hit the cache entries this one
+        leaves behind.
+
+        Refused for anything ``detach_label_set`` does not reach, which is
+        exactly the sets the upload path published -- this server's, or an
+        earlier life's re-attached at registration. A set the format carries
+        (an NGFF ``labels/`` group; a rasterized ``@ome``) is embedded, not
+        attached, and an upload still in flight is not listed at all, so
+        neither can be deleted here.
+        """
+        source_id, _, field = array_id.partition("/")
+        parent = self._registry.get(source_id) if field else None
+        adapter = parent.detach_label_set(field) if parent is not None else None
+        if adapter is None:
+            raise flight.FlightServerError(
+                f"delete_labels: {array_id!r} is not a deletable label set. Only "
+                f"a finished uploaded set can be deleted -- a set the file "
+                f"carries is the file's, and one still uploading is not finished."
+            )
+        parent.detach_label_upload(field)
+        adapter.delete_store()
+        self._sync_parent_row(parent)
+        logger.info(f"Deleted label set {array_id}")
+        return {"array_id": array_id, "deleted": True}
 
     def _drop_catalog_row(self, adapter: WritableSource, source_id: str) -> None:
         """Take a discarded durable upload out of the catalog.
@@ -209,7 +380,7 @@ class UploadManager:
             return 0
         removed = 0
         stores = list(write_dir.glob("*.zarr")) + list(
-            write_dir.glob("labels/*/*.zarr")
+            labels_root(write_dir).glob("*/*.zarr")
         )
         for store in sorted(stores):
             if upload_state(read_zattrs(store)) != UPLOAD_PENDING:
@@ -228,13 +399,13 @@ class UploadManager:
         nothing means the caller believes it has been writing somewhere it has
         not.
         """
-        adapter = self._registry.get(source_id)
+        adapter, parent, field = self._locate(source_id)
         if upload_of(adapter) is None:
             raise flight.FlightServerError(
                 f"finish: {source_id} is not an upload in progress"
             )
         try:
-            return adapter.finish()
+            status = adapter.finish()
         except UploadDiscardedError as e:
             raise _refused(e) from e
         except OSError as e:
@@ -243,6 +414,13 @@ class UploadManager:
             raise flight.FlightServerError(
                 f"finish: could not seal {source_id} on disk: {e}"
             ) from e
+        if parent is not None:
+            # Sealed, so it is a tensor now: list it under its image and
+            # re-publish the parent's row. After the store, never before --
+            # the catalog must not name a set a restart would sweep away.
+            parent.attach_label_set(field, adapter)
+            self._sync_parent_row(parent)
+        return status
 
     # -- write path ------------------------------------------------------------
 
@@ -302,10 +480,10 @@ class UploadManager:
         prefix, sep, name = req_desc.array_id.partition(":")
         kind = UPLOAD_KINDS.get(prefix) if sep else None
         if kind is None:
-            raise flight.FlightServerError(
-                f"Invalid array_id format: {req_desc.array_id}. Use 'cache:' or "
-                f"'ome_zarr:' prefix"
-            )
+            # No kind prefix: the label kind, which creates a tensor of an
+            # existing source rather than a source, and refuses anything that
+            # is not shaped like one (biopb/biopb#1059).
+            return self._create_label_set(req_desc)
 
         # Parsed at the boundary: a malformed payload is the request's fault and
         # must fail before the kind touches anything (biopb/biopb#354).
@@ -368,7 +546,7 @@ class UploadManager:
         table = reader.read_all()
         data_column = table.column(0)
 
-        adapter = self._registry.get(upload.source_id)
+        adapter, _, _ = self._locate(upload.source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {upload.source_id}")
 
@@ -409,6 +587,12 @@ class UploadManager:
         catalog row is dropped here, since both were the server's own
         (biopb/biopb#1059).
 
+        Every registered source's label uploads take the same step, because a
+        set is attached to its parent rather than registered and would
+        otherwise have no sweep at all: a quiet pending set is discarded (its
+        sidecar with it) and unlisted, and its tombstone is later detached,
+        which is what frees the name.
+
         The chunks a reclaimed tombstone wrote stay in the cache until the
         LRU evicts them. They are unreachable: a re-created name gets a fresh
         ``content_version`` namespace, so its chunk ids never collide with
@@ -424,20 +608,29 @@ class UploadManager:
             now = time.monotonic()
         expired = reclaimed = 0
         for source_id, adapter in self._registry.snapshot():
-            if upload_of(adapter) is None:
-                continue
-            expired_now, age = adapter.reap_step(now, ttl)
-            if expired_now:
-                self._drop_catalog_row(adapter, source_id)
-                expired += 1
-                continue
-            if age is not None and age > ttl:
-                # Safe without a compare-and-remove: a tombstone is terminal
-                # and its id cannot be re-registered while it stands, so this
-                # is still the adapter the snapshot saw.
-                self._registry.unregister(source_id)
-                reclaimed += 1
-                logger.info(f"Reclaimed discarded upload {source_id} after {age:.0f} s")
+            if upload_of(adapter) is not None:
+                expired_now, stale = _reap_step(adapter, now, ttl)
+                if expired_now:
+                    self._drop_catalog_row(adapter, source_id)
+                    expired += 1
+                elif stale:
+                    # Safe without a compare-and-remove: a tombstone is
+                    # terminal and its id cannot be re-registered while it
+                    # stands, so this is still the adapter the snapshot saw.
+                    self._registry.unregister(source_id)
+                    reclaimed += 1
+                    logger.info(f"Reclaimed discarded upload {source_id}")
+            # ...and the label sets being uploaded onto it, which are tracked
+            # on the source rather than in the registry.
+            for field, label_set in list(_label_uploads(adapter).items()):
+                expired_now, stale = _reap_step(label_set, now, ttl)
+                if expired_now:
+                    self._unlist_label_set(adapter, field)
+                    expired += 1
+                elif stale:
+                    adapter.detach_label_upload(field)
+                    reclaimed += 1
+                    logger.info(f"Reclaimed discarded label upload {source_id}/{field}")
         return expired, reclaimed
 
     def start_sweep(self) -> None:

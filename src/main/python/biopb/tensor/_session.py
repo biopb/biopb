@@ -1126,6 +1126,25 @@ class CatalogClient:
         )
         return RemoveSourceResult.FromString(result_bytes)
 
+    # ---- label sets (biopb-tensor-server/docs/label-tensors.md) ----
+
+    def label_sets(self, image_array_id: str) -> List[str]:
+        """Backs TensorFlightClient.label_sets; see that method."""
+        prefix = sql_literal(f"{image_array_id}/labels/")
+        table = self._query_table(
+            "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
+            f"WHERE starts_with(t.array_id, {prefix}) ORDER BY t.array_id"
+        )
+        return table.column(0).to_pylist()
+
+    def delete_labels(self, array_id: str) -> Dict[str, Any]:
+        """Backs TensorFlightClient.delete_labels; see that method."""
+        action = flight.Action("delete_labels", array_id.encode("utf-8"))
+        result_bytes = self._do_action_one_result(
+            action, unavailable_hint="Label set deletion is unavailable"
+        )
+        return json.loads(result_bytes.decode("utf-8"))
+
     # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
 
     def list_rois(self, array_id: str, set_name: str = "") -> "RoiListResult":

@@ -17,21 +17,29 @@ Design: ``biopb-tensor-server/docs/label-tensors.md``.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Sequence
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 from biopb_tensor_server.core.axes import canonical_axis
 
 __all__ = [
     "LABELS_SEGMENT",
+    "RESERVED_PREFIX",
     "LabelField",
     "extent_mismatch",
     "join_fields",
+    "label_extent",
     "label_field",
     "split_label_field",
 ]
 
 #: The path segment that marks a label set under its image.
 LABELS_SEGMENT = "labels"
+
+#: A name under this prefix is server-owned, in the spirit of the ``@ome`` ROI
+#: set: ``labels/@ome`` is the set rasterized from an OME-TIFF's masks, and a
+#: native NGFF set keeps whatever name the file gave it. Clients read a
+#: reserved set; they never upload or delete one.
+RESERVED_PREFIX = "@"
 
 
 class LabelField(NamedTuple):
@@ -81,6 +89,26 @@ def _axis_key(label: str) -> str:
     return canonical_axis(label) or str(label).lower()
 
 
+def label_extent(
+    image_labels: Sequence[str], image_shape: Sequence[int]
+) -> Tuple[List[str], List[int]]:
+    """The axes and lengths a set of this image must have (design, "Extent").
+
+    The image's own axes with the channel axis dropped, each at full length,
+    so a label pixel and its image pixel share an index. Axes come back as the
+    image spells them, which for the normalized descriptors the callers hand
+    in is canonical: this is both what :func:`extent_mismatch` compares
+    against and what the upload fills in for a request that named no axes,
+    because the rule leaves exactly one legal answer.
+    """
+    kept = [
+        (str(label), int(size))
+        for label, size in zip(image_labels, image_shape, strict=True)
+        if canonical_axis(label) != "c"
+    ]
+    return [label for label, _ in kept], [size for _, size in kept]
+
+
 def extent_mismatch(
     label_labels: Sequence[str],
     label_shape: Sequence[int],
@@ -90,17 +118,11 @@ def extent_mismatch(
     """Why a set of *label_shape* over *label_labels* does not span the image,
     or None when it does.
 
-    The extent rule (design, "Extent"): a set's axes are the image's canonical
-    axes with the channel axis dropped, each at the image's full length, so a
-    label pixel and its image pixel share an index. Both sides are compared
-    in canonical order -- the caller hands in normalized descriptors -- by
-    canonical axis name, so ``"Z"`` and ``"depth"`` agree.
+    The rule is :func:`label_extent`; this is the comparison. Axes are matched
+    by canonical name, so ``"Z"`` and ``"depth"`` agree.
     """
-    expected_axes, expected_shape = [], []
-    for label, size in zip(image_labels, image_shape, strict=True):
-        if canonical_axis(label) != "c":
-            expected_axes.append(_axis_key(label))
-            expected_shape.append(int(size))
+    expected_labels, expected_shape = label_extent(image_labels, image_shape)
+    expected_axes = [_axis_key(label) for label in expected_labels]
     if [_axis_key(label) for label in label_labels] != expected_axes:
         return (
             f"axes {list(label_labels)} do not match the image's non-channel "

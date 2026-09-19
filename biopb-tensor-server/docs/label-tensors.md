@@ -1,6 +1,7 @@
 # Label tensors — backend design
 
-Status: proposal — not implemented. Companion to `roi-annotations.md`, which
+Status: steps 1–3 implemented; 4 (OME-TIFF masks) and 5 (clients) remain. The
+sequence is biopb/biopb#1059. Companion to `roi-annotations.md`, which
 scoped instance segmentation *out* of the annotation store and into "a label
 tensor the server already serves as pixels". This is that tensor.
 
@@ -143,7 +144,13 @@ ignorant of sidecars:
   `attach_label_set` / `detach_label_set` are what the registry's
   `on_register` hook (finished sidecars, `sidecar_attacher`) and the upload
   kind (at `finish`; `delete`) use; `label_sets` is the merged view, every
-  set normalized like any tensor and checked against the image it binds to.
+  set normalized like any tensor and checked against the image it binds to
+  (`label_binding_error`, which the upload's create calls too, so one rule
+  answers for every origin).
+- `label_uploads` is the second, smaller index: sets the upload path is still
+  filling, and the tombstones of ones it gave up on. Routable but never
+  listed — the bytes have not all arrived, or are gone — and it is what the
+  DoPut boundary looks an upload up in and what the reclaim sweep walks.
 - `resolve_tensor(tensor_id)` and `resolve_chunk_adapter(field)` are the two
   lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
   `.../labels/<name>[/<level>]` field answers from `label_sets`, everything
@@ -190,14 +197,12 @@ special-cased.
 
 ## Upload
 
-The step 7 SDK from biopb/biopb#1048 is reused unchanged:
+The step 7 SDK from biopb/biopb#1048 is reused as it stands, plus one verb:
 
 ```python
-desc = client.create_tensor(TensorDescriptor(
-    array_id="src_ab12/labels/nuclei", shape=..., dim_labels=..., dtype="uint32",
-    chunk_shape=...))
+desc = client.create_tensor("src_ab12/labels/nuclei", labels, chunk_shape=...)
 client.upload_array(desc, labels)        # skips all-zero chunks for this kind
-client.finish_upload(desc)
+client.delete_labels("src_ab12/labels/nuclei")   # frees the name again
 ```
 
 Server side this is a third upload kind, selected by the request `array_id`
@@ -206,8 +211,10 @@ other two, the request's `array_id` *is* the final one. The kind:
 
 - resolves the parent by splitting at the last `/labels/` and refuses if the
   parent is absent, unresolved, or does not serve pixels;
-- refuses a non-integer dtype, a reserved name, or a shape / `dim_labels` that
-  is not the parent's canonical non-channel extent;
+- refuses a non-unsigned-integer dtype, a reserved name, or a shape /
+  `dim_labels` that is not the parent's canonical non-channel extent — a
+  request naming no `dim_labels` is filled in from the image rather than
+  refused, since the extent rule leaves exactly one legal answer;
 - refuses a name already attached, finished or pending — the biopb/biopb#1054
   rule, now per parent;
 - creates the sidecar array with the pending marker and the minted
@@ -215,13 +222,17 @@ other two, the request's `array_id` *is* the final one. The kind:
   attachment: routable for `get_flight_info` (so the poll to READY works from
   create) but not listed.
 
-`finish` clears the pending marker, lists the set, and re-syncs the parent's
-catalog row (`sync_source_added` is an upsert; the ROI re-import it triggers is
-already idempotent). The status and TTL machinery apply as they stand, with two
-plumbing changes in `UploadManager`: `status` / `finish` / `discard` /
-`write_chunk` receive a set's `array_id` where they receive a `source_id`
-today, and resolve it through the parent's attachment; and `reap` visits each
-attachment's pending sets as well as registered upload sources.
+`finish` seals the pending marker, lists the set (`attach_label_set`) and
+re-syncs the parent's catalog row (`sync_source_added` is an upsert; the ROI
+re-import it triggers is already idempotent), in that order — the catalog must
+not name a set a restart would sweep away. The status and TTL machinery apply
+as they stand, with two plumbing changes in `UploadManager`: `status` /
+`finish` / `discard` / `write_chunk` receive a set's `array_id` where they
+receive a `source_id` today, and resolve it through the parent's
+`label_uploads` (`_locate`); and
+`reap` walks that index on every source as well as the registered upload
+sources — a quiet pending set is discarded with its sidecar and unlisted, and
+its tombstone detached a TTL later, which is what frees the name.
 
 **Skipping zeros is per kind.** `upload_array` may drop all-zero chunks only for
 the label kind, where an unwritten chunk reads as fill. A `cache:` source

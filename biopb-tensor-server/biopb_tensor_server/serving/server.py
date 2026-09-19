@@ -71,7 +71,7 @@ from biopb.tensor.ticket_pb2 import (
 from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
-from biopb_tensor_server.adapters.labels import sidecar_attacher
+from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -431,7 +431,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # Uploaded label sets live under write_dir/labels/<source_id>/ and are
         # attached to their source at registration (biopb/biopb#1059).
         self.sources = SourceRegistry(
-            on_register=sidecar_attacher(Path(write_dir) / "labels")
+            on_register=sidecar_attacher(labels_root(Path(write_dir)))
             if write_dir is not None
             else None
         )
@@ -976,6 +976,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "roi_prune",
                 "Report (or with apply, delete) annotations whose source is gone",
             ),
+            flight.ActionType(
+                "delete_labels",
+                "Delete an uploaded label set and its sidecar store",
+            ),
         ]
 
     def do_action(
@@ -1096,6 +1100,15 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context)
             req = RoiPruneRequest.FromString(action.body.to_pybytes())
             yield self._handle_roi_prune(req)
+        elif action.type == "delete_labels":
+            # Full access, like every other mutation: a read capability on the
+            # parent covers reading its sets, never removing one
+            # (biopb/biopb#1059).
+            self._authorize(context)
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+            array_id = action.body.to_pybytes().decode("utf-8")
+            yield json.dumps(self.uploads.delete_labels(array_id)).encode("utf-8")
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
@@ -1723,9 +1736,15 @@ class TensorFlightServer(flight.FlightServerBase):
         # `_refuse_if_discarded` -- a poller learns the reason instead of
         # meeting a dead call.
         if UPLOAD_STATUS in mask:
-            upload = upload_of(source_adapter)
+            # The tensor first: a label set is a tensor of a source that is not
+            # itself an upload, and it is the set's own progress its producer
+            # polls (biopb/biopb#1059). The two source kinds answer from the
+            # source, where the array_id and the source_id are the same string.
+            upload = upload_of(tensor_adapter) or upload_of(source_adapter)
             if upload is not None:
-                _fill_upload_status(read_plan.descriptor, upload, source_id)
+                _fill_upload_status(
+                    read_plan.descriptor, upload, read_plan.descriptor.array_id
+                )
 
         # Residency, only when asked. It is a bounded stat walk of the source,
         # so it is never free -- which is why it is per-source and opt-in rather

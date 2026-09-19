@@ -636,6 +636,52 @@ class TensorFlightClient:
         """
         return self._catalog.remove_source(root_url)
 
+    # ---- label sets ----
+
+    def label_sets(self, image_array_id: str) -> List[str]:
+        """The ``array_id``s of the label sets served under an image.
+
+        A label set is an ordinary tensor of its image, named
+        ``<image array_id>/labels/<name>``, so this is a catalog query over
+        the path and nothing more -- ``get_tensor`` / ``get_descriptor`` read
+        one like any other tensor. A set's descriptor carries an NGFF
+        ``image-label`` block in its ``metadata_json``, whose ``source.image``
+        names this image.
+
+        Args:
+            image_array_id: The image's ``array_id`` (``"src_ab12"``, or
+                ``"src_ab12/Image:0"`` on a multi-tensor source).
+
+        Returns:
+            The sets' ``array_id``s, sorted. Empty when the image has none.
+        """
+        return self._catalog.label_sets(image_array_id)
+
+    def delete_labels(self, array_id: str) -> Dict[str, Any]:
+        """Delete an uploaded label set, and the store behind it.
+
+        Note:
+            Experimental, with the rest of the upload API.
+
+        Only a *finished uploaded* set: a set the image's own file carries is
+        the file's, and a server-owned one (a name under ``@``) is the
+        server's. Deleting frees the name at once -- the next set uploaded
+        under it is a distinct tensor with its own cache namespace, so no
+        stale chunk can be served for it.
+
+        Args:
+            array_id: The set's ``array_id``, as ``label_sets`` reports it.
+
+        Returns:
+            ``{"array_id": ..., "deleted": True}``.
+
+        Raises:
+            pyarrow.flight.FlightServerError: the set is not one this server
+                may delete, or does not exist.
+            RuntimeError: the server predates the ``delete_labels`` action.
+        """
+        return self._catalog.delete_labels(array_id)
+
     # ---- ROI annotations ----
 
     def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
@@ -870,7 +916,12 @@ class TensorFlightClient:
 
         Args:
             source_name: "cache:name" → cache-backed; "ome_zarr:name" →
-                zarr-backed; "cache:" or "ome_zarr:" → server-generated name
+                zarr-backed; "cache:" or "ome_zarr:" → server-generated name;
+                "<image array_id>/labels/<name>" → a label set of an image the
+                server already serves, which is the one form whose id is the
+                request's own rather than a minted ``source_id``. A set is
+                unsigned-integer, spans its image's non-channel axes at full
+                length, and its all-zero chunks are skipped by ``upload_array``
             template: Anything with ``.shape`` and ``.dtype`` -- the array to be
                 uploaded, or one shaped like it. A dask array also supplies the
                 chunk grid (its chunk size per axis).

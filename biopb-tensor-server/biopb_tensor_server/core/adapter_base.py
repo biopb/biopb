@@ -528,6 +528,12 @@ class SourceAdapter(ABC):
     _attached_label_sets: Optional[Dict[str, TensorAdapter]] = None
     # The validated, normalized merge of both; None means rebuild.
     _label_sets_view: Optional[Dict[str, TensorAdapter]] = None
+    # Sets the upload path is still filling, and the tombstones of ones it gave
+    # up on: routable, so a poll to READY and a straggler's write both find
+    # their adapter, but never listed -- the bytes are not all there yet, or
+    # are gone. A finished one is attached as well, and stays here until the
+    # reclaim sweep takes its tombstone (``UploadManager.reap``).
+    _label_uploads: Optional[Dict[str, TensorAdapter]] = None
 
     def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
         """Label sets this source's own file carries, keyed by within-source field.
@@ -554,51 +560,88 @@ class SourceAdapter(ABC):
         A set that fails is dropped with a warning rather than served
         misaligned. Empty until the source is resolved, since its tensors are
         unknown before that; rebuilt after every attach or detach.
+
+        This is the *published* view -- what the catalog lists and what a read
+        resolves first. A set still being uploaded is in :attr:`label_uploads`
+        instead, and joins this one at ``finish``.
         """
         view = self._label_sets_view
         if view is not None:
             return view
         if not self.is_resolved():
             return {}
-        from biopb_tensor_server.core.normalize import (
-            _normalize_descriptor,
-            normalize_adapter,
-        )
+        from biopb_tensor_server.core.normalize import normalize_adapter
 
         if self._embedded_label_sets is None:
             self._embedded_label_sets = dict(self.get_embedded_labels())
-        images = {
-            d.array_id: _normalize_descriptor(d) for d in self.list_tensor_descriptors()
-        }
+        images = self._normalized_tensors()
         candidates = {**self._embedded_label_sets, **(self._attached_label_sets or {})}
         view = {}
         for field, adapter in candidates.items():
-            parsed = split_label_field(field)
-            image = (
-                images.get(join_fields(self.source_id, parsed.image_field))
-                if parsed is not None
-                else None
-            )
-            if image is None:
-                logger.warning(
-                    f"labels: {self.source_id}/{field} binds to no tensor of the "
-                    "source; dropped"
-                )
-                continue
             normalized = normalize_adapter(adapter)
-            desc = normalized.get_tensor_descriptor()
-            why = extent_mismatch(
-                desc.dim_labels, desc.shape, image.dim_labels, image.shape
+            why = self.label_binding_error(
+                field, normalized.get_tensor_descriptor(), images=images
             )
             if why is not None:
-                logger.warning(
-                    f"labels: {self.source_id}/{field} does not span its image: "
-                    f"{why}; dropped"
-                )
+                logger.warning(f"labels: {self.source_id}/{field} dropped: {why}")
                 continue
             view[field] = normalized
         self._label_sets_view = view
         return view
+
+    def _normalized_tensors(self) -> Dict[str, TensorDescriptor]:
+        """This source's own tensors by ``array_id``, in canonical axis order.
+
+        What a label set is checked against, and read once per check rather
+        than per set -- ``list_tensor_descriptors`` re-derives on an HCS plate.
+        """
+        from biopb_tensor_server.core.normalize import _normalize_descriptor
+
+        return {
+            d.array_id: _normalize_descriptor(d) for d in self.list_tensor_descriptors()
+        }
+
+    def label_binding_error(
+        self,
+        field: str,
+        desc: TensorDescriptor,
+        images: Optional[Dict[str, TensorDescriptor]] = None,
+    ) -> Optional[str]:
+        """Why a set of *desc* cannot be served at label *field*, or None.
+
+        One rule, checked at both ends: the upload kind calls it before it
+        mints a sidecar, and :attr:`label_sets` calls it again for every
+        origin when the sets are listed -- a native NGFF group and a sidecar
+        from an earlier server life never passed through the upload. *desc* is
+        in canonical order (both callers normalize first), and *images* is
+        :meth:`_normalized_tensors` when the caller already holds it.
+        """
+        if split_label_field(field) is None:
+            return f"{field!r} does not name a label set"
+        image = self.label_image_descriptor(field, images=images)
+        if image is None:
+            return "binds to no tensor of the source"
+        why = extent_mismatch(
+            desc.dim_labels, desc.shape, image.dim_labels, image.shape
+        )
+        return f"does not span its image: {why}" if why is not None else None
+
+    def label_image_descriptor(
+        self,
+        field: str,
+        images: Optional[Dict[str, TensorDescriptor]] = None,
+    ) -> Optional[TensorDescriptor]:
+        """The image a label *field* binds to, normalized, or None if it has none.
+
+        What the extent is measured against, and what the upload kind reads to
+        fill in the axes of a request that named none.
+        """
+        parsed = split_label_field(field)
+        if parsed is None or parsed.level is not None:
+            return None
+        if images is None:
+            images = self._normalized_tensors()
+        return images.get(join_fields(self.source_id, parsed.image_field))
 
     def attach_label_set(self, field: str, adapter: TensorAdapter) -> None:
         """Make *adapter* answer for label field *field* on this source.
@@ -626,6 +669,33 @@ class SourceAdapter(ABC):
             self._label_sets_view = None
         return removed
 
+    @property
+    def label_uploads(self) -> Dict[str, TensorAdapter]:
+        """Label sets of this source the upload path owns, keyed by field.
+
+        Routable but never listed (see :attr:`label_sets`). Handed out as they
+        were attached -- not normalized, because the upload refuses a
+        non-canonical order at create -- so the boundary reaches the writable
+        adapter itself (``put_chunk``, ``finish``, ``discard``).
+        """
+        return self._label_uploads or {}
+
+    def attach_label_upload(self, field: str, adapter: TensorAdapter) -> None:
+        """Route *field* to an upload in flight; see :attr:`label_uploads`."""
+        if self._label_uploads is None:
+            self._label_uploads = {}
+        self._label_uploads[field] = adapter
+
+    def detach_label_upload(self, field: str) -> Optional[TensorAdapter]:
+        """Stop routing *field* to an upload; returns it, or None.
+
+        The reclaim sweep's half of the lifecycle: a tombstone stops being
+        addressable here, exactly as a discarded source stops being registered.
+        """
+        if not self._label_uploads:
+            return None
+        return self._label_uploads.pop(field, None)
+
     def resolve_tensor(self, tensor_id: Optional[str]) -> TensorAdapter:
         """The adapter bound to *tensor_id*: a label set of this source, else
         whatever :meth:`get_tensor_adapter` answers.
@@ -639,10 +709,22 @@ class SourceAdapter(ABC):
         """
         parsed = split_label_field(self._within_source_field(tensor_id))
         if parsed is not None and parsed.level is None:
-            label_set = self.label_sets.get(parsed.set_field)
+            label_set = self._label_set_for(parsed.set_field)
             if label_set is not None:
                 return label_set
         return self.get_tensor_adapter(tensor_id)
+
+    def _label_set_for(self, set_field: str) -> Optional[TensorAdapter]:
+        """The adapter answering for label field *set_field*, listed or in flight.
+
+        A set being uploaded is addressable from ``create_tensor`` onwards --
+        that is how its producer polls it to READY (biopb/biopb#1048) -- so
+        both views are consulted, the published one first.
+        """
+        label_set = self.label_sets.get(set_field)
+        if label_set is not None:
+            return label_set
+        return self.label_uploads.get(set_field)
 
     def resolve_chunk_adapter(self, field: Optional[str]) -> TensorAdapter:
         """The adapter that serves a chunk whose route carries *field*.
@@ -656,7 +738,7 @@ class SourceAdapter(ABC):
         """
         parsed = split_label_field(field)
         label_set = (
-            self.label_sets.get(parsed.set_field) if parsed is not None else None
+            self._label_set_for(parsed.set_field) if parsed is not None else None
         )
         if label_set is not None:
             level = label_set.get_level_adapter(parsed.level) if parsed.level else None
@@ -1803,6 +1885,11 @@ _SOURCE_SCOPED_API = frozenset(
         "label_sets",
         "attach_label_set",
         "detach_label_set",
+        "label_uploads",
+        "attach_label_upload",
+        "detach_label_upload",
+        "label_binding_error",
+        "label_image_descriptor",
         "resolve_tensor",
         "resolve_chunk_adapter",
         # the level lookup of the chunk route, which is source-scoped
