@@ -456,6 +456,9 @@ class TensorFlightServer(flight.FlightServerBase):
         self.uploads = UploadManager(
             self.sources, write_dir, self._metadata_db, ttl=upload_ttl
         )
+        # What a crashed server left half-written goes before anything can
+        # register it: the caller's discovery scan runs after this returns.
+        self.uploads.discard_unfinished_stores()
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
         # stopped in ``shutdown``.
         self.uploads.start_sweep()

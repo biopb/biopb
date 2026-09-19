@@ -1886,16 +1886,23 @@ class TestDiscard:
             "state"
         ] == ("DISCARDED")
 
-    def test_zarr_backed_uploads_are_refused(self, writable_server, client):
-        """A .zarr on disk and a catalog row are not this call's to release."""
+    def test_a_zarr_backed_discard_takes_its_store_and_row_with_it(
+        self, writable_server, client, tmp_path
+    ):
+        """The store was minted under write_dir and the row written at create,
+        so both are the server's own to release (biopb/biopb#1059)."""
         source_id = client.create_tensor(
-            "ome_zarr:keepme", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+            "ome_zarr:letgo", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
         ).array_id
+        assert (tmp_path / "letgo.zarr").is_dir()
+        assert source_id in _catalog_ids(writable_server.metadata_db)
 
-        with pytest.raises(ValueError, match="not a cache-backed upload"):
-            writable_server.uploads.discard(source_id, "nope")
+        status = writable_server.uploads.discard(source_id, "nope")
 
-        assert client.get_upload_status(source_id)["state"] == "PENDING"
+        assert status["state"] == "DISCARDED"
+        assert not (tmp_path / "letgo.zarr").exists()
+        assert source_id not in _catalog_ids(writable_server.metadata_db)
+        assert client.get_upload_status(source_id)["state"] == "DISCARDED"
 
     def test_the_poll_sees_the_reason(self, writable_server, client):
         """A discarded upload is terminal and the status says why, which is

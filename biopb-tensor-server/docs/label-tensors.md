@@ -213,12 +213,13 @@ deleting the old one first. Delete is the one new action.
 
 ## Lifecycle: durable uploads get the whole of it
 
-The `durable` flag currently gates three things: `discard` raises for a durable
-upload, the reap sweep skips it, and the catalog row is written at create. An
-abandoned `ome_zarr:` upload is therefore PENDING for the life of the server,
-listed, with a partial store on disk — and after a restart the partial store
-comes back through discovery as an ordinary source with no upload state at all.
-A label set would inherit all of that, with the sidecar as its only backing.
+Before step 1 of biopb/biopb#1059 the `durable` flag gated three things:
+`discard` raised for a durable upload, the reap sweep skipped it, and the
+catalog row was written at create. An abandoned `ome_zarr:` upload was
+therefore PENDING for the life of the server, listed, with a partial store on
+disk — and after a restart the partial store came back through discovery as an
+ordinary source with no upload state at all. A label set would have inherited
+all of that, with the sidecar as its only backing.
 
 biopb/biopb#1048 recorded the refusal's reason: a `.zarr` on disk and a catalog
 row "are not this call's to release", and deleting a directory "is a genuinely

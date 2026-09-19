@@ -4,10 +4,15 @@ Relies on OS page cache for raw data caching.
 """
 
 import json
+import logging
+import os
+import shutil
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
+import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
@@ -21,10 +26,59 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.errors import UploadDiscardedError
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+logger = logging.getLogger(__name__)
+
+# The upload marker a server-minted store carries in its root ``.zattrs``:
+# ``{"biopb": {"upload": {"state": "pending" | "ready"}}}``. Written at create,
+# flipped at ``finish``. A store still ``pending`` when a server starts is a
+# crashed upload -- ``UploadManager.discard_unfinished_stores`` deletes it, and
+# discovery declines it (``is_unfinished_upload``) so a shared root never
+# serves a partial store as a source of its own (biopb/biopb#1059).
+UPLOAD_ATTR = "biopb"
+UPLOAD_PENDING = "pending"
+UPLOAD_READY = "ready"
+
+
+def upload_state(zattrs: Any) -> Optional[str]:
+    """The upload marker's state from a parsed ``.zattrs``, or None if unmarked."""
+    if not isinstance(zattrs, dict):
+        return None
+    upload = (zattrs.get(UPLOAD_ATTR) or {}).get("upload")
+    if not isinstance(upload, dict):
+        return None
+    state = upload.get("state")
+    return state if isinstance(state, str) else None
+
+
+def with_upload_state(zattrs: dict, state: str) -> dict:
+    """*zattrs* with the upload marker set to *state* (a copy; the input is not touched)."""
+    out = dict(zattrs)
+    block = dict(out.get(UPLOAD_ATTR) or {})
+    block["upload"] = {"state": state}
+    out[UPLOAD_ATTR] = block
+    return out
+
+
+def is_unfinished_upload(ctx: ClaimContext) -> bool:
+    """Whether the ``.zarr`` directory at *ctx* is an upload that never finished.
+
+    Reads ``.zattrs`` only when it is present and resident: a non-resident
+    cloud placeholder is deferred by the claims themselves, and a store nobody
+    marked is not an upload.
+    """
+    zattrs_ctx = ctx.join(".zattrs")
+    if not zattrs_ctx.exists() or not zattrs_ctx.is_resident():
+        return False
+    try:
+        return upload_state(json.loads(ctx.read_text(".zattrs"))) == UPLOAD_PENDING
+    except Exception:
+        return False
 
 
 class ZarrAdapter(WritableSource, TensorAdapter):
@@ -36,9 +90,15 @@ class ZarrAdapter(WritableSource, TensorAdapter):
     Writable: a chunk-aligned ``put_chunk`` lands in the store. Only an adapter
     built by ``OmeZarrAdapter.create_upload`` tracks an upload; a catalogued
     store accepts writes untracked.
+
+    An upload's store is the server's own (minted under ``write_dir``), so the
+    upload half here also owns its end: discard removes the directory
+    (:meth:`_dispose_store`) and finish clears the pending marker
+    (:meth:`_mark_store_finished`). Neither touches a discovered store, which
+    never began an upload and so never reaches either.
     """
 
-    # A real store on disk: catalogued, and not this side's to throw away.
+    # A real store on disk, catalogued: the boundary keeps the row in step.
     durable = True
 
     @classmethod
@@ -57,6 +117,8 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         """
         # Must be a directory ending in .zarr
         if not ctx.is_dir() or not ctx.name.endswith(".zarr"):
+            return None
+        if is_unfinished_upload(ctx):
             return None
 
         # Check for zarr structure files
@@ -186,6 +248,16 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         # Inherited by OmeZarrAdapter / _HcsFieldAdapter via super().__init__.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
+        # The directory ``create_upload`` minted, for the two store hooks; None
+        # on a discovered store, which is not this adapter's to remove or mark.
+        self._upload_store_path: Optional[Path] = None
+        # Serializes chunk writes against store disposal. Taken by ``put_chunk``
+        # around refuse-and-store, so a write that passed ``_refuse_write``
+        # lands before ``_dispose_store`` removes the directory, and a write
+        # arriving after is refused -- rather than recreating the directory a
+        # moment after it was deleted (zarr's DirectoryStore makes parents on
+        # write). Ordered before ``progress.lock``; disposal never holds that.
+        self._write_lock = threading.Lock()
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -222,6 +294,55 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
+
+    def resolve_chunk_data(self, chunk_id: bytes, cache_manager: Any = None) -> Any:
+        """The read path, refused for a tombstone before the cache is consulted.
+
+        The store is gone once discarded, and zarr would answer fill values
+        for its missing chunks -- or the cache would answer the bytes it still
+        holds. Either way a reader would see data behind a source that has
+        none; it learns the reason instead, as a writer does, mapped to the
+        read path's wire error like ``CachedSourceAdapter`` maps it.
+        """
+        try:
+            self._refuse_if_discarded()
+        except UploadDiscardedError as e:
+            raise flight.FlightServerError(str(e)) from e
+        return super().resolve_chunk_data(chunk_id, cache_manager)
+
+    def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
+        with self._write_lock:
+            super().put_chunk(bounds, data, expected_shape, dtype)
+
+    def _dispose_store(self) -> None:
+        """Remove the minted directory; see ``_write_lock`` for the ordering."""
+        path = self._upload_store_path
+        if path is None:
+            return
+        with self._write_lock:
+            shutil.rmtree(path, ignore_errors=True)
+        logger.info(f"Removed the store of discarded upload {self.source_id}: {path}")
+
+    def _mark_store_finished(self) -> None:
+        self._write_upload_state(UPLOAD_READY)
+
+    def _write_upload_state(self, state: str) -> None:
+        """Rewrite the root ``.zattrs`` with the upload marker set to *state*.
+
+        Atomic (write-then-replace) so a crash mid-write cannot leave a store
+        with no ``.zattrs`` at all. Raises ``OSError`` when it cannot -- the
+        store is gone because discard raced, or the disk refused -- and
+        ``finish`` decides which of the two it was.
+        """
+        path = self._upload_store_path
+        if path is None:
+            return
+        zattrs_path = path / ".zattrs"
+        with self._write_lock:
+            zattrs = json.loads(zattrs_path.read_text())
+            tmp = zattrs_path.with_name(".zattrs.tmp")
+            tmp.write_text(json.dumps(with_upload_state(zattrs, state)))
+            os.replace(tmp, zattrs_path)
 
     def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
         """Write chunk data to zarr array.
