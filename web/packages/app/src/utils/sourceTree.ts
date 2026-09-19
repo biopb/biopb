@@ -178,8 +178,9 @@ export interface TensorGroup {
  * the worse failure of the two.
  */
 export function groupTensors(tensors: TensorDescriptor[]): TensorGroup[] {
+  // A `Map` preserves insertion order, which is what lets images stay in the
+  // order the server listed them without a separate order array.
   const groups = new Map<string, TensorGroup>();
-  const order: string[] = [];
   const sets: Array<{ tensor: TensorDescriptor; imageArrayId: string; name: string }> = [];
 
   for (const tensor of tensors) {
@@ -190,7 +191,6 @@ export function groupTensors(tensors: TensorDescriptor[]): TensorGroup[] {
     }
     if (groups.has(tensor.array_id)) continue;
     groups.set(tensor.array_id, { image: tensor, labelSets: [] });
-    order.push(tensor.array_id);
   }
 
   for (const set of sets) {
@@ -200,7 +200,6 @@ export function groupTensors(tensors: TensorDescriptor[]): TensorGroup[] {
       continue;
     }
     groups.set(set.tensor.array_id, { image: set.tensor, labelSets: [] });
-    order.push(set.tensor.array_id);
   }
 
   // Sets sorted by name, images left in the order the server listed them: it
@@ -209,5 +208,5 @@ export function groupTensors(tensors: TensorDescriptor[]): TensorGroup[] {
   for (const group of groups.values()) {
     group.labelSets.sort((a, b) => a.array_id.localeCompare(b.array_id));
   }
-  return order.map((id) => groups.get(id) as TensorGroup);
+  return [...groups.values()];
 }

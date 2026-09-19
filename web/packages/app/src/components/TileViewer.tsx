@@ -706,18 +706,17 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // Both go through JSON keys for the reason `selectionKey` does: deck.gl
   // refetches on a changed *reference*, and memos keyed on objects would
   // refetch every frame.
-  const labelSelectionKey = useMemo(() => {
-    if (!info || !overlay || !selectionKey) return "";
+  const deriveLabelKey = (key: string | null) => {
+    if (!info || !overlay || !key) return "";
     return JSON.stringify(
-      labelSelection(info, overlay.info, JSON.parse(selectionKey) as Record<string, number>),
+      labelSelection(info, overlay.info, JSON.parse(key) as Record<string, number>),
     );
-  }, [info, overlay, selectionKey]);
-  const labelShownKey = useMemo(() => {
-    if (!info || !overlay || loadedKey === null) return "";
-    return JSON.stringify(
-      labelSelection(info, overlay.info, JSON.parse(loadedKey) as Record<string, number>),
-    );
-  }, [info, overlay, loadedKey]);
+  };
+  const labelSelectionKey = useMemo(
+    () => deriveLabelKey(selectionKey),
+    [info, overlay, selectionKey],
+  );
+  const labelShownKey = useMemo(() => deriveLabelKey(loadedKey), [info, overlay, loadedKey]);
 
   // "Which plane of which set". The set has to be in the key: two sets of one
   // image produce identical selections, so the one switched off a moment ago

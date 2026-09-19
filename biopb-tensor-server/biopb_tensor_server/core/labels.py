@@ -90,6 +90,12 @@ def _axis_key(label: str) -> str:
     return canonical_axis(label) or str(label).lower()
 
 
+def _non_channel_indices(image_labels: Sequence[str]) -> List[int]:
+    """Indices of *image_labels* with the channel axis dropped -- the one
+    predicate :func:`label_extent` and :func:`label_image_axes` both apply."""
+    return [i for i, label in enumerate(image_labels) if canonical_axis(label) != "c"]
+
+
 def label_extent(
     image_labels: Sequence[str], image_shape: Sequence[int]
 ) -> Tuple[List[str], List[int]]:
@@ -102,12 +108,13 @@ def label_extent(
     against and what the upload fills in for a request that named no axes,
     because the rule leaves exactly one legal answer.
     """
-    kept = [
-        (str(label), int(size))
-        for label, size in zip(image_labels, image_shape, strict=True)
-        if canonical_axis(label) != "c"
-    ]
-    return [label for label, _ in kept], [size for _, size in kept]
+    if len(image_labels) != len(image_shape):
+        raise ValueError(
+            f"image_labels {list(image_labels)} and image_shape "
+            f"{list(image_shape)} have different lengths"
+        )
+    kept = _non_channel_indices(image_labels)
+    return [str(image_labels[i]) for i in kept], [int(image_shape[i]) for i in kept]
 
 
 def label_image_axes(
@@ -127,7 +134,7 @@ def label_image_axes(
     is then no mapping to state. Callers that have already run
     :func:`extent_mismatch` never see it.
     """
-    kept = [i for i, label in enumerate(image_labels) if canonical_axis(label) != "c"]
+    kept = _non_channel_indices(image_labels)
     return kept if len(kept) == len(label_labels) else None
 
 

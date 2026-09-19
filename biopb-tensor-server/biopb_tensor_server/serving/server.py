@@ -200,8 +200,7 @@ def _with_label_axes(metadata: dict, source_adapter: Any, desc: Any) -> dict:
     parsed = split_label_field(desc.array_id.partition("/")[2])
     if parsed is None or source_adapter is None:
         return metadata
-    get_axes = getattr(source_adapter, "label_image_axes", None)
-    axes = get_axes(parsed.set_field, desc) if get_axes is not None else None
+    axes = source_adapter.label_image_axes(parsed.set_field, desc)
     if axes is None:
         return metadata
     biopb = {**(metadata.get("biopb") or {})}

@@ -2491,6 +2491,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
     y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
     edge = _tile_edge(shape, [int(d) for d in td.chunk_shape], y_idx, x_idx)
 
+    image_axes = _label_image_axes(td)
     return JSONResponse(
         {
             "array_id": _versioned_array_id(td.array_id, version),
@@ -2510,11 +2511,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
             # A label set only: which of its image's axes each of its own
             # indexes, as the server states it. Absent for an image, and for a
             # server that predates the block.
-            **(
-                {"image_axes": _label_image_axes(td)}
-                if _label_image_axes(td) is not None
-                else {}
-            ),
+            **({"image_axes": image_axes} if image_axes is not None else {}),
             # Advisory: the ladder the SERVER advertises, which is what the rungs
             # above are actually read from -- a native on-disk level where the
             # source ships one, else the computed level precache warms. Published

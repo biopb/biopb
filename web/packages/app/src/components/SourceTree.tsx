@@ -302,7 +302,9 @@ export function TreeRow({
   const isActive = src.source_id === activeSourceId;
   // Label sets filed under the image they annotate, rather than listed beside
   // it: a set is a tensor of the source, but it is *about* one of the others.
-  const groups = groupTensors(src.tensors);
+  // Memoized: an unrelated store change (e.g. toggling the overlay) re-renders
+  // every row, and re-sorting every source's tensors on each one adds up.
+  const groups = useMemo(() => groupTensors(src.tensors), [src.tensors]);
   const hasMultipleTensors = src.tensors.length > 1;
   const firstTensor = src.tensors[0];
   // An unresolved source has no tensor to read, so selecting it would send the

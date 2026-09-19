@@ -12,18 +12,16 @@
  * that is a property of the pair, not of the drawing, and it lives beside the
  * other identity rules as `labelSelection` in `@biopb/tensor-flight-client`.
  *
- * **The layer id must contain Viv's view id**, for the reason `roiLayers.ts`
- * states: `VivViewer` filters every layer through
- * `layer.id.includes(getVivId(viewport.id))`, and a layer that fails it is
- * silently never drawn.
+ * **The layer id must contain Viv's view id** -- see {@link vivLayerId}.
  */
 
 import { DETAIL_VIEW_ID, ImageLayer, MultiscaleImageLayer } from "@hms-dbmi/viv";
 import { LABEL_CONTRAST_LIMITS, LabelPaletteExtension } from "./labelPalette";
+import { vivLayerId } from "./vivUtils";
 
-/** A layer id Viv's `layerFilter` will accept; see `roiLayers.ts::roiLayerId`. */
+/** A layer id Viv's `layerFilter` will accept; see {@link vivLayerId}. */
 export function labelLayerId(name: string): string {
-  return `labels-${name}-#${DETAIL_VIEW_ID}#`;
+  return vivLayerId("labels", name);
 }
 
 /**
