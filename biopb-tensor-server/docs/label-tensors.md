@@ -1,7 +1,7 @@
 # Label tensors — backend design
 
-Status: steps 1–4 implemented; 5 (clients) remains. The
-sequence is biopb/biopb#1059. Companion to `roi-annotations.md`, which
+Status: steps 1–4 implemented, and step 5's SPA half; step 5's MCP/napari half
+remains. The sequence is biopb/biopb#1059. Companion to `roi-annotations.md`, which
 scoped instance segmentation *out* of the annotation store and into "a label
 tensor the server already serves as pixels". This is that tensor.
 
@@ -345,8 +345,49 @@ delete are full access like every other mutation.
 - **MCP / napari**: `add_tensor` builds a `Labels` layer when the descriptor
   carries `image-label`; `viewer.tensor(layer)` plus `upload_array` is the
   round trip. The guide text stops describing masks as a client-only artefact.
-- **SPA**: the source tree lists a tensor's sets under it; one is drawn as an
-  overlay with nearest sampling and a categorical colormap.
+- **SPA** (implemented): the source tree lists a tensor's sets under it; one is
+  drawn as an overlay with nearest sampling and a categorical colormap.
+
+### The SPA's half, as built
+
+The web viewer needs no new route and no new wire field. A set is an ordinary
+tensor, so it is listed by `/api/sources` like any other and read through
+`/api/tile_info` + `/api/tile` like any other; what the browser adds is three
+things.
+
+**The path is what says a tensor is a set.** There is no `role` column by
+decision, and a listing's per-tensor entry carries no `metadata_json` to read
+the `image-label` block out of — so `splitLabelArrayId` (`@biopb/tensor-flight-
+client`, a mirror of `core/labels.py::split_label_field`) is the one place the
+rule lives. The tree groups on it (`groupTensors`), and a set's row sits under
+the image its id names.
+
+**The overlay is a second Viv image layer, not a second data path.** The same
+`createTensorPixelSources` the image uses, a `MultiscaleImageLayer` in
+`deckProps.layers` with an id carrying Viv's view id (the constraint
+`roiLayers.ts` documents), drawn *under* the annotation layers so line work a
+few pixels wide is not covered by a categorical fill. Nearest sampling comes
+from both ends: the server forces it on every computed level of a set, and
+Viv's `interpolation: "nearest"` keeps the GPU from blending two ids into a
+third.
+
+**Colour is a pure function of the id.** `LabelPaletteExtension` claims
+`DECKGL_MUTATE_COLOR` and rotates hue by the golden-ratio conjugate, so the
+consecutive ids a segmentation produces land far apart rather than running a
+gradient; 0 is background and fully transparent. The contrast ramp is left in
+place set to identity (`contrastLimits = [0, 1]`), which is what delivers the
+stored id to the palette — anything else silently renames every object.
+
+Two alignments are worth naming. A set spans the image's **non-channel** extent,
+so the two tensors do not number their axes the same way: `labelSelection`
+matches the set's axis *j* to the image's *j*-th non-channel axis, because
+matching by Viv's selection key would be right for `t`/`z` and wrong for an
+unnamed axis. And the overlay's own failure is returned rather than raised: a
+set that 404s costs the overlay a badge, never the image its viewer.
+
+A link carries the overlay as `lb=<the set's array_id>` and its alpha as `lo`.
+The whole address, not the bare name, so the parameter is self-checking — a link
+that names one image's set and another image's `id` draws nothing.
 
 ## Implementation order
 
@@ -364,4 +405,5 @@ Each step is independently mergeable.
    and `delete_labels`.
 4. **OME-TIFF masks**: rasterizing adapter, the `@ome` set, `BinData` stripped
    from `metadata_json`.
-5. **Clients**: MCP `add_tensor` and guide text; SPA tree and overlay.
+5. **Clients**: MCP `add_tensor` and guide text; SPA tree and overlay. The two
+   halves are independent and landed apart; the SPA's is described above.

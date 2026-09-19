@@ -18,7 +18,7 @@
  */
 
 import type { Camera2DState, Camera3DState, SliceState } from "../store";
-import { clampGamma } from "./vivUtils";
+import { DEFAULT_LABEL_OPACITY, clampGamma, clampLabelOpacity } from "./vivUtils";
 import { DEFAULT_VOLUME_RENDER_MODE, VOLUME_RENDER_MODES, type VolumeRenderMode } from "./volumeUtils";
 
 /** The tensor's whole address; `source_id`, or `source_id/field`. */
@@ -37,8 +37,19 @@ const PERCENTILE_MAX = 4;
  */
 const PARAM_SETS = "rs";
 
+/**
+ * The label set drawn over the image (`lb=<its array_id>`), and its alpha.
+ *
+ * The whole address, not the bare name: a set is a tensor in its own right and
+ * that is what names it. It also makes the parameter self-checking -- the id
+ * says which image the set belongs to, so a link that carries one set's
+ * overlay and another image's `id` simply draws nothing.
+ */
+const PARAM_LABELS = "lb";
+const PARAM_LABEL_OPACITY = "lo";
+
 /** Every parameter this module owns, so unrelated ones survive a write. */
-const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "cl", "g", "v", "vm", "tg", "zm", "rx", "ro", PARAM_SETS]);
+const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "cl", "g", "v", "vm", "tg", "zm", "rx", "ro", PARAM_SETS, PARAM_LABELS, PARAM_LABEL_OPACITY]);
 
 /** `OrbitController` clamps pitch to this; a link may not ask for more. */
 const ROTATION_X_LIMIT = 90;
@@ -68,6 +79,10 @@ export interface ViewerUrlState {
    * tensor, and the listing is what drops the ones naming nothing.
    */
   visibleSets: string[] | null;
+  /** The label set drawn over the image, as its whole `array_id`, or null. */
+  labelOverlay: string | null;
+  /** The overlay's alpha, 0-1. */
+  labelOpacity: number;
 }
 
 function isVolumeRenderMode(v: string): v is VolumeRenderMode {
@@ -195,6 +210,7 @@ export function decodeViewerState(
 
   const p = num(params.get("p"));
   const g = num(params.get("g"));
+  const lo = num(params.get(PARAM_LABEL_OPACITY));
   const vm = params.get("vm");
   const fixed = decodeFixedLimits(params);
   // `rs=` alone is a deliberate "none": the parameter is present, so the list
@@ -226,6 +242,11 @@ export function decodeViewerState(
     camera3d: decodeCamera3d(params) ?? defaults.camera3d,
     camera2d: decodeCamera2d(params) ?? defaults.camera2d,
     visibleSets: sets ?? defaults.visibleSets,
+    // Taken as given, like the axis keys and the set names: which sets an image
+    // has is a property of the image, and the scoping selector is what drops an
+    // id naming none of them.
+    labelOverlay: params.get(PARAM_LABELS) || defaults.labelOverlay,
+    labelOpacity: lo === null ? defaults.labelOpacity : clampLabelOpacity(lo),
   };
 }
 
@@ -282,6 +303,14 @@ export function encodeViewerState(params: URLSearchParams, state: ViewerUrlState
     if (state.visibleSets.length === 0) out.append(PARAM_SETS, "");
     for (const name of state.visibleSets) out.append(PARAM_SETS, name);
   }
+  if (state.labelOverlay !== null) {
+    out.set(PARAM_LABELS, state.labelOverlay);
+    // Only alongside an overlay: an alpha for a set nobody is drawing is a
+    // parameter about nothing, and it would outlive the set in the bar.
+    if (state.labelOpacity !== defaults.labelOpacity) {
+      out.set(PARAM_LABEL_OPACITY, String(round(state.labelOpacity, 3)));
+    }
+  }
   return out;
 }
 
@@ -307,4 +336,6 @@ export const DEFAULT_VIEWER_URL_STATE: Omit<ViewerUrlState, "arrayId"> = {
   camera3d: null,
   camera2d: null,
   visibleSets: null,
+  labelOverlay: null,
+  labelOpacity: DEFAULT_LABEL_OPACITY,
 };

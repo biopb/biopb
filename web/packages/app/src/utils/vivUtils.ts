@@ -160,6 +160,26 @@ export function clampGamma(gamma: number): number {
   return Math.min(Math.max(gamma, GAMMA_MIN), GAMMA_MAX);
 }
 
+/**
+ * The label overlay's alpha when nobody has chosen one.
+ *
+ * Half: both pictures have to be legible at once -- the objects and the pixels
+ * they were drawn from -- and either extreme hides one of them.
+ */
+export const DEFAULT_LABEL_OPACITY = 0.5;
+
+/**
+ * An overlay alpha safe to hand the shader.
+ *
+ * Fully transparent is allowed, and is not the same as no overlay: the set is
+ * still loaded and still listed as on, which is what makes the slider a way to
+ * compare rather than a way to lose the overlay.
+ */
+export function clampLabelOpacity(opacity: number): number {
+  if (!Number.isFinite(opacity)) return DEFAULT_LABEL_OPACITY;
+  return Math.min(Math.max(opacity, 0), 1);
+}
+
 const RANGE_BY_DTYPE: Record<string, [number, number]> = {
   Uint8: [0, 255],
   Int8: [-128, 127],

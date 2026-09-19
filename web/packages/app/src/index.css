@@ -226,6 +226,13 @@ html, body {
 .tensor-item:hover { color: #94a3b8; }
 .tensor-item.active { color: #60a5fa; }
 
+/* A label set under its image. Dimmer than a tensor row, because it is not an
+   alternative to the image: clicking it draws it over the image instead of
+   opening it. The glyph is the state, so the row reads as on/off at a glance. */
+.label-item { color: #64748b; }
+.label-item:hover { color: #94a3b8; }
+.label-item.active { color: #34d399; }
+
 .tensor-pill {
   font-size: 10px;
   background: #2d3748;
@@ -657,6 +664,44 @@ html, body {
 }
 .roi-note { color: #64748b; margin: 0.5rem 0 0; }
 .roi-error { color: #fca5a5; }
+
+.label-panel {
+  background: #141820;
+  border-top: 1px solid #232a38;
+  color: #94a3b8;
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0.6rem 1rem 0.7rem;
+}
+.label-panel-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+/* One line: the pane is narrow and draggable, so a long set name elides rather
+   than pushing the Hide button off the edge. The full address is in the title. */
+.label-panel-name {
+  color: #34d399;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.label-hide {
+  background: none; border: 1px solid #2d3748; border-radius: 4px;
+  color: #cbd5e1; cursor: pointer; flex: 0 0 auto; font: inherit; margin-left: 8px;
+  padding: 0 6px;
+}
+.label-hide:hover { border-color: #34d399; color: #34d399; }
+.label-opacity { align-items: center; display: flex; gap: 8px; margin-top: 6px; }
+.label-opacity span:first-child { color: #64748b; flex: 0 0 auto; }
+.label-opacity input { flex: 1; min-width: 0; }
+.label-opacity-value {
+  color: #64748b;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  width: 34px;
+  text-align: right;
+}
 
 .roi-author {
   background: #141820;

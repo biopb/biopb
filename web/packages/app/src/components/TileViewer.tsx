@@ -35,6 +35,7 @@ import {
 import {
   selectBroadcastAxes,
   selectDraft,
+  selectLabelOverlay,
   selectRoiScopes,
   selectRois,
   selectSelectedRoiId,
@@ -64,7 +65,9 @@ import {
 } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
+import { buildLabelLayers, labelSelection } from "../utils/labelLayers";
 import { useContrastWindow } from "../hooks/useContrastWindow";
+import { useLabelOverlay } from "../hooks/useLabelOverlay";
 import {
   clampGamma,
   contrastSamples,
@@ -680,9 +683,42 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     [shown, selectedRoiId],
   );
 
+  // --- label overlay -------------------------------------------------------
+  // Scoped, like the annotation state: a set chosen on the previous image is
+  // not this one's overlay, and drawing it here would be worse than drawing
+  // nothing.
+  const overlayId = useAppStore(selectLabelOverlay);
+  const labelOpacity = useAppStore((s) => s.labelOpacity);
+  const { overlay, error: labelError } = useLabelOverlay(client, overlayId);
+
+  // The set's own selection, not the image's: a set spans the image's
+  // non-channel extent, so the two do not number their axes the same way.
+  // Through a JSON key for the reason `selectionKey` is: deck.gl refetches on a
+  // changed *reference*, and this memo's inputs change on every contrast drag.
+  const labelSelectionKey = useMemo(
+    () => (info && overlay ? JSON.stringify(labelSelection(info, overlay.info, slice)) : ""),
+    [info, overlay, slice],
+  );
+  const labelLayers = useMemo(() => {
+    // Keyed on the id it was loaded for: `useLabelOverlay` clears its state on a
+    // change, so this can only disagree in the harmless direction, and checking
+    // it is what makes that a property of the code rather than of the order two
+    // effects happen to run in.
+    if (!overlay || overlay.arrayId !== overlayId || !labelSelectionKey) return [];
+    return buildLabelLayers({
+      name: overlay.name,
+      sources: overlay.sources,
+      selection: JSON.parse(labelSelectionKey) as Record<string, number>,
+      opacity: labelOpacity,
+    });
+  }, [overlay, overlayId, labelSelectionKey, labelOpacity]);
+
+  // The label fill goes under the annotations, which are line work a few pixels
+  // wide: drawn over them it would cover them outright, drawn under it is the
+  // background they are read against.
   const overlayLayers = useMemo(
-    () => [...roiLayers, ...selectionLayers, ...draftLayers],
-    [roiLayers, selectionLayers, draftLayers],
+    () => [...labelLayers, ...roiLayers, ...selectionLayers, ...draftLayers],
+    [labelLayers, roiLayers, selectionLayers, draftLayers],
   );
 
   return (
@@ -749,6 +785,13 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
       )}
       {tileError && (
         <div style={{ ...BADGE, bottom: 10, right: 10, color: "#ff6b6b" }}>{tileError}</div>
+      )}
+      {labelError && (
+        // Its own badge, above the image's: an overlay that failed says nothing
+        // about the pixels on screen, and the two must not be read as one fault.
+        <div style={{ ...BADGE, bottom: tileError ? 38 : 10, right: 10, color: "#fbbf24" }}>
+          Label overlay: {labelError}
+        </div>
       )}
     </div>
   );

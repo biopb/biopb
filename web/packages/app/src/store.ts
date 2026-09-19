@@ -17,7 +17,7 @@ import { TensorApiError, isReservedSetName } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
-import { clampSliceTo } from "./utils/vivUtils";
+import { DEFAULT_LABEL_OPACITY, clampLabelOpacity, clampSliceTo } from "./utils/vivUtils";
 import {
   descriptorFromTileInfo,
   forget as forgetRecents,
@@ -25,7 +25,7 @@ import {
   remember as rememberRecent,
   writeRecents,
 } from "./utils/recentSources";
-import { splitArrayVersion } from "@biopb/tensor-flight-client";
+import { splitArrayVersion, splitLabelArrayId } from "@biopb/tensor-flight-client";
 import {
   DEFAULT_VOLUME_RENDER_MODE,
   type VolumeRenderMode,
@@ -291,6 +291,28 @@ export interface AppState {
   /** A write that failed or lost a conditional put, for the panel to report. */
   roiWriteError: string | null;
 
+  // --- label overlay (biopb-tensor-server/docs/label-tensors.md) ----------
+  /**
+   * The label set drawn over the image, as its whole `array_id`, or null.
+   *
+   * One at a time. Two categorical overlays stacked would be two palettes
+   * fighting for the same pixel, with no blend of them that says which object
+   * is which -- so picking a second set replaces the first.
+   *
+   * Scoped like the annotation state rather than reset on a source change: the
+   * id names its own image, so `selectLabelOverlay` can tell whether the set
+   * belongs to the tensor in view, and coming back to that tensor finds its
+   * overlay still on.
+   */
+  labelOverlay: string | null;
+  /**
+   * The overlay's alpha, 0-1.
+   *
+   * Never 1 by default: the point of an overlay is the image under it, and a
+   * fully opaque one is just a different image.
+   */
+  labelOpacity: number;
+
   /**
    * The axis being scrubbed automatically (a `SliderAxis.key`), or null.
    *
@@ -430,6 +452,9 @@ export interface AppState {
   createRoi: (geometry: RoiGeometry, plane: Record<number, number>) => Promise<void>;
   deleteRoi: (roiId: string) => Promise<void>;
   clearRoiSet: (setName: string) => Promise<void>;
+  /** Draw this label set over its image, or nothing. See `labelOverlay`. */
+  setLabelOverlay: (arrayId: string | null) => void;
+  setLabelOpacity: (value: number) => void;
   /**
    * Adopt a whole viewing state at once, as decoded from the URL.
    *
@@ -629,6 +654,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   broadcastAxes: null,
   broadcastAxesFor: null,
   roiWriteError: null,
+
+  labelOverlay: null,
+  labelOpacity: DEFAULT_LABEL_OPACITY,
 
   playAxis: null,
   planeReady: false,
@@ -1145,6 +1173,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => (s.showRois === value ? s : { showRois: value }));
   },
 
+  setLabelOverlay(arrayId) {
+    set((s) => (s.labelOverlay === arrayId ? s : { labelOverlay: arrayId }));
+  },
+
+  setLabelOpacity(value) {
+    const opacity = clampLabelOpacity(value);
+    set((s) => (s.labelOpacity === opacity ? s : { labelOpacity: opacity }));
+  },
+
   toggleSetVisible(setName) {
     set((s) => {
       // Scoped to the tensor in view: a list carried over from another one is
@@ -1206,6 +1243,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         gamma: s.slice.gamma,
       },
       volumeRenderMode: s.volumeRenderMode,
+      // A preference about the overlay rather than about any one set, so it
+      // carries across like gamma and the percentile window. *Which* set is
+      // drawn does not: that belongs to the image the link names.
+      labelOpacity: s.labelOpacity,
     });
     const sourceId = stable.split("/", 1)[0] ?? null;
     // A link counts as opening the source: reaching a `cache://` upload by its
@@ -1227,6 +1268,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       // none opens on the tensor's default rather than on the last choice.
       visibleSets: next.visibleSets,
       visibleSetsFor: requested,
+      // No `...For` companion: the set's own id names its image, so
+      // `selectLabelOverlay` decides whether it is about the tensor this link
+      // opened. A link that names no set clears any overlay left from the
+      // previous one, for the reason the indices are not inherited.
+      labelOverlay: next.labelOverlay,
+      labelOpacity: next.labelOpacity,
       // A link to particular sets is a link to see them; with the overlay off
       // it would be a link to nothing.
       ...(next.visibleSets !== null ? { showRois: true } : {}),
@@ -1521,6 +1568,24 @@ export function currentArrayId(s: AppState): string | null {
 
 export function selectTileInfo(s: AppState): TileInfo | null {
   return s.tileInfoFor === currentArrayId(s) ? s.tileInfo : null;
+}
+
+/**
+ * The label set to draw over the tensor in view, or null.
+ *
+ * Scoped by the id itself rather than by a companion `...For` field: a set's
+ * `array_id` names its image, so the question "is this overlay about what is on
+ * screen?" is answered by the two ids and nothing has to be kept in step.
+ *
+ * Compared against the *stable* address on both sides, because a pinned link
+ * (`id@token`) is the same tensor as the id the tree offered sets for.
+ */
+export function selectLabelOverlay(s: AppState): string | null {
+  const shown = currentArrayId(s);
+  if (!shown || !s.labelOverlay) return null;
+  const address = splitLabelArrayId(s.labelOverlay);
+  if (!address) return null;
+  return address.imageArrayId === splitArrayVersion(shown).arrayId ? s.labelOverlay : null;
 }
 
 /** The levels this tensor's current channel has shown, or null if none yet. */

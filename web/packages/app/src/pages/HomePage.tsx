@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import { useAppStore } from "../store";
 import { ViewerPane } from "../components/ViewerPane";
 import { MetaPanel } from "../components/MetaPanel";
+import { LabelPanel } from "../components/LabelPanel";
 import { RoiAuthor, RoiPanel } from "../components/RoiPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
@@ -51,8 +52,9 @@ export function HomePage() {
   // What the render path fetches: the exact address a link asked for, which may
   // be content-pinned, falling back to the selection for an ordinary click.
   const requestedArrayId = useAppStore((s) => s.requestedArrayId);
-  // The annotations overlay is a 2-D affordance: no panel in volume mode, which
-  // is also what keeps the 3-D viewer from fetching a set it cannot draw.
+  // The annotations and the label overlay are 2-D affordances: no panel in
+  // volume mode, which is also what keeps the 3-D viewer from fetching a set it
+  // cannot draw -- `TileViewer` is the only thing that loads either.
   const render3d = useAppStore((s) => s.render3d);
 
   // --- pane widths ---------------------------------------------------------
@@ -204,6 +206,7 @@ export function HomePage() {
               <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
               {!render3d && (
                 <>
+                  <LabelPanel />
                   <RoiPanel />
                   <RoiAuthor />
                 </>

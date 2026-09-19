@@ -5,7 +5,8 @@
 // inline in a component is a rule nothing can check. What a url's path parts are,
 // and what belongs under "Recent", both have answers worth pinning.
 
-import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
+import { splitLabelArrayId } from "@biopb/tensor-flight-client";
+import type { DataSourceDescriptor, TensorDescriptor } from "@biopb/tensor-flight-client";
 
 // Origin scheme the tensor server stamps on a drag-dropped source's source_url
 // (server-side DND_URL_PREFIX). Display-only marker of drop provenance; the tree
@@ -155,4 +156,58 @@ export function recentNode(recents: DataSourceDescriptor[]): TreeNode | null {
       depth: 2,
     })),
   };
+}
+
+/** An image tensor and the label sets addressed under it. */
+export interface TensorGroup {
+  image: TensorDescriptor;
+  /** Its sets, by name. Empty for an ordinary tensor. */
+  labelSets: TensorDescriptor[];
+}
+
+/**
+ * A source's tensors, with each label set filed under the image it annotates.
+ *
+ * The catalog lists a set as an ordinary tensor of the source -- there is no
+ * `role` column, by decision (biopb/biopb#1059) -- so the path is what says a
+ * tensor is one, and this is where the tree reads it.
+ *
+ * A set whose image the source does not list comes back as a group of its own
+ * rather than being dropped. That should not happen (the server registers a set
+ * on its parent), but a tensor the catalog lists and the tree silently hides is
+ * the worse failure of the two.
+ */
+export function groupTensors(tensors: TensorDescriptor[]): TensorGroup[] {
+  const groups = new Map<string, TensorGroup>();
+  const order: string[] = [];
+  const sets: Array<{ tensor: TensorDescriptor; imageArrayId: string; name: string }> = [];
+
+  for (const tensor of tensors) {
+    const address = splitLabelArrayId(tensor.array_id);
+    if (address) {
+      sets.push({ tensor, imageArrayId: address.imageArrayId, name: address.name });
+      continue;
+    }
+    if (groups.has(tensor.array_id)) continue;
+    groups.set(tensor.array_id, { image: tensor, labelSets: [] });
+    order.push(tensor.array_id);
+  }
+
+  for (const set of sets) {
+    const group = groups.get(set.imageArrayId);
+    if (group) {
+      group.labelSets.push(set.tensor);
+      continue;
+    }
+    groups.set(set.tensor.array_id, { image: set.tensor, labelSets: [] });
+    order.push(set.tensor.array_id);
+  }
+
+  // Sets sorted by name, images left in the order the server listed them: it
+  // puts image tensors first on purpose, and the catalog's scalar `dtype` and
+  // `shape_summary` describe `tensors[0]`.
+  for (const group of groups.values()) {
+    group.labelSets.sort((a, b) => a.array_id.localeCompare(b.array_id));
+  }
+  return order.map((id) => groups.get(id) as TensorGroup);
 }

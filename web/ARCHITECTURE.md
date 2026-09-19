@@ -119,6 +119,17 @@ model are in `README.md`; the architectural notes that aren't there:
   `../biopb-tensor-server/docs/progressive-discovery.md`), the active source/tensor,
   and the slice selection (`t`/`z`/`c`, `scaleFactors`, `reductionMethod`). Actions:
   `initClient` / `loadSources` / `selectSource` / `setSlice` / `clearSession`.
+- **Label overlays** (`labelLayers.ts`, `labelPalette.ts`, `useLabelOverlay.ts`).
+  A label set is an ordinary tensor at `<image array_id>/labels/<name>`, so the
+  path is the only thing that marks one — `splitLabelArrayId` is the single
+  reading of that rule, and the tree groups sets under their image with it. The
+  overlay is a second Viv image layer over a second `PixelSource[]`, added to
+  `deckProps.layers` beneath the annotation layers, with the colour step
+  replaced by `LabelPaletteExtension`: a hue rotated by the golden-ratio
+  conjugate, 0 transparent, and the contrast ramp left at identity so the id the
+  server stored is the id that gets coloured. Nearest sampling is enforced at
+  both ends (the server on every computed level of a set, Viv on the GPU). See
+  `../biopb-tensor-server/docs/label-tensors.md`.
 - **Pages** (`packages/app/src/pages/`): `DashboardPage`, the dataviewer
   (`HomePage` / `ViewerLayout`), `AdminPage`, `McpAdminPage`, `UnlockPage`,
   `ObservePage` — wired to routes in `main.tsx` (see `README.md` for the
