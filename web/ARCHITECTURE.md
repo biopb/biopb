@@ -128,7 +128,11 @@ model are in `README.md`; the architectural notes that aren't there:
   replaced by `LabelPaletteExtension`: a hue rotated by the golden-ratio
   conjugate, 0 transparent, and the contrast ramp left at identity so the id the
   server stored is the id that gets coloured. Nearest sampling is enforced at
-  both ends (the server on every computed level of a set, Viv on the GPU). See
+  both ends (the server on every computed level of a set, Viv on the GPU). The
+  overlay is drawn only while it holds the plane the image has landed -- two
+  independent reads land when they land, and during play the stale-plane cover
+  is dropped, so a mask that is merely *asked* for the right plane would be a
+  wrong picture that looks like a right one. See
   `../biopb-tensor-server/docs/label-tensors.md`.
 - **Pages** (`packages/app/src/pages/`): `DashboardPage`, the dataviewer
   (`HomePage` / `ViewerLayout`), `AdminPage`, `McpAdminPage`, `UnlockPage`,

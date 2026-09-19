@@ -18,7 +18,6 @@
 import { DETAIL_VIEW_ID, ImageLayer, MultiscaleImageLayer } from "@hms-dbmi/viv";
 import { sliderAxes, type TileInfo } from "@biopb/tensor-flight-client";
 import { LABEL_CONTRAST_LIMITS, LabelPaletteExtension } from "./labelPalette";
-import { vivSelection, type SliceIndices } from "./vivUtils";
 
 /** A layer id Viv's `layerFilter` will accept; see `roiLayers.ts::roiLayerId`. */
 export function labelLayerId(name: string): string {
@@ -33,7 +32,12 @@ export function labelLayerId(name: string): string {
 const LABEL_EXTENSIONS = [new LabelPaletteExtension()];
 
 /**
- * The label tensor's selection for the plane the image is showing.
+ * The label tensor's selection for a plane of its image.
+ *
+ * Takes the **image's** Viv selection rather than the store's slice, because
+ * the plane the overlay belongs to is the one on screen, not the one asked for:
+ * see the `shownPlane` rule in `TileViewer`. Deriving it here from `slice`
+ * would put the decision in two places and let the two overlays disagree.
  *
  * The two tensors do not share an axis numbering: a set spans the image's
  * **non-channel** extent (biopb/biopb#1059), so every axis after the image's
@@ -45,31 +49,31 @@ const LABEL_EXTENSIONS = [new LabelPaletteExtension()];
  * So the axes are matched positionally, through the one rule that relates them:
  * the set's axis `j` is the image's `j`-th non-channel axis. A set that does not
  * satisfy the rule (a server that listed something else under `labels/`) falls
- * back to matching by name, which is the best answer available and is exact for
+ * back to matching by key, which is the best answer available and is exact for
  * an ordinary TZYX set.
  */
 export function labelSelection(
   imageInfo: TileInfo,
   labelInfo: TileInfo,
-  slice: SliceIndices,
+  imageSelection: Record<string, number>,
 ): Record<string, number> {
   const nonChannel = imageInfo.shape
     .map((_, i) => i)
     .filter((i) => i !== imageInfo.selectable.c);
-  if (nonChannel.length !== labelInfo.shape.length) {
-    return vivSelection(labelInfo, slice);
-  }
+  const aligned = nonChannel.length === labelInfo.shape.length;
 
-  const chosen = vivSelection(imageInfo, slice);
   const byImageAxis: Record<number, number> = {};
   for (const axis of sliderAxes(imageInfo.dim_labels, imageInfo.shape)) {
-    byImageAxis[axis.axis] = chosen[axis.key] ?? 0;
+    byImageAxis[axis.axis] = imageSelection[axis.key] ?? 0;
   }
 
   const out: Record<string, number> = {};
   for (const axis of sliderAxes(labelInfo.dim_labels, labelInfo.shape)) {
-    const imageAxis = nonChannel[axis.axis];
-    const want = imageAxis === undefined ? 0 : (byImageAxis[imageAxis] ?? 0);
+    const imageAxis = aligned ? nonChannel[axis.axis] : undefined;
+    const want =
+      imageAxis === undefined
+        ? (imageSelection[axis.key] ?? 0)
+        : (byImageAxis[imageAxis] ?? 0);
     // Clamped against the set's own extent, exactly as `vivSelection` clamps
     // against the image's: the two are equal by the extent rule, and a server
     // that broke it should show the last plane rather than fetch past the end.
@@ -83,10 +87,27 @@ export interface LabelLayerOptions {
   name: string;
   /** The label tensor's pixel sources, finest first. */
   sources: unknown[];
-  /** {@link labelSelection}'s answer for the plane on screen. */
+  /** {@link labelSelection}'s answer for the plane the viewer has asked for. */
   selection: Record<string, number>;
   /** 0-1. The image under the overlay is the point, so this is never 1 by default. */
   opacity: number;
+  /**
+   * Whether the tiles this layer is holding are for the plane **on screen**.
+   *
+   * False while it is catching up: its read and the image's are independent, so
+   * for a moment after every plane change one of the two has landed and the
+   * other has not. A mask drawn then is a mask of a different plane, which
+   * during play is a wrong picture that looks like a right one -- so it is held
+   * back until it agrees with the pixels underneath.
+   */
+  showing: boolean;
+  /**
+   * Called when this layer's viewport is fully loaded, exactly as the image's
+   * own is: `MultiscaleImageLayer` pins its background layer's copy to null, so
+   * this fires once per completed viewport. What {@link LabelLayerOptions.showing}
+   * is decided from.
+   */
+  onViewportLoad: (loaded?: unknown) => void;
 }
 
 /**
@@ -97,7 +118,7 @@ export interface LabelLayerOptions {
  */
 export function buildLabelLayers(options: LabelLayerOptions | null): unknown[] {
   if (!options || options.sources.length === 0) return [];
-  const { name, sources, selection, opacity } = options;
+  const { name, sources, selection, opacity, showing, onViewportLoad } = options;
   // Viv's own `getImageLayer` chooses between the two the same way: a single
   // level has no tile grid to walk, and `MultiscaleImageLayer` takes the whole
   // pyramid where `ImageLayer` takes one source.
@@ -115,7 +136,13 @@ export function buildLabelLayers(options: LabelLayerOptions | null): unknown[] {
       contrastLimits: [LABEL_CONTRAST_LIMITS],
       channelsVisible: [true],
       extensions: LABEL_EXTENSIONS,
-      opacity,
+      // Held back by alpha rather than by `visible` or by dropping the layer:
+      // an out-of-step overlay is one that is *loading*, and it has to keep
+      // loading to catch up. Unmounting it would restart the read, and deck.gl's
+      // `visible: false` skips the draw without promising the tileset still
+      // updates -- which would be a layer that can never become visible again.
+      opacity: showing ? opacity : 0,
+      onViewportLoad,
       // Already the default, said out loud because it is the property that
       // makes the overlay correct rather than merely pretty: a linear filter
       // would blend two ids into a third that names no object.

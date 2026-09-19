@@ -691,14 +691,58 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const labelOpacity = useAppStore((s) => s.labelOpacity);
   const { overlay, error: labelError } = useLabelOverlay(client, overlayId);
 
-  // The set's own selection, not the image's: a set spans the image's
-  // non-channel extent, so the two do not number their axes the same way.
-  // Through a JSON key for the reason `selectionKey` is: deck.gl refetches on a
-  // changed *reference*, and this memo's inputs change on every contrast drag.
-  const labelSelectionKey = useMemo(
-    () => (info && overlay ? JSON.stringify(labelSelection(info, overlay.info, slice)) : ""),
-    [info, overlay, slice],
-  );
+  // The overlay reads the plane the viewer has ASKED for, so its tiles load
+  // alongside the image's rather than behind them -- and it is *drawn* only
+  // once it holds the plane actually ON SCREEN. Two reads of two tensors land
+  // when they land, so for a moment after every plane change one of them has
+  // arrived and the other has not; during play the cover is deliberately
+  // dropped, and a mask of plane N+1 over plane N's pixels for the whole of a
+  // frame is a wrong picture that looks like a right one. This is the same rule
+  // the annotations follow through `shownPlane` -- draw the plane on screen --
+  // except that a set has to fetch its plane, so "cannot" means hidden rather
+  // than merely different.
+  //
+  // Both go through JSON keys for the reason `selectionKey` does: deck.gl
+  // refetches on a changed *reference*, and memos keyed on objects would
+  // refetch every frame.
+  const labelSelectionKey = useMemo(() => {
+    if (!info || !overlay || !selectionKey) return "";
+    return JSON.stringify(
+      labelSelection(info, overlay.info, JSON.parse(selectionKey) as Record<string, number>),
+    );
+  }, [info, overlay, selectionKey]);
+  const labelShownKey = useMemo(() => {
+    if (!info || !overlay || loadedKey === null) return "";
+    return JSON.stringify(
+      labelSelection(info, overlay.info, JSON.parse(loadedKey) as Record<string, number>),
+    );
+  }, [info, overlay, loadedKey]);
+
+  // "Which plane of which set". The set has to be in the key: two sets of one
+  // image produce identical selections, so the one switched off a moment ago
+  // would otherwise have its landing counted as this one's.
+  const labelPlaneKey = (selection: string) =>
+    overlay && selection ? `${overlay.arrayId}|${selection}` : "";
+  const [labelLoadedKey, setLabelLoadedKey] = useState<string | null>(null);
+  // Read through a ref for the reason `selectionKeyRef` is: the callback's
+  // identity has to stay stable or every rebuild would look like a prop change.
+  const labelRequestedRef = useRef("");
+  labelRequestedRef.current = labelPlaneKey(labelSelectionKey);
+  const onLabelViewportLoad = useCallback((loaded?: unknown) => {
+    // A *failed* tile counts as loaded to deck.gl, so a viewport whose reads all
+    // errored reports itself complete -- the same check the image's own
+    // `onViewportLoad` makes, and for the same reason: taking it at face value
+    // would show a mask that is not there.
+    if (Array.isArray(loaded)) {
+      if (loaded.some((tile: { content?: unknown } | null) => tile?.content == null)) return;
+    }
+    setLabelLoadedKey(labelRequestedRef.current);
+  }, []);
+  // A key from a set that is no longer the overlay can never match, so switching
+  // sets hides the old one without a reset to remember.
+  const labelShowing =
+    labelLoadedKey !== null && labelLoadedKey === labelPlaneKey(labelShownKey);
+
   const labelLayers = useMemo(() => {
     // Keyed on the id it was loaded for: `useLabelOverlay` clears its state on a
     // change, so this can only disagree in the harmless direction, and checking
@@ -710,8 +754,10 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
       sources: overlay.sources,
       selection: JSON.parse(labelSelectionKey) as Record<string, number>,
       opacity: labelOpacity,
+      showing: labelShowing,
+      onViewportLoad: onLabelViewportLoad,
     });
-  }, [overlay, overlayId, labelSelectionKey, labelOpacity]);
+  }, [overlay, overlayId, labelSelectionKey, labelOpacity, labelShowing, onLabelViewportLoad]);
 
   // The label fill goes under the annotations, which are line work a few pixels
   // wide: drawn over them it would cover them outright, drawn under it is the

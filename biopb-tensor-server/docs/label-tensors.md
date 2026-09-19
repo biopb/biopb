@@ -378,12 +378,27 @@ gradient; 0 is background and fully transparent. The contrast ramp is left in
 place set to identity (`contrastLimits = [0, 1]`), which is what delivers the
 stored id to the palette — anything else silently renames every object.
 
-Two alignments are worth naming. A set spans the image's **non-channel** extent,
-so the two tensors do not number their axes the same way: `labelSelection`
-matches the set's axis *j* to the image's *j*-th non-channel axis, because
-matching by Viv's selection key would be right for `t`/`z` and wrong for an
-unnamed axis. And the overlay's own failure is returned rather than raised: a
-set that 404s costs the overlay a badge, never the image its viewer.
+Three alignments are worth naming.
+
+A set spans the image's **non-channel** extent, so the two tensors do not number
+their axes the same way: `labelSelection` matches the set's axis *j* to the
+image's *j*-th non-channel axis, because matching by Viv's selection key would
+be right for `t`/`z` and wrong for an unnamed axis.
+
+**The overlay is drawn only when it holds the plane on screen.** Its read and
+the image's are two reads of two tensors and land when they land, so for a
+moment after every plane change one has arrived and the other has not. Outside
+play the cover hides that; during play the cover is deliberately dropped, and a
+mask of plane N+1 over plane N's pixels is a wrong picture that looks like a
+right one. So the overlay *asks* for the plane the viewer asked for -- loading
+alongside the image rather than behind it -- and is held transparent until its
+own `onViewportLoad` says it holds the plane the image has landed. This is the
+same rule the annotations follow through `shownPlane`, with the difference that
+a set has to fetch its plane, so "does not have it" means hidden rather than
+merely drawn differently.
+
+And the overlay's own failure is returned rather than raised: a set that 404s
+costs the overlay a badge, never the image its viewer.
 
 A link carries the overlay as `lb=<the set's array_id>` and its alpha as `lo`.
 The whole address, not the bare name, so the parameter is self-checking — a link
