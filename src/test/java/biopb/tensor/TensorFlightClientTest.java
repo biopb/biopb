@@ -105,6 +105,9 @@ public class TensorFlightClientTest {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 RandomAccessibleInterval<FloatType> image = client.getTensor("test-source", "test-tensor");
+                // The lazy adapter consumes the FlightInfo returned by planning;
+                // accessing cells must not initiate a replacement read plan.
+                Assert.assertEquals(1, server.getFlightInfoRequestCount());
                 Assert.assertEquals(0, server.getTotalChunkRequestCount());
 
                 Assert.assertEquals(4, image.dimension(0));
@@ -112,6 +115,7 @@ public class TensorFlightClientTest {
                 Assert.assertEquals(1.0f, image.getAt(0, 0).get(), 0.0001f);
                 Assert.assertEquals(1, server.getChunkRequestCount("base-0-0"));
                 Assert.assertEquals(1, server.getTotalChunkRequestCount());
+                Assert.assertEquals(1, server.getFlightInfoRequestCount());
 
                 Assert.assertEquals(6.0f, image.getAt(1, 1).get(), 0.0001f);
                 Assert.assertEquals(1, server.getChunkRequestCount("base-0-0"));
@@ -688,6 +692,10 @@ public class TensorFlightClientTest {
             return producer.getTotalChunkRequestCount();
         }
 
+        int getFlightInfoRequestCount() {
+            return producer.getFlightInfoRequestCount();
+        }
+
         String getLastReductionMethod() {
             return producer.getLastReductionMethod();
         }
@@ -733,6 +741,7 @@ public class TensorFlightClientTest {
         private final org.apache.arrow.vector.types.pojo.Schema schema;
         private final Map<String, float[]> chunkData;
         private final Map<String, AtomicInteger> chunkRequests;
+        private final AtomicInteger flightInfoRequests;
         private final Map<String, List<Map<String, Object>>> uploadStatusSequences;
         private final Map<String, AtomicInteger> uploadStatusCalls;
         private volatile FlightRequest lastCmd;
@@ -769,6 +778,7 @@ public class TensorFlightClientTest {
             this.schema = createSchema(allocator);
             this.chunkData = new HashMap<>();
             this.chunkRequests = new ConcurrentHashMap<>();
+            this.flightInfoRequests = new AtomicInteger();
             this.uploadStatusSequences = new ConcurrentHashMap<>();
             this.uploadStatusCalls = new ConcurrentHashMap<>();
             chunkData.put("base-0-0", new float[] {1, 2, 5, 6});
@@ -803,6 +813,10 @@ public class TensorFlightClientTest {
             return total;
         }
 
+        int getFlightInfoRequestCount() {
+            return flightInfoRequests.get();
+        }
+
         String getLastReductionMethod() {
             if (lastCmd == null || !lastCmd.hasTensorRead()) {
                 return null;
@@ -812,6 +826,7 @@ public class TensorFlightClientTest {
 
         @Override
         public FlightInfo getFlightInfo(FlightProducer.CallContext context, FlightDescriptor descriptor) {
+            flightInfoRequests.incrementAndGet();
             FlightRequest cmd = parseCmd(descriptor.getCommand());
             lastCmd = cmd;
             TensorReadOption readOpt = cmd.hasTensorRead()

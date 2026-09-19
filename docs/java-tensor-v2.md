@@ -11,7 +11,7 @@ disk caching are deliberately out of scope until the core protocol is stable.
   and common error-mapped calls; add TLS trust in its dedicated slice.
 - [x] Replace descriptor caching and legacy read planning with an `array_id`
   first, FieldMask-driven v2 tensor planner.
-- [ ] Rebuild the lazy Imglib2 read adapter from immutable `FlightInfo` plans.
+- [x] Rebuild the lazy Imglib2 read adapter from immutable `FlightInfo` plans.
 - [ ] Make `SerializedTensor` the only cross-process tensor-handle format.
 - [ ] Implement catalog/metadata/resolve/warm parity.
 - [ ] Implement source lifecycle, upload and ROI parity.

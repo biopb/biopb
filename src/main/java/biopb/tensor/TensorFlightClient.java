@@ -4,7 +4,6 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -12,7 +11,6 @@ import java.util.logging.Logger;
 
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
-import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
@@ -34,25 +32,11 @@ import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 
-import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
-import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
-import net.imglib2.cache.img.ReadOnlyCachedCellImgOptions;
-import net.imglib2.cache.img.SingleCellArrayImg;
-import net.imglib2.cache.img.optional.CacheOptions.CacheType;
-import net.imglib2.img.array.ArrayImg;
-import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
 
-import static biopb.tensor.TensorChunkCodec.cellCount;
-import static biopb.tensor.TensorChunkCodec.createType;
-import static biopb.tensor.TensorChunkCodec.estimateChunkBytes;
-import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
-import static biopb.tensor.TensorChunkCodec.parseTicket;
-import static biopb.tensor.TensorChunkCodec.toIntArray;
 import static biopb.tensor.TensorChunkCodec.toLongArray;
-import static biopb.tensor.TensorChunkCodec.writeChunk;
 
 /**
  * Client for accessing tensors from a TensorFlightServer.
@@ -861,7 +845,8 @@ public class TensorFlightClient implements AutoCloseable {
 
         String arrayId = tensorId == null || tensorId.isEmpty() ? sourceId : tensorId;
         RequestContext context = planRead(arrayId, sliceHint, scaleHint, reductionMethod);
-        RandomAccessibleInterval<T> rai = createArray(context);
+        RandomAccessibleInterval<T> rai = new Imglib2TensorFactory(session, cacheBytes)
+                .create(context.info);
 
         // tensorId may have arrived null (the bare-source_id array_id path);
         // pin it to the server-resolved array_id so the serializable wrapper can
@@ -1162,121 +1147,6 @@ public class TensorFlightClient implements AutoCloseable {
                         "Unsupported reduction method: " + reductionMethod
                                 + ". Supported methods: [nearest, area, linear]");
         }
-    }
-
-    @SuppressWarnings("unchecked")
-    private <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> createArray(
-            RequestContext context) {
-
-        T type = (T) createType(context.descriptor.getDtype());
-        long[] dims = toLongArray(context.descriptor.getShapeList());
-        int[] cellDimensions = toIntArray(context.descriptor.getChunkShapeList());
-
-        ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
-                context.info.getEndpoints(), dims, cellDimensions,
-                ep -> parseChunkBounds(ep.getAppMetadata()),
-                ep -> ep);
-        if (endpointIndex == null) {
-            return materializeArray(context);
-        }
-
-        long estimatedChunkBytes = estimateChunkBytes(context.descriptor);
-        long maxCells = Math.max(1L, cacheBytes / Math.max(estimatedChunkBytes, 1L));
-        ReadOnlyCachedCellImgOptions options = ReadOnlyCachedCellImgOptions.options()
-                .cellDimensions(cellDimensions)
-                .cacheType(CacheType.BOUNDED)
-                .maxCacheSize(maxCells);
-
-        ReadOnlyCachedCellImgFactory factory = new ReadOnlyCachedCellImgFactory(options);
-        return (RandomAccessibleInterval<T>) factory.create(dims, type,
-                cell -> loadCell(cell, endpointIndex));
-    }
-
-    @SuppressWarnings("unchecked")
-    private <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> materializeArray(
-            RequestContext context) {
-
-        T type = (T) createType(context.descriptor.getDtype());
-        long[] dims = toLongArray(context.descriptor.getShapeList());
-        ArrayImg<T, ?> image = (ArrayImg<T, ?>) new ArrayImgFactory<>(type).create(dims);
-        RandomAccess<T> access = image.randomAccess();
-
-        for (FlightEndpoint endpoint : context.info.getEndpoints()) {
-            TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
-            ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-            double[] values = fetchChunkValues(ticket.getChunkId().toByteArray());
-            writeChunk(access, bounds, values);
-        }
-
-        return image;
-    }
-
-    private <T extends NativeType<T> & RealType<T>> void loadCell(
-            SingleCellArrayImg<T, ?> cell,
-            ChunkGridIndex<FlightEndpoint> endpointIndex) {
-
-        long cellIndex = endpointIndex.indexFor(cell);
-        FlightEndpoint endpoint = endpointIndex.get(cellIndex);
-        if (endpoint == null) {
-            throw new IllegalStateException("No Flight endpoint found for cell index " + cellIndex);
-        }
-
-        TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
-        ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-        double[] values = fetchChunkValues(ticket.getChunkId().toByteArray());
-        writeChunk(cell.randomAccess(), bounds, values);
-    }
-
-    private double[] fetchChunkValues(byte[] chunkId) {
-        LOGGER.fine("fetchChunk: chunkId=" + bytesToHex(chunkId, 16));
-        TensorTicket tensorTicket = TensorTicket.newBuilder()
-                .setChunkId(ByteString.copyFrom(chunkId))
-                .build();
-
-        try (FlightStream stream = session.getStream(new Ticket(tensorTicket.toByteArray()))) {
-            double[] values = new double[0];
-            while (stream.next()) {
-                // Unified binary chunk schema (biopb/biopb#293): "data" is one
-                // opaque byte[] per row, "dtype" names how to reinterpret it.
-                FieldVector dataVector = stream.getRoot().getVector("data");
-                FieldVector dtypeVector = stream.getRoot().getVector("dtype");
-                if (dataVector == null || dtypeVector == null) {
-                    throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
-                }
-
-                int rowCount = stream.getRoot().getRowCount();
-                for (int row = 0; row < rowCount; row++) {
-                    Object rowObj = dataVector.getObject(row);
-                    if (!(rowObj instanceof byte[])) {
-                        throw new IllegalStateException("Data column value is not binary: "
-                                + (rowObj == null ? "null" : rowObj.getClass()));
-                    }
-                    Object dtypeObj = dtypeVector.getObject(row);
-                    double[] decoded = ChunkDecoder.decodeChunkBytes((byte[]) rowObj,
-                            dtypeObj == null ? "" : dtypeObj.toString());
-                    int offset = values.length;
-                    values = Arrays.copyOf(values, offset + decoded.length);
-                    System.arraycopy(decoded, 0, values, offset, decoded.length);
-                }
-            }
-            return values;
-        } catch (FlightRuntimeException e) {
-            throw TensorErrorMapper.map(e);
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to fetch chunk payload", e);
-        }
-    }
-
-    private static String bytesToHex(byte[] bytes, int limit) {
-        StringBuilder sb = new StringBuilder();
-        int len = Math.min(bytes.length, limit);
-        for (int i = 0; i < len; i++) {
-            sb.append(String.format("%02x", bytes[i]));
-        }
-        if (bytes.length > limit) {
-            sb.append("...");
-        }
-        return sb.toString();
     }
 
     private static void checkSchemaVersion(FlightInfo info) {
