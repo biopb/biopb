@@ -3,12 +3,8 @@
  *
  * Two things about this integration are not obvious and are load-bearing:
  *
- * **The layer id must contain Viv's view id.** `VivViewer` appends
- * `deckProps.layers` to its own, then filters every layer through
- * `layer.id.includes(getVivId(viewport.id))` -- so a layer whose id lacks
- * `-#detail#` is never drawn and never picked, with no error anywhere. Viv does
- * not export `getVivId`, so {@link roiLayerId} rebuilds it from the exported
- * `DETAIL_VIEW_ID` rather than hardcoding the string.
+ * **The layer id must contain Viv's view id.** See {@link vivLayerId}, which
+ * {@link roiLayerId} builds on.
  *
  * **Geometry needs no transform.** `DetailView` renders in level-0 image
  * pixels, which is exactly the space `annotation.proto` stores ROI coordinates
@@ -18,23 +14,18 @@
  */
 
 import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
-import { DETAIL_VIEW_ID } from "@hms-dbmi/viv";
 import { pinnableAxes, planePinFor, roiVisibleOnPlane, sliderAxes } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-client";
-import { vivSelection, type SliceIndices } from "./vivUtils";
+import { vivLayerId, vivSelection, type SliceIndices } from "./vivUtils";
 import { CLOSE_HANDLE_PX, type RoiDraft } from "./roiDraft";
 import { isSetShown } from "./roiSets";
 
 /** An `[x, y]` in level-0 image pixels, the space deck.gl draws these in. */
 export type XY = [number, number];
 
-/**
- * A layer id Viv's `layerFilter` will accept.
- *
- * Built from `DETAIL_VIEW_ID` so it cannot drift from the view it has to match.
- */
+/** A layer id Viv's `layerFilter` will accept; see {@link vivLayerId}. */
 export function roiLayerId(name: string): string {
-  return `roi-${name}-#${DETAIL_VIEW_ID}#`;
+  return vivLayerId("roi", name);
 }
 
 /**

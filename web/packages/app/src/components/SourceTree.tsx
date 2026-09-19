@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { selectTileInfo, useAppStore } from "../store";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { splitArrayVersion } from "@biopb/tensor-flight-client";
@@ -12,6 +12,7 @@ import {
   UNRESOLVED_GLYPH,
   UNRESOLVED_TOOLTIP,
   getPathParts,
+  groupTensors,
   isUnresolved,
   matchesQuery,
   recentNode,
@@ -25,6 +26,10 @@ function tensorShortName(arrayId: string): string {
   const parts = arrayId.split("/").filter(Boolean);
   return parts[parts.length - 1] || arrayId;
 }
+
+/** On, off. A radio rather than a checkbox: only one set is drawn at a time. */
+const LABEL_ON_GLYPH = "\u25c9";
+const LABEL_OFF_GLYPH = "\u25cb";
 
 function formatShape(shape: number[]): string {
   return shape.join("×");
@@ -230,6 +235,14 @@ export interface TreeRowProps {
   startResolve?: (sourceId: string) => void;
   /** Source ids with a resolve already under way, so the button can say so. */
   resolving?: ReadonlySet<string>;
+  /**
+   * The label set currently drawn, as its whole `array_id`, or null. Unscoped
+   * on purpose: the rows this marks belong to one image, and a set of another
+   * image can never be one of them.
+   */
+  labelOverlay?: string | null;
+  /** Draw this set, or nothing. Optional, so a row renders standalone. */
+  setLabelOverlay?: (arrayId: string | null) => void;
 }
 
 export function TreeRow({
@@ -241,8 +254,21 @@ export function TreeRow({
   selectSource,
   startResolve,
   resolving,
+  labelOverlay,
+  setLabelOverlay,
 }: TreeRowProps) {
   const indent = node.depth * 12 + 12;
+  // Label sets filed under the image they annotate, rather than listed beside
+  // it: a set is a tensor of the source, but it is *about* one of the others.
+  //
+  // Memoized: an unrelated store change (e.g. toggling the overlay) re-renders
+  // every row, and re-sorting every source's tensors on each one adds up.
+  //
+  // Hoisted above the folder branch because that branch returns: a hook after
+  // it runs only for source rows, which is the hook-order rule React enforces
+  // and eslint refuses to build. A folder has no tensors, so it memoizes an
+  // empty list and pays nothing.
+  const groups = useMemo(() => groupTensors(node.source?.tensors ?? []), [node.source]);
 
   if (node.type === "folder") {
     const expanded = expandedFolders.has(node.id);
@@ -274,6 +300,8 @@ export function TreeRow({
               selectSource={selectSource}
               startResolve={startResolve}
               resolving={resolving}
+              labelOverlay={labelOverlay}
+              setLabelOverlay={setLabelOverlay}
             />
           ))}
       </>
@@ -348,8 +376,10 @@ export function TreeRow({
         // otherwise shadow it.
         data-source-id={node.id === src.source_id ? src.source_id : undefined}
         onClick={() => {
-          if (src.tensors.length === 1) {
-            selectSource(src.source_id, src.tensors[0]?.array_id);
+          // One image is unambiguous whether or not it carries label sets; two
+          // are a choice, and guessing it here is what biopb/biopb#75 was about.
+          if (groups.length === 1) {
+            selectSource(src.source_id, groups[0]?.image.array_id);
           } else {
             selectSource(src.source_id);
           }
@@ -358,9 +388,9 @@ export function TreeRow({
       >
         <ChevronSlot />
         <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
-        {hasMultipleTensors ? (
+        {groups.length > 1 ? (
           <span className="tensor-pill" style={{ marginLeft: 8 }}>
-            {src.tensors.length}
+            {groups.length}
           </span>
         ) : firstTensor ? (
           <span
@@ -373,29 +403,69 @@ export function TreeRow({
         ) : null}
       </button>
 
-      {/* Nested tensors when source is active and has multiple tensors */}
+      {/* Nested tensors when source is active and has more than one. A label
+          set counts: its row is the only place the set is offered at all. */}
       {isActive && hasMultipleTensors &&
-        src.tensors.map((t) => {
-          const tActive = t.array_id === activeTensorId;
-          const tName = tensorShortName(t.array_id);
+        groups.map(({ image, labelSets }) => {
+          const tActive = image.array_id === activeTensorId;
           return (
-            <button
-              key={`tensor:${src.source_id}:${t.array_id}`}
-              className={`tree-item tensor-item ${tActive ? "active" : ""}`}
-              style={{
-                width: "100%",
-                textAlign: "left",
-                paddingLeft: indent + 12,
-                display: "flex",
-                alignItems: "center",
-                fontSize: 12,
-              }}
-              onClick={() => selectSource(src.source_id, t.array_id)}
-              title={`${t.array_id}\nShape: ${formatShape(t.shape)}\nDtype: ${t.dtype}`}
-            >
-              <ChevronSlot />
-              <span style={{ flex: 1, marginLeft: 4 }}>{tName}</span>
-            </button>
+            <Fragment key={`tensor:${src.source_id}:${image.array_id}`}>
+              <button
+                className={`tree-item tensor-item ${tActive ? "active" : ""}`}
+                style={{
+                  width: "100%",
+                  textAlign: "left",
+                  paddingLeft: indent + 12,
+                  display: "flex",
+                  alignItems: "center",
+                  fontSize: 12,
+                }}
+                onClick={() => selectSource(src.source_id, image.array_id)}
+                title={`${image.array_id}\nShape: ${formatShape(image.shape)}\nDtype: ${image.dtype}`}
+              >
+                <ChevronSlot />
+                <span style={{ flex: 1, marginLeft: 4 }}>
+                  {tensorShortName(image.array_id)}
+                </span>
+              </button>
+              {labelSets.map((set) => {
+                const on = set.array_id === labelOverlay;
+                return (
+                  <button
+                    key={`labels:${src.source_id}:${set.array_id}`}
+                    className={`tree-item label-item ${on ? "active" : ""}`}
+                    style={{
+                      width: "100%",
+                      textAlign: "left",
+                      paddingLeft: indent + 24,
+                      display: "flex",
+                      alignItems: "center",
+                      fontSize: 12,
+                    }}
+                    aria-pressed={on}
+                    // Selecting the image as well, because the overlay is drawn
+                    // over whatever the viewer has: switching it on from a row
+                    // whose image is not open would otherwise be a control with
+                    // nothing to act on.
+                    onClick={() => {
+                      if (!tActive) selectSource(src.source_id, image.array_id);
+                      setLabelOverlay?.(on ? null : set.array_id);
+                    }}
+                    title={
+                      `${set.array_id}\nLabel set over ${image.array_id}` +
+                      `\nShape: ${formatShape(set.shape)}\nDtype: ${set.dtype}` +
+                      `\n${on ? "Drawn — click to hide" : "Click to draw it over the image"}`
+                    }
+                  >
+                    <ChevronSlot />
+                    <span aria-hidden="true">{on ? LABEL_ON_GLYPH : LABEL_OFF_GLYPH}</span>
+                    <span style={{ flex: 1, marginLeft: 4 }}>
+                      {tensorShortName(set.array_id)}
+                    </span>
+                  </button>
+                );
+              })}
+            </Fragment>
           );
         })}
     </>
@@ -425,6 +495,12 @@ export function SourceTree() {
   const hydrateRecents = useAppStore((s) => s.hydrateRecents);
   const startResolve = useAppStore((s) => s.startResolve);
   const sourceJobs = useAppStore((s) => s.sourceJobs);
+  // Raw, not through `selectLabelOverlay`: a row marks the set it names, and a
+  // set of another image is never one of the rows shown here. Reading the
+  // scoped value would leave the mark off for the moment between selecting an
+  // image and its grid landing.
+  const labelOverlay = useAppStore((s) => s.labelOverlay);
+  const setLabelOverlay = useAppStore((s) => s.setLabelOverlay);
 
   // Ids whose resolve is under way, so a row can say so rather than offering a
   // button that would only join the job it already started.
@@ -653,6 +729,8 @@ export function SourceTree() {
                 expandedFolders={expandedFolders}
                 toggleFolder={toggleFolder}
                 selectSource={selectFromRecent}
+                labelOverlay={labelOverlay}
+                setLabelOverlay={setLabelOverlay}
               />
             )}
             {/* The empty notice is about the catalog, so it is suppressed while
@@ -676,6 +754,8 @@ export function SourceTree() {
                   selectSource={selectSource}
                   startResolve={startResolve}
                   resolving={resolving}
+                  labelOverlay={labelOverlay}
+                  setLabelOverlay={setLabelOverlay}
                 />
               ))
             )}

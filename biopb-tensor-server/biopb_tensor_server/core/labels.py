@@ -28,6 +28,7 @@ __all__ = [
     "extent_mismatch",
     "join_fields",
     "label_extent",
+    "label_image_axes",
     "label_field",
     "split_label_field",
 ]
@@ -89,6 +90,12 @@ def _axis_key(label: str) -> str:
     return canonical_axis(label) or str(label).lower()
 
 
+def _non_channel_indices(image_labels: Sequence[str]) -> List[int]:
+    """Indices of *image_labels* with the channel axis dropped -- the one
+    predicate :func:`label_extent` and :func:`label_image_axes` both apply."""
+    return [i for i, label in enumerate(image_labels) if canonical_axis(label) != "c"]
+
+
 def label_extent(
     image_labels: Sequence[str], image_shape: Sequence[int]
 ) -> Tuple[List[str], List[int]]:
@@ -101,12 +108,34 @@ def label_extent(
     against and what the upload fills in for a request that named no axes,
     because the rule leaves exactly one legal answer.
     """
-    kept = [
-        (str(label), int(size))
-        for label, size in zip(image_labels, image_shape, strict=True)
-        if canonical_axis(label) != "c"
-    ]
-    return [label for label, _ in kept], [size for _, size in kept]
+    if len(image_labels) != len(image_shape):
+        raise ValueError(
+            f"image_labels {list(image_labels)} and image_shape "
+            f"{list(image_shape)} have different lengths"
+        )
+    kept = _non_channel_indices(image_labels)
+    return [str(image_labels[i]) for i in kept], [int(image_shape[i]) for i in kept]
+
+
+def label_image_axes(
+    label_labels: Sequence[str], image_labels: Sequence[str]
+) -> Optional[List[int]]:
+    """For each axis of a set, the wire index of the image axis it indexes.
+
+    A set spans the image's non-channel extent (:func:`label_extent`), so its
+    axis *j* is the image's *j*-th non-channel axis -- ``[0, 2, 3, 4]`` for a
+    ``T Z Y X`` set of a ``T C Z Y X`` image. The rule has exactly one legal
+    answer, which is why the server can state it rather than leave each client
+    to re-derive it: deriving it again is the one way to read frame 0 of a
+    timelapse where frame 40 was asked for, and that is a picture rather than
+    an error (biopb/biopb#1059).
+
+    ``None`` when *label_labels* does not span *image_labels* at all -- there
+    is then no mapping to state. Callers that have already run
+    :func:`extent_mismatch` never see it.
+    """
+    kept = _non_channel_indices(image_labels)
+    return kept if len(kept) == len(label_labels) else None
 
 
 def extent_mismatch(

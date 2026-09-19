@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
+import type { DataSourceDescriptor, TensorDescriptor } from "@biopb/tensor-flight-client";
 import {
   getPathParts,
+  groupTensors,
   isUnresolved,
   recentNode,
   sourceLabel,
@@ -145,5 +146,78 @@ describe("isUnresolved", () => {
     const legacy = source();
     delete (legacy as Partial<DataSourceDescriptor>).is_resolved;
     expect(isUnresolved(legacy)).toBe(false);
+  });
+});
+
+function labelTensor(arrayId: string): TensorDescriptor {
+  return {
+    array_id: arrayId,
+    dim_labels: ["y", "x"],
+    shape: [64, 64],
+    chunk_shape: [],
+    dtype: "uint16",
+  };
+}
+
+const ids = (tensors: TensorDescriptor[]) => tensors.map((t) => t.array_id);
+
+describe("groupTensors", () => {
+  it("leaves an ordinary source as one group per tensor", () => {
+    const groups = groupTensors([labelTensor("src/A/1"), labelTensor("src/A/2")]);
+    expect(groups.map((g) => g.image.array_id)).toEqual(["src/A/1", "src/A/2"]);
+    expect(groups.every((g) => g.labelSets.length === 0)).toBe(true);
+  });
+
+  it("files a set under its image rather than beside it", () => {
+    const groups = groupTensors([labelTensor("src0"), labelTensor("src0/labels/nuclei")]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.image.array_id).toBe("src0");
+    expect(ids(groups[0]!.labelSets)).toEqual(["src0/labels/nuclei"]);
+  });
+
+  it("files each set under the image it names, not under the first one", () => {
+    const groups = groupTensors([
+      labelTensor("plate/A/1"),
+      labelTensor("plate/A/2"),
+      labelTensor("plate/A/2/labels/nuclei"),
+    ]);
+    expect(groups.map((g) => g.image.array_id)).toEqual(["plate/A/1", "plate/A/2"]);
+    expect(groups[0]!.labelSets).toEqual([]);
+    expect(ids(groups[1]!.labelSets)).toEqual(["plate/A/2/labels/nuclei"]);
+  });
+
+  it("keeps the server's tensor order, which puts images first", () => {
+    // The catalog's scalar `dtype`/`shape_summary` describe `tensors[0]`, so
+    // re-sorting the images here would disagree with the row above them.
+    const groups = groupTensors([labelTensor("src/z"), labelTensor("src/a")]);
+    expect(groups.map((g) => g.image.array_id)).toEqual(["src/z", "src/a"]);
+  });
+
+  it("sorts the sets by name, which the listing does not promise", () => {
+    const groups = groupTensors([
+      labelTensor("src0"),
+      labelTensor("src0/labels/nuclei"),
+      labelTensor("src0/labels/@ome"),
+      labelTensor("src0/labels/cells"),
+    ]);
+    expect(ids(groups[0]!.labelSets)).toEqual([
+      "src0/labels/@ome",
+      "src0/labels/cells",
+      "src0/labels/nuclei",
+    ]);
+  });
+
+  it("shows an orphan set rather than hiding it", () => {
+    // Should not happen -- the server registers a set on its parent -- but a
+    // tensor the catalog lists and the tree silently drops is the worse failure.
+    const groups = groupTensors([labelTensor("src/A/1"), labelTensor("src/A/9/labels/nuclei")]);
+    expect(groups.map((g) => g.image.array_id)).toEqual([
+      "src/A/1",
+      "src/A/9/labels/nuclei",
+    ]);
+  });
+
+  it("is empty for a source with no tensors", () => {
+    expect(groupTensors([])).toEqual([]);
   });
 });

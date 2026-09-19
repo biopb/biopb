@@ -1346,3 +1346,75 @@ class TestInfoPaneIsReadableOut:
         w._update_metadata_display()
 
         assert not w._metadata_pane.isVisibleTo(w)
+
+
+class TestGroupTensors:
+    """A source's tensors with its label sets filed under their image.
+
+    The catalog lists a set as an ordinary tensor (biopb/biopb#1059), so
+    without this an ordinary image that gained an ``@ome`` set reads as a
+    two-tensor source: no shape badge, and no double-click open.
+    """
+
+    @staticmethod
+    def _group(*array_ids):
+        from biopb_mcp.tensor_browser._widget import _group_tensors
+
+        tensors = [MagicMock(array_id=a, shape=[8, 8]) for a in array_ids]
+        return _group_tensors(tensors)
+
+    def test_a_set_does_not_count_as_a_tensor_of_the_source(self):
+        groups = self._group("src0", "src0/labels/@ome")
+        assert len(groups) == 1
+        assert groups[0].image.array_id == "src0"
+        assert [s.array_id for s in groups[0].label_sets] == ["src0/labels/@ome"]
+
+    def test_sets_file_under_their_own_image(self):
+        groups = self._group(
+            "src0/A", "src0/B", "src0/B/labels/nuclei", "src0/A/labels/cells"
+        )
+        assert [g.image.array_id for g in groups] == ["src0/A", "src0/B"]
+        assert [s.array_id for s in groups[0].label_sets] == ["src0/A/labels/cells"]
+        assert [s.array_id for s in groups[1].label_sets] == ["src0/B/labels/nuclei"]
+
+    def test_images_keep_the_order_the_server_listed_them(self):
+        # The catalog's scalar dtype/shape_summary describe tensors[0], so the
+        # server puts image tensors first on purpose.
+        groups = self._group("src0/Z", "src0/A")
+        assert [g.image.array_id for g in groups] == ["src0/Z", "src0/A"]
+
+    def test_sets_are_sorted_by_id(self):
+        groups = self._group("src0", "src0/labels/nuclei", "src0/labels/@ome")
+        assert [s.array_id for s in groups[0].label_sets] == [
+            "src0/labels/@ome",
+            "src0/labels/nuclei",
+        ]
+
+    def test_an_orphan_set_keeps_its_own_row(self):
+        # Should not happen -- the server registers a set on its parent -- but a
+        # tensor the catalog lists and the tree hides is the worse failure.
+        groups = self._group("src0/labels/nuclei")
+        assert [g.image.array_id for g in groups] == ["src0/labels/nuclei"]
+        assert groups[0].label_sets == []
+
+
+class TestSoleImage:
+    """Whether a source opens as a single layer -- sets never count."""
+
+    @staticmethod
+    def _sole(*array_ids):
+        from biopb_mcp.tensor_browser._widget import _sole_image
+
+        src = MagicMock()
+        src.tensors = [MagicMock(array_id=a, shape=[8, 8]) for a in array_ids]
+        return _sole_image(src)
+
+    def test_an_image_with_sets_is_still_sole(self):
+        sole = self._sole("src0", "src0/labels/@ome", "src0/labels/nuclei")
+        assert sole.array_id == "src0"
+
+    def test_two_images_have_no_sole(self):
+        assert self._sole("src0/A", "src0/B") is None
+
+    def test_no_tensors(self):
+        assert self._sole() is None

@@ -20,9 +20,11 @@ import {
   selectContrastTrack,
   selectObservedLimits,
   selectTileInfo,
+  selectLabelOverlay,
   catalogFingerprint,
   useAppStore,
 } from "./store";
+import { DEFAULT_LABEL_OPACITY } from "./utils/vivUtils";
 
 const SOURCE: DataSourceDescriptor = {
   source_id: "listed",
@@ -1442,5 +1444,72 @@ describe("resolve / warm jobs", () => {
       );
     }
     expect(startWarm).not.toHaveBeenCalled();
+  });
+});
+
+describe("the label overlay", () => {
+  it("is drawn only when it belongs to the tensor in view", () => {
+    useAppStore.setState({
+      activeTensorId: "src0",
+      requestedArrayId: null,
+      labelOverlay: "src0/labels/nuclei",
+    });
+    expect(selectLabelOverlay(useAppStore.getState())).toBe("src0/labels/nuclei");
+
+    useAppStore.setState({ activeTensorId: "src1", labelOverlay: "src0/labels/nuclei" });
+    expect(selectLabelOverlay(useAppStore.getState())).toBeNull();
+  });
+
+  it("survives a round trip through another tensor", () => {
+    // Not reset on selection, for the reason the annotation state is not: the
+    // id names its own image, so the scoping selector is enough.
+    useAppStore.setState({ activeTensorId: "src0", labelOverlay: "src0/labels/nuclei" });
+    useAppStore.getState().selectSource("src1");
+    expect(selectLabelOverlay(useAppStore.getState())).toBeNull();
+    useAppStore.getState().selectSource("src0");
+    expect(selectLabelOverlay(useAppStore.getState())).toBe("src0/labels/nuclei");
+  });
+
+  it("matches a content-pinned link to the set of its stable id", () => {
+    useAppStore.setState({
+      activeTensorId: "src0",
+      requestedArrayId: "src0@abcd1234",
+      labelOverlay: "src0/labels/nuclei",
+    });
+    expect(selectLabelOverlay(useAppStore.getState())).toBe("src0/labels/nuclei");
+  });
+
+  it("refuses an id that names no set at all", () => {
+    useAppStore.setState({
+      activeTensorId: "src0",
+      requestedArrayId: null,
+      labelOverlay: "src0",
+    });
+    expect(selectLabelOverlay(useAppStore.getState())).toBeNull();
+  });
+
+  it("clamps the opacity to what the shader can take", () => {
+    const { setLabelOpacity } = useAppStore.getState();
+    setLabelOpacity(2);
+    expect(useAppStore.getState().labelOpacity).toBe(1);
+    setLabelOpacity(-1);
+    expect(useAppStore.getState().labelOpacity).toBe(0);
+    setLabelOpacity(Number.NaN);
+    expect(useAppStore.getState().labelOpacity).toBe(DEFAULT_LABEL_OPACITY);
+  });
+
+  it("opens a link's overlay, and clears one the link does not name", () => {
+    useAppStore.setState({ labelOverlay: "old/labels/x", labelOpacity: 0.5 });
+    useAppStore.getState().applyViewerState(
+      new URLSearchParams("id=src0&lb=src0%2Flabels%2Fnuclei&lo=0.25"),
+    );
+    expect(useAppStore.getState().labelOverlay).toBe("src0/labels/nuclei");
+    expect(useAppStore.getState().labelOpacity).toBe(0.25);
+
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src0"));
+    expect(useAppStore.getState().labelOverlay).toBeNull();
+    // The alpha is a preference about the overlay rather than about a set, so
+    // it carries across the way gamma and the percentile window do.
+    expect(useAppStore.getState().labelOpacity).toBe(0.25);
   });
 });

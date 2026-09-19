@@ -172,3 +172,88 @@ describe("TreeRow for an unresolved source", () => {
     );
   });
 });
+
+describe("TreeRow with label sets", () => {
+  const WITH_LABELS: DataSourceDescriptor = {
+    source_id: "zarr_b1",
+    source_url: "file:///data/experiment/cells.zarr",
+    source_type: "zarr",
+    metadata_json: null,
+    is_resolved: true,
+    tensors: [
+      {
+        array_id: "zarr_b1",
+        dim_labels: ["t", "c", "y", "x"],
+        shape: [50, 3, 512, 512],
+        chunk_shape: [],
+        dtype: "uint16",
+      },
+      {
+        array_id: "zarr_b1/labels/nuclei",
+        dim_labels: ["t", "y", "x"],
+        shape: [50, 512, 512],
+        chunk_shape: [],
+        dtype: "uint32",
+      },
+    ],
+  };
+
+  const node: TreeNode = {
+    id: WITH_LABELS.source_id,
+    name: "cells.zarr",
+    type: "source",
+    children: [],
+    source: WITH_LABELS,
+    depth: 1,
+  };
+
+  const open = (labelOverlay: string | null = null) =>
+    renderToStaticMarkup(
+      <TreeRow
+        node={node}
+        activeSourceId={WITH_LABELS.source_id}
+        activeTensorId="zarr_b1"
+        expandedFolders={new Set()}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        labelOverlay={labelOverlay}
+        setLabelOverlay={() => {}}
+      />,
+    );
+
+  it("lists the set under its image once the source is open", () => {
+    const html = open();
+    expect(html).toContain("label-item");
+    expect(html).toContain("nuclei");
+  });
+
+  it("marks the set that is drawn, and only that one", () => {
+    expect(open("zarr_b1/labels/nuclei")).toContain('aria-pressed="true"');
+    expect(open(null)).toContain('aria-pressed="false"');
+    // A set of a different image never appears among these rows, so the mark
+    // follows the id and needs no scoping of its own.
+    expect(open("other/labels/nuclei")).toContain('aria-pressed="false"');
+  });
+
+  it("counts images in the pill, not tensors", () => {
+    // A set is not an alternative to the image: a "2" here would say this
+    // source holds two pictures, and it holds one.
+    expect(open()).not.toContain("tensor-pill");
+  });
+
+  it("renders standalone, without the overlay props", () => {
+    // `TreeRow` is a props component, and the row must not require the store.
+    expect(() =>
+      renderToStaticMarkup(
+        <TreeRow
+          node={node}
+          activeSourceId={WITH_LABELS.source_id}
+          activeTensorId="zarr_b1"
+          expandedFolders={new Set()}
+          toggleFolder={() => {}}
+          selectSource={() => {}}
+        />,
+      ),
+    ).not.toThrow();
+  });
+});

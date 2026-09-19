@@ -150,6 +150,8 @@ describe("encodeViewerState", () => {
       camera3d: { target: [12.5, 30, 7.2], zoom: -2.125, rotationX: 20, rotationOrbit: -45 },
       camera2d: null,
       visibleSets: ["default", "@ome"],
+      labelOverlay: `${TENSOR.array_id}/labels/nuclei`,
+      labelOpacity: 0.35,
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
     expect(decodeViewerState(qs, defaults(TENSOR.array_id))).toEqual(state);
@@ -243,6 +245,8 @@ describe("the 2-D camera", () => {
       camera3d: null,
       camera2d: { target: [10.5, 20.25], zoom: -1.5 },
       visibleSets: null,
+      labelOverlay: null,
+      labelOpacity: DEFAULT_VIEWER_URL_STATE.labelOpacity,
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
     // The target rounds to a tenth, as the encoder documents.
@@ -279,5 +283,44 @@ describe("the annotation sets", () => {
 
   it("replaces the link's sets rather than adding to them", () => {
     expect(decodeURIComponent(enc({ visibleSets: ["@ome"] }, "rs=nuclei"))).not.toContain("nuclei");
+  });
+});
+
+describe("the label overlay", () => {
+  const SET = `${TENSOR.array_id}/labels/nuclei`;
+
+  it("is absent when the link names no set", () => {
+    expect(decode("").labelOverlay).toBeNull();
+    expect(decode("").labelOpacity).toBe(DEFAULT_VIEWER_URL_STATE.labelOpacity);
+  });
+
+  it("carries the set's whole address, not its name", () => {
+    // The address says which image the set belongs to, which is what lets a
+    // link that names one image's set and another image's `id` draw nothing
+    // rather than draw the wrong overlay.
+    expect(decode(`lb=${encodeURIComponent(SET)}`).labelOverlay).toBe(SET);
+    expect(decodeURIComponent(enc({ labelOverlay: SET }))).toContain(`lb=${SET}`);
+  });
+
+  it("reads a bare parameter as no overlay", () => {
+    expect(decode("lb=").labelOverlay).toBeNull();
+  });
+
+  it("clamps an alpha a hand-edited link puts out of range", () => {
+    expect(decode("lo=5").labelOpacity).toBe(1);
+    expect(decode("lo=-1").labelOpacity).toBe(0);
+    expect(decode("lo=x").labelOpacity).toBe(DEFAULT_VIEWER_URL_STATE.labelOpacity);
+  });
+
+  it("writes the alpha only alongside an overlay", () => {
+    // An alpha for a set nobody is drawing is a parameter about nothing, and it
+    // would outlive the set in the bar.
+    expect(enc({ labelOverlay: null, labelOpacity: 0.25 })).not.toContain("lo=");
+    expect(enc({ labelOverlay: SET, labelOpacity: 0.25 })).toContain("lo=0.25");
+    expect(enc({ labelOverlay: SET })).not.toContain("lo=");
+  });
+
+  it("rounds a scrubbed alpha rather than writing its full float", () => {
+    expect(enc({ labelOverlay: SET, labelOpacity: 1 / 3 })).toContain("lo=0.333");
   });
 });

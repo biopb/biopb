@@ -6,6 +6,7 @@
  * tile-cache bound, and the axis/colour translations.
  */
 
+import { DETAIL_VIEW_ID } from "@hms-dbmi/viv";
 import {
   sliderAxes,
   type DataSourceDescriptor,
@@ -22,6 +23,24 @@ import { getColorMultipliers, type ColorValue } from "./colorUtils";
  * never what is on screen.
  */
 export const CAMERA_MIRROR_MS = 150;
+
+// ---------------------------------------------------------------------------
+// Layer ids
+// ---------------------------------------------------------------------------
+
+/**
+ * A deck.gl layer id `VivViewer`'s `layerFilter` will accept.
+ *
+ * `VivViewer` appends `deckProps.layers` to its own, then filters every layer
+ * through `layer.id.includes(getVivId(viewport.id))` -- so a layer id lacking
+ * `-#<view id>#` is never drawn and never picked, with no error anywhere. Viv
+ * does not export `getVivId`, so this rebuilds it from the exported
+ * `DETAIL_VIEW_ID` rather than hardcoding the string. Shared by `roiLayers.ts`
+ * and `labelLayers.ts`, which differ only in the id's prefix.
+ */
+export function vivLayerId(prefix: string, name: string, viewId: string = DETAIL_VIEW_ID): string {
+  return `${prefix}-${name}-#${viewId}#`;
+}
 
 // ---------------------------------------------------------------------------
 // Contrast limits
@@ -158,6 +177,26 @@ export function octavesFromGamma(gamma: number): number {
 export function clampGamma(gamma: number): number {
   if (!Number.isFinite(gamma)) return 1;
   return Math.min(Math.max(gamma, GAMMA_MIN), GAMMA_MAX);
+}
+
+/**
+ * The label overlay's alpha when nobody has chosen one.
+ *
+ * Half: both pictures have to be legible at once -- the objects and the pixels
+ * they were drawn from -- and either extreme hides one of them.
+ */
+export const DEFAULT_LABEL_OPACITY = 0.5;
+
+/**
+ * An overlay alpha safe to hand the shader.
+ *
+ * Fully transparent is allowed, and is not the same as no overlay: the set is
+ * still loaded and still listed as on, which is what makes the slider a way to
+ * compare rather than a way to lose the overlay.
+ */
+export function clampLabelOpacity(opacity: number): number {
+  if (!Number.isFinite(opacity)) return DEFAULT_LABEL_OPACITY;
+  return Math.min(Math.max(opacity, 0), 1);
 }
 
 const RANGE_BY_DTYPE: Record<string, [number, number]> = {

@@ -119,6 +119,26 @@ model are in `README.md`; the architectural notes that aren't there:
   `../biopb-tensor-server/docs/progressive-discovery.md`), the active source/tensor,
   and the slice selection (`t`/`z`/`c`, `scaleFactors`, `reductionMethod`). Actions:
   `initClient` / `loadSources` / `selectSource` / `setSlice` / `clearSession`.
+- **Label overlays** (`labelLayers.ts`, `labelPalette.ts`, `useLabelOverlay.ts`).
+  A label set is an ordinary tensor at `<image array_id>/labels/<name>`, so the
+  path is the only thing that marks one — `splitLabelArrayId` is the single
+  reading of that rule, and the tree groups sets under their image with it. How
+  the set's axes line up with the image's is *read*, not derived: the server
+  states it as `TileInfo.image_axes` and `labelSelection` (also in the SDK)
+  applies it, falling back to the extent rule only against a server that
+  predates the field. The
+  overlay is a second Viv image layer over a second `PixelSource[]`, added to
+  `deckProps.layers` beneath the annotation layers, with the colour step
+  replaced by `LabelPaletteExtension`: a hue rotated by the golden-ratio
+  conjugate, 0 transparent, and the contrast ramp left at identity so the id the
+  server stored is the id that gets coloured. Nearest sampling is enforced at
+  both ends (the server on every computed level of a set, Viv on the GPU). The
+  overlay is drawn only while it holds the plane the image has landed -- two
+  independent reads land when they land, and during play the stale-plane cover
+  is dropped, so a mask that is merely *asked* for the right plane would be a
+  wrong picture that looks like a right one. Play paces on both layers for the
+  same reason: on the image alone, a set whose read is slower never catches up. See
+  `../biopb-tensor-server/docs/label-tensors.md`.
 - **Pages** (`packages/app/src/pages/`): `DashboardPage`, the dataviewer
   (`HomePage` / `ViewerLayout`), `AdminPage`, `McpAdminPage`, `UnlockPage`,
   `ObservePage` — wired to routes in `main.tsx` (see `README.md` for the

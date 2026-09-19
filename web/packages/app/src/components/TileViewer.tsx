@@ -29,12 +29,14 @@ import {
   TensorAbortError,
   createTensorPixelSources,
   isTransportError,
+  labelSelection,
   vivDtype,
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import {
   selectBroadcastAxes,
   selectDraft,
+  selectLabelOverlay,
   selectRoiScopes,
   selectRois,
   selectSelectedRoiId,
@@ -64,7 +66,9 @@ import {
 } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
+import { buildLabelLayers } from "../utils/labelLayers";
 import { useContrastWindow } from "../hooks/useContrastWindow";
+import { useLabelOverlay } from "../hooks/useLabelOverlay";
 import {
   clampGamma,
   contrastSamples,
@@ -320,13 +324,6 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // Zoom and pan never invalidate: they change which tiles are wanted, not
   // which plane, so their partial state is legitimate progressive refinement.
   const dataValid = loadedKey !== null && loadedKey === selectionKey;
-
-  // Published for the play driver, which paces its next frame on it. Same fact
-  // the cover below is drawn from, said where SliceControls can read it.
-  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
-  useEffect(() => {
-    setPlaneReady(dataValid);
-  }, [dataValid, setPlaneReady]);
 
   // Under play the cover is dropped: at 10 frames a second it would be on
   // screen for most of every frame, which is a flicker rather than a warning,
@@ -680,9 +677,113 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
     [shown, selectedRoiId],
   );
 
+  // --- label overlay -------------------------------------------------------
+  // Scoped, like the annotation state: a set chosen on the previous image is
+  // not this one's overlay, and drawing it here would be worse than drawing
+  // nothing.
+  const overlayId = useAppStore(selectLabelOverlay);
+  const labelOpacity = useAppStore((s) => s.labelOpacity);
+  const { overlay, error: labelError } = useLabelOverlay(client, overlayId);
+
+  // The overlay reads the plane the viewer has ASKED for, so its tiles load
+  // alongside the image's rather than behind them -- and it is *drawn* only
+  // once it holds the plane actually ON SCREEN. Two reads of two tensors land
+  // when they land, so for a moment after every plane change one of them has
+  // arrived and the other has not; during play the cover is deliberately
+  // dropped, and a mask of plane N+1 over plane N's pixels for the whole of a
+  // frame is a wrong picture that looks like a right one. This is the same rule
+  // the annotations follow through `shownPlane` -- draw the plane on screen --
+  // except that a set has to fetch its plane, so "cannot" means hidden rather
+  // than merely different.
+  //
+  // Both go through JSON keys for the reason `selectionKey` does: deck.gl
+  // refetches on a changed *reference*, and memos keyed on objects would
+  // refetch every frame.
+  // `useCallback`, not a plain function: the two memos below take it as a
+  // dependency, and a fresh identity every render would rebuild them every
+  // render -- which is the refetch they exist to avoid.
+  const deriveLabelKey = useCallback(
+    (key: string | null) => {
+      if (!info || !overlay || !key) return "";
+      return JSON.stringify(
+        labelSelection(info, overlay.info, JSON.parse(key) as Record<string, number>),
+      );
+    },
+    [info, overlay],
+  );
+  const labelSelectionKey = useMemo(
+    () => deriveLabelKey(selectionKey),
+    [deriveLabelKey, selectionKey],
+  );
+  const labelShownKey = useMemo(
+    () => deriveLabelKey(loadedKey),
+    [deriveLabelKey, loadedKey],
+  );
+
+  // "Which plane of which set". The set has to be in the key: two sets of one
+  // image produce identical selections, so the one switched off a moment ago
+  // would otherwise have its landing counted as this one's.
+  const labelPlaneKey = (selection: string) =>
+    overlay && selection ? `${overlay.arrayId}|${selection}` : "";
+  const [labelLoadedKey, setLabelLoadedKey] = useState<string | null>(null);
+  // Read through a ref for the reason `selectionKeyRef` is: the callback's
+  // identity has to stay stable or every rebuild would look like a prop change.
+  const labelRequestedRef = useRef("");
+  labelRequestedRef.current = labelPlaneKey(labelSelectionKey);
+  const onLabelViewportLoad = useCallback((loaded?: unknown) => {
+    // A *failed* tile counts as loaded to deck.gl, so a viewport whose reads all
+    // errored reports itself complete -- the same check the image's own
+    // `onViewportLoad` makes, and for the same reason: taking it at face value
+    // would show a mask that is not there.
+    if (Array.isArray(loaded)) {
+      if (loaded.some((tile: { content?: unknown } | null) => tile?.content == null)) return;
+    }
+    setLabelLoadedKey(labelRequestedRef.current);
+  }, []);
+  // A key from a set that is no longer the overlay can never match, so switching
+  // sets hides the old one without a reset to remember.
+  const labelShowing =
+    labelLoadedKey !== null && labelLoadedKey === labelPlaneKey(labelShownKey);
+
+  // Published for the play driver, which paces its next frame on it -- the same
+  // fact the cover is drawn from, said where SliceControls can read it. Down
+  // here rather than beside `dataValid` because *the overlay is part of it*:
+  // paced on the image alone, play advances the moment the image's tiles land,
+  // so a set whose read is slower is asked for the next plane before it has
+  // finished the last and is out of step for the whole of playback. Waiting for
+  // both plays slower and shows both.
+  //
+  // Fails open, and deliberately: a set that errored, or none at all, must not
+  // hold the sequence. The driver's own PLAY_STALL_MS would release it in the
+  // end, but only after stalling on every single frame.
+  const labelReady = overlayId === null || labelError !== null || labelShowing;
+  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
+  useEffect(() => {
+    setPlaneReady(dataValid && labelReady);
+  }, [dataValid, labelReady, setPlaneReady]);
+
+  const labelLayers = useMemo(() => {
+    // Keyed on the id it was loaded for: `useLabelOverlay` clears its state on a
+    // change, so this can only disagree in the harmless direction, and checking
+    // it is what makes that a property of the code rather than of the order two
+    // effects happen to run in.
+    if (!overlay || overlay.arrayId !== overlayId || !labelSelectionKey) return [];
+    return buildLabelLayers({
+      name: overlay.name,
+      sources: overlay.sources,
+      selection: JSON.parse(labelSelectionKey) as Record<string, number>,
+      opacity: labelOpacity,
+      showing: labelShowing,
+      onViewportLoad: onLabelViewportLoad,
+    });
+  }, [overlay, overlayId, labelSelectionKey, labelOpacity, labelShowing, onLabelViewportLoad]);
+
+  // The label fill goes under the annotations, which are line work a few pixels
+  // wide: drawn over them it would cover them outright, drawn under it is the
+  // background they are read against.
   const overlayLayers = useMemo(
-    () => [...roiLayers, ...selectionLayers, ...draftLayers],
-    [roiLayers, selectionLayers, draftLayers],
+    () => [...labelLayers, ...roiLayers, ...selectionLayers, ...draftLayers],
+    [labelLayers, roiLayers, selectionLayers, draftLayers],
   );
 
   return (
@@ -749,6 +850,13 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
       )}
       {tileError && (
         <div style={{ ...BADGE, bottom: 10, right: 10, color: "#ff6b6b" }}>{tileError}</div>
+      )}
+      {labelError && (
+        // Its own badge, above the image's: an overlay that failed says nothing
+        // about the pixels on screen, and the two must not be read as one fault.
+        <div style={{ ...BADGE, bottom: tileError ? 38 : 10, right: 10, color: "#fbbf24" }}>
+          Label overlay: {labelError}
+        </div>
       )}
     </div>
   );

@@ -1,9 +1,11 @@
 """Tests for _tensor_utils shared utilities."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import dask.array as da
+import numpy as np
 import pytest
 
 from biopb_mcp._config import get_default_config, get_setting
@@ -12,6 +14,7 @@ from biopb_mcp._tensor_utils import (
     _origin_initial_view,
     _resolve_axes,
     add_tensor_layer,
+    align_label_levels,
     build_layer_scale,
     build_pyramid_levels,
     canonical_dim_labels,
@@ -773,3 +776,286 @@ class TestToNativeByteorder:
         (native_lv,) = _to_native_byteorder([da.from_array(be, chunks=be.shape)])
         out = convert_to_uint8(native_lv.compute())
         assert out.dtype == np.uint8
+
+
+# ---------------------------------------------------------------------------
+# Label sets (biopb/biopb#1059): a set is an ordinary tensor whose array_id is
+# the only thing marking it, so add_tensor_layer routes on the id alone.
+# ---------------------------------------------------------------------------
+
+
+def _label_client(image_desc, label_desc, scale_vec=None, unit_vec=None):
+    """Client that answers get_descriptor for an image and one of its sets.
+
+    ``get_tensor`` hands back a real dask array at the descriptor's shape, so
+    the alignment runs on something with true extents rather than a mock.
+    """
+    client = _make_physical_client(scale_vec, unit_vec)
+    by_id = {image_desc.array_id: image_desc, label_desc.array_id: label_desc}
+
+    def _describe(array_id, **_kwargs):
+        return by_id[array_id]
+
+    client.get_descriptor.side_effect = _describe
+
+    def _get_tensor(array_id, scale_hint=None, reduction_method=None):
+        shape = by_id[array_id].shape
+        hint = scale_hint or [1] * len(shape)
+        return da.zeros(
+            [max(1, s // h) for s, h in zip(shape, hint, strict=False)],
+            chunks=-1,
+            dtype="uint32",
+        )
+
+    client.get_tensor.side_effect = _get_tensor
+    return client
+
+
+def _desc(array_id, shape, dim_labels, *, metadata_json="", pyramid=()):
+    return SimpleNamespace(
+        array_id=array_id,
+        shape=list(shape),
+        dim_labels=list(dim_labels),
+        dtype="uint32",
+        metadata_json=metadata_json,
+        pyramid=list(pyramid),
+    )
+
+
+class TestAlignLabelLevels:
+    def test_broadcasts_the_channel_axis_the_set_does_not_have(self):
+        # napari right-aligns layers of differing rank, so a T Z Y X set beside
+        # a T C Z Y X image would put its T on the image's C.
+        level = da.zeros((5, 4, 64, 64), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels([level], [5, 3, 4, 64, 64], [0, 2, 3, 4])
+        assert aligned.shape == (5, 3, 4, 64, 64)
+
+    def test_the_inserted_axis_is_broadcast_not_singleton(self):
+        # A singleton would put the layer outside its own extent at every
+        # channel but the first, where napari draws nothing rather than
+        # clamping -- the mask blanks as you flip channels.
+        level = da.arange(5, dtype="uint32").reshape(5, 1, 1) * da.ones(
+            (5, 8, 8), dtype="uint32"
+        )
+        (aligned,) = align_label_levels([level], [5, 3, 8, 8], [0, 2, 3])
+        assert aligned.shape == (5, 3, 8, 8)
+        for channel in range(3):
+            assert int(np.asarray(aligned[3, channel, 0, 0])) == 3
+
+    def test_each_level_keeps_its_own_extents(self):
+        # Only the missing axes take the image's length; a coarse level stays
+        # coarse in Y and X.
+        levels = [
+            da.zeros((4, 64, 64), chunks=-1, dtype="uint32"),
+            da.zeros((4, 16, 16), chunks=-1, dtype="uint32"),
+        ]
+        aligned = align_label_levels(levels, [4, 2, 64, 64], [0, 2, 3])
+        assert [a.shape for a in aligned] == [(4, 2, 64, 64), (4, 2, 16, 16)]
+
+    def test_drops_the_samples_axis_for_an_rgb_image(self):
+        # napari does not count interleaved samples as a layer dimension, so
+        # the set's copy of it (the extent rule keeps S) goes too.
+        level = da.zeros((64, 64, 3), chunks=-1, dtype="uint32")
+        (aligned,) = align_label_levels(
+            [level], [64, 64, 3], [0, 1, 2], drop_samples=True
+        )
+        assert aligned.shape == (64, 64)
+
+
+class TestAddTensorLayerRoutesALabelSet:
+    def _pair(self, metadata_json=""):
+        image = _desc("src0", [5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+        label = _desc(
+            "src0/labels/nuclei",
+            [5, 4, 64, 64],
+            ["T", "Z", "Y", "X"],
+            metadata_json=metadata_json,
+        )
+        return image, label
+
+    def test_adds_labels_not_an_image(self):
+        image, label = self._pair()
+        viewer = MagicMock()
+        client = _label_client(image, label)
+
+        add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
+
+        viewer.add_image.assert_not_called()
+        arr = viewer.add_labels.call_args[0][0]
+        assert arr.shape == (5, 3, 4, 64, 64)
+
+    def test_carries_the_image_it_annotates(self):
+        image, label = self._pair()
+        viewer = MagicMock()
+        client = _label_client(image, label)
+
+        add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
+
+        metadata = viewer.add_labels.call_args[1]["metadata"]
+        assert metadata["array_id"] == label.array_id
+        assert metadata["image_array_id"] == "src0"
+        # The layer's axes are the image's once aligned, so its names are too.
+        assert metadata["dim_labels"] == ["t", "c", "z", "y", "x"]
+
+    def test_scale_is_the_images(self):
+        # The set spans the image's grid by the extent rule, so the physical
+        # sizes are the same vector -- and it must be at the image's rank.
+        image, label = self._pair()
+        viewer = MagicMock()
+        client = _label_client(
+            image, label, [0.0, 0.0, 2.0, 0.25, 0.5], ["", "", "µm", "µm", "µm"]
+        )
+
+        add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
+
+        assert viewer.add_labels.call_args[1]["scale"] == [1.0, 1.0, 2.0, 0.25, 0.5]
+        client.get_physical_scale.assert_called_once_with("src0")
+
+    def test_prefers_the_mapping_the_server_states(self):
+        # The stated mapping wins over the rule re-derived. Here a set spanning
+        # C Z Y X says so; the rule would have derived T Z Y X from the ranks
+        # alone and broadcast the wrong axis.
+        stated = json.dumps(
+            {"metadata": {"biopb": {"labels": {"image_axes": [1, 2, 3, 4]}}}}
+        )
+        image, label = self._pair(metadata_json=stated)
+        label.shape = [3, 4, 64, 64]
+        viewer = MagicMock()
+        client = _label_client(image, label)
+
+        add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
+
+        # T broadcast (the stated axis 0 is absent), not C.
+        assert viewer.add_labels.call_args[0][0].shape == (5, 3, 4, 64, 64)
+
+    def test_a_reordering_mapping_is_refused_rather_than_mislaid(self):
+        # Alignment inserts and never permutes, which the extent rule makes
+        # sufficient. A mapping that would need a transpose is a server the
+        # rule no longer describes; inserting into it would put every axis
+        # somewhere wrong without saying so.
+        stated = json.dumps(
+            {"metadata": {"biopb": {"labels": {"image_axes": [2, 0, 3, 4]}}}}
+        )
+        image, label = self._pair(metadata_json=stated)
+        label.shape = [4, 5, 64, 64]
+        viewer = MagicMock()
+        client = _label_client(image, label)
+
+        add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
+
+        assert viewer.add_labels.call_args[0][0].shape == (4, 5, 64, 64)
+
+    def test_an_unbound_set_is_still_a_labels_layer(self):
+        # An image that cannot be described leaves nothing to align to. The
+        # colour model is still the right one, so the layer is added at the
+        # set's own rank rather than refused.
+        _, label = self._pair()
+        viewer = MagicMock()
+        client = _make_physical_client(None)
+        client.get_descriptor.side_effect = [label, RuntimeError("no image")]
+        client.get_tensor.return_value = da.zeros(
+            (5, 4, 64, 64), chunks=-1, dtype="uint32"
+        )
+
+        add_tensor_layer(viewer, client, "src0", label.array_id, label, name="nuclei")
+
+        assert viewer.add_labels.call_args[0][0].shape == (5, 4, 64, 64)
+
+    def test_the_layer_is_not_editable(self):
+        # A set is write-once on the server, and napari's brush on a
+        # dask-backed layer raises rather than refusing.
+        image, label = self._pair()
+        viewer = MagicMock()
+        client = _label_client(image, label)
+
+        layer = add_tensor_layer(
+            viewer, client, "src0", label.array_id, label, name="nuclei"
+        )
+
+        assert layer.editable is False
+
+    def test_an_ordinary_tensor_is_untouched(self):
+        viewer = MagicMock()
+        client = _make_physical_client(None)
+        client.get_tensor.return_value = da.zeros((64, 64))
+
+        add_tensor_layer(
+            viewer,
+            client,
+            "src0",
+            "src0/A",
+            _make_tensor_desc([64, 64], ["Y", "X"]),
+            name="plain",
+        )
+
+        viewer.add_labels.assert_not_called()
+        viewer.add_image.assert_called_once()
+        # The pyramid probe is the only descriptor fetch; nothing asks for the
+        # metadata a set would need, and no image is looked up.
+        assert [c.kwargs for c in client.get_descriptor.call_args_list] == [
+            {"with_pyramid": True}
+        ]
+
+
+class TestALabelSetOnARealViewerModel:
+    """The same add against ``napari.components.ViewerModel``.
+
+    A MagicMock viewer accepts any kwargs, so it cannot catch a ``scale`` of the
+    wrong length, a dtype napari refuses, or a multiscale list it will not take.
+    ViewerModel is the real layer machinery without Qt, so it can.
+    """
+
+    @staticmethod
+    def _viewer():
+        from napari.components import ViewerModel
+
+        return ViewerModel()
+
+    def _add(self, viewer, scale_vec=None, unit_vec=None):
+        image = _desc("src0", [5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
+        label = _desc("src0/labels/nuclei", [5, 4, 64, 64], ["T", "Z", "Y", "X"])
+        client = _label_client(image, label, scale_vec, unit_vec)
+        return add_tensor_layer(
+            viewer, client, "src0", label.array_id, label, name="nuclei"
+        )
+
+    def test_napari_takes_it_as_a_labels_layer(self):
+        from napari.layers import Labels
+
+        viewer = self._viewer()
+        layer = self._add(viewer)
+        assert isinstance(layer, Labels)
+        assert layer.ndim == 5
+
+    def test_the_scale_is_the_length_napari_requires(self):
+        # A scale shorter or longer than layer.ndim raises out of napari.
+        viewer = self._viewer()
+        layer = self._add(
+            viewer, [0.0, 0.0, 2.0, 0.25, 0.5], ["", "", "µm", "µm", "µm"]
+        )
+        assert list(layer.scale) == [1.0, 1.0, 2.0, 0.25, 0.5]
+
+    def test_the_mask_is_there_at_every_channel(self):
+        # The whole reason the inserted axis is broadcast: a singleton one puts
+        # the layer outside its own extent at C>0 and napari draws nothing.
+        image = _desc("src0", [2, 3, 8, 8], ["T", "C", "Y", "X"])
+        label = _desc("src0/labels/n", [2, 8, 8], ["T", "Y", "X"])
+        client = _label_client(image, label)
+
+        def _get_tensor(array_id, scale_hint=None, reduction_method=None):
+            # Frame t is filled with id t+1, so a plane read off the wrong axis
+            # is visible rather than merely empty.
+            block = da.arange(1, 3, dtype="uint32").reshape(2, 1, 1)
+            return block * da.ones((2, 8, 8), dtype="uint32")
+
+        client.get_tensor.side_effect = _get_tensor
+
+        viewer = self._viewer()
+        layer = add_tensor_layer(
+            viewer, client, "src0", label.array_id, label, name="n"
+        )
+        viewer.add_image(np.zeros((2, 3, 8, 8), dtype="uint16"), name="img")
+
+        for channel in range(3):
+            viewer.dims.current_step = (1, channel, 0, 0)
+            assert np.unique(layer._slice.image.raw).tolist() == [2]
