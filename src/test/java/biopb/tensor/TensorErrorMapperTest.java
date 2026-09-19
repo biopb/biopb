@@ -1,6 +1,7 @@
 package biopb.tensor;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Iterator;
 
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.ErrorFlightMetadata;
@@ -35,6 +36,16 @@ public class TensorErrorMapperTest {
         Assert.assertSame(malformed, TensorErrorMapper.map(malformed));
         FlightRuntimeException mismatch = error(FlightStatusCode.NOT_FOUND, "missing", "{\"code\":\"INVALID_ARGUMENT\"}");
         Assert.assertSame(mismatch, TensorErrorMapper.map(mismatch));
+    }
+    @Test public void mapsErrorsRaisedDuringActionIteration() {
+        FlightRuntimeException error = error(FlightStatusCode.INVALID_ARGUMENT, "bad slice",
+                "{\"code\":\"INVALID_ARGUMENT\",\"reason\":\"slice_rank\"}");
+        Iterator<org.apache.arrow.flight.Result> failing = new Iterator<org.apache.arrow.flight.Result>() {
+            @Override public boolean hasNext() { throw error; }
+            @Override public org.apache.arrow.flight.Result next() { throw new AssertionError("unreachable"); }
+        };
+        Assert.assertThrows(InvalidTensorRequestException.class,
+                () -> new FlightSession.ErrorMappingIterator(failing).hasNext());
     }
     private static FlightRuntimeException error(FlightStatusCode code, String message, String payload) {
         ErrorFlightMetadata metadata = null;

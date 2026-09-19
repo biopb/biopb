@@ -93,6 +93,7 @@ public class TensorFlightClient implements AutoCloseable {
     private static final Logger LOGGER = Logger.getLogger(TensorFlightClient.class.getName());
     private static final String DEFAULT_REDUCTION_METHOD = "nearest";
 
+    private final FlightSession session;
     private final BufferAllocator allocator;
     private final FlightClient client;
     private final CredentialCallOption authOption;
@@ -164,13 +165,14 @@ public class TensorFlightClient implements AutoCloseable {
     public TensorFlightClient(Location location, long cacheBytes, String token) {
         LOGGER.info(
                 "Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
-        this.location = location;
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
-        this.client = FlightClient.builder(this.allocator, location).build();
-        this.token = token;
-        this.authOption = (token != null && !token.isEmpty())
-                ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token))
-                : null;
+        this.session = new FlightSession(location, token);
+        // Temporary aliases keep the legacy façade stable while its internals
+        // move method-by-method to the session boundary.
+        this.location = session.location();
+        this.allocator = session.allocator();
+        this.client = session.client();
+        this.token = session.token();
+        this.authOption = session.authOption();
         this.descriptors = new HashMap<>();
         this.cacheBytes = cacheBytes;
     }
@@ -405,7 +407,7 @@ public class TensorFlightClient implements AutoCloseable {
                 .build();
         Schema schema;
         List<ArrowRecordBatch> batches = new ArrayList<>();
-        try (FlightStream stream = client.getStream(new Ticket(ticket.toByteArray()), authOption)) {
+        try (FlightStream stream = session.getStream(new Ticket(ticket.toByteArray()))) {
             schema = stream.getSchema();
 
             // Truncation is the server's own flag on the stream's schema metadata.
@@ -430,6 +432,9 @@ public class TensorFlightClient implements AutoCloseable {
         } catch (Exception e) {
             for (ArrowRecordBatch batch : batches) {
                 batch.close();
+            }
+            if (e instanceof FlightRuntimeException) {
+                throw TensorErrorMapper.map((FlightRuntimeException) e);
             }
             if (e instanceof IOException) {
                 throw (IOException) e;
@@ -579,7 +584,7 @@ public class TensorFlightClient implements AutoCloseable {
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
         VectorSchemaRoot row = null;
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = session.doAction(action);
         try {
             while (iter.hasNext()) {
                 byte[] body = iter.next().getBody();
@@ -611,6 +616,9 @@ public class TensorFlightClient implements AutoCloseable {
         } catch (Exception e) {
             if (row != null) {
                 row.close();
+            }
+            if (e instanceof FlightRuntimeException) {
+                throw TensorErrorMapper.map((FlightRuntimeException) e);
             }
             if (e instanceof IOException) {
                 throw (IOException) e;
@@ -665,7 +673,7 @@ public class TensorFlightClient implements AutoCloseable {
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
         WarmProgress done = null;
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = session.doAction(action);
         while (iter.hasNext()) {
             byte[] body = iter.next().getBody();
             if (body == null || body.length == 0) {
@@ -1009,13 +1017,7 @@ public class TensorFlightClient implements AutoCloseable {
     @Override
     public void close() {
         LOGGER.info("Closing Flight client");
-        try {
-            client.close();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } finally {
-            allocator.close();
-        }
+        session.close();
     }
 
     /**
@@ -1037,7 +1039,7 @@ public class TensorFlightClient implements AutoCloseable {
                 "health",
                 ByteString.EMPTY.toByteArray());
 
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = session.doAction(action);
         if (iter.hasNext()) {
             org.apache.arrow.flight.Result result = iter.next();
             byte[] body = result.getBody();
@@ -1074,10 +1076,9 @@ public class TensorFlightClient implements AutoCloseable {
 
         TensorDescriptor desc;
         try {
-            FlightInfo info = client.getInfo(
-                    FlightDescriptor.command(cmd.toByteArray()), authOption);
+            FlightInfo info = session.getInfo(FlightDescriptor.command(cmd.toByteArray()));
             desc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
-        } catch (FlightRuntimeException exc) {
+        } catch (TensorNotFoundException | FlightRuntimeException exc) {
             // An id the server does not serve. UNKNOWN already means "no upload
             // record here", and an unregistered source is the strongest form of
             // that, so it is the same answer rather than a transport error.
@@ -1137,6 +1138,7 @@ public class TensorFlightClient implements AutoCloseable {
                     resolved = isResolved(row, 0);
                 }
             } catch (IOException | RuntimeException ignored) {
+                rethrowTyped(ignored);
                 // fall through to the per-tensor probe
             }
             if (tensors == null) {
@@ -1149,6 +1151,7 @@ public class TensorFlightClient implements AutoCloseable {
                             fetchTensorDescriptor(sourceId, tensorId));
                     resolved = true;
                 } catch (RuntimeException ignored) {
+                    rethrowTyped(ignored);
                     // fall through to the clean error below
                 }
             }
@@ -1193,6 +1196,7 @@ public class TensorFlightClient implements AutoCloseable {
                 try {
                     baseDescriptor = fetchTensorDescriptor(sourceId, tensorId);
                 } catch (RuntimeException ignored) {
+                    rethrowTyped(ignored);
                     // fall through to the clean error below
                 }
             }
@@ -1242,7 +1246,7 @@ public class TensorFlightClient implements AutoCloseable {
         FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(readBuilder.build())
                 .build();
-        FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
+        FlightInfo info = session.getInfo(FlightDescriptor.command(cmd.toByteArray()));
         checkSchemaVersion(info);
         TensorDescriptor responseDescriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
 
@@ -1347,7 +1351,7 @@ public class TensorFlightClient implements AutoCloseable {
                 .setChunkId(ByteString.copyFrom(chunkId))
                 .build();
 
-        try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
+        try (FlightStream stream = session.getStream(new Ticket(tensorTicket.toByteArray()))) {
             double[] values = new double[0];
             while (stream.next()) {
                 // Unified binary chunk schema (biopb/biopb#293): "data" is one
@@ -1374,6 +1378,8 @@ public class TensorFlightClient implements AutoCloseable {
                 }
             }
             return values;
+        } catch (FlightRuntimeException e) {
+            throw TensorErrorMapper.map(e);
         } catch (Exception e) {
             throw new IllegalStateException("Failed to fetch chunk payload", e);
         }
@@ -1564,20 +1570,7 @@ public class TensorFlightClient implements AutoCloseable {
         FlightRequest cmd = FlightRequest.newBuilder()
                 .setTensorRead(readBuilder.build())
                 .build();
-        FlightInfo info;
-        try {
-            info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
-        } catch (FlightRuntimeException exc) {
-            // GetFlightInfo no longer resolves on serve: an unresolved (cloud /
-            // synced-folder) source refuses with an "unresolved" error instead of
-            // silently downloading. Restate it as the shared directive so the
-            // caller is pointed at the explicit, consented resolve().
-            String msg = exc.getMessage();
-            if (msg != null && msg.toLowerCase().contains("unresolved")) {
-                throw unresolvedSourceError(sourceId);
-            }
-            throw exc;
-        }
+        FlightInfo info = session.getInfo(FlightDescriptor.command(cmd.toByteArray()));
         TensorDescriptor tensorDesc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
         // Cache the structure, never the upload status: a cached PENDING would
         // shadow the READY a later poll came for (biopb/biopb#1048).
@@ -1585,6 +1578,13 @@ public class TensorFlightClient implements AutoCloseable {
                 tensorDesc.getArrayId(),
                 tensorDesc.toBuilder().clearUploadStatus().build());
         return tensorDesc;
+    }
+
+    /** Do not turn a server's typed refusal into a misleading local fallback. */
+    private static void rethrowTyped(Exception error) {
+        if (error instanceof TensorFlightException) {
+            throw (TensorFlightException) error;
+        }
     }
 
     /**

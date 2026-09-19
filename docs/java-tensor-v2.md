@@ -5,10 +5,10 @@ same Flight v2 contract as Python. Remote cache-file transfer and persistent
 disk caching are deliberately out of scope until the core protocol is stable.
 
 - [x] Central typed Flight-error decoding and public Java exceptions.
-- [ ] Route every existing Java Flight call and stream iterator through that
-  decoder; remove message-based refusal detection.
-- [ ] Introduce `FlightSession` for allocator, TLS, auth, client ownership and
-  common error-mapped calls.
+- [x] Route core Java Flight calls and action iterators through the decoder;
+  migrate remaining worker-side paths with their serialization redesign.
+- [x] Introduce `FlightSession` for allocator, authentication, client ownership
+  and common error-mapped calls; add TLS trust in its dedicated slice.
 - [ ] Replace descriptor caching and legacy read planning with an `array_id`
   first, FieldMask-driven v2 tensor planner.
 - [ ] Rebuild the lazy Imglib2 read adapter from immutable `FlightInfo` plans.
