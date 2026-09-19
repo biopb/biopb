@@ -29,6 +29,7 @@ import {
   TensorAbortError,
   createTensorPixelSources,
   isTransportError,
+  labelSelection,
   vivDtype,
   type TileInfo,
 } from "@biopb/tensor-flight-client";
@@ -65,7 +66,7 @@ import {
 } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "./ViewerPane";
 import { GammaExtension } from "../utils/vivGamma";
-import { buildLabelLayers, labelSelection } from "../utils/labelLayers";
+import { buildLabelLayers } from "../utils/labelLayers";
 import { useContrastWindow } from "../hooks/useContrastWindow";
 import { useLabelOverlay } from "../hooks/useLabelOverlay";
 import {

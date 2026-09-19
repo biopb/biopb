@@ -337,6 +337,20 @@ export interface TileInfo {
   sel_axes: TileAxis[];
   levels: TileLevel[];
   /**
+   * A label set only: which of its image's axes each of its own indexes.
+   *
+   * `[0, 2, 3, 4]` for a `T Z Y X` set of a `T C Z Y X` image. The server
+   * states it because the two tensors do not number their axes alike -- a set
+   * spans the image's *non-channel* extent -- and a client matching them by
+   * name gets `t`/`z` right and an unnamed axis wrong, which reads frame 0 of
+   * a timelapse where frame 40 was asked for. That is a picture rather than an
+   * error, so it is not a rule worth re-deriving.
+   *
+   * Absent on an image, and on a server that predates the field; see
+   * {@link labelSelection}, which falls back to the extent rule there.
+   */
+  image_axes?: number[];
+  /**
    * The ladder the *server* advertises, which is what each rung of `levels` is
    * read from: the coarsest entry whose `scale_hint` divides the rung's scale,
    * with the remainder reduced server-side. Coarsest first, full resolution

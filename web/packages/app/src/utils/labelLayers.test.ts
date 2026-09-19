@@ -1,52 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { TileInfo } from "@biopb/tensor-flight-client";
 import {
   buildLabelLayers,
   labelLayerId,
-  labelSelection,
   type LabelLayerOptions,
 } from "./labelLayers";
-import { vivSelection, type SliceIndices } from "./vivUtils";
-
-function grid(over: Partial<TileInfo>): TileInfo {
-  return {
-    array_id: "src0",
-    dim_labels: ["y", "x"],
-    shape: [64, 64],
-    chunk_shape: [64, 64],
-    dtype: "uint16",
-    tile_size: 64,
-    plane: { y: 0, x: 1, s: null },
-    selectable: { t: null, z: null, c: null },
-    sel_axes: [],
-    levels: [{ level: 0, scale: 1, width: 64, height: 64, cols: 1, rows: 1 }],
-    ...over,
-  } as TileInfo;
-}
-
-/**
- * The image's Viv selection for a slice position -- what the viewer hands
- * `labelSelection`, built the one way the viewer builds it.
- */
-const showing = (image: TileInfo, over: Partial<SliceIndices> = {}) =>
-  vivSelection(image, { t: 0, z: 0, c: 0, axes: {}, ...over });
-
-/** T C Z Y X image, and the T Z Y X set that spans its non-channel extent. */
-const IMAGE = grid({
-  array_id: "src0",
-  dim_labels: ["t", "c", "z", "y", "x"],
-  shape: [50, 3, 20, 64, 64],
-  selectable: { t: 0, z: 2, c: 1 },
-  plane: { y: 3, x: 4, s: null },
-});
-const SET = grid({
-  array_id: "src0/labels/nuclei",
-  dim_labels: ["t", "z", "y", "x"],
-  shape: [50, 20, 64, 64],
-  selectable: { t: 0, z: 1, c: null },
-  plane: { y: 2, x: 3, s: null },
-  dtype: "uint32",
-});
 
 describe("labelLayerId", () => {
   it("carries Viv's view id, without which the layer is never drawn", () => {
@@ -55,72 +12,6 @@ describe("labelLayerId", () => {
 
   it("is distinct per set, so two sets are two layers", () => {
     expect(labelLayerId("nuclei")).not.toBe(labelLayerId("cells"));
-  });
-});
-
-describe("labelSelection", () => {
-  it("carries the named axes across, and drops the channel", () => {
-    expect(labelSelection(IMAGE, SET, showing(IMAGE, { t: 7, z: 4, c: 2 }))).toEqual({
-      t: 7,
-      z: 4,
-    });
-  });
-
-  it("reads the plane it is given, not a slice position", () => {
-    // The caller hands it the selection ON SCREEN, which during play is a
-    // frame behind `slice` -- see `shownPlane` in TileViewer. Nothing here may
-    // re-derive the plane, or the two overlays could disagree about it.
-    expect(labelSelection(IMAGE, SET, { t: 3, z: 9, c: 1 })).toEqual({ t: 3, z: 9 });
-  });
-
-  it("matches an unnamed axis by position, not by key", () => {
-    // The image's unnamed axis is wire 0 and the set's is wire 0 too, but put
-    // the channel FIRST and the keys diverge: image `a1`, set `a0`.
-    const image = grid({
-      dim_labels: ["c", "", "y", "x"],
-      shape: [3, 155, 64, 64],
-      selectable: { t: null, z: null, c: 0 },
-      plane: { y: 2, x: 3, s: null },
-    });
-    const set = grid({
-      dim_labels: ["", "y", "x"],
-      shape: [155, 64, 64],
-      selectable: { t: null, z: null, c: null },
-      plane: { y: 1, x: 2, s: null },
-    });
-    // The user is on frame 40 of the image, whose slider is keyed `a1`.
-    expect(labelSelection(image, set, showing(image, { axes: { a1: 40 } }))).toEqual({
-      a0: 40,
-    });
-  });
-
-  it("clamps to the set's own extent", () => {
-    const short = grid({
-      dim_labels: ["t", "z", "y", "x"],
-      shape: [50, 1, 64, 64],
-      selectable: { t: 0, z: 1, c: null },
-      plane: { y: 2, x: 3, s: null },
-    });
-    expect(labelSelection(IMAGE, short, showing(IMAGE, { t: 7, z: 4 }))).toEqual({
-      t: 7,
-      z: 0,
-    });
-  });
-
-  it("falls back to matching by name when the rank rule does not hold", () => {
-    const odd = grid({
-      dim_labels: ["z", "y", "x"],
-      shape: [20, 64, 64],
-      selectable: { t: null, z: 0, c: null },
-      plane: { y: 1, x: 2, s: null },
-    });
-    // Four non-channel image axes, three in the set: nothing to align, so `z`
-    // is read by its name rather than by an index that would name `t`.
-    expect(labelSelection(IMAGE, odd, showing(IMAGE, { t: 7, z: 4 }))).toEqual({ z: 4 });
-  });
-
-  it("handles an image with no channel axis at all", () => {
-    expect(labelSelection(SET, SET, showing(SET, { t: 7, z: 4 }))).toEqual({ t: 7, z: 4 });
   });
 });
 

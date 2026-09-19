@@ -6,8 +6,11 @@
  * forces `nearest` on every computed level of a set (`adapters/labels.py`), so
  * ids are never averaged into ids that were never stored. What differs from the
  * image is the colour step, which {@link LabelPaletteExtension} replaces
- * wholesale, and the alignment of the selection, which {@link labelSelection}
- * answers.
+ * wholesale.
+ *
+ * How a set's selection lines up with its image's is deliberately not here:
+ * that is a property of the pair, not of the drawing, and it lives beside the
+ * other identity rules as `labelSelection` in `@biopb/tensor-flight-client`.
  *
  * **The layer id must contain Viv's view id**, for the reason `roiLayers.ts`
  * states: `VivViewer` filters every layer through
@@ -16,7 +19,6 @@
  */
 
 import { DETAIL_VIEW_ID, ImageLayer, MultiscaleImageLayer } from "@hms-dbmi/viv";
-import { sliderAxes, type TileInfo } from "@biopb/tensor-flight-client";
 import { LABEL_CONTRAST_LIMITS, LabelPaletteExtension } from "./labelPalette";
 
 /** A layer id Viv's `layerFilter` will accept; see `roiLayers.ts::roiLayerId`. */
@@ -30,57 +32,6 @@ export function labelLayerId(name: string): string {
  * a fresh instance per render would rebuild the overlay on every slider move.
  */
 const LABEL_EXTENSIONS = [new LabelPaletteExtension()];
-
-/**
- * The label tensor's selection for a plane of its image.
- *
- * Takes the **image's** Viv selection rather than the store's slice, because
- * the plane the overlay belongs to is the one on screen, not the one asked for:
- * see the `shownPlane` rule in `TileViewer`. Deriving it here from `slice`
- * would put the decision in two places and let the two overlays disagree.
- *
- * The two tensors do not share an axis numbering: a set spans the image's
- * **non-channel** extent (biopb/biopb#1059), so every axis after the image's
- * `c` sits one place to the left in the set. Matching by Viv's selection *key*
- * would therefore be right for named axes and wrong for unnamed ones -- an
- * image's `a3` is the set's `a2`, and reading frame 0 of a timelapse instead of
- * frame 40 is a silently wrong picture rather than a visible failure.
- *
- * So the axes are matched positionally, through the one rule that relates them:
- * the set's axis `j` is the image's `j`-th non-channel axis. A set that does not
- * satisfy the rule (a server that listed something else under `labels/`) falls
- * back to matching by key, which is the best answer available and is exact for
- * an ordinary TZYX set.
- */
-export function labelSelection(
-  imageInfo: TileInfo,
-  labelInfo: TileInfo,
-  imageSelection: Record<string, number>,
-): Record<string, number> {
-  const nonChannel = imageInfo.shape
-    .map((_, i) => i)
-    .filter((i) => i !== imageInfo.selectable.c);
-  const aligned = nonChannel.length === labelInfo.shape.length;
-
-  const byImageAxis: Record<number, number> = {};
-  for (const axis of sliderAxes(imageInfo.dim_labels, imageInfo.shape)) {
-    byImageAxis[axis.axis] = imageSelection[axis.key] ?? 0;
-  }
-
-  const out: Record<string, number> = {};
-  for (const axis of sliderAxes(labelInfo.dim_labels, labelInfo.shape)) {
-    const imageAxis = aligned ? nonChannel[axis.axis] : undefined;
-    const want =
-      imageAxis === undefined
-        ? (imageSelection[axis.key] ?? 0)
-        : (byImageAxis[imageAxis] ?? 0);
-    // Clamped against the set's own extent, exactly as `vivSelection` clamps
-    // against the image's: the two are equal by the extent rule, and a server
-    // that broke it should show the last plane rather than fetch past the end.
-    out[axis.key] = Math.min(Math.max(0, want), Math.max(0, axis.extent - 1));
-  }
-  return out;
-}
 
 export interface LabelLayerOptions {
   /** The set's name, for the layer id -- one layer per set drawn. */
