@@ -952,6 +952,15 @@ public class TensorFlightClientTest {
                     -1);
         }
 
+        /**
+         * A typed server error, on the wire as the real server puts it there.
+         *
+         * <p>The transport status is NOT the payload's code: pyarrow has no
+         * FlightNotFoundError, so every terminal domain error rides
+         * FlightServerError and reaches a client as UNKNOWN, carrying the
+         * precise code in the trailer (server.to_flight_error). Only
+         * UNAVAILABLE has a class of its own.
+         */
         private static RuntimeException typedError(
                 FlightStatusCode status, String message, String code, String reason) {
             ErrorFlightMetadata metadata = new ErrorFlightMetadata();
@@ -959,7 +968,10 @@ public class TensorFlightClientTest {
                     ? "{\"code\":\"" + code + "\"}"
                     : "{\"code\":\"" + code + "\",\"reason\":\"" + reason + "\"}";
             metadata.insert("x-biopb-error-bin", payload.getBytes(StandardCharsets.UTF_8));
-            return new CallStatus(status, null, message, metadata).toRuntimeException();
+            FlightStatusCode wire = status == FlightStatusCode.UNAVAILABLE
+                    ? FlightStatusCode.UNAVAILABLE
+                    : FlightStatusCode.UNKNOWN;
+            return new CallStatus(wire, null, message, metadata).toRuntimeException();
         }
 
         @Override

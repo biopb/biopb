@@ -7,8 +7,13 @@ import com.google.protobuf.InvalidProtocolBufferException;
 import net.imglib2.RandomAccess;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
+import net.imglib2.type.numeric.integer.ByteType;
+import net.imglib2.type.numeric.integer.IntType;
+import net.imglib2.type.numeric.integer.LongType;
+import net.imglib2.type.numeric.integer.ShortType;
 import net.imglib2.type.numeric.integer.UnsignedByteType;
 import net.imglib2.type.numeric.integer.UnsignedIntType;
+import net.imglib2.type.numeric.integer.UnsignedLongType;
 import net.imglib2.type.numeric.integer.UnsignedShortType;
 import net.imglib2.type.numeric.real.DoubleType;
 import net.imglib2.type.numeric.real.FloatType;
@@ -65,65 +70,86 @@ final class TensorChunkCodec {
         return elements * bytesPerElement(descriptor.getDtype());
     }
 
+    /**
+     * A numpy dtype string reduced to kind+size, with the byte-order mark and
+     * the spelled-out aliases folded away ({@code "<u2"}, {@code "u2"} and
+     * {@code "uint16"} are one dtype).
+     */
+    static String normalizeDtype(String dtype) {
+        String text = dtype == null ? "" : dtype.trim().toLowerCase();
+        if (!text.isEmpty()) {
+            char first = text.charAt(0);
+            if (first == '<' || first == '>' || first == '|' || first == '=') {
+                text = text.substring(1);
+            }
+        }
+        switch (text) {
+            case "uint8": return "u1";
+            case "int8": return "i1";
+            case "uint16": return "u2";
+            case "int16": return "i2";
+            case "uint32": return "u4";
+            case "int32": return "i4";
+            case "uint64": return "u8";
+            case "int64": return "i8";
+            case "float16": return "f2";
+            case "float32": return "f4";
+            case "float64": return "f8";
+            default: return text;
+        }
+    }
+
     /** Bytes per element for a numpy dtype string; unknown dtypes assume 4 (float32). */
     static int bytesPerElement(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
+        switch (normalizeDtype(dtype)) {
             case "u1":
-            case "uint8":
-            case "|u1":
+            case "i1":
                 return 1;
-            case "<u2":
-            case ">u2":
             case "u2":
-            case "uint16":
+            case "i2":
+            case "f2":
                 return 2;
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-                return 4;
-            case "<f8":
-            case ">f8":
+            case "u8":
+            case "i8":
             case "f8":
-            case "float64":
                 return 8;
+            case "u4":
+            case "i4":
+            case "f4":
             default:
                 return 4;
         }
     }
 
-    /** imglib2 type for a numpy dtype string; unknown dtypes fall back to float32. */
+    /**
+     * imglib2 type for a numpy dtype string; unknown dtypes fall back to float32.
+     *
+     * <p>Every dtype {@code TensorUploads.numpyDtype} can declare is named
+     * here. The two must stay in step: a tensor uploaded as {@code <i4} and
+     * read back as a {@link FloatType} loses every id above 2^24, silently --
+     * which is exactly the case a label set is (biopb/biopb#1059).
+     */
     static NativeType<?> createType(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
+        switch (normalizeDtype(dtype)) {
             case "u1":
-            case "uint8":
-            case "|u1":
                 return new UnsignedByteType();
-            case "<u2":
-            case ">u2":
+            case "i1":
+                return new ByteType();
             case "u2":
-            case "uint16":
                 return new UnsignedShortType();
-            case "<u4":
-            case ">u4":
+            case "i2":
+                return new ShortType();
             case "u4":
-            case "uint32":
                 return new UnsignedIntType();
-            case "<f8":
-            case ">f8":
+            case "i4":
+                return new IntType();
+            case "u8":
+                return new UnsignedLongType();
+            case "i8":
+                return new LongType();
             case "f8":
-            case "float64":
                 return new DoubleType();
-            case "<f4":
-            case ">f4":
             case "f4":
-            case "float32":
             default:
                 return new FloatType();
         }

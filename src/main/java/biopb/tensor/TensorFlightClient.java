@@ -663,9 +663,15 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>Because a dropped directory's walk has no known size up front, there
      * is no percentage -- progress is a running count of sources registered so
-     * far. Cancelling closes the stream, which the server observes and stops
-     * discovery on; sources already registered stay registered, and this
-     * returns an empty tally rather than raising.
+     * far.
+     *
+     * <p><b>Cancelling stops this client, not the server.</b> It returns an
+     * empty tally rather than raising -- the cancel was intentional -- and
+     * everything registered stays registered, but the server finishes the walk
+     * regardless, so the sources it had left to find still appear in the
+     * catalog. (The Python client's cancel does reach the server; Arrow Java's
+     * {@code doAction} hands back a bare iterator with no handle on the call,
+     * so there is nothing here to cancel with. See docs/java-tensor-v2.md.)
      *
      * @param url Absolute path (or directory) on the server's filesystem
      * @param sourceType Explicit adapter type ({@code "zarr"},
@@ -1018,9 +1024,10 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>A tensor is identified by its {@code array_id} alone (see the tensor
      * identity policy at the top of {@code proto/biopb/tensor/descriptor.proto}),
-     * so this takes that one identifier rather than a {@code (sourceId, tensorId)}
-     * pair. Works even when the source is beyond the server's query row cap, and
-     * the result is cached. A bare {@code source_id} (single-tensor source, or to
+     * so this takes that one identifier. Works even when the source is beyond
+     * the server's query row cap. One {@code GetFlightInfo} per call -- nothing
+     * is cached, because a descriptor is what the server says now. A bare
+     * {@code source_id} (single-tensor source, or to
      * anchor on a multi-tensor source's default/first tensor) is accepted. To
      * enumerate ALL tensors/scenes of a source, read its catalog row's
      * {@code tensors} column -- NOT this method.
@@ -1046,9 +1053,9 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>{@code physical_scale}/{@code physical_unit} are {@code TensorDescriptor}
      * fields the server fills on every {@code GetFlightInfo} (issue #31), so this
-     * reads the descriptor a prior {@link #getTensor} already cached -- no extra
-     * RPC when it is cached, and it never requests the opt-in {@code metadata_json}
-     * field on that same descriptor. (Contrast {@link #getSourceMetadata}, which
+     * is one describe -- the cheap projection, which never requests the opt-in
+     * {@code metadata_json} field or the O(chunks) endpoint plan.
+     * (Contrast {@link #getSourceMetadata}, which
      * ships the whole OME tree; do not dig physical sizes out of that -- this is
      * the compact projection meant for display scale.)
      *
@@ -1464,14 +1471,26 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>The loop shared by {@link #resolve} / {@link #warm} /
      * {@link #addSource}: the {@code doAction} call, the empty-body heartbeat
-     * skip, the envelope parse (a bad parse is skipped -- the SDK refuses a
-     * pre-v2 server at connect), and the old-server {@code "Unknown action"}
+     * skip, the envelope parse, and the old-server {@code "Unknown action"}
      * remap, applied only when {@code unavailableHint} is given.
+     *
+     * <p>A message that does not parse as {@code M} is skipped. Python can call
+     * that harmless because its SDK refuses a pre-v2 server at connect; this
+     * client has no such handshake yet, so against a v1 server the skip is what
+     * turns a protocol mismatch into "returned no terminal result". Reported at
+     * the caller, which is the best this can do until the health-action
+     * {@code protocol} check is ported.
      *
      * <p>Cancellation is deliberately NOT handled here: its semantics differ
      * per caller (resolve/warm raise, addSource returns what it has), and the
      * poll must run relative to a consumed message, which only the caller knows
      * the right side of.
+     *
+     * <p>Whatever a caller does with it, stopping only abandons the iterator:
+     * Arrow Java's {@code doAction} exposes no handle on the underlying call,
+     * so the server runs its action to completion either way. Verified against
+     * a live server -- a cancelled {@code add_source} still registers every
+     * source under the path.
      */
     private <M extends com.google.protobuf.Message> void streamAction(
             String type,

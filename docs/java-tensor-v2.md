@@ -17,6 +17,10 @@ disk caching are deliberately out of scope until the core protocol is stable.
 - [x] Implement source lifecycle, upload and ROI parity.
 - [x] Remove the legacy `(sourceId, tensorId)` entry points and the
   `DataSourceDescriptor` row decoders they fed.
+- [ ] Make a streamed action's cancel reach the server (see below).
+- [ ] Port the connect-time protocol check (`health`'s `protocol`, Python's
+  `_check_protocol_version` / `_check_wire_protocol`). Without it a v1 server
+  is reported as "returned no terminal result" rather than as too old.
 - [ ] Consider remote cache-file/mmap and persistent caching separately, after
   protocol parity is covered by shared integration fixtures.
 
@@ -35,6 +39,14 @@ Two things do not transfer, and are not gaps:
   blocks ship from whichever worker computed them. `TensorUploads.uploadArray`
   walks the descriptor's chunk grid on the calling thread. The grid, the bounds
   and the empty-chunk skip for a label set are the same.
+- **A cancel stops the client, not the server.** Python breaks out of the
+  `do_action` generator, which closes the stream and the server observes it;
+  Arrow Java hands back a bare `Iterator<Result>` with no handle on the call,
+  so abandoning it leaves the server to finish. Verified: a cancelled
+  `addSource` over a directory of eight images returns an empty tally and the
+  server still registers all eight. `resolve` is unaffected -- its recall
+  continues server-side in Python too -- but `warm` and `addSource` promise
+  less here than they do there, and their javadocs say so.
 - **No `RoiAnnotation` wire codec to share.** `biopb.image._roi_rows` is one
   module serving both the Python SDK and the server; Java has only a client, so
   `RoiRowCodec` is a second implementation of that row schema and has to track

@@ -7,7 +7,6 @@ import java.util.logging.Logger;
 import com.google.protobuf.ByteString;
 
 import biopb.tensor.LocationUris;
-import biopb.tensor.SerializableTensorImg;
 import biopb.tensor.SerializedTensor;
 import biopb.tensor.TensorFlightClient;
 import net.imglib2.RandomAccessibleInterval;

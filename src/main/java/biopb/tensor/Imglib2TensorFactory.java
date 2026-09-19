@@ -143,6 +143,11 @@ final class Imglib2TensorFactory {
             return values;
         } catch (FlightRuntimeException error) {
             throw TensorErrorMapper.map(error);
+        } catch (RuntimeException error) {
+            // The session already decoded this one (a stale read plan, an
+            // unresolved source); rewrapping it as an IllegalStateException
+            // would undo exactly the decode this path exists to preserve.
+            throw error;
         } catch (Exception error) {
             throw new IllegalStateException("Failed to fetch chunk payload", error);
         }

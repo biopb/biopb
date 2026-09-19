@@ -5,12 +5,23 @@ import java.util.Map;
 
 import org.apache.arrow.flight.ErrorFlightMetadata;
 import org.apache.arrow.flight.FlightRuntimeException;
-import org.apache.arrow.flight.FlightStatusCode;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 
-/** Decodes validated, typed tensor-server Flight errors. */
+/**
+ * Decodes the typed payload a tensor-server Flight error carries.
+ *
+ * <p><b>The payload is the taxonomy, not the transport status.</b> Flight-in-
+ * Python exposes only a subset of gRPC's canonical codes as typed exceptions --
+ * there is no {@code FlightNotFoundError} -- so the server rides every terminal
+ * domain error on {@code FlightServerError} (the coarsest terminal class it
+ * has, which reaches a client as {@code UNKNOWN}) and puts the precise code in
+ * {@code extra_info}. Cross-checking the two therefore rejects every error
+ * worth decoding; this switches on the payload's own {@code code}, which is
+ * what the server documents and what the Python client does
+ * ({@code _session._addressing_error}).
+ */
 public final class TensorErrorMapper {
     private static final Gson GSON = new Gson();
 
@@ -19,41 +30,75 @@ public final class TensorErrorMapper {
     /** Return a typed SDK exception, or the original error when it is not ours. */
     public static RuntimeException map(FlightRuntimeException error) {
         Payload payload = payload(error.status().metadata());
-        FlightStatusCode status = error.status().code();
-        if (payload == null || !status.name().equals(payload.code)) return error;
+        if (payload == null) {
+            return error;
+        }
 
-        String message = error.status().description();
-        if (message == null || message.isEmpty()) message = error.getMessage();
-        switch (status) {
-            case NOT_FOUND:
+        String message = message(error);
+
+        // An upload refusal carries no `code`: both kinds ride one exception
+        // class, so the terminal state is the data and the class is implied
+        // (upload_manager._refused). Keyed on the reason instead.
+        if (payload.reason != null && payload.reason.startsWith("upload_")) {
+            return new UploadRefusedException(message, payload.reason, payload.sourceId,
+                    payload.state, payload.detail, error);
+        }
+        if (payload.code == null) {
+            return error;
+        }
+        switch (payload.code) {
+            case "NOT_FOUND":
                 return "stale_content_version".equals(payload.reason)
                         ? new StaleReadPlanException(message, payload.reason, error)
                         : new TensorNotFoundException(message, payload.reason, error);
-            case INVALID_ARGUMENT:
+            case "INVALID_ARGUMENT":
                 return new InvalidTensorRequestException(message, payload.reason, error);
-            case UNAVAILABLE:
+            case "UNAVAILABLE":
                 return new SourceUnresolvedException(message, error);
-            case CANCELLED:
-                if (payload.reason != null && payload.reason.startsWith("upload_")) {
-                    return new UploadRefusedException(message, payload.reason, payload.sourceId, payload.state, payload.detail, error);
-                }
-                return error;
             default:
                 return error;
         }
     }
 
+    /**
+     * The server's own message, without the transport's trailer.
+     *
+     * <p>pyarrow appends its own {@code ". Detail: ..."} to whatever the server
+     * said; the Python client cuts at the same marker.
+     */
+    private static String message(FlightRuntimeException error) {
+        String message = error.status().description();
+        if (message == null || message.isEmpty()) {
+            message = error.getMessage();
+        }
+        if (message == null) {
+            return "";
+        }
+        int detail = message.indexOf(". Detail:");
+        return detail < 0 ? message : message.substring(0, detail);
+    }
+
     private static Payload payload(ErrorFlightMetadata metadata) {
-        if (metadata == null) return null;
+        if (metadata == null) {
+            return null;
+        }
         for (String key : metadata.keys()) {
             byte[] raw = metadata.getByte(key);
-            if (raw == null) continue;
+            if (raw == null) {
+                continue;
+            }
             try {
                 Map<String, Object> value = GSON.fromJson(new String(raw, StandardCharsets.UTF_8),
                         new TypeToken<Map<String, Object>>() {}.getType());
-                Object code = value.get("code");
-                if (code instanceof String) {
-                    return new Payload((String) code, string(value, "reason"), string(value, "source_id"),
+                if (value == null) {
+                    continue;
+                }
+                // A payload is ours when it says either what went wrong or why;
+                // an upload refusal sends only the latter.
+                String code = string(value, "code");
+                String reason = string(value, "reason");
+                if (code != null || reason != null) {
+                    return new Payload(code, reason, string(value, "source_id"),
                             string(value, "state"), string(value, "detail"));
                 }
             } catch (RuntimeException ignored) {

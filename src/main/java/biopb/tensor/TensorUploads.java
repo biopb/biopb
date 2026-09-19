@@ -34,6 +34,7 @@ import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.IntegerType;
 import net.imglib2.type.numeric.RealType;
 
+import static biopb.tensor.TensorChunkCodec.normalizeDtype;
 import static biopb.tensor.TensorChunkCodec.rowMajorPosition;
 import static biopb.tensor.TensorChunkCodec.toLongArray;
 
@@ -286,15 +287,29 @@ final class TensorUploads {
         long[] global = new long[extents.length];
         for (long index = 0; index < count; index++) {
             rowMajorPosition(index, extents, local);
-            for (int axis = 0; axis < extents.length; axis++) {
-                global[axis] = start[axis] + local[axis];
-            }
+            positionOf(array, start, local, global);
             access.setPosition(global);
             if (access.get().getRealDouble() != 0.0) {
                 return false;
             }
         }
         return true;
+    }
+
+    /**
+     * Where tensor coordinate {@code start + local} sits in {@code source}.
+     *
+     * <p>The interval's <b>min is the tensor's origin</b>, so a cropped view
+     * ({@code Views.interval}) uploads its own content rather than whatever
+     * lies at the underlying image's 0. A view's random access is unbounded, so
+     * ignoring the min reads real pixels from the wrong place and the upload
+     * stores them without complaint.
+     */
+    private static void positionOf(
+            RandomAccessibleInterval<?> source, long[] start, long[] local, long[] into) {
+        for (int axis = 0; axis < into.length; axis++) {
+            into[axis] = source.min(axis) + start[axis] + local[axis];
+        }
     }
 
     /**
@@ -324,9 +339,7 @@ final class TensorUploads {
         long[] global = new long[extents.length];
         for (int index = 0; index < count; index++) {
             rowMajorPosition(index, extents, local);
-            for (int axis = 0; axis < extents.length; axis++) {
-                global[axis] = start[axis] + local[axis];
-            }
+            positionOf(source, start, local, global);
             access.setPosition(global);
             setElement(vector, index, access.get());
         }
@@ -377,30 +390,6 @@ final class TensorUploads {
             } else {
                 ((BigIntVector) vector).set(index, element);
             }
-        }
-    }
-
-    /** A numpy dtype string reduced to its kind+size, dropping the byte-order mark. */
-    private static String normalizeDtype(String dtype) {
-        String text = dtype == null ? "" : dtype.trim().toLowerCase();
-        if (!text.isEmpty()) {
-            char first = text.charAt(0);
-            if (first == '<' || first == '>' || first == '|' || first == '=') {
-                text = text.substring(1);
-            }
-        }
-        switch (text) {
-            case "uint8": return "u1";
-            case "int8": return "i1";
-            case "uint16": return "u2";
-            case "int16": return "i2";
-            case "uint32": return "u4";
-            case "int32": return "i4";
-            case "uint64": return "u8";
-            case "int64": return "i8";
-            case "float32": return "f4";
-            case "float64": return "f8";
-            default: return text;
         }
     }
 

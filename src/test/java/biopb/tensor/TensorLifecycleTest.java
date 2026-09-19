@@ -453,6 +453,40 @@ public class TensorLifecycleTest {
     }
 
     @Test
+    public void testUploadArrayReadsACroppedViewAtItsOwnMin() throws Exception {
+        // A view's random access is unbounded, so reading it at 0-based
+        // coordinates returns real pixels from the wrong place and the upload
+        // stores them without complaint. The interval's min is the origin.
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                short[] values = new short[12 * 8];
+                for (int i = 0; i < values.length; i++) {
+                    values[i] = (short) (i + 1);
+                }
+                RandomAccessibleInterval<UnsignedShortType> whole =
+                        ArrayImgs.unsignedShorts(values, 12, 8);
+                // The bottom-right 6x4 quadrant, which starts at (6, 4).
+                RandomAccessibleInterval<UnsignedShortType> crop = net.imglib2.view.Views.interval(
+                        whole, new long[] {6, 4}, new long[] {11, 7});
+
+                TensorDescriptor descriptor = TensorDescriptor.newBuilder()
+                        .setArrayId("cache:mine")
+                        .addAllShape(Arrays.asList(6L, 4L))
+                        .addAllChunkShape(Arrays.asList(3L, 2L))
+                        .setDtype("<u2")
+                        .build();
+                client.uploadArray(descriptor, crop);
+
+                Assert.assertEquals(4, server.producer.chunks.size());
+                // Chunk (0,0) of the tensor is the crop's own first block --
+                // (6,4) of the underlying image, which holds 6*1 + 12*4 + 1.
+                Assert.assertEquals(Integer.valueOf(55), server.producer.chunks.get(0).values.get(0));
+                assertReassembles(crop, server.producer.chunks, 6, 4);
+            }
+        }
+    }
+
+    @Test
     public void testUploadChunkSendsOneBlock() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
@@ -549,7 +583,7 @@ public class TensorLifecycleTest {
         net.imglib2.RandomAccess<UnsignedShortType> actual = rebuilt.randomAccess();
         for (long y = 0; y < dims[1]; y++) {
             for (long x = 0; x < dims[0]; x++) {
-                expected.setPosition(new long[] { x, y });
+                expected.setPosition(new long[] { original.min(0) + x, original.min(1) + y });
                 actual.setPosition(new long[] { x, y });
                 Assert.assertEquals("at (" + x + "," + y + ")",
                         expected.get().get(), actual.get().get());
@@ -837,8 +871,11 @@ public class TensorLifecycleTest {
             if (refuseChunks) {
                 org.apache.arrow.flight.ErrorFlightMetadata metadata =
                         new org.apache.arrow.flight.ErrorFlightMetadata();
+                // No `code`, exactly as upload_manager._refused sends it: both
+                // refusal kinds ride one exception class, so the state is the
+                // data and the gRPC code is implied by the class.
                 metadata.insert("x-biopb-error-bin",
-                        ("{\"code\":\"CANCELLED\",\"reason\":\"upload_discarded\",\"source_id\":\""
+                        ("{\"reason\":\"upload_discarded\",\"source_id\":\""
                                 + upload.getSourceId() + "\",\"state\":\"DISCARDED\","
                                 + "\"detail\":\"producer gave up\"}")
                                 .getBytes(StandardCharsets.UTF_8));
