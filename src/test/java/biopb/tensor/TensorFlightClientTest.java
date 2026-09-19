@@ -286,9 +286,6 @@ public class TensorFlightClientTest {
 
     @Test
     public void testSerializableTensorImgSerialization() throws Exception {
-        // Clear connection pool before test
-        TensorConnectionPool.clear();
-
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 // Get tensor - should return SerializableTensorImg
@@ -322,17 +319,15 @@ public class TensorFlightClientTest {
                 Assert.assertEquals(1.0f, deserialized.getAt(0, 0).get(), 0.0001f);
                 Assert.assertEquals(6.0f, deserialized.getAt(1, 1).get(), 0.0001f);
 
-                // Verify connection pool was used
-                Assert.assertTrue(TensorConnectionPool.getConnectionCount() > 0);
+                // The serialized FlightInfo is consumed directly; it does not
+                // issue another read-planning RPC after deserialization.
+                Assert.assertEquals(1, server.getFlightInfoRequestCount());
             }
         }
     }
 
     @Test
     public void testSerializableTensorImgMultipleDeserialization() throws Exception {
-        // Clear connection pool before test
-        TensorConnectionPool.clear();
-
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 RandomAccessibleInterval<FloatType> image = client.getTensor("test-source", "test-tensor");
@@ -356,8 +351,8 @@ public class TensorFlightClientTest {
                     Assert.assertEquals(1.0f, deserialized.getAt(0, 0).get(), 0.0001f);
                 }
 
-                // Connection pool should reuse same connection
-                Assert.assertEquals(1, TensorConnectionPool.getConnectionCount());
+                // Each reconstruction reads the embedded plan; none replans.
+                Assert.assertEquals(1, server.getFlightInfoRequestCount());
             }
         }
     }

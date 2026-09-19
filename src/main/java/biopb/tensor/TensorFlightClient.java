@@ -833,8 +833,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @param scaleHint       Per-dimension scale factors
      * @param reductionMethod Requested reduction method
      * @param <T>             The pixel type
-     * @return SerializableTensorImg containing the requested tensor (implements
-     *         RandomAccessibleInterval)
+     * @return lazy RandomAccessibleInterval containing the requested tensor
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
             String sourceId,
@@ -848,11 +847,6 @@ public class TensorFlightClient implements AutoCloseable {
         RandomAccessibleInterval<T> rai = new Imglib2TensorFactory(session, cacheBytes)
                 .create(context.info);
 
-        // tensorId may have arrived null (the bare-source_id array_id path);
-        // pin it to the server-resolved array_id so the serializable wrapper can
-        // re-fetch independently in another process.
-        String resolvedTensorId = context.descriptor.getArrayId();
-
         // Crop to the originally requested region.
         // The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         // descriptor.shape may be larger than the requested extent.
@@ -861,9 +855,8 @@ public class TensorFlightClient implements AutoCloseable {
                     context.descriptor.getScaleHintList());
         }
 
-        // Return SerializableTensorImg wrapper for serialization support
-        return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, resolvedTensorId,
-                sliceHint, scaleHint, reductionMethod, context.descriptor, rai);
+        // Preserve source compatibility while externalizing only the v2 handle.
+        return new SerializableTensorImg<>(serializedTensorOf(context.info), cacheBytes, rai);
     }
 
     /**
@@ -894,9 +887,13 @@ public class TensorFlightClient implements AutoCloseable {
 
         // The plan is Arrow's own FlightInfo, carried whole; only where and as
         // whom to read it is ours to add.
+        return serializedTensorOf(context.info);
+    }
+
+    private SerializedTensor serializedTensorOf(FlightInfo info) {
         SerializedTensor.Builder builder = SerializedTensor.newBuilder()
                 .setLocation(location.getUri().toString())
-                .setFlightInfo(ByteString.copyFrom(context.info.serialize()));
+                .setFlightInfo(ByteString.copyFrom(info.serialize()));
         if (token != null && !token.isEmpty()) {
             builder.setAuthToken(token);
         }
@@ -921,10 +918,8 @@ public class TensorFlightClient implements AutoCloseable {
      * The lazy imglib2 array a SerializedTensor describes.
      *
      * The one consumer-side helper. The handle is a FlightInfo plus where and
-     * as whom to read it; this decodes the plan's descriptor and the crop it
-     * was asked for, and returns the same lazily-reconstructing
-     * {@link SerializableTensorImg} a live getTensor returns, which plans its
-     * own GetFlightInfo on first access over a pooled connection.
+     * as whom to read it. Its plan is consumed directly on first access; only
+     * the documented endpoint-less progressive-discovery plan is refreshed.
      *
      * @param pb          SerializedTensor protobuf object
      * @param cacheBytes  Maximum cache size in bytes
@@ -935,32 +930,7 @@ public class TensorFlightClient implements AutoCloseable {
             SerializedTensor pb,
             long cacheBytes) {
 
-        FlightInfo info = flightInfoOf(pb);
-        TensorDescriptor descriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
-
-        // The requested slice rides the plan's app_metadata (the descriptor's
-        // slice_hint is the chunk-aligned realized one).
-        SliceHint requested = null;
-        byte[] meta = info.getAppMetadata();
-        if (meta != null && meta.length > 0) {
-            try {
-                requested = SliceHint.parseFrom(meta);
-            } catch (InvalidProtocolBufferException e) {
-                throw new IllegalArgumentException("FlightInfo.app_metadata is not a SliceHint", e);
-            }
-        }
-
-        return new SerializableTensorImg<>(
-                LocationUris.parse(pb.getLocation()),
-                pb.getAuthToken().isEmpty() ? null : pb.getAuthToken(),
-                cacheBytes,
-                descriptor.getArrayId(),
-                descriptor.getArrayId(),  // tensorId == arrayId; server reduces to field
-                requested,
-                descriptor.getScaleHintList().isEmpty() ? null : toLongArray(descriptor.getScaleHintList()),
-                descriptor.getReductionMethod().isEmpty() ? null : descriptor.getReductionMethod(),
-                descriptor,
-                null);  // reconstructed lazily
+        return new SerializableTensorImg<>(pb, cacheBytes, null);
     }
 
     @Override

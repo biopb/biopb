@@ -17,9 +17,12 @@ import org.apache.arrow.memory.BufferAllocator;
 /**
  * Thread-local connection pool for TensorFlightClient connections.
  *
- * This pool is used by SerializableTensorImg to reconstruct connections
- * after deserialization. Each thread maintains its own FlightClient for
- * lock-free read access, with automatic cleanup on thread death or JVM shutdown.
+ * Legacy thread-local Flight connection pool.
+ *
+ * <p>Flight v2 tensor handles reconstruct through {@link FlightSession} from
+ * their embedded {@link SerializedTensor} plan, so this pool is no longer on
+ * the tensor read path. It remains temporarily for binary compatibility with
+ * callers that used its public utility API.
  *
  * Design mirrors Python's thread-local connection pool with:
  * - Per-thread FlightClient storage (lock-free reads)
@@ -27,6 +30,7 @@ import org.apache.arrow.memory.BufferAllocator;
  * - Thread death eviction
  * - Shutdown hook for resource cleanup
  */
+@Deprecated
 public final class TensorConnectionPool {
 
     // Per-thread FlightClient storage (lock-free read)

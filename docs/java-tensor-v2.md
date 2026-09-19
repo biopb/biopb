@@ -12,7 +12,7 @@ disk caching are deliberately out of scope until the core protocol is stable.
 - [x] Replace descriptor caching and legacy read planning with an `array_id`
   first, FieldMask-driven v2 tensor planner.
 - [x] Rebuild the lazy Imglib2 read adapter from immutable `FlightInfo` plans.
-- [ ] Make `SerializedTensor` the only cross-process tensor-handle format.
+- [x] Make `SerializedTensor` the only cross-process tensor-handle format.
 - [ ] Implement catalog/metadata/resolve/warm parity.
 - [ ] Implement source lifecycle, upload and ROI parity.
 - [ ] Deprecate legacy `(sourceId, tensorId)` entry points and update examples.
