@@ -762,6 +762,24 @@ class TestAnnotationsDisabled:
 
         assert "rois" in db.get_metadata_json(SOURCE_ID)
 
+    def test_a_mask_s_bindata_is_stripped_even_so(self):
+        """A mask is not an annotation -- "nothing read them" does not cover it
+        (biopb/biopb#1059 step 4): its bitmap must never reach metadata_json."""
+        db = MetadataDatabase(annotations_enabled=False)
+        mask = _shape(
+            "masks",
+            x=0,
+            y=0,
+            width=2,
+            height=2,
+            bin_data={"value": "////", "compression": "none"},
+        )
+        db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(mask)))
+
+        stored = db.get_metadata_json(SOURCE_ID)
+        assert "rois" in stored  # unlike an annotation import, the shape itself stays
+        assert "value" not in stored["rois"][0]["union"]["masks"][0]["bin_data"]
+
     def test_the_source_still_registers(self):
         db = MetadataDatabase(annotations_enabled=False)
         db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))

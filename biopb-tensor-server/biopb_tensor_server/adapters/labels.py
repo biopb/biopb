@@ -75,6 +75,7 @@ from biopb_tensor_server.core.labels import (
 
 __all__ = [
     "LabelSetAdapter",
+    "NearestPyramidMixin",
     "create_label_upload",
     "labels_root",
     "native_label_sets",
@@ -94,7 +95,26 @@ logger = logging.getLogger(__name__)
 SIDECAR_ATTR = "labels"
 
 
-class LabelSetAdapter(OmeZarrAdapter):
+class NearestPyramidMixin:
+    """Every computed pyramid level of a label set is ``nearest``.
+
+    Averaging label ids produces ids that exist nowhere, so no label-set
+    adapter -- whatever backs it -- ever advertises a computed ``area``
+    level. Native levels (if any) are unaffected; ``super()`` still decides
+    those. Mixed in ahead of the real base in the MRO (``class
+    LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter)``) so one
+    implementation serves every backend instead of each repeating it.
+    """
+
+    def _advertised_pyramid(
+        self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
+    ) -> List[PyramidLevel]:
+        return super()._advertised_pyramid(
+            base_desc, dataclasses.replace(pyramid_config, reduction_method="nearest")
+        )
+
+
+class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
     """An NGFF label image, bound as tensor *field* of source *source_id*."""
 
     def __init__(
@@ -124,14 +144,6 @@ class LabelSetAdapter(OmeZarrAdapter):
 
     def get_embedded_labels(self) -> Dict[str, Any]:
         return {}  # a set has no sets, and never looks for a labels/ of its own
-
-    def _advertised_pyramid(
-        self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
-    ) -> List[PyramidLevel]:
-        """Native levels as they are; computed levels always ``nearest``."""
-        return super()._advertised_pyramid(
-            base_desc, dataclasses.replace(pyramid_config, reduction_method="nearest")
-        )
 
     def get_tensor_metadata(self) -> Optional[dict]:
         """The set's own NGFF metadata, with ``image-label`` naming its image.

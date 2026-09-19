@@ -62,6 +62,7 @@ NOT_DECIMATING = {
     "CachedSourceAdapter": "get_data raises; served by chunk_id only",
     "QptiffAdapter": "source-level; serves levels through _QptiffLevelAdapter",
     "TensorAdapter": "the base class itself",
+    "RasterizedMaskAdapter": "computed on demand; a stride still paints the full extent first",
 }
 
 

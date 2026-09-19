@@ -72,6 +72,7 @@ from biopb.image.roi_pb2 import ROI
 from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from google.protobuf import json_format
 
+from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.errors import AnnotationStoreError
 
@@ -1238,6 +1239,15 @@ class MetadataDatabase:
             # Safe: the derivation above reads the adapter's fresh dict, never
             # this column, so nothing rebuilds from what is dropped.
             metadata = {k: v for k, v in metadata.items() if k != "rois"}
+        elif metadata and "rois" in metadata:
+            # report is None here either because annotations are off, or
+            # because get_embedded_rois raised (caught above) -- either way
+            # nothing dropped the whole `rois` key, so it stays. But a Mask's
+            # `bin_data` is arbitrary binary, unlike every other shape kind,
+            # and must never reach this SQL-queryable column regardless of
+            # why annotation import didn't run (biopb/biopb#1059 step 4,
+            # "Rasterizing OME masks").
+            metadata = strip_mask_bindata(metadata)
 
         # Build row data
         indexed_at = datetime.now()
