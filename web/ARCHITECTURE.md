@@ -136,7 +136,8 @@ model are in `README.md`; the architectural notes that aren't there:
   overlay is drawn only while it holds the plane the image has landed -- two
   independent reads land when they land, and during play the stale-plane cover
   is dropped, so a mask that is merely *asked* for the right plane would be a
-  wrong picture that looks like a right one. See
+  wrong picture that looks like a right one. Play paces on both layers for the
+  same reason: on the image alone, a set whose read is slower never catches up. See
   `../biopb-tensor-server/docs/label-tensors.md`.
 - **Pages** (`packages/app/src/pages/`): `DashboardPage`, the dataviewer
   (`HomePage` / `ViewerLayout`), `AdminPage`, `McpAdminPage`, `UnlockPage`,

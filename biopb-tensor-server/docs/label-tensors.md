@@ -399,6 +399,16 @@ beside the other identity rules rather than in the viewer) **reads** the
 server's `image_axes` rather than re-deriving it, and falls back to the extent
 rule only against a server that does not state it.
 
+**Play waits for both layers.** The driver paces its next frame on "the plane
+is on screen", and with an overlay drawn that fact is about both reads: paced
+on the image alone it advances the moment the image's tiles land, so a set
+whose read is slower -- one with no native pyramid, where every coarse tile is
+a full-resolution read reduced on the way out -- is asked for the next plane
+before it finished the last, and is out of step for the whole of playback.
+Waiting for both plays slower and shows both. It fails open, on a set that
+errored or none at all, and the driver's own `PLAY_STALL_MS` is the backstop
+either way.
+
 **The overlay is drawn only when it holds the plane on screen.** Its read and
 the image's are two reads of two tensors and land when they land, so for a
 moment after every plane change one has arrived and the other has not. Outside

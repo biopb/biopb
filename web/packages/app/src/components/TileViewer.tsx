@@ -325,13 +325,6 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // which plane, so their partial state is legitimate progressive refinement.
   const dataValid = loadedKey !== null && loadedKey === selectionKey;
 
-  // Published for the play driver, which paces its next frame on it. Same fact
-  // the cover below is drawn from, said where SliceControls can read it.
-  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
-  useEffect(() => {
-    setPlaneReady(dataValid);
-  }, [dataValid, setPlaneReady]);
-
   // Under play the cover is dropped: at 10 frames a second it would be on
   // screen for most of every frame, which is a flicker rather than a warning,
   // and the thing it guards against -- mistaking a stale plane for the one
@@ -742,6 +735,23 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // sets hides the old one without a reset to remember.
   const labelShowing =
     labelLoadedKey !== null && labelLoadedKey === labelPlaneKey(labelShownKey);
+
+  // Published for the play driver, which paces its next frame on it -- the same
+  // fact the cover is drawn from, said where SliceControls can read it. Down
+  // here rather than beside `dataValid` because *the overlay is part of it*:
+  // paced on the image alone, play advances the moment the image's tiles land,
+  // so a set whose read is slower is asked for the next plane before it has
+  // finished the last and is out of step for the whole of playback. Waiting for
+  // both plays slower and shows both.
+  //
+  // Fails open, and deliberately: a set that errored, or none at all, must not
+  // hold the sequence. The driver's own PLAY_STALL_MS would release it in the
+  // end, but only after stalling on every single frame.
+  const labelReady = overlayId === null || labelError !== null || labelShowing;
+  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
+  useEffect(() => {
+    setPlaneReady(dataValid && labelReady);
+  }, [dataValid, labelReady, setPlaneReady]);
 
   const labelLayers = useMemo(() => {
     // Keyed on the id it was loaded for: `useLabelOverlay` clears its state on a
