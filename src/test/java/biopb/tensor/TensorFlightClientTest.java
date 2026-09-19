@@ -12,11 +12,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.arrow.flight.Action;
+import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.ErrorFlightMetadata;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer;
 import org.apache.arrow.flight.FlightServer;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.NoOpFlightProducer;
 import org.apache.arrow.flight.Result;
@@ -218,11 +221,11 @@ public class TensorFlightClientTest {
     public void testScaledReadRejectsRankMismatch() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IllegalArgumentException error = Assert.assertThrows(
-                        IllegalArgumentException.class,
+                InvalidTensorRequestException error = Assert.assertThrows(
+                        InvalidTensorRequestException.class,
                         () -> client.getTensor("test-source", "test-tensor", new long[] {2}, "nearest"));
-                Assert.assertTrue(error.getMessage().contains("dimensionality mismatch"));
-                Assert.assertNull(server.getLastReductionMethod());
+                Assert.assertEquals("scale_rank", error.getReason());
+                Assert.assertEquals("nearest", server.getLastReductionMethod());
             }
         }
     }
@@ -231,11 +234,11 @@ public class TensorFlightClientTest {
     public void testScaledReadRejectsNonPositiveScale() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IllegalArgumentException error = Assert.assertThrows(
-                        IllegalArgumentException.class,
+                InvalidTensorRequestException error = Assert.assertThrows(
+                        InvalidTensorRequestException.class,
                         () -> client.getTensor("test-source", "test-tensor", new long[] {2, 0}, "nearest"));
-                Assert.assertTrue(error.getMessage().contains("must be positive"));
-                Assert.assertNull(server.getLastReductionMethod());
+                Assert.assertEquals("scale_not_positive", error.getReason());
+                Assert.assertEquals("nearest", server.getLastReductionMethod());
             }
         }
     }
@@ -257,8 +260,8 @@ public class TensorFlightClientTest {
     public void testTensorNotFoundRaises() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IllegalArgumentException error = Assert.assertThrows(
-                        IllegalArgumentException.class,
+                TensorNotFoundException error = Assert.assertThrows(
+                        TensorNotFoundException.class,
                         () -> client.getTensor("test-source", "nonexistent"));
                 Assert.assertTrue(error.getMessage().contains("not found"));
             }
@@ -269,10 +272,10 @@ public class TensorFlightClientTest {
     public void testSourceNotFoundRaises() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IllegalArgumentException error = Assert.assertThrows(
-                        IllegalArgumentException.class,
+                TensorNotFoundException error = Assert.assertThrows(
+                        TensorNotFoundException.class,
                         () -> client.getTensor("nonexistent-source", "some-tensor"));
-                Assert.assertTrue(error.getMessage().contains("Source not found"));
+                Assert.assertEquals("unknown_field", error.getReason());
             }
         }
     }
@@ -543,11 +546,10 @@ public class TensorFlightClientTest {
             server.setSourceHasTensors(false);
             server.setSourceResolved(false);
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IllegalStateException error = Assert.assertThrows(
-                        IllegalStateException.class,
+                SourceUnresolvedException error = Assert.assertThrows(
+                        SourceUnresolvedException.class,
                         () -> client.getTensor("test-source"));
-                Assert.assertTrue(error.getMessage().contains("is unresolved"));
-                Assert.assertTrue(error.getMessage().contains("resolve('test-source')"));
+                Assert.assertTrue(error.getMessage().contains("resolve"));
             }
         }
     }
@@ -561,11 +563,10 @@ public class TensorFlightClientTest {
         try (TestFlightServer server = new TestFlightServer()) {
             server.setSourceHasTensors(false);
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IllegalArgumentException error = Assert.assertThrows(
-                        IllegalArgumentException.class,
+                TensorNotFoundException error = Assert.assertThrows(
+                        TensorNotFoundException.class,
                         () -> client.getTensor("test-source"));
-                Assert.assertTrue(error.getMessage().contains("no readable tensors"));
-                Assert.assertFalse(error.getMessage().contains("unresolved"));
+                Assert.assertEquals("no_readable_tensors", error.getReason());
             }
         }
     }
@@ -817,6 +818,15 @@ public class TensorFlightClientTest {
                     ? cmd.getTensorRead()
                     : null;
 
+            if (!sourceHasTensors) {
+                if (!sourceResolved) {
+                    throw typedError(FlightStatusCode.UNAVAILABLE,
+                            "Source unresolved (open to resolve)", "UNAVAILABLE", null);
+                }
+                throw typedError(FlightStatusCode.NOT_FOUND,
+                        "Source has no readable tensors", "NOT_FOUND", "no_readable_tensors");
+            }
+
             // A source with a registered upload sequence answers with the status
             // on its descriptor -- the poll path, which needs no endpoints.
             if (readOpt != null && uploadStatusSequences.containsKey(readOpt.getArrayId())) {
@@ -838,7 +848,20 @@ public class TensorFlightClientTest {
             if (readOpt == null
                     || !(readOpt.getArrayId().equals("test-tensor")
                             || readOpt.getArrayId().equals("test-source"))) {
-                throw new IllegalArgumentException("Tensor not found: " + (readOpt != null ? readOpt.getArrayId() : "null"));
+                throw typedError(FlightStatusCode.NOT_FOUND,
+                        "Tensor not found: " + (readOpt != null ? readOpt.getArrayId() : "null"),
+                        "NOT_FOUND", "unknown_field");
+            }
+
+            if (readOpt.getScaleHintCount() != 0 && readOpt.getScaleHintCount() != 2) {
+                throw typedError(FlightStatusCode.INVALID_ARGUMENT,
+                        "Scale hint rank must match tensor rank", "INVALID_ARGUMENT", "scale_rank");
+            }
+            for (long scale : readOpt.getScaleHintList()) {
+                if (scale <= 0) {
+                    throw typedError(FlightStatusCode.INVALID_ARGUMENT,
+                            "Scale hint must be positive", "INVALID_ARGUMENT", "scale_not_positive");
+                }
             }
 
             // Handle scaled reads
@@ -897,6 +920,16 @@ public class TensorFlightClientTest {
                     baseEndpoints(),
                     -1,
                     -1);
+        }
+
+        private static RuntimeException typedError(
+                FlightStatusCode status, String message, String code, String reason) {
+            ErrorFlightMetadata metadata = new ErrorFlightMetadata();
+            String payload = reason == null
+                    ? "{\"code\":\"" + code + "\"}"
+                    : "{\"code\":\"" + code + "\",\"reason\":\"" + reason + "\"}";
+            metadata.insert("x-biopb-error-bin", payload.getBytes(StandardCharsets.UTF_8));
+            return new CallStatus(status, null, message, metadata).toRuntimeException();
         }
 
         @Override

@@ -9,7 +9,7 @@ disk caching are deliberately out of scope until the core protocol is stable.
   migrate remaining worker-side paths with their serialization redesign.
 - [x] Introduce `FlightSession` for allocator, authentication, client ownership
   and common error-mapped calls; add TLS trust in its dedicated slice.
-- [ ] Replace descriptor caching and legacy read planning with an `array_id`
+- [x] Replace descriptor caching and legacy read planning with an `array_id`
   first, FieldMask-driven v2 tensor planner.
 - [ ] Rebuild the lazy Imglib2 read adapter from immutable `FlightInfo` plans.
 - [ ] Make `SerializedTensor` the only cross-process tensor-handle format.
