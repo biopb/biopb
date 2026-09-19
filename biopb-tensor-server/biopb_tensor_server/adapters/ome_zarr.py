@@ -501,7 +501,18 @@ class OmeZarrAdapter(ZarrAdapter):
 
         zarr_name = name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
         zarr_path = write_dir / f"{zarr_name}.zarr"
-        zarr_path.mkdir(parents=True, exist_ok=True)
+        # Exclusive: the directory must be this create's own, because discard
+        # will remove it whole. A name whose store is already on disk -- a
+        # finished upload from an earlier server life, or anything else put
+        # there -- is refused rather than adopted.
+        try:
+            zarr_path.mkdir(parents=True)
+        except FileExistsError:
+            raise ValueError(
+                f"ome_zarr:{zarr_name}: {zarr_path} already exists. A name is "
+                "taken while its store is on disk; discard the upload that owns "
+                "it, or upload under another name."
+            ) from None
         arr = zarr.create(
             store=zarr.DirectoryStore(str(zarr_path)),
             shape=desc.shape,

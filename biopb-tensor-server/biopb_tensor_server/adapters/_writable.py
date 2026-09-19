@@ -235,12 +235,15 @@ class WritableSource:
         """
 
     def _mark_store_finished(self) -> None:  # noqa: B027 - concrete no-op default
-        """Persist that the upload is complete, once it is READY.
+        """Seal the store on disk; READY is announced only once this returns.
 
-        Called after the READY transition, outside ``progress.lock``, once. A
-        durable store carries a pending marker from creation so a crash leaves
-        something a restart can recognize and remove; this is where the marker
-        is cleared.
+        Called by :meth:`finish` **before** the READY transition, outside
+        ``progress.lock``. A durable store carries a pending marker from
+        creation so a crash leaves something a restart can recognize and
+        remove; this is where the marker is flipped, and it is the last write
+        the store's metadata ever sees. Raises ``OSError`` if the seal cannot
+        be written, in which case the upload stays PENDING and ``finish`` is
+        retried.
         """
 
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
@@ -351,6 +354,14 @@ class WritableSource:
         Idempotent, so a retried ``finish`` is not an error -- and, matching
         :meth:`discard`, a no-op past the first call: the first seal's touch
         is the one a reclaim sweep should see, not a retry's.
+
+        The store is sealed on disk (:meth:`_mark_store_finished`) **before**
+        READY is announced, never after: a poller that has seen READY must
+        find the store finished after a crash, not pending and swept away at
+        the next boot. The seal runs outside ``progress.lock`` (it takes the
+        kind's write lock, which orders ahead of this one), so the transition
+        re-checks for a discard that landed in between -- the seal on a store
+        that discard has already removed is what that path reports.
         """
         progress = self._upload
         if progress is None:
@@ -358,18 +369,26 @@ class WritableSource:
         with progress.lock:
             if progress.is_discarded:
                 raise UploadDiscardedError(self.source_id, progress.reason)
-            sealed_now = progress.status is not UploadStatus.READY
-            if sealed_now:
+            if progress.status is UploadStatus.READY:
+                return progress.as_status_dict(self.source_id)
+        try:
+            self._mark_store_finished()
+        except OSError:
+            with progress.lock:
+                if progress.is_discarded:
+                    raise UploadDiscardedError(self.source_id, progress.reason)
+            raise
+        with progress.lock:
+            if progress.is_discarded:
+                raise UploadDiscardedError(self.source_id, progress.reason)
+            if progress.status is not UploadStatus.READY:
                 progress.status = UploadStatus.READY
                 progress.touch()
                 logger.info(
                     f"Finished upload {self.source_id}: "
                     f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
                 )
-            status = progress.as_status_dict(self.source_id)
-        if sealed_now:
-            self._mark_store_finished()
-        return status
+            return progress.as_status_dict(self.source_id)
 
     # -- the shared half -------------------------------------------------------
 

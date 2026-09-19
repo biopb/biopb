@@ -139,7 +139,62 @@ class TestDiscardReleasesTheStore:
         assert not store.exists()
 
 
+class TestCreateOwnsItsDirectory:
+    def test_an_existing_directory_is_refused_and_untouched(
+        self, writable_server, client, tmp_path
+    ):
+        """Discard removes the directory whole, so create must never adopt one
+        it did not make -- a finished upload from an earlier server life, or
+        anything else that happens to sit under write_dir."""
+        theirs = tmp_path / "taken.zarr"
+        theirs.mkdir()
+        (theirs / "keep.txt").write_text("not yours")
+
+        with pytest.raises(flight.FlightServerError, match="already exists"):
+            client.create_tensor(
+                "ome_zarr:taken", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+            )
+
+        assert (theirs / "keep.txt").read_text() == "not yours"
+        assert not (theirs / ".zarray").exists()
+        assert writable_server.uploads.status("ome_zarr_x")["state"] == "UNKNOWN"
+
+
 class TestTheMarker:
+    def test_ready_is_announced_only_after_the_seal(
+        self, writable_server, client, tmp_path
+    ):
+        """A poller that has seen READY must find the store sealed after a
+        crash; so if the seal cannot be written, finish fails and the upload
+        stays PENDING for a retry."""
+        desc = _create(client)
+        _put(client, desc)
+        adapter = writable_server.sources.get(desc.array_id)
+        store = tmp_path / "durable.zarr"
+
+        def refuse(state):
+            raise OSError("disk full")
+
+        adapter._write_upload_state = refuse
+        with pytest.raises(flight.FlightServerError, match="could not seal"):
+            client.finish_upload(desc)
+        assert client.get_upload_status(desc.array_id)["state"] == "PENDING"
+        assert _marker(store) == "pending"
+
+        del adapter._write_upload_state
+        assert client.finish_upload(desc)["state"] == "READY"
+        assert _marker(store) == "ready"
+
+    def test_finish_after_discard_reports_the_discard(self, writable_server, client):
+        """The seal on a removed store fails on the missing file; what the
+        caller learns is the discard, not the missing file."""
+        desc = _create(client)
+        writable_server.uploads.discard(desc.array_id, "gone")
+
+        with pytest.raises(UploadRefused, match="gone") as exc:
+            client.finish_upload(desc)
+        assert exc.value.state == "DISCARDED"
+
     def test_pending_from_create_and_ready_after_finish(self, client, tmp_path):
         desc = _create(client)
         store = tmp_path / "durable.zarr"

@@ -330,19 +330,16 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         """Rewrite the root ``.zattrs`` with the upload marker set to *state*.
 
         Atomic (write-then-replace) so a crash mid-write cannot leave a store
-        with no ``.zattrs`` at all. A store that is already gone -- discard
-        raced finish -- is left alone: the marker only matters on a directory
-        that exists.
+        with no ``.zattrs`` at all. Raises ``OSError`` when it cannot -- the
+        store is gone because discard raced, or the disk refused -- and
+        ``finish`` decides which of the two it was.
         """
         path = self._upload_store_path
         if path is None:
             return
         zattrs_path = path / ".zattrs"
         with self._write_lock:
-            try:
-                zattrs = json.loads(zattrs_path.read_text())
-            except OSError:
-                return
+            zattrs = json.loads(zattrs_path.read_text())
             tmp = zattrs_path.with_name(".zattrs.tmp")
             tmp.write_text(json.dumps(with_upload_state(zattrs, state)))
             os.replace(tmp, zattrs_path)

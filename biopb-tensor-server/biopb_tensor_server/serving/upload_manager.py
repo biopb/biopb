@@ -238,6 +238,12 @@ class UploadManager:
             return adapter.finish()
         except UploadDiscardedError as e:
             raise _refused(e) from e
+        except OSError as e:
+            # The store could not be sealed; the upload stays PENDING and the
+            # caller retries finish, so this is a server error, not a refusal.
+            raise flight.FlightServerError(
+                f"finish: could not seal {source_id} on disk: {e}"
+            ) from e
 
     # -- write path ------------------------------------------------------------
 
