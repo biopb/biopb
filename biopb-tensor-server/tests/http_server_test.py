@@ -1559,6 +1559,33 @@ def _tile_source_desc(
     )
 
 
+def _label_set_desc(image_axes=(0, 2, 3, 4)) -> SimpleNamespace:
+    """The T Z Y X set of the T C Z Y X image above, as GetFlightInfo serves it.
+
+    ``metadata_json`` is the wrapped form the wire carries, with the axis
+    mapping under ``biopb.labels`` beside the NGFF ``image-label`` block.
+    """
+    meta = {
+        "image-label": {"version": "0.4", "source": {"image": "tiled/Image:0"}},
+    }
+    if image_axes is not None:
+        meta["biopb"] = {"labels": {"image_axes": list(image_axes)}}
+    return SimpleNamespace(
+        array_id="tiled/Image:0/labels/nuclei",
+        shape=[1, 16, 1024, 1024],
+        chunk_shape=[1, 1, 512, 512],
+        dtype="uint32",
+        dim_labels=["t", "z", "y", "x"],
+        physical_scale=[],
+        physical_unit=[],
+        content_version=None,
+        pyramid=[],
+        metadata_json=json.dumps(
+            {"type": "zarr", "dim_label": ["t", "z", "y", "x"], "metadata": meta}
+        ),
+    )
+
+
 @pytest.fixture()
 def tile_client():
     """TestClient over a tiled tensor; compute() yields one 512x512 plane."""
@@ -1718,6 +1745,77 @@ class TestTileInfoEndpoint:
     def test_requires_token_when_one_is_set(self, auth_client):
         tc, _ = auth_client
         assert tc.get("/api/tile_info/src0").status_code == 401
+
+
+class TestTileInfoStatesALabelSetsAxes:
+    """Which of its image's axes a label set indexes, read rather than derived.
+
+    The two tensors do not number their axes alike (a set spans the image's
+    *non-channel* extent), so a client matching them by name gets `t`/`z` right
+    and an unnamed axis wrong -- frame 0 of a timelapse where frame 40 was
+    asked for. The server states the mapping; this is the route that carries it.
+    """
+
+    @pytest.fixture()
+    def labelled(self):
+        def build(image_axes=(0, 2, 3, 4)):
+            src = _tile_source_desc()
+            src.tensors.append(_label_set_desc(image_axes))
+            mock_fc = _build_mock_client(src)
+            # The real GetFlightInfo fills metadata_json only when the mask asks
+            # for it. Without modelling that, a route that forgot to ask would
+            # still be handed the metadata and this whole class would pass.
+            served = mock_fc.get_descriptor.side_effect
+
+            def masked(array_id, **kwargs):
+                td = served(array_id, **kwargs)
+                if kwargs.get("with_metadata"):
+                    return td
+                return SimpleNamespace(**{**vars(td), "metadata_json": None})
+
+            mock_fc.get_descriptor.side_effect = masked
+            with patch(
+                "biopb_tensor_server.serving.http_server.TensorFlightClient",
+                return_value=mock_fc,
+            ):
+                app = create_app(token=None)
+                with TestClient(app, raise_server_exceptions=True) as tc:
+                    yield tc, mock_fc
+
+        return contextmanager(build)
+
+    def test_carries_the_mapping_the_server_states(self, labelled):
+        with labelled() as (tc, _):
+            body = tc.get("/api/tile_info/tiled/Image:0/labels/nuclei").json()
+            assert body["image_axes"] == [0, 2, 3, 4]
+
+    def test_an_image_carries_none(self, labelled):
+        # Absent, not null: an image has no image to map onto, and a client
+        # reading the field is asking a question only a set can answer.
+        with labelled() as (tc, _):
+            assert "image_axes" not in tc.get("/api/tile_info/tiled/Image:0").json()
+
+    def test_a_server_predating_the_block_simply_omits_it(self, labelled):
+        with labelled(None) as (tc, _):
+            body = tc.get("/api/tile_info/tiled/Image:0/labels/nuclei").json()
+            assert "image_axes" not in body
+
+    def test_metadata_is_fetched_only_for_a_set(self, labelled):
+        # The mapping rides in the metadata, and a source's metadata row can be
+        # a whole OME-XML: paying for it on every image's grid would be a real
+        # cost for a field only a set has.
+        with labelled() as (tc, mock_fc):
+            tc.get("/api/tile_info/tiled/Image:0")
+            assert all(
+                not call.kwargs.get("with_metadata")
+                for call in mock_fc.get_descriptor.call_args_list
+            )
+            mock_fc.get_descriptor.reset_mock()
+            tc.get("/api/tile_info/tiled/Image:0/labels/nuclei")
+            assert any(
+                call.kwargs.get("with_metadata")
+                for call in mock_fc.get_descriptor.call_args_list
+            )
 
 
 class TestTileEndpoint:

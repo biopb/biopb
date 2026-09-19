@@ -71,6 +71,19 @@ which is the contract the ROI store already runs on ("level-0 pixels, the
 server never rescales geometry") and what lets a viewer overlay a set with no
 transform.
 
+**The server states the mapping the rule implies.** Dropping an axis means the
+two tensors do not number their axes alike, and a client matching them by name
+gets `t`/`z` right and an unnamed axis wrong -- frame 0 of a timelapse where
+frame 40 was asked for, which is a picture rather than an error. The rule has
+exactly one legal answer (`label_image_axes`), so the set's served metadata
+carries it: `biopb.labels.image_axes`, the image axis each axis of the set
+indexes, beside the NGFF `image-label` block rather than inside it, since that
+block is a spec block. `/api/tile_info` surfaces the same list as `image_axes`
+for a label set, and asks for metadata only for a set -- a source's metadata
+row can be a whole OME-XML, and an image's grid should not pay for a field only
+a set has. A client reads it; it re-derives the rule only against a server that
+predates the field.
+
 Sparse coverage — one labelled frame of a thousand — is a storage question, not
 a shape one, and every layer already answers it with zeros:
 
@@ -381,9 +394,10 @@ stored id to the palette — anything else silently renames every object.
 Three alignments are worth naming.
 
 A set spans the image's **non-channel** extent, so the two tensors do not number
-their axes the same way: `labelSelection` matches the set's axis *j* to the
-image's *j*-th non-channel axis, because matching by Viv's selection key would
-be right for `t`/`z` and wrong for an unnamed axis.
+their axes the same way. `labelSelection` (in `@biopb/tensor-flight-client`,
+beside the other identity rules rather than in the viewer) **reads** the
+server's `image_axes` rather than re-deriving it, and falls back to the extent
+rule only against a server that does not state it.
 
 **The overlay is drawn only when it holds the plane on screen.** Its read and
 the image's are two reads of two tensors and land when they land, so for a

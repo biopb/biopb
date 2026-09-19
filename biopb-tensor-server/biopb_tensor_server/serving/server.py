@@ -87,6 +87,7 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
+from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.read_mask import (
     IS_RESIDENT,
     METADATA_JSON,
@@ -176,6 +177,36 @@ def to_flight_error(exc: Exception) -> flight.FlightError:
     # the caller's mistake, terminal -- do not retry -- but NOT an INTERNAL
     # "server bug". FlightServerError is the coarsest terminal class Flight offers.
     return flight.FlightServerError(str(exc), extra_info)
+
+
+def _with_label_axes(metadata: dict, source_adapter: Any, desc: Any) -> dict:
+    """*metadata* plus ``biopb.labels.image_axes`` when *desc* is a label set.
+
+    The mapping the extent rule already implies -- which of the image's axes
+    each axis of the set indexes -- said out loud, so a client reads it instead
+    of re-deriving it from two descriptors (design, "Extent"). Stamped at the
+    one place a tensor's served metadata is assembled, and measured against
+    the descriptor being served, so it lines up with the axes the client is
+    about to see.
+
+    NGFF's own ``image-label`` block is left alone: that is a spec block and
+    this is not in the spec. It rides in the ``biopb`` namespace beside it,
+    merged into whatever the source already has there -- an ``ome_zarr:``
+    upload's own ``.zattrs`` carry an upload marker -- rather than replacing it.
+
+    ``source_id`` is the slash-free prefix by the identity policy, so the
+    within-source field is everything after the first "/".
+    """
+    parsed = split_label_field(desc.array_id.partition("/")[2])
+    if parsed is None or source_adapter is None:
+        return metadata
+    get_axes = getattr(source_adapter, "label_image_axes", None)
+    axes = get_axes(parsed.set_field, desc) if get_axes is not None else None
+    if axes is None:
+        return metadata
+    biopb = {**(metadata.get("biopb") or {})}
+    biopb["labels"] = {**(biopb.get("labels") or {}), "image_axes": list(axes)}
+    return {**metadata, "biopb": biopb}
 
 
 def _adapter_lookup_error(exc: Exception, miss_context: str) -> flight.FlightError:
@@ -1703,6 +1734,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 tensor_extra = tensor_adapter.get_tensor_metadata()
                 if tensor_extra:
                     raw_metadata = {**raw_metadata, **tensor_extra}
+                raw_metadata = _with_label_axes(
+                    raw_metadata, source_adapter, read_plan.descriptor
+                )
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
                         "type": source_adapter.source_type,

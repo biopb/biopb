@@ -30,6 +30,7 @@ from biopb_tensor_server.core.errors import TensorNotFound, WriteNotSupportedErr
 from biopb_tensor_server.core.labels import (
     extent_mismatch,
     label_field,
+    label_image_axes,
     split_label_field,
 )
 from biopb_tensor_server.core.normalize import NormalizingAdapter
@@ -155,6 +156,33 @@ class TestTheFieldShape:
             ["c", "y", "x"], [3, 64, 64], ["c", "y", "x"], [3, 64, 64]
         )
 
+    def test_image_axes_states_what_the_extent_rule_implies(self):
+        # The mapping a client would otherwise re-derive. Matching by NAME gets
+        # t/z right and an unnamed axis wrong, which is the whole reason the
+        # server says it out loud (biopb/biopb#1059).
+        assert label_image_axes(["t", "z", "y", "x"], ["t", "c", "z", "y", "x"]) == [
+            0,
+            2,
+            3,
+            4,
+        ]
+        assert label_image_axes(["y", "x"], ["y", "x"]) == [0, 1]
+        # An interleaved samples axis is NOT dropped -- `label_extent` drops only
+        # the channel -- so it maps like any other axis.
+        assert label_image_axes(["t", "y", "x", "s"], ["t", "c", "y", "x", "s"]) == [
+            0,
+            2,
+            3,
+            4,
+        ]
+        # An unnamed axis keeps its place; the set's `a0` is the image's axis 0
+        # even though the image spells the same slider `a1`.
+        assert label_image_axes(["", "y", "x"], ["", "c", "y", "x"]) == [0, 2, 3]
+
+    def test_image_axes_is_none_for_a_set_that_does_not_span(self):
+        # Nothing to state, and the same set `label_sets` drops.
+        assert label_image_axes(["z", "y", "x"], ["t", "c", "z", "y", "x"]) is None
+
 
 class TestANativeSetIsATensorOfItsImage:
     def test_listed_after_the_image_and_readable_by_id(self, registered):
@@ -271,6 +299,15 @@ class TestOverTheWire:
         ]
         meta = json.loads(desc.metadata_json)["metadata"]
         assert meta["image-label"]["source"] == {"image": "oz1"}
+        # Stated, not left to the client: which of the image's axes each of the
+        # set's own indexes. The NGFF block is a spec block and is left alone,
+        # so this rides beside it under `biopb`.
+        assert meta["biopb"]["labels"]["image_axes"] == [0, 1]
+
+    def test_an_image_is_not_given_a_label_axis_block(self, served, client):
+        desc = client.get_descriptor("oz1", with_metadata=True)
+        meta = json.loads(desc.metadata_json)["metadata"]
+        assert "labels" not in (meta.get("biopb") or {})
 
         coarse = client.get_tensor(
             "oz1/labels/nuclei", scale_hint=[2, 2], reduction_method="precompute"

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import json
 import logging
 import os
 import re
@@ -79,6 +80,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from google.protobuf import json_format
 from pydantic import BaseModel
+
+from biopb_tensor_server.core.labels import split_label_field
 
 logger = logging.getLogger(__name__)
 
@@ -755,8 +758,41 @@ def _versioned_array_id(array_id: str, token: Optional[str]) -> str:
     return f"{source}{_VERSION_SEP}{token}{slash}{field}"
 
 
+def _names_label_set(array_id: str) -> bool:
+    """Whether *array_id* addresses a label set rather than an image.
+
+    ``source_id`` is the slash-free prefix by the identity policy, so the
+    within-source field is everything after the first "/". The one reading of
+    the path in this module; see ``core/labels.py``.
+    """
+    return split_label_field(array_id.partition("/")[2]) is not None
+
+
+def _label_image_axes(td: Any) -> Optional[List[int]]:
+    """Which of the image's axes each axis of this set indexes, as the server
+    states it (``biopb.labels.image_axes``), or None.
+
+    Read, never re-derived: the whole point of the server publishing it is that
+    a client matching the two tensors' axes by name gets `t`/`z` right and an
+    unnamed axis wrong. None for a server that predates the block, which leaves
+    the client to fall back to the extent rule as it did before.
+    """
+    raw = getattr(td, "metadata_json", None)
+    if not raw:
+        return None
+    try:
+        wrapped = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    block = ((wrapped or {}).get("metadata") or {}).get("biopb") or {}
+    axes = (block.get("labels") or {}).get("image_axes")
+    if not isinstance(axes, list) or not all(isinstance(a, int) for a in axes):
+        return None
+    return axes
+
+
 def _tensor_desc_by_array_id(
-    client: TensorFlightClient, array_id: str
+    client: TensorFlightClient, array_id: str, *, with_metadata: bool = False
 ) -> Tuple[Any, Optional[str]]:
     """``(TensorDescriptor, current version token)`` for *array_id*.
 
@@ -790,7 +826,9 @@ def _tensor_desc_by_array_id(
     """
     array_id, asked_version = _split_array_version(array_id)
     try:
-        bound = client.get_descriptor(array_id, with_pyramid=False)
+        bound = client.get_descriptor(
+            array_id, with_pyramid=False, with_metadata=with_metadata
+        )
     except (flight.FlightServerError, ValueError):
         # The two terminal answers: a Flight-side addressing refusal (NOT_FOUND
         # / INVALID_ARGUMENT ride FlightServerError -- pyarrow exposes no typed
@@ -2421,7 +2459,13 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
         # Published here and nowhere else: the viewer threads this array_id
         # through every subsequent tile URL, so the versioned form IS the
         # delivery mechanism -- no new field, no client change (biopb/biopb#780).
-        td, version = _tensor_desc_by_array_id(client, array_id)
+        # Metadata is asked for only when the id names a label set: it is
+        # where the axis mapping rides, and pulling a source's whole metadata
+        # row (an OME-XML, say) for every image's grid would be a real cost for
+        # a field only a set has.
+        td, version = _tensor_desc_by_array_id(
+            client, array_id, with_metadata=_names_label_set(array_id)
+        )
         candidates = [] if td is not None else _tensor_candidates(client, array_id)
         levels = () if td is None else _advertised_levels(client, td, version)
     except HTTPException:
@@ -2463,6 +2507,14 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
                 dim_labels, shape, _plane_axes_set(y_idx, x_idx, s_idx)
             ),
             "levels": _tile_levels(shape, y_idx, x_idx, edge),
+            # A label set only: which of its image's axes each of its own
+            # indexes, as the server states it. Absent for an image, and for a
+            # server that predates the block.
+            **(
+                {"image_axes": _label_image_axes(td)}
+                if _label_image_axes(td) is not None
+                else {}
+            ),
             # Advisory: the ladder the SERVER advertises, which is what the rungs
             # above are actually read from -- a native on-disk level where the
             # source ships one, else the computed level precache warms. Published
