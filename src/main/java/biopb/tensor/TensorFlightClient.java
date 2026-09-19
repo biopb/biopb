@@ -8,6 +8,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
@@ -537,6 +539,26 @@ public class TensorFlightClient implements AutoCloseable {
      * @throws IOException If the action fails or the server returns no row
      */
     public VectorSchemaRoot resolve(String sourceId) throws IOException {
+        return resolve(sourceId, null, null);
+    }
+
+    /**
+     * Resolve an unresolved source with optional progress and cancellation hooks.
+     *
+     * <p>Both callbacks run on the calling thread after each streamed action
+     * message. Returning true from {@code shouldCancel} stops consuming the
+     * action stream; the server may finish its recall independently and cache
+     * the result for a later call.
+     *
+     * @param sourceId source to resolve
+     * @param onProgress receives server progress heartbeats, or null
+     * @param shouldCancel polled once per action message, or null
+     * @return the terminal catalog row; caller must close it
+     */
+    public VectorSchemaRoot resolve(
+            String sourceId,
+            Consumer<ResolveProgress> onProgress,
+            BooleanSupplier shouldCancel) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
         // point that performs the (possibly minutes-long) recall. The action
         // streams ResolveStreamMessage progress heartbeats to keep the
@@ -556,8 +578,17 @@ public class TensorFlightClient implements AutoCloseable {
                     continue;
                 }
                 ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
+                if (shouldCancel != null && shouldCancel.getAsBoolean()) {
+                    throw new TensorOperationCancelledException("resolve", sourceId);
+                }
+                if (msg.getPayloadCase() == ResolveStreamMessage.PayloadCase.PROGRESS) {
+                    if (onProgress != null) {
+                        onProgress.accept(msg.getProgress());
+                    }
+                    continue;
+                }
                 if (msg.getPayloadCase() != ResolveStreamMessage.PayloadCase.SOURCE_ROW) {
-                    continue; // heartbeat (no progress callback on the Java client yet)
+                    continue;
                 }
                 try (ArrowStreamReader reader = new ArrowStreamReader(
                         new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
@@ -580,6 +611,9 @@ public class TensorFlightClient implements AutoCloseable {
             }
             if (e instanceof FlightRuntimeException) {
                 throw TensorErrorMapper.map((FlightRuntimeException) e);
+            }
+            if (e instanceof TensorOperationCancelledException) {
+                throw (TensorOperationCancelledException) e;
             }
             if (e instanceof IOException) {
                 throw (IOException) e;
@@ -629,6 +663,21 @@ public class TensorFlightClient implements AutoCloseable {
      *         the {@code warm} action, or it returns no terminal status.
      */
     public WarmProgress warm(String sourceId) throws IOException {
+        return warm(sourceId, null, null);
+    }
+
+    /**
+     * Warm a source with optional progress and cancellation hooks.
+     *
+     * @param sourceId source to warm
+     * @param onProgress receives non-terminal warm progress, or null
+     * @param shouldCancel polled once per action message, or null
+     * @return the terminal progress snapshot
+     */
+    public WarmProgress warm(
+            String sourceId,
+            Consumer<WarmProgress> onProgress,
+            BooleanSupplier shouldCancel) throws IOException {
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
                 "warm",
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -641,10 +690,16 @@ public class TensorFlightClient implements AutoCloseable {
                 continue;
             }
             WarmStreamMessage msg = WarmStreamMessage.parseFrom(body);
-            if (msg.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
+            if (shouldCancel != null && shouldCancel.getAsBoolean()) {
+                throw new TensorOperationCancelledException("warm", sourceId);
+            }
+            if (msg.getPayloadCase() == WarmStreamMessage.PayloadCase.PROGRESS) {
+                if (onProgress != null) {
+                    onProgress.accept(msg.getProgress());
+                }
+            } else if (msg.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
                 done = msg.getDone();
             }
-            // PROGRESS arms are ignored (no progress callback on the Java client yet).
         }
         if (done == null) {
             throw new IOException("warm('" + sourceId

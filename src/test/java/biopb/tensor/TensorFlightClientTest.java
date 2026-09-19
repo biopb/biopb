@@ -521,6 +521,28 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testResolveReportsProgressAndHonorsCancellation() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setResolveHeartbeats(3);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                List<ResolveProgress> progress = new ArrayList<>();
+                try (VectorSchemaRoot row = client.resolve("test-source", progress::add, () -> false)) {
+                    Assert.assertEquals(1, row.getRowCount());
+                }
+                Assert.assertEquals(3, progress.size());
+                Assert.assertEquals("img.tif", progress.get(0).getTargetName());
+
+                TensorOperationCancelledException error = Assert.assertThrows(
+                        TensorOperationCancelledException.class,
+                        () -> client.resolve("test-source", ignored -> Assert.fail("must not report after cancellation"),
+                                () -> true));
+                Assert.assertEquals("resolve", error.getOperation());
+                Assert.assertEquals("test-source", error.getSourceId());
+            }
+        }
+    }
+
+    @Test
     public void testResolveWithoutTerminalRowFails() throws Exception {
         // Heartbeats and nothing else: the server closed without a row. That is an
         // error, not an empty result.
@@ -593,6 +615,25 @@ public class TensorFlightClientTest {
                         IOException.class,
                         () -> client.warm("test-source"));
                 Assert.assertTrue(error.getMessage().contains("no terminal status"));
+            }
+        }
+    }
+
+    @Test
+    public void testWarmReportsProgressAndHonorsCancellation() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                List<WarmProgress> progress = new ArrayList<>();
+                WarmProgress done = client.warm("test-source", progress::add, () -> false);
+                Assert.assertEquals(1, progress.size());
+                Assert.assertEquals(1, progress.get(0).getFilesDone());
+                Assert.assertEquals(2, done.getFilesDone());
+
+                TensorOperationCancelledException error = Assert.assertThrows(
+                        TensorOperationCancelledException.class,
+                        () -> client.warm("test-source", ignored -> Assert.fail("must not report after cancellation"),
+                                () -> true));
+                Assert.assertEquals("warm", error.getOperation());
             }
         }
     }

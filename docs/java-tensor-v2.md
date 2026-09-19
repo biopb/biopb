@@ -13,7 +13,7 @@ disk caching are deliberately out of scope until the core protocol is stable.
   first, FieldMask-driven v2 tensor planner.
 - [x] Rebuild the lazy Imglib2 read adapter from immutable `FlightInfo` plans.
 - [x] Make `SerializedTensor` the only cross-process tensor-handle format.
-- [ ] Implement catalog/metadata/resolve/warm parity.
+- [x] Implement catalog/metadata/resolve/warm parity.
 - [ ] Implement source lifecycle, upload and ROI parity.
 - [ ] Deprecate legacy `(sourceId, tensorId)` entry points and update examples.
 - [ ] Consider remote cache-file/mmap and persistent caching separately, after
