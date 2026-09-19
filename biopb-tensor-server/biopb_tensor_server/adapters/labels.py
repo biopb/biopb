@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
+from biopb_tensor_server.adapters._writable import unsafe_store_name
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
     _first_dataset_path,
@@ -384,6 +385,13 @@ def create_label_upload(
             f"{array_id!r}: names under {RESERVED_PREFIX!r} are the server's "
             f"own; upload under another name."
         )
+    # The name is slash-free by construction -- the field was split on "/" --
+    # but it still becomes a directory the server creates and later removes
+    # whole, so the rest of the rule applies: ".." and a Windows separator or
+    # drive letter would both escape the sidecar directory.
+    why = unsafe_store_name(parsed.name)
+    if why is not None:
+        raise ValueError(f"{array_id!r}: the set's name {why}.")
     if not parent.is_resolved():
         raise ValueError(
             f"{array_id!r}: source {parent.source_id!r} is not resolved, so "

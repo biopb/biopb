@@ -112,6 +112,16 @@ mints a random token at create, persists it in the sidecar's attrs, and its
 adapter wraps chunk ids with it — the gen-token pattern `cache:` uploads use —
 so a name reused after a delete can never hit a stale cache entry.
 
+**The name is a path, so it is checked as one.** A store's directory is named
+after what the client asked for, and discard removes that directory whole, so
+the name must stay inside the directory the server chose: `ome_zarr:../../x`
+otherwise mints and later deletes a store two levels above `write_dir`. Both
+separators and `:` are refused on every platform, not just the host's, and the
+name is refused rather than sanitized — it is an identity as well as a path
+(it is what `create_tensor` refuses a collision on), so folding two requests
+onto one store would trade a traversal for a mix-up. `cache:` needs none of
+this: it hashes the name into a `source_id` and never reaches a filesystem.
+
 **Never inside the source.** An uploaded set is not written into the user's
 OME-Zarr even when it could be: discovery rescans the tree, and the
 reconciler's stat-based `content_version` would flip and invalidate the
@@ -211,7 +221,9 @@ other two, the request's `array_id` *is* the final one. The kind:
 
 - resolves the parent by splitting at the last `/labels/` and refuses if the
   parent is absent, unresolved, or does not serve pixels;
-- refuses a non-unsigned-integer dtype, a reserved name, or a shape /
+- refuses a non-unsigned-integer dtype, a reserved name, a name that would not
+  stay inside the sidecar directory (`unsafe_store_name` — the name becomes a
+  directory the server creates and, on discard, removes whole), or a shape /
   `dim_labels` that is not the parent's canonical non-channel extent — a
   request naming no `dim_labels` is filled in from the image rather than
   refused, since the extent rule leaves exactly one legal answer;
@@ -270,8 +282,13 @@ So, for both kinds:
 - **The upload state is persisted.** A pending marker is written into the
   store's attrs at create and cleared at `finish`. At startup, a sidecar still
   carrying it is a crashed upload and is deleted rather than served; the
-  `ome_zarr:` equivalent is deleted before discovery can claim it. The cache
-  kind never needed this because nothing of it survives a restart.
+  `ome_zarr:` equivalent is deleted before discovery can claim it, together
+  with its catalog row — a persisted catalog outlives the process, and
+  `write_dir` is outside every discovery root, so the reconciler never sees
+  that id and nothing else would drop it. A sidecar has no row of its own: it
+  is a tensor of its parent, whose row is rebuilt when that parent registers.
+  The cache kind never needed any of this because nothing of it survives a
+  restart.
 - **`delete_labels`** (`do_action`, full access) removes a *finished* uploaded
   set: drop it from the attachment, delete the sidecar, re-sync the parent's
   catalog row. Refused for a reserved or native set. Its cache chunks become

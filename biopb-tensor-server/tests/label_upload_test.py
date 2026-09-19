@@ -151,6 +151,18 @@ class TestWhatTheKindRefuses:
         with pytest.raises(flight.FlightServerError, match=why):
             _create(client, array_id, arr=arr)
 
+    @pytest.mark.parametrize("name", ["..", ".", "a\\b", "C:evil", "x" * 260])
+    def test_a_name_that_would_escape_the_sidecar_directory_is_refused(
+        self, served, client, tmp_path, name
+    ):
+        """The set's name becomes a directory the server creates and later
+        removes whole, so it has to stay inside the one the server chose."""
+        import pyarrow.flight as flight
+
+        with pytest.raises(flight.FlightServerError, match="the set's name"):
+            _create(client, f"oz1/labels/{name}")
+        assert not list(labels_root(Path(tmp_path)).glob("**/*.zarr"))
+
     def test_a_taken_name_is_refused_until_it_is_deleted(self, served, client):
         import pyarrow.flight as flight
 

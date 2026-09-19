@@ -89,6 +89,48 @@ def upload_of(adapter: object) -> Optional[UploadProgress]:
     return getattr(adapter, "upload", None)
 
 
+#: What a store's directory name may be at most, extension included. 255 bytes
+#: is the single-component limit ext4, APFS and NTFS share.
+_MAX_STORE_NAME = 255
+
+
+def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
+    """Why *name* cannot be a store's directory name, or None if it can.
+
+    A kind that puts its bytes on disk names the directory after what the
+    client asked for -- ``ome_zarr:<name>`` becomes ``<write_dir>/<name>.zarr``
+    and a label set becomes ``<write_dir>/labels/<source_id>/<name>.zarr`` --
+    so the name is untrusted input that turns into a path component, of a
+    directory the server later creates and, on discard, deletes whole. It must
+    therefore name one component *inside* the directory the server chose:
+    ``ome_zarr:../../x`` otherwise mints and later removes a store two levels
+    above ``write_dir``.
+
+    Refused rather than sanitized, because the name is an identity as well as
+    a path: it is what ``create_tensor`` refuses a collision on, so folding two
+    different requests onto one store would trade a traversal for a mix-up.
+    Both separators and ``:`` are refused on every platform rather than the
+    host's own, so a name minted on Linux cannot escape when the same
+    ``write_dir`` is later served from Windows.
+
+    A kind whose name never reaches the filesystem does not need this:
+    ``cache:`` hashes it into a ``source_id`` (``upload_source_id``).
+    """
+    if not name:
+        return "is empty"
+    if len(name) + len(suffix) > _MAX_STORE_NAME:
+        return f"is longer than {_MAX_STORE_NAME - len(suffix)} characters"
+    if "/" in name or "\\" in name:
+        return "contains a path separator"
+    if ":" in name:
+        return "contains ':', which names a drive or a stream on Windows"
+    if "\x00" in name:
+        return "contains a NUL"
+    if name in (".", ".."):
+        return "is a relative path component"
+    return None
+
+
 def _expected_chunk_count(shape: Sequence[int], chunk_shape: Sequence[int]) -> int:
     count = 1
     for dim, chunk in zip(shape, chunk_shape, strict=True):

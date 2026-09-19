@@ -349,17 +349,24 @@ class UploadManager:
 
         The row was written at create (a durable upload is listed while it
         fills), so a tombstone would otherwise stay browsable with nothing
-        behind it. Idempotent, like the discard it follows. Best-effort for
-        the same reason the write was: the catalog must not fail the upload.
+        behind it. Idempotent, like the discard it follows.
         """
-        if not getattr(adapter, "durable", False) or self._metadata_db is None:
+        if getattr(adapter, "durable", False):
+            self._drop_row(source_id)
+
+    def _drop_row(self, source_id: str) -> None:
+        """Take *source_id* out of the catalog; best-effort.
+
+        Best-effort for the same reason the write was: the catalog must not
+        fail the upload, and a leaked row is the worst case -- the same policy
+        the reconciler's own teardown keeps.
+        """
+        if self._metadata_db is None:
             return
         try:
             self._metadata_db.sync_source_removed(source_id)
         except Exception as e:
-            logger.warning(
-                f"Failed to drop discarded upload {source_id} from catalog: {e}"
-            )
+            logger.warning(f"Failed to drop upload {source_id} from the catalog: {e}")
 
     def discard_unfinished_stores(self) -> int:
         """Delete the stores of uploads a previous server never finished.
@@ -373,22 +380,38 @@ class UploadManager:
 
         The two layouts the server mints: ``write_dir/*.zarr``
         (``OmeZarrAdapter.create_upload``) and the label sidecars
-        ``write_dir/labels/<source_id>/*.zarr``.
+        ``write_dir/labels/<source_id>/*.zarr``. They differ in what the
+        catalog owes them, which is why they are swept separately.
         """
         write_dir = self._write_dir
         if write_dir is None or not write_dir.is_dir():
             return 0
         removed = 0
-        stores = list(write_dir.glob("*.zarr")) + list(
-            labels_root(write_dir).glob("*/*.zarr")
-        )
-        for store in sorted(stores):
-            if upload_state(read_zattrs(store)) != UPLOAD_PENDING:
+        for store in sorted(write_dir.glob("*.zarr")):
+            if not self._remove_unfinished(store):
                 continue
-            shutil.rmtree(store, ignore_errors=True)
+            # An ``ome_zarr:`` upload is a source of its own, and a persisted
+            # catalog still carries the row written at its create in the life
+            # that died. Nothing else will drop it -- write_dir is outside
+            # every discovery root, so the reconciler never sees this id -- and
+            # the row would otherwise stay browsable with no store behind it.
+            self._drop_row(OmeZarrAdapter.upload_source_id(store))
             removed += 1
-            logger.info(f"Removed unfinished upload store {store}")
+        for store in sorted(labels_root(write_dir).glob("*/*.zarr")):
+            # A sidecar has no row of its own: it is a tensor of its parent,
+            # whose row is rebuilt when that parent registers -- which is
+            # after this sweep, since it runs from the constructor.
+            removed += self._remove_unfinished(store)
         return removed
+
+    @staticmethod
+    def _remove_unfinished(store: Path) -> bool:
+        """Delete *store* if it is still pending; whether it was."""
+        if upload_state(read_zattrs(store)) != UPLOAD_PENDING:
+            return False
+        shutil.rmtree(store, ignore_errors=True)
+        logger.info(f"Removed unfinished upload store {store}")
+        return True
 
     def finish(self, source_id: str) -> Dict[str, Any]:
         """Seal an upload; see ``WritableSource.finish``.
@@ -502,6 +525,11 @@ class UploadManager:
         source_id = adapter.source_id
         registered = self._registry.register_new(source_id, adapter)
         if registered is None:
+            # The refused create has already minted its store (``ome_zarr:``
+            # creates one before it has an id to register), so release it here
+            # rather than leave the server's own bytes on disk for the next
+            # boot sweep to find. No catalog row was written yet.
+            adapter.discard("create refused: the name is already taken")
             close_adapter(adapter)
             raise flight.FlightServerError(
                 f"create_tensor: {req_desc.array_id!r} already exists as "

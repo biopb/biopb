@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
+from biopb_tensor_server.adapters._writable import unsafe_store_name
 from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
     ZarrAdapter,
@@ -470,6 +471,20 @@ class OmeZarrAdapter(ZarrAdapter):
             return zarr.open_array(zarr_store, path=relpath, mode="r")
         return zarr.open_array(os.path.join(zarr_path, relpath), mode="r")
 
+    @staticmethod
+    def upload_source_id(zarr_path: Path) -> str:
+        """The ``source_id`` an ``ome_zarr:`` upload of the store at *zarr_path* takes.
+
+        A function of the resolved path, so it is the same in the life that
+        created the store and in the one that finds it left behind: the boot
+        sweep names the catalog row of a store it removes without having
+        created it (``UploadManager.discard_unfinished_stores``). The
+        ``cache:`` counterpart keys off the name instead, having no path
+        (``CachedSourceAdapter.upload_source_id``).
+        """
+        digest = hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()
+        return f"ome_zarr_{digest[:12]}"
+
     @classmethod
     def create_upload(
         cls,
@@ -494,12 +509,19 @@ class OmeZarrAdapter(ZarrAdapter):
 
         if write_dir is None:
             raise ValueError("write_dir not configured for zarr-backed sources")
+        zarr_name = name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
+        # The name becomes a directory under write_dir, which discard later
+        # removes whole, so it has to stay inside it (``unsafe_store_name``).
+        why = unsafe_store_name(zarr_name)
+        if why is not None:
+            raise ValueError(
+                f"ome_zarr:{zarr_name!r} cannot name a store: the name {why}."
+            )
         zattrs = with_upload_state(
             metadata if metadata is not None else minimal_ome_metadata(desc),
             UPLOAD_PENDING,
         )
 
-        zarr_name = name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
         zarr_path = write_dir / f"{zarr_name}.zarr"
         # Exclusive: the directory must be this create's own, because discard
         # will remove it whole. A name whose store is already on disk -- a
@@ -522,9 +544,10 @@ class OmeZarrAdapter(ZarrAdapter):
         with open(zarr_path / ".zattrs", "w") as f:
             json.dump(zattrs, f)
 
-        source_id = f"ome_zarr_{hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()[:12]}"
         adapter = cls(
-            arr, source_id, list(desc.dim_labels) if desc.dim_labels else None
+            arr,
+            cls.upload_source_id(zarr_path),
+            list(desc.dim_labels) if desc.dim_labels else None,
         )
         adapter._upload_store_path = zarr_path
         adapter.begin_upload(desc.shape, desc.chunk_shape)
