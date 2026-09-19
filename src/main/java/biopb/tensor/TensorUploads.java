@@ -159,8 +159,9 @@ final class TensorUploads {
                 .build();
 
         BufferAllocator allocator = session.allocator();
-        try (FieldVector data = encodeBlock(descriptor.getDtype(), source, start, stop, allocator);
-                VectorSchemaRoot root = VectorSchemaRoot.of(data);
+        // The root takes the column; closing it is what frees the block.
+        FieldVector data = encodeBlock(descriptor.getDtype(), source, start, stop, allocator);
+        try (VectorSchemaRoot root = VectorSchemaRoot.of(data);
                 SyncPutListener reply = new SyncPutListener()) {
             root.setRowCount(data.getValueCount());
             FlightClient.ClientStreamListener writer = session.startPut(

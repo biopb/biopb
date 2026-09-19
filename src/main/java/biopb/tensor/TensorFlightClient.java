@@ -549,6 +549,9 @@ public class TensorFlightClient implements AutoCloseable {
         } catch (IOException error) {
             closeQuietly(row);
             throw new UncheckedIOException(error);
+        } catch (RuntimeException error) {
+            closeQuietly(row);
+            throw error;
         }
         return row;
     }
@@ -1142,6 +1145,17 @@ public class TensorFlightClient implements AutoCloseable {
 
         // Preserve source compatibility while externalizing only the v2 handle.
         return new SerializableTensorImg<>(serializedTensorOf(context.info), cacheBytes, rai);
+    }
+
+    /**
+     * Get a SerializedTensor protobuf for a whole tensor.
+     *
+     * @param arrayId Globally-unique tensor id ({@code source_id} or
+     *                {@code source_id/field})
+     * @return SerializedTensor protobuf object
+     */
+    public SerializedTensor getTensorAsPb(String arrayId) {
+        return getTensorAsPb(arrayId, null, null, null);
     }
 
     /**
