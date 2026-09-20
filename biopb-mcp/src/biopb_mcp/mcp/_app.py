@@ -108,7 +108,8 @@ _AUTHORING_INSTRUCTIONS = (
 # (biopb/biopb#894 is the record of agents missing the *first* hop).
 _INDEX_HEADER = (
     "The doc index follows. It is itself doc `index`: re-read it with "
-    '`read_doc("index")` and edit it with `write_doc`.'
+    '`read_doc("index")` and edit it with `write_doc`. A bullet that opens '
+    "with `id:` is a doc entry; write notes as plain prose."
 )
 
 

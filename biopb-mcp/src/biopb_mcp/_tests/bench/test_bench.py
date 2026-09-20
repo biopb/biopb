@@ -87,9 +87,9 @@ def test_the_benchmark_ran_and_wrote_its_report(run: Run):
 def test_the_catalog_matched_the_switch(run: Run):
     """Whether the report means anything at all.
 
-    Checked on what the catalog *returned*, not on whether `list_skills` was
-    called: the tool stays registered either way and it is `load_catalog()` that
-    gates, so a `--bench-docs=false` run can call it and get an empty list.
+    Checked on what the store *served*, not on whether `read_doc` was called:
+    the tool stays registered either way, so a `--bench-docs=false` run can
+    call it and find no procedure.
 
     It asserts one thing and deliberately not a second: that the catalog was
     non-empty exactly when the switch said it should be. It never names an

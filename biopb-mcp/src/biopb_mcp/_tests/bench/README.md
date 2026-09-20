@@ -24,8 +24,8 @@ properties of the invocation, not of the case.
 **A case does not name a skill.** It used to, and three things read that field:
 a `--bench-cases=skills|tasks` filter, a coverage ledger over the shipped
 catalog, and a rule about which agent could score it. All three are gone, and
-this package no longer imports the skills layout or globs `_skills_data` —
-promoting or banking a skill is a change to the catalog and to nothing here.
+this package no longer imports the store or globs `_docs_data` —
+promoting or banking a doc is a change to the seed and to nothing here.
 
 What declares that a case **withholds** something is `persona_must_know`, which
 is what `test_cases.py` reads. That was always the right declaration: it and
@@ -302,7 +302,7 @@ to carry `skill=`, which fed a coverage ledger asserting every shipped skill was
 either benchmarked or listed in `NOT_BENCHMARKED` with a reason. Nothing now
 notices a shipped skill that no case covers, so "what does the benchmark cover"
 is again answered by reading the directory. The ledger was removed because it
-*was* the coupling — it globbed `_skills_data` from inside this package — and if
+*was* the coupling — it globbed `_docs_data` from inside this package — and if
 it is wanted back it belongs on the skills side, asserting outwards from the
 catalog.
 
@@ -491,8 +491,8 @@ transcription never reads the file, so editing a step — or deleting the skill 
 left it green. It also could not reach the instructions that need a *choice* in
 order to be wrong, which is most of what these bodies are for.
 
-Here the body arrives through the real `biopb_mcp.mcp._skills` — `list_skills`
-and `skill://<id>`, the same calls the runtime makes — and the run happens
+Here the body arrives through the real `biopb_mcp.mcp._docs` — the index in
+the handshake and `read_doc`, the same calls the runtime makes — and the run happens
 against a real session: real kernel, real napari, real dask, the nine real
 tools with their real schemas and the server's own `instructions`.
 

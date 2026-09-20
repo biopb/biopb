@@ -3,7 +3,9 @@
 Read one with `read_doc(id)`. This file is itself a doc: edit it with
 `write_doc("index", old=…, new=…)` — regroup, re-hook, drop a line to retire a
 doc of your own, and add a shipped id to the `ignored:` line to stop listing
-one you do not want.
+one you do not want. A bullet that opens with `id:` is a doc entry, so a note
+written as `- Remember: …` is read as a doc named `Remember`; write notes as
+plain prose instead.
 
 ## References
 

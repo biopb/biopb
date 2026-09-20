@@ -162,18 +162,18 @@ def test_the_kernel_runs_the_shipped_package_not_the_checkout(session):
             "import biopb_mcp, importlib.util, os.path\n"
             "print('pkg:', biopb_mcp.__file__)\n"
             "print('tests:', importlib.util.find_spec('biopb_mcp._tests'))\n"
-            # isdir, not load_catalog(): reading the catalog *from the kernel*
-            # is indistinguishable from an ablated arm doing the same, and it
+            # isdir, not a read_doc: reading the store *from the kernel* is
+            # indistinguishable from an ablated arm doing the same, and it
             # would leave that residue in the tripwire for the next test.
-            "print('skills_dir:', os.path.isdir(os.path.join(\n"
-            "    os.path.dirname(biopb_mcp.__file__), 'mcp', '_skills_data')))\n"
+            "print('docs_dir:', os.path.isdir(os.path.join(\n"
+            "    os.path.dirname(biopb_mcp.__file__), 'mcp', '_docs_data')))\n"
         ),
     )
     assert not out.is_error, out.text
     assert "tests: None" in out.text, f"the test tree is importable:\n{out.text}"
     assert "/biopb_mcp/_tests/" not in out.text
-    # Staging must not have cost the child the catalog it is measured on.
-    assert "skills_dir: True" in out.text, out.text
+    # Staging must not have cost the child the docs it is measured on.
+    assert "docs_dir: True" in out.text, out.text
 
 
 def test_reading_the_answer_key_does_not_go_unrecorded(session):
