@@ -5,7 +5,7 @@ description: Remove vignetting and shading from a collection of images taken on 
 
 # Correct uneven illumination across a set of tiles or fields
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, dask.
 
 ## When to use
 
@@ -43,7 +43,7 @@ and the illumination does not.
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `TILES` | `(N, Y, X)` | Every frame from one optical configuration, one channel, one resolution level, stacked. Read [[data]] first — pyramid level and laziness both bite here |
+| `TILES` | `(N, Y, X)` | Every frame from one optical configuration, one channel, one resolution level, stacked. Read [[tensor-server-client]] first — pyramid level and laziness both bite here |
 | `DARKFIELD` | counts | The camera offset present in every pixel. **Ask** (step 2) — it is a property of the camera, not of the pixels, and getting it wrong costs more than every other choice combined |
 | `KEEP` | — | How many low-order DCT coefficients per axis describe the field. `16` for a normal vignette; the optimum is broad (see step 4) so this is not a knob to tune |
 | `N_TILES` | — | How many frames to fit on. Use all of them if they fit in memory; **8 is enough** and 3 is the floor. More tiles help only through specimen averaging, which saturates fast |

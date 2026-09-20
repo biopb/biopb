@@ -132,7 +132,8 @@ back with `rs`. And it shows nothing that is not on the server, which is a step
 
 ## Related
 
-- [[viewer]] — the napari window: the other display surface, and the one that
+- [[napari-viewer]] — the napari window: the other display surface, and the one that
   can show an array without an upload.
-- [[client]] — uploading a result so this page can read it.
-- [[data]] — what an `array_id` addresses, and the pyramid behind it.
+- [[tensor-server-client]] — uploading a result so this page can read it.
+- [[tensor-server-client]] — what an `array_id` addresses, and the pyramid
+  behind it.

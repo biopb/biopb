@@ -491,7 +491,9 @@ class TestTheKnowledgeStore:
         assert {"read_doc", "write_doc"} <= names
 
     def test_a_doc_reads_back(self, chat_host):
-        text, images = asyncio.run(_chat._dispatch("read_doc", {"id": "data"}, None))
+        text, images = asyncio.run(
+            _chat._dispatch("read_doc", {"id": "tensor-server-client"}, None)
+        )
         assert images == []
         assert "client.get_tensor" in text
 
@@ -1069,7 +1071,7 @@ class TestProviderEcho:
         model = _scripted(
             {
                 "content": "",
-                "tool_calls": [_call("read_doc", id="data")],
+                "tool_calls": [_call("read_doc", id="tensor-server-client")],
                 "reasoning_content": "which doc",
             },
             {"content": "done"},

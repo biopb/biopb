@@ -140,7 +140,10 @@ def test_the_ablation_reaches_the_tool_and_not_only_the_index():
             assert "switched off" in out.text, out.text[:200]
             # The reference docs are still there: withholding the whole store
             # would move the baseline the ablated arm establishes.
-            assert "client.get_tensor" in live.call("read_doc", id="data").text
+            assert (
+                "client.get_tensor"
+                in live.call("read_doc", id="tensor-server-client").text
+            )
     except SessionUnavailable as exc:
         pytest.skip(str(exc))
 

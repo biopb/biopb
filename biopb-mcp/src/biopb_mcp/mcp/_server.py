@@ -705,13 +705,13 @@ async def execute_code(
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
 
-    * viewer mutations (read_doc("viewer") has more):
+    * viewer mutations (read_doc("napari-viewer") has more):
     The viewer is thread-safe: mutations are auto-marshaled to the Qt main
     thread, so mutate it directly from job code. run_on_main(fn) is optional --
     use it to batch many mutations into one main-thread hop, or to touch raw Qt
     (viewer.window), which still requires the main thread.
 
-    * data access (read_doc("client") has more):
+    * data access (read_doc("tensor-server-client") has more):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
@@ -734,7 +734,7 @@ async def execute_code(
       in display axis order ([..., Z, Y, X], at the source's own rank), and
       lazy -- np.asarray() of it silently gives the *lowest* level. Use
       viewer.tensor(layer), which returns a plain full-resolution dask array
-      from any layer, and read_doc("data") before measuring or computing from
+      from any layer, and read_doc("napari-viewer") before measuring or computing from
       a layer.
     """
     host, err = _app._require_kernel_host()

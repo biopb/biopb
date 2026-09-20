@@ -104,7 +104,7 @@ def test_the_read_first_docs_cover_both_display_surfaces(seed_index):
     """napari is optional, so an index that lists only it leaves an agent on a
     headless session with no route to showing the user anything."""
     read_first = seed_index.split("## Read first", 1)[1].split("\n##", 1)[0]
-    assert "- viewer:" in read_first
+    assert "- napari-viewer:" in read_first
     assert "- web-viewer:" in read_first
 
 

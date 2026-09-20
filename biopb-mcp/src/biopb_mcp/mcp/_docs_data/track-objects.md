@@ -6,7 +6,7 @@ packages: [laptrack~=0.17.1]
 
 # Track segmented objects through a time-lapse
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`; the `laptrack~=0.17.1` package.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`; the `laptrack~=0.17.1` package.
 
 ## When to use
 
@@ -35,7 +35,7 @@ where it was missed, and keeps lineage where cells divide.
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `LABELS` | `(T, Y, X)` | The segmented series, one label image per frame, in acquisition order. Ids need not agree across frames — that is what this produces. 3D is `(T, Z, Y, X)` and changes only the coordinate columns in step 3. [[data]] for getting it out of a layer or off the tensor server |
+| `LABELS` | `(T, Y, X)` | The segmented series, one label image per frame, in acquisition order. Ids need not agree across frames — that is what this produces. 3D is `(T, Z, Y, X)` and changes only the coordinate columns in step 3. [[tensor-server-client]] and [[napari-viewer]] for getting it |
 | `METRIC` | — | `laptrack` takes any `cdist` metric **or a callable**, so this is a real choice, and it sets the units of `CUTOFF` and the columns in step 3. **Centroid distance** (`sqeuclidean`, the default) — every number here was measured on it. With full masks, prefer **`1 - gIoU`** as a callable (step 4): it follows the mask, so growth and shape change stop reading as motion, and neighbours ambiguous by position are unambiguous by their footprints. Use *generalized* IoU, not IoU — plain IoU is 0 for every pair that does not overlap, so it cannot rank them and needs objects that move less than their own size; gIoU keeps falling as they separate and is applicable wherever centroid distance is. On anisotropic voxels put the coordinates in µm — one pixel cutoff cannot mean one speed limit along both z and y |
 | `PIXEL_UM` | µm/px | From the acquisition. Ask (step 2) — no pixel carries it. With a z-step, ask for that too: it is a second number, not the same one |
 | `INTERVAL_S` | s | Seconds between frames, likewise from the acquisition |
@@ -181,7 +181,7 @@ where it was missed, and keeps lineage where cells divide.
    toward the spacing this degrades — at 2.9× it holds 73.8% of links and no
    cutoff recovers the rest, which is the boundary the `METRIC` row is about.
 
-7. **Report the tracks and the settings.** On [[viewer]], `viewer.add_tracks`
+7. **Report the tracks and the settings.** On [[napari-viewer]], `viewer.add_tracks`
    wants one row per detection as `[track_id, t, y, x]` — id first, not the
    order of the table you have been carrying. Print the dict that reproduces the run beside it: the
    three cutoffs, `MAX_GAP`, `PIXEL_UM`, `INTERVAL_S`, and which id column each

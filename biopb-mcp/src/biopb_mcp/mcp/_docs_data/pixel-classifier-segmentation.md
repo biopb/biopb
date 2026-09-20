@@ -5,7 +5,7 @@ description: Train a classifier on a few hand-drawn scribbles and label every pi
 
 # Segment by training a pixel classifier on scribbles
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`.
 
 **Every number below is synthetic** — a 640 x 640 three-class field, two
 acquisitions of it, and about 4000 scribbled pixels. The two large classes have
@@ -41,7 +41,7 @@ scribbles on one field. The output is a class per pixel.
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `FIELDS` | `(Y, X)` each | The field the scribbles are on, plus every other field to be labelled. [[data]] for getting them off a layer or the tensor server |
+| `FIELDS` | `(Y, X)` each | The field the scribbles are on, plus every other field to be labelled. [[tensor-server-client]] and [[napari-viewer]] for getting them |
 | `SCRIBBLES` | `(Y, X)` int | `0` where unlabelled, `1..K` for the classes. A napari Labels layer the user painted. What each number *means* is step 2 |
 | `SIGMA_MIN`, `SIGMA_MAX` | px | **Leave them at the library defaults, 0.5 and 16.** Tying the top scale to the object size is the instinct and it is a pessimisation: `sigma_max=32`, chosen from a cell diameter of ~130 px, scored macro IoU **0.672** against **0.708** at the default on the same scribbles. Raise it only if a class is defined at a scale larger than 16 px, and re-measure when you do |
 | `NORM` | — | The robust centre and spread of **each field on its own** — `np.percentile(field, [16, 50, 84])`. Never statistics carried from the scribbled field; step 3 is what that costs |

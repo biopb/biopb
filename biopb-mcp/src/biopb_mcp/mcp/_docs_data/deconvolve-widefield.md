@@ -5,7 +5,7 @@ description: Restore a 3D widefield fluorescence stack blurred along z, and chec
 
 # Deconvolve a widefield z-stack
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`.
 
 Every number below was measured on a synthetic widefield stack —
 `(40, 160, 160)`, NA 1.4 oil, 520 nm emission, immersion RI 1.515, voxels
@@ -39,7 +39,7 @@ measuring shape, size or resolution on it.
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `IMAGE` | `(Z, Y, X)` | The stack, in acquisition order. [[data]] for getting it off a layer or the tensor server |
+| `IMAGE` | `(Z, Y, X)` | The stack, in acquisition order. [[tensor-server-client]] and [[napari-viewer]] for getting it |
 | `BEADS` | `(Z, Y, X)` or `None` | A sub-resolution bead stack from the **same mount, depth and optics**. This is the single biggest lever and it is a question for the user, not something to infer — ask in step 2 |
 | `SPACING` | µm | `(dz, dy, dx)`. From the acquisition; ask. The z-step is a separate number from the lateral pixel, never the same one |
 | `NA`, `LAMBDA_NM`, `RI` | — | Objective NA, emission wavelength, immersion index. Used **only** for the no-beads fallback and for sizing windows |

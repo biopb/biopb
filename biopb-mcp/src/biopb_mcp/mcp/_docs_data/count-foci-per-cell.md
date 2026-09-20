@@ -5,7 +5,7 @@ description: Count the foci, puncta or FISH spots inside every segmented cell an
 
 # Count punctate spots inside each segmented cell
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`.
 
 ## When to use
 
@@ -158,7 +158,7 @@ brightness but no useful shape — and the answer is a count, not an area.
    fraction of 0 where the truth was 0.20.
 
 7. **Show the spots and report the distribution** *(visual check)*. Show `peaks`
-   over the raw channel — a Points layer on [[viewer]], or the foci uploaded as
+   over the raw channel — a Points layer on [[napari-viewer]], or the foci uploaded as
    a label set and linked with [[web-viewer]]'s `lb=` — and name one crop. The
    eye is very good at "that is a focus" and very bad at "that is 0.42 above
    threshold". Never the picture alone: report the total, the mean

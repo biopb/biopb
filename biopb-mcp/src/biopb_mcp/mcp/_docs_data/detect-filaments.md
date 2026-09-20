@@ -5,7 +5,7 @@ description: Trace the centrelines of filamentous structures in a fluorescence i
 
 # Detect filaments and measure their width
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`.
 
 The numbers below come from synthetic 2D fields — 512 x 512, twelve curved
 filaments 0.30-0.90 µm wide at 0.1 µm/px, peak SNR 3-30 — except where a
@@ -44,7 +44,7 @@ their width, rather than a foreground mask.
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `IMAGE` | `(Y, X)` | One plane. [[data]] for getting it off a layer or the tensor server. For a stack, run this per plane — the width step below measures across a ridge in the image plane |
+| `IMAGE` | `(Y, X)` | One plane. [[tensor-server-client]] and [[napari-viewer]] for getting it. For a stack, run this per plane — the width step below measures across a ridge in the image plane |
 | `PX_UM` | µm/px | From the acquisition; **ask**. It is not in the pixels, and every width you report is a pixel count times this number |
 | `WIDTH_LO`, `WIDTH_HI` | µm | The range of filament widths to look for, bracketing what the user expects. Sato's `sigmas` are half-widths in pixels: `np.arange(WIDTH_LO, WIDTH_HI, PX_UM) / 2 / PX_UM`. Too narrow a range misses the filaments outside it; too wide only costs time |
 | `LOW_FRAC` | — | How far below the seed threshold a filament may be and still be grown into. **0.25**, and it is a plateau rather than a lucky value: 0.25, 0.20 and 0.15 all recovered 11-12 of 12 filaments at precision ≥ 0.94, while 0.35 lost one more on a field with an illumination gradient, 0.10 dropped precision to 0.65 and 0.05 to 0.09 |

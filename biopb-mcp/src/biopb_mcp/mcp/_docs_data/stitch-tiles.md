@@ -5,7 +5,7 @@ description: Turn a grid of overlapping tiles into a single continuous image, pl
 
 # Register a grid of overlapping tiles into one mosaic
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, dask.
 
 ## When to use
 
@@ -39,7 +39,7 @@ known positions, nominal placement left an rms of **10 px** (individual tiles
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `TILES` | `(N, Y, X)` | One channel, one resolution level, stacked in a stated acquisition order. Read [[data]] first — pyramid level and laziness both bite here |
+| `TILES` | `(N, Y, X)` | One channel, one resolution level, stacked in a stated acquisition order. Read [[tensor-server-client]] first — pyramid level and laziness both bite here |
 | `GRID` | (rows, cols) | From stage positions in the metadata if they are there; otherwise **ask**. `n_tiles == rows * cols` is a check, not a derivation — 24 tiles is 4×6 or 6×4 |
 | `TILE_ORDER` | — | Row-major, or **snake** (alternate rows reversed). Snake read as row-major mirrors every other row. Step 5 does catch it — measured, the accepted pairs fell into 15 pieces instead of 1 — but as "registration failed", so ask rather than diagnose it backwards |
 | `OVERLAP` | % of tile width | The nominal value from the acquisition, 10–20% typically. It sets where to look, not where the tile lands |
@@ -205,7 +205,7 @@ known positions, nominal placement left an rms of **10 px** (individual tiles
    ```
 
    Then upload it in the input's dtype and print what reproduces it. Pixel
-   spacing does not ride along by default ([[data]]), and a mosaic that
+   spacing does not ride along by default ([[upload]]), and a mosaic that
    lost it measures in pixels while looking exactly the same.
 
    ```python

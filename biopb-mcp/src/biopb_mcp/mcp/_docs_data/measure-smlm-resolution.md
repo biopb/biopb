@@ -5,7 +5,7 @@ description: Run single molecule localization on an SMLM/STORM/PALM blinking sta
 
 # Localize an SMLM stack and measure a resolution you can quote
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask, the `image_resolution` kernel plugin.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, dask, the `image_resolution` kernel plugin.
 
 Numbers below are measured and marked. **PAINT** is a real 40 000-frame
 acquisition from the catalog (364x500, ~100 spots/frame, ~4 million fits).

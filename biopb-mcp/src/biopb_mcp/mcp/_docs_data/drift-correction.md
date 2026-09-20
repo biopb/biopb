@@ -6,7 +6,7 @@ packages: [pystackreg~=0.2.8]
 
 # Correct stage drift in a time series before measuring
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask; the `pystackreg~=0.2.8` package.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, dask; the `pystackreg~=0.2.8` package.
 
 ## When to use
 
@@ -32,7 +32,7 @@ kymographs, ratio images.
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `MOVIE` | `(T, Y, X)` | One channel of the time series, one resolution level, in acquisition order. Read [[data]] first — pyramid level and laziness both bite here |
+| `MOVIE` | `(T, Y, X)` | One channel of the time series, one resolution level, in acquisition order. Read [[tensor-server-client]] first — pyramid level and laziness both bite here |
 | `REF_CHANNEL` | — | **One structural** channel that persists across the movie. Not a mean projection over channels — that mixes in the very channel whose intensity is the measurement. Never a sparse or blinking one |
 | `MODE` | — | `TRANSLATION` unless rotation is visible. `RIGID_BODY` adds rotation, costs ~1.5x, and is the only option that handles a rotated stage return |
 | `REFERENCE` | — | **`"previous"`.** See step 3 — this is not a preference |

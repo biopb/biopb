@@ -39,7 +39,8 @@ descriptor is the server's echo and is what every later call takes.
 pixel size travel only if you pass them — `dim_labels=` and `ome_metadata=` on
 `create_tensor` — so a result uploaded without them comes back uncalibrated and
 measures in pixels. Copy them off the input's descriptor rather than writing
-them out; [[data]] trap 6 is this failure from the reading end.
+them out; [[napari-viewer]] is this failure from the reading end, where an
+uncalibrated layer measures in pixels.
 
 **The destination prefix decides where it lands.** `"cache:<name>"` is
 cache-backed and right for something the user is only going to look at;
@@ -58,6 +59,19 @@ dtype, and `UploadRefused` once the upload is over. Writing the grid yourself is
 is the only route to READY, the state a consumer waiting on the result polls
 for. `get_upload_status(array_id)` reports `state`, `expected_chunks` and
 `uploaded_chunks` while it is in flight.
+
+## The round trip, for data too large to hold
+
+Nothing is materialized until the upload, and the upload never holds the whole
+result at once, so this works on data far larger than memory:
+
+```python
+arr = client.get_tensor("raw_data_id")   # lazy, nothing read yet
+mask = arr > 0.5                         # still lazy, still nothing read
+
+desc = client.create_tensor("cache:thresholded_v1", mask)
+client.upload_array(desc, mask)          # the eager step: chunk by chunk
+```
 
 ## Label sets
 
@@ -114,7 +128,7 @@ SQL browse surface; `list_rois` is the only way to read them.
 
 An upload is not a display. Once it lands, put the link in front of the user
 ([[web-viewer]]) or the tensor on the window (`viewer.add_tensor(array_id)`,
-[[viewer]]) — the upload only made that possible.
+[[napari-viewer]]) — the upload only made that possible.
 
 Uploading costs a round trip over the data they are about to look at, so on a
 session that has a napari window, the window is cheaper for a quick
@@ -123,5 +137,6 @@ session.
 
 ## Related
 
-- [[client]] — the read side: browsing the catalog and loading a tensor.
-- [[data]] — what an `array_id` addresses, and the axis order an upload expects.
+- [[tensor-server-client]] — the read side: browsing the catalog and loading a tensor.
+- [[tensor-server-client]] — what an `array_id` addresses, and the axis order an
+  upload expects.

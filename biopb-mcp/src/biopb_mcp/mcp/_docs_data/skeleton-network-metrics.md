@@ -6,7 +6,7 @@ packages: [skan~=0.13.1, networkx~=3.4]
 
 # Measure the length and branching of a segmented filament network
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]); the `skan~=0.13.1` and `networkx~=3.4` packages.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]); the `skan~=0.13.1` and `networkx~=3.4` packages.
 
 ## When to use
 

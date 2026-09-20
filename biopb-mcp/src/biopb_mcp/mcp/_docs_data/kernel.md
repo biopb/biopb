@@ -13,7 +13,7 @@ display — a napari viewer window. The kernel is **stateful**: variables, impor
 persist across turns. Agent code runs in a background thread to keep the main Qt thread responsive.
 
 **There are two ways to show the user an image**, and which ones this session has is a fact about
-the session, not about the work: the napari window ([[viewer]]) and the browser page the control
+the session, not about the work: the napari window ([[napari-viewer]]) and the browser page the control
 serves ([[web-viewer]]). `server_status` says which. Do not assume a window exists.
 
 ## Namespace
@@ -30,14 +30,13 @@ serves ([[web-viewer]]). `server_status` says which. Do not assume a window exis
   mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
   the `add_*()` family, …) to the Qt main thread. One caveat: raw Qt (`viewer.window`)
   still requires the main thread — off-thread access raises a clear error, so wrap it in
-  `run_on_main()`. See [[viewer]] for the full set of viewer operations, including
+  `run_on_main()`. See [[napari-viewer]] for the full set of viewer operations, including
   mouse events.
 - The `client` represents a `TensorFlightClient` instance. Data from the client are
-  lazy, thread-safe, picklable dask arrays. See [[client]] for the full set of client
+  lazy, thread-safe, picklable dask arrays. See [[tensor-server-client]] for the full set of client
   operations, including browsing sources and reading tensors ([[upload]] is the write
   side); and see
-  [[data]] for the traps when moving pixels between the server, a layer, and your own
-  variables. **Read a layer's pixels with `viewer.tensor(layer)`** — `layer.data` is
+  [[napari-viewer]] for how a layer's pixels differ from the server's. **Read a layer's pixels with `viewer.tensor(layer)`** — `layer.data` is
   packaged for the renderer, and handing a multiscale one to numpy silently computes on
   the lowest pyramid level.
 - `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
@@ -153,8 +152,8 @@ or remove a layer, or import something you did not.
   not make came from the person, and the note above is the whole story. If you are the
   one refused, say so and let the user decide; the restart is theirs.
 
-Reading pixels, moving them between the server / a layer / your own variables,
-and the round trip for data too large to hold: [[data]].
+Reading pixels off the server is [[tensor-server-client]], off a layer is
+[[napari-viewer]], and the round trip for data too large to hold is [[upload]].
 
 ## What a procedure needs
 

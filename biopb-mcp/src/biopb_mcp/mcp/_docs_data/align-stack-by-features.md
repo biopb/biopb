@@ -5,7 +5,7 @@ description: Register a stack of serial sections that were each placed independe
 
 # Align serial sections that shifted and turned between slices
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`.
 
 ## When to use
 
@@ -42,7 +42,7 @@ turns over.
 
 | Name | Unit | How to derive it |
 |---|---|---|
-| `STACK` | `(Z, Y, X)` | One channel, one resolution level, in cutting order. Read [[data]] first — pyramid level and laziness both bite here |
+| `STACK` | `(Z, Y, X)` | One channel, one resolution level, in cutting order. Read [[tensor-server-client]] first — pyramid level and laziness both bite here |
 | `REF_CHANNEL` | — | One **structural** channel present in every section. The transforms are estimated once on it and applied to all channels |
 | `MIN_INLIERS` | count | The gate on the direct fit (step 4). It must sit far above the model's `min_samples`, which is 3 — see step 4 for why 3 is the number that matters. `20` is a fine starting point and the value is not delicate |
 | `DETECTOR` | — | `SIFT`. `ORB` is about 2x faster (0.14 s vs 0.30 s per 512² section) and cost one section of direct reach on the same fixture — take it only when the stack is large enough for that to matter |
@@ -182,7 +182,7 @@ turns over.
    Show `aligned` cut on an orthogonal (XZ) slice too — a stack that is aligned
    looks continuous down the cut and a chained section that slipped shows as a
    step. On [[web-viewer]] that is the uploaded stack with `v=0` and the XZ
-   plane selected; on [[viewer]] it is the ortho view.
+   plane selected; on [[napari-viewer]] it is the ortho view.
 
 7. **Hand back the aligned stack and how each section got its place.** Upload it
    if it is worth keeping — [[upload]] covers it, including the pixel spacing,

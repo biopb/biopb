@@ -5,7 +5,7 @@ description: Report object areas, volumes, and diameters in microns instead of p
 
 # Measure labeled objects in physical units, not pixels
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, dask.
 
 ## When to use
 
@@ -42,7 +42,7 @@ the form "the objects are N units across".
 | `UNIT` | — | The unit reported beside the scale, usually `um`. Never assume; a source in nm and one in µm differ by 10⁹ in volume |
 
 `IMAGE` is where the metadata (physical scale and units) lives. `LABELS` may be a temporary result
-generated from a previous step. Read [[data]] before pulling pixels and metadata off data sources.
+generated from a previous step. Read [[tensor-server-client]] and [[napari-viewer]] before pulling pixels and metadata off them.
 
 ## Steps
 
@@ -68,7 +68,7 @@ generated from a previous step. Read [[data]] before pulling pixels and metadata
      arrays comparable at all — but a scale vector is still per-axis, not
      positional. A `[C, Y, X]` image has no Z, and for interleaved colour
      `layer.scale` is one element shorter than the array. Read the axis labels
-     ([[data]]) and pass one entry per axis `LABELS` actually has;
+     ([[napari-viewer]]) and pass one entry per axis `LABELS` actually has;
      `spacing` on the wrong axis changes every number and no shape.
 
 3. **Confirm-input** *(blocking)* — only if the spacing is all ones or absent.

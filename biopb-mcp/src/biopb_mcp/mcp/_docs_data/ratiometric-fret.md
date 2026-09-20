@@ -5,7 +5,7 @@ description: Turn the donor, acceptor and FRET channels of a biosensor experimen
 
 # Compute a corrected FRET ratio that is comparable between conditions
 
-**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`.
 
 Numbers below come from two places and are marked. **TIRF** is a real
 dual-camera molecular-tension-sensor acquisition — donor and acceptor imaged

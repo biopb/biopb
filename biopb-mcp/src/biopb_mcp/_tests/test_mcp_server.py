@@ -236,14 +236,14 @@ class TestTheReferenceDocs:
         assert "inspect_object" in content
 
     def test_the_viewer_doc_mentions_layers(self):
-        assert "viewer.layers" in call_tool(_server.read_doc, "viewer")
+        assert "viewer.layers" in call_tool(_server.read_doc, "napari-viewer")
 
     def test_the_client_doc_mentions_client(self):
-        assert "client" in call_tool(_server.read_doc, "client")
+        assert "client" in call_tool(_server.read_doc, "tensor-server-client")
 
     def test_the_viewer_doc_absorbed_the_annotation_guide(self):
         # One handle, one doc.
-        content = call_tool(_server.read_doc, "viewer")
+        content = call_tool(_server.read_doc, "napari-viewer")
         assert "add_labels" in content
         assert "add_points" in content
 
@@ -1659,52 +1659,54 @@ class TestRun:
 # -----------------------------------------------------------------------
 
 
-class TestDataDoc:
-    """The data-representation doc, and the places that must point at it.
+class TestReadingPixels:
+    """Where a layer's pixels come from, and the doc that has to say so.
 
     Layer data here is a pyramid of proxies in display axis order, none of which
-    a napari-shaped habit expects -- so the doc has to be reachable from the
-    index, and linked from every doc whose examples touch pixels.
+    a napari-shaped habit expects. That story is `napari-viewer`'s; the server
+    half -- lazy, canonical order, what it costs -- is `tensor-server-client`'s.
     """
 
-    def test_listed_in_the_index_the_handshake_carries(self):
+    def test_both_halves_are_listed_in_the_index_the_handshake_carries(self):
         _app.set_docs_enabled(True)
-        assert "- data:" in _app.mcp._mcp_server.instructions
+        instr = _app.mcp._mcp_server.instructions
+        assert "- tensor-server-client:" in instr
+        assert "- napari-viewer:" in instr
 
-    def test_names_all_three_sources_of_array_data(self):
-        doc = call_tool(_server.read_doc, "data")
-        assert "client.get_tensor" in doc  # the server
-        assert "layer.data" in doc  # the viewer
-        assert "multiscale" in doc  # ...which may be a list of levels
+    def test_the_server_doc_names_what_a_tensor_arrives_as(self):
+        doc = call_tool(_server.read_doc, "tensor-server-client")
+        assert "client.get_tensor" in doc
+        assert "Z, Y, X" in doc  # the canonical order the server guarantees
+        assert "lazy" in doc.lower()
 
-    def test_pairs_each_scale_with_the_array_it_belongs_to(self):
-        # The two scale vectors sit on the same axes now, so crossing them no
-        # longer transposes anything -- but for interleaved colour layer.scale
-        # is one shorter, so the doc must still name both.
-        doc = call_tool(_server.read_doc, "data")
-        assert "get_physical_scale" in doc
-        assert "layer.scale" in doc
-
-    def test_the_viewer_doc_reads_layer_data_the_safe_way(self):
+    def test_the_napari_doc_leads_with_the_accessor_not_the_attribute(self):
         # The layer-listing example is the snippet most likely to be copied, so
         # it must teach the accessor rather than the branch idiom
         # (biopb/biopb#974). `layer.data.shape` is fine and stays -- it reports
         # level 0 on either branch; what breaks is *indexing* `.data`, which is
         # what the old form of this test got backwards (biopb/biopb#973).
-        doc = call_tool(_server.read_doc, "viewer")
+        doc = call_tool(_server.read_doc, "napari-viewer")
         assert "viewer.tensor(" in doc
         assert "layer.data[0] if layer.multiscale" not in doc
+        # And it arrives before the layer operations that would tempt `.data`.
+        assert doc.index("viewer.tensor(") < doc.index("## Layers")
 
-    def test_the_data_doc_states_the_real_multiscale_failure(self):
+    def test_the_napari_doc_states_the_real_multiscale_failure(self):
         # biopb/biopb#973: the trap used to be "layer.data.shape raises", which
         # it does not. The failures that are real are silent ones -- np.asarray
         # of a MultiScaleData returns the *lowest* level -- and a doc that names
         # the wrong one sends the agent looking for an exception that never
         # comes.
-        doc = call_tool(_server.read_doc, "data")
-        assert "viewer.tensor(" in doc
+        doc = call_tool(_server.read_doc, "napari-viewer")
         assert "lowest" in doc
         assert "layer.data.shape` raises" not in doc
+
+    def test_the_napari_doc_pairs_each_scale_with_its_array(self):
+        # For interleaved colour layer.scale is one shorter than the array, so
+        # the doc has to name both rather than let them be crossed.
+        doc = call_tool(_server.read_doc, "napari-viewer")
+        assert "layer.scale" in doc
+        assert "dim_labels" in doc
 
 
 class TestToolReturnShape:

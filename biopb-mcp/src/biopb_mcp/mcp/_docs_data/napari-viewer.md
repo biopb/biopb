@@ -1,9 +1,9 @@
 ---
 kind: reference
-description: The napari window, where the session has one — layers, camera, dims, annotation layers.
+description: The napari window, where the session has one — reading a layer, layers, camera, dims, annotation layers.
 ---
 
-# Viewer Operations
+# The napari window
 
 **This is the napari window, and a session need not have one.** It is the
 display surface that can show an array without uploading it, and the one
@@ -32,12 +32,72 @@ pyramid (`layer.data` is napari's `MultiScaleData` sequence of levels), in
 display axis order, wrapped so napari's slice reads stay in-process. Read the
 pixels with **`viewer.tensor(layer)`** — a plain full-resolution dask array from
 any layer — rather than indexing `.data`, where `data[0]` means level 0 on a
-multiscale layer and plane 0 on a single-scale one. [[data]] has the full
-set of traps.
+multiscale layer and plane 0 on a single-scale one. The next section has the
+whole story.
+
+## Reading a layer's pixels
+
+**`viewer.tensor(layer)`.** A plain, lazy `da.Array` at the layer's full
+resolution, in canonical `[..., Z, Y, X]` order, on either kind of layer — the
+array already in hand, unwrapped, with no server round trip, so it works with
+the server disconnected. For a *fresh* read instead, `client.get_tensor(id)`
+([[tensor-server-client]]).
+
+```python
+arr = viewer.tensor(layer)        # or viewer.tensor("layer name")
+```
+
+**`layer.data` is the renderer's packaging, not your array**, and reading pixels
+off it is the most expensive mistake here because it does not raise. On a
+multiscale layer it is napari's `MultiScaleData`, a sequence of levels: `data[0]`
+is level 0, while on a single-scale layer the same expression is *plane* 0 — a
+different rank, silently. Worse, `np.asarray(layer.data)` and anything numpy
+touches return the **lowest** level, so a filter runs at pyramid bottom with no
+error and no warning. Each level is also a `_ViewerArray` proxy rather than a
+real dask array, so `isinstance(arr, da.Array)` is False and library code that
+type-checks its input breaks.
+
+`.shape`, `.ndim` and `.dtype` are safe on both branches and report level 0, so
+those never need a branch. Everything else does, and `viewer.tensor` is that
+branch written once. (`.unwrap()` gets a real dask array out of a proxy you
+already hold.)
+
+**Going back to the server** is a different question: `layer.metadata['array_id']`
+is the id `client.get_tensor` takes, for when you want a fresh read of a source
+re-indexed since the layer loaded. The layer *name* is not a reliable origin —
+it is a display stem the user may rename — and a layer built with
+`add_image`/`add_labels` has no `array_id` entry at all.
+
+Worth running before planning any work off a layer:
+
+```python
+print([(l.name, type(l).__name__, l.multiscale, l.data.shape)
+       for l in viewer.layers])
+
+layer = viewer.layers[NAME]
+arr = viewer.tensor(layer)
+print(arr.shape, arr.dtype, layer.scale)
+sub = arr[0, 100:600, 100:600].compute()     # crop, then compute
+```
+
+## Geometry a layer does and does not carry
+
+**`layer.scale` is not positional.** A layer carries the source's axes unchanged,
+so each size sits on the axis it describes: a 3-D `[C, Y, X]` layer has **no Z**,
+and `layer.scale[-3]` is its channel axis, not depth. Read
+`layer.metadata['dim_labels']` rather than counting from the end. For interleaved
+colour napari does not count `S`, so `layer.scale` is one shorter than the array
+— `layer.scale[-1]` is X, and the array's last axis is the colour count.
+
+**A layer you built carries none of it.** `add_image(arr)` / `add_labels(arr)`
+store exactly that array: no pyramid, `scale` all ones. A segmentation added
+beside a calibrated image measures in pixels until you copy the image's `scale`
+onto it.
 
 ## Layers
 ```python
-# List all layers (read) -- .data reports full resolution on either branch
+# List all layers (read). .shape is safe on either branch; for pixels use
+# viewer.tensor (above), never .data.
 for layer in viewer.layers:
     print(f"{layer.name}: {type(layer).__name__} "
           f"{layer.data.shape} {layer.data.dtype}")
@@ -90,7 +150,7 @@ Use `inspect_object("viewer.add_image")` for full signatures.
 ## Annotation layers (Labels, Points, Shapes)
 A layer you build here holds exactly the array you pass — no pyramid, and
 `scale` defaults to all ones, so it does **not** inherit the geometry of the
-image it was derived from ([[data]], trap 6). Copy the source layer's
+image it was derived from. Copy the source layer's
 `scale` across, or every measurement off it comes out in pixels.
 
 ```python

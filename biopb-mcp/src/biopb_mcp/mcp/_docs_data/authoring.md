@@ -43,7 +43,7 @@ none at all. Name the type in the step:
   so every visual check needs a numeric fallback and a stated slice or crop.
 
   *Where* they see it is the session's, not the doc's: the napari window when
-  there is one ([[viewer]]), otherwise a [[web-viewer]] link. Write the step as
+  there is one ([[napari-viewer]]), otherwise a [[web-viewer]] link. Write the step as
   "show X" and name the crop and the numbers; do not write it as "add a layer",
   which is one of the two routes.
 
@@ -64,7 +64,8 @@ interrupting a running job, overwriting a layer, writing files.
 ## What belongs somewhere else
 
 - **API mechanics.** Getting an array out of a layer or off the tensor server is
-  [[data]]'s job — pyramids, laziness, a per-axis `scale`, what an upload drops.
+  [[tensor-server-client]]'s and [[napari-viewer]]'s job — pyramids, laziness, a
+  per-axis `scale`, what an upload drops.
   A snippet here is a second copy that changes with the loader, and a wrong one
   runs and quietly reports the wrong numbers. Name what your steps need from the
   data ("both label arrays at the same level"), and link the reference.
