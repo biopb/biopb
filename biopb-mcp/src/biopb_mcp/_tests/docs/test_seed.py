@@ -100,12 +100,19 @@ def test_no_doc_links_to_itself(shipped_docs):
         assert doc_id_of(path) not in WIKILINK.findall(body)
 
 
-def test_the_read_first_docs_cover_both_display_surfaces(seed_index):
+def test_both_display_surfaces_are_listed(seed_index):
     """napari is optional, so an index that lists only it leaves an agent on a
-    headless session with no route to showing the user anything."""
-    read_first = seed_index.split("## Read first", 1)[1].split("\n##", 1)[0]
-    assert "- napari-viewer:" in read_first
-    assert "- web-viewer:" in read_first
+    headless session with no route to showing the user anything.
+
+    Keyed to the entries, not to the heading above them: how the index is
+    grouped is the agent's, and the seed's own grouping is not an invariant.
+    The neighbouring test only requires a shipped doc to be listed *or ignored*,
+    so this is what stops one of the two being banked.
+    """
+    listed = {
+        doc_id for line in seed_index.splitlines() if (doc_id := _docs._entry_id(line))
+    }
+    assert {"napari-viewer", "web-viewer"} <= listed
 
 
 def test_every_shipped_doc_declares_a_kind(shipped_docs):

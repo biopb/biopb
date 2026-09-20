@@ -5,7 +5,7 @@ Read one with `read_doc(id)`. This file is itself a doc: edit it with
 doc of your own, and add a shipped id to the `ignored:` line to stop listing
 one you do not want.
 
-## Read first
+## References
 
 - kernel: the namespace, kernel plugins, long-running jobs, where a compute runs
 - tensor-server-client: browse the catalog, load a tensor, and what lazy costs
@@ -13,10 +13,10 @@ one you do not want.
 - web-viewer: show data in the browser — needs no window; send the link, or open it yourself
 - napari-viewer: the window, when there is one — reading a layer, layers, dims, mouse events
 - ops: the server-side image-processing ops in `ops`
+- requirements: check what a procedure needs, and what to do when a piece is missing
 
 ## Procedures
 
-- requirements: check what a procedure needs, and what to do when a piece is missing
 - flatfield: correct uneven illumination across a set of tiles or fields
 - stitch-tiles: assemble a grid of overlapping tiles into one mosaic
 - align-stack-by-features: register serial sections that shifted and turned
