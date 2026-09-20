@@ -373,6 +373,18 @@ class TestViewSessionRegistration:
         assert rec["host"] == "127.0.0.1"
         assert rec["pid"] == os.getpid()
         assert rec["mcp_url"] == "http://127.0.0.1:45678/mcp"
+        # Nobody launched us, so there is no launch to attribute this to.
+        assert "launch_token" not in rec
+
+    def test_a_launchers_token_is_echoed_onto_the_record(self, monkeypatch):
+        # How the control recognises the viewer it just spawned. It cannot use
+        # the pid it holds: behind a Windows trampoline (uv / pip console-script
+        # launchers) that is the stub's, not ours (biopb#1084).
+        from biopb import _locations, _sessions
+
+        monkeypatch.setenv(_locations.MCP_LAUNCH_TOKEN_ENV, "tok-abc123")
+        rec = _sessions.read_session(_register_view_session(45678))
+        assert rec["launch_token"] == "tok-abc123"
 
     def test_registered_session_is_listed_as_live(self):
         from biopb import _sessions

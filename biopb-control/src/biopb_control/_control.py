@@ -88,6 +88,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -839,6 +840,21 @@ def _viewer_log_tail(path) -> str:
     return data.decode("utf-8", "replace").strip()[-_VIEWER_LOG_TAIL:]
 
 
+def _is_our_launch(rec: dict, launch_token: str, child_pid: int) -> bool:
+    """Whether session record ``rec`` is the viewer this launch just spawned.
+
+    The token is the answer whenever the child echoed one (every biopb-mcp that
+    knows ``MCP_LAUNCH_TOKEN_ENV``), and it is exact. The pid comparison behind
+    it is the compatibility path for a child too old to echo it, and it is only
+    consulted for a record carrying no token at all — a record with a *different*
+    token is somebody else's launch and must never match on a coincidental pid.
+    """
+    token = rec.get("launch_token")
+    if token is not None:
+        return token == launch_token
+    return rec.get("pid") == child_pid
+
+
 def _launch_viewer(timeout: float) -> dict:
     """Start an agentless viewer session; wait for it to publish itself.
 
@@ -846,8 +862,19 @@ def _launch_viewer(timeout: float) -> dict:
     runs its eager ``host.ensure_started()`` *before* ``_register_view_session``
     (biopb-mcp ``mcp/__main__.py``), so a record appearing means a napari window
     really opened, and a child that dies first never registers. The record is
-    matched on the child's own pid — a viewer registers ``os.getpid()`` — so a
-    session someone else starts concurrently is never mistaken for this one.
+    matched on a per-launch token we hand the child in its environment
+    (:data:`biopb._locations.MCP_LAUNCH_TOKEN_ENV`), so a session someone else
+    starts concurrently is never mistaken for this one.
+
+    The token replaced a pid match, which looked exact and was not: on Windows a
+    venv's ``Scripts/python.exe`` is frequently a *trampoline* (uv's, and pip's
+    console-script launchers) that re-spawns the real interpreter and waits on
+    it, so ``proc.pid`` is the stub and the pid the viewer registers is its own.
+    They never matched, and every dashboard launch on such an install waited out
+    the full timeout over a window that had been open for seconds — then, if the
+    user closed the session inside that window, reported the trampoline's
+    forwarded exit as "exited before it opened" (biopb#1084). A pid match is
+    kept only as a fallback for a child too old to echo the token.
 
     Detached (:func:`detach_kwargs`) and then forgotten: the ``Popen`` handle is
     held only long enough to notice an early exit, never to reap or restart. A
@@ -862,12 +889,14 @@ def _launch_viewer(timeout: float) -> dict:
     # The environment is inherited: it carries the DISPLAY/XAUTHORITY/
     # WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
     # where the window lands. That inheritance is the whole risk #98 named and
-    # the whole reason for the gate above. The one addition tells the child where
-    # its own output went, so `server_status` can name the file rather than
-    # guessing the canonical one -- the same thing the shim does for its child.
-    env = None
+    # the whole reason for the gate above. Two additions ride on top of it: the
+    # per-launch token we recognise the child's registration by, and where its
+    # own output went, so `server_status` can name the file rather than guessing
+    # the canonical one -- the same thing the shim does for its child.
+    launch_token = secrets.token_hex(8)
+    env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
     if log_path is not None:
-        env = {**os.environ, _locations.MCP_SESSION_LOG_ENV: str(log_path)}
+        env[_locations.MCP_SESSION_LOG_ENV] = str(log_path)
     try:
         proc = subprocess.Popen(
             argv,
@@ -887,8 +916,12 @@ def _launch_viewer(timeout: float) -> dict:
     while True:
         for rec in _sessions.list_sessions():
             session_id = rec.get("session_id")
-            if session_id and rec.get("pid") == proc.pid:
-                logger.info("Viewer session %s is up (pid %s)", session_id, proc.pid)
+            if session_id and _is_our_launch(rec, launch_token, proc.pid):
+                # The record's pid, not ours: behind a trampoline the process we
+                # spawned is a stub and the viewer is the pid it published.
+                logger.info(
+                    "Viewer session %s is up (pid %s)", session_id, rec.get("pid")
+                )
                 return {
                     "state": "started",
                     "session_id": session_id,

@@ -68,6 +68,23 @@ SESSIONS_DIR_ENV = "BIOPB_SESSIONS_DIR"
 # others (control ARCHITECTURE.md, I2).
 MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 
+# Env var carrying a one-shot token that identifies *this* launch of a viewer
+# session. Set by the control on the child it spawns and written verbatim into
+# that child's registry record, so the launcher can recognise its own session
+# among all the live ones.
+#
+# It exists because the obvious signal -- match the record's pid against the
+# spawned ``Popen.pid`` -- is not reliable: on Windows a venv's
+# ``Scripts/python.exe`` is often a *trampoline* (uv, and pip's console-script
+# launchers) that re-spawns the real interpreter and waits on it, so the pid the
+# launcher holds is the stub's and the pid the child records is its own. They
+# never match, and the launcher waits out its whole timeout over a viewer that
+# opened seconds ago. A token also beats a pid on the merits: it cannot be
+# recycled, and it says "the process I started", not "a process with this
+# number". Defined here for the same reason MCP_SESSION_LOG_ENV is -- two
+# packages that may not import each other must agree on one string.
+MCP_LAUNCH_TOKEN_ENV = "BIOPB_MCP_LAUNCH_TOKEN"
+
 
 # --- base trees ---------------------------------------------------------- #
 #
