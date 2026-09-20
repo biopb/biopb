@@ -86,12 +86,18 @@ ignored: measure-smlm-resolution, ratiometric-fret
 
 - An **entry** is a list line whose first token is an id: `- <id>: <hook>`.
   The hook is the agent's text and is rendered verbatim.
-- The **`ignored:`** line names docs, shipped or local, the agent has decided
-  not to list. It is the only removal there is: the agent never deletes a
-  file, so retiring a doc is one index edit, and a local file the user wants
-  gone is theirs to remove. Ignore is explicit rather than absence, so a line
-  lost in a sloppy rewrite reappears instead of silently retiring a doc (§5).
-  An ignored doc is still readable by id.
+- The **`ignored:`** line names *shipped* docs the agent has decided not to
+  list, so it is bounded by the size of a release. Ignore is explicit rather
+  than absence, so a line lost in a sloppy rewrite reappears instead of
+  silently retiring a shipped doc (§5). An ignored doc is still readable by id.
+
+**Local docs are indexed from birth and retired by one edit.** `write_doc`
+appends an entry for a doc it creates (§4), so every local doc has a line to
+remove. A local file with no entry — one the agent retired, or one the user
+dropped in by hand — is not surfaced anywhere; it is readable by id and it is
+the user's to delete. This is the harness-memory rule: the index is the
+catalog, and a file it does not name does not exist to the agent. Keeping
+local docs out of the tail and the ignore line is what keeps both bounded.
 
 Headings, prose and order are the agent's. The loader interprets nothing else.
 
@@ -100,8 +106,9 @@ plus what the loader knows and the file cannot:
 
 1. an entry whose file does not exist gets the suffix `(missing)`; one that
    shadows a shipped doc gets `(local copy)`;
-2. a tail, `Unindexed (N): id, id, …`, listing docs with neither an entry nor
-   an `ignored:` mention — at most the first 10 ids, then the count.
+2. a tail, `New shipped docs: id, id, …`, listing shipped docs with neither an
+   entry nor an `ignored:` mention. Not truncated: it is bounded by what one
+   release adds, and truncating it would hide the upgrade it exists to report.
 
 The agent cleans up both by editing the file.
 
@@ -131,15 +138,18 @@ index (§3).
 
 **`write_doc(id, body=None, diff=None)`** — exactly one of the two.
 
-- `body` creates or replaces the local file.
+- `body` creates or replaces the local file. On a *create*, the tool also
+  appends `- <id>: <description>` to the index, under a trailing `## Unfiled`
+  heading it adds if absent, so the doc is discoverable without a second call
+  and the agent moves the line where it belongs when it next edits the index.
 - `diff` is a unified diff applied to the current text. Index edits are the
   common case, and a full rewrite of a long index is both slow and lossy —
   models drop and paraphrase lines past ~100 of verbatim reproduction. With a
   diff, an edit costs a few dozen output tokens whatever the index length.
 
-There is no delete. Removing a doc is removing its index entry, or putting it
-on the `ignored:` line if it would otherwise resurface in the tail (§3): one
-call instead of two, and no tool that destroys a file.
+There is no delete. Retiring a local doc is removing its index entry, and
+retiring a shipped one is putting it on the `ignored:` line (§3): one call,
+and no tool that destroys a file.
 
 **Shipped docs are copy-on-write.** A `body` or `diff` write to a shipped id
 creates a local file that shadows it (the diff is applied to the shipped text
@@ -178,7 +188,7 @@ need merging because the index references docs by id and the loader
 reconciles on every render:
 
 - a **new shipped doc** has no entry and no ignore, so it appears in the
-  unindexed tail; the agent files it or ignores it, once;
+  *New shipped docs* tail; the agent files it or ignores it, once;
 - a **removed shipped doc** leaves its entry marked `(missing)`; the agent
   deletes the line;
 - a **changed shipped doc** is simply read fresh; if the user had shadowed
