@@ -714,12 +714,15 @@ async def execute_code(
     * data access (read_doc("tensor-server-client") has more):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
-      source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
-      is_resolved (note source_url, not "url"). This is the browse
-      surface; there is no other. Unresolved
-      (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
-      predicate hides them; use `is_resolved` to filter on them on purpose
-      (e.g. `WHERE NOT is_resolved` to list what hasn't been resolved yet).
+      source_url, source_type, indexed_at, metadata_json, is_resolved, and
+      `tensors`, a LIST of STRUCT(array_id, dim_labels, shape, dtype) with one
+      entry per tensor (note source_url, not "url"). This is the browse
+      surface; there is no other. Structure is a per-tensor question, so ask it
+      of `tensors`: `WHERE len(list_filter(tensors, t -> t.dtype='uint16')) > 0`,
+      or `tensors[1].dtype` for the source's first tensor. An unresolved (cloud)
+      source has an empty `tensors`, so any such predicate hides it; use
+      `is_resolved` to filter on them on purpose (e.g. `WHERE NOT is_resolved`
+      to list what hasn't been resolved yet).
     - resolved is not the same as local. Assume a cloud or synced-folder
       source's bytes may not be on the serving machine, so its first read can
       be slow or fail offline -- say so before starting one, not after.

@@ -55,8 +55,11 @@ class TestQuerySourcesFormat:
         return pa.table(
             {
                 "source_id": ["a", "b"],
-                # list column mirrors the real `shape_summary` catalog field
-                "shape_summary": [[1, 4, 5734, 5734], [1, 5, 7616, 7616]],
+                # nested column, like the real `tensors` catalog field
+                "tensors": [
+                    [{"array_id": "a/t1", "shape": [1, 4, 5734, 5734]}],
+                    [{"array_id": "b/t1", "shape": [1, 5, 7616, 7616]}],
+                ],
             }
         )
 
@@ -82,7 +85,7 @@ class TestQuerySourcesFormat:
         out = TensorFlightClient._format_query_result(t, "pandas")
         assert isinstance(out, pd.DataFrame)
         assert list(out["source_id"]) == ["a", "b"]
-        assert list(out["shape_summary"].iloc[0]) == [1, 4, 5734, 5734]
+        assert list(out["tensors"].iloc[0][0]["shape"]) == [1, 4, 5734, 5734]
 
     def test_pandas_string_nulls_become_none_not_nan(self):
         # issue #47: a NULL in a *string* column (e.g. metadata_json) coerces
@@ -123,8 +126,14 @@ class TestQuerySourcesFormat:
         t = self._table()
         out = TensorFlightClient._format_query_result(t, "records")
         assert out == [
-            {"source_id": "a", "shape_summary": [1, 4, 5734, 5734]},
-            {"source_id": "b", "shape_summary": [1, 5, 7616, 7616]},
+            {
+                "source_id": "a",
+                "tensors": [{"array_id": "a/t1", "shape": [1, 4, 5734, 5734]}],
+            },
+            {
+                "source_id": "b",
+                "tensors": [{"array_id": "b/t1", "shape": [1, 5, 7616, 7616]}],
+            },
         ]
 
     def test_unknown_format_rejected_before_network(self):

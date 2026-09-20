@@ -3283,11 +3283,6 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_type": row.get("source_type") or "",
         # Always null on a listing; see _SOURCE_LIST_SQL.
         "metadata_json": None,
-        # Deliberately not the scalar dtype/shape_summary columns: those exist
-        # for catalog clients that never read the tensors struct, and this
-        # listing carries the struct. A scalar that only describes tensors[0]
-        # is a trap next to a real per-tensor list.
-        #
         # There is no residency field here, and no column to read one from:
         # "are the bytes local right now" is answered live by the `is_resident`
         # action, never by a row (biopb/biopb#1035). `is_resolved` is the

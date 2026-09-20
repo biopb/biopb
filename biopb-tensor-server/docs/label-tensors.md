@@ -179,9 +179,9 @@ ignorant of sidecars:
   `.../labels/<name>[/<level>]` field answers from `label_sets`, everything
   else delegates to the format. A label-shaped id the source has no set for is
   handed to the format anyway — a proxy's upstream may serve it.
-- `catalog_tensors` appends the sets after `list_tensor_descriptors`. The
-  catalog's scalar `dtype` / `shape_summary` columns describe `tensors[0]`, so
-  a set is never first.
+- `catalog_tensors` appends the sets after `list_tensor_descriptors`. A
+  source's first tensor is the one every listing reads as its picture, so a set
+  is never first.
 
 A set's adapter is `LabelSetAdapter` (`adapters/labels.py`): `OmeZarrAdapter`
 opened on the label group, bound under the parent's `source_id` with the set's

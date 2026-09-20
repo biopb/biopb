@@ -48,7 +48,7 @@ the one legitimate hydrate — the moment a human asked for the pixels.
 ## The model: unresolved sources + lazy resolution
 
 A cloud source is a **URL-only, *unresolved* catalog entry** — an explicit
-`UNKNOWN` descriptor (empty `tensors`, NULL `dtype`/`shape_summary`), not a
+`UNKNOWN` descriptor (empty `tensors`), not a
 missing row. Resolution (learning shape/dtype/fields) is **lazy and
 user-triggered**, deferred to the first consented access.
 
@@ -78,9 +78,9 @@ therefore only ever record where the bytes were when someone last looked, which
 is not the question anyone asks. So there is no residency column and no
 descriptor field; `do_action("is_resident", [...])` calls straight through to
 `adapter.is_resident()` on every invocation — a live lookup like `chunk_locate`,
-not a row. Unresolved sources (NULL dtype) stay filterable on purpose via
-`WHERE NOT is_resolved`, instead of being silently dropped by a `WHERE dtype=…`
-predicate.
+not a row. Unresolved sources (empty `tensors`) stay filterable on purpose via
+`WHERE NOT is_resolved`, instead of being silently dropped by a
+`WHERE tensors[1].dtype = …` predicate.
 
 ## Shipped architecture
 

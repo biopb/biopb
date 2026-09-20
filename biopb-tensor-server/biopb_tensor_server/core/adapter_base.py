@@ -206,9 +206,10 @@ def catalog_tensors(adapter: Any) -> List[TensorDescriptor]:
 
     Duck-typed on ``list_tensor_descriptors`` alone, like the rest of the
     registration surface ``sync_source_added`` reads -- plus ``label_sets``
-    when the adapter has it, listed **after** the image tensors: the catalog's
-    scalar ``dtype`` / ``shape_summary`` describe ``tensors[0]``, and a label
-    set must never be that (biopb/biopb#1059).
+    when the adapter has it, listed **after** the image tensors: a source's
+    first tensor is the one every listing reads as its picture -- the browser
+    groups on it, and SQL reaches for ``tensors[1]`` -- and a label set must
+    never be that (biopb/biopb#1059).
     """
     tensors = [catalog_entry(t) for t in adapter.list_tensor_descriptors()]
     sets = getattr(adapter, "label_sets", None) or {}

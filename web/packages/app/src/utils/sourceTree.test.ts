@@ -187,7 +187,7 @@ describe("groupTensors", () => {
   });
 
   it("keeps the server's tensor order, which puts images first", () => {
-    // The catalog's scalar `dtype`/`shape_summary` describe `tensors[0]`, so
+    // `tensors[0]` is the source's picture by the server's ordering, so
     // re-sorting the images here would disagree with the row above them.
     const groups = groupTensors([labelTensor("src/z"), labelTensor("src/a")]);
     expect(groups.map((g) => g.image.array_id)).toEqual(["src/z", "src/a"]);
