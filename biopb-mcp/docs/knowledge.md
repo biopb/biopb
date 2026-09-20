@@ -101,7 +101,7 @@ local docs out of the tail and the ignore line is what keeps both bounded.
 
 Headings, prose and order are the agent's. The loader interprets nothing else.
 
-**Rendering.** `read_doc("index")` and the start tool (§4) return the file
+**Rendering.** `read_doc("index")` and the handshake (§4) return the file
 plus what the loader knows and the file cannot:
 
 1. an entry whose file does not exist gets the suffix `(missing)`; one that
@@ -136,47 +136,64 @@ resources. Tools rather than resources because every host has tools.
 and `shadows shipped` when it does). `read_doc("index")` returns the rendered
 index (§3).
 
-**`write_doc(id, body=None, diff=None)`** — exactly one of the two.
+**`write_doc(id, body=None, old=None, new=None)`** — `body` alone, or the
+`old`/`new` pair.
 
 - `body` creates or replaces the local file. On a *create*, the tool also
   appends `- <id>: <description>` to the index, under a trailing `## Unfiled`
   heading it adds if absent, so the doc is discoverable without a second call
   and the agent moves the line where it belongs when it next edits the index.
-- `diff` is a unified diff applied to the current text. Index edits are the
+- `old`/`new` replaces one exact occurrence of `old` with `new`; the call is
+  refused if `old` is absent or matches more than once. Index edits are the
   common case, and a full rewrite of a long index is both slow and lossy —
   models drop and paraphrase lines past ~100 of verbatim reproduction. With a
-  diff, an edit costs a few dozen output tokens whatever the index length.
+  replace, an edit costs a few dozen output tokens whatever the index length.
+  This is the primitive every agent harness uses for file edits, so models
+  are trained on it; a unified diff was considered and rejected because it
+  needs an applier of our own (`difflib` cannot apply a patch) and its hunk
+  offsets are the part models get wrong. Several edits are several calls.
 
 There is no delete. Retiring a local doc is removing its index entry, and
 retiring a shipped one is putting it on the `ignored:` line (§3): one call,
 and no tool that destroys a file.
 
-**Shipped docs are copy-on-write.** A `body` or `diff` write to a shipped id
-creates a local file that shadows it (the diff is applied to the shipped text
-as its base). The shipped file is never touched, so an upgrade can still
+**Shipped docs are copy-on-write.** A `body` or `old`/`new` write to a shipped
+id creates a local file that shadows it (the replace is applied to the shipped
+text as its base). The shipped file is never touched, so an upgrade can still
 replace it, and the index marks the shadow (§3).
 
-**The diff applier is ours.** `difflib` produces and compares diffs but does
-not apply them, and `patch` is not portable. The applier parses unified hunks,
-**ignores the `@@` line numbers** (models get context right and offsets
-wrong), locates each hunk by its context and removed lines, requires the match
-to be unique, and applies the whole diff atomically or refuses it naming the
-hunk that failed. About fifty lines. The tool returns `difflib.unified_diff`
-of before and after, so a mangled hunk is visible in the result.
+**The result is the diff.** Whichever form was used, the tool returns
+`difflib.unified_diff` of before and after, so what actually changed is
+visible in the result and a replace that landed somewhere unexpected shows
+immediately.
 
 **Body cap.** A doc is read whole into context, so `write_doc` refuses a body
 over 300 lines. The shipped procedures sit near 200.
 
-**The start tool returns the index.** `start_biopb` (renamed per #894;
-`start_kernel` stays as an alias for one release) appends the rendered index
-to its ready text, after the display warning, under one header line saying
-this is doc `index`, editable with `write_doc`. Inlined rather than "now call
+**The handshake carries the index.** The MCP `instructions` field is the
+server's `CLAUDE.md`: sent once per session at initialize, read by every host,
+and in context before the first tool call. The rendered index goes there,
+under one header line saying this is doc `index`, editable with `write_doc`
+and re-readable with `read_doc`. The SDK builds the initialization options
+per session, so the instructions are recomposed at each initialize and a
+session sees the index as it stands. Inlined rather than "now call
 `read_doc('index')`": every prompted hop loses agents (#894 is the record of
-agents missing the *first* hop), and the index has to enter context anyway,
-so inlining costs nothing when the agent complies and saves the round trip.
+agents missing the *first* hop).
 
-**The handshake** shrinks to: call the start tool first; the index in its
-return lists what to read, and its *Read first* section is what to read before
+Not the start tool's return: `start_biopb` (renamed per #894; `start_kernel`
+stays as an alias for one release) is also the recovery path and gets called
+again after a stuck or dead kernel, and a 25 KB index resent on every retry
+is cost with no information. Its return stays what it is today.
+
+Mid-session edits are seen through `read_doc("index")`, and the `write_doc`
+result shows the change. Where the host implements resource subscriptions,
+the index is additionally exposed as a resource and a `resources/updated`
+notification is sent on every write to it — the nearest thing MCP has to a
+harness injecting recall. It is a nudge for the hosts that honour it, and
+nothing in the design depends on it.
+
+**The rest of the handshake** shrinks to: call the start tool first; the index
+above lists what to read, and its *Read first* section is what to read before
 non-trivial work; the standing guardrails; one sentence that destructive steps
 always ask first. The skills paragraph and the checkpoint vocabulary go — the
 checkpoint types move into the authoring doc and the procedures that use them.
@@ -198,9 +215,14 @@ No seen-list, no version stamp, no merge step.
 
 ## 6. Writing discipline
 
-The authoring gate collapses to the `write_doc` docstring, in three bullets:
-write only a validated multi-step procedure, never a dataset-specific one, and
-phrase the index hook as the user's request. A short shipped reference doc,
+The authoring gate collapses to the `write_doc` docstring, in five bullets:
+write only a validated multi-step procedure, never a dataset-specific one;
+phrase the index hook as the user's request; **update an existing doc rather
+than write a near-duplicate** — read the index first, and prefer an
+`old`/`new` edit to a new file; and **verify a name, flag or call a doc quotes
+still exists before relying on it**, since a local doc has no contract test
+behind it. The last two are what keep an agent-written store from rotting,
+and are lifted from the harness memory prompt that has proven them. A short shipped reference doc,
 `authoring`, keeps what a docstring cannot hold — the checkpoint types
 (confirm-input, visual check, validate-and-gate) and the derivation-rule
 convention for parameters — in well under a hundred lines. `write-a-skill`'s
@@ -261,15 +283,16 @@ rewrite; then the acceptance run.
 ## 9. Open risks
 
 1. **Whether the seed still gets read.** The ablation proved the bodies help
-   under tool-then-resource delivery. Under inline-index-then-`read_doc`
+   under tool-then-resource delivery. Under index-in-handshake-then-`read_doc`
    delivery the read is a call the agent chooses to make. Only the acceptance
    run answers this. If it fails, the fallback is inlining the *Read first*
-   bodies into the start return, at ~30 KB per session.
+   bodies into the handshake as well, `CLAUDE.md`-style, at ~30 KB per
+   session.
 2. **Quality of unsupervised local docs.** The bench uses the seed, so it
    cannot see this. The cap bounds the size of the damage, not its rate; only
    dogfooding over weeks will show whether three bullets are enough discipline.
 3. **Concurrent hand edits.** The user can edit the local directory, and the
-   observe page may grow a way to. A `diff` write fails safe on changed
-   context; a `body` write from stale state clobbers. Accepted for now.
+   observe page may grow a way to. An `old`/`new` write fails safe when the
+   text has moved; a `body` write from stale state clobbers. Accepted for now.
 4. **Two hundred entries is a context-budget guess.** Raising it later touches
-   nothing but the constant, since edits are diffs.
+   nothing but the constant, since edits are replaces, not rewrites.
