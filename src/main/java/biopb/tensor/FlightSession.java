@@ -1,6 +1,8 @@
 package biopb.tensor;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
+import java.util.Map;
 
 import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightClient;
@@ -9,12 +11,16 @@ import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.Result;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 
 /**
  * Owns one Flight connection's allocator, authentication and error boundary.
@@ -30,6 +36,16 @@ public final class FlightSession implements AutoCloseable {
     private final CredentialCallOption authOption;
     private final Location location;
     private final String token;
+
+    private static final Gson GSON = new Gson();
+
+    /**
+     * Set once the server's Flight protocol shape has been checked. Volatile
+     * and checked outside the lock: the probe is idempotent, so a racing pair
+     * costing one extra {@code health} call is cheaper than serializing every
+     * RPC behind a monitor.
+     */
+    private volatile boolean protocolChecked;
 
     public FlightSession(Location location, String token) {
         this.location = location;
@@ -47,7 +63,64 @@ public final class FlightSession implements AutoCloseable {
     public FlightClient client() { return client; }
     public CredentialCallOption authOption() { return authOption; }
 
+    /**
+     * Refuse a server whose Flight protocol shape is not this SDK's, once per
+     * connection.
+     *
+     * <p>Runs on first use rather than in the constructor, so building a client
+     * stays free of I/O -- the arrangement Python's {@code _ClientState.client}
+     * property has. Reads the {@code protocol} key from the {@code health}
+     * action; a server without it predates the key and speaks v1, which this
+     * SDK no longer does. Failing here names the mismatch, where letting a v2
+     * request reach a v1 server produces a parse error from the wrong proto,
+     * or a chunk this client cannot decode.
+     *
+     * <p>Deliberately quiet in two cases. A capability token cannot reach the
+     * catalog tier that {@code health} sits on, and the private call about to
+     * be made authorizes itself; and a server that answers nothing is not a
+     * biopb server at all, so the first real call gives the better error.
+     */
+    private void ensureProtocol() {
+        if (protocolChecked) {
+            return;
+        }
+        byte[] body;
+        try {
+            Iterator<Result> results = client.doAction(new Action("health", new byte[0]), authOption);
+            body = results.hasNext() ? results.next().getBody() : null;
+        } catch (FlightRuntimeException error) {
+            if (error.status().code() == FlightStatusCode.UNAUTHENTICATED
+                    || error.status().code() == FlightStatusCode.UNAUTHORIZED) {
+                protocolChecked = true;
+                return;
+            }
+            throw TensorErrorMapper.map(error);
+        }
+        if (body == null || body.length == 0) {
+            protocolChecked = true;
+            return;
+        }
+        int serverVersion = 1;
+        try {
+            Map<String, Object> health = GSON.fromJson(new String(body, StandardCharsets.UTF_8),
+                    new TypeToken<Map<String, Object>>() {}.getType());
+            Object protocol = health == null ? null : health.get("protocol");
+            if (protocol instanceof Number) {
+                serverVersion = ((Number) protocol).intValue();
+            }
+        } catch (RuntimeException ignored) {
+            // Unparseable health is a v1 server's silence by another name.
+        }
+        if (serverVersion != WireVersions.FLIGHT_PROTOCOL_VERSION) {
+            throw new UnsupportedOperationException(WireVersions.mismatch(
+                    "Flight protocol", serverVersion, WireVersions.FLIGHT_PROTOCOL_VERSION,
+                    "The server at " + location + " routes requests in another shape."));
+        }
+        protocolChecked = true;
+    }
+
     public FlightInfo getInfo(FlightDescriptor descriptor) {
+        ensureProtocol();
         try {
             return client.getInfo(descriptor, authOption);
         } catch (FlightRuntimeException error) {
@@ -56,6 +129,7 @@ public final class FlightSession implements AutoCloseable {
     }
 
     public FlightStream getStream(Ticket ticket) {
+        ensureProtocol();
         try {
             return client.getStream(ticket, authOption);
         } catch (FlightRuntimeException error) {
@@ -69,6 +143,7 @@ public final class FlightSession implements AutoCloseable {
      */
     public FlightClient.ClientStreamListener startPut(
             FlightDescriptor descriptor, VectorSchemaRoot root, FlightClient.PutListener listener) {
+        ensureProtocol();
         try {
             return client.startPut(descriptor, root, listener, authOption);
         } catch (FlightRuntimeException error) {
@@ -94,6 +169,9 @@ public final class FlightSession implements AutoCloseable {
     }
 
     public Iterator<Result> doAction(Action action) {
+        // `health` itself goes through the raw client in ensureProtocol, so
+        // this cannot recurse.
+        ensureProtocol();
         try {
             return new ErrorMappingIterator(client.doAction(action, authOption));
         } catch (FlightRuntimeException error) {

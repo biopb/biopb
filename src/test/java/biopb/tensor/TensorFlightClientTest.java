@@ -423,6 +423,107 @@ public class TensorFlightClientTest {
         }
     }
 
+    // ---- protocol gates ---------------------------------------------------
+
+    @Test
+    public void testRefusesAServerSpeakingAnotherFlightShape() throws Exception {
+        // v1 routed by a sentinel source_id in a FlightCmd; sending it a v2
+        // FlightRequest gets it parsed as something else. Name the mismatch
+        // instead, once per connection, before the first real call.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setProtocolVersion(1);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                UnsupportedOperationException error = Assert.assertThrows(
+                        UnsupportedOperationException.class,
+                        () -> client.getTensor("test-tensor"));
+                Assert.assertTrue(error.getMessage(),
+                        error.getMessage().contains("server speaks v1"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("Upgrade the server"));
+            }
+        }
+    }
+
+    @Test
+    public void testAcceptsAMatchingFlightShapeAndProbesOnlyOnce() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.getTensor("test-tensor");
+                client.getTensor("test-tensor");
+                // The probe is cached: a connection is checked once, not per call.
+                Assert.assertEquals(1, server.getHealthRequestCount());
+            }
+        }
+    }
+
+    @Test
+    public void testACapabilityTokenIsNotRefusedForFailingTheProbe() throws Exception {
+        // health is on the catalog tier, which a per-source capability cannot
+        // reach. Refusing it here would lock the narrowest credential out of the
+        // SDK entirely; the private call it is about to make authorizes itself.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setHealthUnauthenticated(true);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                RandomAccessibleInterval<FloatType> image = client.getTensor("test-tensor");
+                Assert.assertEquals(4, image.dimension(0));
+                Assert.assertEquals(1.0f, image.getAt(0, 0).get(), 0.0001f);
+            }
+        }
+    }
+
+    @Test
+    public void testRefusesAChunkEncodingItCannotDecode() throws Exception {
+        // An unstamped schema is a pre-#293 server: chunks are a typed
+        // data: list<T>, which this client reads as "not binary" from inside a
+        // cell load. Refuse at the plan, with the reason.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setChunkWireProtocol(null);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                UnsupportedOperationException error = Assert.assertThrows(
+                        UnsupportedOperationException.class,
+                        () -> client.getTensor("test-tensor"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("server speaks v1"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("#293"));
+                // Refused before any chunk was fetched.
+                Assert.assertEquals(0, server.getTotalChunkRequestCount());
+            }
+        }
+    }
+
+    @Test
+    public void testRefusesAChunkEncodingFromTheFuture() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setChunkWireProtocol("3");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                UnsupportedOperationException error = Assert.assertThrows(
+                        UnsupportedOperationException.class,
+                        () -> client.getTensor("test-tensor"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("Upgrade the client"));
+            }
+        }
+    }
+
+    @Test
+    public void testAnUnstampedPlanIsRefusedWhereverItCameFrom() throws Exception {
+        // A handle that arrived from another process is reconstructed by the
+        // same factory, so it meets the same gate -- the reason the check sits
+        // where a plan becomes an image rather than at GetFlightInfo.
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                SerializedTensor pb = client.getTensorAsPb("test-tensor");
+                SerializedTensor unstamped = SerializedTensor.newBuilder(pb)
+                        .setFlightInfo(ByteString.copyFrom(new FlightInfo(
+                                new org.apache.arrow.vector.types.pojo.Schema(new ArrayList<>()),
+                                TensorFlightClient.flightInfoOf(pb).getDescriptor(),
+                                TensorFlightClient.flightInfoOf(pb).getEndpoints(),
+                                -1, -1).serialize()))
+                        .build();
+                RandomAccessibleInterval<FloatType> image =
+                        TensorFlightClient.tensorFromPb(unstamped, 10_000_000L);
+                Assert.assertThrows(UnsupportedOperationException.class, () -> image.dimension(0));
+            }
+        }
+    }
+
     // ---- cloud path: resolve / warm / getSourceMetadata -------------------
     // These run against a `doAction` fake, which is what the suite lacked: the
     // three calls that drive an unresolved (cloud / synced-folder) source were
@@ -711,6 +812,10 @@ public class TensorFlightClientTest {
             return producer.getFlightInfoRequestCount();
         }
 
+        int getHealthRequestCount() {
+            return producer.healthRequests.get();
+        }
+
         String getLastReductionMethod() {
             return producer.getLastReductionMethod();
         }
@@ -743,9 +848,35 @@ public class TensorFlightClientTest {
             producer.sourceHasTensors = has;
         }
 
+        void setProtocolVersion(int version) {
+            producer.protocolVersion = version;
+        }
+
+        void setChunkWireProtocol(String version) {
+            producer.chunkWireProtocol = version;
+        }
+
+        void setHealthUnauthenticated(boolean refuse) {
+            producer.healthUnauthenticated = refuse;
+        }
+
+        /**
+         * Shut the server down, then wait for the producer to be idle before
+         * closing the allocator.
+         *
+         * <p>A cancelled action leaves its handler running -- that is the whole
+         * point of cancelling -- and Arrow runs one on its own executor, which
+         * {@code server.close()} does not wait for. Closing the allocator out
+         * from under a handler that still holds a root reports it as a leak by
+         * whichever test happened to cancel.
+         */
         @Override
         public void close() throws Exception {
             server.close();
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (producer.inFlight.get() > 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
             allocator.close();
         }
     }
@@ -772,6 +903,16 @@ public class TensorFlightClientTest {
         // resolved and held nothing readable, which is the pair #1032 exists
         // to stop conflating.
         private volatile boolean sourceHasTensors = true;
+        // The Flight protocol shape this fake claims to speak.
+        volatile int protocolVersion = 2;
+        final AtomicInteger healthRequests = new AtomicInteger();
+        /** Producer calls currently running, so teardown can wait them out. */
+        final AtomicInteger inFlight = new AtomicInteger();
+        // A capability token cannot read the catalog tier health sits on.
+        volatile boolean healthUnauthenticated = false;
+        // The chunk encoding this fake stamps; null leaves the schema unstamped,
+        // which is how a pre-#293 server presents.
+        volatile String chunkWireProtocol = "2";
         // Residency is asked per call, never stored, so the fake counts the
         // asks as well as answering them (biopb/biopb#1035).
 
@@ -913,7 +1054,7 @@ public class TensorFlightClientTest {
                         .setReductionMethod(readOpt.getReductionMethod())
                         .build();
                 return new FlightInfo(
-                        schema,
+                        planSchema(),
                         FlightDescriptor.command(responseDescriptor.toByteArray()),
                         scaledEdgeEndpoints(),
                         -1,
@@ -937,7 +1078,7 @@ public class TensorFlightClientTest {
                         .setReductionMethod(readOpt.getReductionMethod())
                         .build();
                 return new FlightInfo(
-                        schema,
+                        planSchema(),
                         FlightDescriptor.command(responseDescriptor.toByteArray()),
                         scaledEndpoints(),
                         -1,
@@ -945,7 +1086,7 @@ public class TensorFlightClientTest {
             }
 
             return new FlightInfo(
-                    schema,
+                    planSchema(),
                     FlightDescriptor.command(baseDescriptor.toByteArray()),
                     baseEndpoints(),
                     -1,
@@ -979,6 +1120,29 @@ public class TensorFlightClientTest {
                 FlightProducer.CallContext context,
                 Action action,
                 FlightProducer.StreamListener<Result> listener) {
+            inFlight.incrementAndGet();
+            try {
+                dispatch(action, listener);
+            } finally {
+                inFlight.decrementAndGet();
+            }
+        }
+
+        private void dispatch(Action action, FlightProducer.StreamListener<Result> listener) {
+            if ("health".equals(action.getType())) {
+                healthRequests.incrementAndGet();
+                if (healthUnauthenticated) {
+                    listener.onError(CallStatus.UNAUTHENTICATED
+                            .withDescription("no catalog access").toRuntimeException());
+                    return;
+                }
+                // Every v2 server answers this, and the SDK probes it once per
+                // connection before its first real call.
+                listener.onNext(new Result(("{\"status\":\"SERVING\",\"protocol\":"
+                        + protocolVersion + "}").getBytes(StandardCharsets.UTF_8)));
+                listener.onCompleted();
+                return;
+            }
             if ("resolve".equals(action.getType())) {
                 doResolve(new String(action.getBody(), StandardCharsets.UTF_8), listener);
                 return;
@@ -1106,7 +1270,15 @@ public class TensorFlightClientTest {
                 FlightProducer.CallContext context,
                 Ticket ticket,
                 FlightProducer.ServerStreamListener listener) {
+            inFlight.incrementAndGet();
+            try {
+                serve(ticket, listener);
+            } finally {
+                inFlight.decrementAndGet();
+            }
+        }
 
+        private void serve(Ticket ticket, FlightProducer.ServerStreamListener listener) {
             TensorTicket tensorTicket = parseTicket(ticket.getBytes());
             if (tensorTicket.hasCatalogQuery()) {
                 // The `catalog` flight: the `sources` row(s) the query selects, as
@@ -1316,10 +1488,26 @@ public class TensorFlightClientTest {
         }
 
         private static org.apache.arrow.vector.types.pojo.Schema createSchema(BufferAllocator allocator) {
-            // Unified binary chunk schema (biopb/biopb#293): data (binary), dtype (utf8).
+            // Unified binary chunk schema (biopb/biopb#293): data (binary), dtype (utf8),
+            // stamped with the encoding version the client gates on -- the real
+            // server stamps every read plan's schema the same way.
             Field dataField = new Field("data", FieldType.nullable(ArrowType.Binary.INSTANCE), null);
             Field dtypeField = new Field("dtype", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
-            return new org.apache.arrow.vector.types.pojo.Schema(Arrays.asList(dataField, dtypeField));
+            return new org.apache.arrow.vector.types.pojo.Schema(
+                    Arrays.asList(dataField, dtypeField),
+                    Collections.singletonMap("chunk_wire_protocol", "2"));
+        }
+
+        /** The read-plan schema, stamped as this fake is currently configured. */
+        private org.apache.arrow.vector.types.pojo.Schema planSchema() {
+            if ("2".equals(chunkWireProtocol)) {
+                return schema;
+            }
+            java.util.Map<String, String> metadata = new java.util.HashMap<>();
+            if (chunkWireProtocol != null) {
+                metadata.put("chunk_wire_protocol", chunkWireProtocol);
+            }
+            return new org.apache.arrow.vector.types.pojo.Schema(schema.getFields(), metadata);
         }
 
         private static FlightRequest parseCmd(byte[] bytes) {

@@ -19,9 +19,9 @@ disk caching are deliberately out of scope until the core protocol is stable.
   `DataSourceDescriptor` row decoders they fed.
 - [x] Own Flight connections after the pool's removal: `FlightSessions` shares
   one per `(location, token)`, as `biopb.tensor._pool` does.
-- [ ] Port the connect-time protocol check (`health`'s `protocol`, Python's
-  `_check_protocol_version` / `_check_wire_protocol`). Without it a v1 server
-  is reported as "returned no terminal result" rather than as too old.
+- [x] Port the two compatibility gates: the `health` action's `protocol`
+  (checked once per connection) and the read plan's `chunk_wire_protocol`
+  (checked where a plan becomes an image).
 - [ ] Consider remote cache-file/mmap and persistent caching separately, after
   protocol parity is covered by shared integration fixtures.
 
@@ -33,6 +33,27 @@ disk caching are deliberately out of scope until the core protocol is stable.
 | `label_sets` / `delete_labels` | `labelSets` / `deleteLabels` |
 | `list_rois` / `put_rois` / `delete_rois` / `prune_rois` | `listRois` / `putRois` / `deleteRois` / `pruneRois` |
 | `create_tensor` / `upload_array` / `upload_chunk` / `finish_upload` | `createTensor` / `uploadArray` / `uploadChunk` / `finishUpload` |
+
+### The two version gates
+
+A server advertises three version signals and only two of them are contracts:
+
+| signal | where | meaning |
+| --- | --- | --- |
+| `protocol` | `health` action | the protocol *shape* -- which descriptors, tickets and put commands the server understands. v1 routed by a sentinel `source_id`; v2 is the oneofs this client sends. |
+| `chunk_wire_protocol` | schema metadata on every read plan | the chunk *encoding*. v1 was `data: list<T>`; v2 is one binary blob plus a numpy dtype string (biopb/biopb#293), which is what `ChunkDecoder` reads. |
+| `tensor_schema_version` | same schema | the server package's release tag. Informational -- the server's own comment says so -- and nothing to do with the wire. |
+
+`FlightSession` probes the first on first use, so building a client stays free
+of I/O and a v1 server is named rather than sent a request it will parse as
+something else. `Imglib2TensorFactory` checks the second where a plan becomes
+an image -- the same place Python checks it, and the one point both a
+locally-planned read and a `SerializedTensor` from another process pass
+through. An absent stamp means v1 in both cases: the key postdates that
+version.
+
+Neither is the cache-file `format_version` from `chunk_locate`, which versions
+the localhost mmap handoff this SDK does not implement.
 
 Cancellation transfers, by a different route. Python breaks out of the
 `do_action` generator and pyarrow closes the stream; Arrow Java hands back a

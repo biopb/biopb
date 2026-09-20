@@ -52,6 +52,7 @@ final class Imglib2TensorFactory {
 
     @SuppressWarnings("unchecked")
     <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> create(FlightInfo plan) {
+        checkWireProtocol(plan);
         TensorDescriptor descriptor = descriptorOf(plan);
         T type = (T) createType(descriptor.getDtype());
         long[] dims = toLongArray(descriptor.getShapeList());
@@ -75,6 +76,37 @@ final class Imglib2TensorFactory {
         ReadOnlyCachedCellImgFactory factory = new ReadOnlyCachedCellImgFactory(options);
         return (RandomAccessibleInterval<T>) factory.create(dims, type,
                 cell -> loadCell(cell, endpointIndex));
+    }
+
+    /**
+     * Refuse a plan whose chunk encoding this client cannot read.
+     *
+     * <p>Here rather than at {@code GetFlightInfo} because this is the one
+     * place every plan passes through -- one the client planned itself, and one
+     * that arrived serialized in a {@link SerializedTensor} from another
+     * process -- and it is the last point before the bytes are reinterpreted.
+     * The same reason Python checks in {@code _dask_from_flight_info}.
+     *
+     * <p>An unstamped schema is a pre-#293 server: the key postdates v1, so its
+     * absence names the version rather than leaving it unknown. Refusing here
+     * costs an actionable message instead of "Data column value is not binary"
+     * from inside a cell load.
+     */
+    private static void checkWireProtocol(FlightInfo plan) {
+        String stamped = null;
+        java.util.Optional<org.apache.arrow.vector.types.pojo.Schema> schema = plan.getSchemaOptional();
+        if (schema.isPresent()) {
+            java.util.Map<String, String> metadata = schema.get().getCustomMetadata();
+            if (metadata != null) {
+                stamped = metadata.get(WireVersions.WIRE_PROTOCOL_METADATA_KEY);
+            }
+        }
+        int serverVersion = WireVersions.stampedVersion(stamped);
+        if (serverVersion != WireVersions.TENSOR_WIRE_PROTOCOL_VERSION) {
+            throw new UnsupportedOperationException(WireVersions.mismatch(
+                    "tensor wire protocol", serverVersion, WireVersions.TENSOR_WIRE_PROTOCOL_VERSION,
+                    "The chunk encoding is a breaking contract (biopb/biopb#293)."));
+        }
     }
 
     private static TensorDescriptor descriptorOf(FlightInfo plan) {

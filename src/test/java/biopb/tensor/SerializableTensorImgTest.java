@@ -155,7 +155,8 @@ public class SerializableTensorImgTest {
             }
         }
         FlightInfo plan = new FlightInfo(
-                new Schema(new ArrayList<>()),
+                new Schema(new ArrayList<>(),
+                        java.util.Collections.singletonMap("chunk_wire_protocol", "2")),
                 FlightDescriptor.command(descriptor.toByteArray()),
                 endpoints, -1, -1);
         return SerializedTensor.newBuilder()

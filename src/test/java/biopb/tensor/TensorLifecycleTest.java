@@ -724,6 +724,15 @@ public class TensorLifecycleTest {
                 Action action,
                 FlightProducer.StreamListener<Result> listener) {
             try {
+                if ("health".equals(action.getType())) {
+                    // Answered whatever knownActions says: an older v2 server
+                    // missing add_source still has health, and the SDK probes it
+                    // before every first call.
+                    listener.onNext(new Result(
+                            "{\"status\":\"SERVING\",\"protocol\":2}".getBytes(StandardCharsets.UTF_8)));
+                    listener.onCompleted();
+                    return;
+                }
                 if (!knownActions.contains(action.getType())) {
                     listener.onError(org.apache.arrow.flight.CallStatus.INTERNAL
                             .withDescription("Unknown action: " + action.getType())

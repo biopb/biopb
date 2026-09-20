@@ -1662,7 +1662,11 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     private static void checkSchemaVersion(FlightInfo info) {
-        // Advisory only: a malformed version string must never fail a read.
+        // Advisory only, and NOT a compatibility gate: tensor_schema_version is
+        // the server package's own release tag, which says nothing about the
+        // wire. The two real gates are the health action's `protocol`
+        // (FlightSession) and the schema's `chunk_wire_protocol`
+        // (Imglib2TensorFactory). A malformed version string must never fail a read.
         try {
             java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
             if (!schemaOpt.isPresent()) {
