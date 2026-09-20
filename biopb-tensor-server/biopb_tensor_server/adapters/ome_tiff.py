@@ -298,6 +298,25 @@ _STRIP_EMPTY_BINDATA = re.compile(
 )
 
 
+def _strip_mask_bindata_payloads(ome_xml: str) -> str:
+    """Redact inline ``Mask/BinData`` bytes while retaining mask geometry.
+
+    ``Length=0`` keeps the element valid for ome-types if metadata is read
+    after registration; removing the element entirely makes ome-types discard
+    the containing ROI.  This is called only after the label adapters have
+    copied the decoded payloads they need for rasterization.
+    """
+    root = ET.fromstring(ome_xml)
+    for mask in root.iter():
+        if mask.tag.rsplit("}", 1)[-1] != "Mask":
+            continue
+        for child in mask:
+            if child.tag.rsplit("}", 1)[-1] == "BinData":
+                child.text = None
+                child.set("Length", "0")
+    return ET.tostring(root, encoding="unicode")
+
+
 def _b64_encode_mask_bindata(ome: Any) -> None:
     """Base64-encode every ``<Mask>``'s ``bin_data.value`` in place.
 
@@ -488,6 +507,11 @@ class OmeTiffAdapter(TensorAdapter):
         # calls the former directly; the latter is label_sets' one-time call).
         self._parsed_metadata: Optional[dict] = None
         self._parsed_metadata_probed = False
+        # Set only after get_embedded_labels has handed every usable bitmap to
+        # its RasterizedMaskAdapter.  release_registration_cache may also run
+        # on an adapter that has never entered label discovery, in which case
+        # its metadata must remain complete for that later discovery.
+        self._mask_payloads_transferred = False
 
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -728,6 +752,7 @@ class OmeTiffAdapter(TensorAdapter):
             tensors_by_field([(d.array_id, list(d.dim_labels)) for d in descriptors]),
         )
         if not by_image:
+            self._mask_payloads_transferred = True
             return {}
         sets: Dict[str, TensorAdapter] = {}
         for desc in descriptors:
@@ -747,6 +772,7 @@ class OmeTiffAdapter(TensorAdapter):
                 parent_array_id=desc.array_id,
                 content_version=self.content_version,
             )
+        self._mask_payloads_transferred = True
         return sets
 
     def _reduced_ome_xml_cached(self) -> Optional[str]:
@@ -834,15 +860,29 @@ class OmeTiffAdapter(TensorAdapter):
         # inherits either (raw, unsettled) and gets cascaded below, or (no raw,
         # settled) and needs nothing.
         reduced = self._reduced_ome_xml_cached()
+        if reduced is not None and self._mask_payloads_transferred:
+            # The label adapters have already copied the decoded mask bytes.
+            # Retaining either the base64 XML or the parsed dict would duplicate
+            # a potentially very large payload for the source lifetime.
+            reduced = _strip_mask_bindata_payloads(reduced)
+            self._reduced_ome_xml = reduced
+            self._parsed_metadata = None
+            self._parsed_metadata_probed = False
         if self._raw_ome_xml is not None:
             self._raw_ome_xml = None
             self._raw_ome_xml_released = True
         for adapter in list(self._tensor_adapters.values()):
             if adapter is self:
                 continue
-            if reduced is not None and not adapter._reduced_ome_xml_probed:
+            if reduced is not None and (
+                self._mask_payloads_transferred or not adapter._reduced_ome_xml_probed
+            ):
                 adapter._reduced_ome_xml = reduced
                 adapter._reduced_ome_xml_probed = True
+            if self._mask_payloads_transferred:
+                adapter._parsed_metadata = None
+                adapter._parsed_metadata_probed = False
+                adapter._mask_payloads_transferred = True
             adapter.release_registration_cache()
 
     def __del__(self):

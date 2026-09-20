@@ -130,6 +130,22 @@ class TestRasterizedMaskAdapter:
             out = adapter.get_data(ChunkBounds(start=[0, 0], stop=[4, 4]))
             assert (out > 0).astype(np.uint8).tolist() == bmp.tolist()
 
+    @pytest.mark.parametrize("compression", ("zlib", "bzip2"))
+    def test_corrupt_compressed_mask_is_skipped_not_fatal(self, compression):
+        bad = _mask(0, 0, 2, 2, np.ones((2, 2)), compression=compression)
+        bad["bin_data"]["value"] = base64.b64encode(b"not a valid stream").decode(
+            "ascii"
+        )
+        good = _mask(2, 2, 2, 2, np.ones((2, 2)))
+        adapter = self._adapter(self._shapes(_meta({"Image:0": [bad, good]})))
+
+        out = adapter.get_data(ChunkBounds(start=[0, 0], stop=[4, 4]))
+
+        assert (out[:2, :2] == 0).all()
+        assert (out[2:, 2:] == 2).all()
+        # The failed decode is memoized; another intersecting chunk stays safe.
+        assert (adapter.get_data(ChunkBounds(start=[0, 0], stop=[2, 2])) == 0).all()
+
     def test_a_partial_chunk_reads_only_its_own_region(self):
         bmp = np.ones((4, 4))
         meta = _meta({"Image:0": [_mask(1, 1, 2, 2, bmp)]})  # bbox = [1,3) x [1,3)
@@ -307,6 +323,26 @@ class TestFastMetadataRealBitmap:
 
         # And through the base SourceAdapter machinery: extent must match.
         assert "Image:0/labels/@ome" in adapter.label_sets
+
+        adapter.release_registration_cache()
+
+        # The label adapter keeps the decoded bitmap, while the source retains
+        # neither the base64 payload nor its parsed duplicate.
+        assert base64.b64encode(raw).decode("ascii") not in adapter._reduced_ome_xml
+        assert adapter._parsed_metadata is None
+        assert adapter._parsed_metadata_probed is False
+        for scene in adapter._tensor_adapters.values():
+            assert base64.b64encode(raw).decode("ascii") not in scene._reduced_ome_xml
+        cached_label_set = adapter.label_sets["Image:0/labels/@ome"]
+        assert (
+            cached_label_set.get_data(
+                ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
+            )[tuple([0] * (out.ndim - 2) + [2, 2])]
+            == 1
+        )
+        metadata_after_release = adapter.get_metadata()
+        mask_after_release = metadata_after_release["rois"][0]["union"]["masks"][0]
+        assert mask_after_release["bin_data"]["value"] == ""
 
     def test_get_metadata_parses_the_ome_xml_only_once(self, tmp_path, monkeypatch):
         """get_embedded_labels() calls get_metadata() internally, and so does
