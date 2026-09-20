@@ -98,13 +98,16 @@ plus what the loader knows and the file cannot:
 1. an entry whose file does not exist gets the suffix `(missing)`; one that
    shadows a shipped doc gets `(local copy)`;
 2. a tail, `Unindexed (N): id, id, …`, listing docs with neither an entry nor
-   an `ignored:` mention — at most the first 10 ids, then the count;
-3. a `## Kernel plugins` section of derived, read-only lines, one per plugin
-   the loader will bind, from the module docstring (today's plugin rows; off
-   with `services.docs_index_plugins`). They change with installs, so they are
-   never stored in the file.
+   an `ignored:` mention — at most the first 10 ids, then the count.
 
-The agent cleans up 1 and 2 by editing the file. 3 is never editable.
+The agent cleans up both by editing the file.
+
+**Kernel plugins are not docs.** They are modules already bound in the
+namespace: `server_status` lists which ones loaded and `inspect_object` reads
+their docstrings, so the store does not mirror them. Today's plugin rows in
+`list_skills` go with it. One thing to watch in the acceptance run (§9): those
+rows were added because two ablated bench runs saw the bare plugin name in
+the status output and never followed it up.
 
 **Bounds.** At most **200 entries**; the write tool refuses an index over that
 with a message saying so, which forces condensing rather than silent growth.
@@ -229,9 +232,9 @@ Code and config:
 
 - `_skills.py`, `_skills_layout.py`, `_resources.py`'s constants,
   `list_skills`, `skill://`, `guide://` are removed; `_docs.py` replaces them;
-- `services.skills_enabled / skills_local_dir / skills_index_plugins` become
-  `docs_enabled / docs_local_dir / docs_index_plugins`; the old keys are read
-  as aliases for one release;
+- `services.skills_enabled / skills_local_dir` become
+  `docs_enabled / docs_local_dir`, the old keys read as aliases for one
+  release; `skills_index_plugins` is dropped with the plugin rows;
 - `biopb._locations.mcp_skill_dir` gains a `mcp_docs_dir` sibling;
 - `start_kernel` → `start_biopb` with the alias (#894).
 
