@@ -185,8 +185,8 @@ turns over.
    plane selected; on [[viewer]] it is the ortho view.
 
 7. **Hand back the aligned stack and how each section got its place.** Upload it
-   if it is worth keeping — [[data]] covers upload, and pixel spacing does
-   not ride along by default.
+   if it is worth keeping — [[upload]] covers it, including the pixel spacing,
+   which does not ride along by default.
 
    ```python
    print({"ref_channel": REF_CHANNEL, "min_inliers": MIN_INLIERS,

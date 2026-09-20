@@ -141,5 +141,6 @@ check = viewer.tensor(layer_name)   # the layer's pixels, as a plain dask array
 ```
 
 Uploading is also what makes a result *shareable* — an array in the kernel is
-visible to nothing else and dies with it. [[client]] has the upload
-arguments, including the ones that carry axis labels and pixel size (trap 6).
+visible to nothing else and dies with it. [[upload]] has the rest — the other
+two kinds, the naming rules, and the arguments that carry axis labels and pixel
+size (trap 6).

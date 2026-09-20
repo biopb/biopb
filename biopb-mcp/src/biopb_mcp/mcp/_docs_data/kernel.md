@@ -34,7 +34,8 @@ serves ([[web-viewer]]). `server_status` says which. Do not assume a window exis
   mouse events.
 - The `client` represents a `TensorFlightClient` instance. Data from the client are
   lazy, thread-safe, picklable dask arrays. See [[client]] for the full set of client
-  operations, including browsing sources, reading tensors, and uploading results; and see
+  operations, including browsing sources and reading tensors ([[upload]] is the write
+  side); and see
   [[data]] for the traps when moving pixels between the server, a layer, and your own
   variables. **Read a layer's pixels with `viewer.tensor(layer)`** — `layer.data` is
   packaged for the renderer, and handing a multiscale one to numpy silently computes on

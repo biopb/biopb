@@ -72,26 +72,32 @@ A camera is all-or-nothing on `tg` **and** `zm`: a target without a zoom frames
 the volume somewhere nobody chose, so it is ignored. Send neither and the view
 opens fitted, which is usually what you want.
 
-## It shows the catalog, and only the catalog
+## Showing something you made
 
 This is the difference that changes how you work. A napari layer is this
-session's own memory; the web viewer reads the tensor server, so **an array you
-computed is invisible to it until you upload one**. See [[client]]:
+session's own memory; the web viewer reads the tensor server, so anything you
+want on screen has to be **on the server** first. All three kinds can be, and
+each has a parameter that draws it:
+
+| what you have | show it with |
+|---|---|
+| an image, or any array uploaded as a tensor | `id=<array_id>` |
+| a segmentation uploaded as a label set | `id=<image>&lb=<set array_id>` |
+| points, boxes, polygons written with `put_rois` | `rs=<set_name>` |
 
 ```python
-desc = client.create_tensor("cache:my_result", arr)
-client.upload_array(desc, arr)
-url = f"{control_base_url()}/viewer?id={desc.array_id}"
+desc = client.create_tensor(f"{image_id}/labels/nuclei", labels)
+client.upload_array(desc, labels)
+url = f"{control_base_url()}/viewer?id={image_id}&lb={desc.array_id}&lo=0.5"
 ```
 
-`cache:` is the right destination for something the user is only going to look
-at. A segmentation is better uploaded as a *label set* of the image it came
-from, which the viewer can then draw over the original with `lb=` — one link
-instead of two, and the two stay registered.
+[[upload]] is how each one gets there, and which to pick — a segmentation
+belongs in a label set rather than its own tensor, so that one link shows both
+and they stay registered.
 
-Uploading costs a round trip over the data the user is about to look at, so for
-a quick intermediate on a session that *does* have a napari window, the window
-is cheaper. Where there is no window, this is the only route.
+Uploading costs a round trip over the data the user is about to look at, so on a
+session that *does* have a napari window that window is cheaper for a quick
+intermediate. Where there is no window, this is the route.
 
 ## Access
 
@@ -117,12 +123,12 @@ Three things to get right:
 - **Looking is not showing.** Your capture is yours. The user still needs the
   link, and a visual check is not satisfied by a screenshot they never saw.
 
-## What it does not do
+## What it will not do
 
-- **No 2-D annotation drawing from here.** ROIs are shown (`rs`), and are
-  created through `client`, not by this page on your behalf.
-- **Nothing in-memory.** No array, mask or overlay that is not a tensor on the
-  server can be displayed.
+The page **displays; it does not author**. Nothing on it draws an ROI or edits a
+label on your behalf — annotations are written with `client.put_rois` and read
+back with `rs`. And it shows nothing that is not on the server, which is a step
+(above) rather than a wall.
 
 ## Related
 

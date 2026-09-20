@@ -184,8 +184,8 @@ that was not there.
    is what is subtracted. Apply the **same** `flat` to every frame in the group —
    re-fitting per tile removes the very differences between tiles that a mosaic
    needs preserved. Then upload the corrected stack if it is worth keeping and
-   print the settings that reproduce it; [[data]] covers upload and pixel
-   spacing, which does not ride along by default.
+   print the settings that reproduce it; [[upload]] covers it, including the
+   pixel spacing, which does not ride along by default.
 
    ```python
    print({"darkfield": DARKFIELD, "keep": KEEP, "n_tiles": len(TILES),

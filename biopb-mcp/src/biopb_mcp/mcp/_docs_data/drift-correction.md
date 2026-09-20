@@ -114,8 +114,8 @@ chromatic error that was not there.
    are extrapolated. A measurement over the full frame silently includes them.
 
 7. **Publish the corrected movie and the settings.** Upload it if it is worth
-   keeping, and print the dict that reproduces it — [[data]] covers upload
-   and pixel size, which does not ride along by default.
+   keeping, and print the dict that reproduces it — [[upload]] covers it,
+   including the pixel size, which does not ride along by default.
 
    ```python
    print({"mode": MODE, "reference": "previous", "ref_channel": REF_CHANNEL,

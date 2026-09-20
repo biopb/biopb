@@ -1,6 +1,6 @@
 ---
 kind: reference
-description: The `client` handle: browsing the catalog, loading tensors, uploading results.
+description: The `client` handle: browsing the catalog and loading tensors.
 ---
 
 # The `client` Handle: Catalog and Tensor Data
@@ -123,13 +123,14 @@ arr = client.get_tensor("source_id/t1")
 ```
 
 ## Upload to Server
-Declare the tensor, then fill it. Use `"cache:my_result"` as destination for
-ephemeral results that don't need to be persisted long-term.
+
+The write side is [[upload]] — tensors, label sets and ROI annotations, and what
+each refuses. The short form:
+
 ```python
-desc = client.create_tensor("cache:my_result", arr)   # shape, dtype, chunks from arr
+desc = client.create_tensor("cache:my_result", arr)
 client.upload_array(desc, arr)
-array_id = desc.array_id
 ```
-A name is taken while its source exists: creating under a name that already
-exists is refused. Re-running a cell needs a new name, or `"cache:"` for a
-server-minted one.
+
+A name is taken while its source exists, so re-running a cell needs a new one or
+a bare `"cache:"` for a server-minted name.
