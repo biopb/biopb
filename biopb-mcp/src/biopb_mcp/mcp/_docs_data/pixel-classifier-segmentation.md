@@ -51,7 +51,7 @@ scribbles on one field. The output is a class per pixel.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`; [[kernel]] covers a gap. `scikit-learn` ships with the
+   `server_status`; [[requirements]] covers a gap. `scikit-learn` ships with the
    server and is importable in the kernel.
 
 2. **Confirm the inputs** *(blocking)*. Three facts, none of them in the pixels:

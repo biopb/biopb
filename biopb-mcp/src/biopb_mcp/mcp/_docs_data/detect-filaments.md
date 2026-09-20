@@ -53,7 +53,7 @@ their width, rather than a foreground mask.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`; [[kernel]] covers a gap.
+   `server_status`; [[requirements]] covers a gap.
 
 2. **Confirm the inputs** *(blocking)*. Two facts and one judgement:
 

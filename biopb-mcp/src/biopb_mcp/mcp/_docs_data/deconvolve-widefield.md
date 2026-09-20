@@ -49,7 +49,7 @@ measuring shape, size or resolution on it.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`; [[kernel]] covers a gap.
+   `server_status`; [[requirements]] covers a gap.
 
 2. **Confirm the inputs** *(blocking)*. Three things, and only the first is
    about pixels:

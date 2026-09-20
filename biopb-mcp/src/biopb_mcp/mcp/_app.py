@@ -95,8 +95,14 @@ _BASE_INSTRUCTIONS = (
 
 # Appended to _BASE_INSTRUCTIONS only when procedure docs are served
 # (`services.docs_enabled`, on by default), so an install that switches them off
-# is not told to write one.
+# is told neither to follow one nor to write one.
 _AUTHORING_INSTRUCTIONS = (
+    "A procedure doc opens with a Requirements line; resolve it against "
+    "`server_status` before starting, and treat a gap as something to name and "
+    'work around rather than a reason to stop (`read_doc("requirements")`). '
+    "Never substitute silently -- the user cannot judge a result whose method "
+    "they were not told changed.\n"
+    "\n"
     "After accomplishing a task worth repeating, ask the user whether it should "
     "become a doc, and write it with `write_doc`.\n"
     "\n"

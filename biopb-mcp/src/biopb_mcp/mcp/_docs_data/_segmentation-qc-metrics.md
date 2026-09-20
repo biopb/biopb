@@ -68,7 +68,7 @@ measurement made from it.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status` — [[kernel]] covers what to do about a gap.
+   `server_status` — [[requirements]] covers a gap.
 
    `GT` and `PRED` come from either `viewer` or `client`. We need at least one of
    the two. `plugin:segmentation_qc` is a kernel plugin, so `## Kernel plugins`

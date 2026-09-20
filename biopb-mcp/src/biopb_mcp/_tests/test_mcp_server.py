@@ -163,12 +163,12 @@ class TestTheReferenceDocs:
         assert "biopb-mcp" in content
         assert "execute_code" in content
 
-    def test_the_kernel_doc_routes_every_requirement_to_a_status_section(self):
-        # A procedure's Requirements line is resolved here, so every kind of
-        # thing it can name must name the section that answers it -- one with no
-        # route is one the agent will guess at.
-        doc = call_tool(_server.read_doc, "kernel")
-        section = doc[doc.index("## What a procedure needs") :]
+    def test_the_requirements_doc_routes_every_kind_to_a_status_section(self):
+        # A procedure's Requirements line is resolved against this, so every
+        # kind of thing it can name must name the section that answers it --
+        # one with no route is one the agent will guess at.
+        doc = call_tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## Where each one is answered") :]
         for where in (
             "## Viewer",
             "## Tensor Server",
@@ -178,12 +178,12 @@ class TestTheReferenceDocs:
         ):
             assert where in section
 
-    def test_the_kernel_doc_gives_a_missing_package_three_options(self):
+    def test_a_missing_package_gets_three_options(self):
         # The choice is the user's, so all three have to be on the table: the
         # agent installing is one option among them, not the default, and the
         # degraded path is the one that survives a managed-env upgrade.
-        doc = call_tool(_server.read_doc, "kernel")
-        section = doc[doc.index("### When something is missing") :]
+        doc = call_tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## When something is missing") :]
         assert "They install it" in section
         assert "You install it for them" in section
         assert "only after they say yes" in section
@@ -196,17 +196,17 @@ class TestTheReferenceDocs:
         # The durability note belongs to the two options that install something.
         # Indented under option 3 -- the one where nothing is installed -- it reads
         # as a non-sequitur, so pin it as its own unindented paragraph.
-        doc = call_tool(_server.read_doc, "kernel")
-        section = doc[doc.index("### When something is missing") :]
+        doc = call_tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## When something is missing") :]
         (line,) = [ln for ln in section.splitlines() if "extra-packages.txt" in ln]
         assert not line.startswith(" "), line
 
-    def test_the_kernel_doc_separates_the_three_missing_plugin_causes(self):
+    def test_the_three_missing_plugin_causes_stay_separate(self):
         # Seeding cannot fix an install that predates the plugin, and a file that
         # failed to load is not a file that is absent -- different fixes, so the
         # doc must not collapse them into "run the seeder".
-        doc = call_tool(_server.read_doc, "kernel")
-        section = doc[doc.index("### When something is missing") :]
+        doc = call_tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## When something is missing") :]
         assert "predates it" in section
         assert "failed to load" in section
         assert "biopb-mcp-seed-plugins" in section

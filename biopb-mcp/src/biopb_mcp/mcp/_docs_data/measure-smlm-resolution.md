@@ -57,7 +57,7 @@ may claim for it.
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
    `server_status`; `## Kernel plugins` answers for `plugin:image_resolution`,
-   and [[kernel]] covers a gap. Without the plugin, FRC is perhaps thirty
+   and [[requirements]] covers a gap. Without the plugin, FRC is perhaps thirty
    lines to write by hand and the *split* below is still the part that decides
    the answer — write the split correctly and a hand-rolled FRC is fine. Without
    `dask` everything still works serially; step 3 says what that costs.

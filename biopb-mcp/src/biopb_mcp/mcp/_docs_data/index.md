@@ -8,6 +8,7 @@ one you do not want.
 ## Read first
 
 - kernel: the namespace, kernel plugins, long-running jobs, where a compute runs
+- requirements: check what a procedure needs, and what to do when a piece is missing
 - tensor-server-client: browse the catalog, load a tensor, and what lazy costs
 - upload: put a result on the server — tensors, label sets, ROI annotations
 - web-viewer: show data in the browser — needs no window; send the link, or open it yourself

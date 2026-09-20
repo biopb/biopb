@@ -46,7 +46,7 @@ chromatic error that was not there.
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
    `server_status`, and `import pystackreg` for the `pkg:` token —
-   [[kernel]] covers what to do about a gap.
+   [[requirements]] covers a gap.
 
    Without `pystackreg`, the degraded path is `skimage.registration.
    phase_cross_correlation`, which is translation-only and less precise but needs

@@ -50,7 +50,7 @@ between cells, fields or conditions.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`; [[kernel]] covers a gap.
+   `server_status`; [[requirements]] covers a gap.
 
 2. **Confirm the inputs** *(blocking)*. This is the step the result turns on,
    and none of these four facts is in the pixels:

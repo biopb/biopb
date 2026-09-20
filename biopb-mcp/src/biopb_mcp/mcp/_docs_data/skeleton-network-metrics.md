@@ -48,7 +48,7 @@ whole measurement rests on.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`; [[kernel]] covers what to do about a gap. `skan` is
+   `server_status`; [[requirements]] covers a gap. `skan` is
    the branch-graph library everything below is written against and it installs
    into a biopb environment without moving anything else.
 

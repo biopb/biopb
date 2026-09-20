@@ -50,7 +50,7 @@ turns over.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status` — [[kernel]] covers what to do about a gap. Everything
+   `server_status` — [[requirements]] covers a gap. Everything
    below is `skimage.feature`, `skimage.measure` and `skimage.transform`, all
    core, so there is nothing to install and no degraded path to describe.
 

@@ -49,7 +49,7 @@ known positions, nominal placement left an rms of **10 px** (individual tiles
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status` — [[kernel]] covers what to do about a gap. Everything
+   `server_status` — [[requirements]] covers a gap. Everything
    below is numpy, `scipy.sparse.csgraph` and
    `skimage.registration.phase_cross_correlation`, all core, so there is no
    package to install and no degraded path to fall back to.
