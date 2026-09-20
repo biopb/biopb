@@ -245,7 +245,8 @@ durable planes and the web origin in
 - **The skills catalog:** `biopb-mcp/docs/skills.md` — what a skill is, how it
   ships, and how it is checked: structure, retrieval and contract tests in CI;
   simulated-user interaction runs against a real session locally, as a benchmark
-  rather than a gate.
+  rather than a gate. Proposed replacement: `biopb-mcp/docs/knowledge.md` —
+  one flat doc store, an agent-edited index, two tools.
 - **Workflow verification:** `docs/verification-scratch-kernel.md` — proposed:
   why `verify_workflow` should run in a scratch *process* rather than a scratch
   namespace, what a second kernel costs, and the one-slot admission rule that

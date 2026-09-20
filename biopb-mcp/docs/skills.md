@@ -1,5 +1,9 @@
 # Skills — curated agent workflows, and how they are tested
 
+> **Superseded (proposed):** [`knowledge.md`](knowledge.md) replaces Part I
+> with a flat doc store and an agent-edited index. Part II's contract layer
+> survives as scoped there (§7). This file stays current until that lands.
+
 **Component:** `biopb-mcp` — `mcp/_skills.py` (runtime), `mcp/_skills_data/*.md`
 (the skills), `_tests/skills/` (the authoring gate), `_tests/bench/` (the
 benchmark),
