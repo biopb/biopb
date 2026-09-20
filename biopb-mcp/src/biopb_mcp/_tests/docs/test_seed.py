@@ -9,7 +9,9 @@ where it is an authoring bug the author's own PR can catch.
 
 from __future__ import annotations
 
+import importlib.util
 import re
+from pathlib import Path
 
 from biopb_mcp.mcp import _docs
 
@@ -158,3 +160,35 @@ def test_a_banked_doc_is_not_in_the_tail(shipped_docs):
     listed = set(_docs.shipped_ids())
     banked = {doc_id_of(p) for p in shipped_docs if p.name.startswith("_")}
     assert not (listed & banked)
+
+
+# `.github/scripts/doc_contracts.py` runs before any env exists, so it cannot
+# import this package and applies the banked-name rule itself. That is a second
+# copy of a rule the runtime also holds (biopb/biopb#726, #727, against the
+# module the old catalog shared instead) -- three lines rather than a module,
+# but still two places that can disagree about which docs a gate may speak for.
+_DRIVER = (
+    Path(__file__).resolve().parents[5] / ".github" / "scripts" / "doc_contracts.py"
+)
+
+
+def _load_driver():
+    spec = importlib.util.spec_from_file_location("doc_contracts", _DRIVER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_ci_gate_walks_the_docs_the_runtime_offers():
+    """Otherwise a gate proves packages for a doc no session is offered, or
+    skips one it is -- the failure the shared-module pin existed to stop, in the
+    shape the redesign left it."""
+    assert _DRIVER.exists(), f"{_DRIVER} is missing; the gate has nothing to run"
+    gated = {doc_id_of(p) for p in _load_driver().doc_files()}
+    assert gated, "the gate walks nothing, so this would compare two empty sets"
+    offered = {doc_id_of(p) for p in offered_files()}
+    assert gated == offered, (
+        "the CI package gate and the runtime disagree about which docs are "
+        f"offered:\n  only the gate: {sorted(gated - offered)}\n"
+        f"  only the runtime: {sorted(offered - gated)}"
+    )
