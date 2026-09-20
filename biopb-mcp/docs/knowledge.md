@@ -105,7 +105,9 @@ The agent cleans up both by editing the file.
 **Kernel plugins are not docs.** They are modules already bound in the
 namespace: `server_status` lists which ones loaded and `inspect_object` reads
 their docstrings, so the store does not mirror them. Today's plugin rows in
-`list_skills` go with it. One thing to watch in the acceptance run (§9): those
+`list_skills` go with it. Plugins belong to the planned algorithm-plane
+revamp, where the control manages both the `biopb.image` services and the
+local Python plugin modules; that plan is not written up yet. One thing to watch in the acceptance run (§9): those
 rows were added because two ablated bench runs saw the bare plugin name in
 the status output and never followed it up.
 
