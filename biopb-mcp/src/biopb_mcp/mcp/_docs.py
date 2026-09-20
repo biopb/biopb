@@ -38,6 +38,8 @@ from datetime import date
 from importlib import resources
 from pathlib import Path
 
+from biopb._config_io import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 # The shipped seed, as package data (see pyproject [tool.setuptools.package-data]).
@@ -441,8 +443,7 @@ def index_text() -> str:
     path = _local_path(INDEX_ID)
     if path is not None:
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(seed, encoding="utf-8")
+            atomic_write_text(path, seed, raise_on_error=True)
         except OSError:
             logger.debug("docs: could not seed the local index", exc_info=True)
     return seed
@@ -637,8 +638,7 @@ def write_doc(
             )
 
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(after, encoding="utf-8")
+        atomic_write_text(path, after, raise_on_error=True)
     except OSError as exc:
         return f"Could not write '{doc_id}': {exc}"
 
@@ -667,8 +667,7 @@ def _file_index_entry(doc_id: str) -> str:
     if path is None:
         return ""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(after, encoding="utf-8")
+        atomic_write_text(path, after, raise_on_error=True)
     except OSError:
         logger.debug("docs: could not file %s in the index", doc_id, exc_info=True)
         return ""

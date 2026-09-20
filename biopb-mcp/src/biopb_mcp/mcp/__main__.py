@@ -436,9 +436,6 @@ def _serve_http(config, port, view=False):
 
     _app.set_kernel_host(host)
     _app.set_promote_after(get_setting(config, "kernel.promote_after"))
-    # Mirror the docs switch into the server process, so the handshake and
-    # server_status agree with what read_doc will actually return.
-    _app.set_docs_enabled(get_setting(config, "services.docs_enabled"))
 
     # Tell server_status where this process's log lives, so an agent can find it.
     #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the

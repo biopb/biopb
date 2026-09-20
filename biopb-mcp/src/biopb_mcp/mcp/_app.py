@@ -31,13 +31,6 @@ _kernel_host: KernelHost | None = None
 # instead of an inline result (set from config by the launcher).
 _promote_after: float = 10.0
 
-# Whether the knowledge store's procedure docs are served (mirrors
-# `services.docs_enabled`, on by default). Set by the launcher
-# (set_docs_enabled); the store reads the same setting, and the handshake drops
-# the authoring directive with it. test_mcp_server pins this literal to the
-# config default so the two can't drift.
-_docs_enabled: bool = True
-
 # This process's logfile path (set by the launcher), surfaced by server_status so
 # an agent can find its own log. None when output goes to a terminal (foreground
 # `--transport http` / `biopb mcp view`) rather than a file.
@@ -153,29 +146,25 @@ def build_transport_security(
 mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
 
 # FastMCP built the low-level server with instructions=None at import; seed the
-# always-on base guidance now so it is present even if set_docs_enabled is never
-# called (e.g. tests, or a standalone import). No index here: composing one at
-# import would read the config tree before the launcher has configured it.
+# always-on base guidance now so it is present even if no session is ever
+# initialized (e.g. tests, or a standalone import). No index here: composing one
+# at import would read the config tree before the launcher has configured it.
 mcp._mcp_server.instructions = _BASE_INSTRUCTIONS
 
 
-def _recompose_per_session(build=mcp._mcp_server.create_initialization_options):
-    """Recompose ``instructions`` each time a session is initialized.
-
-    The index is a file the agent edits, and a long-lived HTTP server outlives
-    many sessions, so composing once at launch would hand later sessions an
-    index that has moved. ``create_initialization_options`` is the one call the
-    SDK makes per session that reads ``instructions``.
-    """
-
-    def create_initialization_options(*args, **kwargs):
-        _recompose_instructions()
-        return build(*args, **kwargs)
-
-    return create_initialization_options
+# The index is a file the agent edits, and a long-lived HTTP server outlives
+# many sessions, so composing once at launch would hand later sessions an index
+# that has moved. `create_initialization_options` is the one call the SDK makes
+# per session that reads `instructions`.
+_create_initialization_options = mcp._mcp_server.create_initialization_options
 
 
-mcp._mcp_server.create_initialization_options = _recompose_per_session()
+def _recompose_per_session(*args, **kwargs):
+    _recompose_instructions()
+    return _create_initialization_options(*args, **kwargs)
+
+
+mcp._mcp_server.create_initialization_options = _recompose_per_session
 
 
 def set_kernel_host(host: KernelHost):
@@ -212,15 +201,19 @@ def _compose_instructions() -> str:
     so switching a dimension back off cannot leave a stale fragment behind.
     """
     parts = [_BASE_INSTRUCTIONS]
+    # Procedures on by default: the store's own fail-open default, kept here too
+    # so a render_index failure below can't also swallow the authoring directive.
+    procedures_on = True
     try:
-        from ._docs import render_index
+        from ._docs import procedures_enabled, render_index
 
         parts.append(f"{_INDEX_HEADER}\n\n{render_index()}")
+        procedures_on = procedures_enabled()
     except Exception:  # pragma: no cover - the store is fail-open everywhere else
         logger.debug(
             "docs: could not render the index for the handshake", exc_info=True
         )
-    if _docs_enabled:
+    if procedures_on:
         parts.append(_AUTHORING_INSTRUCTIONS)
     return "\n\n".join(parts)
 
@@ -228,17 +221,6 @@ def _compose_instructions() -> str:
 def _recompose_instructions():
     """Refresh the ``instructions`` the low-level Server hands out."""
     mcp._mcp_server.instructions = _compose_instructions()
-
-
-def set_docs_enabled(enabled: bool):
-    """Serve (or withhold) the knowledge store's procedure docs.
-
-    Mirrors ``services.docs_enabled`` into this process so the handshake and
-    ``server_status`` agree with what ``read_doc`` will actually return.
-    """
-    global _docs_enabled
-    _docs_enabled = bool(enabled)
-    _recompose_instructions()
 
 
 def _require_kernel_host():

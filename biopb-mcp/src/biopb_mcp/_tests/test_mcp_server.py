@@ -16,9 +16,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp._tests.conftest import call_tool as _tool
-from biopb_mcp.mcp import _app, _kernel_rpc, _server, _writers
+from biopb_mcp.mcp import _app, _docs, _kernel_rpc, _server, _writers
 
-from .conftest import call_tool
+
+def _set_docs_enabled(monkeypatch, enabled: bool) -> None:
+    """Force ``_docs.procedures_enabled()`` and recompose the handshake."""
+    monkeypatch.setattr(_docs, "procedures_enabled", lambda: enabled)
+    _app._recompose_instructions()
 
 
 def _result(stdout="", result_text="", error_text="", status="ok"):
@@ -114,12 +118,10 @@ def _snapshot(
 def reset_server_state():
     old_host = _app._kernel_host
     old_promote = _app._promote_after
-    old_docs = _app._docs_enabled
     old_instructions = _app.mcp._mcp_server.instructions
     yield
     _app._kernel_host = old_host
     _app._promote_after = old_promote
-    _app._docs_enabled = old_docs
     _app.mcp._mcp_server.instructions = old_instructions
     # The mirrored one-agent claim is process state like the rest: a test that
     # claims the kernel must not decide whether the next one is refused.
@@ -159,7 +161,7 @@ def server_with_host(mock_kernel_host):
 
 class TestTheReferenceDocs:
     def test_the_kernel_doc_reads_back(self):
-        content = call_tool(_server.read_doc, "kernel")
+        content = _tool(_server.read_doc, "kernel")
         assert "biopb-mcp" in content
         assert "execute_code" in content
 
@@ -167,7 +169,7 @@ class TestTheReferenceDocs:
         # A procedure's Requirements line is resolved against this, so every
         # kind of thing it can name must name the section that answers it --
         # one with no route is one the agent will guess at.
-        doc = call_tool(_server.read_doc, "requirements")
+        doc = _tool(_server.read_doc, "requirements")
         section = doc[doc.index("## Where each one is answered") :]
         for where in (
             "## Viewer",
@@ -182,7 +184,7 @@ class TestTheReferenceDocs:
         # The choice is the user's, so all three have to be on the table: the
         # agent installing is one option among them, not the default, and the
         # degraded path is the one that survives a managed-env upgrade.
-        doc = call_tool(_server.read_doc, "requirements")
+        doc = _tool(_server.read_doc, "requirements")
         section = doc[doc.index("## When something is missing") :]
         assert "They install it" in section
         assert "You install it for them" in section
@@ -196,7 +198,7 @@ class TestTheReferenceDocs:
         # The durability note belongs to the two options that install something.
         # Indented under option 3 -- the one where nothing is installed -- it reads
         # as a non-sequitur, so pin it as its own unindented paragraph.
-        doc = call_tool(_server.read_doc, "requirements")
+        doc = _tool(_server.read_doc, "requirements")
         section = doc[doc.index("## When something is missing") :]
         (line,) = [ln for ln in section.splitlines() if "extra-packages.txt" in ln]
         assert not line.startswith(" "), line
@@ -205,7 +207,7 @@ class TestTheReferenceDocs:
         # Seeding cannot fix an install that predates the plugin, and a file that
         # failed to load is not a file that is absent -- different fixes, so the
         # doc must not collapse them into "run the seeder".
-        doc = call_tool(_server.read_doc, "requirements")
+        doc = _tool(_server.read_doc, "requirements")
         section = doc[doc.index("## When something is missing") :]
         assert "predates it" in section
         assert "failed to load" in section
@@ -215,7 +217,7 @@ class TestTheReferenceDocs:
         # The runtime note ("the user ran job-N") says a change happened; this
         # section is what makes that legible -- without it the agent has no model
         # of a second writer, and reads the note as noise.
-        doc = call_tool(_server.read_doc, "kernel")
+        doc = _tool(_server.read_doc, "kernel")
         section = doc[doc.index("## You are not the only writer") :]
         assert "observe" in section
         assert "poll_job" in section
@@ -229,21 +231,21 @@ class TestTheReferenceDocs:
     def test_the_kernel_doc_points_at_server_status_for_plugins(self):
         # The loader is fail-open, so "file on disk" != "plugin loaded"; the
         # report is the only place that distinction is readable.
-        content = call_tool(_server.read_doc, "kernel")
+        content = _tool(_server.read_doc, "kernel")
         assert "## Kernel plugins" in content
         assert "services.namespace_enabled" in content
         # ...and introspection remains the answer to the other question.
         assert "inspect_object" in content
 
     def test_the_viewer_doc_mentions_layers(self):
-        assert "viewer.layers" in call_tool(_server.read_doc, "napari-viewer")
+        assert "viewer.layers" in _tool(_server.read_doc, "napari-viewer")
 
     def test_the_client_doc_mentions_client(self):
-        assert "client" in call_tool(_server.read_doc, "tensor-server-client")
+        assert "client" in _tool(_server.read_doc, "tensor-server-client")
 
     def test_the_viewer_doc_absorbed_the_annotation_guide(self):
         # One handle, one doc.
-        content = call_tool(_server.read_doc, "napari-viewer")
+        content = _tool(_server.read_doc, "napari-viewer")
         assert "add_labels" in content
         assert "add_points" in content
 
@@ -331,29 +333,22 @@ class TestInstructions:
         # And does not make `viewer` the only place a result can go.
         assert "Put intermediate results back on `viewer`" not in base
 
-    def test_module_default_mirrors_config_default(self):
-        # The launcher always sets this from config, but the module literal is a
-        # restated default -- pin it, since that is how it diverged once before.
-        from biopb_mcp._config import DEFAULT_CONFIG
-
-        assert _app._docs_enabled is DEFAULT_CONFIG["services"]["docs_enabled"]
-
-    def test_the_handshake_carries_the_index(self):
+    def test_the_handshake_carries_the_index(self, monkeypatch):
         # Inlined rather than "now call read_doc('index')": every prompted hop
         # loses agents (#894).
-        _app.set_docs_enabled(True)
+        _set_docs_enabled(monkeypatch, True)
         instr = _app.mcp._mcp_server.instructions
         assert instr.startswith(_app._BASE_INSTRUCTIONS)
         assert _app._INDEX_HEADER in instr
         assert "- kernel:" in instr
 
-    def test_the_authoring_directive_is_gated_on_enable(self):
-        _app.set_docs_enabled(False)
+    def test_the_authoring_directive_is_gated_on_enable(self, monkeypatch):
+        _set_docs_enabled(monkeypatch, False)
         assert (
             "write_doc"
             not in _app.mcp._mcp_server.instructions.split(_app._INDEX_HEADER)[0]
         )
-        _app.set_docs_enabled(True)
+        _set_docs_enabled(monkeypatch, True)
         assert "write_doc" in _app.mcp._mcp_server.instructions
 
     def test_the_instructions_are_recomposed_per_session(self):
@@ -1667,14 +1662,16 @@ class TestReadingPixels:
     half -- lazy, canonical order, what it costs -- is `tensor-server-client`'s.
     """
 
-    def test_both_halves_are_listed_in_the_index_the_handshake_carries(self):
-        _app.set_docs_enabled(True)
+    def test_both_halves_are_listed_in_the_index_the_handshake_carries(
+        self, monkeypatch
+    ):
+        _set_docs_enabled(monkeypatch, True)
         instr = _app.mcp._mcp_server.instructions
         assert "- tensor-server-client:" in instr
         assert "- napari-viewer:" in instr
 
     def test_the_server_doc_names_what_a_tensor_arrives_as(self):
-        doc = call_tool(_server.read_doc, "tensor-server-client")
+        doc = _tool(_server.read_doc, "tensor-server-client")
         assert "client.get_tensor" in doc
         assert "Z, Y, X" in doc  # the canonical order the server guarantees
         assert "lazy" in doc.lower()
@@ -1685,7 +1682,7 @@ class TestReadingPixels:
         # (biopb/biopb#974). `layer.data.shape` is fine and stays -- it reports
         # level 0 on either branch; what breaks is *indexing* `.data`, which is
         # what the old form of this test got backwards (biopb/biopb#973).
-        doc = call_tool(_server.read_doc, "napari-viewer")
+        doc = _tool(_server.read_doc, "napari-viewer")
         assert "viewer.tensor(" in doc
         assert "layer.data[0] if layer.multiscale" not in doc
         # And it arrives before the layer operations that would tempt `.data`.
@@ -1697,14 +1694,14 @@ class TestReadingPixels:
         # of a MultiScaleData returns the *lowest* level -- and a doc that names
         # the wrong one sends the agent looking for an exception that never
         # comes.
-        doc = call_tool(_server.read_doc, "napari-viewer")
+        doc = _tool(_server.read_doc, "napari-viewer")
         assert "lowest" in doc
         assert "layer.data.shape` raises" not in doc
 
     def test_the_napari_doc_pairs_each_scale_with_its_array(self):
         # For interleaved colour layer.scale is one shorter than the array, so
         # the doc has to name both rather than let them be crossed.
-        doc = call_tool(_server.read_doc, "napari-viewer")
+        doc = _tool(_server.read_doc, "napari-viewer")
         assert "layer.scale" in doc
         assert "dim_labels" in doc
 
