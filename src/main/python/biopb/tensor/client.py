@@ -49,12 +49,11 @@ from biopb.tensor._session import (
     CatalogClient,
     ChunkFetcher,
     ResolveCancelled as ResolveCancelled,
-    _check_wire_protocol as _check_wire_protocol,
     _ClientState,
     _dask_from_flight_info,
     _refetch_flight_info,
     _requested_slice,
-    _split_array_id as _split_array_id,
+    _split_array_id,
 )
 from biopb.tensor._tls import resolve_tls_trust
 from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
@@ -71,6 +70,13 @@ from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 logger = logging.getLogger(__name__)
+
+# The public name for the array_id identity split, bound rather than aliased so
+# it is an export and not an unused import. Private in ``_session``; public here
+# because this module is the stable import surface a cross-package caller uses
+# (biopb-mcp), and the policy it implements is a contract -- see
+# ``_session._split_array_id``.
+split_array_id = _split_array_id
 
 
 def _normalize_location(location: str) -> str:

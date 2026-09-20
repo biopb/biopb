@@ -487,6 +487,11 @@ def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     acceptable is the caller's policy, not this function's: see
     :meth:`CatalogClient._resolve_descriptor`, which refuses it (#75), versus
     :meth:`CatalogClient.get_descriptor`, which anchors on the default.
+
+    Private here, public across the package boundary: ``client.py`` re-exports
+    it as ``split_array_id``, which is the name biopb-mcp imports. The identity
+    policy it implements is a contract, so a caller outside this package should
+    not have to reach for an underscore to honour it.
     """
     if "/" in array_id:
         return array_id.split("/", 1)[0], array_id

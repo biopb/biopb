@@ -5,11 +5,11 @@ Tests utility functions that don't require a live Flight server.
 
 import pyarrow as pa
 import pytest
+from biopb.tensor._session import _check_wire_protocol
 from biopb.tensor._wire_version import (
     TENSOR_WIRE_PROTOCOL_VERSION,
     WIRE_PROTOCOL_METADATA_KEY,
 )
-from biopb.tensor.client import _check_wire_protocol
 
 
 def _schema_with_protocol(version):
