@@ -24,7 +24,7 @@ The content itself is not the problem. The one clean ablation on record
 (sessions `20260810-172816` / `20260811-095710`, gpt-5.6-luna, 20 cases) scored
 17/3 with the catalog and 12/8 without. So the redesign changes how knowledge
 is stored, found and written, and keeps the shipped bodies as the seed.
-Re-running that pairing on the new store is the acceptance test (§9).
+Re-running that pairing on the new store is the acceptance test (§7).
 
 ## 2. The store
 
@@ -117,9 +117,10 @@ namespace: `server_status` lists which ones loaded and `inspect_object` reads
 their docstrings, so the store does not mirror them. Today's plugin rows in
 `list_skills` go with it. Plugins belong to the planned algorithm-plane
 revamp, where the control manages both the `biopb.image` services and the
-local Python plugin modules; that plan is not written up yet. One thing to watch in the acceptance run (§9): those
-rows were added because two ablated bench runs saw the bare plugin name in
-the status output and never followed it up.
+local Python plugin modules; that plan is not written up yet. One thing to
+watch in the acceptance run (§7): those rows were added because two ablated
+bench runs saw the bare plugin name in the status output and never followed
+it up.
 
 **Bounds.** At most **200 entries**; the write tool refuses an index over that
 with a message saying so, which forces condensing rather than silent growth.
@@ -280,7 +281,34 @@ Sequence: one PR for the store, the tools, the seed and the handshake, with
 the old surface still registered; a second for the deletions and the test
 rewrite; then the acceptance run.
 
-## 9. Open risks
+## 9. Extensibility: what v1 must not preclude
+
+The next class of shipped content is the engine's own design docs
+(`ARCHITECTURE.md`, `docs/*.md` across packages), so an agent can diagnose the
+engine: 43 files, ~830 KB, 18 of them over the body cap. Not in v1 — they
+need pruning first — but shipping them as forty-three index entries would
+spend a fifth of the cap, flood the upgrade tail on the release that adds
+them, and cost ~16k tokens to read the largest whole. The shape that fits is
+**collections**: a first path segment is one unit wherever the loader counts
+— one index line, one tail entry, one `ignored:` name — and
+`read_doc("internals/")` returns a derived listing (id, lines, first
+paragraph) instead of a body; docs over the cap return their heading outline,
+and `read_doc(id, section=…)` returns one section.
+
+None of that is built in v1. What v1 does so it stays additive:
+
+- ids may contain `/` and map to subdirectories in both tiers, and the seed
+  layout allows them;
+- an id ending in `/` is reserved: refused by `write_doc`, and a `- <id>/:`
+  index line is kept verbatim and counted as one entry, so a collection line
+  in a seed index parses today and means something later;
+- reconciliation, the cap and the `ignored:` line are keyed by id in one
+  place, so grouping by first segment is a change to that place alone;
+- `read_doc` keeps a single positional `id`; `section` is added, never a new
+  tool, and a long-doc outline is a change to what the body returns, not to
+  the call.
+
+## 10. Open risks
 
 1. **Whether the seed still gets read.** The ablation proved the bodies help
    under tool-then-resource delivery. Under index-in-handshake-then-`read_doc`
