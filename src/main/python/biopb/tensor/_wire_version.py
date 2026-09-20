@@ -46,12 +46,3 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   token; GetFlightInfo stamps the requested ``slice_hint`` on the
 #   FlightInfo's ``app_metadata``.
 FLIGHT_PROTOCOL_VERSION = 2
-
-# Name of the per-row column each cache segment record carries its own cache key
-# in. A cross-process contract: the server writes it (``cache/file_backend.py``)
-# and a localhost client reads it back off the mmap to verify the message at a
-# server-supplied offset is the entry it asked for. Here rather than in the
-# server package for the same reason as the keys above -- the SDK cannot import
-# ``biopb-tensor-server``, so a constant both sides need has exactly one
-# definition or it has two that nothing keeps in step.
-SEGMENT_CACHE_KEY_FIELD = "__biopb_cache_key__"

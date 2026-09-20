@@ -26,7 +26,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.adapter_base import TensorAdapter, _get_read_plan
 from biopb_tensor_server.core.chunk import (
     _CV_SENTINEL,
-    apply_semantics_epoch,
     array_id_from_chunk_id,
     cache_key_for_chunk_id,
     content_version_from_path,
@@ -37,6 +36,7 @@ from biopb_tensor_server.core.chunk import (
     encode_chunk_id,
     encode_chunk_id_with_scale,
     encode_proxy_envelope,
+    epoch_of,
     get_bounds_from_chunk_id,
     is_proxy_envelope,
     is_scaled_chunk,
@@ -263,8 +263,9 @@ class TestProxyEnvelope:
         for cv in (CV, None):
             env = encode_proxy_envelope(inner, "local/img", cv)
             assert is_proxy_envelope(env)
-            route, got_cv, got_inner = peel_proxy_envelope(env)
+            route, got_epoch, got_cv, got_inner = peel_proxy_envelope(env)
             assert route == "local/img"
+            assert got_epoch == 0
             assert got_cv == cv  # empty cv decodes back to None
             assert got_inner == inner  # inner forwarded verbatim
 
@@ -275,7 +276,20 @@ class TestProxyEnvelope:
             encode_chunk_id_with_scale("upstream/img", _bounds(), (2, 2)), b"iat:99"
         )
         env = encode_proxy_envelope(inner, "local/img", CV)
-        assert peel_proxy_envelope(env)[2] == inner
+        assert peel_proxy_envelope(env)[3] == inner
+
+    def test_the_proxy_s_own_epoch_moves_its_envelope(self, epoch):
+        """A mirror re-serves the upstream's bytes locally, so a change in what
+        they mean HERE has to re-key here (biopb/biopb#1076)."""
+        inner = encode_chunk_id("upstream/img", _bounds())
+        before = encode_proxy_envelope(inner, "local/img", CV)
+        epoch(3)
+        after = encode_proxy_envelope(inner, "local/img", CV)
+        assert after != before
+        assert peel_proxy_envelope(after)[1] == 3
+        assert peel_proxy_envelope(after)[2] == CV  # upstream's, still readable
+        assert peel_proxy_envelope(after)[3] == inner
+        assert cache_key_for_chunk_id(after) != cache_key_for_chunk_id(before)
 
     def test_discriminators_are_mutually_exclusive(self):
         legacy = encode_chunk_id("src/t", _bounds())
@@ -340,10 +354,10 @@ class TestReadPlanWiring:
         expected = mint_chunk_id(
             "src/t",
             bounds,
-            served_version=content_version,
+            content_version=content_version,
         )
         plan = _get_read_plan(
-            _base_desc(), request, (5, 5), served_version=content_version
+            _base_desc(), request, (5, 5), content_version=content_version
         )
 
         assert plan.chunk_endpoints
@@ -392,7 +406,7 @@ class TestReadPlanWiring:
 
     def test_version_wraps_every_chunk_id(self):
         plan = _get_read_plan(
-            _base_desc(), TensorDescriptor(), (5, 5), served_version=CV
+            _base_desc(), TensorDescriptor(), (5, 5), content_version=CV
         )
         assert plan.chunk_endpoints
         assert all(content_version_of(ep.chunk_id) == CV for ep in plan.chunk_endpoints)
@@ -402,10 +416,10 @@ class TestReadPlanWiring:
 
     def test_version_bump_changes_all_cache_keys(self):
         p1 = _get_read_plan(
-            _base_desc(), TensorDescriptor(), (5, 5), served_version=b"v1"
+            _base_desc(), TensorDescriptor(), (5, 5), content_version=b"v1"
         )
         p2 = _get_read_plan(
-            _base_desc(), TensorDescriptor(), (5, 5), served_version=b"v2"
+            _base_desc(), TensorDescriptor(), (5, 5), content_version=b"v2"
         )
         keys1 = {cache_key_for_chunk_id(ep.chunk_id) for ep in p1.chunk_endpoints}
         keys2 = {cache_key_for_chunk_id(ep.chunk_id) for ep in p2.chunk_endpoints}
@@ -649,33 +663,67 @@ class TestDoGetCacheHitRejectsStaleVersion:
 
 
 class TestSemanticsEpoch:
-    def test_epoch_zero_is_the_identity(self):
+    def test_epoch_zero_writes_the_pre_epoch_header(self):
         """Adopting the mechanism must not cold-start a single cache.
 
         Byte-identical ids, not merely compatible ones: anything else re-warms
         every cache in the system for a no-op change.
         """
-        for cv in (None, CV, b""):
-            assert apply_semantics_epoch(cv) == cv
+        bounds = _bounds()
+        assert mint_chunk_id("src/t", bounds) == encode_chunk_id("src/t", bounds)
+        versioned = mint_chunk_id("src/t", bounds, content_version=CV)
+        assert versioned == wrap_content_version(encode_chunk_id("src/t", bounds), CV)
+        assert versioned[1] == 1  # the pre-epoch format byte
+
+    def test_the_two_versions_are_framed_separately_not_fused(self, epoch):
+        """The point of a format byte over a value prefix: each half is
+        recoverable on its own, so a reader that wants the content signal is not
+        unpicking it from something else."""
+        epoch(7)
+        chunk_id = mint_chunk_id("src/t", _bounds(), content_version=CV)
+        assert chunk_id[1] == 2  # the epoch format byte
+        assert content_version_of(chunk_id) == CV
+        assert epoch_of(chunk_id) == 7
 
     def test_a_bump_versions_a_previously_unversioned_source(self, epoch):
         """An unstat-able source (cloud, unresolved) has no content signal of
         its own, but it caches this server's output like any other."""
+        bounds = _bounds()
+        assert epoch_of(mint_chunk_id("src/t", bounds)) == 0
         epoch(1)
-        assert apply_semantics_epoch(None) is not None
+        versioned = mint_chunk_id("src/t", bounds)
+        assert epoch_of(versioned) == 1
+        # An epoch-only header makes no claim about content.
+        assert content_version_of(versioned) is None
 
-    def test_epochs_are_distinct_and_injective(self, epoch):
-        """A version from another build must compare UNEQUAL, never pass.
+    def test_epochs_are_distinct_and_the_framing_is_injective(self, epoch):
+        """A chunk_id from another build must compare UNEQUAL, never pass.
 
-        The prefix is what keeps composed forms from colliding with the raw
-        content_versions the codebase mints -- all ASCII under a fixed prefix.
+        Framed fields rather than a value prefix, so this holds structurally
+        instead of resting on a content_version never happening to look like a
+        composed one.
         """
         seen = set()
         for value in (0, 1, 2, 11):
             epoch(value)
-            seen.add(apply_semantics_epoch(CV))
-            seen.add(apply_semantics_epoch(b""))
+            seen.add(mint_chunk_id("src/t", _bounds(), content_version=CV))
+            seen.add(mint_chunk_id("src/t", _bounds()))
         assert len(seen) == 8
+
+    def test_a_content_version_that_looks_like_an_epoch_header_is_safe(self, epoch):
+        """The case a value-level prefix could only argue about statistically.
+
+        An uploaded label set's content_version is random bytes
+        (``adapters/labels.py``), so it can look like anything -- including a
+        composed version from another build. Framing decides it.
+        """
+        adversarial = b"epoch=1;" + CV
+        plain = mint_chunk_id("src/t", _bounds(), content_version=adversarial)
+        epoch(1)
+        composed = mint_chunk_id("src/t", _bounds(), content_version=CV)
+        assert plain != composed
+        assert content_version_of(plain) == adversarial
+        assert epoch_of(plain) == 0
 
     def test_a_bump_changes_every_chunk_id_and_cache_key(self, epoch):
         def plan():
@@ -684,7 +732,7 @@ class TestSemanticsEpoch:
                 adapter.get_tensor_descriptor(),
                 TensorDescriptor(),
                 (5, 5),
-                served_version=adapter.served_version,
+                content_version=adapter.content_version,
             )
 
         before = plan()
@@ -710,7 +758,7 @@ class TestSemanticsEpoch:
         held = mint_chunk_id(
             "stub",
             _bounds(),
-            served_version=adapter.served_version,
+            content_version=adapter.content_version,
         )
         adapter.check_chunk_version(held)  # current epoch: fine
 

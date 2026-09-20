@@ -94,43 +94,81 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 _CV_SENTINEL = 0xFF  # leading byte marking a version-wrapped chunk_id
-_CV_FORMAT = 1  # wrapper layout version (after the sentinel byte)
+# Wrapper layout version (the byte after the sentinel). v1 frames a
+# content_version alone; v2 frames a serving-semantics epoch in front of it. The
+# byte is what discriminates them, so one payload can never be read as the
+# other -- see the epoch section below.
+_CV_FORMAT_CONTENT = 1
+_CV_FORMAT_EPOCH = 2
 
 
-def _version_header(content_version: bytes) -> bytes:
-    """The constant prefix that wraps a chunk_id with a content_version.
+def _version_header(content_version: Optional[bytes], epoch: int) -> bytes:
+    """The prefix that wraps a chunk_id with the versions it was minted under.
 
-    ``[0xFF sentinel][uint8 fmt][uint32 cv_len][cv bytes]``. Rebuilt per chunk by
-    :func:`mint_chunk_id` -- ~120 ns of a ~2.7 us mint, against ~2.4 us for
-    ``encode_chunk_id`` itself, so keeping one composition point is worth more
-    than hoisting it.
+    - epoch 0: ``[0xFF][1][uint32 cv_len][cv]`` -- byte-identical to the
+      pre-epoch format, so nothing re-keys until an epoch is declared.
+    - epoch > 0: ``[0xFF][2][uint32 epoch][uint32 cv_len][cv]``.
+
+    Two framed fields rather than one fused value: they answer different
+    questions (see :data:`CHUNK_SEMANTICS_EPOCH`), and a reader that wants one
+    must not have to unpick it from the other.
     """
-    return (
-        struct.pack(">BBI", _CV_SENTINEL, _CV_FORMAT, len(content_version))
-        + content_version
-    )
+    cv = content_version or b""
+    if epoch == 0:
+        return struct.pack(">BBI", _CV_SENTINEL, _CV_FORMAT_CONTENT, len(cv)) + cv
+    return struct.pack(">BBII", _CV_SENTINEL, _CV_FORMAT_EPOCH, epoch, len(cv)) + cv
 
 
-def wrap_content_version(inner_chunk_id: bytes, content_version: bytes) -> bytes:
-    """Prepend a content_version header to a legacy (inner) chunk_id."""
-    return _version_header(content_version) + inner_chunk_id
+def wrap_content_version(
+    inner_chunk_id: bytes, content_version: Optional[bytes]
+) -> bytes:
+    """Prepend a version header, under the epoch this server currently serves."""
+    return _version_header(content_version, current_epoch()) + inner_chunk_id
 
 
-def _split_version(chunk_id: bytes) -> Tuple[Optional[bytes], bytes]:
-    """Split a chunk_id into ``(content_version | None, inner_legacy_chunk_id)``.
+def _split_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
+    """Split a chunk_id into ``(epoch, content_version | None, inner)``.
 
-    Unversioned chunk_ids (no 0xFF sentinel) pass through unchanged, so every
-    codec function below can strip first and reuse the pre-#178 logic verbatim.
+    Unversioned chunk_ids (no 0xFF sentinel) pass through as ``(0, None, id)``,
+    so every codec function below can strip first and reuse the pre-#178 logic
+    verbatim. A zero-length content_version field decodes back to None: an
+    epoch-only header (an unversioned source past epoch 0) makes no claim about
+    content.
     """
     if not chunk_id or chunk_id[0] != _CV_SENTINEL:
-        return None, chunk_id
-    cv_len = struct.unpack(">I", chunk_id[2:6])[0]
-    inner_offset = 6 + cv_len
-    return chunk_id[6:inner_offset], chunk_id[inner_offset:]
+        return 0, None, chunk_id
+    if chunk_id[1] == _CV_FORMAT_EPOCH:
+        epoch, cv_len = struct.unpack(">II", chunk_id[2:10])
+        start = 10
+    else:
+        epoch = 0
+        cv_len = struct.unpack(">I", chunk_id[2:6])[0]
+        start = 6
+    end = start + cv_len
+    return epoch, (chunk_id[start:end] if cv_len else None), chunk_id[end:]
+
+
+def split_chunk_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
+    """``(epoch, content_version | None, inner)`` -- both framed versions at once.
+
+    For the staleness gate, which checks both halves and would otherwise parse
+    the header twice.
+    """
+    return _split_version(chunk_id)
 
 
 def content_version_of(chunk_id: bytes) -> Optional[bytes]:
-    """The chunk_id's content_version, or None if it carries no version header."""
+    """The chunk_id's content_version, or None if it carries none.
+
+    The RAW content signal, recoverable whatever epoch the id was minted under
+    -- which is the point of framing the epoch separately rather than fusing the
+    two into one token.
+    """
+    return _split_version(chunk_id)[1]
+
+
+def epoch_of(chunk_id: bytes) -> int:
+    """The serving-semantics epoch the chunk_id was minted under (0 if none)."""
     return _split_version(chunk_id)[0]
 
 
@@ -146,13 +184,18 @@ def content_version_of(chunk_id: bytes) -> Optional[bytes]:
 # server's own segments and the mmap parser and nothing else -- not the SDK's
 # on-disk cache, not a proxy's, not a browser's tiles.
 #
-# The epoch is that missing arm, and it rides the mechanism that already reaches
-# every cache keyed by chunk_id: it composes INTO the content_version header, so
-# a bump changes every chunk_id and every cache key at once. A cache that cannot
-# key by chunk_id (the HTTP sidecar's tile URLs) namespaces itself on the
-# version published on the descriptor, which is composed the same way. No new
-# wire key, and no client change -- chunk_id is opaque by contract, which is
-# exactly what makes this free for clients (biopb/biopb#346, #520).
+# The epoch is that missing arm, carried by the mechanism that already reaches
+# every cache keyed by chunk_id: its OWN framed field in the version header
+# (``_CV_FORMAT_EPOCH``), beside the content_version rather than fused into it,
+# because the two answer different questions and a reader of one must not have
+# to unpick the other. A bump changes every chunk_id and every cache key at
+# once. No wire key and no client change -- chunk_id is opaque by contract
+# (biopb/biopb#346, #520), which is what makes this free for clients.
+#
+# It is NOT published: re-keying a chunk is not a claim that the data changed,
+# and a consumer told otherwise would suspect its own derived products (an ROI's
+# ``drawn_against_version``). A cache that cannot key by chunk_id -- the HTTP
+# sidecar's tile URLs -- composes the epoch into its own keys itself.
 #
 # BUMP IT when a server change alters what the bytes for a stable chunk_id mean.
 # Do NOT bump it for a segment-file layout change: that is
@@ -163,36 +206,22 @@ def content_version_of(chunk_id: bytes) -> Optional[bytes]:
 # this server's. For a change that alters what the bytes MEAN that is the
 # correct outcome; the alternative is what #596 shipped -- correct on the
 # server, silently wrong in every cache it could not reach.
+#
+# At epoch 0 the header keeps its pre-epoch form, so adopting this re-keys
+# nothing.
 CHUNK_SEMANTICS_EPOCH = 0
 
-# Marks an epoch-composed version. Chosen so it cannot be confused with a raw
-# content_version: every minted one is ASCII under a fixed prefix
-# (``<mtime_ns>:<size>``, ``iat:``, ``gen:``). The lone exception is an uploaded
-# label set's 8 random bytes (``adapters/labels.py``), which can only collide
-# with this form at exactly 8 bytes against an empty content_version -- 2^-64.
-# Injectivity is what lets a stale id from another build compare UNEQUAL rather
-# than passing the version check.
-_EPOCH_PREFIX = b"epoch="
 
+def current_epoch() -> int:
+    """The epoch this server is serving under.
 
-def apply_semantics_epoch(content_version: Optional[bytes]) -> Optional[bytes]:
-    """Compose :data:`CHUNK_SEMANTICS_EPOCH` into *content_version*.
-
-    The result is the version a chunk_id carries -- a cache keyed by one has to
-    miss when either half moves, so the two travel as one value. Adapters reach
-    it through ``SourceAdapter.served_version``; this is the composition itself.
-    It is deliberately not published: see :data:`CHUNK_SEMANTICS_EPOCH`.
-
-    At epoch 0 it is the identity, so ids and cache keys stay byte-identical to
-    the pre-#1076 ones and adopting the mechanism costs no re-warm. From epoch 1
-    on, a source that was UNVERSIONED (no stat signature -- cloud, unresolved)
-    becomes versioned too: it caches this server's output like any other and has
-    no per-source signal of its own to ride.
+    A function, not the constant re-exported: a module that does
+    ``from ... import CHUNK_SEMANTICS_EPOCH`` binds the value at import and
+    would not see a change -- which in production is a restart, but under test
+    is a monkeypatch, and a gate that silently cannot be exercised is worse than
+    one that is wrong.
     """
-    if CHUNK_SEMANTICS_EPOCH == 0:
-        return content_version
-    epoch = str(CHUNK_SEMANTICS_EPOCH).encode()
-    return _EPOCH_PREFIX + epoch + b";" + (content_version or b"")
+    return CHUNK_SEMANTICS_EPOCH
 
 
 # =============================================================================
@@ -217,7 +246,12 @@ def apply_semantics_epoch(content_version: Optional[bytes]) -> Optional[bytes]:
 # =============================================================================
 
 _ENV_SENTINEL = 0xFE  # leading byte marking a proxy-envelope chunk_id
-_ENV_FORMAT = 1  # envelope layout version (after the sentinel byte)
+# Envelope layout version. v1 frames (route, cv); v2 frames (route, epoch, cv) --
+# the same split the content-version header makes, and for the same reason: a
+# mirror re-serves the upstream's bytes locally, so this proxy's own serving
+# semantics belong in its cache key.
+_ENV_FORMAT_CONTENT = 1
+_ENV_FORMAT_EPOCH = 2
 
 
 def is_proxy_envelope(chunk_id: bytes) -> bool:
@@ -232,22 +266,24 @@ def encode_proxy_envelope(
 
     ``route`` is the proxy's LOCAL array_id (how the server dispatches the chunk
     back to this adapter); ``content_version`` is the upstream source's version
-    (``None``/empty when the upstream is unversioned). The inner is stored and
+    (``None``/empty when the upstream is unversioned). This proxy's own serving
+    epoch is added here, as it is for a plain chunk_id. The inner is stored and
     later forwarded byte-for-byte -- the proxy never interprets it.
     """
     route_bytes = route.encode("utf-8")
     cv = content_version or b""
-    return (
-        struct.pack(">BBI", _ENV_SENTINEL, _ENV_FORMAT, len(route_bytes))
-        + route_bytes
-        + struct.pack(">I", len(cv))
-        + cv
-        + inner_chunk_id
-    )
+    epoch = current_epoch()
+    fmt = _ENV_FORMAT_CONTENT if epoch == 0 else _ENV_FORMAT_EPOCH
+    head = struct.pack(">BBI", _ENV_SENTINEL, fmt, len(route_bytes)) + route_bytes
+    if epoch != 0:
+        head += struct.pack(">I", epoch)
+    return head + struct.pack(">I", len(cv)) + cv + inner_chunk_id
 
 
-def peel_proxy_envelope(chunk_id: bytes) -> Tuple[str, Optional[bytes], bytes]:
-    """Split a proxy envelope into ``(route, content_version | None, inner)``.
+def peel_proxy_envelope(
+    chunk_id: bytes,
+) -> Tuple[str, int, Optional[bytes], bytes]:
+    """Split a proxy envelope into ``(route, epoch, content_version | None, inner)``.
 
     Inverse of :func:`encode_proxy_envelope`. A zero-length content_version field
     decodes back to ``None``. ``inner`` is the verbatim upstream chunk_id.
@@ -255,12 +291,17 @@ def peel_proxy_envelope(chunk_id: bytes) -> Tuple[str, Optional[bytes], bytes]:
     route_len = struct.unpack(">I", chunk_id[2:6])[0]
     offset = 6 + route_len
     route = chunk_id[6:offset].decode("utf-8")
+    if chunk_id[1] == _ENV_FORMAT_EPOCH:
+        epoch = struct.unpack(">I", chunk_id[offset : offset + 4])[0]
+        offset += 4
+    else:
+        epoch = 0
     cv_len = struct.unpack(">I", chunk_id[offset : offset + 4])[0]
     offset += 4
     cv = chunk_id[offset : offset + cv_len]
     offset += cv_len
     inner = chunk_id[offset:]
-    return route, (cv if cv_len > 0 else None), inner
+    return route, epoch, (cv if cv_len > 0 else None), inner
 
 
 def routing_array_id(chunk_id: bytes) -> str:
@@ -323,7 +364,7 @@ def encode_chunk_id(
 def decode_chunk_id(chunk_id: bytes) -> Tuple[str, ChunkBounds]:
     """Decode array_id and bounds from chunk_id. Works for both regular
     and virtual chunk_ids (ignores virtual payload) and version-wrapped ones."""
-    _, chunk_id = _split_version(chunk_id)
+    _epoch, _cv, chunk_id = _split_version(chunk_id)
     array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     array_id = chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
@@ -347,7 +388,7 @@ def array_id_from_chunk_id(chunk_id: bytes) -> str:
     :func:`decode_chunk_id` builds a ``ChunkBounds`` message to get there --
     paid per chunk on the routing and retention paths, thrown away by both.
     """
-    _, chunk_id = _split_version(chunk_id)
+    _epoch, _cv, chunk_id = _split_version(chunk_id)
     array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     return chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
@@ -420,17 +461,17 @@ def mint_chunk_id(
     bounds: ChunkBounds,
     scale_hint: Optional[Tuple[int, ...]] = None,
     reduction_method: str = CHUNK_ID_IMPLICIT_REDUCTION_METHOD,
-    served_version: Optional[bytes] = None,
+    content_version: Optional[bytes] = None,
 ) -> bytes:
     """Mint the canonical chunk_id for a read-plan endpoint.
 
     This is the single composition point for regular or scaled encoding and the
-    optional version wrapper. Keeping those choices together ensures cache
-    probes mint the same bytes as read plans.
+    version header. Keeping those choices together ensures cache probes mint the
+    same bytes as read plans.
 
-    ``served_version`` is ``SourceAdapter.served_version`` -- the source's
-    content_version composed with the semantics epoch -- never a raw
-    content_version, or a probe minted here misses the ids a read plan hands out.
+    The caller passes only what it owns -- its ``content_version``. The
+    serving-semantics epoch is this server's, so the codec applies it here
+    rather than asking every call site to remember to.
     """
     if scale_hint is None:
         inner = encode_chunk_id(array_id, bounds)
@@ -438,9 +479,9 @@ def mint_chunk_id(
         inner = encode_chunk_id_with_scale(
             array_id, bounds, scale_hint, reduction_method
         )
-    if served_version is not None:
-        return wrap_content_version(inner, served_version)
-    return inner
+    if content_version is None and current_epoch() == 0:
+        return inner  # byte-identical to the pre-#178 format
+    return wrap_content_version(inner, content_version)
 
 
 def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
@@ -459,7 +500,7 @@ def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
 
 def is_scaled_chunk(chunk_id: bytes) -> bool:
     """Check if chunk_id has scale info appended after bounds."""
-    _, inner = _split_version(chunk_id)
+    _epoch, _cv, inner = _split_version(chunk_id)
     _, bounds_end = _bounds_end(inner)
     return len(inner) > bounds_end
 
@@ -495,13 +536,18 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     """
     if is_proxy_envelope(chunk_id):
         return chunk_id
-    cv, inner = _split_version(chunk_id)
+    epoch, cv, inner = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(inner)
     scale_end = bounds_end + ndim * 8
     # Keep array_id+bounds+scale_hint and at most the one-byte method suffix; a
     # longer trailing run is the legacy uint16 method form, stripped (#76).
     base = inner if len(inner) <= scale_end + 1 else inner[:scale_end]
-    return wrap_content_version(base, cv) if cv is not None else base
+    if cv is None and epoch == 0:
+        return base
+    # The header the id was MINTED with, not the one this server would mint now:
+    # a key is for finding what was written, and a stale entry has to stay
+    # findable long enough to be recognised as stale.
+    return _version_header(cv, epoch) + base
 
 
 def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
@@ -512,7 +558,7 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
     :func:`decode_reduction_method`; any trailing bytes here are ignored, so a
     legacy method-carrying chunk_id still decodes its scale correctly.
     """
-    _, chunk_id = _split_version(chunk_id)
+    _epoch, _cv, chunk_id = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(chunk_id)
 
     return struct.unpack_from(f">{ndim}q", chunk_id, bounds_end)
@@ -533,7 +579,7 @@ def decode_reduction_method(chunk_id: bytes) -> str:
     legacy ``uint16 len + bytes`` method suffix resolve the same way, so an old
     scaled read is served exactly as before, never rejected.
     """
-    _, inner = _split_version(chunk_id)
+    _epoch, _cv, inner = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(inner)
     scale_end = bounds_end + ndim * 8
     if len(inner) == scale_end + 1:

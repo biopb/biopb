@@ -98,8 +98,9 @@ change to chunking or axis normalization leaves a stable `chunk_id` resolving to
 different bytes, with no per-source signal moving at all. biopb/biopb#596 is the
 worked example, and it had to invalidate through the server's own
 `CACHE_FILE_FORMAT_VERSION`, which this cache never sees. `CHUNK_SEMANTICS_EPOCH`
-(biopb/biopb#1076) closes that: the server composes it into the same header, so a
-bump re-keys every chunk_id and this cache misses like any other. Nothing to
+(biopb/biopb#1076) closes that: the header carries it as its own framed field
+beside the content_version, so a bump re-keys every chunk_id and this cache
+misses like any other. Nothing to
 implement here, and nothing to remember — which is the point, because remembering
 is what failed the first time.
 

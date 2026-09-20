@@ -45,7 +45,6 @@ from dask.utils import parse_bytes
 from biopb.tensor import _diskcache
 from biopb.tensor._location import location_host
 from biopb.tensor._tls import NO_TLS, TlsTrust
-from biopb.tensor._wire_version import SEGMENT_CACHE_KEY_FIELD
 from biopb.tensor.ticket_pb2 import TensorTicket
 
 logger = logging.getLogger(__name__)
@@ -78,10 +77,10 @@ logger = logging.getLogger(__name__)
 # pinned-segment accounting below (disk-leak workaround, biopb/biopb#571).
 
 # No negotiated segment-format version (biopb/biopb#1070): content is the
-# chunk_id's job (``CHUNK_SEMANTICS_EPOCH``), and what is left is structural, so
-# _try_cachefile_transfer checks it structurally instead. A layout this client
-# cannot parse raises and falls back to do_get; one it parses into the wrong
-# message fails the identity check and falls back too.
+# chunk_id's job (``CHUNK_SEMANTICS_EPOCH``), and the server verifies that a
+# range it hands out really holds the entry it was asked for before answering,
+# so a client cannot be pointed at another chunk's bytes. A layout this client
+# cannot parse raises and falls back to do_get.
 
 # Per-location capability cache: dask workers are separate processes, so each
 # memoizes independently after its first probe. None = unknown, False = the
@@ -544,28 +543,6 @@ def _try_cachefile_transfer(
             mm.seek(byte_offset)
             msg = pa.ipc.read_message(mm)
             batch = pa.ipc.read_record_batch(msg, schema)
-            # The offset came from the server and is read against a layout
-            # nothing negotiates, so check that the message IS the entry asked
-            # for rather than trusting it. An offset landing mid-message already
-            # raises; one landing on the wrong message decodes cleanly and would
-            # hand back another chunk's pixels -- the only silent failure this
-            # path has. Every segment record carries its own cache key as a
-            # per-row column, and chunk_locate echoes the key it resolved, so
-            # this is an exact identity check on opaque bytes: nothing parsed,
-            # nothing computed, nothing to keep in lockstep with the server. A
-            # segment predating the key column (or a server not echoing one)
-            # simply has no claim to check, as before.
-            expected_key = info.get("cache_key")
-            if (
-                expected_key is not None
-                and SEGMENT_CACHE_KEY_FIELD in batch.schema.names
-            ):
-                got = batch.column(SEGMENT_CACHE_KEY_FIELD)[0].as_py()
-                if got is None or got.hex() != expected_key:
-                    raise ValueError(
-                        f"segment message at offset {byte_offset} belongs to "
-                        f"another entry; using do_get"
-                    )
             # Option C (biopb/biopb#571): hand out a zero-copy view onto the
             # mapping instead of copying out of it. The IPC-decoded data buffer
             # aliases the mmap, and Arrow refcounts the mapping -- ``mm.close()``

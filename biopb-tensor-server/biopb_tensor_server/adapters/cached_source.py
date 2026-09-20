@@ -367,7 +367,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         # the id the base read plan mints, so the client's echoed chunk_id
         # resolves here and a prior upload's chunks are never served.
         chunk_id = mint_chunk_id(
-            self.source_id, bounds, served_version=self.served_version
+            self.source_id, bounds, content_version=self.content_version
         )
 
         if isinstance(data, pa.ChunkedArray):

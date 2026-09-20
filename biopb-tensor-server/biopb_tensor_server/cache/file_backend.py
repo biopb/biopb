@@ -861,7 +861,7 @@ class ArrowFileBackend:
             if self._access_counter % 100 == 0:
                 self._maybe_release_cold_mmaps()
 
-        batch = self._read_batch_at(segment_id, mmap, entry_info)
+        batch = self._read_batch_at(segment_id, mmap, entry_info, key)
         if batch is None:
             return None
 
@@ -870,8 +870,43 @@ class ArrowFileBackend:
             names=["data", "shape", "dtype"],
         )
 
+    def _batch_at_offset(
+        self, segment_id: int, mmap, entry_info: SegmentEntryInfo, key: bytes
+    ) -> Optional[pa.RecordBatch]:
+        """The batch at this entry's recorded range, if it really is this entry.
+
+        Decoding at a byte offset trusts the index. A range that no longer names
+        this key -- a mis-restored ``.idx``, a layout change, a bug -- decodes
+        into a *valid* batch belonging to someone else, which is the one failure
+        on this path that is silent rather than loud. Every record carries its
+        own key (``CACHE_KEY_FIELD``), so check it and let the caller walk the
+        segment instead: slower, correct, and a repair rather than a refusal
+        (biopb/biopb#1070). Unconditional on purpose -- a guarantee a caller can
+        opt out of, or that depends on the checked party volunteering the
+        evidence, is not one.
+        """
+        schema = self._segment_schema(segment_id, mmap)
+        if schema is None:
+            return None
+        try:
+            mmap.seek(entry_info.byte_offset)
+            batch = pa.ipc.read_record_batch(pa.ipc.read_message(mmap), schema)
+        except (pa.ArrowInvalid, OSError, EOFError, StopIteration):
+            return None
+        if CACHE_KEY_FIELD not in batch.schema.names:
+            return batch  # pre-key-column segment: nothing to check against
+        if batch.column(CACHE_KEY_FIELD)[0].as_py() != key:
+            logger.warning(
+                "segment %s offset %s does not hold the entry it is indexed "
+                "under; walking the segment instead",
+                segment_id,
+                entry_info.byte_offset,
+            )
+            return None
+        return batch
+
     def _read_batch_at(
-        self, segment_id: int, mmap, entry_info: SegmentEntryInfo
+        self, segment_id: int, mmap, entry_info: SegmentEntryInfo, key: bytes
     ) -> Optional[pa.RecordBatch]:
         """Decode the single record batch this entry points at.
 
@@ -882,13 +917,9 @@ class ArrowFileBackend:
         or a segment whose schema can't be read, falls back to walk the segment.
         """
         if entry_info.byte_offset and entry_info.byte_length:
-            schema = self._segment_schema(segment_id, mmap)
-            if schema is not None:
-                try:
-                    mmap.seek(entry_info.byte_offset)
-                    return pa.ipc.read_record_batch(pa.ipc.read_message(mmap), schema)
-                except (pa.ArrowInvalid, OSError, EOFError, StopIteration):
-                    pass  # fall through to the sequential walk
+            batch = self._batch_at_offset(segment_id, mmap, entry_info, key)
+            if batch is not None:
+                return batch
 
         # No usable range: walk the stream to the entry's index.
         mmap.seek(0)
@@ -944,10 +975,11 @@ class ArrowFileBackend:
 
         Backs the localhost cache-file handoff (issue #9). Byte ranges are
         recorded when the entry is written and restored at boot from the ``.idx``
-        sidecar or the segment walk, so this derives nothing -- it is a dict
-        lookup under ``_lock``. Returns None when the key isn't cached, has no
-        recorded range, or its segment is gone, signalling the caller to fall
-        back to do_get.
+        sidecar or the segment walk, so this derives nothing: an index lookup
+        under ``_lock``, then one check that the range really names this entry
+        (below). Returns None when the key isn't cached, has no recorded range,
+        its segment is gone, or the range doesn't hold it -- every case
+        signalling the caller to fall back to do_get.
         """
         with self._lock:
             entry_info = self._metadata.get(key)
@@ -967,7 +999,47 @@ class ArrowFileBackend:
             # fall back to do_get and are counted there (biopb/biopb#514).
             self._hits += 1
             self._update_segment_frequency(entry_info.segment_id)
-            return location
+
+        # Verify OUTSIDE the lock: `_lock` guards the in-memory index only, and
+        # doing I/O under it is the deadlock class biopb/biopb#302 closed.
+        #
+        # A locate hands a byte range to another process, which reads it with
+        # the server no longer in the loop. If the range does not name this
+        # entry, that client gets someone else's pixels and nothing says so --
+        # so the range is checked before it is published, rather than asking the
+        # client to check it afterwards against evidence this reply volunteers.
+        # ~1 us on a ~290 us locate RTT, and the client is about to fault the
+        # same page anyway.
+        if not self._range_holds_key(location, entry_info, key):
+            return None
+        return location
+
+    def _range_holds_key(
+        self, location: ChunkLocation, entry_info: SegmentEntryInfo, key: bytes
+    ) -> bool:
+        """Does the recorded range really hold *key*'s record?
+
+        Uses the live mapping when there is one; an open write segment has none,
+        and it is exactly the segment whose ranges are freshest, so it gets its
+        own short-lived map rather than being waved through. Never called under
+        ``_lock``.
+        """
+        mmap = self._segment_mmaps.get(entry_info.segment_id)
+        if mmap is not None:
+            return (
+                self._batch_at_offset(entry_info.segment_id, mmap, entry_info, key)
+                is not None
+            )
+        try:
+            with pa.memory_map(location.segment_path, "r") as scratch:
+                return (
+                    self._batch_at_offset(
+                        entry_info.segment_id, scratch, entry_info, key
+                    )
+                    is not None
+                )
+        except (OSError, pa.ArrowInvalid):
+            return False
 
     def _build_chunk_location(
         self, entry_info: SegmentEntryInfo

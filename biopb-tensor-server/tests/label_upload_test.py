@@ -365,11 +365,16 @@ class TestContentVersion:
     chunk_id is keying it by the published form.
     """
 
+    def _chunk_ids(self, client, array_id):
+        info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
+        return set(_parse_flight_endpoints(info)[0])
+
     def _minted(self, client, array_id):
         """The content_version the read plan's chunk_ids carry."""
-        info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
-        chunk_ids, _bounds = _parse_flight_endpoints(info)
-        return {content_version_of(chunk_id) for chunk_id in chunk_ids}
+        return {
+            content_version_of(chunk_id)
+            for chunk_id in self._chunk_ids(client, array_id)
+        }
 
     def test_a_set_publishes_its_own_version_not_its_image_s(self, served, client):
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
@@ -407,18 +412,25 @@ class TestContentVersion:
         """biopb/biopb#1076, over the wire.
 
         The epoch re-keys chunks; it does not claim the data changed. So the
-        chunk_ids move and the field does not -- a consumer that stamped
-        something with this token (an ROI's ``drawn_against_version``) must not
-        read a server upgrade as "your image changed".
+        chunk_ids move, the published field does not, and -- because the two
+        versions are framed separately rather than fused -- the content_version
+        INSIDE the new chunk_ids is still the published one. A consumer that
+        stamped something with this token (an ROI's ``drawn_against_version``)
+        must not read a server upgrade as "your image changed".
         """
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
-        ids = {a: self._minted(client, a) for a in ("oz1", "oz1/labels/nuclei")}
-        published = {a: client.get_descriptor(a).content_version for a in ids}
+        names = ("oz1", "oz1/labels/nuclei")
+        ids = {a: self._chunk_ids(client, a) for a in names}
+        published = {a: client.get_descriptor(a).content_version for a in names}
+        assert all(self._minted(client, a) == {published[a]} for a in names)
 
         epoch(1)
 
-        for array_id, was in ids.items():
-            assert self._minted(client, array_id).isdisjoint(was)
+        for array_id in names:
+            assert self._chunk_ids(client, array_id).isdisjoint(ids[array_id])
             assert (
                 client.get_descriptor(array_id).content_version == published[array_id]
             )
+            # Still recoverable from the re-keyed ids: the epoch moved, the
+            # content claim did not.
+            assert self._minted(client, array_id) == {published[array_id]}

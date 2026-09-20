@@ -12,7 +12,6 @@ Replaces the retired /dev/shm shm_transfer path. Covers:
 
 import dataclasses
 import hashlib
-import json
 import os
 import shutil
 import subprocess
@@ -1178,18 +1177,16 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_a_segment_message_that_is_not_the_chunk_is_refused(self, transfer_target):
-        """The fast path verifies what it decoded, and falls back if it is wrong.
+    def test_a_range_that_names_another_entry_is_refused(self, transfer_target):
+        """The server verifies a range before it hands it out, and before it
+        reads through it itself (biopb/biopb#1070).
 
-        There is no negotiated segment-format version any more (biopb/biopb#1070):
-        its one bump ever stood in for a content change, which the chunk_id now
-        carries. What it left unguarded is the failure that matters -- an offset
-        that decodes cleanly into the WRONG message hands back another chunk's
-        pixels, silently. Every segment record carries its own cache key, and
-        chunk_locate echoes the key it resolved, so the client can check exactly
-        that. Here every locate is answered with the FIRST chunk's location, so
-        each later chunk is pointed at a valid message of the same shape that
-        belongs to someone else -- which a shape check would wave through.
+        An offset that decodes cleanly into the WRONG message is the one silent
+        failure on this path: a valid batch of the same shape belonging to
+        someone else. It used to be the client's job to notice, which made the
+        guarantee conditional on the server volunteering the evidence and the
+        client bothering to check. Now the index entry is checked against the
+        record it points at, here by pointing one entry at another's bytes.
         """
         import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
@@ -1199,53 +1196,37 @@ class TestCachefileIntegration:
         transfer_target(4096)
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
-        original = type(server)._handle_chunk_locate
-        first = {}
-
-        def misdirect(self, chunk_id):
-            """Resolve the right entry, then point at the wrong bytes.
-
-            Exactly the shape of a segment-layout drift: the server knows
-            which entry the client asked for -- so its echoed key is
-            correct -- but the byte range no longer names that entry's
-            message. Keeping the key honest is what makes this the failure
-            a client CAN catch, as opposed to a server that resolved the
-            wrong entry outright, which no client-side check can see.
-            """
-            payload = json.loads(original(self, chunk_id))
-            if payload.get("available"):
-                if first:
-                    payload.update(first["where"])
-                else:
-                    first["where"] = {
-                        k: payload[k]
-                        for k in (
-                            "segment_path",
-                            "byte_offset",
-                            "byte_length",
-                            "generation_id",
-                        )
-                    }
-            return json.dumps(payload)
-
         try:
             cmod._cachefile_support.clear()
             client = TensorFlightClient(loc, cache_bytes=0)
-            # Warm every chunk into the segment cache first, honestly.
             assert np.array_equal(
                 client.get_tensor("z").compute(scheduler="threads"), src
             )
             assert len(client.get_tensor("z").chunks[0]) > 1, "need >1 chunk"
             client.close()
 
+            backend = CacheManager.get_instance()._backend
+            keys = [k for k, i in backend._metadata.items() if i.byte_offset]
+            assert len(keys) > 1
+            # Point the second entry at the first's bytes: a real message, the
+            # right shape, the wrong chunk.
+            victim, donor = keys[1], backend._metadata[keys[0]]
+            backend._metadata[victim] = dataclasses.replace(
+                backend._metadata[victim],
+                byte_offset=donor.byte_offset,
+                byte_length=donor.byte_length,
+            )
+
+            # The handoff refuses it outright rather than publishing the range.
+            assert backend.locate_entry(victim) is None
+            # And the server's own read walks the segment instead, so it still
+            # serves the right bytes -- a repair, not a refusal.
             cmod._cachefile_support.clear()
-            with patch.object(type(server), "_handle_chunk_locate", misdirect):
-                client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z").compute(scheduler="threads")
-                # Correct pixels, via the do_get fallback -- not the first
-                # chunk's bytes smeared over the whole array.
-                assert np.array_equal(got, src)
-                client.close()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            assert np.array_equal(
+                client.get_tensor("z").compute(scheduler="threads"), src
+            )
+            client.close()
         finally:
             server.shutdown()
             CacheManager.reset()
@@ -1575,14 +1556,30 @@ class TestDirectSeekRead:
             info = file_backend._metadata[f"seek-{i}".encode()]
             assert info.byte_offset > 0 and info.byte_length > 0
 
-            seeked = file_backend._read_batch_at(segment_id, mmap, info)
+            key = f"seek-{i}".encode()
+            seeked = file_backend._read_batch_at(segment_id, mmap, info, key)
             # Same entry with its range stripped -> forced down the walk.
             walked = file_backend._read_batch_at(
                 segment_id,
                 mmap,
                 dataclasses.replace(info, byte_offset=0, byte_length=0),
+                key,
             )
             assert seeked.equals(walked)
+
+            # A range pointing at another entry is refused and walks instead,
+            # so the two still agree (biopb/biopb#1070). Without the check the
+            # seek would return entry 0's batch and the walk entry i's.
+            if i > 0:
+                other = file_backend._metadata[b"seek-0"]
+                misindexed = dataclasses.replace(
+                    info,
+                    byte_offset=other.byte_offset,
+                    byte_length=other.byte_length,
+                )
+                assert file_backend._read_batch_at(
+                    segment_id, mmap, misindexed, key
+                ).equals(walked)
             assert np.array_equal(unpack_chunk_array(seeked), arrs[i])
 
     def test_entry_without_range_still_reads(self, file_backend):

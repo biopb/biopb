@@ -1997,11 +1997,6 @@ class TensorFlightServer(flight.FlightServerBase):
             return json.dumps(
                 {
                     "available": True,
-                    # The entry this offset resolves to, echoed so the client can
-                    # verify the message it decodes is that entry (every segment
-                    # record carries the key as a per-row column). Opaque both
-                    # ways -- the client compares bytes and parses nothing.
-                    "cache_key": cache_key.hex(),
                     "segment_path": location.segment_path,
                     "byte_offset": location.byte_offset,
                     "byte_length": location.byte_length,

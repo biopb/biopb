@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple, get_args
 
 import pyarrow as pa
-from biopb.tensor._wire_version import SEGMENT_CACHE_KEY_FIELD
 
 from biopb_tensor_server.cache.types import RetentionClass
 
@@ -45,10 +44,7 @@ logger = logging.getLogger(__name__)
 # segment), so per-batch schema metadata is lost on read-back and every batch
 # would report the first entry's key. A column value is stored per row and
 # round-trips correctly. See scan_segment_records.
-#
-# Defined in the core SDK because the localhost mmap client reads it too, and a
-# constant two packages share has one definition or it has two.
-CACHE_KEY_FIELD = SEGMENT_CACHE_KEY_FIELD
+CACHE_KEY_FIELD = "__biopb_cache_key__"
 
 # Per-segment sidecar index (biopb/biopb#300). Each sealed segment gets a
 # ``seg_NNNN.idx`` sidecar written at seal time, recording every entry's key ->

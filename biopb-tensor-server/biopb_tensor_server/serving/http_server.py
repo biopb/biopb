@@ -81,8 +81,7 @@ from fastapi.responses import JSONResponse
 from google.protobuf import json_format
 from pydantic import BaseModel
 
-from biopb_tensor_server.core import chunk as _chunk
-from biopb_tensor_server.core.chunk import apply_semantics_epoch
+from biopb_tensor_server.core.chunk import current_epoch
 from biopb_tensor_server.core.labels import split_label_field
 
 logger = logging.getLogger(__name__)
@@ -725,7 +724,11 @@ def _version_token(content_version: bytes) -> str:
     because the sidecar ships with the Flight plane ``cli.py`` points it at.
     See ``core.chunk.CHUNK_SEMANTICS_EPOCH``.
     """
-    return hashlib.sha256(apply_semantics_epoch(content_version)).hexdigest()[:8]
+    epoch = current_epoch()
+    # Epoch 0 hashes the content alone, mirroring the chunk_id header's rule, so
+    # adopting the mechanism moves no tile URL.
+    seed = content_version if epoch == 0 else b"%d:" % epoch + content_version
+    return hashlib.sha256(seed).hexdigest()[:8]
 
 
 def _descriptor_version_token(td: Any) -> Optional[str]:
@@ -2703,15 +2706,13 @@ async def get_tile(
             ("cv", current_version or ""),
             # And the epoch on its own, because an UNVERSIONED source has no
             # `cv` to carry it: its chunk_ids are re-keyed on a bump
-            # (`apply_semantics_epoch(None)` is not None past epoch 0) while its
+            # (an epoch-only version header past epoch 0) while its
             # tile URL is not, so without this the browser revalidates to the
             # same ETag forever. It does NOT earn such a source a version token:
             # a token promotes the URL to `immutable` for a year, and an
             # unversioned source is precisely one whose content can change with
             # no signal at all.
-            # Read off the module, not bound at import: a bump is a
-            # restart in production but a monkeypatch under test.
-            ("epoch", _chunk.CHUNK_SEMANTICS_EPOCH),
+            ("epoch", current_epoch()),
         ],
     )
     # The resolution above already refused a superseded token, so a token that

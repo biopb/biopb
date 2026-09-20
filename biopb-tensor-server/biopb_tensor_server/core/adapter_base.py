@@ -46,12 +46,11 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.cache_source import cache_sourced_units
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
-    apply_semantics_epoch,
     array_id_from_chunk_id,
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
-    content_version_of,
+    current_epoch,
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
@@ -60,6 +59,7 @@ from biopb_tensor_server.core.chunk import (
     normalized_scale_hint,
     normalized_slice_bounds,
     scaled_virtual_chunk_size,
+    split_chunk_version as _split_chunk_version,
 )
 from biopb_tensor_server.core.chunk_batch import (
     CHUNK_WIRE_SCHEMA,
@@ -363,31 +363,18 @@ class SourceAdapter(ABC):
         The version of the bytes THIS adapter serves, which for a multi-tensor
         source is not always the source's own -- see ``_content_version``.
 
-        The RAW content signal. Anything namespacing a cache wants
-        :attr:`served_version` instead; this one is for a consumer that means
-        "did the source's content change?" and nothing else -- an ROI's
-        ``drawn_against_version``.
+        The content signal alone. A chunk_id carries this AND the server's
+        serving-semantics epoch, framed separately (``core.chunk``); a cache has
+        to miss on either, while a consumer asking "did the data change?" -- an
+        ROI's ``drawn_against_version``, the descriptor field -- wants this one.
         """
         return self._content_version
-
-    @property
-    def served_version(self) -> Optional[bytes]:
-        """The version this adapter's chunk_ids carry.
-
-        :attr:`content_version` composed with the server's serving-semantics
-        epoch (biopb/biopb#1076), which together answer "may a cached chunk for
-        this id still be served?" -- the source's bytes and this server's
-        reading of them can each move independently, and a cache keyed by
-        chunk_id has to miss on either. Not what the descriptor publishes: that
-        is the raw content_version, a claim about data (``serving/server.py``).
-        """
-        return apply_semantics_epoch(self.content_version)
 
     def check_chunk_version(self, chunk_id: bytes) -> None:
         """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
 
-        Pure in-memory comparison of ``content_version_of(chunk_id)`` against
-        ``self.served_version`` -- no adapter I/O -- so a caller can run it as a
+        Pure in-memory comparison of the chunk_id's framed versions against
+        this source's and this server's -- no adapter I/O -- so a caller can run it as a
         cheap guard ahead of a cache lookup (``server._handle_chunk_locate``) as
         well as ahead of an actual read (:meth:`TensorAdapter.resolve_chunk_data`),
         without paying for a second adapter lookup or (for a native-pyramid
@@ -399,8 +386,11 @@ class SourceAdapter(ABC):
         envelope's own version instead -- it never mints a plain (non-envelope)
         chunk_id, so this base implementation would misparse one of its chunk_ids.
         """
-        held_version = content_version_of(chunk_id)
-        if held_version is not None and held_version != self.served_version:
+        held_epoch, held_version, _inner = _split_chunk_version(chunk_id)
+        stale_content = (
+            held_version is not None and held_version != self.content_version
+        )
+        if stale_content or held_epoch != current_epoch():
             raise StaleChunkError(
                 f"chunk_id for {self.array_id!r} was minted against a "
                 "version this source no longer serves; re-request the "
@@ -1346,7 +1336,7 @@ class TensorAdapter(SourceAdapter):
         unit, fetch, borrowed = cache_sourced_units(
             cache_manager,
             descriptor,
-            self.served_version,
+            self.content_version,
             start,
             stop,
             unit,
@@ -1623,14 +1613,14 @@ class TensorAdapter(SourceAdapter):
             return self._plan_precomputed_read(request_desc, scale_hint)
 
         chunk_size = self.get_transfer_chunk_size()
-        # served_version is a SourceAdapter property; every TensorAdapter is a
-        # SourceAdapter, so it is always present -- an unversioned source at
-        # epoch 0 returns None.
+        # content_version is a SourceAdapter property; every TensorAdapter is a
+        # SourceAdapter, so it is always present -- an unversioned source
+        # returns None. The epoch is the codec's to add.
         return _get_read_plan(
             base_desc,
             request_desc,
             chunk_size,
-            served_version=self.served_version,
+            content_version=self.content_version,
         )
 
     # ---- native-pyramid precompute routing ---------------------------------
@@ -1936,7 +1926,6 @@ _SOURCE_SCOPED_API = frozenset(
         "source_type",
         "capability_token",
         "content_version",
-        "served_version",
         "check_chunk_version",
         "claim",
         "create_from_config",
@@ -2043,16 +2032,16 @@ def _get_read_plan(
     base_desc: TensorDescriptor,
     request_desc: TensorDescriptor,
     chunk_size: Tuple[int, ...],
-    served_version: Optional[bytes] = None,
+    content_version: Optional[bytes] = None,
 ) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
 
-    ``served_version`` (``SourceAdapter.served_version``: content_version
-    biopb/biopb#178, composed with the semantics epoch biopb/biopb#1076), when
-    set, is folded into every minted chunk_id so the cache namespaces by it.
+    ``content_version`` (biopb/biopb#178), when set, is folded into every minted
+    chunk_id so the cache namespaces by it -- alongside the serving-semantics
+    epoch, which ``mint_chunk_id`` adds (biopb/biopb#1076).
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
@@ -2168,7 +2157,7 @@ def _get_read_plan(
             virtual_bounds,
             scale_hint,
             reduction_method,
-            served_version,
+            content_version,
         )
 
         logical_endpoints.append(
