@@ -130,6 +130,22 @@ class TestRasterizedMaskAdapter:
             out = adapter.get_data(ChunkBounds(start=[0, 0], stop=[4, 4]))
             assert (out > 0).astype(np.uint8).tolist() == bmp.tolist()
 
+    @pytest.mark.parametrize("compression", ("zlib", "bzip2"))
+    def test_corrupt_compressed_mask_is_skipped_not_fatal(self, compression):
+        bad = _mask(0, 0, 2, 2, np.ones((2, 2)), compression=compression)
+        bad["bin_data"]["value"] = base64.b64encode(b"not a valid stream").decode(
+            "ascii"
+        )
+        good = _mask(2, 2, 2, 2, np.ones((2, 2)))
+        adapter = self._adapter(self._shapes(_meta({"Image:0": [bad, good]})))
+
+        out = adapter.get_data(ChunkBounds(start=[0, 0], stop=[4, 4]))
+
+        assert (out[:2, :2] == 0).all()
+        assert (out[2:, 2:] == 2).all()
+        # The failed decode is memoized; another intersecting chunk stays safe.
+        assert (adapter.get_data(ChunkBounds(start=[0, 0], stop=[2, 2])) == 0).all()
+
     def test_a_partial_chunk_reads_only_its_own_region(self):
         bmp = np.ones((4, 4))
         meta = _meta({"Image:0": [_mask(1, 1, 2, 2, bmp)]})  # bbox = [1,3) x [1,3)
@@ -307,6 +323,59 @@ class TestFastMetadataRealBitmap:
 
         # And through the base SourceAdapter machinery: extent must match.
         assert "Image:0/labels/@ome" in adapter.label_sets
+
+        adapter.release_registration_cache()
+
+        # The label adapter keeps the decoded bitmap, while the source retains
+        # neither the base64 payload nor its parsed duplicate.
+        assert base64.b64encode(raw).decode("ascii") not in adapter._reduced_ome_xml
+        assert adapter._parsed_metadata is None
+        assert adapter._parsed_metadata_probed is False
+        for scene in adapter._tensor_adapters.values():
+            assert base64.b64encode(raw).decode("ascii") not in scene._reduced_ome_xml
+        cached_label_set = adapter.label_sets["Image:0/labels/@ome"]
+        assert (
+            cached_label_set.get_data(
+                ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
+            )[tuple([0] * (out.ndim - 2) + [2, 2])]
+            == 1
+        )
+        metadata_after_release = adapter.get_metadata()
+        mask_after_release = metadata_after_release["rois"][0]["union"]["masks"][0]
+        assert mask_after_release["bin_data"]["value"] == ""
+
+    def test_release_survives_a_reduced_xml_the_stripper_cannot_parse(
+        self, tmp_path, monkeypatch
+    ):
+        """release_registration_cache() is documented to never raise. A reduced
+        XML the mask stripper's ET.fromstring rejects must not abort the raw-XML
+        drop or the cascade to scene adapters below it -- it is left un-redacted
+        instead (biopb/biopb#1081)."""
+        import xml.etree.ElementTree as ET
+
+        import biopb_tensor_server.adapters.ome_tiff as ome_tiff_module
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        raw_bitmap = np.zeros((4, 4), dtype=np.uint8)
+        raw_bitmap[1:3, 1:3] = 1
+        raw = np.packbits(raw_bitmap.flatten(), bitorder="big").tobytes()
+        path = self._write(tmp_path, raw)
+        adapter = OmeTiffAdapter(path, "src1")
+        adapter.get_embedded_labels()  # sets _mask_payloads_transferred
+
+        def _broken_strip(ome_xml):
+            raise ET.ParseError("boom")
+
+        monkeypatch.setattr(
+            ome_tiff_module, "_strip_mask_bindata_payloads", _broken_strip
+        )
+
+        adapter.release_registration_cache()  # must not raise
+
+        assert adapter._raw_ome_xml is None
+        assert adapter._raw_ome_xml_released is True
+        # Left un-redacted: the strip that would have dropped it never ran.
+        assert base64.b64encode(raw).decode("ascii") in adapter._reduced_ome_xml
 
     def test_get_metadata_parses_the_ome_xml_only_once(self, tmp_path, monkeypatch):
         """get_embedded_labels() calls get_metadata() internally, and so does

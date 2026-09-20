@@ -279,6 +279,7 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
             for axis in ("t", "z", "y", "x")
         }
         self._bitmaps: Dict[int, np.ndarray] = {}
+        self._unreadable_bitmap_ids: set[int] = set()
 
     @property
     def dim_labels(self) -> List[str]:
@@ -329,11 +330,32 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
             "the file's own OME metadata, not uploaded"
         )
 
-    def _bitmap_of(self, shape: _MaskShape) -> np.ndarray:
-        cached = self._bitmaps.get(id(shape))
-        if cached is None:
+    def _bitmap_of(self, shape: _MaskShape) -> Optional[np.ndarray]:
+        """Return a decoded bitmap, or ``None`` for a corrupt one.
+
+        Compression is deliberately deferred until a read intersects the
+        shape.  A malformed stream must therefore fail at this per-shape
+        boundary, rather than making every chunk of the whole label set
+        unreadable.  Cache the failure too, both to avoid repeated decompression
+        attempts and to emit one useful warning instead of one per chunk.
+        """
+        key = id(shape)
+        if key in self._unreadable_bitmap_ids:
+            return None
+        cached = self._bitmaps.get(key)
+        if cached is not None:
+            return cached
+        try:
             cached = _bitmap(shape)
-            self._bitmaps[id(shape)] = cached
+        except Exception:
+            logger.warning(
+                "ome masks: skipping unreadable compressed mask in %s",
+                self.array_id,
+                exc_info=True,
+            )
+            self._unreadable_bitmap_ids.add(key)
+            return None
+        self._bitmaps[key] = cached
         return cached
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -388,7 +410,10 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
         if x0 >= x1 or y0 >= y1:
             return
 
-        bitmap = self._bitmap_of(shape)[y0 - my0 : y1 - my0, x0 - mx0 : x1 - mx0]
+        bitmap = self._bitmap_of(shape)
+        if bitmap is None:
+            return
+        bitmap = bitmap[y0 - my0 : y1 - my0, x0 - mx0 : x1 - mx0]
         index[y_axis] = slice(y0 - starts[y_axis], y1 - starts[y_axis])
         index[x_axis] = slice(x0 - starts[x_axis], x1 - starts[x_axis])
         region = out[tuple(index)]  # full rank: no axis was int-indexed above
