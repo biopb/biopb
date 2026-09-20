@@ -203,8 +203,8 @@ export function groupTensors(tensors: TensorDescriptor[]): TensorGroup[] {
   }
 
   // Sets sorted by name, images left in the order the server listed them: it
-  // puts image tensors first on purpose, and the catalog's scalar `dtype` and
-  // `shape_summary` describe `tensors[0]`.
+  // puts image tensors first on purpose, so `tensors[0]` is the source's
+  // picture.
   for (const group of groups.values()) {
     group.labelSets.sort((a, b) => a.array_id.localeCompare(b.array_id));
   }

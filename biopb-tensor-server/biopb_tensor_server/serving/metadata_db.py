@@ -545,7 +545,9 @@ class MetadataDatabase:
     Example:
         db = MetadataDatabase()
         db.sync_source_added('plate-001', adapter)
-        table = db.query("SELECT source_id FROM sources WHERE dtype='uint16'")
+        table = db.query(
+            "SELECT source_id FROM sources WHERE tensors[1].dtype = 'uint16'"
+        )
     """
 
     # The public catalog: what the ``catalog`` flight lists and SQL may read.
@@ -742,10 +744,8 @@ class MetadataDatabase:
                 source_id TEXT PRIMARY KEY,
                 source_url TEXT,
                 source_type TEXT,
-                dtype TEXT,
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
-                shape_summary TEXT,
                 -- Does a real, hydrated adapter back this row? Monotonic --
                 -- never flips back to FALSE once TRUE -- which is what makes it
                 -- storable: a stale copy can only lag harmlessly. TRUE default:
@@ -758,11 +758,14 @@ class MetadataDatabase:
                 is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
                 -- Full per-tensor structural info (biopb/biopb#224): one struct
                 -- per tensor, so multi-field / HCS sources are queryable per
-                -- tensor instead of via the first-tensor projection only. Only
-                -- cheap/structural fields (already in the lean ListFlights
-                -- descriptor) are stored here -- the expensive/lazy fields
-                -- (metadata_json, pyramid, physical_scale) are deliberately left
-                -- out, filled only by GetFlightInfo. A single nested column (not a
+                -- tensor. This is the sole home of shape/dtype -- there is no
+                -- scalar projection column -- so a source-wide answer means
+                -- `tensors[1].dtype` (DuckDB is 1-indexed), empty on an
+                -- unresolved source. Only cheap/structural fields
+                -- (already in the lean ListFlights descriptor) are stored
+                -- here -- the expensive/lazy fields (metadata_json, pyramid,
+                -- physical_scale) are deliberately left out, filled only by
+                -- GetFlightInfo. A single nested column (not a
                 -- child table) keeps the whole row a single-statement upsert, so
                 -- shrinking a source's tensor set can't leave ghost rows and a
                 -- read never straddles a torn sources-tensors join. Unresolved
@@ -1159,16 +1162,6 @@ class MetadataDatabase:
         catalog = catalog_tensors(adapter)
         metadata = adapter.get_metadata()
 
-        # Scalar first-tensor projection, kept for back-compat: the MCP guide's
-        # `WHERE dtype='uint16'` / `shape_summary` predicates keep working, and
-        # since they are written in the SAME upsert as the tensors struct below
-        # they can never desync from it.
-        shape_summary = None
-        dtype = None
-        if catalog:
-            shape_summary = json.dumps(list(catalog[0].shape))
-            dtype = catalog[0].dtype
-
         # Full per-tensor structural info (biopb/biopb#224): one struct per
         # tensor, not just tensors[0]. Expensive/lazy fields (metadata_json,
         # pyramid, physical_scale) are omitted -- they belong to the
@@ -1258,18 +1251,16 @@ class MetadataDatabase:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, dtype, indexed_at,
-                 metadata_json, shape_summary, is_resolved, tensors)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (source_id, source_url, source_type, indexed_at,
+                 metadata_json, is_resolved, tensors)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     source_id,
                     source_url,
                     source_type,
-                    dtype,
                     indexed_at,
                     metadata_json,
-                    shape_summary,
                     is_resolved,
                     tensors,
                 ],

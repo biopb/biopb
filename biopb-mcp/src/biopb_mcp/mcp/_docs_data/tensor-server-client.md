@@ -19,18 +19,19 @@ else:
 ## Browse Sources
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
-# The sources table columns: source_id, source_url, source_type, dtype,
-# indexed_at, metadata_json, shape_summary, is_resolved, and `tensors`
-# (a LIST of STRUCT(array_id, dim_labels, shape, dtype) -- one per tensor;
-# `dtype`/`shape_summary` are just the first-tensor projection).
+# The sources table columns: source_id, source_url, source_type,
+# indexed_at, metadata_json, is_resolved, and `tensors`
+# (a LIST of STRUCT(array_id, dim_labels, shape, dtype) -- one per tensor).
+# Shape and dtype live in `tensors` only: a source can hold many, so there is
+# no source-wide answer to ask for.
 # The catalog is structural: the transfer grid a tensor is delivered on is not
 # stored here -- `client.get_descriptor(array_id).chunk_shape` answers it.
 df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
 print(df)
 
 # Per-tensor queries (multi-field / HCS sources): use the nested `tensors`
-# column with UNNEST or list_filter -- the scalar dtype/shape_summary only
-# describe tensors[0].
+# column with UNNEST or list_filter. `tensors[1]` is the source's first tensor,
+# which for an image source is its picture (DuckDB lists are 1-indexed).
 client.query_sources(  # every tensor, one row each
     "SELECT source_id, t.array_id, t.shape, t.dtype "
     "FROM sources, UNNEST(tensors) AS u(t)", format="pandas")
@@ -76,10 +77,10 @@ source may need to fetch on first read — slow, and impossible offline — and 
 for it: warn the user before a long read rather than after it, and crop or warm
 rather than reaching for the whole thing.
 
-**Filter footgun:** an unresolved source has NULL `dtype`/`shape_summary`, so
-`query_sources("... WHERE dtype='uint8'")` silently drops it — hidden for being
-unresolved, not for failing to match. `WHERE NOT is_resolved` is how you ask for
-them on purpose.
+**Filter footgun:** an unresolved source has an empty `tensors`, so
+`query_sources("... WHERE tensors[1].dtype = 'uint8'")` silently drops it —
+hidden for being unresolved, not for failing to match. `WHERE NOT is_resolved`
+is how you ask for them on purpose.
 
 ## Loading a tensor
 

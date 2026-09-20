@@ -118,7 +118,10 @@ class TestConcurrentAccess:
                 if thread_id % 3 == 0:
                     sql = "SELECT source_id FROM sources WHERE source_type='ome-zarr' LIMIT 10"
                 elif thread_id % 3 == 1:
-                    sql = "SELECT source_id, dtype FROM sources WHERE dtype='uint16' LIMIT 10"
+                    sql = (
+                        "SELECT source_id, tensors[1].dtype FROM sources "
+                        "WHERE tensors[1].dtype = 'uint16' LIMIT 10"
+                    )
                 else:
                     sql = "SELECT COUNT(*) FROM sources"
 
@@ -295,8 +298,8 @@ class TestQueryComplexity:
                 SELECT source_id, source_url
                 FROM sources
                 WHERE source_type='ome-zarr'
-                  AND dtype='uint16'
-                  AND shape_summary LIKE '%512%'
+                  AND tensors[1].dtype = 'uint16'
+                  AND list_contains(tensors[1].shape, 512)
                 LIMIT 500
             """
             result = db.query(sql)

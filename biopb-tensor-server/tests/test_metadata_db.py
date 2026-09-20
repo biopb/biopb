@@ -116,17 +116,20 @@ class TestSourceSync:
         db.sync_source_added("plate-001", adapter)
 
         conn = db._get_connection()
-        result = conn.execute(
-            "SELECT * FROM sources WHERE source_id='plate-001'"
+        row = conn.execute(
+            "SELECT source_url, source_type, metadata_json, tensors "
+            "FROM sources WHERE source_id='plate-001'"
         ).fetchone()
 
-        assert result is not None
-        assert result[0] == "plate-001"
-        assert result[1] == "/data/plate.ome.zarr"
-        assert result[2] == "ome-zarr"
-        assert result[3] == "uint16"
-        assert result[5] is not None  # metadata_json
-        assert result[6] == "[512, 512, 64]"  # shape_summary
+        assert row is not None
+        source_url, source_type, metadata_json, tensors = row
+        assert source_url == "/data/plate.ome.zarr"
+        assert source_type == "ome-zarr"
+        assert metadata_json is not None
+        # Shape and dtype live in `tensors` and nowhere else.
+        assert [(t["shape"], t["dtype"]) for t in tensors] == [
+            ([512, 512, 64], "uint16")
+        ]
 
     def test_sync_numpy_types(self):
         """Test that numpy scalar types are serialized correctly."""
@@ -347,20 +350,24 @@ class TestPerTensorCatalog:
         ).fetchall()
         assert rows == [("hcs",)]
 
-    def test_scalar_projection_still_first_tensor(self):
-        """The back-compat scalar dtype/shape_summary stay the first-tensor
-        projection, written in the same upsert so they can't desync."""
+    def test_there_is_no_scalar_projection(self):
+        """The scalar `dtype` / `shape_summary` columns are gone: they described
+        tensors[0] only, and `tensors[1]` says the same thing."""
         db = MetadataDatabase()
         db.sync_source_added(
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
         )
         conn = db._get_connection()
-        dtype, shape_summary = conn.execute(
-            "SELECT dtype, shape_summary FROM sources WHERE source_id='hcs'"
+        with pytest.raises(duckdb.BinderException):
+            conn.execute("SELECT dtype, shape_summary FROM sources")
+
+        dtype, shape = conn.execute(
+            "SELECT tensors[1].dtype, tensors[1].shape FROM sources "
+            "WHERE source_id='hcs'"
         ).fetchone()
-        assert dtype == "uint16"  # tensors[0]
-        assert shape_summary == "[512, 512]"
+        assert dtype == "uint16"
+        assert shape == [512, 512]
 
     def test_no_tensors_is_empty_list(self):
         """An unresolved (no-tensor) source stores an empty list, so per-tensor
@@ -733,7 +740,8 @@ class TestSQLValidation:
 
         db._validate_query("SELECT * FROM sources")
         db._validate_query(
-            "SELECT source_id, source_type FROM sources WHERE dtype='uint16'"
+            "SELECT source_id, source_type FROM sources "
+            "WHERE tensors[1].dtype = 'uint16'"
         )
 
     def test_validate_forbidden_insert(self):
@@ -937,13 +945,13 @@ class TestNoResidencyColumn:
     """There is no residency column, and registration never asks for one.
 
     `is_resolved` carries what #110 added `data_resident` for -- keeping a
-    NULL-dtype cloud source filterable -- and can be stored, being monotonic
+    tensor-less cloud source filterable -- and can be stored, being monotonic
     (biopb/biopb#1035).
     """
 
     class _UnresolvedAdapter:
-        """A cloud / synced-folder source catalogued by URL only: no tensors
-        (so NULL dtype/shape_summary) and not resident until resolved."""
+        """A cloud / synced-folder source catalogued by URL only: no tensors,
+        and not resident until resolved."""
 
         def __init__(self, source_id, source_url):
             self.source_id = source_id
@@ -962,7 +970,7 @@ class TestNoResidencyColumn:
             return False
 
         def list_tensor_descriptors(self):
-            return []  # no tensors -> NULL dtype / shape_summary
+            return []  # nothing to say about shape or dtype yet
 
         def get_metadata(self):
             return {}
@@ -1007,7 +1015,7 @@ class TestNoResidencyColumn:
         conn = db._get_connection()
 
         by_dtype = conn.execute(
-            "SELECT source_id FROM sources WHERE dtype='uint8'"
+            "SELECT source_id FROM sources WHERE tensors[1].dtype = 'uint8'"
         ).fetchall()
         assert [r[0] for r in by_dtype] == ["local-1"]
 

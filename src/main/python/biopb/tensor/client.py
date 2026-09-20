@@ -247,7 +247,8 @@ class TensorFlightClient:
         constructed without a metadata database rejects the query.
 
         Args:
-            sql: SQL query (e.g., "SELECT source_id, source_type FROM sources WHERE dtype='uint16'")
+            sql: SQL query (e.g., "SELECT source_id, source_type FROM sources
+                WHERE tensors[1].dtype = 'uint16'")
             format: Shape of the returned result:
 
                 - ``"arrow"`` (default) — a ``pyarrow.Table``. This is the
@@ -260,8 +261,8 @@ class TensorFlightClient:
         Returns:
             The query result in the requested ``format``; an empty query
             returns an empty object of that same type. For ``"pandas"`` and
-            ``"records"`` the usual Arrow->Python coercion applies (list
-            columns such as ``shape_summary`` become Python lists / object
+            ``"records"`` the usual Arrow->Python coercion applies (nested
+            columns such as ``tensors`` become Python lists of dicts / object
             dtype, and nullable integer columns may widen to float). For
             ``"pandas"``, NULLs in string columns (e.g. ``metadata_json``) are
             normalized to ``None`` rather than the truthy float ``NaN`` Arrow

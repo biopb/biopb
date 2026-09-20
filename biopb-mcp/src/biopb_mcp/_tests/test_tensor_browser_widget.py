@@ -1378,8 +1378,8 @@ class TestGroupTensors:
         assert [s.array_id for s in groups[1].label_sets] == ["src0/B/labels/nuclei"]
 
     def test_images_keep_the_order_the_server_listed_them(self):
-        # The catalog's scalar dtype/shape_summary describe tensors[0], so the
-        # server puts image tensors first on purpose.
+        # The server puts image tensors first on purpose: tensors[0] is the
+        # source's picture.
         groups = self._group("src0/Z", "src0/A")
         assert [g.image.array_id for g in groups] == ["src0/Z", "src0/A"]
 
