@@ -266,13 +266,21 @@ class SourceAdapter(ABC):
     _capability_token: Optional[str] = None
 
     # Optional content-version token (biopb/biopb#178). When set, it is folded
-    # into every chunk_id this source mints (via ``get_read_plan``) and hence into
+    # into every chunk_id this adapter mints (via ``get_read_plan``) and hence into
     # the cache key, so a re-registered source with new bytes gets a fresh cache
     # namespace instead of serving stale cached chunks. None (the base default,
     # like ``capability_token``) means "unversioned" -- the pre-#178 behavior, and
     # byte-identical chunk_ids / cache keys -- so an adapter opts in only when it
     # has a cheap, reliable change signal (e.g. a local file's stat signature).
     # An opaque token: the codec never interprets it, only namespaces by it.
+    #
+    # Declared here because a source is the usual owner of a content lifetime,
+    # but the value is per TENSOR: a source's tensors inherit it only while their
+    # bytes are the source's. A tensor whose bytes live elsewhere carries its own
+    # (an uploaded label set, ``adapters/labels.py``), and a tensor reading out of
+    # the source file keeps the source's (a discovered NGFF set does). So read it
+    # off the adapter that serves the bytes, never off the source the array_id
+    # happens to name.
     _content_version: Optional[bytes] = None
 
     # Display-only override for the catalog ``source_url`` (the descriptor field
@@ -348,8 +356,12 @@ class SourceAdapter(ABC):
 
     @property
     def content_version(self) -> Optional[bytes]:
-        """Opaque content-version token folded into this source's chunk_ids, or
-        None when the source is unversioned (see ``_content_version``)."""
+        """Opaque content-version token folded into this adapter's chunk_ids, or
+        None when its content is unversioned (see ``_content_version``).
+
+        The version of the bytes THIS adapter serves, which for a multi-tensor
+        source is not always the source's own -- see ``_content_version``.
+        """
         return self._content_version
 
     def check_chunk_version(self, chunk_id: bytes) -> None:

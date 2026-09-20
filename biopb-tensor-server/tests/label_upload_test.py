@@ -15,10 +15,13 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow.flight as flight
 import pytest
+from biopb.tensor.ticket_pb2 import TensorTicket
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, upload_state
 from biopb_tensor_server.core.adapter_base import catalog_tensors
+from biopb_tensor_server.core.chunk import content_version_of
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
@@ -349,3 +352,53 @@ class TestTheSweep:
             assert not store.exists()
         finally:
             fresh.shutdown()
+
+
+class TestContentVersion:
+    """What the descriptor publishes is what the tickets were minted with.
+
+    An uploaded set's bytes are its own -- they live in the sidecar store, not
+    in the image file, which a set arriving never touches. So it carries its
+    own ``content_version`` (biopb/biopb#178), and the copy published on the
+    descriptor (biopb/biopb#780) has to be that one and not the image's: they
+    are one signal, and a consumer namespacing a cache it cannot key by
+    chunk_id is keying it by the published form.
+    """
+
+    def _minted(self, client, array_id):
+        """The content_version the read plan's chunk_ids carry."""
+        info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
+        return {
+            content_version_of(TensorTicket.FromString(endpoint.ticket.ticket).chunk_id)
+            for endpoint in info.endpoints
+        }
+
+    def test_a_set_publishes_its_own_version_not_its_image_s(self, served, client):
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+
+        image = client.get_descriptor("oz1").content_version
+        labels = client.get_descriptor("oz1/labels/nuclei").content_version
+
+        assert image and labels
+        assert labels != image
+
+    @pytest.mark.parametrize("array_id", ["oz1", "oz1/labels/nuclei"])
+    def test_the_published_version_is_the_minted_one(self, served, client, array_id):
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+
+        published = client.get_descriptor(array_id).content_version
+        assert self._minted(client, array_id) == {published}
+
+    def test_a_reused_name_publishes_a_new_version(self, served, client):
+        """``delete_labels``: "the next set uploaded under it is a distinct
+        tensor with its own cache namespace". The image file is untouched by
+        both uploads, so an image-derived version could not say so."""
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        first = client.get_descriptor("oz1/labels/nuclei").content_version
+        client.delete_labels("oz1/labels/nuclei")
+
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        second = client.get_descriptor("oz1/labels/nuclei").content_version
+
+        assert first != second
+        assert client.get_descriptor("oz1").content_version  # unmoved either way

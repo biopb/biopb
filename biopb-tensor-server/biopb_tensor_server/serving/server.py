@@ -1708,8 +1708,14 @@ class TensorFlightServer(flight.FlightServerBase):
             # it to decide whether a cache entry is still valid, and this call is
             # fetch-per-call by contract while a listing is a natural thing to
             # cache. None stays unset -- absent is "no claim", not "unchanged".
-            if source_adapter is not None and source_adapter.content_version:
-                read_plan.descriptor.content_version = source_adapter.content_version
+            #
+            # From the TENSOR adapter, which is what minted the chunk_ids in this
+            # same reply. Reading the source's instead published the parent
+            # image's version for an uploaded label set, whose bytes are its own
+            # (``adapters/labels.py``) -- the one signal and its published form
+            # disagreeing about the same tensor.
+            if tensor_adapter.content_version:
+                read_plan.descriptor.content_version = tensor_adapter.content_version
 
             # Populate metadata_json in response descriptor if requested
             if METADATA_JSON in mask:
