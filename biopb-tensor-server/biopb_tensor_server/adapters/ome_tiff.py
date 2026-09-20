@@ -863,11 +863,19 @@ class OmeTiffAdapter(TensorAdapter):
         if reduced is not None and self._mask_payloads_transferred:
             # The label adapters have already copied the decoded mask bytes.
             # Retaining either the base64 XML or the parsed dict would duplicate
-            # a potentially very large payload for the source lifetime.
-            reduced = _strip_mask_bindata_payloads(reduced)
-            self._reduced_ome_xml = reduced
-            self._parsed_metadata = None
-            self._parsed_metadata_probed = False
+            # a potentially very large payload for the source lifetime. This
+            # method must never raise (docstring above), so a reduced XML the
+            # stdlib parser rejects is left un-redacted rather than aborting the
+            # release below and the cascade to every scene -- worse for memory
+            # on that one source, not a correctness problem.
+            try:
+                reduced = _strip_mask_bindata_payloads(reduced)
+            except ET.ParseError:
+                logger.debug("could not redact mask payloads", exc_info=True)
+            else:
+                self._reduced_ome_xml = reduced
+                self._parsed_metadata = None
+                self._parsed_metadata_probed = False
         if self._raw_ome_xml is not None:
             self._raw_ome_xml = None
             self._raw_ome_xml_released = True

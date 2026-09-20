@@ -344,6 +344,39 @@ class TestFastMetadataRealBitmap:
         mask_after_release = metadata_after_release["rois"][0]["union"]["masks"][0]
         assert mask_after_release["bin_data"]["value"] == ""
 
+    def test_release_survives_a_reduced_xml_the_stripper_cannot_parse(
+        self, tmp_path, monkeypatch
+    ):
+        """release_registration_cache() is documented to never raise. A reduced
+        XML the mask stripper's ET.fromstring rejects must not abort the raw-XML
+        drop or the cascade to scene adapters below it -- it is left un-redacted
+        instead (biopb/biopb#1081)."""
+        import xml.etree.ElementTree as ET
+
+        import biopb_tensor_server.adapters.ome_tiff as ome_tiff_module
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        raw_bitmap = np.zeros((4, 4), dtype=np.uint8)
+        raw_bitmap[1:3, 1:3] = 1
+        raw = np.packbits(raw_bitmap.flatten(), bitorder="big").tobytes()
+        path = self._write(tmp_path, raw)
+        adapter = OmeTiffAdapter(path, "src1")
+        adapter.get_embedded_labels()  # sets _mask_payloads_transferred
+
+        def _broken_strip(ome_xml):
+            raise ET.ParseError("boom")
+
+        monkeypatch.setattr(
+            ome_tiff_module, "_strip_mask_bindata_payloads", _broken_strip
+        )
+
+        adapter.release_registration_cache()  # must not raise
+
+        assert adapter._raw_ome_xml is None
+        assert adapter._raw_ome_xml_released is True
+        # Left un-redacted: the strip that would have dropped it never ran.
+        assert base64.b64encode(raw).decode("ascii") in adapter._reduced_ome_xml
+
     def test_get_metadata_parses_the_ome_xml_only_once(self, tmp_path, monkeypatch):
         """get_embedded_labels() calls get_metadata() internally, and so does
         the registration path (metadata_db.py) -- the parsed dict is cached so
