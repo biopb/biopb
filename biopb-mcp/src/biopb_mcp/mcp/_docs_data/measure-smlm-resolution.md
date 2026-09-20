@@ -5,7 +5,7 @@ description: Run single molecule localization on an SMLM/STORM/PALM blinking sta
 
 # Localize an SMLM stack and measure a resolution you can quote
 
-**Requirements:** the napari viewer, an image from `client`, dask, the `image_resolution` kernel plugin.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask, the `image_resolution` kernel plugin.
 
 Numbers below are measured and marked. **PAINT** is a real 40 000-frame
 acquisition from the catalog (364x500, ~100 spots/frame, ~4 million fits).
@@ -101,7 +101,7 @@ may claim for it.
 
    `frc_from_localizations` builds its own counts render, so hand it the list,
    not your display image. Report the localization count and median CRLB with
-   the picture, never a screenshot alone.
+   the picture, never the picture alone.
 
 5. **Measure the resolution — and the split is the measurement.** A localization
    list is not a bag of independent samples: one fluorophore blinks many times

@@ -9,6 +9,10 @@ Three places hold pixels here, and they are **not interchangeable**. Treating
 them as one is the common source of wrong answers — a plain-napari habit that
 breaks because these arrays come off a tensor server, lazily, in a pyramid.
 
+The middle row exists only where the session has a napari window ([[viewer]]).
+Without one, pixels come from the server and from your own variables, and
+showing the user a result means putting it *back* on the server ([[web-viewer]]).
+
 | Source | You get it with | What you get |
 |---|---|---|
 | **Tensor server** | `client.get_tensor(array_id)` | Lazy dask array, **canonical order** `[..., Z, Y, X]` (`S` last for interleaved colour), full resolution |

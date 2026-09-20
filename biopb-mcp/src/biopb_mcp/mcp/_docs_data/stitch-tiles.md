@@ -5,7 +5,7 @@ description: Turn a grid of overlapping tiles into a single continuous image, pl
 
 # Register a grid of overlapping tiles into one mosaic
 
-**Requirements:** the napari viewer, an image from `client`, dask.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask.
 
 ## When to use
 

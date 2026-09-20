@@ -5,7 +5,7 @@ description: Trace the centrelines of filamentous structures in a fluorescence i
 
 # Detect filaments and measure their width
 
-**Requirements:** the napari viewer, an image from `client`.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
 
 The numbers below come from synthetic 2D fields — 512 x 512, twelve curved
 filaments 0.30-0.90 µm wide at 0.1 µm/px, peak SNR 3-30 — except where a
@@ -148,7 +148,7 @@ their width, rather than a foreground mask.
      coverage 12% to 62%, components 11 to 1. Stop at the last cut whose
      coverage is plausible for the structure, and say that you did.
 
-   Then put `mask` on the viewer over `IMAGE` and look at the dim corners
+   Then show `mask` over `IMAGE` and look at the dim corners
    specifically, because that is where the missing filaments are.
 
 7. **Measure the width on the image, never on the mask.** The distance

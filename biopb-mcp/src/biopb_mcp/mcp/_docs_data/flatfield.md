@@ -5,7 +5,7 @@ description: Remove vignetting and shading from a collection of images taken on 
 
 # Correct uneven illumination across a set of tiles or fields
 
-**Requirements:** the napari viewer, an image from `client`, dask.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask.
 
 ## When to use
 
@@ -143,7 +143,7 @@ that was not there.
          f"centre/corner {flat[flat.shape[0] // 2, flat.shape[1] // 2] / flat[0, 0]:.2f}")
    ```
 
-   Put `flat` on the viewer and look at it. It should be **smooth, monotonic
+   Show `flat` and look at it. It should be **smooth, monotonic
    outward from a single bright region, and free of specimen structure**.
 
    Then read the range against **this** optical path rather than against a

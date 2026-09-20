@@ -5,7 +5,7 @@ description: Count the foci, puncta or FISH spots inside every segmented cell an
 
 # Count punctate spots inside each segmented cell
 
-**Requirements:** the napari viewer, an image from `client`.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
 
 ## When to use
 
@@ -59,7 +59,7 @@ brightness but no useful shape — and the answer is a count, not an area.
      foci-negative fraction is usually the readout — and it changes what you
      build in step 6.
 
-   Put the raw channel on the viewer before asking and say what you can see, so
+   Show the raw channel before asking and say what you can see, so
    the person is answering about their own picture.
 
 3. **Subtract the background at the spot scale.** A band-pass keeps what is the
@@ -157,10 +157,11 @@ brightness but no useful shape — and the answer is a count, not an area.
    from 2.00 to 2.50 foci per cell, **25% high**, and reported a foci-negative
    fraction of 0 where the truth was 0.20.
 
-7. **Show the spots and report the distribution** *(visual check)*. Add `peaks`
-   to the viewer as a Points layer over the raw channel and screenshot one
-   crop — the eye is very good at "that is a focus" and very bad at "that is
-   0.42 above threshold". Never the screenshot alone: report the total, the mean
+7. **Show the spots and report the distribution** *(visual check)*. Show `peaks`
+   over the raw channel — a Points layer on [[viewer]], or the foci uploaded as
+   a label set and linked with [[web-viewer]]'s `lb=` — and name one crop. The
+   eye is very good at "that is a focus" and very bad at "that is 0.42 above
+   threshold". Never the picture alone: report the total, the mean
    per cell, the foci-negative fraction, and **how many candidates step 5
    rejected**. That last number is the one that says whether the confirm-input
    answer was used, and a run where it is 0 on a sample that has aggregates has

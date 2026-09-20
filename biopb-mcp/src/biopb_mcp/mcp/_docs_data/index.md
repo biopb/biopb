@@ -10,7 +10,8 @@ one you do not want.
 - kernel: the namespace, kernel plugins, long-running jobs, where a compute runs
 - data: pyramids, laziness, axis order and rank — read before moving pixels
 - client: browse the catalog, load a tensor, upload a result
-- viewer: layers, camera, dims, annotation layers, mouse events
+- web-viewer: show data in the browser — needs no window; send the link, or open it yourself
+- viewer: the napari window, when there is one — layers, camera, dims, mouse events
 - ops: the server-side image-processing ops in `ops`
 
 ## Procedures

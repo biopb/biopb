@@ -37,10 +37,20 @@ none at all. Name the type in the step:
 - **confirm-input** *(blocking, before compute)* — only for facts the data
   cannot give you: voxel spacing, which channel is which, expected object size.
 - **visual check** *(non-blocking)* — after any step that changes how the data
-  is interpreted. Layer to the viewer, screenshot, and report two or three
-  numbers with it. **Never a screenshot alone**: without numbers an agent will
-  call a failed result good. Sessions can be headless and volumes can be huge,
+  is interpreted. Put the result where the user can see it and report two or
+  three numbers with it. **Never a picture alone**: without numbers an agent
+  will call a failed result good, and volumes can be too large to show usefully,
   so every visual check needs a numeric fallback and a stated slice or crop.
+
+  *Where* they see it is the session's, not the doc's: the napari window when
+  there is one ([[viewer]]), otherwise a [[web-viewer]] link. Write the step as
+  "show X" and name the crop and the numbers; do not write it as "add a layer",
+  which is one of the two routes.
+
+  Looking at it *yourself* is a third thing and not a substitute:
+  `take_screenshot` on a napari window, or your host's browser automation on a
+  [[web-viewer]] link. It is what stops you reporting a result you never saw —
+  but the user has to see it too, so a doc says to show it either way.
 - **validate-and-gate** *(blocking)* — immediately before something expensive or
   hard to undo: scaling out over the catalog, a full-volume GPU op, declaring
   numbers final.

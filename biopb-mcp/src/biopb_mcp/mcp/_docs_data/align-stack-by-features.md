@@ -5,7 +5,7 @@ description: Register a stack of serial sections that were each placed independe
 
 # Align serial sections that shifted and turned between slices
 
-**Requirements:** the napari viewer, an image from `client`.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
 
 ## When to use
 
@@ -179,9 +179,10 @@ turns over.
    was measured on, and it is **the only signal that catches a swapped coordinate
    order** (0.34–0.48), which leaves the inlier counts untouched.
 
-   Put `aligned` on the viewer and screenshot an orthogonal (XZ) slice too — a
-   stack that is aligned looks continuous down the cut and a chained section that
-   slipped shows as a step.
+   Show `aligned` cut on an orthogonal (XZ) slice too — a stack that is aligned
+   looks continuous down the cut and a chained section that slipped shows as a
+   step. On [[web-viewer]] that is the uploaded stack with `v=0` and the XZ
+   plane selected; on [[viewer]] it is the ortho view.
 
 7. **Hand back the aligned stack and how each section got its place.** Upload it
    if it is worth keeping — [[data]] covers upload, and pixel spacing does

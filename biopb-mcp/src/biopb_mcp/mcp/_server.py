@@ -175,18 +175,20 @@ elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
     # having seen that message (context cleared, kernel already up).
     print("  display: VIRTUAL (Xvfb " + str(_os.environ.get("DISPLAY", "?")) + ")")
     print("    The user sees NO napari window, and software GL renders 3-D")
-    print("    volumes ~13x slower than a real GPU. TELL THE USER, if you have")
-    print("    not already. Usually the host does have a display and the MCP")
-    print("    client dropped $DISPLAY on the way in (Codex CLI does) — ask")
-    print("    whether they sit at a desktop on this machine before treating")
-    print("    the host as headless.")
+    print("    volumes ~13x slower than a real GPU. Show results through the")
+    print("    web viewer instead (## Web viewer above) — it needs no display")
+    print("    here and is what the user can actually look at.")
+    print("    Say so once, and ask: usually the host does have a display and")
+    print("    the MCP client dropped $DISPLAY on the way in (Codex CLI does),")
+    print("    in which case a restart with it set gives them a real window.")
 else:
     print("  display: " + str(
         _os.environ.get("DISPLAY") or _os.environ.get("WAYLAND_DISPLAY") or "?"
     ))
 if not _viewer_window_alive():
     print("  window: CLOSED — the napari window was closed; layer mutations")
-    print("    won't display. Data/compute still work; restart_kernel to restore.")
+    print("    won't display. Data/compute still work; restart_kernel to restore,")
+    print("    or show results through the web viewer, which needs no window.")
     print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
 else:
     print("  window: open")
@@ -476,6 +478,23 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
             f"poll_job('{job_id}')."
         )
     return "\n".join(lines)
+
+
+def _viewer_base_url() -> str:
+    """The control's origin, which is where the web viewer is served.
+
+    Resolved per call because the port is configurable and a control that
+    restarts elsewhere republishes it. A control published below the root
+    (``--url-prefix``) still answers here; what carries the prefix is the URL
+    the *user's* browser reaches it by, which nothing in this process can know.
+    """
+    try:
+        from biopb._endpoints import control_base_url
+
+        return control_base_url()
+    except Exception:  # pragma: no cover - core SDK always present in practice
+        logger.debug("status: control base url unresolvable", exc_info=True)
+        return "http://127.0.0.1:8813"
 
 
 def _format_job_status(snap: dict) -> str:
@@ -1150,15 +1169,17 @@ async def start_kernel() -> str:
         display = host.virtual_display
         if display:
             ready += (
-                "\n\nWARNING: no display was detected, so the viewer is on a "
-                f"virtual one (Xvfb {display}). Screenshots work, but the "
+                "\n\nWARNING: no display was detected, so the napari window is "
+                f"on a virtual one (Xvfb {display}). Screenshots work, but the "
                 "window is invisible to the user and software GL renders 3-D "
                 "volumes ~13x slower than a real GPU.\n"
                 "TELL THE USER THIS NOW, before doing any work: no napari "
-                "window will appear for them. Usually the host does have a "
-                "display and their MCP client dropped $DISPLAY on the way in "
-                "(Codex CLI does this) — so ask whether they are at a desktop "
-                "on this machine before treating the host as headless."
+                "window will appear for them. Show results through the web "
+                "viewer instead — server_status has its URL, and it needs no "
+                "display on this machine. Usually the host does have one and "
+                "their MCP client dropped $DISPLAY on the way in (Codex CLI "
+                "does this) — so ask whether they are at a desktop here before "
+                "treating the host as headless."
             )
         return ready
     return (
@@ -1259,6 +1280,17 @@ async def server_status() -> str:
         lines.append(f"  mode: {obs['mode']}")
     else:
         lines.append("  status: not running (observe.enabled off or failed to start)")
+    lines.append("")
+
+    # The display surface that does not need this session to have one. Reported
+    # rather than probed: the control serves the page *and* this session's data
+    # plane, so "## Tensor Server: connected" already answers whether it is up,
+    # and a probe here would put a network round trip on every status call.
+    lines.append("## Web viewer")
+    lines.append(f"  url: {_viewer_base_url()}/viewer?id=<array_id>")
+    lines.append("    Served by the control. Works with no napari window; shows")
+    lines.append("    what is in the catalog, so a result has to be uploaded")
+    lines.append('    first. read_doc("web-viewer") has the parameters.')
     lines.append("")
 
     # Where a doc the agent writes lands. Server-process state (the store is

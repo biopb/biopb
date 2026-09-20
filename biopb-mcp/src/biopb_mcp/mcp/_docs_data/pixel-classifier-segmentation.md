@@ -5,7 +5,7 @@ description: Train a classifier on a few hand-drawn scribbles and label every pi
 
 # Segment by training a pixel classifier on scribbles
 
-**Requirements:** the napari viewer, an image from `client`.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
 
 **Every number below is synthetic** — a 640 x 640 three-class field, two
 acquisitions of it, and about 4000 scribbled pixels. The two large classes have

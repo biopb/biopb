@@ -5,7 +5,7 @@ description: Report object areas, volumes, and diameters in microns instead of p
 
 # Measure labeled objects in physical units, not pixels
 
-**Requirements:** the napari viewer, an image from `client`, dask.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask.
 
 ## When to use
 

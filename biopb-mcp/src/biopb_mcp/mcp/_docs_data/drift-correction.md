@@ -6,7 +6,7 @@ packages: [pystackreg~=0.2.8]
 
 # Correct stage drift in a time series before measuring
 
-**Requirements:** the napari viewer, an image from `client`, dask; the `pystackreg~=0.2.8` package.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, dask; the `pystackreg~=0.2.8` package.
 
 ## When to use
 

@@ -1,9 +1,16 @@
 ---
 kind: reference
-description: Viewer operations: layers, camera, dims, display, annotation layers.
+description: The napari window, where the session has one — layers, camera, dims, annotation layers.
 ---
 
 # Viewer Operations
+
+**This is the napari window, and a session need not have one.** It is the
+display surface that can show an array without uploading it, and the one
+`take_screenshot` captures — but it needs a display, and a headless session or a
+closed window has none. `server_status`'s `## Viewer` says which you are
+in; [[web-viewer]] is the route that works either way. Everything below assumes
+a window.
 
 **Threading:** the `viewer` is thread-safe — every mutation (layer properties,
 `viewer.dims`, `viewer.layers.remove()`, `viewer.camera`, the `add_*()` family)

@@ -319,6 +319,18 @@ class TestInstructions:
         # for a doc the agent cannot then write.
         assert "write_doc" not in base
 
+    def test_the_handshake_does_not_promise_a_napari_window(self):
+        """napari is one of two display surfaces and a session need not have it,
+        so the always-on guidance must not be written as though it does -- an
+        agent that believes there is a window reports a visual check nobody
+        could see."""
+        base = _app._BASE_INSTRUCTIONS
+        assert "server_status" in base
+        # The guardrail names the route that works either way.
+        assert "web-viewer" in base
+        # And does not make `viewer` the only place a result can go.
+        assert "Put intermediate results back on `viewer`" not in base
+
     def test_module_default_mirrors_config_default(self):
         # The launcher always sets this from config, but the module literal is a
         # restated default -- pin it, since that is how it diverged once before.
@@ -1311,6 +1323,9 @@ class TestStartKernel:
         assert "Kernel ready" in result  # still the success path
         assert ":2" in result
         assert "TELL THE USER" in result
+        # And names the surface that still works, so "no window" is a change of
+        # route rather than a dead end.
+        assert "web viewer" in result
 
     def test_virtual_display_is_not_reported_on_the_failure_path(
         self, server_with_host
@@ -1408,6 +1423,40 @@ class TestServerStatus:
         result = _tool(_server.server_status)
         assert "## Observe" in result
         assert "/api" in result
+
+    def test_reports_the_web_viewer_without_a_kernel(self, monkeypatch):
+        """The display surface that does not need this session to have one, so
+        it is reported like Observe: server-process state, no kernel needed."""
+        _app._kernel_host = None
+        result = _tool(_server.server_status)
+        assert "## Web viewer" in result
+        assert "/viewer?id=" in result
+        # Where the parameters live, rather than a copy of them here.
+        assert 'read_doc("web-viewer")' in result
+
+    def test_the_web_viewer_url_follows_a_moved_control(
+        self, server_with_host, monkeypatch
+    ):
+        """The port is configurable, so it is resolved per call rather than
+        written out -- a hard-coded 8813 is wrong on any moved control."""
+        monkeypatch.setattr(_server, "_viewer_base_url", lambda: "http://host:9999")
+        assert "http://host:9999/viewer?id=" in _tool(_server.server_status)
+
+    def test_the_web_viewer_is_reported_without_probing_the_control(
+        self, server_with_host, monkeypatch
+    ):
+        """server_status is called often, and the control serves this session's
+        data plane too -- so `## Tensor Server` already answers whether it is
+        up, and a round trip here would be latency for nothing."""
+        import urllib.request
+
+        def explode(
+            *a, **k
+        ):  # pragma: no cover - the assertion is that it is not called
+            raise AssertionError("server_status probed the control")
+
+        monkeypatch.setattr(urllib.request, "urlopen", explode)
+        assert "## Web viewer" in _tool(_server.server_status)
 
     def test_starting_kernel_skips_query(self, server_with_host):
         # Kernel still booting (launcher serves the handshake first): report the

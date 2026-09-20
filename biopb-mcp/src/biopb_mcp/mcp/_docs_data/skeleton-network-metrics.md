@@ -6,7 +6,7 @@ packages: [skan~=0.13.1, networkx~=3.4]
 
 # Measure the length and branching of a segmented filament network
 
-**Requirements:** the napari viewer; the `skan~=0.13.1` and `networkx~=3.4` packages.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]); the `skan~=0.13.1` and `networkx~=3.4` packages.
 
 ## When to use
 
@@ -60,8 +60,8 @@ whole measurement rests on.
    as counts, and say in the hand-off which you did.
 
 2. **Ask about the sample** *(confirm-input, blocking)*. One question, three
-   facts, none of them in a boolean mask. Put the mask on the viewer before
-   asking, and say what you can see.
+   facts, none of them in a boolean mask. Show the mask before asking, and say
+   what you can see.
 
    - **What is the voxel size, in each axis separately?** This is the fact the
      answer scales with. If nobody knows, stop and say the length cannot be
@@ -184,9 +184,9 @@ whole measurement rests on.
    Merging on a *physical* distance is what makes the count independent of how
    finely the stack was sampled.
 
-8. **Look at it, and report the numbers together** *(visual check)*. Put the
-   skeleton on the viewer over the mask and screenshot one crop. Never the
-   screenshot alone — report `total_length_um`, `n_branches`, `n_junctions`,
+8. **Look at it, and report the numbers together** *(visual check)*. Show the
+   skeleton over the mask, one named crop. Never the picture alone — report
+   `total_length_um`, `n_branches`, `n_junctions`,
    `n_pieces`, **how many spurs step 5 dropped**, and `DIAMETER`.
 
    Those last two say whether the procedure ran as intended. A spur count of 0

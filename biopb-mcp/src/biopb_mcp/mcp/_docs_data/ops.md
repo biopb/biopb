@@ -20,5 +20,5 @@ Call signature: `ops["name"](image, dim_labels=None, **kwargs)`
 ```python
 labels = ops["cellpose_cyto2"](arr)          # ndarray -> ndarray
 seg_id = ops["cellpose_cyto2"]("raw_data_id") # id -> id (lazy, large data)
-viewer.add_tensor(seg_id)                    # view the result
+viewer.add_tensor(seg_id)                    # view it, where there is a window
 ```

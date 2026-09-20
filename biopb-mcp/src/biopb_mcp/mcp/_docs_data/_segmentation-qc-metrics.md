@@ -5,7 +5,7 @@ description: Compare a segmentation to ground truth and report F1 at matched IoU
 
 # Score an instance segmentation against ground truth
 
-**Requirements:** the napari viewer, an image from `client`, the `segmentation_qc` kernel plugin.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`, the `segmentation_qc` kernel plugin.
 
 > **Not listed by default.** Eight benchmark arms have run this subject and all
 > eight passed — three that read this body and used `segmentation_qc`, five that
@@ -126,10 +126,10 @@ measurement made from it.
 
 5. **Visual check** *(non-blocking)*. Put the disagreement on screen, not just
    the score — the numbers say how much is wrong, the overlay says what kind.
-   Layer truth and prediction together with `blending="additive"`, screenshot one
-   stated slice or crop, and report F1@0.5, F1@0.8, and the split/merge counts
-   beside it. Never the screenshot alone: two label layers look similar at a
-   glance at almost any F1.
+   Show truth and prediction together — `blending="additive"` on [[viewer]], or
+   the two uploaded and opened one after the other — name the slice or crop, and
+   report F1@0.5, F1@0.8, and the split/merge counts beside it. Never the
+   picture alone: two label images look similar at a glance at almost any F1.
 
 6. **Validate-and-gate** *(blocking)* before scaling out. Scoring one field is
    cheap; scoring a whole catalog, or re-running a GPU segmentation with new

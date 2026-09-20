@@ -5,7 +5,7 @@ description: Turn the donor, acceptor and FRET channels of a biosensor experimen
 
 # Compute a corrected FRET ratio that is comparable between conditions
 
-**Requirements:** the napari viewer, an image from `client`.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
 
 Numbers below come from two places and are marked. **TIRF** is a real
 dual-camera molecular-tension-sensor acquisition — donor and acceptor imaged
@@ -167,8 +167,8 @@ between cells, fields or conditions.
      biology backwards. Do not require the correlation to vanish: on the same
      field the correctly corrected ratio was rank-correlated with donor intensity
      at **-0.41**, because real biology varies with expression level.
-8. **Hand off with the picture and the numbers.** Put the ratio on the viewer
-   over the donor channel with a fixed contrast range, and give the median and
+8. **Hand off with the picture and the numbers.** Show the ratio over the donor
+   channel with a fixed contrast range, and give the median and
    inter-quartile range **per condition, inside the mask**, the two coefficients
    used, and the registration residual. Never a statistic over the whole ratio
    image: outside the cell it is noise over noise, TIRF p99 of 14.6 against an

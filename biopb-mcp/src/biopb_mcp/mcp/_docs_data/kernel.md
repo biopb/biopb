@@ -7,22 +7,26 @@ description: The kernel: namespace, plugins, long-running jobs, where computes r
 
 **Operation Guardrails** are in session `instructions`. Apply on every turn — follow them throughout.
 
-Kernel is the main execution context for the agent. It is a live Python interpreter with a napari
-viewer window, and it has access to the TensorFlightClient for browsing and retrieving image data.
-The kernel is **stateful**: variables, imports, and viewer state persist across turns. Agent code
-runs in a background thread to keep the main Qt thread responsive.
+Kernel is the main execution context for the agent. It is a live Python interpreter with access to
+the TensorFlightClient for browsing and retrieving image data, and — where the session has a
+display — a napari viewer window. The kernel is **stateful**: variables, imports, and viewer state
+persist across turns. Agent code runs in a background thread to keep the main Qt thread responsive.
+
+**There are two ways to show the user an image**, and which ones this session has is a fact about
+the session, not about the work: the napari window ([[viewer]]) and the browser page the control
+serves ([[web-viewer]]). `server_status` says which. Do not assume a window exists.
 
 ## Namespace
 
 | Name | Type | Description |
 |------|------|-------------|
 | `client` | TensorFlightClient or None | Connection to the data server for browsing/retrieving image data. Marshaled and thread-safe. |
-| `viewer` | napari.Viewer | The active viewer instance that user sees and manipulates. `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array |
+| `viewer` | napari.Viewer | The napari window, where the session has one. `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array. Check `## Viewer` in `server_status` before relying on anything being *seen* — the object is bound even when nothing is on screen |
 | `np/da` | module | imported packages: numpy and dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
 | `run_on_main` | callable | runs `fn` on the Qt main thread and returns its result. Use it to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
 
-- The `viewer` is a live napari window, made **thread-safe** by marshaling known
+- The `viewer` is a napari window, made **thread-safe** by marshaling known
   mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
   the `add_*()` family, …) to the Qt main thread. One caveat: raw Qt (`viewer.window`)
   still requires the main thread — off-thread access raises a clear error, so wrap it in
@@ -212,11 +216,13 @@ uv-managed, say so and name `~/.config/biopb/extra-packages.txt`: the install
 lands now but is gone at the next biopb upgrade unless the requirement is in
 that file.
 
-**The viewer — two different failures.** *Headless* means no window exists this
-session: run the numeric checks and report numbers, never a screenshot.
-*`window: CLOSED`* means data and compute still work but nothing displays;
-`restart_kernel` restores it (ask — layers are lost). Neither is a reason to stop
-if the results are numbers.
+**The viewer.** `## Viewer` says whether there is a window on screen. *Headless*
+means there is none this session; *`window: CLOSED`* means the user closed it,
+and `restart_kernel` restores it (ask — layers are lost). Neither is a reason to
+stop, and neither means the result cannot be seen: upload it and send a
+[[web-viewer]] link, which does not depend on this session having a display at
+all. What you lose is `take_screenshot` — unless your host gives you browser
+automation, in which case you open that link and look at it yourself.
 
 **The data plane.** `## Tensor Server` names the cause (not connected / auth /
 still starting). Check `biopb control status` with the user, or point at

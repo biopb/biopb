@@ -6,7 +6,7 @@ packages: [laptrack~=0.17.1]
 
 # Track segmented objects through a time-lapse
 
-**Requirements:** the napari viewer, an image from `client`; the `laptrack~=0.17.1` package.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`; the `laptrack~=0.17.1` package.
 
 ## When to use
 
@@ -181,9 +181,9 @@ where it was missed, and keeps lineage where cells divide.
    toward the spacing this degrades — at 2.9× it holds 73.8% of links and no
    cutoff recovers the rest, which is the boundary the `METRIC` row is about.
 
-7. **Report the tracks and the settings.** `viewer.add_tracks` wants one row per
-   detection as `[track_id, t, y, x]` — id first, not the order of the table you
-   have been carrying. Print the dict that reproduces the run beside it: the
+7. **Report the tracks and the settings.** On [[viewer]], `viewer.add_tracks`
+   wants one row per detection as `[track_id, t, y, x]` — id first, not the
+   order of the table you have been carrying. Print the dict that reproduces the run beside it: the
    three cutoffs, `MAX_GAP`, `PIXEL_UM`, `INTERVAL_S`, and which id column each
    number was counted from.
 

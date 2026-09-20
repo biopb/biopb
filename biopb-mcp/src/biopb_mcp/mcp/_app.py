@@ -49,8 +49,9 @@ _session_log_path: str | None = None
 # field carries the guidance that must hold on *every* turn — the operation
 # guardrails.
 _BASE_INSTRUCTIONS = (
-    "First action of every session: call `start_kernel`. It brings up the napari "
-    "viewer, dask and the tensor client, and blocks until they are ready; nothing "
+    "First action of every session: call `start_kernel`. It brings up the kernel, "
+    "dask, the tensor client and -- where the session has a display -- a napari "
+    "window, and blocks until they are ready; nothing "
     "auto-starts, and every other kernel tool fails until it returns. It also "
     "rebuilds a kernel that never started, died, or was torn down by the user "
     "closing the viewer window -- but a kernel that is already up it leaves "
@@ -58,14 +59,17 @@ _BASE_INSTRUCTIONS = (
     "the job) or `restart_kernel` (hard-restart). A user asking to start, open, "
     "or launch biopb or napari is asking for this tool.\n"
     "\n"
-    "This biopb-mcp session drives a live napari viewer through a child IPython "
-    "kernel; `execute_code` runs arbitrary Python in that kernel. The index below "
+    "This biopb-mcp session drives a child IPython kernel over bioimage data; "
+    "`execute_code` runs arbitrary Python in it. There are two ways to show the "
+    "user an image and a session need not have both -- a napari window, and the "
+    "browser page the control serves -- so `server_status` is what says which, "
+    "and nothing should assume a window exists. The index below "
     "lists the docs; read one with `read_doc(id)`, and read its *Read first* "
     "section before non-trivial work.\n"
     "\n"
     "Operation guardrails (apply on every turn):\n"
-    "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
-    "explicitly asks.\n"
+    "- Use data from `client`, or from `viewer`'s layers where the session has a "
+    "window; avoid the filesystem unless the user explicitly asks.\n"
     '- Browse the catalog with `client.query_sources(sql, format="pandas")` '
     "(server-side DuckDB, the only browse surface); the `sources` columns are source_id, "
     "source_url, source_type, dtype, indexed_at, metadata_json, "
@@ -83,8 +87,9 @@ _BASE_INSTRUCTIONS = (
     "`client.get_descriptor(array_id, with_pyramid=False, "
     "with_residency=True).is_resident`.\n"
     "- Prefer lazy dask operations; only `.compute()` the final result.\n"
-    "- Put intermediate results back on `viewer` for the user to validate at "
-    "each step.\n"
+    "- Show intermediate results for the user to validate at each step: a layer "
+    "on `viewer` where the session has a window, otherwise upload the result and "
+    'give them a web-viewer link (`read_doc("web-viewer")`).\n'
     "- Do not assume — ask the user to clarify uncertainties; they know the "
     "data better than you do."
 )

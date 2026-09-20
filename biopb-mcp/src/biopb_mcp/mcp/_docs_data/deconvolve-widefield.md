@@ -5,7 +5,7 @@ description: Restore a 3D widefield fluorescence stack blurred along z, and chec
 
 # Deconvolve a widefield z-stack
 
-**Requirements:** the napari viewer, an image from `client`.
+**Requirements:** somewhere to show the user an image ([[viewer]] or [[web-viewer]]), an image from `client`.
 
 Every number below was measured on a synthetic widefield stack —
 `(40, 160, 160)`, NA 1.4 oil, 520 nm emission, immersion RI 1.515, voxels
@@ -169,7 +169,7 @@ measuring shape, size or resolution on it.
    | PSF measured from beads | 0.52 µm | 0.413 |
    | exact generating PSF (unreachable) | 0.44 µm | 0.587 |
 
-7. **Put it back on the viewer** next to the input, same contrast limits, so
+7. **Show it next to the input**, same contrast limits, so
    the user can see the difference rather than take it on trust.
 
 ## Failure modes
