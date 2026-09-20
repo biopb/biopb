@@ -86,9 +86,7 @@ _BASE_INSTRUCTIONS = (
     "data better than you do."
 )
 
-# Appended to _BASE_INSTRUCTIONS only when procedure docs are served
-# (`services.docs_enabled`, on by default), so an install that switches them off
-# is told neither to follow one nor to write one.
+# Appended after the index: how to follow a procedure doc, and when to write one.
 _AUTHORING_INSTRUCTIONS = (
     "A procedure doc opens with a Requirements line; resolve it against "
     "`server_status` before starting, and treat a gap as something to name and "
@@ -202,20 +200,15 @@ def _compose_instructions() -> str:
     so switching a dimension back off cannot leave a stale fragment behind.
     """
     parts = [_BASE_INSTRUCTIONS]
-    # Procedures on by default: the store's own fail-open default, kept here too
-    # so a render_index failure below can't also swallow the authoring directive.
-    procedures_on = True
     try:
-        from ._docs import procedures_enabled, render_index
+        from ._docs import render_index
 
         parts.append(f"{_INDEX_HEADER}\n\n{render_index()}")
-        procedures_on = procedures_enabled()
     except Exception:  # pragma: no cover - the store is fail-open everywhere else
         logger.debug(
             "docs: could not render the index for the handshake", exc_info=True
         )
-    if procedures_on:
-        parts.append(_AUTHORING_INSTRUCTIONS)
+    parts.append(_AUTHORING_INSTRUCTIONS)
     return "\n\n".join(parts)
 
 

@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: What a procedure doc must contain — the checkpoint types, and how to write a parameter.
 ---
 

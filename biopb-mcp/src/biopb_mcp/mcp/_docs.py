@@ -18,10 +18,10 @@ files: a derived listing cannot carry the agent's own hooks, grouping and
 entry with no file, a shadowed shipped doc, a shipped doc the index has never
 mentioned -- is added at render time (:func:`render_index`).
 
-``services.docs_enabled`` is the benchmark's ablation switch. Off, it withholds
-``kind: procedure`` docs -- the curated workflows -- from the index and from
-:func:`read_doc`; reference docs stay, so the ablated arm loses the procedures
-and not the API documentation.
+The store classifies nothing. Which docs are reference and which are
+procedures is the index's sectioning, maintained by the agent. The benchmark's
+ablation is an index too -- the seed with its procedures moved to ``ignored:``
+-- written into the run's own config tree by the bench harness.
 
 **Fail-open.** A malformed or unreadable file is skipped and debug-logged. The
 write path is the exception: a refusal there is returned to the agent as text
@@ -50,10 +50,6 @@ _SUFFIX = ".md"
 
 #: The index is a doc, under this reserved id.
 INDEX_ID = "index"
-
-#: ``kind:``, on shipped docs only. Procedures are what the ablation withholds.
-KIND_REFERENCE = "reference"
-KIND_PROCEDURE = "procedure"
 
 #: Index entries the write tool will accept. At the cap the rendered index is
 #: roughly 25 KB, paid once per session in the handshake; past it the agent has
@@ -172,24 +168,22 @@ def _setting(path: str, default=_UNSET):
     return get_setting(CONFIG.as_dict(), path, default)
 
 
-def procedures_enabled() -> bool:
-    """Whether ``kind: procedure`` docs are served (``services.docs_enabled``)."""
-    try:
-        return bool(_setting("services.docs_enabled"))
-    except Exception:  # pragma: no cover - config always loadable in practice
-        logger.debug("docs: docs_enabled unreadable, assuming on", exc_info=True)
-        return True
-
-
 def local_dir() -> Path | None:
-    """The local tier's directory. Resolved per call, never created here."""
+    """The local tier's directory. Resolved per call, never created here.
+
+    ``mcp_docs_dir`` arrived in the core SDK with this store, and the two
+    packages upgrade separately, so against an older SDK the same path is
+    built from ``config_dir``, which every release has.
+    """
     configured = (_setting("services.docs_local_dir", "") or "").strip()
     if configured:
         return Path(configured).expanduser()
     try:
-        from biopb._locations import mcp_docs_dir
+        from biopb import _locations
 
-        return mcp_docs_dir()
+        if hasattr(_locations, "mcp_docs_dir"):
+            return _locations.mcp_docs_dir()
+        return _locations.config_dir() / "docs"
     except Exception:  # pragma: no cover - core SDK always present in practice
         logger.debug("docs: no local dir resolvable", exc_info=True)
         return None
@@ -346,9 +340,9 @@ def _updated(text: str, path: Path | None) -> str:
 def describe(doc_id: str) -> dict | None:
     """Resolve *doc_id* to its text and what the loader knows about it.
 
-    Keys: ``id``, ``text``, ``body``, ``title``, ``description``, ``kind``,
-    ``packages``, ``updated``, ``origin``, ``shadows_shipped``. ``None`` when
-    no tier holds it.
+    Keys: ``id``, ``text``, ``body``, ``title``, ``description``, ``packages``,
+    ``updated``, ``origin``, ``shadows_shipped``. ``None`` when no tier holds
+    it.
     """
     if not valid_id(doc_id):
         return None
@@ -361,12 +355,6 @@ def describe(doc_id: str) -> dict | None:
     origin = _ORIGIN_LOCAL if local is not None else _ORIGIN_SHIPPED
     front = parse_frontmatter(text)
     body = strip_frontmatter(text)
-    kind = str(front.get("kind") or "").strip().lower()
-    if origin == _ORIGIN_LOCAL or kind not in (KIND_REFERENCE, KIND_PROCEDURE):
-        # `kind` is a shipped-doc key. A local doc is a procedure, which is what
-        # keeps the ablation honest: it withholds every curated workflow, not
-        # only the ones that happen to ship.
-        kind = KIND_PROCEDURE
     packages = front.get("packages")
     if isinstance(packages, str):
         packages = [p.strip() for p in packages.split(",") if p.strip()]
@@ -381,7 +369,6 @@ def describe(doc_id: str) -> dict | None:
         "description": str(
             front.get("description") or _first_prose(body) or doc_id
         ).strip(),
-        "kind": kind,
         "packages": [str(p) for p in packages],
         "updated": _updated(text, _local_path(doc_id) if local is not None else None),
         "origin": origin,
@@ -389,16 +376,16 @@ def describe(doc_id: str) -> dict | None:
     }
 
 
-def _visible(meta: dict, procedures: bool) -> bool:
-    return procedures or meta["kind"] == KIND_REFERENCE
-
-
 # --------------------------------------------------------------------------- #
 # The index
 # --------------------------------------------------------------------------- #
 # Two line shapes are recognised; everything else -- headings, prose, ordering --
-# is the agent's and passes through untouched.
-_ENTRY = re.compile(r"\A(\s*[-*]\s+)([A-Za-z0-9][A-Za-z0-9._/-]*/?)\s*:\s*(.*)\Z")
+# is the agent's and passes through untouched. An entry is any bullet whose
+# first token is `id:`, so a prose bullet in that shape is read as one and
+# annotated `(missing)`; the seed index and the handshake header say so, rather
+# than a heuristic guessing which bullets were meant. A leading `_` is allowed
+# because that is what a banked doc's promotion line starts with.
+_ENTRY = re.compile(r"\A(\s*[-*]\s+)([A-Za-z0-9_][A-Za-z0-9._/-]*/?)\s*:\s*(.*)\Z")
 _IGNORED = re.compile(r"\A\s*ignored\s*:\s*(.*)\Z", re.IGNORECASE)
 
 _UNFILED = "## Unfiled"
@@ -460,7 +447,6 @@ def render_index(text: str | None = None) -> str:
     """
     if text is None:
         text = index_text()
-    procedures = procedures_enabled()
 
     named: set[str] = set(_ignored_ids(text))
     out: list[str] = []
@@ -477,15 +463,9 @@ def render_index(text: str | None = None) -> str:
         if meta is None:
             out.append(f"{line} (missing)")
             continue
-        if not _visible(meta, procedures):
-            continue
         out.append(f"{line} (local copy)" if meta["shadows_shipped"] else line)
 
-    new = [
-        i
-        for i in shipped_ids()
-        if i not in named and _visible(describe(i) or {"kind": ""}, procedures)
-    ]
+    new = [i for i in shipped_ids() if i not in named]
     if new:
         out.append("")
         out.append(f"New shipped docs: {', '.join(new)}")
@@ -521,8 +501,6 @@ def _header(meta: dict) -> str:
     bits = [meta["origin"]]
     if meta["shadows_shipped"]:
         bits.append("shadows shipped")
-    if meta["origin"] == _ORIGIN_SHIPPED:
-        bits.append(meta["kind"])
     if meta["updated"]:
         bits.append(f"updated {meta['updated']}")
     return f"{meta['id']} — {', '.join(bits)}"
@@ -542,11 +520,6 @@ def read_doc(doc_id: str) -> str:
         return (
             f"No doc '{doc_id}'. Read the index with read_doc('index') for what "
             "there is."
-        )
-    if not _visible(meta, procedures_enabled()):
-        return (
-            f"Doc '{doc_id}' is a procedure, and procedures are switched off on "
-            "this server (services.docs_enabled)."
         )
     return f"{_header(meta)}\n\n{meta['body']}"
 

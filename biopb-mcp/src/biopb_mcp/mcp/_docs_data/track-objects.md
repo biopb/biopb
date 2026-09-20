@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Follow each segmented object across the frames of a time-lapse, so cells keep one identity over time and their lineage survives division.
 packages: [laptrack~=0.17.1]
 ---

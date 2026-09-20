@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Register a time-lapse whose field of view has drifted, so the same object stays at the same coordinates across frames.
 packages: [pystackreg~=0.2.8]
 ---

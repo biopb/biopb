@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Turn the donor, acceptor and FRET channels of a biosensor experiment into a bleedthrough-corrected, masked ratio that is comparable between conditions.
 ---
 

@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Count the foci, puncta or FISH spots inside every segmented cell and report a per-cell table, including the cells that have none.
 ---
 

@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Compare a segmentation to ground truth and report F1 at matched IoU, plus how many objects were split or merged.
 ---
 

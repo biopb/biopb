@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Register a stack of serial sections that were each placed independently, so the same structure sits at the same coordinates through the whole stack.
 ---
 

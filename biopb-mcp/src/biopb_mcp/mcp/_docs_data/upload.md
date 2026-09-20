@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: Put a result on the server — tensors, label sets and ROI annotations, and what each refuses.
 ---
 

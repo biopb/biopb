@@ -369,15 +369,6 @@ class ServicesConfig:
         "biopb.image ProcessImage servicer URLs (grpc:// or grpcs://). Each is "
         "queried via GetOpNames and exposed as callables in the kernel's `ops` dict.",
     )
-    docs_enabled: bool = _h(
-        True,
-        "Serve the curated procedure docs -- the step-by-step workflows in the "
-        "knowledge store. On by default. Off withholds every doc of kind "
-        "'procedure' from the index and from read_doc, and leaves the reference "
-        "docs (kernel, data, viewer, client, ops) in place; it is the switch the "
-        "benchmark's ablation flips, and the store itself keeps working so the "
-        "ablated arm loses the workflows and not the API documentation.",
-    )
     docs_local_dir: str = _h(
         "",
         "Directory of the agent's own docs (*.md), written by write_doc and "
@@ -876,7 +867,6 @@ def _validate_and_clamp(config: dict) -> dict:
 # new key wins where both are present.
 _RENAMED_KEYS = {
     "services": {
-        "skills_enabled": "docs_enabled",
         "skills_local_dir": "docs_local_dir",
     },
 }

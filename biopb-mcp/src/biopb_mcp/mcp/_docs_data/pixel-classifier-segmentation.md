@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Train a classifier on a few hand-drawn scribbles and label every pixel of a field, with a quality number that is not the training accuracy.
 ---
 

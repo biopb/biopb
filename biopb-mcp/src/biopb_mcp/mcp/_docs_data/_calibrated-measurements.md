@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Report object areas, volumes, and diameters in microns instead of pixels, using the image's real voxel spacing.
 ---
 

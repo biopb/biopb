@@ -20,7 +20,6 @@ def store(tmp_path, monkeypatch):
     shipped.mkdir()
     monkeypatch.setattr(_docs, "_shipped_root", lambda: shipped)
     monkeypatch.setattr(_docs, "local_dir", lambda: local)
-    monkeypatch.setattr(_docs, "procedures_enabled", lambda: True)
     return shipped, local
 
 
@@ -104,19 +103,6 @@ def test_a_file_with_no_frontmatter_still_loads(store):
     meta = _docs.describe("bare")
     assert meta["title"] == "A title"
     assert meta["description"] == "The first sentence."
-    assert meta["kind"] == _docs.KIND_PROCEDURE
-
-
-def test_kind_is_read_from_the_shipped_frontmatter(store):
-    ship(store, "ref", kind="reference")
-    assert _docs.describe("ref")["kind"] == _docs.KIND_REFERENCE
-
-
-def test_a_local_doc_is_always_a_procedure(store):
-    """`kind` is a shipped key. A local doc that claimed `reference` would opt
-    itself out of the ablation, which is the one thing it must not do."""
-    _docs.write_doc("mine", body="---\nkind: reference\n---\n\n# Mine\n")
-    assert _docs.describe("mine")["kind"] == _docs.KIND_PROCEDURE
 
 
 def test_packages_is_read_as_a_list(store):
@@ -144,12 +130,14 @@ def test_an_unknown_id_says_so_rather_than_raising(store):
     assert "No doc 'nope'" in _docs.read_doc("nope")
 
 
-def test_the_ablation_withholds_procedures_and_keeps_references(store, monkeypatch):
-    ship(store, "proc", kind="procedure")
-    ship(store, "ref", kind="reference")
-    monkeypatch.setattr(_docs, "procedures_enabled", lambda: False)
-    assert "switched off" in _docs.read_doc("proc")
-    assert _docs.read_doc("ref").startswith("ref — shipped")
+def test_a_shadow_of_a_shipped_doc_keeps_its_frontmatter(store):
+    """The store classifies nothing, so a shadow is the shipped text edited and
+    nothing about it changes but the origin."""
+    ship(store, "ref", "# Ref\n\nProse.\n", description="the ref")
+    _docs.write_doc("ref", old="Prose.", new="Prose, edited.")
+    meta = _docs.describe("ref")
+    assert meta["description"] == "the ref"
+    assert meta["origin"] == "local" and meta["shadows_shipped"]
 
 
 # --------------------------------------------------------------------------- #
@@ -199,15 +187,12 @@ def test_a_collection_line_is_kept_verbatim(store):
     assert "(missing)" not in rendered
 
 
-def test_the_ablation_drops_procedure_entries_from_the_index(store, monkeypatch):
-    ship(store, "index", "- proc: hook\n- ref: hook\n")
-    ship(store, "proc", kind="procedure")
-    ship(store, "ref", kind="reference")
-    monkeypatch.setattr(_docs, "procedures_enabled", lambda: False)
-    rendered = _docs.render_index()
-    assert "- proc:" not in rendered
-    assert "- ref: hook" in rendered
-    assert "New shipped docs" not in rendered
+def test_a_prose_bullet_in_entry_shape_is_an_entry(store):
+    """The one bullet shape the loader claims. Documented in the seed preamble
+    and the handshake header rather than guessed around."""
+    ship(store, "index", "- Remember: check the scale\n")
+    assert "- Remember: check the scale (missing)" in _docs.render_index()
+    assert _docs.index_entry_count("- Remember: x\n- _banked: y\n") == 2
 
 
 def test_prose_and_headings_pass_through(store):

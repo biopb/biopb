@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: The tensor server through `client` — browsing the catalog, loading a tensor, and what lazy costs.
 ---
 

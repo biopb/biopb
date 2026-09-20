@@ -120,7 +120,7 @@ def test_the_extractor_finds_declared_packages(docs_dir):
     write_doc_file(
         docs_dir,
         "needs-things",
-        "kind: procedure\npackages: [biopb-mcp>=0.13.0, some-package>=2.0]\n",
+        "packages: [biopb-mcp>=0.13.0, some-package>=2.0]\n",
     )
     assert _pkg_requirements(docs_dir) == ["some-package>=2.0"]
 

@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Turn a grid of overlapping tiles into a single continuous image, placed by the specimen rather than by the stage's nominal coordinates.
 ---
 

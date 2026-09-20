@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: The kernel: namespace, plugins, long-running jobs, where computes run.
 ---
 

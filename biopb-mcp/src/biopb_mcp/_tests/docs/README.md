@@ -66,8 +66,8 @@ than fails.
 ## Adding a doc to the shipped seed
 
 Drop the `.md` in `mcp/_docs_data/` and add its line to `index.md` — the suite
-discovers the directory and applies every rule. It will ask for a `kind:`, an
-index entry (or a place on the `ignored:` line), `[[links]]` that resolve, a
+discovers the directory and applies every rule. It will ask for an index
+entry (or a place on the `ignored:` line), `[[links]]` that resolve, a
 body inside the cap, and a contract test for any third-party package.
 
 **Banking one** is prefixing its filename with `_`. It ships and `read_doc`

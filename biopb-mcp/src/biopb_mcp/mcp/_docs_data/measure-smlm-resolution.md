@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Run single molecule localization on an SMLM/STORM/PALM blinking stack and measure the reconstruction's resolution by Fourier ring correlation, apart from localization precision and label density.
 ---
 

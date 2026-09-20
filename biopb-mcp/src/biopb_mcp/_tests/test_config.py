@@ -234,7 +234,6 @@ class TestDefaultConfig:
         services = DEFAULT_CONFIG["services"]
         # Docs ship on: they are package data, so the default install always has
         # something to answer with and there is nothing to fetch.
-        assert services["docs_enabled"] is True
         assert services["docs_local_dir"] == ""
         # Docs are package data, not a fetch (biopb-mcp/docs/knowledge.md §2).
         assert "skills_catalog_url" not in services

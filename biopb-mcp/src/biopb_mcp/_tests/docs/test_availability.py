@@ -130,7 +130,7 @@ def test_the_extractor_finds_third_party_packages(docs_dir):
     write_doc_file(
         docs_dir,
         "needs-things",
-        "kind: procedure\npackages: [biopb-mcp>=0.13.0, some-package>=2.0]\n",
+        "packages: [biopb-mcp>=0.13.0, some-package>=2.0]\n",
     )
     assert _declared(docs_dir) == [("needs-things", "some-package>=2.0")]
 

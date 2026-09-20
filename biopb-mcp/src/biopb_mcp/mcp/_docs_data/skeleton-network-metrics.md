@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Measure how long a filament network is and how branched, in physical units — mitochondria, vessels, neurites or cytoskeleton, from a mask you already have.
 packages: [skan~=0.13.1, networkx~=3.4]
 ---

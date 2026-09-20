@@ -1296,8 +1296,6 @@ async def server_status() -> str:
     # quoting ~/.config/biopb/docs can be wrong.
     lines.append("## Docs")
     lines.append(_docs.local_dir_status())
-    if not _docs.procedures_enabled():
-        lines.append("  procedures: withheld (services.docs_enabled)")
     lines.append("")
 
     lines.append("## Kernel")

@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: Server-side image-processing ops: what `ops` holds and how to call one.
 ---
 

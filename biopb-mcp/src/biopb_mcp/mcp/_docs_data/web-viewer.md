@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: Show data in the browser when there is no napari window — the URL format, and who opens it.
 ---
 

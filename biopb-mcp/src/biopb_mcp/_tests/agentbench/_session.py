@@ -397,7 +397,7 @@ class LiveSession:
     instructions: str
     tools: list[ToolSpec]
     scratch: Path
-    #: Whether the curated procedure docs were served at all (`--bench-docs`).
+    #: Whether the curated procedure docs were listed at all (`--bench-docs`).
     docs_enabled: bool
     #: Where the tripwire writes. Absent until something is recorded.
     guard_log: Path = Path()
@@ -569,24 +569,67 @@ class LiveSession:
         return f"{SENTINEL} client True" in out.text
 
 
+#: The seed index heading the procedures sit under. The one heading named from
+#: outside the index, and only here: the store classifies nothing, so the
+#: ablation is expressed as an index, and the seed gate
+#: (`_tests/docs/test_seed.py`) pins that the seed keeps this heading.
+PROCEDURES_HEADING = "Procedures"
+
+
+def ablated_index(seed: str) -> str:
+    """The seed index with every entry under *PROCEDURES_HEADING* moved to
+    ``ignored:``.
+
+    Moved, not deleted: an ignored id stays out of the *New shipped docs* tail,
+    so the ablated arm's handshake names no procedure at all. What survives is
+    ``read_doc`` of an id the agent already knows, which the handshake does not
+    give it -- the same leak the old tool-based ablation had, through a narrower
+    door.
+    """
+    from biopb_mcp.mcp import _docs
+
+    out: list[str] = []
+    withheld: list[str] = []
+    under = False
+    ignored_line = None
+    for line in seed.splitlines():
+        if line.startswith("#"):
+            under = line.strip() == f"## {PROCEDURES_HEADING}"
+        if under and (doc_id := _docs._entry_id(line)):
+            withheld.append(doc_id)
+            continue
+        if _docs._IGNORED.match(line):
+            ignored_line = len(out)
+        out.append(line)
+    already = _docs._ignored_ids(seed)
+    ids = sorted(already | set(withheld))
+    ignored = "ignored: " + ", ".join(ids)
+    if ignored_line is None:
+        out.extend(["", ignored])
+    else:
+        out[ignored_line] = ignored
+    return "\n".join(out).rstrip() + "\n"
+
+
 def _write_config(
     root: Path, *, docs_enabled: bool = True, plugins: Sequence[str] = ()
 ) -> None:
     """A config tree of our own, so neither the developer's settings nor their
-    personal skills reach the child.
+    personal docs reach the child.
 
-    ``docs_enabled=False`` is what **`--bench-docs=false`** sets: ``read_doc``
-    stays registered but refuses every procedure doc, so the agent
-    can call it and get nothing back, while the kernel, napari, dask and every
-    library stay exactly as they were. That is §5's rule — disclose the
-    environment, withhold only the skill — and it is a real shipped
-    configuration rather than a hole cut for the test.
+    ``docs_enabled=False`` is what **`--bench-docs=false`** sets: the tree gets
+    a local index that is the seed with its procedures on the ``ignored:`` line
+    (:func:`ablated_index`), so the handshake lists none and the tail
+    resurfaces none, while the kernel, napari, dask and every library stay
+    exactly as they were. That is §5's rule — disclose the environment,
+    withhold only the procedure — done with the same file an agent would edit
+    rather than a switch cut into the store for the test.
 
-    ``plugins`` names kernel plugins the case's skill declares in its
-    ``checklist:``. They are seeded into this tree's own ``biopb/kernel/`` from
-    the ones biopb-mcp ships, so the loader that runs is the real one — and only
-    what a case asks for is present, since a plugin the skill never declared is
-    an environment difference nobody chose.
+    ``plugins`` names kernel plugins the case's procedure names in its
+    Requirements line. They are seeded into this tree's own ``biopb/kernel/``
+    from the ones biopb-mcp ships, so the loader that runs is the real one — and
+    only what a case asks for is present, since a plugin the procedure never
+    named is an environment difference nobody chose.
     """
     (root / "biopb").mkdir(parents=True, exist_ok=True)
     if plugins:
@@ -606,14 +649,21 @@ def _write_config(
                 # Nothing watches a web UI during an unattended run.
                 "observe": {"enabled": False},
                 "transport": {"kind": "http"},
-                "services": {"docs_enabled": docs_enabled},
             }
         ),
         encoding="utf-8",
     )
-    # Present but empty: the local-skills dir must exist as *nothing*, so the
-    # catalog under test is exactly what the package ships.
-    (root / "biopb" / "skills").mkdir(exist_ok=True)
+    # The local tier. Empty on the docs-on arm, so the store under test is
+    # exactly what the package ships and its own seeding runs; on the docs-off
+    # arm it holds the one file the ablation is.
+    docs_dir = root / "biopb" / "docs"
+    docs_dir.mkdir(exist_ok=True)
+    if not docs_enabled:
+        from biopb_mcp.mcp import _docs
+
+        (docs_dir / "index.md").write_text(
+            ablated_index(_docs._seed_index_text()), encoding="utf-8"
+        )
 
 
 @contextmanager
@@ -625,7 +675,7 @@ def live_session(
 ) -> Iterator[LiveSession]:
     """Bring a session up, hand back a driver, and reap it on the way out.
 
-    ``docs_enabled=False`` withholds the curated procedure docs and nothing
+    ``docs_enabled=False`` unlists the curated procedure docs and nothing
     else -- the ablated half of a doc's delta, `--bench-docs=false`. The
     reference docs stay. ``plugins`` seeds the kernel plugins a case declares.
 

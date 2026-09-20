@@ -38,6 +38,7 @@ from ..agentbench._conversation import (
     TURN_CAP,
 )
 from ..agentbench._fixture import Attempt, Fixture, Metric, Outcome
+from ..agentbench._session import PROCEDURES_HEADING, ablated_index
 from . import _engine, conftest
 from ._engine import (
     CATALOG_UNREAD,
@@ -607,23 +608,35 @@ def test_the_catalog_probe_reads_the_index_and_keeps_the_procedures():
     """The probe must not depend on anything a `Case` carries, and must not
     name a doc id -- this package cannot know which docs ship.
 
-    It reads the index the agent sees and asks each entry what kind it is, so
-    the reference docs that survive the ablation do not read as a catalog.
+    It reads the index the agent sees and keeps the entries under the seed's
+    procedures heading, so the reference docs that survive the ablation do not
+    read as a catalog. One read: the store classifies nothing, so there is
+    nothing to ask each entry.
     """
-    bodies = {
-        "index": "# docs\n\n- kernel: hook\n- flatfield: hook\n",
-        "kernel": "kernel — shipped, reference\n\nProse.",
-        "flatfield": "flatfield — shipped, procedure\n\nProse.",
-    }
+    index = (
+        "# docs\n\n## References\n\n- kernel: hook\n\n"
+        f"## {PROCEDURES_HEADING}\n\n- flatfield: hook\n\n## Writing\n\n- authoring: hook\n"
+    )
     calls: list = []
 
     class FakeSession:
         def call(self, tool, **kwargs):
             calls.append((tool, kwargs))
-            return SimpleNamespace(text=bodies[kwargs["id"]])
+            return SimpleNamespace(text=index)
 
     assert read_catalog(FakeSession()) == ("flatfield",)
-    assert calls[0] == ("read_doc", {"id": "index"})
+    assert calls == [("read_doc", {"id": "index"})]
+    # The ablated index: the same file with that section's entries on
+    # `ignored:`, which is what `--bench-docs=false` writes.
+    ablated = ablated_index(index)
+    assert "ignored: flatfield" in ablated
+    assert "- flatfield:" not in ablated and "- kernel: hook" in ablated
+
+    class Ablated:
+        def call(self, tool, **kwargs):
+            return SimpleNamespace(text=ablated)
+
+    assert read_catalog(Ablated()) == ()
 
 
 def test_a_probe_that_raises_reports_that_it_did_not_look():

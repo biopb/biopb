@@ -63,13 +63,17 @@ ignored, nothing fatal. Recognised keys:
 
 | key | who writes it | meaning |
 |---|---|---|
-| `description` | author, or inferred from the first paragraph | one line for the reconciliation tail (§3) |
-| `kind` | shipped docs only | `reference` or `procedure` (default); the one bit the ablation switch needs (§7) |
+| `description` | author, or inferred from the first paragraph | the hook `write_doc` files a new doc under (§4) |
 | `packages` | shipped docs only | `name~=x.y.z, …` — the third-party APIs the body quotes, read by the contract tests (§7) and by nothing at runtime |
-| `updated` | `write_doc` | ISO date of the last write |
+| `updated` | author, optional | overrides the file mtime the header otherwise reports |
 
 Title is the first H1, else the id. Origin (shipped / local / local shadowing
-shipped) is derived from where the file sits, never stored.
+shipped) is derived from where the file sits, never stored. **The store
+classifies nothing else.** Which docs are reference and which are procedures
+is the index's sectioning, maintained by the agent; a runtime `kind:` was
+built and removed, because the one consumer it had — the bench ablation — is
+better expressed as an index (§7), and the rule it needed for local docs
+turned a shadowed reference doc into a procedure.
 
 ## 3. The index
 
@@ -88,7 +92,7 @@ the curated ordering.
 ```markdown
 # biopb docs
 
-## Read first
+## References
 - kernel: namespace, jobs, where computes run, the user shares this kernel
 - data: pyramids, laziness, axis order; read a layer with viewer.tensor()
 
@@ -210,7 +214,7 @@ harness injecting recall. It is a nudge for the hosts that honour it, and
 nothing in the design depends on it.
 
 **The rest of the handshake** shrinks to: call the start tool first; the index
-above lists what to read, and its *Read first* section is what to read before
+above lists what to read, and its reference docs are what to read before
 non-trivial work; the standing guardrails; one sentence that destructive steps
 always ask first. The skills paragraph and the checkpoint vocabulary go — the
 checkpoint types move into the authoring doc and the procedures that use them.
@@ -260,11 +264,16 @@ everything it mentions. Index hooks carry no links.
 
 ## 7. Ablation and tests
 
-**The bench switch withholds procedures, not the store.** With guides in the
-same store, "docs off" would also withhold the API reference and change the
-baseline arm. `--bench-docs=false` (today's `--bench-skills`) hides
-`kind: procedure` docs from the rendered index and from `read_doc`; reference
-docs stay. That is the only reason `kind` exists.
+**The bench switch is an index.** With guides in the same store, "docs off"
+would also withhold the API reference and change the baseline arm, and a
+runtime switch needs the store to classify docs. So `--bench-docs=false`
+writes the run's isolated config tree a local index: the seed with every
+entry under its `## Procedures` heading moved to the `ignored:` line. Nothing
+lists them, the tail does not resurface them, and the handshake never shows
+an id the agent could guess; the reference docs stay listed. The one leak is
+`read_doc` of an id the agent already knows, which the old tool-based
+ablation had too. That heading is the only index heading named from outside
+the index, by the bench alone, and the seed gate pins it.
 
 **What survived from `_tests/skills/`**, now `_tests/docs/`:
 
@@ -285,13 +294,15 @@ move much, since it now keeps the reference docs it used to lose.
 
 Content:
 
-- the five guides become `kind: reference` docs `kernel`, `data`, `viewer`,
-  `client`, `ops`, listed under *Read first*; the `## Skill requirements`
-  section of the kernel guide is dropped;
-- the twelve served skills become `kind: procedure` docs; `checklist:` becomes
-  one prose *Requirements* line per doc, and a package that must never be
+- the five guides become seven reference docs — `kernel`, `ops`, and the old
+  data/viewer/client trio re-cut as `tensor-server-client`, `upload`,
+  `napari-viewer`, `web-viewer` (napari is optional, so the browser surface
+  gets its own doc), plus `requirements`, which holds what the kernel guide's
+  skill-requirements section said minus the `checklist:` grammar;
+- the twelve served skills become procedure docs; `checklist:` becomes one
+  prose *Requirements* line per doc, and a package that must never be
   installed is a sentence there;
-- the three banked (`_`) skills stay in the repo, unshipped, as today;
+- the three banked (`_`) skills ship unlisted (§2);
 - `write-a-skill` becomes `authoring` (§6).
 
 Code and config:
@@ -301,9 +312,10 @@ Code and config:
   The chat loop's synthesized `read_resource` goes with them: it existed only
   because a chat-completions API has no verb for `resources/read`, and the
   store is now ordinary tools;
-- `services.skills_enabled / skills_local_dir` become
-  `docs_enabled / docs_local_dir`, the old keys read as aliases for one
-  release; `skills_index_plugins` is dropped with the plugin rows;
+- `services.skills_local_dir` becomes `docs_local_dir`, the old key read as
+  an alias for one release; `skills_enabled` and `skills_index_plugins` go,
+  the first because the ablation is an index and the second with the plugin
+  rows;
 - `biopb._locations.mcp_skill_dir` gains a `mcp_docs_dir` sibling;
 - `start_kernel` → `start_biopb` with the alias (#894). **Not done here** -- it
   is its own issue with a thirty-file blast radius and no coupling to the
@@ -361,7 +373,7 @@ None of that is built in v1. What v1 does so it stays additive:
 1. **Whether the seed still gets read.** The ablation proved the bodies help
    under tool-then-resource delivery. Under index-in-handshake-then-`read_doc`
    delivery the read is a call the agent chooses to make. Only the acceptance
-   run answers this. If it fails, the fallback is inlining the *Read first*
+   run answers this. If it fails, the fallback is inlining the reference
    bodies into the handshake as well, `CLAUDE.md`-style, at ~30 KB per
    session.
 2. **Quality of unsupervised local docs.** The bench uses the seed, so it

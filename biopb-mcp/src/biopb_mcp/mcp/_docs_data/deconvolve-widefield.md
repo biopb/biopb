@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Restore a 3D widefield fluorescence stack blurred along z, and check that the restoration actually restored something.
 ---
 

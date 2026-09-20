@@ -117,19 +117,28 @@ def test_both_display_surfaces_are_listed(seed_index):
     assert {"napari-viewer", "web-viewer"} <= listed
 
 
-def test_every_shipped_doc_declares_a_kind(shipped_docs):
-    """`kind` decides what the ablation withholds, and it defaults to procedure.
+def test_the_seed_groups_its_procedures_under_one_heading(seed_index):
+    """The one heading named from outside the index, and only by the bench.
 
-    A reference doc that forgets it is silently withheld from the ablated arm,
-    which moves the baseline the arm exists to establish.
+    The store classifies nothing; the ablation arm is the seed with the entries
+    under this heading moved to `ignored:` (`_tests/agentbench/_session.py`).
+    A procedure filed elsewhere would survive the ablation, and a reference
+    doc filed here would be withheld from the baseline, so the seed's grouping
+    is an invariant for this heading alone.
     """
-    missing = sorted(
-        doc_id_of(p)
-        for p in shipped_docs
-        if _docs.parse_frontmatter(read_doc_file(p)).get("kind")
-        not in (_docs.KIND_REFERENCE, _docs.KIND_PROCEDURE)
+    from biopb_mcp._tests.agentbench._session import (
+        PROCEDURES_HEADING,
+        ablated_index,
     )
-    assert not missing, "shipped docs with no kind:\n" + "\n".join(missing)
+
+    assert f"## {PROCEDURES_HEADING}" in seed_index.splitlines()
+    ablated = ablated_index(seed_index)
+    withheld = _docs._ignored_ids(ablated)
+    assert withheld, "the ablation would withhold nothing"
+    listed = {i for line in ablated.splitlines() if (i := _docs._entry_id(line))}
+    assert not (withheld & listed)
+    # What stays is the reference set the baseline arm is meant to keep.
+    assert {"kernel", "tensor-server-client", "napari-viewer", "web-viewer"} <= listed
 
 
 def test_no_body_names_a_specific_dataset(shipped_docs):

@@ -16,13 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp._tests.conftest import call_tool as _tool
-from biopb_mcp.mcp import _app, _docs, _kernel_rpc, _server, _writers
-
-
-def _set_docs_enabled(monkeypatch, enabled: bool) -> None:
-    """Force ``_docs.procedures_enabled()`` and recompose the handshake."""
-    monkeypatch.setattr(_docs, "procedures_enabled", lambda: enabled)
-    _app._recompose_instructions()
+from biopb_mcp.mcp import _app, _kernel_rpc, _server, _writers
 
 
 def _result(stdout="", result_text="", error_text="", status="ok"):
@@ -333,23 +327,15 @@ class TestInstructions:
         # And does not make `viewer` the only place a result can go.
         assert "Put intermediate results back on `viewer`" not in base
 
-    def test_the_handshake_carries_the_index(self, monkeypatch):
+    def test_the_handshake_carries_the_index(self):
         # Inlined rather than "now call read_doc('index')": every prompted hop
         # loses agents (#894).
-        _set_docs_enabled(monkeypatch, True)
+        _app._recompose_instructions()
         instr = _app.mcp._mcp_server.instructions
         assert instr.startswith(_app._BASE_INSTRUCTIONS)
         assert _app._INDEX_HEADER in instr
         assert "- kernel:" in instr
-
-    def test_the_authoring_directive_is_gated_on_enable(self, monkeypatch):
-        _set_docs_enabled(monkeypatch, False)
-        assert (
-            "write_doc"
-            not in _app.mcp._mcp_server.instructions.split(_app._INDEX_HEADER)[0]
-        )
-        _set_docs_enabled(monkeypatch, True)
-        assert "write_doc" in _app.mcp._mcp_server.instructions
+        assert "write_doc" in instr.split(_app._INDEX_HEADER)[1]
 
     def test_the_instructions_are_recomposed_per_session(self):
         """A long-lived HTTP server outlives many sessions, and the index is a
@@ -1662,10 +1648,8 @@ class TestReadingPixels:
     half -- lazy, canonical order, what it costs -- is `tensor-server-client`'s.
     """
 
-    def test_both_halves_are_listed_in_the_index_the_handshake_carries(
-        self, monkeypatch
-    ):
-        _set_docs_enabled(monkeypatch, True)
+    def test_both_halves_are_listed_in_the_index_the_handshake_carries(self):
+        _app._recompose_instructions()
         instr = _app.mcp._mcp_server.instructions
         assert "- tensor-server-client:" in instr
         assert "- napari-viewer:" in instr

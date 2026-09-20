@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: The napari window, where the session has one — reading a layer, layers, camera, dims, annotation layers.
 ---
 

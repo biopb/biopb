@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Trace the centrelines of filamentous structures in a fluorescence image and report how wide the filaments are.
 ---
 

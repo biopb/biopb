@@ -98,7 +98,11 @@ from ..agentbench._respondent import (
     SilentRespondent,
     model_respondent,
 )
-from ..agentbench._session import SessionUnavailable, live_session
+from ..agentbench._session import (
+    PROCEDURES_HEADING,
+    SessionUnavailable,
+    live_session,
+)
 from ._case import BLOCKING_BUDGET, LAYER_KINDS, TENSOR_HANDLE, Case
 from ._options import RESPONDER, Options
 
@@ -513,7 +517,7 @@ def where_for(case: Case) -> Path:
     return session_dir() / case.namespace / case.case_id
 
 
-_INDEX_ENTRY = re.compile(r"\A\s*[-*]\s+([A-Za-z0-9][A-Za-z0-9._/-]*)\s*:")
+_INDEX_ENTRY = re.compile(r"\A\s*[-*]\s+([A-Za-z0-9_][A-Za-z0-9._/-]*)\s*:")
 
 
 def index_entry_ids(text: str) -> tuple[str, ...]:
@@ -539,13 +543,15 @@ def read_catalog(session) -> tuple[str, ...]:
 
     Read rather than assumed, because whether the ablation took effect is the
     one thing that would silently make a whole table meaningless. It is read off
-    the store the agent sees: the index lists what is offered, and each entry's
-    `read_doc` header says whether it is a procedure or a reference doc. Under
-    `--bench-docs=false` the procedures are absent from both, so this comes back
-    empty while the reference docs are still there -- which is the ablation the
-    switch is supposed to perform.
+    the index the agent sees: the entries under the seed's procedures heading
+    are what is offered, since the store classifies nothing and the heading is
+    the only classification there is. Under `--bench-docs=false` those entries
+    are on the `ignored:` line instead, so this comes back empty while the
+    reference docs are still listed -- which is the ablation the switch is
+    supposed to perform.
 
     No doc id appears here, because this package cannot know which docs ship.
+    One heading does, and the seed gate pins it.
 
     A failure returns :data:`CATALOG_UNREAD`, which is neither a catalog nor an
     empty one. The distinction is load-bearing: the sentinel used to be an
@@ -554,15 +560,16 @@ def read_catalog(session) -> tuple[str, ...]:
     verified nothing -- the exact hole #738 was written to close.
     """
     try:
-        listed = index_entry_ids(session.call("read_doc", id="index").text)
-        if listed == ("<unparseable>",):
+        text = session.call("read_doc", id="index").text
+        if index_entry_ids(text) == ("<unparseable>",):
             return CATALOG_UNREAD
         offered = []
-        for doc_id in listed:
-            header = session.call("read_doc", id=doc_id).text.splitlines()[0]
-            # `read_doc`'s header line names the kind: "<id> — shipped, procedure".
-            if "procedure" in header:
-                offered.append(doc_id)
+        under = False
+        for line in text.splitlines():
+            if line.startswith("#"):
+                under = line.strip() == f"## {PROCEDURES_HEADING}"
+            elif under and (match := _INDEX_ENTRY.match(line)):
+                offered.append(match.group(1))
         return tuple(offered)
     except Exception:  # noqa: BLE001 -- provenance is best-effort, the run is not
         return CATALOG_UNREAD
@@ -681,9 +688,8 @@ def run_one(
         tensor_url=plane.url if plane is not None else "",
     ) as session:
         # Read here rather than inferred from behaviour: `read_doc` stays
-        # registered under `--bench-docs=false` and refuses the procedures, so
-        # what the agent was offered is a property of the store, not of the
-        # tool list.
+        # registered under `--bench-docs=false`, so what the agent was offered
+        # is a property of the index it was handed, not of the tool list.
         result.catalog = read_catalog(session)
         load_fixture(session, case, fixture, ids)
         trace = converse(

@@ -1,5 +1,4 @@
 ---
-kind: reference
 description: What a procedure's Requirements line names, where to check each, and what to do when one is missing.
 ---
 

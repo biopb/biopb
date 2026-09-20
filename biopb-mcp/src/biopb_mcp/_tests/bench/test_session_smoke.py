@@ -119,25 +119,28 @@ def test_an_id_that_does_not_resolve_is_a_result_not_a_crash(session):
     assert "no-such-doc" in out.text
 
 
-def test_the_ablation_reaches_the_tool_and_not_only_the_index():
+def test_the_ablation_keeps_procedures_out_of_the_handshake_and_the_tail():
     """The one way the switch could quietly void the benchmark.
 
-    `--bench-docs=false` withholds the procedures, not the filesystem. If the
-    ablation only dropped them from the *index*, an ablated arm could name
-    `drift-correction` from memory and read it straight back, and the 2x2 would
-    be measuring nothing. The gate is in `read_doc` itself -- the server's own,
-    not one the harness re-states -- but the cost of that being wrong is every
-    number in the layer, so it is worth a session of its own.
+    `--bench-docs=false` is an index, not a switch in the store: the seed with
+    its procedures on the `ignored:` line. Two things have to hold for the 2x2
+    to measure anything. The handshake the ablated arm is handed names no
+    procedure, and the *New shipped docs* tail does not put them back -- the
+    tail is what would resurface a merely deleted line. What is *not* gated is
+    `read_doc` of an id the agent already knows; the handshake is the only place
+    it could learn one, so that door is checked shut here too.
     """
     if reason := _session.why_unavailable():
         pytest.skip(reason)
     try:
         with live_session(docs_enabled=False) as live:
-            out = live.call("read_doc", id="drift-correction")
-            assert 'reference="previous"' not in out.text, (
-                "the ablation arm just read the doc it is supposed to lack"
-            )
-            assert "switched off" in out.text, out.text[:200]
+            assert "- drift-correction:" not in live.instructions
+            assert "New shipped docs" not in live.instructions
+            rendered = live.call("read_doc", id="index").text
+            assert "- drift-correction:" not in rendered
+            assert "New shipped docs" not in rendered
+            # The reference docs are the baseline, and they stay.
+            assert "- kernel:" in live.instructions
             # The reference docs are still there: withholding the whole store
             # would move the baseline the ablated arm establishes.
             assert (

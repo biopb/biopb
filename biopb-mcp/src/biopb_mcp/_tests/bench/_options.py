@@ -68,10 +68,10 @@ FIXTURES = Setting(
     "always available, `curated` is real data and needs $BIOPB_FIXTURES",
 )
 
-#: The procedures switch. `false` is `services.docs_enabled: false` in the
-#: session's own config — a real shipped configuration, so the kernel, napari,
-#: dask and every library stay exactly as they are and only the curated
-#: procedures go. The reference docs stay, which is the point: withholding the
+#: The procedures switch. `false` writes the session an index with the seed's
+#: procedures moved to its `ignored:` line, so the kernel, napari, dask and
+#: every library stay exactly as they are and only the curated procedures go
+#: unlisted. The reference docs stay, which is the point: withholding the
 #: whole store would also withhold the API documentation and move the baseline.
 #:
 #: Against a case that names a procedure, two runs either side of this is that

@@ -1,5 +1,4 @@
 ---
-kind: procedure
 description: Remove vignetting and shading from a collection of images taken on the same optics, so intensities are comparable within a frame and between frames.
 ---
 
