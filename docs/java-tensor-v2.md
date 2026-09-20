@@ -17,6 +17,8 @@ disk caching are deliberately out of scope until the core protocol is stable.
 - [x] Implement source lifecycle, upload and ROI parity.
 - [x] Remove the legacy `(sourceId, tensorId)` entry points and the
   `DataSourceDescriptor` row decoders they fed.
+- [x] Own Flight connections after the pool's removal: `FlightSessions` shares
+  one per `(location, token)`, as `biopb.tensor._pool` does.
 - [ ] Make a streamed action's cancel reach the server (see below).
 - [ ] Port the connect-time protocol check (`health`'s `protocol`, Python's
   `_check_protocol_version` / `_check_wire_protocol`). Without it a v1 server
@@ -39,6 +41,13 @@ Two things do not transfer, and are not gaps:
   blocks ship from whichever worker computed them. `TensorUploads.uploadArray`
   walks the descriptor's chunk grid on the calling thread. The grid, the bounds
   and the empty-chunk skip for a label set are the same.
+- **Connections are shared, not pooled per thread.** Python keys its pool by
+  `(location, token)` *and* by thread, because a `FlightClient` is not
+  pickle-safe and each dask worker dials its own. Java has no such constraint:
+  one `FlightSession` per `(location, token)` for the whole process, held until
+  exit. `TensorFlightClient` is unaffected -- it owns its session and closes it;
+  the cache is for `SerializableTensorImg`, which hands its session to an
+  imglib2 cell cache that outlives every call it can see.
 - **A cancel stops the client, not the server.** Python breaks out of the
   `do_action` generator, which closes the stream and the server observes it;
   Arrow Java hands back a bare `Iterator<Result>` with no handle on the call,

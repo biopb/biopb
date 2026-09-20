@@ -79,6 +79,33 @@ public class SerializableTensorImgTest {
         image.close();
     }
 
+    @Test
+    public void testManyImagesOnOneServerShareOneConnection() throws Exception {
+        // The reason the cache exists: a worker is handed many SerializedTensors
+        // and reconstructs an image from each. One session per image made the
+        // channel count scale with the tensors deserialized -- and tensorFromPb
+        // is typed RandomAccessibleInterval, so a caller cannot close one.
+        FlightSessions.closeAll();
+        try {
+            for (int i = 0; i < 20; i++) {
+                new SerializableTensorImg<>(
+                        plannedHandle("grpc+tcp://localhost:8815"), 1_000L, null).numDimensions();
+            }
+            assertEquals(1, FlightSessions.size());
+
+            // A different server, and a different token on the same server, are
+            // each their own connection: a channel's authorization is not shared.
+            new SerializableTensorImg<>(
+                    plannedHandle("grpc+tcp://localhost:8816"), 1_000L, null).numDimensions();
+            new SerializableTensorImg<>(
+                    plannedHandle("grpc+tcp://localhost:8815", "cap-token"), 1_000L, null).numDimensions();
+            assertEquals(3, FlightSessions.size());
+        } finally {
+            FlightSessions.closeAll();
+        }
+        assertEquals(0, FlightSessions.size());
+    }
+
     private static Object delegateOf(SerializableTensorImg<?> image) throws Exception {
         java.lang.reflect.Field field = SerializableTensorImg.class.getDeclaredField("delegate");
         field.setAccessible(true);
@@ -101,6 +128,10 @@ public class SerializableTensorImgTest {
      * until a call is made.
      */
     private static SerializedTensor plannedHandle(String location) {
+        return plannedHandle(location, "");
+    }
+
+    private static SerializedTensor plannedHandle(String location, String token) {
         TensorDescriptor descriptor = TensorDescriptor.newBuilder()
                 .setArrayId("test-tensor")
                 .addShape(4).addShape(4)
@@ -129,6 +160,7 @@ public class SerializableTensorImgTest {
                 endpoints, -1, -1);
         return SerializedTensor.newBuilder()
                 .setLocation(location)
+                .setAuthToken(token)
                 .setFlightInfo(ByteString.copyFrom(plan.serialize()))
                 .build();
     }

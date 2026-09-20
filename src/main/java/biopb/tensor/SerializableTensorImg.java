@@ -26,6 +26,11 @@ import net.imglib2.type.numeric.RealType;
  * {@code SerializedTensor} protobuf and a local cache budget. It never
  * serializes source IDs, read options, descriptors, or a second bespoke ticket
  * format. New cross-process APIs should pass {@link SerializedTensor} directly.
+ *
+ * <p>Its Flight connection comes from {@link FlightSessions}, shared per
+ * {@code (location, token)} across every image in the process, so
+ * reconstructing many tensors from one server costs one channel rather than
+ * one each.
  */
 @Deprecated
 public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
@@ -113,7 +118,10 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         }
 
         FlightInfo plan = TensorFlightClient.flightInfoOf(handle);
-        session = new FlightSession(
+        // Shared per (location, token): an image hands its session to an imglib2
+        // cell cache that outlives every call here, so there is no point at
+        // which this class could close one. See FlightSessions.
+        session = FlightSessions.shared(
                 LocationUris.parse(handle.getLocation()),
                 handle.getAuthToken().isEmpty() ? null : handle.getAuthToken());
         if (plan.getEndpoints().isEmpty()) {
@@ -166,12 +174,15 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         }
     }
 
+    /**
+     * Drops this image's reference to its connection, which the shared cache
+     * owns; the connection itself stays open for the next image on the same
+     * server. Retained because the class is {@link AutoCloseable} and callers
+     * may already wrap it.
+     */
     @Override
     public synchronized void close() {
-        if (session != null) {
-            session.close();
-            session = null;
-        }
+        session = null;
     }
 
     @Override public long min(int d) { ensureDelegate(); return delegate.min(d); }
