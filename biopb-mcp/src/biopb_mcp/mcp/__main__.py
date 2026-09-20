@@ -22,7 +22,11 @@ import signal
 import socket
 import sys
 
-from biopb._locations import MCP_LAUNCH_TOKEN_ENV, MCP_SESSION_LOG_ENV
+from biopb._locations import (
+    LAUNCH_TOKEN_FIELD,
+    MCP_LAUNCH_TOKEN_ENV,
+    MCP_SESSION_LOG_ENV,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +97,7 @@ def _register_view_session(port):
     # hold (see MCP_LAUNCH_TOKEN_ENV). Nothing else reads it, and a viewer
     # started by hand carries none.
     launched_by = os.environ.get(ENV_LAUNCH_TOKEN)
-    extra = {"launch_token": launched_by} if launched_by else {}
+    extra = {LAUNCH_TOKEN_FIELD: launched_by} if launched_by else {}
 
     try:
         session_id = _sessions.new_session_id()

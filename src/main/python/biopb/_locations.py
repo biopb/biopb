@@ -85,6 +85,12 @@ MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 # packages that may not import each other must agree on one string.
 MCP_LAUNCH_TOKEN_ENV = "BIOPB_MCP_LAUNCH_TOKEN"
 
+# The registry-record field the token above is echoed into (biopb._sessions
+# .register); named here, not just at each call site, so the two ends
+# (biopb-control reading it, biopb-mcp writing it) can't drift apart on the
+# key's spelling.
+LAUNCH_TOKEN_FIELD = "launch_token"
+
 
 # --- base trees ---------------------------------------------------------- #
 #

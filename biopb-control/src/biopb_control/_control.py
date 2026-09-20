@@ -840,19 +840,15 @@ def _viewer_log_tail(path) -> str:
     return data.decode("utf-8", "replace").strip()[-_VIEWER_LOG_TAIL:]
 
 
-def _is_our_launch(rec: dict, launch_token: str, child_pid: int) -> bool:
+def _is_our_launch(rec: dict, launch_token: str) -> bool:
     """Whether session record ``rec`` is the viewer this launch just spawned.
 
-    The token is the answer whenever the child echoed one (every biopb-mcp that
-    knows ``MCP_LAUNCH_TOKEN_ENV``), and it is exact. The pid comparison behind
-    it is the compatibility path for a child too old to echo it, and it is only
-    consulted for a record carrying no token at all — a record with a *different*
-    token is somebody else's launch and must never match on a coincidental pid.
+    biopb-mcp and biopb-control are never mismatched -- they read the same
+    ``release-v*`` tag (docs/release-model.md) -- so every viewer this control
+    can launch echoes the token; there is no older biopb-mcp to fall back to a
+    pid match for.
     """
-    token = rec.get("launch_token")
-    if token is not None:
-        return token == launch_token
-    return rec.get("pid") == child_pid
+    return rec.get(_locations.LAUNCH_TOKEN_FIELD) == launch_token
 
 
 def _launch_viewer(timeout: float) -> dict:
@@ -873,8 +869,7 @@ def _launch_viewer(timeout: float) -> dict:
     They never matched, and every dashboard launch on such an install waited out
     the full timeout over a window that had been open for seconds — then, if the
     user closed the session inside that window, reported the trampoline's
-    forwarded exit as "exited before it opened" (biopb#1084). A pid match is
-    kept only as a fallback for a child too old to echo the token.
+    forwarded exit as "exited before it opened" (biopb#1084).
 
     Detached (:func:`detach_kwargs`) and then forgotten: the ``Popen`` handle is
     held only long enough to notice an early exit, never to reap or restart. A
@@ -916,7 +911,7 @@ def _launch_viewer(timeout: float) -> dict:
     while True:
         for rec in _sessions.list_sessions():
             session_id = rec.get("session_id")
-            if session_id and _is_our_launch(rec, launch_token, proc.pid):
+            if session_id and _is_our_launch(rec, launch_token):
                 # The record's pid, not ours: behind a trampoline the process we
                 # spawned is a stub and the viewer is the pid it published.
                 logger.info(

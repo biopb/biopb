@@ -1168,6 +1168,19 @@ def _launchable(monkeypatch, tmp_path, argv):
     monkeypatch.setattr(_control, "_viewer_argv", lambda: argv)
 
 
+def _registering_child_script(session_id: str) -> str:
+    """Source for a stand-in ``--view`` child: register under *session_id*,
+    echoing the launch token it was handed, then stay alive like a real
+    viewer would."""
+    return (
+        "import os, time;"
+        "from biopb import _locations, _sessions;"
+        f"_sessions.register({session_id!r}, port=1234, pid=os.getpid(),"
+        " launch_token=os.environ[_locations.MCP_LAUNCH_TOKEN_ENV]);"
+        "time.sleep(30)"
+    )
+
+
 def _launch_app(tmp_path, console_enabled=True):
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
@@ -1257,13 +1270,7 @@ def test_start_session_waits_for_the_child_to_register(tmp_path, monkeypatch):
     # viewer would.
     from starlette.testclient import TestClient
 
-    child = (
-        "import os, time;"
-        "from biopb import _locations, _sessions;"
-        "_sessions.register('launched', port=1234, pid=os.getpid(),"
-        " launch_token=os.environ[_locations.MCP_LAUNCH_TOKEN_ENV]);"
-        "time.sleep(30)"
-    )
+    child = _registering_child_script("launched")
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", child])
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
@@ -1283,13 +1290,7 @@ def test_a_viewer_behind_a_trampoline_is_still_recognised(tmp_path, monkeypatch)
 
     from biopb_control import _control
 
-    grandchild = (
-        "import os, time;"
-        "from biopb import _locations, _sessions;"
-        "_sessions.register('behind-a-stub', port=1234, pid=os.getpid(),"
-        " launch_token=os.environ[_locations.MCP_LAUNCH_TOKEN_ENV]);"
-        "time.sleep(30)"
-    )
+    grandchild = _registering_child_script("behind-a-stub")
     # The stub: spawn the real thing under a pid of its own, then wait on it and
     # forward its exit code, exactly as the trampolines do.
     stub = (
