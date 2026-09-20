@@ -1178,7 +1178,7 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_a_segment_message_that_is_not_the_chunk_is_refused(self):
+    def test_a_segment_message_that_is_not_the_chunk_is_refused(self, transfer_target):
         """The fast path verifies what it decoded, and falls back if it is wrong.
 
         There is no negotiated segment-format version any more (biopb/biopb#1070):
@@ -1193,64 +1193,63 @@ class TestCachefileIntegration:
         """
         import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
-        from biopb_tensor_server.core import chunk as chunk_mod
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
-        with patch.object(chunk_mod, "PREFERRED_ARROW_BATCH_BYTES", 4096):
-            server, src = self._serve_zarr(tmp, cfg)
-            loc = f"grpc://localhost:{server.port}"
-            original = type(server)._handle_chunk_locate
-            first = {}
+        transfer_target(4096)
+        server, src = self._serve_zarr(tmp, cfg)
+        loc = f"grpc://localhost:{server.port}"
+        original = type(server)._handle_chunk_locate
+        first = {}
 
-            def misdirect(self, chunk_id):
-                """Resolve the right entry, then point at the wrong bytes.
+        def misdirect(self, chunk_id):
+            """Resolve the right entry, then point at the wrong bytes.
 
-                Exactly the shape of a segment-layout drift: the server knows
-                which entry the client asked for -- so its echoed key is
-                correct -- but the byte range no longer names that entry's
-                message. Keeping the key honest is what makes this the failure
-                a client CAN catch, as opposed to a server that resolved the
-                wrong entry outright, which no client-side check can see.
-                """
-                payload = json.loads(original(self, chunk_id))
-                if payload.get("available"):
-                    if first:
-                        payload.update(first["where"])
-                    else:
-                        first["where"] = {
-                            k: payload[k]
-                            for k in (
-                                "segment_path",
-                                "byte_offset",
-                                "byte_length",
-                                "generation_id",
-                            )
-                        }
-                return json.dumps(payload)
+            Exactly the shape of a segment-layout drift: the server knows
+            which entry the client asked for -- so its echoed key is
+            correct -- but the byte range no longer names that entry's
+            message. Keeping the key honest is what makes this the failure
+            a client CAN catch, as opposed to a server that resolved the
+            wrong entry outright, which no client-side check can see.
+            """
+            payload = json.loads(original(self, chunk_id))
+            if payload.get("available"):
+                if first:
+                    payload.update(first["where"])
+                else:
+                    first["where"] = {
+                        k: payload[k]
+                        for k in (
+                            "segment_path",
+                            "byte_offset",
+                            "byte_length",
+                            "generation_id",
+                        )
+                    }
+            return json.dumps(payload)
 
-            try:
-                cmod._cachefile_support.clear()
+        try:
+            cmod._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            # Warm every chunk into the segment cache first, honestly.
+            assert np.array_equal(
+                client.get_tensor("z").compute(scheduler="threads"), src
+            )
+            assert len(client.get_tensor("z").chunks[0]) > 1, "need >1 chunk"
+            client.close()
+
+            cmod._cachefile_support.clear()
+            with patch.object(type(server), "_handle_chunk_locate", misdirect):
                 client = TensorFlightClient(loc, cache_bytes=0)
-                # Warm every chunk into the segment cache first, honestly.
-                assert np.array_equal(
-                    client.get_tensor("z").compute(scheduler="threads"), src
-                )
-                assert len(client.get_tensor("z").chunks[0]) > 1, "need >1 chunk"
+                got = client.get_tensor("z").compute(scheduler="threads")
+                # Correct pixels, via the do_get fallback -- not the first
+                # chunk's bytes smeared over the whole array.
+                assert np.array_equal(got, src)
                 client.close()
-
-                cmod._cachefile_support.clear()
-                with patch.object(type(server), "_handle_chunk_locate", misdirect):
-                    client = TensorFlightClient(loc, cache_bytes=0)
-                    got = client.get_tensor("z").compute(scheduler="threads")
-                    # Correct pixels, via the do_get fallback -- not the first
-                    # chunk's bytes smeared over the whole array.
-                    assert np.array_equal(got, src)
-                    client.close()
-            finally:
-                server.shutdown()
-                CacheManager.reset()
-                shutil.rmtree(tmp, ignore_errors=True)
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_view_is_weak_cached_not_copy_cached(self):
         """A fast-path mmap view lands in the weak view cache (free; dedups a live

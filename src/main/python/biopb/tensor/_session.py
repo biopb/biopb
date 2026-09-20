@@ -454,7 +454,7 @@ def _raise_read_refusal(exc: flight.FlightError, array_id: str) -> None:
     ):
         # Taken from the server rather than a local catalog check, so it also
         # holds for a capability-token holder, who cannot browse the catalog.
-        raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
+        raise _unresolved_source_error(split_array_id(array_id)[0]) from exc
     addressing = _addressing_error(exc)
     if addressing is not None:
         raise addressing from exc
@@ -476,7 +476,7 @@ def _unresolved_source_error(source_id: str) -> ValueError:
     )
 
 
-def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
+def split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     """Split a tensor's globally-unique ``array_id`` into ``(source_id,
     array_id-or-None)``.
 
@@ -488,10 +488,9 @@ def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     :meth:`CatalogClient._resolve_descriptor`, which refuses it (#75), versus
     :meth:`CatalogClient.get_descriptor`, which anchors on the default.
 
-    Private here, public across the package boundary: ``client.py`` re-exports
-    it as ``split_array_id``, which is the name biopb-mcp imports. The identity
-    policy it implements is a contract, so a caller outside this package should
-    not have to reach for an underscore to honour it.
+    Public, unlike its neighbours in this private module: the identity policy it
+    implements is a contract, and callers outside the package honour it
+    (biopb-mcp through ``client.py``'s re-export, the tensor server directly).
     """
     if "/" in array_id:
         return array_id.split("/", 1)[0], array_id
@@ -796,7 +795,7 @@ class CatalogClient:
         capability-token holder, who may read the source but not browse the
         catalog.
         """
-        source_id, tensor_id = _split_array_id(array_id)
+        source_id, tensor_id = split_array_id(array_id)
         row = self._source_tensors_row(source_id)
 
         if row is not None:
@@ -836,7 +835,7 @@ class CatalogClient:
         plate. It goes away once ``GetFlightInfo`` reports the substitution
         itself, which all four bindings must adopt in step.
         """
-        source_id = _split_array_id(array_id)[0]
+        source_id = split_array_id(array_id)[0]
         count = self._source_tensor_count(source_id)
         if count is not None and count > 1:
             raise _ambiguous_default_error(source_id, count)

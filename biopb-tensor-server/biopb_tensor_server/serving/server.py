@@ -44,7 +44,7 @@ from biopb.image.annotation_pb2 import (
     RoiPutResult,
     RoiUnseen,
 )
-from biopb.tensor._session import _split_array_id
+from biopb.tensor._session import split_array_id
 from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -344,7 +344,7 @@ def _roi_source_id(array_id: str) -> str:
     """
     if not array_id:
         raise ValueError("array_id is required")
-    source_id, _ = _split_array_id(array_id)
+    source_id, _ = split_array_id(array_id)
     return source_id
 
 
@@ -1620,7 +1620,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         req = self._parse(FlightRequest(), descriptor.command, "GetFlightInfo command")
         read_opt = req.tensor_read
-        source_id, tensor_id = _split_array_id(read_opt.array_id)
+        source_id, tensor_id = split_array_id(read_opt.array_id)
         if not source_id:
             raise flight.FlightServerError("tensor_read: array_id is required")
 
@@ -1992,13 +1992,8 @@ class TensorFlightServer(flight.FlightServerBase):
             if location is None:
                 return json.dumps({"available": False})
 
-            # No `format_version`. It negotiated a segment layout the client
-            # parses, but its one bump ever (biopb/biopb#596) taught the client
-            # nothing to parse -- it stood in for "these bytes mean something
-            # different now", which is CHUNK_SEMANTICS_EPOCH's job and rides the
-            # chunk_id (biopb/biopb#1070, #1076). What is left is structural and
-            # the client checks it structurally: the batch it decodes has to be
-            # the chunk it asked for.
+            # No `format_version`: retired with biopb/biopb#1070, because what
+            # it was actually being bumped for is now the chunk_id's epoch.
             return json.dumps(
                 {
                     "available": True,

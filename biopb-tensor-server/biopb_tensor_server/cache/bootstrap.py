@@ -38,13 +38,8 @@ logger = logging.getLogger(__name__)
 
 # On-disk segment format version (issue #9). SERVER-LOCAL: one process, one
 # directory, read at boot to decide whether this build may reuse the segments it
-# finds. It is no longer reported to anyone. It used to ride the chunk_locate
-# reply, where a client matched it against a constant of its own -- a version
-# negotiation across two codebases whose one bump in life
-# (biopb/biopb#596) taught the client nothing to parse, because it was standing
-# in for a content change. Content is the chunk_id's job
-# (``CHUNK_SEMANTICS_EPOCH``, biopb/biopb#1076) and identity is checked
-# structurally on the read, so the negotiation went (biopb/biopb#1070).
+# finds. It used to ride the chunk_locate reply too, negotiated against a
+# constant in the SDK; that went with biopb/biopb#1070.
 #
 # ONE question: "may this build reuse these segment files?". Bump it for a
 # layout change. Do NOT bump it for a content change -- that is the epoch, and

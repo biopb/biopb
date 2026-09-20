@@ -65,37 +65,6 @@ class TestCheckWireProtocol:
             )
 
 
-class TestVersionComparison:
-    """Tests for version comparison logic."""
-
-    def test_major_version_comparison(self):
-        """Test major version comparison."""
-        # Client 1.x.x vs Server 2.x.x -> older
-        client_parsed = (1, 5, 0)
-        server_parsed = (2, 0, 0)
-        assert client_parsed < server_parsed
-
-    def test_minor_version_comparison(self):
-        """Test minor version comparison."""
-        # Client 1.1.x vs Server 1.2.x -> older
-        client_parsed = (1, 1, 0)
-        server_parsed = (1, 2, 0)
-        assert client_parsed < server_parsed
-
-    def test_patch_version_comparison(self):
-        """Test patch version comparison."""
-        # Client 1.0.0 vs Server 1.0.1 -> older
-        client_parsed = (1, 0, 0)
-        server_parsed = (1, 0, 1)
-        assert client_parsed < server_parsed
-
-    def test_equal_versions(self):
-        """Test equal versions."""
-        client_parsed = (1, 2, 3)
-        server_parsed = (1, 2, 3)
-        assert client_parsed == server_parsed
-
-
 class TestImport:
     """Test module imports."""
 

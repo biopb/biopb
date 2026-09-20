@@ -871,6 +871,7 @@ class RemoteTensorAdapter(TensorAdapter):
         try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
             endpoints = []
+            served = self.served_version  # loop-invariant
             for ep in info.endpoints:
                 ticket = TensorTicket.FromString(ep.ticket.ticket)
                 bounds = ChunkBounds.FromString(ep.app_metadata)
@@ -890,7 +891,7 @@ class RemoteTensorAdapter(TensorAdapter):
                 local_chunk_id = encode_proxy_envelope(
                     ticket.chunk_id,
                     self._to_local_array_id(upstream_aid),
-                    self.served_version,
+                    served,
                 )
                 endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
             return TensorReadPlan(

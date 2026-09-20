@@ -2564,14 +2564,32 @@ class TestTheTileTokenCarriesTheSemanticsEpoch:
     the sidecar at the Flight plane it ships with.
     """
 
-    def test_a_bump_moves_the_token(self, monkeypatch):
-        from biopb_tensor_server.core import chunk as chunk_mod
+    def test_a_bump_moves_the_token(self, epoch):
         from biopb_tensor_server.serving.http_server import _version_token
 
         cv = b"1700000000:4096"
         before = _version_token(cv)
-        monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", 1)
+        epoch(1)
         assert _version_token(cv) != before
+
+    def test_an_unversioned_source_keeps_no_token_but_moves_its_etag(self, epoch):
+        """The population with no `cv` to carry the epoch.
+
+        Its chunk_ids ARE re-keyed on a bump, but its tile URL is not, so the
+        epoch has to reach the ETag directly or the browser revalidates to the
+        same value forever. It must NOT earn a token: a token means `immutable`
+        for a year, and an unversioned source is one whose content can change
+        with no signal at all.
+        """
+        from biopb_tensor_server.serving.http_server import (
+            _descriptor_version_token,
+        )
+
+        class _Unversioned:
+            content_version = b""
+
+        epoch(1)
+        assert _descriptor_version_token(_Unversioned()) is None
 
     def test_epoch_zero_leaves_every_tile_url_untouched(self):
         """Adopting the mechanism must not cold-start a browser cache either."""
@@ -2581,17 +2599,6 @@ class TestTheTileTokenCarriesTheSemanticsEpoch:
 
         cv = b"1700000000:4096"
         assert _version_token(cv) == hashlib.sha256(cv).hexdigest()[:8]
-
-    def test_two_epochs_do_not_collide(self, monkeypatch):
-        from biopb_tensor_server.core import chunk as chunk_mod
-        from biopb_tensor_server.serving.http_server import _version_token
-
-        cv = b"1700000000:4096"
-        seen = set()
-        for value in (0, 1, 2):
-            monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", value)
-            seen.add(_version_token(cv))
-        assert len(seen) == 3
 
 
 class TestVersionedTileRequests:

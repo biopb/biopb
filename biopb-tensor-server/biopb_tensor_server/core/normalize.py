@@ -32,12 +32,11 @@ normalized descriptor, and a chunk whose axes match them.
 Because the id is unchanged but the *bytes it now resolves to* are transposed,
 cached segments written before this change would be served in the wrong order.
 That is what ``CHUNK_SEMANTICS_EPOCH`` is bumped for (``core.chunk``,
-biopb/biopb#1076): it changes every chunk_id, so every cache keyed by one misses
--- this server's segments, a client's, a proxy's alike. This change predates the
-epoch and reached for ``CACHE_FILE_FORMAT_VERSION`` instead, which is why the
-epoch exists. The transpose happens **inside** the cache's ``compute_fn``, so
-what lands in a segment is the served representation and the localhost mmap fast
-path stays valid.
+biopb/biopb#1076); this change predates it and reached for
+``CACHE_FILE_FORMAT_VERSION`` instead, which is why the epoch exists. The
+transpose happens **inside** the cache's ``compute_fn``, so what lands in a
+segment is the served representation and the localhost mmap fast path stays
+valid.
 
 **Plans are delegated, not re-derived.** ``plan_flight_info`` / ``get_read_plan``
 call the wrapped adapter and permute its answer, rather than inheriting the base
@@ -264,10 +263,6 @@ class NormalizingAdapter(TensorAdapter):
     @property
     def content_version(self) -> Optional[bytes]:
         return self._inner.content_version
-
-    @property
-    def served_version(self) -> Optional[bytes]:
-        return self._inner.served_version
 
     @property
     def array_id(self) -> str:

@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor.ticket_pb2 import TensorTicket
+from biopb.tensor._session import _parse_flight_endpoints
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, upload_state
 from biopb_tensor_server.core.adapter_base import catalog_tensors
@@ -368,10 +368,8 @@ class TestContentVersion:
     def _minted(self, client, array_id):
         """The content_version the read plan's chunk_ids carry."""
         info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
-        return {
-            content_version_of(TensorTicket.FromString(endpoint.ticket.ticket).chunk_id)
-            for endpoint in info.endpoints
-        }
+        chunk_ids, _bounds = _parse_flight_endpoints(info)
+        return {content_version_of(chunk_id) for chunk_id in chunk_ids}
 
     def test_a_set_publishes_its_own_version_not_its_image_s(self, served, client):
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
@@ -404,7 +402,7 @@ class TestContentVersion:
         assert client.get_descriptor("oz1").content_version  # unmoved either way
 
     def test_a_semantics_epoch_bump_leaves_the_published_version_alone(
-        self, served, client, monkeypatch
+        self, served, client, epoch
     ):
         """biopb/biopb#1076, over the wire.
 
@@ -413,13 +411,11 @@ class TestContentVersion:
         something with this token (an ROI's ``drawn_against_version``) must not
         read a server upgrade as "your image changed".
         """
-        from biopb_tensor_server.core import chunk as chunk_mod
-
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
         ids = {a: self._minted(client, a) for a in ("oz1", "oz1/labels/nuclei")}
         published = {a: client.get_descriptor(a).content_version for a in ids}
 
-        monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", 1)
+        epoch(1)
 
         for array_id, was in ids.items():
             assert self._minted(client, array_id).isdisjoint(was)

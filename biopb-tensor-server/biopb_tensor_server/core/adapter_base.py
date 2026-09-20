@@ -372,15 +372,14 @@ class SourceAdapter(ABC):
 
     @property
     def served_version(self) -> Optional[bytes]:
-        """The version this adapter's chunk_ids carry and its descriptor publishes.
+        """The version this adapter's chunk_ids carry.
 
         :attr:`content_version` composed with the server's serving-semantics
-        epoch (biopb/biopb#1076), which is the whole answer to "may a cached
-        chunk for this id still be served?" -- the source's bytes and this
-        server's reading of them can each move independently, and a cache has to
-        miss on either. One value so the two carriers (the opaque chunk_id
-        header, and the field the descriptor publishes for caches that cannot
-        key by chunk_id) cannot drift apart.
+        epoch (biopb/biopb#1076), which together answer "may a cached chunk for
+        this id still be served?" -- the source's bytes and this server's
+        reading of them can each move independently, and a cache keyed by
+        chunk_id has to miss on either. Not what the descriptor publishes: that
+        is the raw content_version, a claim about data (``serving/server.py``).
         """
         return apply_semantics_epoch(self.content_version)
 
@@ -2053,9 +2052,7 @@ def _get_read_plan(
 
     ``served_version`` (``SourceAdapter.served_version``: content_version
     biopb/biopb#178, composed with the semantics epoch biopb/biopb#1076), when
-    set, is folded into every minted chunk_id so the cache namespaces by it. It
-    is constant across the grid, so the wrapper header is precomputed once and
-    prepended per chunk (one concat).
+    set, is folded into every minted chunk_id so the cache namespaces by it.
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)

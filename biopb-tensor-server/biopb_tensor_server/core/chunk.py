@@ -100,8 +100,10 @@ _CV_FORMAT = 1  # wrapper layout version (after the sentinel byte)
 def _version_header(content_version: bytes) -> bytes:
     """The constant prefix that wraps a chunk_id with a content_version.
 
-    ``[0xFF sentinel][uint8 fmt][uint32 cv_len][cv bytes]``. Precompute once per
-    read plan (content_version is constant across a source's chunks) and prepend.
+    ``[0xFF sentinel][uint8 fmt][uint32 cv_len][cv bytes]``. Rebuilt per chunk by
+    :func:`mint_chunk_id` -- ~120 ns of a ~2.7 us mint, against ~2.4 us for
+    ``encode_chunk_id`` itself, so keeping one composition point is worth more
+    than hoisting it.
     """
     return (
         struct.pack(">BBI", _CV_SENTINEL, _CV_FORMAT, len(content_version))
@@ -176,10 +178,10 @@ _EPOCH_PREFIX = b"epoch="
 def apply_semantics_epoch(content_version: Optional[bytes]) -> Optional[bytes]:
     """Compose :data:`CHUNK_SEMANTICS_EPOCH` into *content_version*.
 
-    The result is the version a chunk_id actually carries and the descriptor
-    actually publishes -- a cache has to miss when either half moves, so the two
-    travel as one value. Adapters reach it through
-    ``SourceAdapter.served_version``; this is the composition itself.
+    The result is the version a chunk_id carries -- a cache keyed by one has to
+    miss when either half moves, so the two travel as one value. Adapters reach
+    it through ``SourceAdapter.served_version``; this is the composition itself.
+    It is deliberately not published: see :data:`CHUNK_SEMANTICS_EPOCH`.
 
     At epoch 0 it is the identity, so ids and cache keys stay byte-identical to
     the pre-#1076 ones and adopting the mechanism costs no re-warm. From epoch 1

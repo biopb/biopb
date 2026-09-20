@@ -45,6 +45,7 @@ from dask.utils import parse_bytes
 from biopb.tensor import _diskcache
 from biopb.tensor._location import location_host
 from biopb.tensor._tls import NO_TLS, TlsTrust
+from biopb.tensor._wire_version import SEGMENT_CACHE_KEY_FIELD
 from biopb.tensor.ticket_pb2 import TensorTicket
 
 logger = logging.getLogger(__name__)
@@ -76,24 +77,11 @@ logger = logging.getLogger(__name__)
 # mapped-segment size and copies the chunk out once over budget -- see the
 # pinned-segment accounting below (disk-leak workaround, biopb/biopb#571).
 
-# There is no negotiated segment-format version. There was one, and in its whole
-# life it was bumped once (biopb/biopb#596) for a change that taught this client
-# nothing to parse -- the server had stored the same layout with transposed
-# content, and reached for the only invalidation signal it had. That signal is
-# now CHUNK_SEMANTICS_EPOCH, folded into the chunk_id, so a chunk whose bytes
-# mean something new has a new id and this path never sees the old one
-# (biopb/biopb#1070, #1076). What remains is structural, and is checked
-# structurally in _try_cachefile_transfer: the batch decoded out of the mapping
-# must be the chunk that was asked for. A layout this client cannot parse raises
-# and falls back to do_get; one it parses into the wrong message fails the shape
-# check and falls back too. Neither needs a number kept in lockstep across two
-# codebases.
-
-# The per-row column every segment record carries its own cache key in
-# (``cache.segment_index.CACHE_KEY_FIELD``). Part of the segment layout this
-# client already parses, and what lets a read verify it decoded the entry it
-# asked for -- see _try_cachefile_transfer.
-_SEGMENT_KEY_FIELD = "__biopb_cache_key__"
+# No negotiated segment-format version (biopb/biopb#1070): content is the
+# chunk_id's job (``CHUNK_SEMANTICS_EPOCH``), and what is left is structural, so
+# _try_cachefile_transfer checks it structurally instead. A layout this client
+# cannot parse raises and falls back to do_get; one it parses into the wrong
+# message fails the identity check and falls back too.
 
 # Per-location capability cache: dask workers are separate processes, so each
 # memoizes independently after its first probe. None = unknown, False = the
@@ -568,8 +556,11 @@ def _try_cachefile_transfer(
             # segment predating the key column (or a server not echoing one)
             # simply has no claim to check, as before.
             expected_key = info.get("cache_key")
-            if expected_key is not None and _SEGMENT_KEY_FIELD in batch.schema.names:
-                got = batch.column(_SEGMENT_KEY_FIELD)[0].as_py()
+            if (
+                expected_key is not None
+                and SEGMENT_CACHE_KEY_FIELD in batch.schema.names
+            ):
+                got = batch.column(SEGMENT_CACHE_KEY_FIELD)[0].as_py()
                 if got is None or got.hex() != expected_key:
                     raise ValueError(
                         f"segment message at offset {byte_offset} belongs to "

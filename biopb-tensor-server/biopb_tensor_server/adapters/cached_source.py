@@ -37,9 +37,8 @@ from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
 from biopb_tensor_server.core.chunk import (
     decode_chunk_id,
-    encode_chunk_id,
     is_scaled_chunk,
-    wrap_content_version,
+    mint_chunk_id,
 )
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA
 from biopb_tensor_server.core.errors import UploadDiscardedError
@@ -362,15 +361,14 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         if cache_manager is None:
             raise RuntimeError("Cache not initialized")
 
-        chunk_id = encode_chunk_id(self.source_id, bounds)
-        served = self.served_version
-        if served is not None:
-            # Store under the same version-wrapped id the base read plan mints, so
-            # the client's echoed chunk_id resolves here and a prior upload's
-            # (differently-versioned) chunks are never served. For an unscaled
-            # chunk cache_key_for_chunk_id(wrapped) == wrapped, so the file-cache
-            # locate path (server._handle_chunk_locate) keys identically too.
-            chunk_id = wrap_content_version(chunk_id, served)
+        # Through mint_chunk_id, the single composition point: the read-side
+        # probe (core.cache_source.chunk_cache_keys) mints the same way, and a
+        # key that differs by one byte is a probe that never hits. Stored under
+        # the id the base read plan mints, so the client's echoed chunk_id
+        # resolves here and a prior upload's chunks are never served.
+        chunk_id = mint_chunk_id(
+            self.source_id, bounds, served_version=self.served_version
+        )
 
         if isinstance(data, pa.ChunkedArray):
             data = data.combine_chunks()

@@ -81,6 +81,7 @@ from fastapi.responses import JSONResponse
 from google.protobuf import json_format
 from pydantic import BaseModel
 
+from biopb_tensor_server.core import chunk as _chunk
 from biopb_tensor_server.core.chunk import apply_semantics_epoch
 from biopb_tensor_server.core.labels import split_label_field
 
@@ -717,16 +718,12 @@ def _version_token(content_version: bytes) -> str:
     collision is today's behaviour (no versioning at all), so the trade is
     strictly favourable.
 
-    The serving-semantics epoch is hashed in with it (biopb/biopb#1076). This
-    token is the tile cache's key namespace, and that cache has to miss on the
-    same two things any chunk cache does: the data changing, and this server's
-    reading of the data changing. The Flight plane gets the second for free
-    inside the opaque chunk_id; a browser holding an `immutable` tile URL gets it
-    only here, so composing it is this module's own key-forming decision -- like
-    the chunk codec's, internal, and not a wire contract. Read from the local
-    constant because the sidecar ships with the Flight plane it serves and is
-    pointed at it by ``cli.py``. At epoch 0 the token is unchanged, so adopting
-    the mechanism invalidates nothing.
+    The serving-semantics epoch is hashed in with it: this token is the tile
+    cache's key namespace, and a browser holding an `immutable` tile URL has no
+    other way to hear about a bump (the Flight plane gets it inside the opaque
+    chunk_id). This module's own key-forming decision, from the local constant,
+    because the sidecar ships with the Flight plane ``cli.py`` points it at.
+    See ``core.chunk.CHUNK_SEMANTICS_EPOCH``.
     """
     return hashlib.sha256(apply_semantics_epoch(content_version)).hexdigest()[:8]
 
@@ -2704,6 +2701,17 @@ async def get_tile(
             # answering 304 for bytes that changed. Empty when the source
             # publishes no version, which keeps exactly today's semantics.
             ("cv", current_version or ""),
+            # And the epoch on its own, because an UNVERSIONED source has no
+            # `cv` to carry it: its chunk_ids are re-keyed on a bump
+            # (`apply_semantics_epoch(None)` is not None past epoch 0) while its
+            # tile URL is not, so without this the browser revalidates to the
+            # same ETag forever. It does NOT earn such a source a version token:
+            # a token promotes the URL to `immutable` for a year, and an
+            # unversioned source is precisely one whose content can change with
+            # no signal at all.
+            # Read off the module, not bound at import: a bump is a
+            # restart in production but a monkeypatch under test.
+            ("epoch", _chunk.CHUNK_SEMANTICS_EPOCH),
         ],
     )
     # The resolution above already refused a superseded token, so a token that

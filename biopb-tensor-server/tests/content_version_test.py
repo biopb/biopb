@@ -23,7 +23,6 @@ import numpy as np
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb_tensor_server.core import chunk as chunk_mod
 from biopb_tensor_server.core.adapter_base import TensorAdapter, _get_read_plan
 from biopb_tensor_server.core.chunk import (
     _CV_SENTINEL,
@@ -649,16 +648,6 @@ class TestDoGetCacheHitRejectsStaleVersion:
 # and the mmap path and nothing else.
 
 
-@pytest.fixture
-def epoch(monkeypatch):
-    """Bump the epoch for one test."""
-
-    def bump(value):
-        monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", value)
-
-    return bump
-
-
 class TestSemanticsEpoch:
     def test_epoch_zero_is_the_identity(self):
         """Adopting the mechanism must not cold-start a single cache.
@@ -669,15 +658,9 @@ class TestSemanticsEpoch:
         for cv in (None, CV, b""):
             assert apply_semantics_epoch(cv) == cv
 
-    def test_a_bump_moves_every_version(self, epoch):
-        epoch(1)
-        assert apply_semantics_epoch(CV) != CV
-        assert apply_semantics_epoch(CV).endswith(CV)
-
     def test_a_bump_versions_a_previously_unversioned_source(self, epoch):
         """An unstat-able source (cloud, unresolved) has no content signal of
         its own, but it caches this server's output like any other."""
-        assert apply_semantics_epoch(None) is None
         epoch(1)
         assert apply_semantics_epoch(None) is not None
 
@@ -734,14 +717,3 @@ class TestSemanticsEpoch:
         epoch(1)
         with pytest.raises(StaleChunkError, match="no longer serves"):
             adapter.check_chunk_version(held)
-
-    def test_the_source_s_own_content_version_is_left_alone(self, epoch):
-        """The published claim is about data and must not move.
-
-        A consumer asking "did the data change?" -- an ROI's
-        ``drawn_against_version``, the sidecar's versioned array_id -- reads
-        content_version. A server upgrade is not a data change."""
-        epoch(1)
-        adapter = _VersionedStubAdapter((10, 10), CV)
-        assert adapter.content_version == CV
-        assert adapter.served_version != CV

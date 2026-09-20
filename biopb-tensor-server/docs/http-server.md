@@ -198,6 +198,13 @@ into its own keys. It is read from the local constant, not the wire: `cli.py`
 points the sidecar at the Flight plane it ships with. At epoch 0 the token is
 byte-identical to the pre-#1076 one, so no tile URL moved when this landed.
 
+An **unversioned** source has no `content_version` to carry the epoch, and gets
+no token — a token means `immutable` for a year, and an unversioned source is
+precisely one whose content can change with no signal at all. Its chunk_ids are
+still re-keyed on a bump, so the epoch goes into the tile **ETag** on its own;
+without that the browser would revalidate an unversioned tile URL to the same
+value forever.
+
 This exists **only above the Flight wire**. The sidecar strips it before every
 Flight call; no adapter, chunk_id, catalog row or descriptor carries it. A `@` in
 a *field* name is untouched — only the half before the first `/` is parsed, and a
