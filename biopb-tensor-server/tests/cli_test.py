@@ -193,6 +193,26 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
 
 
+def _patched_launch_internals(monkeypatch) -> dict:
+    """No-op every `launch`/`_setup_flight_server` collaborator except the
+    latter, whose kwargs land in the returned dict -- shared scaffolding for
+    tests that only care what `launch` computed and forwarded."""
+    captured: dict = {}
+    monkeypatch.setattr(cli, "load_config", lambda path: _fake_server_config())
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
+    monkeypatch.setattr(cli, "run_http_server", lambda **k: None)
+    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
+
+    def _capture_setup(cfg, **kwargs):
+        captured.update(kwargs)
+        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    return captured
+
+
 @pytest.mark.parametrize(
     "argv, forwarded",
     [
@@ -217,19 +237,7 @@ def test_writable_flag_is_three_state_through_typer(monkeypatch, argv, forwarded
     """
     from typer.testing import CliRunner
 
-    captured: dict = {}
-    monkeypatch.setattr(cli, "load_config", lambda path: _fake_server_config())
-    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
-    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
-    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
-    monkeypatch.setattr(cli, "run_http_server", lambda **k: None)
-    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
-
-    def _capture_setup(cfg, **kwargs):
-        captured.update(kwargs)
-        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
-
-    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    captured = _patched_launch_internals(monkeypatch)
 
     result = CliRunner().invoke(cli.app, ["launch", "--config", "unused.json", *argv])
     assert result.exit_code == 0, result.output
@@ -243,25 +251,12 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     flight bind, and the token mode switch follows the *overridden* host. A public
     --host with no token must auto-generate one (fail-closed), not bind open.
     """
-    captured: dict = {}
-    # Config binds loopback; the override makes the flight plane public.
-    server_config = _fake_server_config()
-    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
-    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
-    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
-    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
-
-    def _capture_setup(cfg, **kwargs):
-        captured.update(kwargs)
-        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
-
-    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    captured = _patched_launch_internals(monkeypatch)
     monkeypatch.setattr(
         cli,
         "run_http_server",
         lambda **kwargs: captured.update(sidecar_token=kwargs.get("token")),
     )
-    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
 
     _run_launch(Path("unused.json"), host="0.0.0.0", port=9001, writable=True)
 
