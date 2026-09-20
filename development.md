@@ -242,16 +242,17 @@ durable planes and the web origin in
   `packages/tensor-flight-client/` (the TS data-plane SDK). See `web/README.md`
   and `web/ARCHITECTURE.md`.
 - **Release / build:** `docs/release-model.md`.
-- **The skills catalog:** `biopb-mcp/docs/skills.md` — what a skill is, how it
-  ships, and how it is checked: structure, retrieval and contract tests in CI;
-  simulated-user interaction runs against a real session locally, as a benchmark
-  rather than a gate. Proposed replacement: `biopb-mcp/docs/knowledge.md` —
-  one flat doc store, an agent-edited index, two tools.
+- **The knowledge store:** `biopb-mcp/docs/knowledge.md` — one flat set of
+  markdown docs in two tiers, an index the agent edits, and two tools
+  (`read_doc` / `write_doc`). How it is checked is
+  `biopb-mcp/src/biopb_mcp/_tests/docs/README.md`: seed, packaging and contract
+  tests in CI; simulated-user interaction runs against a real session locally,
+  as a benchmark rather than a gate.
 - **Workflow verification:** `docs/verification-scratch-kernel.md` — proposed:
   why `verify_workflow` should run in a scratch *process* rather than a scratch
   namespace, what a second kernel costs, and the one-slot admission rule that
   keeps two kernels from becoming two schedulers.
 - **Agent benchmarks:** `biopb-mcp/docs/fixtures.md` — what a run is given and
   how it is scored. One runner over one case directory, whether the case is a
-  claim about a skill or about a piece of work (`_tests/agentbench/` for the
+  claim about a doc or about a piece of work (`_tests/agentbench/` for the
   machinery, `_tests/bench/` for the cases and the run).

@@ -201,12 +201,11 @@ exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
-# The curated skills (mcp/_skills_data/). These ship with the package and are the
-# only source the runtime reads — a skill is documentation about a specific
-# runtime version, so it rides that version's upgrade cycle rather than being
-# fetched. There is no catalog index: the frontmatter is the metadata and
-# mcp/_skills.py parses it. See biopb-mcp/docs/skills.md §1.
-"biopb_mcp.mcp" = ["_skills_data/*.md"]
+# The shipped knowledge store (mcp/_docs_data/), including the seed index. A doc
+# quotes an API of a particular runtime, so it rides that runtime's upgrade cycle
+# rather than being fetched. Everything ships: what the agent is *offered* is the
+# seed index's decision. See biopb-mcp/docs/knowledge.md §2.
+"biopb_mcp.mcp" = ["_docs_data/*.md", "_docs_data/**/*.md"]
 
 # Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
 # is no longer a package, setuptools reclassifies its files as *data* of the

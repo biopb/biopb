@@ -1,6 +1,6 @@
 """The benchmark: put a model in front of a real session and score what comes out.
 
-``biopb-mcp/docs/skills.md`` §10. The layers next door ask whether a skill file
+`_tests/bench/README.md`. The layers next door ask whether a skill file
 is well-formed, whether the API it quotes still exists, and whether anyone can
 retrieve it. This one runs the thing.
 
@@ -26,7 +26,7 @@ calls the runtime makes — and every run happens against a real shim-spawned
 session: real kernel, real napari, real dask, the nine real tools with their
 real schemas and the server's own ``instructions``. Nothing is stood in for.
 A hand-written tool surface would have put ``execute_code``'s return shape and
-the ``guide://`` bodies back into a transcription — a thing this suite once had
+the reference docs back into a transcription — a thing this suite once had
 a whole layer of, and dropped: a hand-written procedure stays green while the
 file it was transcribed from changes underneath it.
 

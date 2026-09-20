@@ -1,6 +1,6 @@
 # The benchmark — one runner, one case directory
 
-[`biopb-mcp/docs/skills.md`](../../../../docs/skills.md) §10. Put a model in
+[`biopb-mcp/docs/knowledge.md`](../../../../docs/knowledge.md) §7. Put a model in
 front of a **real** biopb session and score what comes out.
 
 ```sh
@@ -17,7 +17,7 @@ should surface as a normal red test rather than be found by someone
 mid-diagnosis with a paid run.
 
 Every case asks the same question — whether the work gets done — and two kinds
-of comparison answer it: two sessions either side of `--bench-skills` say what
+of comparison answer it: two sessions either side of `--bench-docs` say what
 the catalog was worth, and repetition says what one number is worth. Both are
 properties of the invocation, not of the case.
 
@@ -43,7 +43,7 @@ ago should not be the answer to "why did this take two hours".
 | Flag | Environment | Values | Does |
 |---|---|---|---|
 | `--bench-fixtures` | `BIOPB_BENCH_FIXTURES` | `all` (default), `synthetic`, `curated` | which kind of data |
-| `--bench-skills` | `BIOPB_BENCH_SKILLS` | `true` (default), `false` | whether the agent is offered the catalog |
+| `--bench-docs` | `BIOPB_BENCH_DOCS` | `true` (default), `false` | whether the agent is offered the catalog |
 | `--bench-responder` | `BIOPB_BENCH_RESPONDER` | `model` (default), `silent`, `briefed` | who answers the agent — or, for `briefed`, whether there is anything left to ask |
 | `--bench-samples` | `BIOPB_BENCH_SAMPLES` | a positive integer, default 1 | how many times each case |
 
@@ -62,7 +62,7 @@ deeper (in `bench/conftest.py`) would narrow this further, to `bench/` alone.
 pytest .../bench -m bench -s
 
 # the same cases with the catalog withheld -- the other half of a skill's delta
-pytest .../bench -m bench -s --bench-skills=false
+pytest .../bench -m bench -s --bench-docs=false
 
 # one case, three times, nobody answering
 pytest .../bench -m bench -s -k drift-correction --bench-responder=silent \
@@ -84,7 +84,7 @@ tests as well would be the worst of both.
 
 ### One invocation is one configuration
 
-`--bench-skills` and `--bench-responder` are settings on the session the run
+`--bench-docs` and `--bench-responder` are settings on the session the run
 happens in, fixed for the whole invocation. A run therefore has no arms and no
 grid: it runs the cases you selected, `--bench-samples` times each, in one
 configuration, and writes one session directory that says which.
@@ -92,11 +92,11 @@ configuration, and writes one session directory that says which.
 The 2x2 that used to be a table inside one report is one command per corner:
 
 ```sh
-pytest ... --bench-skills=true  --bench-responder=model    # does the whole thing work
-pytest ... --bench-skills=true  --bench-responder=silent   # does *asking* matter
-pytest ... --bench-skills=true  --bench-responder=briefed  # what the asking cost
-pytest ... --bench-skills=false --bench-responder=model    # does the *skill* matter
-pytest ... --bench-skills=false --bench-responder=silent   # the floor
+pytest ... --bench-docs=true  --bench-responder=model    # does the whole thing work
+pytest ... --bench-docs=true  --bench-responder=silent   # does *asking* matter
+pytest ... --bench-docs=true  --bench-responder=briefed  # what the asking cost
+pytest ... --bench-docs=false --bench-responder=model    # does the *skill* matter
+pytest ... --bench-docs=false --bench-responder=silent   # the floor
 ```
 
 **What that buys.** A run costs what you asked it for rather than what the case
@@ -155,7 +155,7 @@ persona's facts and nothing else: `test_cases.py` asserts it fences off the same
 `persona_must_not_know` vocabulary the persona does, so it discloses the fact and
 never the procedure for using it.
 
-### `--bench-skills=false` on a case with no skill
+### `--bench-docs=false` on a case with no skill
 
 Allowed, and it measures something real — whether the catalog was helping that
 work at all. It is simply not the question the case was written to ask, and the
@@ -415,7 +415,7 @@ the other end — a `--bench-responder=model` session that got no answers ran th
 
 Two things *are* asserted, and neither judges a subject: that `summary.md`
 reached disk with a transcript per sample, and that the **catalog matched the
-switch**. The second is not a finding — if `--bench-skills=false` stopped
+switch**. The second is not a finding — if `--bench-docs=false` stopped
 withholding the catalog, a skill's delta against the other session would read as
 zero for a reason unrelated to the skill, which is a green table asserting the
 opposite of the truth.
@@ -498,7 +498,7 @@ tools with their real schemas and the server's own `instructions`.
 
 **Nothing is stood in for, and that was a deliberate choice.** A hand-written
 tool surface would have been cheaper and would have put `execute_code`'s return
-shape, `server_status`'s report and the `guide://` bodies back into a
+shape, `server_status`'s report and the reference docs back into a
 transcription — the same disease, moved from the subject into the environment.
 
 ## What this needs

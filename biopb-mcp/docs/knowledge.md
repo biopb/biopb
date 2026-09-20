@@ -1,7 +1,9 @@
 # Knowledge store — one flat set of docs, an agent-edited index
 
-Status: **proposed**. Supersedes [`skills.md`](skills.md) Part I (what a skill is
-and how it ships). Part II's contract layer survives, scoped in §7.
+Status: **implemented**. Replaces `skills.md`, which is gone: Part I (what a
+skill is and how it ships) is this document, and Part II's surviving layers are
+[`_tests/docs/README.md`](../src/biopb_mcp/_tests/docs/README.md) and
+[`_tests/bench/README.md`](../src/biopb_mcp/_tests/bench/README.md).
 
 **Component:** `biopb-mcp` — `mcp/_docs.py` (store, index, tools),
 `mcp/_docs_data/` (the shipped seed), `~/.config/biopb/docs/` (the user's own).
@@ -38,8 +40,22 @@ A doc is a markdown file. Two directories, read fresh on every access:
 **Id is the path under the directory, minus `.md`**, and may contain `/`.
 Nothing about subdirectories is interpreted today; allowing the slash now
 means the store can grow a tree by naming convention later without a
-migration. `index` is reserved (§3). A shipped file whose name starts with `_`
-is not shipped — the one surviving spelling of "banked, not served".
+migration. `index` is reserved (§3).
+
+**A `_`-prefixed name is banked: unlisted, not withheld.** It ships, and
+`read_doc` returns it by id; what it does not get is a line in the seed index,
+so it stays out of the reconciliation tail (§3) and no session is told it
+exists. One hand-written entry promotes it, which is what keeps banking cheap to
+undo — and is why the file has to be in the wheel. Enforced in exactly one
+place, `shipped_ids()`, which only the tail consumes.
+
+This leaves two ways for a doc to go unlisted, and they belong to different
+actors: the `_` prefix is *the release does not list this*, the index's
+`ignored:` line is *this agent does not list this*. Neither can express the
+other's decision, so the seed ships with an empty `ignored:` line and the agent
+owns it outright. What a banked doc does *not* get is an assertion — the package
+gates read the offered set (§7), since a doc is usually banked because its
+evidence is thin, which is exactly when a green gate reads as an endorsement.
 
 **Frontmatter is optional and small.** The reader is the tolerant one that
 exists today (`_parse_frontmatter`): scalars and inline lists, unknown keys
@@ -250,16 +266,16 @@ baseline arm. `--bench-docs=false` (today's `--bench-skills`) hides
 `kind: procedure` docs from the rendered index and from `read_doc`; reference
 docs stay. That is the only reason `kind` exists.
 
-**What survives from `_tests/skills/`.**
+**What survived from `_tests/skills/`**, now `_tests/docs/`:
 
 | layer | fate |
 |---|---|
 | structure (`test_schema`, `test_validate`, `_validate.py`, `_skills_layout.py`) | deleted with the schema |
-| retrieval (`test_retrieval`) | replaced by one invariant: every shipped doc is either an entry of the seed index or on its `ignored:` line, and every seed entry names a file that ships |
-| packaging (`test_packaging`) | kept: every seed doc reaches the wheel, `_`-prefixed ones do not |
+| retrieval (`test_retrieval`) | replaced by `test_seed.py`: every shipped doc is either an entry of the seed index or on its `ignored:` line, every seed entry names a file that ships, every `[[link]]` lands, and nothing is over a cap |
+| packaging (`test_packaging`) | kept: every doc, banked ones included, reaches the wheel — a banked doc that did not ship could not be promoted |
 | contract (`test_contracts`) | kept: the hand-written API pins need no schema; the coverage fixture reads `packages:` instead of `checklist:` |
 | satisfiability / availability | key off `packages:` and survive unchanged in spirit; whether availability keeps earning its CI minutes is a separate call |
-| bench cases | unchanged; the switch is renamed |
+| bench cases | unchanged. The switch is `--bench-docs`, and its probe reads the index and each entry's `read_doc` header rather than a `list_skills` reply |
 
 **Acceptance.** Re-run the gpt-5.6-luna pairing with the new store, both arms.
 The bar is the recorded 17/3 on the docs-on arm; the docs-off arm should not
@@ -281,16 +297,30 @@ Content:
 Code and config:
 
 - `_skills.py`, `_skills_layout.py`, `_resources.py`'s constants,
-  `list_skills`, `skill://`, `guide://` are removed; `_docs.py` replaces them;
+  `list_skills`, `skill://`, `guide://` are removed; `_docs.py` replaces them.
+  The chat loop's synthesized `read_resource` goes with them: it existed only
+  because a chat-completions API has no verb for `resources/read`, and the
+  store is now ordinary tools;
 - `services.skills_enabled / skills_local_dir` become
   `docs_enabled / docs_local_dir`, the old keys read as aliases for one
   release; `skills_index_plugins` is dropped with the plugin rows;
 - `biopb._locations.mcp_skill_dir` gains a `mcp_docs_dir` sibling;
-- `start_kernel` → `start_biopb` with the alias (#894).
+- `start_kernel` → `start_biopb` with the alias (#894). **Not done here** -- it
+  is its own issue with a thirty-file blast radius and no coupling to the
+  store.
 
-Sequence: one PR for the store, the tools, the seed and the handshake, with
-the old surface still registered; a second for the deletions and the test
-rewrite; then the acceptance run.
+Two departures from the plan above, both because the plan was wrong about a
+detail rather than about the design:
+
+- **`updated` is derived, not stamped.** An `old`/`new` write that also
+  rewrote the frontmatter would be a replace that changed something the agent
+  did not name. It is read from `updated:` where an author wrote one, and from
+  the local file's mtime otherwise.
+- **The kernel guide keeps its requirements section.** The `checklist:` token
+  grammar went, but the rest of it -- which `server_status` section answers
+  which question, and the three causes of a missing plugin -- is what every
+  procedure's first step points at, and dropping it would have left twelve
+  dangling pointers.
 
 ## 9. Extensibility: what v1 must not preclude
 

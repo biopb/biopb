@@ -4,7 +4,7 @@
 `_tests/agentbench/test_fixture_protocol.py` (its own tests),
 `_tests/agentbench/test_fixture_tree.py` (the `-m fixtures` check),
 `biopb-mcp/tools/author_*_fixture.py` (authoring a curated case's data).
-**Related:** [`skills.md`](skills.md) §10 — the benchmark written in this
+**Related:** [`../src/biopb_mcp/_tests/bench/README.md`](../src/biopb_mcp/_tests/bench/README.md) — the benchmark written in this
 vocabulary; `_tests/bench/README.md` — how to run it.
 
 One runner puts a model in front of a real biopb session and scores what comes

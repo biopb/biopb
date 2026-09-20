@@ -1,6 +1,6 @@
 """Run every selected case and report. A benchmark, not a gate.
 
-`biopb-mcp/docs/skills.md` §10. The engine is `_engine.py` and the data is
+`_tests/bench/README.md`. The engine is `_engine.py` and the data is
 `cases/`; this file is only the pytest surface over them, so a new case costs a
 `Case` and nothing here.
 
@@ -11,7 +11,7 @@ stopping at the first bad corner would discard the rows that explain it.
 
 Two things *are* asserted, and neither judges a case: that the report reached
 disk with a transcript per sample, and that the **catalog matched the switch**.
-The second is not a finding — if `--bench-skills=false` stopped withholding the
+The second is not a finding — if `--bench-docs=false` stopped withholding the
 catalog, a skill's delta against the other session would read as zero for a
 reason unrelated to the skill, which is a green table saying the opposite of
 the truth.
@@ -89,7 +89,7 @@ def test_the_catalog_matched_the_switch(run: Run):
 
     Checked on what the catalog *returned*, not on whether `list_skills` was
     called: the tool stays registered either way and it is `load_catalog()` that
-    gates, so a `--bench-skills=false` run can call it and get an empty list.
+    gates, so a `--bench-docs=false` run can call it and get an empty list.
 
     It asserts one thing and deliberately not a second: that the catalog was
     non-empty exactly when the switch said it should be. It never names an
@@ -103,13 +103,13 @@ def test_the_catalog_matched_the_switch(run: Run):
     reading in either direction, and treating "we could not look" as evidence of
     a catalog is how this check silently stopped checking once before.
     """
-    want = run.options.skills
+    want = run.options.docs
     wrong = [
         f"{r.name}: the catalog probe failed, so nothing here verifies "
-        f"--bench-skills={str(want).lower()}"
+        f"--bench-docs={str(want).lower()}"
         if r.catalog == CATALOG_UNREAD
         else (
-            f"{r.name}: --bench-skills={str(want).lower()} but the catalog held "
+            f"{r.name}: --bench-docs={str(want).lower()} but the catalog held "
             f"{len(r.catalog)} entries"
         )
         for r in run.results

@@ -26,7 +26,7 @@ visible in the data and an unaided run may well find it:
     does not) are different answers to "how many cells"
 
 The reference implementation these tolerances come from is in the pull request
-that added this case, per `biopb-mcp/docs/skills.md` §11b.
+that added this case, per `_tests/bench/README.md`.
 """
 
 from __future__ import annotations

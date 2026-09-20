@@ -133,21 +133,21 @@ jobs:
         run: uv run --no-sync pytest -v --color=yes --cov=biopb_mcp --cov-report=xml biopb-mcp/src/biopb_mcp/_tests
 
       # Deselected from the run above (pyproject addopts) because each token is a
-      # real resolver run. Resolves every `pkg:` a shipped skill's `checklist:` declares against
-      # the environment just built, so a skill whose package installs only by
+      # real resolver run. Resolves every `packages:` entry a shipped doc declares against
+      # the environment just built, so a doc whose package installs only by
       # downgrading biopb's own deps fails here rather than on a user's machine.
       # Metadata only -- nothing is downloaded or installed.
       #
       # This step owns ONE question: does installing it move something already
       # here. That is fatal wherever it happens -- a live kernel has the old
-      # versions imported -- so one red cell rejects the skill, and required and
+      # versions imported -- so one red cell rejects the doc, and required and
       # optional packages are judged the same way.
       #
       # Whether the package can be installed on a platform at all is a different
-      # question with a different verdict, and it is the skill-availability job
+      # question with a different verdict, and it is the doc-availability job
       # below rather than another per-cell step (#680).
       - name: Skill package satisfiability
-        run: uv run --no-sync pytest -v --color=yes -m satisfiability biopb-mcp/src/biopb_mcp/_tests/skills
+        run: uv run --no-sync pytest -v --color=yes -m satisfiability biopb-mcp/src/biopb_mcp/_tests/docs
 
       - name: Coverage
         uses: codecov/codecov-action@v6
@@ -167,8 +167,8 @@ jobs:
   # gates nothing, so a session without the package says so and works around it.
   # Installing on NO cell still fails -- that is a token nobody can ever satisfy
   # rather than a platform gap.
-  skill-availability:
-    name: skill package availability
+  doc-availability:
+    name: doc package availability
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -201,4 +201,4 @@ jobs:
       - name: Skill package availability
         run: >-
           uv run --no-sync pytest -v --color=yes -m availability
-          biopb-mcp/src/biopb_mcp/_tests/skills/test_availability.py
+          biopb-mcp/src/biopb_mcp/_tests/docs/test_availability.py

@@ -1,6 +1,6 @@
 """The run options: which fixtures, in what configuration, how many times.
 
-**One invocation is one configuration.** `--bench-skills` decides whether the
+**One invocation is one configuration.** `--bench-docs` decides whether the
 agent is offered the catalog at all and `--bench-responder` decides who answers
 it — or whether there is anything left to ask; both are settings on the session
 the run happens in, and neither varies within a run. What used to be a 2x2 the
@@ -26,8 +26,8 @@ the values offered here are the ones the engine can actually honour.
 `.env` for credentials and model selection, which are facts about a machine. An
 option here decides what gets *spent* and what a number means — a fixture kind,
 a catalog, a sample count — and a file somebody put in the repo root a month ago
-should not be what answers that. An explicit `--bench-skills=false` on the
-command line is why a report has no catalog in it; `BIOPB_BENCH_SKILLS` in a
+should not be what answers that. An explicit `--bench-docs=false` on the
+command line is why a report has no catalog in it; `BIOPB_BENCH_DOCS` in a
 `.env` is not.
 
 **Selecting one case is `-k`**, pytest's own. The parametrization ids are case
@@ -68,23 +68,24 @@ FIXTURES = Setting(
     "always available, `curated` is real data and needs $BIOPB_FIXTURES",
 )
 
-#: The catalog switch. `false` is `services.skills_enabled: false` in the
+#: The procedures switch. `false` is `services.docs_enabled: false` in the
 #: session's own config — a real shipped configuration, so the kernel, napari,
 #: dask and every library stay exactly as they are and only the curated
-#: procedures go. §6's rule: disclose the environment, withhold only the skill.
+#: procedures go. The reference docs stay, which is the point: withholding the
+#: whole store would also withhold the API documentation and move the baseline.
 #:
-#: Against a case that names a skill, two runs either side of this is that
-#: skill's behavioural delta, and it is the number the whole layer exists to
+#: Against a case that names a procedure, two runs either side of this is that
+#: doc's behavioural delta, and it is the number the whole layer exists to
 #: produce. Against a case that names none it asks a fair question too — were
-#: the skills helping this at all — it is simply not the one the case was
+#: the procedures helping this at all — it is simply not the one the case was
 #: written for.
-SKILLS = Setting(
-    "--bench-skills",
-    "BIOPB_BENCH_SKILLS",
+DOCS = Setting(
+    "--bench-docs",
+    "BIOPB_BENCH_DOCS",
     ("true", "false"),
     "true",
-    "whether the agent is offered the skills catalog at all; `false` withholds "
-    "it and nothing else, which is the ablation half of a skill's delta",
+    "whether the agent is offered the curated procedure docs; `false` withholds "
+    "them and nothing else, which is the ablation half of a doc's delta",
 )
 
 #: Who answers when the agent asks — and, for one value, whether there is
@@ -117,7 +118,7 @@ RESPONDER = Setting(
     "the same information with the asking taken out",
 )
 
-SETTINGS = (FIXTURES, SKILLS, RESPONDER)
+SETTINGS = (FIXTURES, DOCS, RESPONDER)
 
 #: How many times to run the case. One unless asked for more.
 #:
@@ -145,7 +146,7 @@ class Options:
     """
 
     fixtures: str = FIXTURES.default
-    skills: bool = True
+    docs: bool = True
     responder: str = RESPONDER.default
     samples: int = 1
 
@@ -153,7 +154,7 @@ class Options:
     def filtered(self) -> bool:
         """Whether the *case list* was narrowed. Decides if a run has to say so.
 
-        Only the selection option counts. `skills` and `responder` change what
+        Only the selection option counts. `docs` and `responder` change what
         a run measures rather than how much of the catalogue it covers, and both
         are already in every report header and in `session.json`.
         """
@@ -162,7 +163,7 @@ class Options:
     @property
     def configuration(self) -> str:
         """The session's harness configuration, short enough for a heading."""
-        return f"skills={'on' if self.skills else 'off'} responder={self.responder}"
+        return f"docs={'on' if self.docs else 'off'} responder={self.responder}"
 
     def describe(self) -> str:
         """One line, for the report and the terminal. Every option, including
@@ -170,7 +171,7 @@ class Options:
         be read as a record of what was run."""
         return (
             f"fixtures={self.fixtures} "
-            f"skills={str(self.skills).lower()} responder={self.responder} "
+            f"docs={str(self.docs).lower()} responder={self.responder} "
             f"samples={self.samples}"
         )
 
@@ -179,7 +180,7 @@ class Options:
         who has seen `pytest -h` needs nothing else to interpret them."""
         return {
             "fixtures": self.fixtures,
-            "skills": self.skills,
+            "docs": self.docs,
             "responder": self.responder,
             "samples": self.samples,
         }
@@ -247,7 +248,7 @@ def resolve(config=None) -> Options:
     """This run's options: the flag, else the environment, else the default."""
     return Options(
         fixtures=_chosen(config, FIXTURES),
-        skills=_chosen(config, SKILLS) == "true",
+        docs=_chosen(config, DOCS) == "true",
         responder=_chosen(config, RESPONDER),
         samples=_samples(config),
     )

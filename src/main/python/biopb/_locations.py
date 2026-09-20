@@ -244,18 +244,17 @@ def mcp_plugin_dir() -> Path:
     return config_dir() / "kernel"
 
 
-def mcp_skill_dir() -> Path:
-    """User skills dir (``~/.config/biopb/skills``).
+def mcp_docs_dir() -> Path:
+    """The agent's own docs (``~/.config/biopb/docs``).
 
-    ``*.md`` files here are merged into the agent's skills catalog beside the
-    curated ones, which ship inside biopb-mcp -- the personal tier of the same
-    "drop a file in a config dir" path as :func:`mcp_plugin_dir`, and the only
-    way a skill reaches a machine outside a release. Config-tree
-    (user-authored), resolved at call time for test isolation and **not created
-    on access**: absence is the normal no-local-skills case, and a bare read
-    must not materialize an empty dir.
+    The local tier of biopb-mcp's knowledge store: ``*.md`` files the agent
+    writes with ``write_doc``, plus the index it edits. A doc here shadows a
+    shipped one of the same id. The personal tier of the same "drop a file in a
+    config dir" path as :func:`mcp_plugin_dir`. Config-tree (user-authored),
+    resolved at call time for test isolation and **not created on access** --
+    the store creates it when it seeds the index or writes the first doc.
     """
-    return config_dir() / "skills"
+    return config_dir() / "docs"
 
 
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:

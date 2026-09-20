@@ -32,14 +32,13 @@ import time
 from typing import Annotated
 
 from mcp.types import ImageContent, TextContent
-from pydantic import Field
+from pydantic import AnyUrl, Field
 
 from . import (
     _app,
+    _docs,
     _kernel_rpc,
-    _resources,
     _scratch,
-    _skills,
     _workflow_doc,
     _writers,
 )
@@ -135,7 +134,7 @@ try:
     else:
         print("  mode: in-process (" + str(_dst["scheduler"]) + "), shared with the viewer")
         print("    `_dask_ctl.attach()` in a cell spins a cluster for multi-process")
-        print("    parallelism / a cancellable compute; guide://kernel explains when")
+        print("    parallelism / a cancellable compute; the `kernel` doc explains when")
 except Exception as _e:
     print("  error: " + str(_e))
 
@@ -507,54 +506,16 @@ def _format_job_status(snap: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.resource("guide://kernel")
-def get_kernel_guide() -> str:
-    """Overview: available namespaces, helper functions, resource URIs.
+@mcp.resource("docs://index")
+def get_index() -> str:
+    """The doc index, for hosts that subscribe to resources.
 
-    The skill-requirements section is appended only when the catalog is enabled
-    (``services.skills_enabled``): with it off there is no ``list_skills`` to
-    return a ``checklist:``, so the section would document an unreachable
-    tool -- the same gate the handshake instructions use.
+    The same text the handshake carries and ``read_doc("index")`` returns. It is
+    a resource as well so a host that honours ``resources/updated`` re-reads it
+    after a write -- the nearest thing MCP has to a harness injecting recall.
+    Nothing depends on it; the tool is the contract.
     """
-    if _app._skills_enabled:
-        return _resources.GUIDE + _resources.SKILL_REQUIREMENTS
-    return _resources.GUIDE
-
-
-@mcp.resource("guide://data")
-def get_data_guide() -> str:
-    """How array data is represented here: the three sources, and their traps."""
-    return _resources.DATA
-
-
-@mcp.resource("guide://viewer")
-def get_viewer_guide() -> str:
-    """Viewer operations: layers, camera, dims, display."""
-    return _resources.VIEWER
-
-
-@mcp.resource("guide://client")
-def get_client_guide() -> str:
-    """The `client` handle: listing sources, loading, uploading."""
-    return _resources.CLIENT
-
-
-@mcp.resource("guide://ops")
-def get_ops_guide() -> str:
-    """Image processing operations: segmentation, feature extraction, super-resolution."""
-    return _resources.OPS
-
-
-@mcp.resource("skill://{skill_id}")
-def get_skill(skill_id: str) -> str:
-    """Full workflow body for a curated skill; discover ids with `list_skills`.
-
-    The catalog (metadata) is served separately via the `list_skills` tool; this
-    resource reads one skill's markdown body from the file the catalog named.
-    Fail-open: returns a short explanatory string rather than erroring when a
-    skill is unknown or its file is unreadable.
-    """
-    return _skills.get_skill_body(skill_id)
+    return _docs.render_index()
 
 
 # ---------------------------------------------------------------------------
@@ -563,53 +524,74 @@ def get_skill(skill_id: str) -> str:
 
 
 @mcp.tool()
-async def list_skills(keywords: list[str] | None = None) -> list:
-    """Discover curated biopb workflows ("skills"). Call at the start of a task.
+async def read_doc(id: str) -> str:  # noqa: A002 - the parameter name is the wire contract
+    """Read one doc from the biopb knowledge store.
 
-    Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
-    labels").
+    `id` is what the index lists. `read_doc("index")` returns the index itself
+    -- the catalog of everything readable, with the agent's own hooks -- and is
+    worth re-reading when the session's handshake copy has gone stale.
 
-    **`keywords` is a keyword filter, not a search engine.** Each keyword must
-    appear in a skill's id/title/description/tags, so every one you add can only
-    remove results. Pass **one or two** domain terms and widen from there:
-    `["drift"]`, `["fret"]`, `["illumination"]`, `["stitch", "tiles"]`. Omit it
-    to list the whole catalog — worth doing once, since it is small.
-
-    **An empty result usually means too many keywords, not no such skill.**
-    `["count", "foci", "per", "nucleus"]` returns nothing while `["foci"]`
-    returns the skill that counts them. If you get nothing back, drop keywords
-    and call again, or call with none and read the list.
-
-    **Results are of two `kind`s, and they are used differently.**
-
-    - `kind="skill"` — a curated workflow. It carries a `uri` (`skill://<id>`);
-      read that resource for the full step-by-step body. Prefer an existing
-      skill over improvising.
-    - `kind="plugin"` — a Python module already loaded into the kernel
-      namespace, listed with its docstring summary. There is no body to read.
-      It carries a `handle`, the name it is bound under: call
-      `inspect_object(handle)` for its callables and signatures, then use it in
-      `execute_code` as `handle.some_function(...)`. **Prefer it over writing
-      your own** — these exist because the from-scratch version is slow, subtly
-      wrong, or both, and the docstring says which.
-
-    Skills are listed before plugins.
-
-    A result's `checklist` lists what the skill touches (`viewer`, `tensor`, `dask`,
-    `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
-    skill — it informs rather than blocks, so a gap is something to name and
-    work around, not a reason to abandon the skill: `server_status` answers every token except a third-party `pkg:` — it
-    does carry biopb-mcp's own version — and for those, `execute_code` an
-    `import <name>` and read the version with
-    `importlib.metadata.version("<name>")`, not the module's `__version__`
-    (packages forget to bump it). A gap is the user's call —
-    installing, seeding a plugin, restarting the kernel all need their consent —
-    but naming it up front beats failing halfway through.
-
-    Fail-open: returns an empty list (never errors) rather than reporting a
-    catalog that could not be read.
+    A doc links another as `[[other-id]]`; follow one with another `read_doc`.
     """
-    return await asyncio.to_thread(_skills.list_skills, keywords or ())
+    return await asyncio.to_thread(_docs.read_doc, id)
+
+
+@mcp.tool()
+async def write_doc(
+    id: str,  # noqa: A002 - the parameter name is the wire contract
+    body: str | None = None,
+    old: str | None = None,
+    new: str | None = None,
+) -> str:
+    """Write a doc into the biopb knowledge store. Returns a diff of the change.
+
+    Two forms. `body` writes the whole doc. `old`/`new` replaces one exact
+    occurrence of `old` -- the cheaper form, and the only sane one for the
+    index, which is long enough that rewriting it loses lines. The call is
+    refused if `old` is absent or matches more than once, so include enough
+    surrounding text to name one place. Several edits are several calls.
+
+    Writing a shipped doc creates your own copy shadowing it; the shipped file
+    is never touched, so an upgrade can still replace it. There is no delete:
+    retire a doc of your own by removing its index entry, and a shipped one by
+    adding its id to the index's `ignored:` line.
+
+    A new doc is filed in the index automatically, under `## Unfiled` -- move
+    the line where it belongs next time you edit the index.
+
+    Five rules, and they are what keep this store worth reading:
+
+    - Write only a **validated, multi-step** procedure -- one the user has just
+      confirmed on real data. A doc is a claim that the procedure works.
+    - Never a **dataset-specific** one. A source_id, an array_id or a pathname
+      makes it unusable by the next session; that run belongs in a notebook.
+    - Phrase the index hook **as the user's request**, not as an implementation
+      summary. It is what a later session matches against.
+    - **Update an existing doc rather than write a near-duplicate.** Read the
+      index first, and prefer an `old`/`new` edit to a new file.
+    - **Verify that a name, flag or call the doc quotes still exists** before
+      relying on it. Nothing else checks a doc of yours.
+
+    `read_doc("authoring")` has what a procedure doc must contain.
+    """
+    result = await asyncio.to_thread(_docs.write_doc, id, body, old, new)
+    await _notify_doc_written(id)
+    return result
+
+
+async def _notify_doc_written(doc_id: str) -> None:
+    """Tell a subscribing host the index resource moved. Best-effort.
+
+    Only the index is exposed as a resource, and only some hosts subscribe, so
+    a failure here is not a failed write.
+    """
+    if doc_id != _docs.INDEX_ID:
+        return
+    try:
+        session = mcp.get_context().session
+        await session.send_resource_updated(AnyUrl("docs://index"))
+    except Exception:
+        logger.debug("docs: could not notify the index resource update", exc_info=True)
 
 
 @mcp.tool()
@@ -704,13 +686,13 @@ async def execute_code(
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
 
-    * viewer mutations (see guide://viewer for more details):
+    * viewer mutations (read_doc("viewer") has more):
     The viewer is thread-safe: mutations are auto-marshaled to the Qt main
     thread, so mutate it directly from job code. run_on_main(fn) is optional --
     use it to batch many mutations into one main-thread hop, or to touch raw Qt
     (viewer.window), which still requires the main thread.
 
-    * data access (see guide://client for more details):
+    * data access (read_doc("client") has more):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
@@ -733,7 +715,7 @@ async def execute_code(
       in display axis order ([..., Z, Y, X], at the source's own rank), and
       lazy -- np.asarray() of it silently gives the *lowest* level. Use
       viewer.tensor(layer), which returns a plain full-resolution dask array
-      from any layer, and read guide://data before measuring or computing from
+      from any layer, and read_doc("data") before measuring or computing from
       a layer.
     """
     host, err = _app._require_kernel_host()
@@ -1279,13 +1261,14 @@ async def server_status() -> str:
         lines.append("  status: not running (observe.enabled off or failed to start)")
     lines.append("")
 
-    # Where a skill the agent writes has to land. Server-process state (the
-    # catalog is scanned here, not in the kernel), and the path is configurable,
-    # so a hard-coded ~/.config/biopb/skills in a skill body can be wrong.
-    if _app._skills_enabled:
-        lines.append("## Skills")
-        lines.append(_skills.local_dir_status())
-        lines.append("")
+    # Where a doc the agent writes lands. Server-process state (the store is
+    # read here, not in the kernel) and the path is configurable, so a doc body
+    # quoting ~/.config/biopb/docs can be wrong.
+    lines.append("## Docs")
+    lines.append(_docs.local_dir_status())
+    if not _app._docs_enabled:
+        lines.append("  procedures: withheld (services.docs_enabled)")
+    lines.append("")
 
     lines.append("## Kernel")
 

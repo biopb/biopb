@@ -31,11 +31,12 @@ _kernel_host: KernelHost | None = None
 # instead of an inline result (set from config by the launcher).
 _promote_after: float = 10.0
 
-# Whether the curated-skills catalog is advertised to the agent (mirrors
-# `services.skills_enabled`, on by default). Set by the launcher
-# (set_skills_enabled); gates the _SKILLS_INSTRUCTIONS fragment in the handshake.
-# test_mcp_server pins this literal to the config default so the two can't drift.
-_skills_enabled: bool = True
+# Whether the knowledge store's procedure docs are served (mirrors
+# `services.docs_enabled`, on by default). Set by the launcher
+# (set_docs_enabled); the store reads the same setting, and the handshake drops
+# the authoring directive with it. test_mcp_server pins this literal to the
+# config default so the two can't drift.
+_docs_enabled: bool = True
 
 # This process's logfile path (set by the launcher), surfaced by server_status so
 # an agent can find its own log. None when output goes to a terminal (foreground
@@ -58,13 +59,9 @@ _BASE_INSTRUCTIONS = (
     "or launch biopb or napari is asking for this tool.\n"
     "\n"
     "This biopb-mcp session drives a live napari viewer through a child IPython "
-    "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
-    "for detail before non-trivial work: guide://kernel (namespace, skill "
-    "requirements, long-running jobs & cancellation), guide://data (how arrays are "
-    "represented here -- pyramids, laziness, axis order and rank -- and the traps), "
-    "guide://client (the `client` handle: catalog, load, upload), "
-    "guide://viewer (layers/camera/dims, annotation layers), "
-    "guide://ops (server-side image-processing ops).\n"
+    "kernel; `execute_code` runs arbitrary Python in that kernel. The index below "
+    "lists the docs; read one with `read_doc(id)`, and read its *Read first* "
+    "section before non-trivial work.\n"
     "\n"
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
@@ -92,30 +89,25 @@ _BASE_INSTRUCTIONS = (
     "data better than you do."
 )
 
-# Appended to _BASE_INSTRUCTIONS only when the skills catalog is enabled
-# (`services.skills_enabled`, on by default). Kept out of the base so an install
-# that switches skills off neither points the agent at `list_skills` (which would
-# return nothing) nor prompts it to author skills — set_skills_enabled owns the
-# field.
-_SKILLS_INSTRUCTIONS = (
-    "Once the kernel is ready, call `list_skills` at the start of a task to "
-    "check for a curated workflow before improvising; read the matching `skill://<id>` resource for the "
-    "steps. Results marked `origin: local` are the user's own unreviewed skills "
-    "from ~/.config/biopb/skills; prefer a curated one when both fit. After "
-    "accomplishing a task, ask the user whether a new skill should be generated "
-    "and added to the agent's toolbox for future use.\n"
+# Appended to _BASE_INSTRUCTIONS only when procedure docs are served
+# (`services.docs_enabled`, on by default), so an install that switches them off
+# is not told to write one.
+_AUTHORING_INSTRUCTIONS = (
+    "After accomplishing a task worth repeating, ask the user whether it should "
+    "become a doc, and write it with `write_doc`.\n"
     "\n"
-    "Skills name three checkpoint types in their steps; honor them:\n"
-    "- confirm-input: ask before computing, but only for facts the data cannot "
-    "give you (voxel spacing, which channel is which, expected object size).\n"
-    "- visual checklist: put the intermediate on the viewer and report two or three "
-    "numbers with it -- never a screenshot alone, and report the numbers alone "
-    "when the data is too large to show usefully.\n"
-    "- validate-and-gate: stop and get the user's agreement before anything "
-    "expensive or hard to walk back.\n"
-    "Destructive steps always ask first, whatever a skill says: restarting the "
+    "Destructive steps always ask first, whatever a doc says: restarting the "
     "kernel, interrupting a running job, overwriting a layer, or writing files."
 )
+
+# The header the rendered index is carried under. The index is inlined here
+# rather than fetched on request because every prompted hop loses agents
+# (biopb/biopb#894 is the record of agents missing the *first* hop).
+_INDEX_HEADER = (
+    "The doc index follows. It is itself doc `index`: re-read it with "
+    '`read_doc("index")` and edit it with `write_doc`.'
+)
+
 
 # DNS-rebinding / cross-origin protection (review finding A2).  execute_code is
 # a full kernel (RCE by design), so the only thing standing between a malicious
@@ -151,10 +143,29 @@ def build_transport_security(
 mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
 
 # FastMCP built the low-level server with instructions=None at import; seed the
-# always-on base guidance now so it is present even if set_skills_enabled is
-# never called (e.g. tests, or a standalone import), which recomposes from this
-# base.
+# always-on base guidance now so it is present even if set_docs_enabled is never
+# called (e.g. tests, or a standalone import). No index here: composing one at
+# import would read the config tree before the launcher has configured it.
 mcp._mcp_server.instructions = _BASE_INSTRUCTIONS
+
+
+def _recompose_per_session(build=mcp._mcp_server.create_initialization_options):
+    """Recompose ``instructions`` each time a session is initialized.
+
+    The index is a file the agent edits, and a long-lived HTTP server outlives
+    many sessions, so composing once at launch would hand later sessions an
+    index that has moved. ``create_initialization_options`` is the one call the
+    SDK makes per session that reads ``instructions``.
+    """
+
+    def create_initialization_options(*args, **kwargs):
+        _recompose_instructions()
+        return build(*args, **kwargs)
+
+    return create_initialization_options
+
+
+mcp._mcp_server.create_initialization_options = _recompose_per_session()
 
 
 def set_kernel_host(host: KernelHost):
@@ -184,28 +195,39 @@ def set_session_log_path(path: str | None):
     _session_log_path = path
 
 
-def _recompose_instructions():
-    """Rebuild the handshake ``instructions`` from ``_BASE_INSTRUCTIONS`` plus
-    whichever optional fragments the current mode enables (skills).
+def _compose_instructions() -> str:
+    """The handshake text: the base guidance, the rendered index, the rest.
 
-    Recomposing from the base in both directions is idempotent, so flipping any
-    dimension back off can't leave a stale fragment in the handshake while
-    preserving the always-on base guidance. The low-level Server holds the
-    `instructions` returned in the handshake.
+    Composed from :data:`_BASE_INSTRUCTIONS` every time rather than appended to,
+    so switching a dimension back off cannot leave a stale fragment behind.
     """
     parts = [_BASE_INSTRUCTIONS]
-    if _skills_enabled:
-        parts.append(_SKILLS_INSTRUCTIONS)
-    mcp._mcp_server.instructions = "\n\n".join(parts)
+    try:
+        from ._docs import render_index
+
+        parts.append(f"{_INDEX_HEADER}\n\n{render_index()}")
+    except Exception:  # pragma: no cover - the store is fail-open everywhere else
+        logger.debug(
+            "docs: could not render the index for the handshake", exc_info=True
+        )
+    if _docs_enabled:
+        parts.append(_AUTHORING_INSTRUCTIONS)
+    return "\n\n".join(parts)
 
 
-def set_skills_enabled(enabled: bool):
-    """Advertise (or hide) the curated-skills catalog in the agent's initialize
-    ``instructions``. On by default; switching skills off also drops the
-    directive, so the agent is never pointed at ``list_skills`` when it would
-    return nothing."""
-    global _skills_enabled
-    _skills_enabled = bool(enabled)
+def _recompose_instructions():
+    """Refresh the ``instructions`` the low-level Server hands out."""
+    mcp._mcp_server.instructions = _compose_instructions()
+
+
+def set_docs_enabled(enabled: bool):
+    """Serve (or withhold) the knowledge store's procedure docs.
+
+    Mirrors ``services.docs_enabled`` into this process so the handshake and
+    ``server_status`` agree with what ``read_doc`` will actually return.
+    """
+    global _docs_enabled
+    _docs_enabled = bool(enabled)
     _recompose_instructions()
 
 

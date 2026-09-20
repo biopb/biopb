@@ -46,7 +46,7 @@ export const MCP_NAV: McpNavItem[] = [
   {
     id: "services",
     label: "Services",
-    description: "ProcessImage algorithm servers wired into the kernel as `ops`, and the skills catalog.",
+    description: "ProcessImage algorithm servers wired into the kernel as `ops`, and the knowledge store.",
     kind: "fields",
     section: "services",
   },

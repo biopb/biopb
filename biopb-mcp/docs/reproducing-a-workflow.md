@@ -4,7 +4,7 @@
 slot), `mcp/_jobs.py` (`_Verification`, `_exec_cells`), `mcp/_server.py`
 (`verify_workflow`), `mcp/_notebook.py` (`build_workflow_notebook`),
 `mcp/_observe.py` (`/api/notebook?workflow=1`).
-**Related:** [`skills.md`](skills.md) — the *other* way a workflow is kept;
+**Related:** [`knowledge.md`](knowledge.md) — the *other* way a workflow is kept;
 [`../../docs/verification-scratch-kernel.md`](../../docs/verification-scratch-kernel.md)
 — why the isolation is a process, what it costs, and which display it takes.
 
@@ -17,7 +17,7 @@ competing answers to one question:
 |---|---|---|
 | What it holds | the procedure, minus the dataset | this run, on this dataset |
 | Who re-runs it | an agent, deriving parameters on new data | the user, editing cells |
-| Where it lives | `list_skills` catalog | a `.ipynb` on their disk |
+| Where it lives | the doc index (`read_doc`) | a `.ipynb` on their disk |
 
 `write-a-skill`'s *When NOT to use* already sends dataset-specific work away
 from the catalog; this is where it goes.
