@@ -293,7 +293,14 @@ them, and cost ~16k tokens to read the largest whole. The shape that fits is
 — one index line, one tail entry, one `ignored:` name — and
 `read_doc("internals/")` returns a derived listing (id, lines, first
 paragraph) instead of a body; docs over the cap return their heading outline,
-and `read_doc(id, section=…)` returns one section.
+and `read_doc(id, section=…)` returns one section. The listing is not the
+scaling limit — one line per doc reads fine to a few hundred — but a listing
+cannot answer the troubleshooting question, which starts from a literal (an
+exception name, a config key, a log line). That is full-text search, and at
+under a megabyte of prose it is grep: a `search_docs(pattern)` tool returning
+id, line and context, in-process, no index to build. Embeddings would earn
+their cost only at tens of megabytes or for questions with no literal anchor,
+and design docs share their vocabulary with the errors the code raises.
 
 None of that is built in v1. What v1 does so it stays additive:
 
