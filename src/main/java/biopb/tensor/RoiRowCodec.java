@@ -9,7 +9,6 @@ import java.util.Map;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -98,24 +97,36 @@ final class RoiRowCodec {
     static VectorSchemaRoot roisToRoot(List<RoiAnnotation> rois, BufferAllocator allocator) {
         VectorSchemaRoot root = VectorSchemaRoot.create(ROI_ROW_SCHEMA, allocator);
         root.allocateNew();
+        // Arrow looks a column up by scanning the field list, so the lookups
+        // are hoisted: the schema is fixed and the loop is per ROI.
+        VarCharVector roiId = (VarCharVector) root.getVector("roi_id");
+        VarCharVector arrayId = (VarCharVector) root.getVector("array_id");
+        VarCharVector setName = (VarCharVector) root.getVector("set_name");
+        VarCharVector label = (VarCharVector) root.getVector("label");
+        VarCharVector geometry = (VarCharVector) root.getVector("geometry");
+        VarCharVector propsJson = (VarCharVector) root.getVector("props_json");
+        VarBinaryVector version = (VarBinaryVector) root.getVector("drawn_against_version");
+        BigIntVector rev = (BigIntVector) root.getVector("rev");
+        BigIntVector createdAt = (BigIntVector) root.getVector("created_at_unix_ms");
+        BigIntVector updatedAt = (BigIntVector) root.getVector("updated_at_unix_ms");
+        MapVector plane = (MapVector) root.getVector("plane");
         for (int row = 0; row < rois.size(); row++) {
             RoiAnnotation roi = rois.get(row);
-            setUtf8(root, "roi_id", row, roi.getRoiId());
-            setUtf8(root, "array_id", row, roi.getArrayId());
-            setUtf8(root, "set_name", row, roi.getSetName());
-            setUtf8(root, "label", row, roi.getLabel());
-            setUtf8(root, "geometry", row, geometryJson(roi.getRoi()));
-            setUtf8(root, "props_json", row, roi.getPropsJson());
-            VarBinaryVector version = (VarBinaryVector) root.getVector("drawn_against_version");
+            setUtf8(roiId, row, roi.getRoiId());
+            setUtf8(arrayId, row, roi.getArrayId());
+            setUtf8(setName, row, roi.getSetName());
+            setUtf8(label, row, roi.getLabel());
+            setUtf8(geometry, row, geometryJson(roi.getRoi()));
+            setUtf8(propsJson, row, roi.getPropsJson());
             if (roi.hasDrawnAgainstVersion()) {
                 version.setSafe(row, roi.getDrawnAgainstVersion().toByteArray());
             } else {
                 version.setNull(row);
             }
-            ((BigIntVector) root.getVector("rev")).setSafe(row, roi.getRev());
-            ((BigIntVector) root.getVector("created_at_unix_ms")).setSafe(row, roi.getCreatedAtUnixMs());
-            ((BigIntVector) root.getVector("updated_at_unix_ms")).setSafe(row, roi.getUpdatedAtUnixMs());
-            writePlane((MapVector) root.getVector("plane"), row, roi.getPlaneMap());
+            rev.setSafe(row, roi.getRev());
+            createdAt.setSafe(row, roi.getCreatedAtUnixMs());
+            updatedAt.setSafe(row, roi.getUpdatedAtUnixMs());
+            writePlane(plane, row, roi.getPlaneMap());
         }
         root.setRowCount(rois.size());
         return root;
@@ -125,8 +136,9 @@ final class RoiRowCodec {
     static VectorSchemaRoot roiIdsToRoot(List<String> roiIds, BufferAllocator allocator) {
         VectorSchemaRoot root = VectorSchemaRoot.create(ROI_ID_SCHEMA, allocator);
         root.allocateNew();
+        VarCharVector roiId = (VarCharVector) root.getVector("roi_id");
         for (int row = 0; row < roiIds.size(); row++) {
-            setUtf8(root, "roi_id", row, roiIds.get(row));
+            setUtf8(roiId, row, roiIds.get(row));
         }
         root.setRowCount(roiIds.size());
         return root;
@@ -151,31 +163,45 @@ final class RoiRowCodec {
                     "ROI rows are missing column(s) " + missing + "; expected the ROI row schema "
                             + ROI_ROW_SCHEMA.getFields());
         }
+        VarCharVector roiId = (VarCharVector) root.getVector("roi_id");
+        VarCharVector arrayId = (VarCharVector) root.getVector("array_id");
+        VarCharVector setName = (VarCharVector) root.getVector("set_name");
+        VarCharVector label = (VarCharVector) root.getVector("label");
+        VarCharVector geometry = (VarCharVector) root.getVector("geometry");
+        VarCharVector propsJson = (VarCharVector) root.getVector("props_json");
+        VarBinaryVector version = (VarBinaryVector) root.getVector("drawn_against_version");
+        BigIntVector rev = (BigIntVector) root.getVector("rev");
+        BigIntVector createdAt = (BigIntVector) root.getVector("created_at_unix_ms");
+        BigIntVector updatedAt = (BigIntVector) root.getVector("updated_at_unix_ms");
+        MapVector plane = (MapVector) root.getVector("plane");
         List<RoiAnnotation> out = new ArrayList<>(root.getRowCount());
         for (int row = 0; row < root.getRowCount(); row++) {
             RoiAnnotation.Builder roi = RoiAnnotation.newBuilder()
-                    .setRoiId(utf8At(root, "roi_id", row))
-                    .setArrayId(utf8At(root, "array_id", row))
-                    .setSetName(utf8At(root, "set_name", row))
-                    .setLabel(utf8At(root, "label", row))
-                    .setPropsJson(utf8At(root, "props_json", row))
-                    .setRev(int64At(root, "rev", row))
-                    .setCreatedAtUnixMs(int64At(root, "created_at_unix_ms", row))
-                    .setUpdatedAtUnixMs(int64At(root, "updated_at_unix_ms", row));
-            parseGeometry(utf8At(root, "geometry", row), roi);
-            VarBinaryVector version = (VarBinaryVector) root.getVector("drawn_against_version");
+                    .setRoiId(utf8At(roiId, row))
+                    .setArrayId(utf8At(arrayId, row))
+                    .setSetName(utf8At(setName, row))
+                    .setLabel(utf8At(label, row))
+                    .setPropsJson(utf8At(propsJson, row))
+                    .setRev(int64At(rev, row))
+                    .setCreatedAtUnixMs(int64At(createdAt, row))
+                    .setUpdatedAtUnixMs(int64At(updatedAt, row));
+            parseGeometry(utf8At(geometry, row), roi);
             if (!version.isNull(row)) {
                 roi.setDrawnAgainstVersion(ByteString.copyFrom(version.get(row)));
             }
-            roi.putAllPlane(readPlane((MapVector) root.getVector("plane"), row));
+            roi.putAllPlane(readPlane(plane, row));
             out.add(roi.build());
         }
         return out;
     }
 
+    private static final JsonFormat.Printer GEOMETRY_PRINTER =
+            JsonFormat.printer().omittingInsignificantWhitespace();
+    private static final JsonFormat.Parser GEOMETRY_PARSER = JsonFormat.parser().ignoringUnknownFields();
+
     private static String geometryJson(ROI roi) {
         try {
-            return JsonFormat.printer().omittingInsignificantWhitespace().print(roi);
+            return GEOMETRY_PRINTER.print(roi);
         } catch (InvalidProtocolBufferException error) {
             throw new IllegalArgumentException("ROI geometry cannot be encoded as proto3 JSON", error);
         }
@@ -184,7 +210,7 @@ final class RoiRowCodec {
     private static void parseGeometry(String json, RoiAnnotation.Builder roi) {
         String text = json == null || json.isEmpty() ? "{}" : json;
         try {
-            JsonFormat.parser().merge(text, roi.getRoiBuilder());
+            GEOMETRY_PARSER.merge(text, roi.getRoiBuilder());
         } catch (InvalidProtocolBufferException error) {
             throw new IllegalArgumentException("ROI "
                     + (roi.getRoiId().isEmpty() ? "<new>" : roi.getRoiId())
@@ -235,17 +261,15 @@ final class RoiRowCodec {
         return pins;
     }
 
-    private static void setUtf8(VectorSchemaRoot root, String column, int row, String value) {
-        ((VarCharVector) root.getVector(column)).setSafe(row, value.getBytes(StandardCharsets.UTF_8));
+    private static void setUtf8(VarCharVector vector, int row, String value) {
+        vector.setSafe(row, value.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String utf8At(VectorSchemaRoot root, String column, int row) {
-        FieldVector vector = root.getVector(column);
-        return vector.isNull(row) ? "" : new String(((VarCharVector) vector).get(row), StandardCharsets.UTF_8);
+    private static String utf8At(VarCharVector vector, int row) {
+        return vector.isNull(row) ? "" : new String(vector.get(row), StandardCharsets.UTF_8);
     }
 
-    private static long int64At(VectorSchemaRoot root, String column, int row) {
-        FieldVector vector = root.getVector(column);
-        return vector.isNull(row) ? 0L : ((BigIntVector) vector).get(row);
+    private static long int64At(BigIntVector vector, int row) {
+        return vector.isNull(row) ? 0L : vector.get(row);
     }
 }

@@ -1,50 +1,22 @@
 package biopb.tensor;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+
+import java.lang.reflect.Method;
 
 import org.junit.Test;
 
-import net.imglib2.type.numeric.integer.UnsignedByteType;
-import net.imglib2.type.numeric.integer.UnsignedIntType;
-import net.imglib2.type.numeric.integer.UnsignedShortType;
-import net.imglib2.type.numeric.real.DoubleType;
-import net.imglib2.type.numeric.real.FloatType;
-
 /**
- * Unit tests for TensorFlightClient utility functions.
+ * Unit tests for {@link TensorFlightClient}'s static helpers -- the ones that
+ * need no live Flight server.
  *
- * Tests static utility methods that don't require a live Flight server.
+ * <p>The dtype helpers this file used to cover live in {@link TensorChunkCodec}
+ * and are tested against the real methods in {@link TensorChunkCodecTest}. They
+ * were tested here through private copies, which is how the {@code parseVersion}
+ * regression below survived: the copy was correct and the production method was
+ * not.
  */
 public class TensorFlightClientUtilTest {
-
-    // Test normalizeReductionMethod indirectly through getTensor validation
-    // (the method is private but behavior can be verified through public API)
-
-    @Test
-    public void testNormalizeReductionMethodNearest() {
-        // "nearest" should stay "nearest"
-        // "stride" and "decimate" should normalize to "nearest"
-        // This is tested indirectly through TensorFlightClient.getTensor
-        // with valid/invalid reduction methods
-        // See TensorFlightClientTest for those tests
-    }
-
-    @Test
-    public void testNormalizeReductionMethodArea() {
-        // "area" should stay "area"
-        // "mean" should normalize to "area"
-    }
-
-    @Test
-    public void testNormalizeReductionMethodLinear() {
-        // "linear" should stay "linear"
-    }
-
-    @Test
-    public void testNormalizeReductionMethodInvalid() {
-        // Invalid methods like "median" should throw IllegalArgumentException
-        // See TensorFlightClientTest.testScaledReadRejectsUnsupportedMethod
-    }
 
     // Tensor identity policy: source_id is the prefix of array_id before the
     // first '/' (array_id = source_id or source_id/field; source_id slash-free).
@@ -66,265 +38,33 @@ public class TensorFlightClientUtilTest {
         assertEquals("plate_x", TensorFlightClient.sourceIdFromArrayId("plate_x/A01/0"));
     }
 
-    // We can test bytesPerElement and createType by examining the types they create
-
     @Test
-    public void testBytesPerElementUint8() {
-        // u1, uint8, |u1 -> 1 byte
-        assertEquals(1, getBytesPerElement("u1"));
-        assertEquals(1, getBytesPerElement("uint8"));
-        assertEquals(1, getBytesPerElement("|u1"));
-    }
-
-    @Test
-    public void testBytesPerElementUint16() {
-        // u2, uint16 -> 2 bytes
-        assertEquals(2, getBytesPerElement("u2"));
-        assertEquals(2, getBytesPerElement("uint16"));
-        assertEquals(2, getBytesPerElement("<u2"));
-        assertEquals(2, getBytesPerElement(">u2"));
+    public void testParseVersionHandlesDevAndBuildMetadataSuffixes() throws Exception {
+        // Regression: parseVersion used split("+") -- an invalid regex that
+        // throws PatternSyntaxException on a dev version with a "+gHASH"
+        // build-metadata suffix.
+        assertVersion(parseVersion("1.2.3"), 1, 2, 3);
+        assertVersion(parseVersion("0.3.1.dev43"), 0, 3, 1);
+        assertVersion(parseVersion("0.3.1.dev43+gabc123"), 0, 3, 1);
+        assertVersion(parseVersion("1.2.3+gabc"), 1, 2, 3);
     }
 
     @Test
-    public void testBytesPerElementUint32() {
-        // u4, uint32 -> 4 bytes
-        assertEquals(4, getBytesPerElement("u4"));
-        assertEquals(4, getBytesPerElement("uint32"));
+    public void testParseVersionFillsMissingParts() throws Exception {
+        assertVersion(parseVersion("1.2"), 1, 2, 0);
+        assertVersion(parseVersion("1"), 1, 0, 0);
     }
 
-    @Test
-    public void testBytesPerElementFloat32() {
-        // f4, float32 -> 4 bytes
-        assertEquals(4, getBytesPerElement("f4"));
-        assertEquals(4, getBytesPerElement("float32"));
-        assertEquals(4, getBytesPerElement("<f4"));
-        assertEquals(4, getBytesPerElement(">f4"));
+    private static void assertVersion(int[] version, int major, int minor, int patch) {
+        assertEquals(major, version[0]);
+        assertEquals(minor, version[1]);
+        assertEquals(patch, version[2]);
     }
 
-    @Test
-    public void testBytesPerElementFloat64() {
-        // f8, float64 -> 8 bytes
-        assertEquals(8, getBytesPerElement("f8"));
-        assertEquals(8, getBytesPerElement("float64"));
-    }
-
-    @Test
-    public void testBytesPerElementUnknown() {
-        // Unknown dtype should default to 4 bytes
-        assertEquals(4, getBytesPerElement("unknown"));
-        assertEquals(4, getBytesPerElement(null));
-        assertEquals(4, getBytesPerElement(""));
-    }
-
-    @Test
-    public void testCreateTypeUint8() {
-        // u1, uint8, |u1 -> UnsignedByteType
-        assertTrue(createType("u1") instanceof UnsignedByteType);
-        assertTrue(createType("uint8") instanceof UnsignedByteType);
-        assertTrue(createType("|u1") instanceof UnsignedByteType);
-    }
-
-    @Test
-    public void testCreateTypeUint16() {
-        // u2, uint16 -> UnsignedShortType
-        assertTrue(createType("u2") instanceof UnsignedShortType);
-        assertTrue(createType("uint16") instanceof UnsignedShortType);
-        assertTrue(createType("<u2") instanceof UnsignedShortType);
-        assertTrue(createType(">u2") instanceof UnsignedShortType);
-    }
-
-    @Test
-    public void testCreateTypeUint32() {
-        // u4, uint32 -> UnsignedIntType
-        assertTrue(createType("u4") instanceof UnsignedIntType);
-        assertTrue(createType("uint32") instanceof UnsignedIntType);
-    }
-
-    @Test
-    public void testCreateTypeFloat32() {
-        // f4, float32 -> FloatType
-        assertTrue(createType("f4") instanceof FloatType);
-        assertTrue(createType("float32") instanceof FloatType);
-        assertTrue(createType("<f4") instanceof FloatType);
-        assertTrue(createType(">f4") instanceof FloatType);
-    }
-
-    @Test
-    public void testCreateTypeFloat64() {
-        // f8, float64 -> DoubleType
-        assertTrue(createType("f8") instanceof DoubleType);
-        assertTrue(createType("float64") instanceof DoubleType);
-    }
-
-    @Test
-    public void testCreateTypeUnknownDefaultsToFloat() {
-        // Unknown or null dtype should default to FloatType
-        assertTrue(createType("unknown") instanceof FloatType);
-        assertTrue(createType(null) instanceof FloatType);
-        assertTrue(createType("") instanceof FloatType);
-    }
-
-    @Test
-    public void testParseVersionSimple() {
-        // Simple semantic version parsing
-        int[] version = parseVersion("1.2.3");
-        assertEquals(3, version.length);
-        assertEquals(1, version[0]);  // major
-        assertEquals(2, version[1]);  // minor
-        assertEquals(3, version[2]);  // patch
-    }
-
-    @Test
-    public void testParseVersionDev() {
-        // Dev versions like "0.3.1.dev43+g..."
-        int[] version = parseVersion("0.3.1.dev43");
-        assertEquals(0, version[0]);  // major
-        assertEquals(3, version[1]);  // minor
-        assertEquals(1, version[2]);  // patch
-
-        // With + suffix
-        version = parseVersion("1.2.3+gabc");
-        assertEquals(1, version[0]);
-        assertEquals(2, version[1]);
-        assertEquals(3, version[2]);
-    }
-
-    @Test
-    public void testRealParseVersionHandlesBuildMetadataSuffix() throws Exception {
-        // Regression: the real (private) parseVersion used split("+") -- an
-        // invalid regex that throws PatternSyntaxException on dev versions with
-        // a "+gHASH" build-metadata suffix. The local mirror above uses the
-        // correct split("\\+"), so it never covered the real method. Invoke the
-        // real one via reflection.
-        java.lang.reflect.Method m =
-                TensorFlightClient.class.getDeclaredMethod("parseVersion", String.class);
-        m.setAccessible(true);
-
-        int[] dev = (int[]) m.invoke(null, "0.3.1.dev43+gabc123");
-        assertEquals(0, dev[0]);
-        assertEquals(3, dev[1]);
-        assertEquals(1, dev[2]);
-
-        int[] plus = (int[]) m.invoke(null, "1.2.3+gabc");
-        assertEquals(1, plus[0]);
-        assertEquals(2, plus[1]);
-        assertEquals(3, plus[2]);
-    }
-
-    @Test
-    public void testParseVersionPartial() {
-        // Two-part version
-        int[] version = parseVersion("1.2");
-        assertEquals(1, version[0]);
-        assertEquals(2, version[1]);
-        assertEquals(0, version[2]);
-
-        // One-part version
-        version = parseVersion("1");
-        assertEquals(1, version[0]);
-        assertEquals(0, version[1]);
-        assertEquals(0, version[2]);
-    }
-
-    @Test
-    public void testBytesToHex() {
-        byte[] bytes = {0x01, 0x02, 0x03, 0x04, 0x05};
-        String hex = bytesToHex(bytes, 5);
-        assertEquals("0102030405", hex);
-
-        // With limit
-        hex = bytesToHex(bytes, 3);
-        assertEquals("010203...", hex);
-
-        // Empty bytes
-        hex = bytesToHex(new byte[0], 10);
-        assertEquals("", hex);
-    }
-
-    // Helper methods that mirror TensorFlightClient's private methods
-    // These allow testing the logic without exposing private methods
-
-    private static int getBytesPerElement(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return 1;
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return 2;
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-                return 4;
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return 8;
-            default:
-                return 4;
-        }
-    }
-
-    private static net.imglib2.type.NativeType<?> createType(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return new UnsignedByteType();
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return new UnsignedShortType();
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-                return new UnsignedIntType();
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return new DoubleType();
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-            default:
-                return new FloatType();
-        }
-    }
-
-    private static int[] parseVersion(String version) {
-        // Handle dev versions like "0.3.1.dev43+g..."
-        String base = version.split(".dev")[0].split("\\+")[0];
-        String[] parts = base.split("\\.");
-        int major = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
-        int minor = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
-        int patch = parts.length > 2 ? Integer.parseInt(parts[2]) : 0;
-        return new int[] { major, minor, patch };
-    }
-
-    private static String bytesToHex(byte[] bytes, int limit) {
-        StringBuilder sb = new StringBuilder();
-        int len = Math.min(bytes.length, limit);
-        for (int i = 0; i < len; i++) {
-            sb.append(String.format("%02x", bytes[i]));
-        }
-        if (bytes.length > limit) {
-            sb.append("...");
-        }
-        return sb.toString();
+    /** The production method, reached by reflection rather than re-implemented. */
+    private static int[] parseVersion(String version) throws Exception {
+        Method method = TensorFlightClient.class.getDeclaredMethod("parseVersion", String.class);
+        method.setAccessible(true);
+        return (int[]) method.invoke(null, version);
     }
 }

@@ -39,7 +39,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     private byte[] serializedTensorBytes;
     private long cacheBytes;
 
-    private transient RandomAccessibleInterval<T> delegate;
+    private transient volatile RandomAccessibleInterval<T> delegate;
     private transient FlightSession session;
 
     /** Required for {@link Externalizable}. */
@@ -98,15 +98,22 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     /**
      * Build the delegate on first access.
      *
-     * <p>Synchronized because reconstruction opens a {@link FlightSession}, and
-     * every accessor below funnels through here: two threads reading the same
-     * image -- the ordinary case once a cell cache is loading chunks in
-     * parallel -- would otherwise each open one, and the loser's is orphaned
-     * with no reference left to close it.
+     * <p>Locked because reconstruction opens a {@link FlightSession}: two
+     * threads reading the same image -- the ordinary case once a cell cache is
+     * loading chunks in parallel -- would otherwise each open one, and the
+     * loser's is orphaned with no reference left to close it. Double-checked
+     * against a volatile field so that the parallel readers this protects are
+     * not then serialized on every {@code min}/{@code max}/{@code randomAccess}
+     * for the image's whole life.
      */
-    private synchronized void ensureDelegate() {
-        if (delegate == null) {
-            delegate = reconstructDelegate();
+    private void ensureDelegate() {
+        if (delegate != null) {
+            return;
+        }
+        synchronized (this) {
+            if (delegate == null) {
+                delegate = reconstructDelegate();
+            }
         }
     }
 
@@ -130,7 +137,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
 
         RandomAccessibleInterval<T> image = new Imglib2TensorFactory(session, cacheBytes).create(plan);
         SliceHint requested = requestedSlice(plan);
-        TensorDescriptor descriptor = descriptorOf(plan);
+        TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(plan);
         if (requested != null && descriptor.hasSliceHint()) {
             image = RegionCrop.cropToRequest(image, requested, descriptor.getSliceHint(),
                     descriptor.getScaleHintList());
@@ -139,7 +146,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     }
 
     private FlightInfo refreshEndpointlessPlan(FlightInfo plan) {
-        TensorDescriptor descriptor = descriptorOf(plan);
+        TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(plan);
         TensorReadOption.Builder read = TensorReadOption.newBuilder()
                 .setArrayId(descriptor.getArrayId())
                 .setFields(FieldMask.newBuilder().addPaths("endpoints").build());
@@ -152,14 +159,6 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         }
         FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
         return session.getInfo(FlightDescriptor.command(request.toByteArray()));
-    }
-
-    private static TensorDescriptor descriptorOf(FlightInfo plan) {
-        try {
-            return TensorDescriptor.parseFrom(plan.getDescriptor().getCommand());
-        } catch (InvalidProtocolBufferException error) {
-            throw new IllegalArgumentException("FlightInfo descriptor is not a TensorDescriptor", error);
-        }
     }
 
     private static SliceHint requestedSlice(FlightInfo plan) {

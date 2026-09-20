@@ -55,7 +55,6 @@ import net.imglib2.RandomAccessibleInterval;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
 
-import static biopb.tensor.TensorChunkCodec.toLongArray;
 
 /**
  * Client for accessing tensors from a TensorFlightServer.
@@ -1214,7 +1213,7 @@ public class TensorFlightClient implements AutoCloseable {
 
     /** The resolved descriptor a SerializedTensor's plan names. */
     public static TensorDescriptor descriptorOf(SerializedTensor pb) {
-        return parseDescriptorUnchecked(flightInfoOf(pb).getDescriptor().getCommand());
+        return TensorChunkCodec.descriptorOf(flightInfoOf(pb));
     }
 
     /**
@@ -1257,24 +1256,13 @@ public class TensorFlightClient implements AutoCloseable {
      * @throws IOException If action fails
      */
     public Map<String, Object> healthCheck() throws IOException {
-        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
-                "health",
-                ByteString.EMPTY.toByteArray());
-
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = session.doAction(action);
-        if (iter.hasNext()) {
-            org.apache.arrow.flight.Result result = iter.next();
-            byte[] body = result.getBody();
-            if (body != null && body.length > 0) {
-                return GSON.fromJson(new String(body, java.nio.charset.StandardCharsets.UTF_8),
-                        new TypeToken<Map<String, Object>>() {
-                        }.getType());
-            }
-        }
-
         Map<String, Object> unknown = new HashMap<>();
         unknown.put("status", "UNKNOWN");
-        return unknown;
+        try {
+            return session.health().orElse(unknown);
+        } catch (FlightRuntimeException error) {
+            throw TensorErrorMapper.map(error);
+        }
     }
 
     /**
@@ -1299,7 +1287,7 @@ public class TensorFlightClient implements AutoCloseable {
         TensorDescriptor desc;
         try {
             FlightInfo info = session.getInfo(FlightDescriptor.command(cmd.toByteArray()));
-            desc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
+            desc = TensorChunkCodec.descriptorOf(info);
         } catch (TensorNotFoundException | FlightRuntimeException exc) {
             // An id the server does not serve. UNKNOWN already means "no upload
             // record here", and an unregistered source is the strongest form of
@@ -1601,7 +1589,7 @@ public class TensorFlightClient implements AutoCloseable {
         FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
         FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
         checkSchemaVersion(info);
-        TensorDescriptor descriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
+        TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(info);
         refuseAmbiguousDefault(arrayId, descriptor.getArrayId());
         return new RequestContext(descriptor, info);
     }
@@ -1616,7 +1604,7 @@ public class TensorFlightClient implements AutoCloseable {
         FlightRequest request = FlightRequest.newBuilder().setTensorRead(read).build();
         FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
         checkSchemaVersion(info);
-        return parseDescriptorUnchecked(info.getDescriptor().getCommand());
+        return TensorChunkCodec.descriptorOf(info);
     }
 
     /** A bare id is valid only when the catalog can confirm it is unambiguous. */
@@ -1727,14 +1715,6 @@ public class TensorFlightClient implements AutoCloseable {
         return new int[] { major, minor, patch };
     }
 
-    private static TensorDescriptor parseDescriptorUnchecked(byte[] bytes) {
-        try {
-            return TensorDescriptor.parseFrom(bytes);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to parse TensorDescriptor", e);
-        }
-    }
-
     private static final Gson GSON = new Gson();
 
     private static Map<String, Object> parseMetadataJson(String json) {
@@ -1828,7 +1808,7 @@ public class TensorFlightClient implements AutoCloseable {
         final FlightInfo info;
 
         RequestContext(TensorDescriptor descriptor, FlightInfo info) {
-            this.descriptor = parseDescriptorUnchecked(descriptor.toByteArray());
+            this.descriptor = descriptor;
             this.info = info;
         }
     }

@@ -34,8 +34,9 @@ import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.IntegerType;
 import net.imglib2.type.numeric.RealType;
 
+import static biopb.tensor.TensorChunkCodec.advanceRowMajor;
+import static biopb.tensor.TensorChunkCodec.cellCount;
 import static biopb.tensor.TensorChunkCodec.normalizeDtype;
-import static biopb.tensor.TensorChunkCodec.rowMajorPosition;
 import static biopb.tensor.TensorChunkCodec.toLongArray;
 
 /**
@@ -87,7 +88,7 @@ final class TensorUploads {
         if (!results.hasNext()) {
             throw new IllegalStateException("create_tensor: server returned no result");
         }
-        TensorDescriptor created = parseDescriptor(results.next().getBody());
+        TensorDescriptor created = TensorChunkCodec.parseDescriptor(results.next().getBody());
         LOGGER.info("createTensor: created " + created.getArrayId());
         return created;
     }
@@ -128,10 +129,7 @@ final class TensorUploads {
             for (int axis = 0; axis < shape.length; axis++) {
                 stop[axis] = Math.min(start[axis] + chunkShape[axis], shape[axis]);
             }
-            ChunkBounds bounds = boundsOf(start, stop);
-            if (!skipEmpty || !isAllZero(array, start, stop)) {
-                uploadChunk(descriptor, bounds, array);
-            }
+            uploadChunk(descriptor, boundsOf(start, stop), array, skipEmpty);
             if (!advance(start, chunkShape, shape)) {
                 break;
             }
@@ -145,6 +143,21 @@ final class TensorUploads {
     /** Backs {@link TensorFlightClient#uploadChunk}; see that method. */
     <T extends NativeType<T> & RealType<T>> void uploadChunk(
             TensorDescriptor descriptor, ChunkBounds bounds, RandomAccessibleInterval<T> source) {
+        uploadChunk(descriptor, bounds, source, false);
+    }
+
+    /**
+     * As {@link #uploadChunk}, but with {@code skipEmpty} the block is encoded
+     * and then dropped unsent if every element was zero.
+     *
+     * <p>Encoding first and deciding after is what keeps the emptiness test and
+     * the upload one traversal rather than two -- and, more to the point, keeps
+     * {@link #positionOf}'s handling of a cropped view's min in one loop rather
+     * than in two that have to agree.
+     */
+    private <T extends NativeType<T> & RealType<T>> void uploadChunk(
+            TensorDescriptor descriptor, ChunkBounds bounds, RandomAccessibleInterval<T> source,
+            boolean skipEmpty) {
         long[] start = toLongArray(bounds.getStartList());
         long[] stop = toLongArray(bounds.getStopList());
         if (start.length != stop.length || start.length != source.numDimensions()) {
@@ -161,7 +174,12 @@ final class TensorUploads {
 
         BufferAllocator allocator = session.allocator();
         // The root takes the column; closing it is what frees the block.
-        FieldVector data = encodeBlock(descriptor.getDtype(), source, start, stop, allocator);
+        Block block = encodeBlock(descriptor.getDtype(), source, start, stop, allocator);
+        FieldVector data = block.data;
+        if (skipEmpty && !block.anyNonZero) {
+            data.close();
+            return;
+        }
         try (VectorSchemaRoot root = VectorSchemaRoot.of(data);
                 SyncPutListener reply = new SyncPutListener()) {
             root.setRowCount(data.getValueCount());
@@ -229,9 +247,8 @@ final class TensorUploads {
      * the id rather than a flag the caller could set on anything.
      */
     static boolean isLabelSet(String arrayId) {
-        int slash = arrayId.indexOf('/');
-        String head = slash < 0 ? arrayId : arrayId.substring(0, slash);
-        return head.indexOf(':') < 0 && arrayId.contains("/labels/");
+        return TensorFlightClient.sourceIdFromArrayId(arrayId).indexOf(':') < 0
+                && arrayId.contains("/labels/");
     }
 
     /** The numpy dtype string an imglib2 type uploads as. */
@@ -278,24 +295,6 @@ final class TensorUploads {
         return false;
     }
 
-    private static <T extends RealType<T>> boolean isAllZero(
-            RandomAccessibleInterval<T> array, long[] start, long[] stop) {
-        RandomAccess<T> access = array.randomAccess();
-        long[] extents = extentsOf(start, stop);
-        long count = elementCount(extents);
-        long[] local = new long[extents.length];
-        long[] global = new long[extents.length];
-        for (long index = 0; index < count; index++) {
-            rowMajorPosition(index, extents, local);
-            positionOf(array, start, local, global);
-            access.setPosition(global);
-            if (access.get().getRealDouble() != 0.0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     /**
      * Where tensor coordinate {@code start + local} sits in {@code source}.
      *
@@ -322,75 +321,165 @@ final class TensorUploads {
      * double accessor: a 64-bit label id is exact here and would not survive
      * the widening.
      */
-    private static <T extends RealType<T>> FieldVector encodeBlock(
+    private static <T extends RealType<T>> Block encodeBlock(
             String dtype,
             RandomAccessibleInterval<T> source,
             long[] start,
             long[] stop,
             BufferAllocator allocator) {
         long[] extents = extentsOf(start, stop);
-        int count = Math.toIntExact(elementCount(extents));
-        FieldVector vector = newVector(dtype, allocator);
+        int count = Math.toIntExact(cellCount(extents));
+        Column column = Column.of(dtype);
+        FieldVector vector = column.newVector(allocator);
         vector.setInitialCapacity(count);
         vector.allocateNew();
 
         RandomAccess<T> access = source.randomAccess();
         long[] local = new long[extents.length];
         long[] global = new long[extents.length];
+        boolean anyNonZero = false;
         for (int index = 0; index < count; index++) {
-            rowMajorPosition(index, extents, local);
             positionOf(source, start, local, global);
             access.setPosition(global);
-            setElement(vector, index, access.get());
+            anyNonZero |= column.set(vector, index, access.get());
+            advanceRowMajor(local, extents);
         }
         vector.setValueCount(count);
-        return vector;
+        return new Block(vector, anyNonZero);
     }
 
-    private static FieldVector newVector(String dtype, BufferAllocator allocator) {
-        switch (normalizeDtype(dtype)) {
-            case "u1": return new UInt1Vector("data", allocator);
-            case "i1": return new TinyIntVector("data", allocator);
-            case "u2": return new UInt2Vector("data", allocator);
-            case "i2": return new SmallIntVector("data", allocator);
-            case "u4": return new UInt4Vector("data", allocator);
-            case "i4": return new IntVector("data", allocator);
-            case "u8": return new UInt8Vector("data", allocator);
-            case "i8": return new BigIntVector("data", allocator);
-            case "f8": return new Float8Vector("data", allocator);
-            case "f4": return new Float4Vector("data", allocator);
-            default:
-                throw new IllegalArgumentException("Cannot upload dtype '" + dtype + "'");
+    /** An encoded chunk, and whether any of it was non-zero. */
+    private static final class Block {
+        final FieldVector data;
+        final boolean anyNonZero;
+
+        Block(FieldVector data, boolean anyNonZero) {
+            this.data = data;
+            this.anyNonZero = anyNonZero;
         }
     }
 
-    private static <T extends RealType<T>> void setElement(FieldVector vector, int index, T value) {
-        if (vector instanceof Float4Vector) {
-            ((Float4Vector) vector).set(index, value.getRealFloat());
-        } else if (vector instanceof Float8Vector) {
-            ((Float8Vector) vector).set(index, value.getRealDouble());
-        } else {
-            long element = value instanceof IntegerType
-                    ? ((IntegerType<?>) value).getIntegerLong()
-                    : (long) value.getRealDouble();
-            if (vector instanceof UInt1Vector) {
+    /**
+     * The Arrow column one dtype uploads as: how to build it and how to write
+     * one element into it.
+     *
+     * <p>Resolved once per block. The alternative -- re-deriving the type from
+     * the vector's class per element -- put a ladder of {@code instanceof}
+     * checks in the loop that runs once per pixel.
+     */
+    private enum Column {
+        U1 {
+            FieldVector newVector(BufferAllocator allocator) { return new UInt1Vector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((UInt1Vector) vector).set(index, (int) element);
-            } else if (vector instanceof TinyIntVector) {
+                return element != 0L;
+            }
+        },
+        I1 {
+            FieldVector newVector(BufferAllocator allocator) { return new TinyIntVector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((TinyIntVector) vector).set(index, (int) element);
-            } else if (vector instanceof UInt2Vector) {
+                return element != 0L;
+            }
+        },
+        U2 {
+            FieldVector newVector(BufferAllocator allocator) { return new UInt2Vector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((UInt2Vector) vector).set(index, (int) element);
-            } else if (vector instanceof SmallIntVector) {
+                return element != 0L;
+            }
+        },
+        I2 {
+            FieldVector newVector(BufferAllocator allocator) { return new SmallIntVector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((SmallIntVector) vector).set(index, (int) element);
-            } else if (vector instanceof UInt4Vector) {
+                return element != 0L;
+            }
+        },
+        U4 {
+            FieldVector newVector(BufferAllocator allocator) { return new UInt4Vector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((UInt4Vector) vector).set(index, (int) element);
-            } else if (vector instanceof IntVector) {
+                return element != 0L;
+            }
+        },
+        I4 {
+            FieldVector newVector(BufferAllocator allocator) { return new IntVector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((IntVector) vector).set(index, (int) element);
-            } else if (vector instanceof UInt8Vector) {
+                return element != 0L;
+            }
+        },
+        U8 {
+            FieldVector newVector(BufferAllocator allocator) { return new UInt8Vector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((UInt8Vector) vector).set(index, element);
-            } else {
+                return element != 0L;
+            }
+        },
+        I8 {
+            FieldVector newVector(BufferAllocator allocator) { return new BigIntVector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                long element = integerOf(value);
                 ((BigIntVector) vector).set(index, element);
+                return element != 0L;
+            }
+        },
+        F4 {
+            FieldVector newVector(BufferAllocator allocator) { return new Float4Vector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                float element = value.getRealFloat();
+                ((Float4Vector) vector).set(index, element);
+                return element != 0.0f;
+            }
+        },
+        F8 {
+            FieldVector newVector(BufferAllocator allocator) { return new Float8Vector("data", allocator); }
+            boolean set(FieldVector vector, int index, RealType<?> value) {
+                double element = value.getRealDouble();
+                ((Float8Vector) vector).set(index, element);
+                return element != 0.0;
+            }
+        };
+
+        abstract FieldVector newVector(BufferAllocator allocator);
+
+        /** Write one element, reporting whether it was non-zero. */
+        abstract boolean set(FieldVector vector, int index, RealType<?> value);
+
+        static Column of(String dtype) {
+            switch (normalizeDtype(dtype)) {
+                case "u1": return U1;
+                case "i1": return I1;
+                case "u2": return U2;
+                case "i2": return I2;
+                case "u4": return U4;
+                case "i4": return I4;
+                case "u8": return U8;
+                case "i8": return I8;
+                case "f8": return F8;
+                case "f4": return F4;
+                default:
+                    throw new IllegalArgumentException("Cannot upload dtype '" + dtype + "'");
             }
         }
+    }
+
+    /**
+     * An integer element, exactly. Not the double accessor: a 64-bit label id
+     * would not survive the widening.
+     */
+    private static long integerOf(RealType<?> value) {
+        return value instanceof IntegerType
+                ? ((IntegerType<?>) value).getIntegerLong()
+                : (long) value.getRealDouble();
     }
 
     private static long[] extentsOf(long[] start, long[] stop) {
@@ -401,19 +490,4 @@ final class TensorUploads {
         return extents;
     }
 
-    private static long elementCount(long[] extents) {
-        long count = 1L;
-        for (long extent : extents) {
-            count *= extent;
-        }
-        return count;
-    }
-
-    private static TensorDescriptor parseDescriptor(byte[] bytes) {
-        try {
-            return TensorDescriptor.parseFrom(bytes);
-        } catch (InvalidProtocolBufferException error) {
-            throw new IllegalStateException("create_tensor: server returned no TensorDescriptor", error);
-        }
-    }
 }

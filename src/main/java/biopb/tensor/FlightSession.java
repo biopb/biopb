@@ -1,8 +1,10 @@
 package biopb.tensor;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Optional;
 
 import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightClient;
@@ -84,10 +86,9 @@ public final class FlightSession implements AutoCloseable {
         if (protocolChecked) {
             return;
         }
-        byte[] body;
+        Optional<Map<String, Object>> health;
         try {
-            Iterator<Result> results = client.doAction(new Action("health", new byte[0]), authOption);
-            body = results.hasNext() ? results.next().getBody() : null;
+            health = health();
         } catch (FlightRuntimeException error) {
             if (error.status().code() == FlightStatusCode.UNAUTHENTICATED
                     || error.status().code() == FlightStatusCode.UNAUTHORIZED) {
@@ -96,27 +97,47 @@ public final class FlightSession implements AutoCloseable {
             }
             throw TensorErrorMapper.map(error);
         }
-        if (body == null || body.length == 0) {
+        if (!health.isPresent()) {
             protocolChecked = true;
             return;
         }
-        int serverVersion = 1;
-        try {
-            Map<String, Object> health = GSON.fromJson(new String(body, StandardCharsets.UTF_8),
-                    new TypeToken<Map<String, Object>>() {}.getType());
-            Object protocol = health == null ? null : health.get("protocol");
-            if (protocol instanceof Number) {
-                serverVersion = ((Number) protocol).intValue();
-            }
-        } catch (RuntimeException ignored) {
-            // Unparseable health is a v1 server's silence by another name.
-        }
+        // Anything but a stated v2 is a v1 server -- including a body that does
+        // not parse. The key postdates that version, so its absence names the
+        // version rather than leaving it unknown.
+        Object protocol = health.get().get("protocol");
+        int serverVersion = protocol instanceof Number ? ((Number) protocol).intValue() : 1;
         if (serverVersion != WireVersions.FLIGHT_PROTOCOL_VERSION) {
             throw new UnsupportedOperationException(WireVersions.mismatch(
                     "Flight protocol", serverVersion, WireVersions.FLIGHT_PROTOCOL_VERSION,
                     "The server at " + location + " routes requests in another shape."));
         }
         protocolChecked = true;
+    }
+
+    /**
+     * The server's {@code health} reply, parsed. Absent means it answered
+     * nothing at all -- which is not a biopb server, so the first real call
+     * gives the better error; an empty map means it answered something that is
+     * not JSON, which {@link #ensureProtocol} reads as a v1 server.
+     *
+     * <p>Goes straight to the client rather than through {@link #doAction}, so
+     * that {@link #ensureProtocol} -- which is the reason this exists -- cannot
+     * recurse into itself, and so a caller asking for health does not pay for a
+     * second {@code health} round trip to get there.
+     */
+    Optional<Map<String, Object>> health() {
+        Iterator<Result> results = client.doAction(new Action("health", new byte[0]), authOption);
+        byte[] body = results.hasNext() ? results.next().getBody() : null;
+        if (body == null || body.length == 0) {
+            return Optional.empty();
+        }
+        try {
+            Map<String, Object> parsed = GSON.fromJson(new String(body, StandardCharsets.UTF_8),
+                    new TypeToken<Map<String, Object>>() {}.getType());
+            return Optional.of(parsed == null ? Collections.emptyMap() : parsed);
+        } catch (RuntimeException ignored) {
+            return Optional.of(Collections.emptyMap());
+        }
     }
 
     public FlightInfo getInfo(FlightDescriptor descriptor) {

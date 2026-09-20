@@ -36,17 +36,22 @@ public final class TensorErrorMapper {
 
         String message = message(error);
 
-        // An upload refusal carries no `code`: it rides FlightCancelledError,
-        // which survives the trip as CANCELLED, so the code would restate the
-        // class (upload_manager._refused). Keyed on the reason prefix alone --
+        // An upload refusal is the one payload with no `code`: it rides
+        // FlightCancelledError, and the code would restate the class
+        // (upload_manager._refused). So it is keyed on the reason prefix --
         // Python also gates on the class, but a refusal moved to another class
         // would then silently stop decoding, which is the failure this whole
         // decode exists to avoid.
-        if (payload.reason != null && payload.reason.startsWith("upload_")) {
-            return new UploadRefusedException(message, payload.reason, payload.sourceId,
-                    payload.state, payload.detail, error);
-        }
+        //
+        // Only when there is no code, though: the rule stays "switch on the
+        // code, refine on the reason", and a coded error whose reason happens
+        // to begin `upload_` is not a refusal. biopb/biopb#1070 covers putting
+        // the code on the refusal too, which would retire this branch.
         if (payload.code == null) {
+            if (payload.reason != null && payload.reason.startsWith("upload_")) {
+                return new UploadRefusedException(message, payload.reason, payload.sourceId,
+                        payload.state, payload.detail, error);
+            }
             return error;
         }
         switch (payload.code) {

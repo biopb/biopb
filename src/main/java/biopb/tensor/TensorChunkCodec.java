@@ -2,6 +2,8 @@ package biopb.tensor;
 
 import java.util.List;
 
+import org.apache.arrow.flight.FlightInfo;
+
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
@@ -155,6 +157,20 @@ final class TensorChunkCodec {
         }
     }
 
+    /** Parse a {@link TensorDescriptor} from a Flight command's bytes. */
+    static TensorDescriptor parseDescriptor(byte[] bytes) {
+        try {
+            return TensorDescriptor.parseFrom(bytes);
+        } catch (InvalidProtocolBufferException e) {
+            throw new IllegalStateException("Failed to parse TensorDescriptor", e);
+        }
+    }
+
+    /** The realized descriptor a read plan carries in its Flight descriptor. */
+    static TensorDescriptor descriptorOf(FlightInfo plan) {
+        return parseDescriptor(plan.getDescriptor().getCommand());
+    }
+
     /** Parse a {@link TensorTicket} from an endpoint ticket's bytes. */
     static TensorTicket parseTicket(byte[] bytes) {
         try {
@@ -202,12 +218,12 @@ final class TensorChunkCodec {
         long[] localPosition = new long[chunkShape.length];
         long[] globalPosition = new long[chunkShape.length];
         for (int index = 0; index < values.length; index++) {
-            rowMajorPosition(index, chunkShape, localPosition);
             for (int axis = 0; axis < chunkShape.length; axis++) {
                 globalPosition[axis] = start[axis] + localPosition[axis];
             }
             access.setPosition(globalPosition);
             access.get().setReal(values[index]);
+            advanceRowMajor(localPosition, chunkShape);
         }
     }
 
@@ -221,6 +237,23 @@ final class TensorChunkCodec {
         for (int axis = shape.length - 1; axis >= 0; axis--) {
             position[axis] = remaining % shape[axis];
             remaining /= shape[axis];
+        }
+    }
+
+    /**
+     * Step {@code position} to the next row-major coordinate in {@code shape}.
+     *
+     * <p>The odometer form of {@link #rowMajorPosition}, for walking a whole
+     * block: one increment per element instead of one division per axis per
+     * element. On a multi-million-element chunk those divisions are a dependent
+     * chain and cost more than everything else the walk does.
+     */
+    static void advanceRowMajor(long[] position, long[] shape) {
+        for (int axis = shape.length - 1; axis >= 0; axis--) {
+            if (++position[axis] < shape[axis]) {
+                return;
+            }
+            position[axis] = 0;
         }
     }
 }
