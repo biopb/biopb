@@ -758,10 +758,10 @@ class MetadataDatabase:
                 is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
                 -- Full per-tensor structural info (biopb/biopb#224): one struct
                 -- per tensor, so multi-field / HCS sources are queryable per
-                -- tensor. The scalar `dtype` / `shape_summary` columns that once
-                -- sat beside this one are gone: they described tensors[0] only,
-                -- and `tensors[1].dtype` says the same thing, NULL on an
-                -- unresolved source included. Only cheap/structural fields
+                -- tensor. This is the sole home of shape/dtype -- there is no
+                -- scalar projection column -- so a source-wide answer means
+                -- `tensors[1].dtype` (DuckDB is 1-indexed), empty on an
+                -- unresolved source. Only cheap/structural fields
                 -- (already in the lean ListFlights descriptor) are stored
                 -- here -- the expensive/lazy fields (metadata_json, pyramid,
                 -- physical_scale) are deliberately left out, filled only by

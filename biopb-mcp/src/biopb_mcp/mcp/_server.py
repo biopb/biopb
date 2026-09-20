@@ -719,7 +719,8 @@ async def execute_code(
       entry per tensor (note source_url, not "url"). This is the browse
       surface; there is no other. Structure is a per-tensor question, so ask it
       of `tensors`: `WHERE len(list_filter(tensors, t -> t.dtype='uint16')) > 0`,
-      or `tensors[1].dtype` for the source's first tensor. An unresolved (cloud)
+      or `tensors[1].dtype` for the source's first tensor (DuckDB lists are
+      1-indexed, unlike `tensors[0]` in Python/TS code). An unresolved (cloud)
       source has an empty `tensors`, so any such predicate hides it; use
       `is_resolved` to filter on them on purpose (e.g. `WHERE NOT is_resolved`
       to list what hasn't been resolved yet).

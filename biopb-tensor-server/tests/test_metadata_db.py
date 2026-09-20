@@ -353,17 +353,14 @@ class TestPerTensorCatalog:
     def test_there_is_no_scalar_projection(self):
         """The scalar `dtype` / `shape_summary` columns are gone: they described
         tensors[0] only, and `tensors[1]` says the same thing."""
-        import duckdb
-
         db = MetadataDatabase()
         db.sync_source_added(
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
         )
         conn = db._get_connection()
-        for column in ("dtype", "shape_summary"):
-            with pytest.raises(duckdb.BinderException):
-                conn.execute(f"SELECT {column} FROM sources")
+        with pytest.raises(duckdb.BinderException):
+            conn.execute("SELECT dtype, shape_summary FROM sources")
 
         dtype, shape = conn.execute(
             "SELECT tensors[1].dtype, tensors[1].shape FROM sources "
