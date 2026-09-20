@@ -24,9 +24,6 @@ else:
 # indexed_at, metadata_json, shape_summary, is_resolved, and `tensors`
 # (a LIST of STRUCT(array_id, dim_labels, shape, dtype) -- one per tensor;
 # `dtype`/`shape_summary` are just the first-tensor projection).
-# There is no residency column, and no catalog-wide way to ask: whether a
-# source's bytes are local is a live filesystem check, so it is answered per
-# source, for one you are about to read (see below).
 # The catalog is structural: the transfer grid a tensor is delivered on is not
 # stored here -- `client.get_descriptor(array_id).chunk_shape` answers it.
 df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
@@ -73,14 +70,12 @@ a full download. It returns the source's `sources` row, now populated. For a
 multi-file source it fetches metadata only; `client.warm(source_id)` pulls the
 member files resident up front, server-side, if you are about to read all of it.
 
-**Residency is not a catalog column, and is not resolution.** `is_resolved` is
-monotonic and lives in a row; whether the bytes are local is true only right now
-— a synced folder re-dehydrates — so it is a live check on the descriptor, asked
-of one source you are about to read and never in a loop over a listing:
-
-```python
-client.get_descriptor(array_id, with_pyramid=False, with_residency=True).is_resident
-```
+**Resolved is not the same as local.** `is_resolved` says the server has read
+the source's structure; it says nothing about where the bytes are, and a synced
+folder re-dehydrates under storage pressure. Assume any cloud or synced-folder
+source may need to fetch on first read — slow, and impossible offline — and plan
+for it: warn the user before a long read rather than after it, and crop or warm
+rather than reaching for the whole thing.
 
 **Filter footgun:** an unresolved source has NULL `dtype`/`shape_summary`, so
 `query_sources("... WHERE dtype='uint8'")` silently drops it — hidden for being
