@@ -488,9 +488,9 @@ def split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     :meth:`CatalogClient._resolve_descriptor`, which refuses it (#75), versus
     :meth:`CatalogClient.get_descriptor`, which anchors on the default.
 
-    Public, unlike its neighbours in this private module: the identity policy it
-    implements is a contract, and callers outside the package honour it
-    (biopb-mcp through ``client.py``'s re-export, the tensor server directly).
+    Public, unlike its neighbours in this private module: callers outside the
+    package honour the same policy (biopb-mcp through ``client.py``'s
+    re-export, the tensor server directly).
     """
     if "/" in array_id:
         return array_id.split("/", 1)[0], array_id

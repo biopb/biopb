@@ -717,16 +717,14 @@ def _version_token(content_version: bytes) -> str:
     collision is today's behaviour (no versioning at all), so the trade is
     strictly favourable.
 
-    The serving-semantics epoch is hashed in with it: this token is the tile
-    cache's key namespace, and a browser holding an `immutable` tile URL has no
-    other way to hear about a bump (the Flight plane gets it inside the opaque
-    chunk_id). This module's own key-forming decision, from the local constant,
-    because the sidecar ships with the Flight plane ``cli.py`` points it at.
-    See ``core.chunk.CHUNK_SEMANTICS_EPOCH``.
+    The serving epoch is hashed in with it: this token is the tile cache's key
+    namespace, and a browser holding an `immutable` URL has no other way to hear
+    about a bump (the Flight plane carries it inside the opaque chunk_id). Read
+    from the local constant -- ``cli.py`` points the sidecar at the Flight plane
+    it ships with. See ``core.chunk.CHUNK_SEMANTICS_EPOCH``.
     """
     epoch = current_epoch()
-    # Epoch 0 hashes the content alone, mirroring the chunk_id header's rule, so
-    # adopting the mechanism moves no tile URL.
+    # Epoch 0 hashes the content alone, as the chunk_id header omits the field.
     seed = content_version if epoch == 0 else b"%d:" % epoch + content_version
     return hashlib.sha256(seed).hexdigest()[:8]
 
@@ -2704,14 +2702,11 @@ async def get_tile(
             # answering 304 for bytes that changed. Empty when the source
             # publishes no version, which keeps exactly today's semantics.
             ("cv", current_version or ""),
-            # And the epoch on its own, because an UNVERSIONED source has no
-            # `cv` to carry it: its chunk_ids are re-keyed on a bump
-            # (an epoch-only version header past epoch 0) while its
-            # tile URL is not, so without this the browser revalidates to the
-            # same ETag forever. It does NOT earn such a source a version token:
-            # a token promotes the URL to `immutable` for a year, and an
-            # unversioned source is precisely one whose content can change with
-            # no signal at all.
+            # The epoch on its own, because an unversioned source has no `cv`
+            # to carry it and its tile URL never moves; without this the browser
+            # revalidates to the same ETag forever. Such a source still gets no
+            # version token: a token means `immutable` for a year, and an
+            # unversioned source is one whose content can change unannounced.
             ("epoch", current_epoch()),
         ],
     )

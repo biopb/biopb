@@ -36,19 +36,17 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# On-disk segment format version (issue #9). SERVER-LOCAL: one process, one
+# On-disk segment format version (issue #9). Server-local: one process, one
 # directory, read at boot to decide whether this build may reuse the segments it
-# finds. It used to ride the chunk_locate reply too, negotiated against a
-# constant in the SDK; that went with biopb/biopb#1070.
+# finds, and reported to nobody.
 #
 # ONE question: "may this build reuse these segment files?". Bump it for a
-# layout change. Do NOT bump it for a content change -- that is the epoch, and
-# conflating the two is what #1076 describes.
+# layout change, never for a change in what the bytes mean -- that is
+# ``core.chunk.CHUNK_SEMANTICS_EPOCH``, which reaches every cache rather than
+# only this one.
 #
-# v2: biopb/biopb#596 implemented axis order normalization. A v1 segment holds the
-# pre-transpose bytes, so reusing it would serve axes in the wrong order. That is
-# a content change and would bump the epoch today; the number stays at 2 because
-# lowering it would re-admit those v1 segments.
+# v1 segments hold pre-normalization bytes (biopb/biopb#596) and must never be
+# read back, so the number never goes below 2.
 CACHE_FILE_FORMAT_VERSION = 2
 
 # Name of the on-disk marker file (in the cache root, beside ``lock`` and

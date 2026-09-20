@@ -280,7 +280,7 @@ class TestProxyEnvelope:
 
     def test_the_proxy_s_own_epoch_moves_its_envelope(self, epoch):
         """A mirror re-serves the upstream's bytes locally, so a change in what
-        they mean HERE has to re-key here (biopb/biopb#1076)."""
+        they mean here re-keys here."""
         inner = encode_chunk_id("upstream/img", _bounds())
         before = encode_proxy_envelope(inner, "local/img", CV)
         epoch(3)
@@ -652,22 +652,17 @@ class TestDoGetCacheHitRejectsStaleVersion:
 # ==============================================================================
 # Serving-semantics epoch (biopb/biopb#1076)
 # ==============================================================================
-# content_version says "the data changed" -- a claim about content, which is why
-# it is published and why an identifier built from it changes with the data. The
-# epoch says only "this key was formed under an older reading": chunking or
-# normalization moved, the data did not. Different claims, so they are not one
-# value; the epoch stays inside the opaque chunk_id, where key formation is the
-# server's own business. #596 had neither and reached for
-# CACHE_FILE_FORMAT_VERSION, which is why it invalidated this server's segments
-# and the mmap path and nothing else.
+# content_version says "the data changed"; the epoch says "this key was formed
+# under an older reading of it". Different claims, separately framed, and only
+# the first is published.
 
 
 class TestSemanticsEpoch:
     def test_epoch_zero_writes_the_pre_epoch_header(self):
-        """Adopting the mechanism must not cold-start a single cache.
+        """A server that has declared no epoch mints the ids it always did.
 
-        Byte-identical ids, not merely compatible ones: anything else re-warms
-        every cache in the system for a no-op change.
+        Byte-identical, not merely compatible: anything else re-warms every
+        cache in the system.
         """
         bounds = _bounds()
         assert mint_chunk_id("src/t", bounds) == encode_chunk_id("src/t", bounds)
@@ -676,9 +671,7 @@ class TestSemanticsEpoch:
         assert versioned[1] == 1  # the pre-epoch format byte
 
     def test_the_two_versions_are_framed_separately_not_fused(self, epoch):
-        """The point of a format byte over a value prefix: each half is
-        recoverable on its own, so a reader that wants the content signal is not
-        unpicking it from something else."""
+        """Each half is recoverable on its own."""
         epoch(7)
         chunk_id = mint_chunk_id("src/t", _bounds(), content_version=CV)
         assert chunk_id[1] == 2  # the epoch format byte
@@ -697,12 +690,7 @@ class TestSemanticsEpoch:
         assert content_version_of(versioned) is None
 
     def test_epochs_are_distinct_and_the_framing_is_injective(self, epoch):
-        """A chunk_id from another build must compare UNEQUAL, never pass.
-
-        Framed fields rather than a value prefix, so this holds structurally
-        instead of resting on a content_version never happening to look like a
-        composed one.
-        """
+        """A chunk_id minted under a different epoch compares unequal."""
         seen = set()
         for value in (0, 1, 2, 11):
             epoch(value)
@@ -711,12 +699,9 @@ class TestSemanticsEpoch:
         assert len(seen) == 8
 
     def test_a_content_version_that_looks_like_an_epoch_header_is_safe(self, epoch):
-        """The case a value-level prefix could only argue about statistically.
-
-        An uploaded label set's content_version is random bytes
-        (``adapters/labels.py``), so it can look like anything -- including a
-        composed version from another build. Framing decides it.
-        """
+        """A content_version is arbitrary bytes -- an uploaded label set's is
+        random (``adapters/labels.py``) -- and cannot be confused with an
+        epoch-framed header however it is spelled."""
         adversarial = b"epoch=1;" + CV
         plain = mint_chunk_id("src/t", _bounds(), content_version=adversarial)
         epoch(1)
@@ -752,8 +737,8 @@ class TestSemanticsEpoch:
         ]
 
     def test_an_id_from_the_previous_epoch_is_refused(self, epoch):
-        """The already-live staleness path carries it -- a client holding a read
-        plan across the upgrade re-plans instead of being served stale bytes."""
+        """A client holding a read plan across a bump re-plans rather than
+        being served bytes minted under the old reading."""
         adapter = _VersionedStubAdapter((10, 10), CV)
         held = mint_chunk_id(
             "stub",

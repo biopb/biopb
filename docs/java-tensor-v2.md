@@ -56,12 +56,9 @@ with `setReal`, so `i8`/`u8` tensors lose ids above 2^53 even though
 `createType` gives them the right imglib2 type -- biopb/biopb#1071. The upload
 side is already exact.
 
-There were two more until biopb/biopb#1070: `tensor_schema_version` on the same
-schema (a release tag, retired years before anything stopped sending it) and
-`format_version` in the `chunk_locate` reply (a segment-layout negotiation whose
-one bump stood in for a content change). Both are gone. This client had
-implemented the first as a compatibility check, which is the argument for
-removing a retired key rather than documenting it.
+Those two are the whole set. A read plan's schema carries no other version key,
+and `chunk_locate` advertises no segment format -- the server verifies a byte
+range before handing it out instead (biopb/biopb#1070).
 
 `FlightSession` probes the first on first use, so building a client stays free
 of I/O and a v1 server is named rather than sent a request it will parse as

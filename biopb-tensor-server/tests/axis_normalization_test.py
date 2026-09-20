@@ -575,15 +575,9 @@ class TestNormalizedCaching:
                 CacheManager.reset()
 
     def test_the_segment_marker_still_refuses_pre_transpose_segments(self):
-        """This server must never read back a v1 segment: it holds pre-transpose
-        bytes under an id that is still valid.
-
-        The bump was the only invalidation signal available at the time, and it
-        reached only this server's own cache (biopb/biopb#1076). A change like
-        this one bumps CHUNK_SEMANTICS_EPOCH today, which re-keys the chunks and
-        so reaches every cache. The marker keeps its number regardless --
-        lowering it would re-admit the v1 segments it was raised to exclude.
-        """
+        """This server must never read back a v1 segment: it holds
+        pre-transpose bytes under an id that is still valid, so the marker
+        never goes below 2."""
         from biopb_tensor_server.cache.bootstrap import CACHE_FILE_FORMAT_VERSION
 
         assert CACHE_FILE_FORMAT_VERSION >= 2

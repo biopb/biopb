@@ -91,18 +91,14 @@ Two notes on why this exact key:
   distinctly) — and over-keying costs a miss, while under-keying serves wrong
   pixels. That is the correct failure direction for a client.
 
-A second thing rides the same header, and it is what makes the key sufficient
+A second signal rides the same header, and it is what makes the key sufficient
 rather than merely usually-right. `content_version` covers "the source's data
-changed". It cannot cover "the server's *reading* of that data changed" — a
-change to chunking or axis normalization leaves a stable `chunk_id` resolving to
-different bytes, with no per-source signal moving at all. biopb/biopb#596 is the
-worked example, and it had to invalidate through the server's own
-`CACHE_FILE_FORMAT_VERSION`, which this cache never sees. `CHUNK_SEMANTICS_EPOCH`
-(biopb/biopb#1076) closes that: the header carries it as its own framed field
-beside the content_version, so a bump re-keys every chunk_id and this cache
-misses like any other. Nothing to
-implement here, and nothing to remember — which is the point, because remembering
-is what failed the first time.
+changed"; it cannot cover "the server's *reading* of that data changed" — a
+chunking or axis-normalization change leaves a stable `chunk_id` resolving to
+different bytes with no per-source signal moving at all. `CHUNK_SEMANTICS_EPOCH`
+(biopb/biopb#1076) is framed beside it in the header, so a bump re-keys every
+chunk_id and this cache misses like any other. Nothing to implement here and
+nothing to remember.
 
 The staleness bet — `content_version` is a `mtime_ns:size` stat signature, so a
 size-preserving write that also preserves mtime is invisible — is the same bet the

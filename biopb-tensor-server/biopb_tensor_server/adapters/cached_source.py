@@ -361,11 +361,11 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         if cache_manager is None:
             raise RuntimeError("Cache not initialized")
 
-        # Through mint_chunk_id, the single composition point: the read-side
-        # probe (core.cache_source.chunk_cache_keys) mints the same way, and a
-        # key that differs by one byte is a probe that never hits. Stored under
-        # the id the base read plan mints, so the client's echoed chunk_id
-        # resolves here and a prior upload's chunks are never served.
+        # Stored under the id the base read plan mints, so a client's echoed
+        # chunk_id resolves here and a prior upload's chunks are never served.
+        # Through mint_chunk_id because the read-side probe
+        # (core.cache_source.chunk_cache_keys) mints the same way, and a key
+        # that differs by one byte is a probe that never hits.
         chunk_id = mint_chunk_id(
             self.source_id, bounds, content_version=self.content_version
         )

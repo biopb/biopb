@@ -875,15 +875,12 @@ class ArrowFileBackend:
     ) -> Optional[pa.RecordBatch]:
         """The batch at this entry's recorded range, if it really is this entry.
 
-        Decoding at a byte offset trusts the index. A range that no longer names
-        this key -- a mis-restored ``.idx``, a layout change, a bug -- decodes
-        into a *valid* batch belonging to someone else, which is the one failure
-        on this path that is silent rather than loud. Every record carries its
-        own key (``CACHE_KEY_FIELD``), so check it and let the caller walk the
-        segment instead: slower, correct, and a repair rather than a refusal
-        (biopb/biopb#1070). Unconditional on purpose -- a guarantee a caller can
-        opt out of, or that depends on the checked party volunteering the
-        evidence, is not one.
+        Decoding at a byte offset trusts the index, and a range that no longer
+        names this key decodes into a *valid* batch belonging to someone else --
+        the one failure here that is silent rather than loud. Every record
+        carries its own key (``CACHE_KEY_FIELD``), so it is checked; None sends
+        the caller down the sequential walk, which is slower but finds the right
+        record.
         """
         schema = self._segment_schema(segment_id, mmap)
         if schema is None:
@@ -1000,16 +997,14 @@ class ArrowFileBackend:
             self._hits += 1
             self._update_segment_frequency(entry_info.segment_id)
 
-        # Verify OUTSIDE the lock: `_lock` guards the in-memory index only, and
-        # doing I/O under it is the deadlock class biopb/biopb#302 closed.
-        #
         # A locate hands a byte range to another process, which reads it with
-        # the server no longer in the loop. If the range does not name this
-        # entry, that client gets someone else's pixels and nothing says so --
-        # so the range is checked before it is published, rather than asking the
-        # client to check it afterwards against evidence this reply volunteers.
-        # ~1 us on a ~290 us locate RTT, and the client is about to fault the
-        # same page anyway.
+        # the server no longer in the loop, so the range is checked before it is
+        # published -- a range that does not name this entry would hand that
+        # client someone else's pixels silently. ~1 us against a ~290 us locate
+        # RTT, and the client is about to fault the same page anyway.
+        #
+        # Outside the lock: `_lock` guards the in-memory index only, and I/O
+        # under it deadlocks (biopb/biopb#302).
         if not self._range_holds_key(location, entry_info, key):
             return None
         return location
@@ -1019,10 +1014,8 @@ class ArrowFileBackend:
     ) -> bool:
         """Does the recorded range really hold *key*'s record?
 
-        Uses the live mapping when there is one; an open write segment has none,
-        and it is exactly the segment whose ranges are freshest, so it gets its
-        own short-lived map rather than being waved through. Never called under
-        ``_lock``.
+        Uses the live mapping when there is one. An open write segment has none
+        and gets a short-lived map of its own. Never called under ``_lock``.
         """
         mmap = self._segment_mmaps.get(entry_info.segment_id)
         if mmap is not None:

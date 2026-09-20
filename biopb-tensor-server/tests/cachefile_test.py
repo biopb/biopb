@@ -1178,15 +1178,12 @@ class TestCachefileIntegration:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_a_range_that_names_another_entry_is_refused(self, transfer_target):
-        """The server verifies a range before it hands it out, and before it
-        reads through it itself (biopb/biopb#1070).
+        """The server verifies a range before handing it out, and before
+        reading through it itself.
 
-        An offset that decodes cleanly into the WRONG message is the one silent
+        An offset that decodes cleanly into the wrong message is the one silent
         failure on this path: a valid batch of the same shape belonging to
-        someone else. It used to be the client's job to notice, which made the
-        guarantee conditional on the server volunteering the evidence and the
-        client bothering to check. Now the index entry is checked against the
-        record it points at, here by pointing one entry at another's bytes.
+        someone else. Here one entry is pointed at another's bytes.
         """
         import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
@@ -1568,8 +1565,7 @@ class TestDirectSeekRead:
             assert seeked.equals(walked)
 
             # A range pointing at another entry is refused and walks instead,
-            # so the two still agree (biopb/biopb#1070). Without the check the
-            # seek would return entry 0's batch and the walk entry i's.
+            # so the two still agree.
             if i > 0:
                 other = file_backend._metadata[b"seek-0"]
                 misindexed = dataclasses.replace(

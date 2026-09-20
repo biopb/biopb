@@ -2554,14 +2554,11 @@ class TestTileInfoPublishesTheVersion:
 
 
 class TestTheTileTokenCarriesTheSemanticsEpoch:
-    """biopb/biopb#1076: the one cache that cannot key by chunk_id.
+    """The one cache that cannot key by chunk_id.
 
-    A browser holds a versioned tile URL under `immutable, max-age=1y`. The
-    Flight plane re-keys its chunks inside the opaque chunk_id when this
-    server's reading of the bytes changes; a browser sees none of that, so the
-    sidecar composes the epoch into its own key namespace. Its own decision
-    about its own keys -- read from the local constant, because `cli.py` points
-    the sidecar at the Flight plane it ships with.
+    A browser holds a versioned tile URL under `immutable, max-age=1y` and sees
+    nothing of the chunk_id the Flight plane re-keys, so the sidecar folds the
+    epoch into its own key namespace.
     """
 
     def test_a_bump_moves_the_token(self, epoch):
@@ -2573,13 +2570,11 @@ class TestTheTileTokenCarriesTheSemanticsEpoch:
         assert _version_token(cv) != before
 
     def test_an_unversioned_source_keeps_no_token_but_moves_its_etag(self, epoch):
-        """The population with no `cv` to carry the epoch.
+        """A source with no `cv` to carry the epoch gets no token either.
 
-        Its chunk_ids ARE re-keyed on a bump, but its tile URL is not, so the
-        epoch has to reach the ETag directly or the browser revalidates to the
-        same value forever. It must NOT earn a token: a token means `immutable`
-        for a year, and an unversioned source is one whose content can change
-        with no signal at all.
+        A token means `immutable` for a year, and an unversioned source is one
+        whose content can change unannounced; the epoch reaches its tiles
+        through the ETag instead.
         """
         from biopb_tensor_server.serving.http_server import (
             _descriptor_version_token,
@@ -2592,7 +2587,7 @@ class TestTheTileTokenCarriesTheSemanticsEpoch:
         assert _descriptor_version_token(_Unversioned()) is None
 
     def test_epoch_zero_leaves_every_tile_url_untouched(self):
-        """Adopting the mechanism must not cold-start a browser cache either."""
+        """At epoch 0 a tile URL is the hash of the content alone."""
         import hashlib
 
         from biopb_tensor_server.serving.http_server import _version_token

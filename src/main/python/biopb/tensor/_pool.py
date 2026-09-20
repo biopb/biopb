@@ -76,11 +76,10 @@ logger = logging.getLogger(__name__)
 # mapped-segment size and copies the chunk out once over budget -- see the
 # pinned-segment accounting below (disk-leak workaround, biopb/biopb#571).
 
-# No negotiated segment-format version (biopb/biopb#1070): content is the
-# chunk_id's job (``CHUNK_SEMANTICS_EPOCH``), and the server verifies that a
-# range it hands out really holds the entry it was asked for before answering,
-# so a client cannot be pointed at another chunk's bytes. A layout this client
-# cannot parse raises and falls back to do_get.
+# There is no segment-format version to negotiate. The server verifies that a
+# range it hands out really holds the entry that was asked for, so this read
+# cannot land on another chunk's bytes; a layout this client cannot parse raises
+# and falls back to do_get.
 
 # Per-location capability cache: dask workers are separate processes, so each
 # memoizes independently after its first probe. None = unknown, False = the

@@ -94,24 +94,17 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 _CV_SENTINEL = 0xFF  # leading byte marking a version-wrapped chunk_id
-# Wrapper layout version (the byte after the sentinel). v1 frames a
-# content_version alone; v2 frames a serving-semantics epoch in front of it. The
-# byte is what discriminates them, so one payload can never be read as the
-# other -- see the epoch section below.
-_CV_FORMAT_CONTENT = 1
-_CV_FORMAT_EPOCH = 2
+# Wrapper layout, the byte after the sentinel. The discriminator: a v1 payload
+# can never be read as a v2 one.
+_CV_FORMAT_CONTENT = 1  # [0xFF][1][uint32 cv_len][cv]
+_CV_FORMAT_EPOCH = 2  # [0xFF][2][uint32 epoch][uint32 cv_len][cv]
 
 
 def _version_header(content_version: Optional[bytes], epoch: int) -> bytes:
     """The prefix that wraps a chunk_id with the versions it was minted under.
 
-    - epoch 0: ``[0xFF][1][uint32 cv_len][cv]`` -- byte-identical to the
-      pre-epoch format, so nothing re-keys until an epoch is declared.
-    - epoch > 0: ``[0xFF][2][uint32 epoch][uint32 cv_len][cv]``.
-
-    Two framed fields rather than one fused value: they answer different
-    questions (see :data:`CHUNK_SEMANTICS_EPOCH`), and a reader that wants one
-    must not have to unpick it from the other.
+    Epoch 0 writes the v1 form, which carries no epoch field, so a server that
+    has declared no epoch mints the same bytes it always did.
     """
     cv = content_version or b""
     if epoch == 0:
@@ -122,18 +115,17 @@ def _version_header(content_version: Optional[bytes], epoch: int) -> bytes:
 def wrap_content_version(
     inner_chunk_id: bytes, content_version: Optional[bytes]
 ) -> bytes:
-    """Prepend a version header, under the epoch this server currently serves."""
+    """Prepend a version header, under this server's current epoch."""
     return _version_header(content_version, current_epoch()) + inner_chunk_id
 
 
 def _split_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
     """Split a chunk_id into ``(epoch, content_version | None, inner)``.
 
-    Unversioned chunk_ids (no 0xFF sentinel) pass through as ``(0, None, id)``,
-    so every codec function below can strip first and reuse the pre-#178 logic
-    verbatim. A zero-length content_version field decodes back to None: an
-    epoch-only header (an unversioned source past epoch 0) makes no claim about
-    content.
+    An unwrapped chunk_id (no 0xFF sentinel) passes through as ``(0, None, id)``,
+    so every codec function below can strip first and work on the inner alone.
+    A zero-length content_version field decodes to None -- an epoch-only header
+    makes no claim about content.
     """
     if not chunk_id or chunk_id[0] != _CV_SENTINEL:
         return 0, None, chunk_id
@@ -149,10 +141,9 @@ def _split_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
 
 
 def split_chunk_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
-    """``(epoch, content_version | None, inner)`` -- both framed versions at once.
+    """``(epoch, content_version | None, inner)`` in one parse.
 
-    For the staleness gate, which checks both halves and would otherwise parse
-    the header twice.
+    For the staleness gate, which needs both halves.
     """
     return _split_version(chunk_id)
 
@@ -160,9 +151,7 @@ def split_chunk_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
 def content_version_of(chunk_id: bytes) -> Optional[bytes]:
     """The chunk_id's content_version, or None if it carries none.
 
-    The RAW content signal, recoverable whatever epoch the id was minted under
-    -- which is the point of framing the epoch separately rather than fusing the
-    two into one token.
+    The content signal alone, whatever epoch the id was minted under.
     """
     return _split_version(chunk_id)[1]
 
@@ -175,51 +164,32 @@ def epoch_of(chunk_id: bytes) -> int:
 # =============================================================================
 # Serving-semantics epoch (biopb/biopb#1076)
 # -----------------------------------------------------------------------------
-# content_version answers "did this source's bytes change?". It cannot answer
-# "did the meaning of the bytes this server returns for a given chunk_id
-# change?" -- a question a server-code change asks of every source at once, and
-# which no per-source signal has an expression for. #596 (axis normalization) is
-# the worked example: same chunk_id, same source bytes, transposed output. It
-# had to invalidate through CACHE_FILE_FORMAT_VERSION, which reaches this
-# server's own segments and the mmap parser and nothing else -- not the SDK's
-# on-disk cache, not a proxy's, not a browser's tiles.
+# content_version says "this source's data changed". The epoch says "what this
+# server returns for a stable chunk_id changed" -- a chunking or normalization
+# change, which moves no per-source signal at all. Both are framed in the
+# version header, so a bump re-keys every chunk_id and every cache keyed by one:
+# this server's segments, the SDK's disk cache, a proxy's, any yet to be
+# written. Nothing on the wire; chunk_id is opaque by contract (#346, #520).
 #
-# The epoch is that missing arm, carried by the mechanism that already reaches
-# every cache keyed by chunk_id: its OWN framed field in the version header
-# (``_CV_FORMAT_EPOCH``), beside the content_version rather than fused into it,
-# because the two answer different questions and a reader of one must not have
-# to unpick the other. A bump changes every chunk_id and every cache key at
-# once. No wire key and no client change -- chunk_id is opaque by contract
-# (biopb/biopb#346, #520), which is what makes this free for clients.
-#
-# It is NOT published: re-keying a chunk is not a claim that the data changed,
-# and a consumer told otherwise would suspect its own derived products (an ROI's
-# ``drawn_against_version``). A cache that cannot key by chunk_id -- the HTTP
-# sidecar's tile URLs -- composes the epoch into its own keys itself.
+# The epoch is never published. Re-keying a chunk is not a claim that the data
+# changed, and a consumer that reads it as one -- an ROI's
+# drawn_against_version -- would treat a server upgrade as an edit. A cache that
+# cannot key by chunk_id (the HTTP sidecar's tile URLs) folds the epoch into its
+# own keys itself.
 #
 # BUMP IT when a server change alters what the bytes for a stable chunk_id mean.
-# Do NOT bump it for a segment-file layout change: that is
-# CACHE_FILE_FORMAT_VERSION's job, and keeping the two apart is the point of
-# #1076 -- one number was carrying both questions for two different audiences.
-#
-# Cost of a bump, stated plainly: every cache everywhere cold-starts, not just
-# this server's. For a change that alters what the bytes MEAN that is the
-# correct outcome; the alternative is what #596 shipped -- correct on the
-# server, silently wrong in every cache it could not reach.
-#
-# At epoch 0 the header keeps its pre-epoch form, so adopting this re-keys
-# nothing.
+# NOT for a segment-file layout change -- that is CACHE_FILE_FORMAT_VERSION.
+# A bump cold-starts every cache everywhere, which is the correct outcome for a
+# change in what the bytes mean.
 CHUNK_SEMANTICS_EPOCH = 0
 
 
 def current_epoch() -> int:
     """The epoch this server is serving under.
 
-    A function, not the constant re-exported: a module that does
-    ``from ... import CHUNK_SEMANTICS_EPOCH`` binds the value at import and
-    would not see a change -- which in production is a restart, but under test
-    is a monkeypatch, and a gate that silently cannot be exercised is worse than
-    one that is wrong.
+    Call this rather than importing the constant: ``from ... import
+    CHUNK_SEMANTICS_EPOCH`` binds at import, so a test that patches the module
+    would not be seen.
     """
     return CHUNK_SEMANTICS_EPOCH
 
@@ -246,12 +216,9 @@ def current_epoch() -> int:
 # =============================================================================
 
 _ENV_SENTINEL = 0xFE  # leading byte marking a proxy-envelope chunk_id
-# Envelope layout version. v1 frames (route, cv); v2 frames (route, epoch, cv) --
-# the same split the content-version header makes, and for the same reason: a
-# mirror re-serves the upstream's bytes locally, so this proxy's own serving
-# semantics belong in its cache key.
-_ENV_FORMAT_CONTENT = 1
-_ENV_FORMAT_EPOCH = 2
+# Envelope layout, the byte after the sentinel.
+_ENV_FORMAT_CONTENT = 1  # (route, cv, inner)
+_ENV_FORMAT_EPOCH = 2  # (route, epoch, cv, inner)
 
 
 def is_proxy_envelope(chunk_id: bytes) -> bool:
@@ -267,8 +234,9 @@ def encode_proxy_envelope(
     ``route`` is the proxy's LOCAL array_id (how the server dispatches the chunk
     back to this adapter); ``content_version`` is the upstream source's version
     (``None``/empty when the upstream is unversioned). This proxy's own serving
-    epoch is added here, as it is for a plain chunk_id. The inner is stored and
-    later forwarded byte-for-byte -- the proxy never interprets it.
+    epoch is added here: the mirror re-serves those bytes locally, so a change
+    in what they mean here has to re-key here. The inner is stored and later
+    forwarded byte-for-byte -- the proxy never interprets it.
     """
     route_bytes = route.encode("utf-8")
     cv = content_version or b""
@@ -465,13 +433,9 @@ def mint_chunk_id(
 ) -> bytes:
     """Mint the canonical chunk_id for a read-plan endpoint.
 
-    This is the single composition point for regular or scaled encoding and the
-    version header. Keeping those choices together ensures cache probes mint the
-    same bytes as read plans.
-
-    The caller passes only what it owns -- its ``content_version``. The
-    serving-semantics epoch is this server's, so the codec applies it here
-    rather than asking every call site to remember to.
+    The single composition point for regular or scaled encoding and the version
+    header, so cache probes mint the same bytes as read plans. The caller passes
+    its ``content_version``; the epoch is this server's and is applied here.
     """
     if scale_hint is None:
         inner = encode_chunk_id(array_id, bounds)
@@ -480,7 +444,7 @@ def mint_chunk_id(
             array_id, bounds, scale_hint, reduction_method
         )
     if content_version is None and current_epoch() == 0:
-        return inner  # byte-identical to the pre-#178 format
+        return inner  # nothing to version by: no header at all
     return wrap_content_version(inner, content_version)
 
 
@@ -545,8 +509,7 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     if cv is None and epoch == 0:
         return base
     # The header the id was MINTED with, not the one this server would mint now:
-    # a key is for finding what was written, and a stale entry has to stay
-    # findable long enough to be recognised as stale.
+    # a key has to find what was written, including an entry now stale.
     return _version_header(cv, epoch) + base
 
 

@@ -358,11 +358,9 @@ class TestContentVersion:
     """What the descriptor publishes is what the tickets were minted with.
 
     An uploaded set's bytes are its own -- they live in the sidecar store, not
-    in the image file, which a set arriving never touches. So it carries its
-    own ``content_version`` (biopb/biopb#178), and the copy published on the
-    descriptor (biopb/biopb#780) has to be that one and not the image's: they
-    are one signal, and a consumer namespacing a cache it cannot key by
-    chunk_id is keying it by the published form.
+    in the image file, which a set arriving never touches -- so it carries its
+    own ``content_version``, and the descriptor publishes that one and not the
+    image's.
     """
 
     def _chunk_ids(self, client, array_id):
@@ -394,8 +392,8 @@ class TestContentVersion:
 
     def test_a_reused_name_publishes_a_new_version(self, served, client):
         """``delete_labels``: "the next set uploaded under it is a distinct
-        tensor with its own cache namespace". The image file is untouched by
-        both uploads, so an image-derived version could not say so."""
+        tensor with its own cache namespace". Both uploads leave the image file
+        untouched, so an image-derived version could not say so."""
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
         first = client.get_descriptor("oz1/labels/nuclei").content_version
         client.delete_labels("oz1/labels/nuclei")
@@ -409,14 +407,10 @@ class TestContentVersion:
     def test_a_semantics_epoch_bump_leaves_the_published_version_alone(
         self, served, client, epoch
     ):
-        """biopb/biopb#1076, over the wire.
+        """The epoch re-keys chunks without claiming the data changed.
 
-        The epoch re-keys chunks; it does not claim the data changed. So the
-        chunk_ids move, the published field does not, and -- because the two
-        versions are framed separately rather than fused -- the content_version
-        INSIDE the new chunk_ids is still the published one. A consumer that
-        stamped something with this token (an ROI's ``drawn_against_version``)
-        must not read a server upgrade as "your image changed".
+        So the chunk_ids move, the published field does not, and the
+        content_version inside the new chunk_ids is still the published one.
         """
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
         names = ("oz1", "oz1/labels/nuclei")

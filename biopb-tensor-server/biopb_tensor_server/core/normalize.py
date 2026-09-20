@@ -30,10 +30,8 @@ client therefore sees a coherent normalized view: normalized bounds, a
 normalized descriptor, and a chunk whose axes match them.
 
 Because the id is unchanged but the *bytes it now resolves to* are transposed,
-cached segments written before this change would be served in the wrong order.
-That is what ``CHUNK_SEMANTICS_EPOCH`` is bumped for (``core.chunk``,
-biopb/biopb#1076); this change predates it and reached for
-``CACHE_FILE_FORMAT_VERSION`` instead, which is why the epoch exists. The
+cached segments written before this change would be served in the wrong order;
+a change of this shape bumps ``CHUNK_SEMANTICS_EPOCH`` (``core.chunk``). The
 transpose happens **inside** the cache's ``compute_fn``, so what lands in a
 segment is the served representation and the localhost mmap fast path stays
 valid.
@@ -527,8 +525,7 @@ class NormalizingAdapter(TensorAdapter):
         is never wrapped. That ordering is the point: a cached segment must hold
         what the client is served, because the localhost fast path hands the
         client that segment's bytes directly, with the server no longer in the
-        loop to transpose them. Existing segments predate the transpose; a change
-        like this one bumps ``CHUNK_SEMANTICS_EPOCH`` (biopb/biopb#1076).
+        loop to transpose them.
         """
         perm = self.perm
         if perm is None:

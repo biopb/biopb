@@ -1709,18 +1709,14 @@ class TensorFlightServer(flight.FlightServerBase):
             # fetch-per-call by contract while a listing is a natural thing to
             # cache. None stays unset -- absent is "no claim", not "unchanged".
             #
-            # The RAW content_version, from the TENSOR adapter: this field is a
-            # claim about the data ("is this the same content?"), effectively a
-            # version suffix on the identity a consumer builds -- which is what
-            # the HTTP sidecar does with it. The serving-semantics epoch is NOT
-            # composed in: it would move the token on a server upgrade that
-            # changed no data, and a consumer cannot then tell whether its
-            # derived products (an ROI's ``drawn_against_version``) are suspect.
-            # Chunk-key uniqueness under a chunking change is the server's own
-            # business, and stays inside the opaque chunk_id (biopb/biopb#1076).
+            # A claim about the data, so the raw content_version and never the
+            # serving epoch: a consumer builds an identity from this (the HTTP
+            # sidecar's versioned array_id) and stamps its own records with it
+            # (an ROI's ``drawn_against_version``), neither of which may move on
+            # a server upgrade that changed no data.
             #
-            # From the tensor and not the source because an uploaded label set's
-            # bytes are its own (``adapters/labels.py``).
+            # From the TENSOR adapter: an uploaded label set's bytes are its own
+            # (``adapters/labels.py``), not the source's.
             if tensor_adapter.content_version:
                 read_plan.descriptor.content_version = tensor_adapter.content_version
 
@@ -1992,8 +1988,6 @@ class TensorFlightServer(flight.FlightServerBase):
             if location is None:
                 return json.dumps({"available": False})
 
-            # No `format_version`: retired with biopb/biopb#1070, because what
-            # it was actually being bumped for is now the chunk_id's epoch.
             return json.dumps(
                 {
                     "available": True,

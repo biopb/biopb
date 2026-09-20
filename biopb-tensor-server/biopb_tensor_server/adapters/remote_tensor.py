@@ -883,10 +883,8 @@ class RemoteTensorAdapter(TensorAdapter):
                 # array_id (not self.array_id -- a sibling-field chunk keeps its own)
                 # only to build the LOCAL route, so the server dispatches a later
                 # do_get back to the right local tensor view. The upstream's
-                # The upstream's content_version rides the envelope so the proxy
-                # cache namespaces by upstream content; the envelope adds this
-                # proxy's own serving epoch, because the mirror re-serves those
-                # bytes locally (biopb/biopb#1076).
+                # The upstream's content_version rides the envelope, so the
+                # proxy cache namespaces by upstream content.
                 upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
                     ticket.chunk_id,

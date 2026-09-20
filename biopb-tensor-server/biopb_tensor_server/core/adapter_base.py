@@ -266,22 +266,19 @@ class SourceAdapter(ABC):
     # total for every other adapter.
     _capability_token: Optional[str] = None
 
-    # Optional content-version token (biopb/biopb#178). When set, it is folded
-    # into every chunk_id this adapter mints (via ``get_read_plan``) and hence into
-    # the cache key, so a re-registered source with new bytes gets a fresh cache
-    # namespace instead of serving stale cached chunks. None (the base default,
-    # like ``capability_token``) means "unversioned" -- the pre-#178 behavior, and
-    # byte-identical chunk_ids / cache keys -- so an adapter opts in only when it
-    # has a cheap, reliable change signal (e.g. a local file's stat signature).
-    # An opaque token: the codec never interprets it, only namespaces by it.
+    # Optional content-version token (biopb/biopb#178), folded into every
+    # chunk_id this adapter mints and hence into the cache key, so a
+    # re-registered source with new bytes gets a fresh cache namespace instead
+    # of serving stale chunks. None means unversioned: no header, and an adapter
+    # opts in only when it has a cheap, reliable change signal (a local file's
+    # stat signature). Opaque -- the codec namespaces by it, never reads it.
     #
-    # Declared here because a source is the usual owner of a content lifetime,
-    # but the value is per TENSOR: a source's tensors inherit it only while their
-    # bytes are the source's. A tensor whose bytes live elsewhere carries its own
-    # (an uploaded label set, ``adapters/labels.py``), and a tensor reading out of
-    # the source file keeps the source's (a discovered NGFF set does). So read it
-    # off the adapter that serves the bytes, never off the source the array_id
-    # happens to name.
+    # Declared on the source because a source is the usual owner of a content
+    # lifetime, but the value is per TENSOR. A tensor whose bytes live elsewhere
+    # carries its own (an uploaded label set, ``adapters/labels.py``); one
+    # reading out of the source file keeps the source's (a discovered NGFF set).
+    # Read it off the adapter that serves the bytes, not off the source the
+    # array_id happens to name.
     _content_version: Optional[bytes] = None
 
     # Display-only override for the catalog ``source_url`` (the descriptor field
@@ -363,9 +360,9 @@ class SourceAdapter(ABC):
         The version of the bytes THIS adapter serves, which for a multi-tensor
         source is not always the source's own -- see ``_content_version``.
 
-        The content signal alone. A chunk_id carries this AND the server's
-        serving-semantics epoch, framed separately (``core.chunk``); a cache has
-        to miss on either, while a consumer asking "did the data change?" -- an
+        The content signal alone. A chunk_id also carries the server's
+        serving-semantics epoch, framed separately (``core.chunk``); a cache
+        misses on either, while a consumer asking "did the data change?" -- an
         ROI's ``drawn_against_version``, the descriptor field -- wants this one.
         """
         return self._content_version

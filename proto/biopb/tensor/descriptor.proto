@@ -186,17 +186,16 @@ message TensorDescriptor {
   // whatever freshness policy they used before rather than treating absence as
   // a stable version. Servers predating this field also leave it unset.
   //
-  // Read it as a version suffix on the tensor's identity: it exists so that an
-  // identifier built from it changes when the data changes. That is literally
-  // what the HTTP sidecar does -- it splices the token into the array_id it
-  // publishes, so a browser cache keyed on a tile URL cannot outlive the content
-  // (biopb/biopb#780). The chunk cache needs nothing from this field: the server
-  // folds the same value into chunk_id, where it invalidates for free.
+  // Read it as a version suffix on the tensor's identity: an identifier built
+  // from it changes when the data changes. The HTTP sidecar does exactly that,
+  // splicing the token into the array_id it publishes so a browser cache keyed
+  // on a tile URL cannot outlive the content (biopb/biopb#780). A chunk cache
+  // needs nothing from this field -- the server folds the same value into
+  // chunk_id, where it invalidates for free.
   //
-  // It is a claim about the DATA, and moves only when the data does. How this
-  // server forms an opaque chunk key -- which must also change when chunking or
-  // normalization changes, with no data change at all -- is internal to the
-  // server and is deliberately not visible here (biopb/biopb#1076).
+  // A claim about the DATA: it moves only when the data does. How the server
+  // forms an opaque chunk key, which must also change when chunking or
+  // normalization changes, is internal to the server and not visible here.
   optional bytes content_version = 14;
 }
 
