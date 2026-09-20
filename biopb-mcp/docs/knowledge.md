@@ -86,9 +86,12 @@ ignored: measure-smlm-resolution, ratiometric-fret
 
 - An **entry** is a list line whose first token is an id: `- <id>: <hook>`.
   The hook is the agent's text and is rendered verbatim.
-- The **`ignored:`** line names shipped docs the agent has decided not to list.
-  Ignore is explicit rather than absence, so a line lost in a sloppy rewrite
-  reappears instead of silently retiring a shipped doc (§4, §5).
+- The **`ignored:`** line names docs, shipped or local, the agent has decided
+  not to list. It is the only removal there is: the agent never deletes a
+  file, so retiring a doc is one index edit, and a local file the user wants
+  gone is theirs to remove. Ignore is explicit rather than absence, so a line
+  lost in a sloppy rewrite reappears instead of silently retiring a doc (§5).
+  An ignored doc is still readable by id.
 
 Headings, prose and order are the agent's. The loader interprets nothing else.
 
@@ -126,16 +129,17 @@ resources. Tools rather than resources because every host has tools.
 and `shadows shipped` when it does). `read_doc("index")` returns the rendered
 index (§3).
 
-**`write_doc(id, body=None, diff=None, delete=False)`** — exactly one of the
-three.
+**`write_doc(id, body=None, diff=None)`** — exactly one of the two.
 
 - `body` creates or replaces the local file.
 - `diff` is a unified diff applied to the current text. Index edits are the
   common case, and a full rewrite of a long index is both slow and lossy —
   models drop and paraphrase lines past ~100 of verbatim reproduction. With a
   diff, an edit costs a few dozen output tokens whatever the index length.
-- `delete` removes a local file. A shipped id cannot be deleted; the answer is
-  its `ignored:` line.
+
+There is no delete. Removing a doc is removing its index entry, or putting it
+on the `ignored:` line if it would otherwise resurface in the tail (§3): one
+call instead of two, and no tool that destroys a file.
 
 **Shipped docs are copy-on-write.** A `body` or `diff` write to a shipped id
 creates a local file that shadows it (the diff is applied to the shipped text
