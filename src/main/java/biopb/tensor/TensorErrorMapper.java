@@ -36,9 +36,12 @@ public final class TensorErrorMapper {
 
         String message = message(error);
 
-        // An upload refusal carries no `code`: both kinds ride one exception
-        // class, so the terminal state is the data and the class is implied
-        // (upload_manager._refused). Keyed on the reason instead.
+        // An upload refusal carries no `code`: it rides FlightCancelledError,
+        // which survives the trip as CANCELLED, so the code would restate the
+        // class (upload_manager._refused). Keyed on the reason prefix alone --
+        // Python also gates on the class, but a refusal moved to another class
+        // would then silently stop decoding, which is the failure this whole
+        // decode exists to avoid.
         if (payload.reason != null && payload.reason.startsWith("upload_")) {
             return new UploadRefusedException(message, payload.reason, payload.sourceId,
                     payload.state, payload.detail, error);
