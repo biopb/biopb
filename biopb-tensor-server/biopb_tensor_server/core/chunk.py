@@ -133,6 +133,67 @@ def content_version_of(chunk_id: bytes) -> Optional[bytes]:
 
 
 # =============================================================================
+# Serving-semantics epoch (biopb/biopb#1076)
+# -----------------------------------------------------------------------------
+# content_version answers "did this source's bytes change?". It cannot answer
+# "did the meaning of the bytes this server returns for a given chunk_id
+# change?" -- a question a server-code change asks of every source at once, and
+# which no per-source signal has an expression for. #596 (axis normalization) is
+# the worked example: same chunk_id, same source bytes, transposed output. It
+# had to invalidate through CACHE_FILE_FORMAT_VERSION, which reaches this
+# server's own segments and the mmap parser and nothing else -- not the SDK's
+# on-disk cache, not a proxy's, not a browser's tiles.
+#
+# The epoch is that missing arm, and it rides the mechanism that already reaches
+# every cache keyed by chunk_id: it composes INTO the content_version header, so
+# a bump changes every chunk_id and every cache key at once. A cache that cannot
+# key by chunk_id (the HTTP sidecar's tile URLs) namespaces itself on the
+# version published on the descriptor, which is composed the same way. No new
+# wire key, and no client change -- chunk_id is opaque by contract, which is
+# exactly what makes this free for clients (biopb/biopb#346, #520).
+#
+# BUMP IT when a server change alters what the bytes for a stable chunk_id mean.
+# Do NOT bump it for a segment-file layout change: that is
+# CACHE_FILE_FORMAT_VERSION's job, and keeping the two apart is the point of
+# #1076 -- one number was carrying both questions for two different audiences.
+#
+# Cost of a bump, stated plainly: every cache everywhere cold-starts, not just
+# this server's. For a change that alters what the bytes MEAN that is the
+# correct outcome; the alternative is what #596 shipped -- correct on the
+# server, silently wrong in every cache it could not reach.
+CHUNK_SEMANTICS_EPOCH = 0
+
+# Marks an epoch-composed version. Chosen so it cannot be confused with a raw
+# content_version: every minted one is ASCII under a fixed prefix
+# (``<mtime_ns>:<size>``, ``iat:``, ``gen:``). The lone exception is an uploaded
+# label set's 8 random bytes (``adapters/labels.py``), which can only collide
+# with this form at exactly 8 bytes against an empty content_version -- 2^-64.
+# Injectivity is what lets a stale id from another build compare UNEQUAL rather
+# than passing the version check.
+_EPOCH_PREFIX = b"epoch="
+
+
+def apply_semantics_epoch(content_version: Optional[bytes]) -> Optional[bytes]:
+    """Compose :data:`CHUNK_SEMANTICS_EPOCH` into *content_version*.
+
+    The result is the version a chunk_id actually carries and the descriptor
+    actually publishes -- a cache has to miss when either half moves, so the two
+    travel as one value. Adapters reach it through
+    ``SourceAdapter.served_version``; this is the composition itself.
+
+    At epoch 0 it is the identity, so ids and cache keys stay byte-identical to
+    the pre-#1076 ones and adopting the mechanism costs no re-warm. From epoch 1
+    on, a source that was UNVERSIONED (no stat signature -- cloud, unresolved)
+    becomes versioned too: it caches this server's output like any other and has
+    no per-source signal of its own to ride.
+    """
+    if CHUNK_SEMANTICS_EPOCH == 0:
+        return content_version
+    epoch = str(CHUNK_SEMANTICS_EPOCH).encode()
+    return _EPOCH_PREFIX + epoch + b";" + (content_version or b"")
+
+
+# =============================================================================
 # Proxy envelope (biopb/biopb#178 W1)
 # -----------------------------------------------------------------------------
 # A remote-tensor proxy wraps the UPSTREAM's chunk_id in an envelope instead of
@@ -357,13 +418,17 @@ def mint_chunk_id(
     bounds: ChunkBounds,
     scale_hint: Optional[Tuple[int, ...]] = None,
     reduction_method: str = CHUNK_ID_IMPLICIT_REDUCTION_METHOD,
-    content_version: Optional[bytes] = None,
+    served_version: Optional[bytes] = None,
 ) -> bytes:
     """Mint the canonical chunk_id for a read-plan endpoint.
 
     This is the single composition point for regular or scaled encoding and the
-    optional content-version wrapper. Keeping those choices together ensures
-    cache probes mint the same bytes as read plans.
+    optional version wrapper. Keeping those choices together ensures cache
+    probes mint the same bytes as read plans.
+
+    ``served_version`` is ``SourceAdapter.served_version`` -- the source's
+    content_version composed with the semantics epoch -- never a raw
+    content_version, or a probe minted here misses the ids a read plan hands out.
     """
     if scale_hint is None:
         inner = encode_chunk_id(array_id, bounds)
@@ -371,8 +436,8 @@ def mint_chunk_id(
         inner = encode_chunk_id_with_scale(
             array_id, bounds, scale_hint, reduction_method
         )
-    if content_version is not None:
-        return wrap_content_version(inner, content_version)
+    if served_version is not None:
+        return wrap_content_version(inner, served_version)
     return inner
 
 

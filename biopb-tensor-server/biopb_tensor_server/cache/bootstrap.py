@@ -40,8 +40,17 @@ logger = logging.getLogger(__name__)
 # #9). The server reports it in chunk_locate and a client declines the fast
 # path (falls back to do_get) for any version it doesn't understand.
 #
+# ONE question only: "can you parse this segment file?". Its audience is this
+# server's boot sweep and a localhost mmap client. It is NOT the signal for
+# "have the bytes a chunk_id resolves to changed meaning?" -- that reaches every
+# cache, including ones this server cannot see, and is ``CHUNK_SEMANTICS_EPOCH``
+# in ``core.chunk`` (biopb/biopb#1076). One number carried both questions until
+# then, which is the bug #1076 describes.
+#
 # v2: biopb/biopb#596 implemented axis order normalization. A v1 segment holds the
-# pre-transpose bytes, so reusing it would serve axes in the wrong order.
+# pre-transpose bytes, so reusing it would serve axes in the wrong order. That is
+# a semantics change and would bump the epoch today; the number stays at 2
+# because lowering it would re-admit those v1 segments.
 CACHE_FILE_FORMAT_VERSION = 2
 
 # Name of the on-disk marker file (in the cache root, beside ``lock`` and

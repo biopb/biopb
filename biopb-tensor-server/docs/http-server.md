@@ -177,14 +177,26 @@ ambiguity ends — the viewer threads that id back through every tile after.
 
 `/api/tile_info` publishes `source_id "@" token [ "/" field ]` when the tensor
 carries a `content_version` — e.g. `zarr_a3f2@9f1c4e2b/Image:0`. The token is the
-first 8 hex of `sha256(content_version)`; the raw value is a stat signature whose
-mtime has no business in every tile URL and access log.
+first 8 hex of `sha256(content_version, CHUNK_SEMANTICS_EPOCH)`; the raw
+`content_version` is a stat signature whose mtime has no business in every tile
+URL and access log.
 
 `content_version` is a **serving field** on `TensorDescriptor`, like `chunk_shape`
-and `pyramid`: filled by `GetFlightInfo` from the bound adapter, empty on the
-structural `DataSourceDescriptor.tensors[]` entries. It is a source-level property
-repeated on the tensor deliberately — the check has to read the freshest thing in
-the request.
+and `pyramid`: filled by `GetFlightInfo` from the bound tensor adapter, empty on
+the structural `DataSourceDescriptor.tensors[]` entries — the check has to read
+the freshest thing in the request. Usually a source-level property repeated on
+the tensor, but a tensor whose bytes are not the source's carries its own (an
+uploaded label set).
+
+The epoch is hashed in because this token is the tile cache's key namespace, and
+a browser holds these URLs under `immutable, max-age=1y`. A tile has to change
+when the data changes (`content_version`) *and* when this server's reading of the
+data changes — chunking, axis normalization — which moves no per-source signal at
+all (biopb/biopb#1076). The Flight plane gets the second for free inside the
+opaque `chunk_id`; nothing reaches a browser that way, so this module composes it
+into its own keys. It is read from the local constant, not the wire: `cli.py`
+points the sidecar at the Flight plane it ships with. At epoch 0 the token is
+byte-identical to the pre-#1076 one, so no tile URL moved when this landed.
 
 This exists **only above the Flight wire**. The sidecar strips it before every
 Flight call; no adapter, chunk_id, catalog row or descriptor carries it. A `@` in

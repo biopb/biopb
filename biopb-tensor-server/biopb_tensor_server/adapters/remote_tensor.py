@@ -881,13 +881,16 @@ class RemoteTensorAdapter(TensorAdapter):
                 # array_id (not self.array_id -- a sibling-field chunk keeps its own)
                 # only to build the LOCAL route, so the server dispatches a later
                 # do_get back to the right local tensor view. The upstream's
-                # content_version rides the envelope so the proxy cache namespaces
-                # by upstream content.
+                # served_version rides the envelope so the proxy cache
+                # namespaces by upstream content AND by this proxy's own serving
+                # semantics (biopb/biopb#1076) -- the mirror re-serves those
+                # bytes locally, so a change in what they mean here invalidates
+                # here.
                 upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
                     ticket.chunk_id,
                     self._to_local_array_id(upstream_aid),
-                    self.content_version,
+                    self.served_version,
                 )
                 endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
             return TensorReadPlan(
@@ -978,7 +981,7 @@ class RemoteTensorAdapter(TensorAdapter):
                 f"(stale pre-upgrade ticket); re-open the tensor to refresh."
             )
         _route, held_version, _inner = peel_proxy_envelope(chunk_id)
-        if held_version is not None and held_version != self.content_version:
+        if held_version is not None and held_version != self.served_version:
             raise StaleChunkError(
                 f"chunk_id for {self.array_id!r} was minted against a "
                 "content_version this mirror no longer has (re-synced "

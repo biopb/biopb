@@ -23,9 +23,11 @@ import numpy as np
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from biopb_tensor_server.core import chunk as chunk_mod
 from biopb_tensor_server.core.adapter_base import TensorAdapter, _get_read_plan
 from biopb_tensor_server.core.chunk import (
     _CV_SENTINEL,
+    apply_semantics_epoch,
     array_id_from_chunk_id,
     cache_key_for_chunk_id,
     content_version_from_path,
@@ -339,10 +341,10 @@ class TestReadPlanWiring:
         expected = mint_chunk_id(
             "src/t",
             bounds,
-            content_version=content_version,
+            served_version=content_version,
         )
         plan = _get_read_plan(
-            _base_desc(), request, (5, 5), content_version=content_version
+            _base_desc(), request, (5, 5), served_version=content_version
         )
 
         assert plan.chunk_endpoints
@@ -391,7 +393,7 @@ class TestReadPlanWiring:
 
     def test_version_wraps_every_chunk_id(self):
         plan = _get_read_plan(
-            _base_desc(), TensorDescriptor(), (5, 5), content_version=CV
+            _base_desc(), TensorDescriptor(), (5, 5), served_version=CV
         )
         assert plan.chunk_endpoints
         assert all(content_version_of(ep.chunk_id) == CV for ep in plan.chunk_endpoints)
@@ -401,10 +403,10 @@ class TestReadPlanWiring:
 
     def test_version_bump_changes_all_cache_keys(self):
         p1 = _get_read_plan(
-            _base_desc(), TensorDescriptor(), (5, 5), content_version=b"v1"
+            _base_desc(), TensorDescriptor(), (5, 5), served_version=b"v1"
         )
         p2 = _get_read_plan(
-            _base_desc(), TensorDescriptor(), (5, 5), content_version=b"v2"
+            _base_desc(), TensorDescriptor(), (5, 5), served_version=b"v2"
         )
         keys1 = {cache_key_for_chunk_id(ep.chunk_id) for ep in p1.chunk_endpoints}
         keys2 = {cache_key_for_chunk_id(ep.chunk_id) for ep in p2.chunk_endpoints}
@@ -553,7 +555,7 @@ class TestResolveChunkDataRejectsStaleVersion:
             encode_chunk_id(adapter.array_id, ChunkBounds(start=[0, 0], stop=[5, 5])),
             b"v1",
         )
-        with pytest.raises(StaleChunkError, match="content_version"):
+        with pytest.raises(StaleChunkError, match="no longer serves"):
             adapter.resolve_chunk_data(stale_chunk_id)
 
     def test_stale_version_rejected_even_when_bounds_still_fit(self):
@@ -628,7 +630,118 @@ class TestDoGetCacheHitRejectsStaleVersion:
             # Re-registration: the source is now v2, but a client's held
             # chunk_id (and, if still resident, its cache entry) is still v1.
             adapter._content_version = b"v2"
-            with pytest.raises(StaleChunkError, match="content_version"):
+            with pytest.raises(StaleChunkError, match="no longer serves"):
                 adapter.resolve_chunk_data(scaled_v1, cache_manager)
         finally:
             CacheManager.reset()
+
+
+# ==============================================================================
+# Serving-semantics epoch (biopb/biopb#1076)
+# ==============================================================================
+# content_version says "the data changed" -- a claim about content, which is why
+# it is published and why an identifier built from it changes with the data. The
+# epoch says only "this key was formed under an older reading": chunking or
+# normalization moved, the data did not. Different claims, so they are not one
+# value; the epoch stays inside the opaque chunk_id, where key formation is the
+# server's own business. #596 had neither and reached for
+# CACHE_FILE_FORMAT_VERSION, which is why it invalidated this server's segments
+# and the mmap path and nothing else.
+
+
+@pytest.fixture
+def epoch(monkeypatch):
+    """Bump the epoch for one test."""
+
+    def bump(value):
+        monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", value)
+
+    return bump
+
+
+class TestSemanticsEpoch:
+    def test_epoch_zero_is_the_identity(self):
+        """Adopting the mechanism must not cold-start a single cache.
+
+        Byte-identical ids, not merely compatible ones: anything else re-warms
+        every cache in the system for a no-op change.
+        """
+        for cv in (None, CV, b""):
+            assert apply_semantics_epoch(cv) == cv
+
+    def test_a_bump_moves_every_version(self, epoch):
+        epoch(1)
+        assert apply_semantics_epoch(CV) != CV
+        assert apply_semantics_epoch(CV).endswith(CV)
+
+    def test_a_bump_versions_a_previously_unversioned_source(self, epoch):
+        """An unstat-able source (cloud, unresolved) has no content signal of
+        its own, but it caches this server's output like any other."""
+        assert apply_semantics_epoch(None) is None
+        epoch(1)
+        assert apply_semantics_epoch(None) is not None
+
+    def test_epochs_are_distinct_and_injective(self, epoch):
+        """A version from another build must compare UNEQUAL, never pass.
+
+        The prefix is what keeps composed forms from colliding with the raw
+        content_versions the codebase mints -- all ASCII under a fixed prefix.
+        """
+        seen = set()
+        for value in (0, 1, 2, 11):
+            epoch(value)
+            seen.add(apply_semantics_epoch(CV))
+            seen.add(apply_semantics_epoch(b""))
+        assert len(seen) == 8
+
+    def test_a_bump_changes_every_chunk_id_and_cache_key(self, epoch):
+        def plan():
+            adapter = _VersionedStubAdapter((10, 10), CV)
+            return _get_read_plan(
+                adapter.get_tensor_descriptor(),
+                TensorDescriptor(),
+                (5, 5),
+                served_version=adapter.served_version,
+            )
+
+        before = plan()
+        epoch(1)
+        after = plan()
+
+        assert len(before.chunk_endpoints) == len(after.chunk_endpoints) == 4
+        ids_before = {ep.chunk_id for ep in before.chunk_endpoints}
+        ids_after = {ep.chunk_id for ep in after.chunk_endpoints}
+        assert ids_before.isdisjoint(ids_after)
+        assert {cache_key_for_chunk_id(i) for i in ids_before}.isdisjoint(
+            {cache_key_for_chunk_id(i) for i in ids_after}
+        )
+        # The grid itself is untouched: only the namespace moved.
+        assert [ep.bounds for ep in before.chunk_endpoints] == [
+            ep.bounds for ep in after.chunk_endpoints
+        ]
+
+    def test_an_id_from_the_previous_epoch_is_refused(self, epoch):
+        """The already-live staleness path carries it -- a client holding a read
+        plan across the upgrade re-plans instead of being served stale bytes."""
+        adapter = _VersionedStubAdapter((10, 10), CV)
+        held = mint_chunk_id(
+            "stub",
+            _bounds(),
+            served_version=adapter.served_version,
+        )
+        adapter.check_chunk_version(held)  # current epoch: fine
+
+        epoch(1)
+        with pytest.raises(StaleChunkError, match="no longer serves"):
+            adapter.check_chunk_version(held)
+
+    def test_the_source_s_own_content_version_is_left_alone(self, epoch):
+        """The published claim is about data and must not move.
+
+        A consumer asking "did the data change?" -- an ROI's
+        ``drawn_against_version``, the sidecar's versioned array_id -- reads
+        content_version. A server upgrade is not a data change."""
+        epoch(1)
+        adapter = _VersionedStubAdapter((10, 10), CV)
+        assert adapter.content_version == CV
+        assert adapter.served_version != CV

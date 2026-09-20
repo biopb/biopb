@@ -2553,6 +2553,47 @@ class TestTileInfoPublishesTheVersion:
             assert _published_array_id(tc) == "tiled/Image:0"
 
 
+class TestTheTileTokenCarriesTheSemanticsEpoch:
+    """biopb/biopb#1076: the one cache that cannot key by chunk_id.
+
+    A browser holds a versioned tile URL under `immutable, max-age=1y`. The
+    Flight plane re-keys its chunks inside the opaque chunk_id when this
+    server's reading of the bytes changes; a browser sees none of that, so the
+    sidecar composes the epoch into its own key namespace. Its own decision
+    about its own keys -- read from the local constant, because `cli.py` points
+    the sidecar at the Flight plane it ships with.
+    """
+
+    def test_a_bump_moves_the_token(self, monkeypatch):
+        from biopb_tensor_server.core import chunk as chunk_mod
+        from biopb_tensor_server.serving.http_server import _version_token
+
+        cv = b"1700000000:4096"
+        before = _version_token(cv)
+        monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", 1)
+        assert _version_token(cv) != before
+
+    def test_epoch_zero_leaves_every_tile_url_untouched(self):
+        """Adopting the mechanism must not cold-start a browser cache either."""
+        import hashlib
+
+        from biopb_tensor_server.serving.http_server import _version_token
+
+        cv = b"1700000000:4096"
+        assert _version_token(cv) == hashlib.sha256(cv).hexdigest()[:8]
+
+    def test_two_epochs_do_not_collide(self, monkeypatch):
+        from biopb_tensor_server.core import chunk as chunk_mod
+        from biopb_tensor_server.serving.http_server import _version_token
+
+        cv = b"1700000000:4096"
+        seen = set()
+        for value in (0, 1, 2):
+            monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", value)
+            seen.add(_version_token(cv))
+        assert len(seen) == 3
+
+
 class TestVersionedTileRequests:
     def test_the_published_id_serves_tiles_and_goes_immutable(self):
         with _versioned_tile_client(b"1700000000:4096") as (tc, _):

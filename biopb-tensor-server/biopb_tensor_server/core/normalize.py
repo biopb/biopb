@@ -31,10 +31,13 @@ normalized descriptor, and a chunk whose axes match them.
 
 Because the id is unchanged but the *bytes it now resolves to* are transposed,
 cached segments written before this change would be served in the wrong order.
-``CACHE_FILE_FORMAT_VERSION`` is bumped for exactly that reason (see
-``cache.file_backend``); the transpose happens **inside** the cache's
-``compute_fn``, so what lands in a segment is the served representation and the
-localhost mmap fast path stays valid.
+That is what ``CHUNK_SEMANTICS_EPOCH`` is bumped for (``core.chunk``,
+biopb/biopb#1076): it changes every chunk_id, so every cache keyed by one misses
+-- this server's segments, a client's, a proxy's alike. This change predates the
+epoch and reached for ``CACHE_FILE_FORMAT_VERSION`` instead, which is why the
+epoch exists. The transpose happens **inside** the cache's ``compute_fn``, so
+what lands in a segment is the served representation and the localhost mmap fast
+path stays valid.
 
 **Plans are delegated, not re-derived.** ``plan_flight_info`` / ``get_read_plan``
 call the wrapped adapter and permute its answer, rather than inheriting the base
@@ -261,6 +264,10 @@ class NormalizingAdapter(TensorAdapter):
     @property
     def content_version(self) -> Optional[bytes]:
         return self._inner.content_version
+
+    @property
+    def served_version(self) -> Optional[bytes]:
+        return self._inner.served_version
 
     @property
     def array_id(self) -> str:
@@ -525,8 +532,8 @@ class NormalizingAdapter(TensorAdapter):
         is never wrapped. That ordering is the point: a cached segment must hold
         what the client is served, because the localhost fast path hands the
         client that segment's bytes directly, with the server no longer in the
-        loop to transpose them. Existing segments predate the transpose, which is
-        what ``CACHE_FILE_FORMAT_VERSION`` is bumped for.
+        loop to transpose them. Existing segments predate the transpose; a change
+        like this one bumps ``CHUNK_SEMANTICS_EPOCH`` (biopb/biopb#1076).
         """
         perm = self.perm
         if perm is None:

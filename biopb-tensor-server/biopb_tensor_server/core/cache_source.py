@@ -6,7 +6,7 @@ second time -- see :func:`cache_sourced_units` for what that buys and when it
 declines.
 
 Module functions rather than adapter methods: the only adapter state they need
-is ``content_version`` (one argument), and as methods every subclass and every
+is ``served_version`` (one argument), and as methods every subclass and every
 delegating wrapper inherited a seam it never meant to offer.
 """
 
@@ -90,7 +90,7 @@ def _acquired_chunk_view(
 def cache_sourced_units(
     cache_manager: Optional[CacheManager],
     descriptor: TensorDescriptor,
-    content_version: Optional[bytes],
+    served_version: Optional[bytes],
     start: Tuple[int, ...],
     stop: Tuple[int, ...],
     unit: Tuple[int, ...],
@@ -197,7 +197,7 @@ def cache_sourced_units(
     # tenth of this path.
     keys: Dict[Tuple[int, ...], bytes] = {}
     for chunk_start, key in chunk_cache_keys(
-        descriptor, content_version, start, stop, transfer
+        descriptor, served_version, start, stop, transfer
     ):
         if not cache_manager.contains(key):
             return declined
@@ -247,7 +247,7 @@ def cache_sourced_units(
 
 def chunk_cache_keys(
     descriptor: TensorDescriptor,
-    content_version: Optional[bytes],
+    served_version: Optional[bytes],
     start: Sequence[int],
     stop: Sequence[int],
     transfer: Sequence[int],
@@ -256,7 +256,7 @@ def chunk_cache_keys(
     ``[start, stop)``.
 
     Minted exactly as ``_get_read_plan`` mints an unscaled endpoint -- same
-    absolute grid, same ``array_id``, same ``content_version`` header --
+    absolute grid, same ``array_id``, same ``served_version`` header --
     because a key that differs by one byte is a probe that never hits.
     """
     shape = tuple(int(dim) for dim in descriptor.shape)
@@ -264,7 +264,7 @@ def chunk_cache_keys(
         chunk_id = mint_chunk_id(
             descriptor.array_id,
             ChunkBounds(start=list(chunk_start), stop=list(chunk_stop)),
-            content_version=content_version,
+            served_version=served_version,
         )
         yield chunk_start, cache_key_for_chunk_id(chunk_id)
 

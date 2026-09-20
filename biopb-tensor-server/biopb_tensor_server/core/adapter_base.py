@@ -46,6 +46,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.cache_source import cache_sourced_units
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
+    apply_semantics_epoch,
     array_id_from_chunk_id,
     build_pyramid_plan,
     cache_key_for_chunk_id,
@@ -361,14 +362,33 @@ class SourceAdapter(ABC):
 
         The version of the bytes THIS adapter serves, which for a multi-tensor
         source is not always the source's own -- see ``_content_version``.
+
+        The RAW content signal. Anything namespacing a cache wants
+        :attr:`served_version` instead; this one is for a consumer that means
+        "did the source's content change?" and nothing else -- an ROI's
+        ``drawn_against_version``.
         """
         return self._content_version
+
+    @property
+    def served_version(self) -> Optional[bytes]:
+        """The version this adapter's chunk_ids carry and its descriptor publishes.
+
+        :attr:`content_version` composed with the server's serving-semantics
+        epoch (biopb/biopb#1076), which is the whole answer to "may a cached
+        chunk for this id still be served?" -- the source's bytes and this
+        server's reading of them can each move independently, and a cache has to
+        miss on either. One value so the two carriers (the opaque chunk_id
+        header, and the field the descriptor publishes for caches that cannot
+        key by chunk_id) cannot drift apart.
+        """
+        return apply_semantics_epoch(self.content_version)
 
     def check_chunk_version(self, chunk_id: bytes) -> None:
         """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
 
         Pure in-memory comparison of ``content_version_of(chunk_id)`` against
-        ``self.content_version`` -- no adapter I/O -- so a caller can run it as a
+        ``self.served_version`` -- no adapter I/O -- so a caller can run it as a
         cheap guard ahead of a cache lookup (``server._handle_chunk_locate``) as
         well as ahead of an actual read (:meth:`TensorAdapter.resolve_chunk_data`),
         without paying for a second adapter lookup or (for a native-pyramid
@@ -381,10 +401,10 @@ class SourceAdapter(ABC):
         chunk_id, so this base implementation would misparse one of its chunk_ids.
         """
         held_version = content_version_of(chunk_id)
-        if held_version is not None and held_version != self.content_version:
+        if held_version is not None and held_version != self.served_version:
             raise StaleChunkError(
                 f"chunk_id for {self.array_id!r} was minted against a "
-                "content_version this source no longer has; re-request the "
+                "version this source no longer serves; re-request the "
                 "read plan (GetFlightInfo) rather than retrying this chunk_id.",
                 reason="stale_content_version",
             )
@@ -1327,7 +1347,7 @@ class TensorAdapter(SourceAdapter):
         unit, fetch, borrowed = cache_sourced_units(
             cache_manager,
             descriptor,
-            self.content_version,
+            self.served_version,
             start,
             stop,
             unit,
@@ -1604,14 +1624,14 @@ class TensorAdapter(SourceAdapter):
             return self._plan_precomputed_read(request_desc, scale_hint)
 
         chunk_size = self.get_transfer_chunk_size()
-        # content_version is a SourceAdapter property; every TensorAdapter is a
-        # SourceAdapter, so it is always present -- an unversioned source returns
-        # None.
+        # served_version is a SourceAdapter property; every TensorAdapter is a
+        # SourceAdapter, so it is always present -- an unversioned source at
+        # epoch 0 returns None.
         return _get_read_plan(
             base_desc,
             request_desc,
             chunk_size,
-            content_version=self.content_version,
+            served_version=self.served_version,
         )
 
     # ---- native-pyramid precompute routing ---------------------------------
@@ -1917,6 +1937,7 @@ _SOURCE_SCOPED_API = frozenset(
         "source_type",
         "capability_token",
         "content_version",
+        "served_version",
         "check_chunk_version",
         "claim",
         "create_from_config",
@@ -2023,16 +2044,18 @@ def _get_read_plan(
     base_desc: TensorDescriptor,
     request_desc: TensorDescriptor,
     chunk_size: Tuple[int, ...],
-    content_version: Optional[bytes] = None,
+    served_version: Optional[bytes] = None,
 ) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
 
-    ``content_version`` (biopb/biopb#178), when set, is folded into every minted
-    chunk_id so the cache namespaces by it. It is constant across the grid, so the
-    wrapper header is precomputed once and prepended per chunk (one concat).
+    ``served_version`` (``SourceAdapter.served_version``: content_version
+    biopb/biopb#178, composed with the semantics epoch biopb/biopb#1076), when
+    set, is folded into every minted chunk_id so the cache namespaces by it. It
+    is constant across the grid, so the wrapper header is precomputed once and
+    prepended per chunk (one concat).
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
@@ -2148,7 +2171,7 @@ def _get_read_plan(
             virtual_bounds,
             scale_hint,
             reduction_method,
-            content_version,
+            served_version,
         )
 
         logical_endpoints.append(

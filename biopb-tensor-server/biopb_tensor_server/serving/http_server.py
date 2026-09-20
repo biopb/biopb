@@ -81,6 +81,7 @@ from fastapi.responses import JSONResponse
 from google.protobuf import json_format
 from pydantic import BaseModel
 
+from biopb_tensor_server.core.chunk import apply_semantics_epoch
 from biopb_tensor_server.core.labels import split_label_field
 
 logger = logging.getLogger(__name__)
@@ -715,8 +716,19 @@ def _version_token(content_version: bytes) -> str:
     matter only between two versions OF ONE SOURCE, where the alternative to a
     collision is today's behaviour (no versioning at all), so the trade is
     strictly favourable.
+
+    The serving-semantics epoch is hashed in with it (biopb/biopb#1076). This
+    token is the tile cache's key namespace, and that cache has to miss on the
+    same two things any chunk cache does: the data changing, and this server's
+    reading of the data changing. The Flight plane gets the second for free
+    inside the opaque chunk_id; a browser holding an `immutable` tile URL gets it
+    only here, so composing it is this module's own key-forming decision -- like
+    the chunk codec's, internal, and not a wire contract. Read from the local
+    constant because the sidecar ships with the Flight plane it serves and is
+    pointed at it by ``cli.py``. At epoch 0 the token is unchanged, so adopting
+    the mechanism invalidates nothing.
     """
-    return hashlib.sha256(content_version).hexdigest()[:8]
+    return hashlib.sha256(apply_semantics_epoch(content_version)).hexdigest()[:8]
 
 
 def _descriptor_version_token(td: Any) -> Optional[str]:

@@ -402,3 +402,27 @@ class TestContentVersion:
 
         assert first != second
         assert client.get_descriptor("oz1").content_version  # unmoved either way
+
+    def test_a_semantics_epoch_bump_leaves_the_published_version_alone(
+        self, served, client, monkeypatch
+    ):
+        """biopb/biopb#1076, over the wire.
+
+        The epoch re-keys chunks; it does not claim the data changed. So the
+        chunk_ids move and the field does not -- a consumer that stamped
+        something with this token (an ROI's ``drawn_against_version``) must not
+        read a server upgrade as "your image changed".
+        """
+        from biopb_tensor_server.core import chunk as chunk_mod
+
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        ids = {a: self._minted(client, a) for a in ("oz1", "oz1/labels/nuclei")}
+        published = {a: client.get_descriptor(a).content_version for a in ids}
+
+        monkeypatch.setattr(chunk_mod, "CHUNK_SEMANTICS_EPOCH", 1)
+
+        for array_id, was in ids.items():
+            assert self._minted(client, array_id).isdisjoint(was)
+            assert (
+                client.get_descriptor(array_id).content_version == published[array_id]
+            )
