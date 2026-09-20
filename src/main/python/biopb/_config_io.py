@@ -20,11 +20,12 @@ from typing import Any, Dict
 logger = logging.getLogger(__name__)
 
 
-def atomic_write_json(
-    path: Path, data: Dict[str, Any], *, raise_on_error: bool
+def _atomic_write(
+    path: Path, write_into: Any, *, raise_on_error: bool, what: str, wrote: str
 ) -> None:
-    """Write *data* to *path* as pretty JSON, atomically.
+    """Write to *path* via a sibling temp file plus ``os.replace``.
 
+    *write_into* does the actual write, given the temp path to write into.
     *raise_on_error* is the one real difference between the callers: an admin
     endpoint must surface a permission/disk error to the user who clicked save,
     while a best-effort settings write from a running session logs and carries on
@@ -35,11 +36,9 @@ def atomic_write_json(
     # the temp file (the MCP kernel writes settings from background threads).
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        with tmp.open("w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
+        write_into(tmp)
         os.replace(tmp, path)
-        logger.debug("Wrote config to %s", path)
+        logger.debug("%s %s", wrote, path)
     except Exception as e:  # noqa: BLE001 - re-raised or logged per the caller's policy
         try:
             tmp.unlink()
@@ -47,4 +46,34 @@ def atomic_write_json(
             pass
         if raise_on_error:
             raise
-        logger.warning("Failed to save config to %s: %s", path, e)
+        logger.warning("Failed to %s %s: %s", what, path, e)
+
+
+def atomic_write_json(
+    path: Path, data: Dict[str, Any], *, raise_on_error: bool
+) -> None:
+    """Write *data* to *path* as pretty JSON, atomically. See :func:`_atomic_write`."""
+
+    def write_into(tmp: Path) -> None:
+        with tmp.open("w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+
+    _atomic_write(
+        path,
+        write_into,
+        raise_on_error=raise_on_error,
+        what="save config to",
+        wrote="Wrote config to",
+    )
+
+
+def atomic_write_text(path: Path, text: str, *, raise_on_error: bool) -> None:
+    """Write *text* to *path* atomically. See :func:`_atomic_write`."""
+    _atomic_write(
+        path,
+        lambda tmp: tmp.write_text(text, encoding="utf-8"),
+        raise_on_error=raise_on_error,
+        what="write",
+        wrote="Wrote",
+    )

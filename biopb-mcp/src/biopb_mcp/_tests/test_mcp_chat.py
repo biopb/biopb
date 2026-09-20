@@ -309,10 +309,11 @@ class TestToolSurface:
         payload = asyncio.run(_chat.tool_payload())
         names = {t["function"]["name"] for t in payload}
         listed = {t.name for t in asyncio.run(_app.mcp.list_tools())}
-        # Every registered tool, and exactly one thing that is not one: the
-        # resource reader, which has no registry entry to generate from. Pinned
-        # as equality so a second hand-written tool cannot creep in unnoticed.
-        assert names == listed | {_chat.RESOURCE_TOOL}
+        # Exactly the registered tools and nothing else: the knowledge store is
+        # read_doc/write_doc, which are ordinary tools, so the loop no longer
+        # synthesizes a reader for the resource surface. Pinned as equality so a
+        # hand-written tool cannot creep back in unnoticed.
+        assert names == listed
         # $schema/title are pydantic's and several providers reject them.
         for tool in payload:
             assert "$schema" not in tool["function"]["parameters"]
@@ -320,12 +321,12 @@ class TestToolSurface:
 
     def test_both_call_tool_shapes_collapse(self, chat_host):
         # server_status has an output schema and returns (blocks, structured);
-        # list_skills has none and returns a bare block list. The loop is below
-        # the layer that collapses them, so it does that job -- and must, for
-        # both, or one whole class of tool comes back as a tuple.
+        # take_screenshot has none and returns a bare block list. The loop is
+        # below the layer that collapses them, so it does that job -- and must,
+        # for both, or one whole class of tool comes back as a tuple.
         for name, args in (
             ("server_status", {}),
-            ("list_skills", {"keywords": ["drift"]}),
+            ("read_doc", {"id": "index"}),
         ):
             text, images = asyncio.run(_chat._dispatch(name, args, None))
             assert isinstance(text, str) and text
@@ -475,57 +476,32 @@ class TestVision:
         assert _chat.images_allowed() is True
 
 
-class TestResources:
-    """The resource surface, which function-calling has no verb for.
+class TestTheKnowledgeStore:
+    """The store reaches a function-calling model as ordinary tools.
 
-    Both halves of the borrowed system prompt point at it -- the guides by URI
-    and, through list_skills, the skills -- so an agent that cannot reach it is
-    being told to open documents it has no way to open.
+    That is the whole reason it is tools and not resources: a chat-completions
+    API has no verb for `resources/read`, so before the redesign the loop had to
+    synthesize one or the agent was told to open documents it could not open.
     """
 
-    def test_the_reader_is_offered_and_lists_what_is_registered(self, chat_host):
+    def test_no_reader_is_synthesized_any_more(self, chat_host):
         payload = asyncio.run(_chat.tool_payload())
-        reader = [t for t in payload if t["function"]["name"] == _chat.RESOURCE_TOOL]
-        assert len(reader) == 1
-        described = reader[0]["function"]["description"]
-        # Generated from the registry, so it cannot drift from what exists.
-        for res in asyncio.run(_app.mcp.list_resources()):
-            assert str(res.uri) in described
-        for tpl in asyncio.run(_app.mcp.list_resource_templates()):
-            assert tpl.uriTemplate in described
+        names = {t["function"]["name"] for t in payload}
+        assert "read_resource" not in names
+        assert {"read_doc", "write_doc"} <= names
 
-    def test_a_guide_reads_back(self, chat_host):
+    def test_a_doc_reads_back(self, chat_host):
         text, images = asyncio.run(
-            _chat._dispatch(_chat.RESOURCE_TOOL, {"uri": "guide://data"}, None)
+            _chat._dispatch("read_doc", {"id": "tensor-server-client"}, None)
         )
         assert images == []
-        assert text == _server.get_data_guide()
+        assert "client.get_tensor" in text
 
-    def test_the_skill_template_resolves(self, chat_host):
-        # list_skills answers with ids and nothing else, so this is the half
-        # that makes a curated workflow reachable at all.
-        from biopb_mcp.mcp import _skills
-
-        skill_id = _skills.load_catalog()[0]["id"]
-        text, _images = asyncio.run(
-            _chat._dispatch(_chat.RESOURCE_TOOL, {"uri": f"skill://{skill_id}"}, None)
-        )
-        assert text.strip()
-
-    def test_an_unknown_uri_is_a_tool_result_not_a_dead_turn(self, chat_host):
+    def test_an_unknown_doc_is_a_tool_result_not_a_dead_turn(self, chat_host):
         # The model's mistake to correct on the next round, like any other bad
         # argument -- not an exception that ends the conversation.
-        model = _scripted(
-            {
-                "content": "",
-                "tool_calls": [_call(_chat.RESOURCE_TOOL, uri="guide://nope")],
-            },
-            {"content": "I will read guide://data instead"},
-        )
-        asyncio.run(_chat.run_turn("what ops exist?", model))
-        tool_msg = [m for m in _chat.history() if m["role"] == "tool"][0]
-        assert "Could not read" in tool_msg["content"]
-        assert _chat.history()[-1]["content"].startswith("I will read")
+        text, _images = asyncio.run(_chat._dispatch("read_doc", {"id": "nope"}, None))
+        assert "No doc 'nope'" in text
 
 
 class TestExecuteCode:
@@ -1095,14 +1071,14 @@ class TestProviderEcho:
         model = _scripted(
             {
                 "content": "",
-                "tool_calls": [_call(_chat.RESOURCE_TOOL, uri="guide://data")],
-                "reasoning_content": "which guide",
+                "tool_calls": [_call("read_doc", id="tensor-server-client")],
+                "reasoning_content": "which doc",
             },
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("what ops exist?", model))
         called = self._assistant(model)[0]
-        assert called["reasoning_content"] == "which guide"
+        assert called["reasoning_content"] == "which doc"
         assert called["tool_calls"]
 
     def test_the_providers_own_spelling_is_kept(self, chat_host):

@@ -362,41 +362,19 @@ class ViewerConfig:
 
 @dataclass
 class ServicesConfig:
-    """Compute-plane servers and the skills catalog wired into the kernel."""
+    """Compute-plane servers and the knowledge store wired into the kernel."""
 
     process_image_servers: List[str] = _hlist(
         [],
         "biopb.image ProcessImage servicer URLs (grpc:// or grpcs://). Each is "
         "queried via GetOpNames and exposed as callables in the kernel's `ops` dict.",
     )
-    skills_enabled: bool = _h(
-        True,
-        "Master switch for skills discovery/retrieval. On by default: the agent is "
-        "told to consult list_skills, which resolves the curated workflows shipped "
-        "with this package plus the user's own (skills_local_dir). Set false to keep "
-        "the subsystem dormant -- list_skills returns nothing and the agent is not "
-        "told about skills.",
-    )
-    skills_local_dir: str = _h(
+    docs_local_dir: str = _h(
         "",
-        "Directory of user-authored skill files (*.md) merged into the catalog "
-        "beside the shipped ones; empty -> ~/.config/biopb/skills. Personal and "
-        "unreviewed (list_skills reports them as origin=local), re-read on every "
-        "discovery so an edit is live without a restart. Since the curated set now "
-        "arrives only with a release, this is also the only way a skill reaches a "
-        "machine out of band. Off with skills_enabled like the rest of the "
-        "subsystem.",
-    )
-    skills_index_plugins: bool = _h(
-        True,
-        "Also return kernel plugins from list_skills, described by their module "
-        "docstring (read with ast, never imported). Without this a plugin is "
-        "discoverable only as a bare name in server_status, which conveys nothing "
-        "about what it does -- measured: five benchmark arms were shown the name "
-        "and none followed it up. Rows carry kind='plugin' and a namespace handle "
-        "instead of a skill:// uri. Off with skills_enabled or namespace_enabled, "
-        "since there is nothing to advertise if the catalog is dormant or the "
-        "plugins will not load.",
+        "Directory of the agent's own docs (*.md), written by write_doc and "
+        "shadowing a shipped doc of the same id; empty -> ~/.config/biopb/docs. "
+        "Holds the index the agent edits, and is re-read on every access so a "
+        "hand edit is live without a restart.",
     )
     namespace_enabled: bool = _h(
         True,
@@ -884,6 +862,35 @@ def _validate_and_clamp(config: dict) -> dict:
     return config
 
 
+# Keys renamed by the knowledge-store redesign (biopb-mcp/docs/knowledge.md §8),
+# read for one release so an existing config file is not silently ignored. The
+# new key wins where both are present.
+_RENAMED_KEYS = {
+    "services": {
+        "skills_local_dir": "docs_local_dir",
+    },
+}
+
+
+def _apply_renames(config: dict) -> dict:
+    """Carry a retired key's value onto its replacement, in place."""
+    for section, mapping in _RENAMED_KEYS.items():
+        values = config.get(section)
+        if not isinstance(values, dict):
+            continue
+        for old, new in mapping.items():
+            if old in values and new not in values:
+                values[new] = values.pop(old)
+                logger.warning(
+                    "config: %s.%s is now %s.%s; reading the old key this release",
+                    section,
+                    old,
+                    section,
+                    new,
+                )
+    return config
+
+
 def _read_and_merge_from_disk() -> dict:
     """Read the config file and merge onto defaults.
 
@@ -904,7 +911,7 @@ def _read_and_merge_from_disk() -> dict:
 
         # Deep-merge with defaults so partial user sections override only their own
         # leaves and every expected key still resolves.
-        merged = _deep_merge(get_default_config(), config)
+        merged = _deep_merge(get_default_config(), _apply_renames(config))
         # Reject out-of-range / bad-enum leaves (warn + reset) before any hot path
         # reads them (biopb/biopb#182).
         _validate_and_clamp(merged)

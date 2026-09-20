@@ -112,12 +112,10 @@ def _snapshot(
 def reset_server_state():
     old_host = _app._kernel_host
     old_promote = _app._promote_after
-    old_skills = _app._skills_enabled
     old_instructions = _app.mcp._mcp_server.instructions
     yield
     _app._kernel_host = old_host
     _app._promote_after = old_promote
-    _app._skills_enabled = old_skills
     _app.mcp._mcp_server.instructions = old_instructions
     # The mirrored one-agent claim is process state like the rest: a test that
     # claims the kernel must not decide whether the next one is refused.
@@ -155,34 +153,33 @@ def server_with_host(mock_kernel_host):
 # -----------------------------------------------------------------------
 
 
-class TestResources:
-    def test_guide_resource_returns_string(self):
-        content = _server.get_kernel_guide()
+class TestTheReferenceDocs:
+    def test_the_kernel_doc_reads_back(self):
+        content = _tool(_server.read_doc, "kernel")
         assert "biopb-mcp" in content
         assert "execute_code" in content
 
-    def test_guide_routes_every_requires_token_to_a_status_section(self):
-        # The guide is where a skill's `checklist:` is resolved, so every token
-        # kind must name the section that answers it -- a token with no route is
-        # one the agent will guess at.
-        guide = _server.get_kernel_guide()
-        section = guide[guide.index("## Skill requirements") :]
-        for token, where in [
-            ("`viewer`", "## Viewer"),
-            ("`tensor`", "## Tensor Server"),
-            ("`dask`", "## Dask"),
-            ("`ops:<kind>`", "## Ops"),
-            ("`plugin:<name>`", "## Kernel plugins"),
-            ("`pkg:biopb-mcp`", "## Versions"),
-        ]:
-            assert token in section and where in section
+    def test_the_requirements_doc_routes_every_kind_to_a_status_section(self):
+        # A procedure's Requirements line is resolved against this, so every
+        # kind of thing it can name must name the section that answers it --
+        # one with no route is one the agent will guess at.
+        doc = _tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## Where each one is answered") :]
+        for where in (
+            "## Viewer",
+            "## Tensor Server",
+            "## Dask",
+            "## Ops",
+            "## Kernel\nplugins",
+        ):
+            assert where in section
 
-    def test_guide_gives_a_missing_package_three_options(self):
+    def test_a_missing_package_gets_three_options(self):
         # The choice is the user's, so all three have to be on the table: the
         # agent installing is one option among them, not the default, and the
         # degraded path is the one that survives a managed-env upgrade.
-        section = _server.get_kernel_guide()
-        section = section[section.index("### When something is missing") :]
+        doc = _tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## When something is missing") :]
         assert "They install it" in section
         assert "You install it for them" in section
         assert "only after they say yes" in section
@@ -195,27 +192,27 @@ class TestResources:
         # The durability note belongs to the two options that install something.
         # Indented under option 3 -- the one where nothing is installed -- it reads
         # as a non-sequitur, so pin it as its own unindented paragraph.
-        section = _server.get_kernel_guide()
-        section = section[section.index("### When something is missing") :]
+        doc = _tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## When something is missing") :]
         (line,) = [ln for ln in section.splitlines() if "extra-packages.txt" in ln]
         assert not line.startswith(" "), line
 
-    def test_guide_separates_the_three_missing_plugin_causes(self):
+    def test_the_three_missing_plugin_causes_stay_separate(self):
         # Seeding cannot fix an install that predates the plugin, and a file that
         # failed to load is not a file that is absent -- different fixes, so the
-        # guide must not collapse them into "run the seeder".
-        section = _server.get_kernel_guide()
-        section = section[section.index("### When something is missing") :]
-        assert "predates the plugin" in section
+        # doc must not collapse them into "run the seeder".
+        doc = _tool(_server.read_doc, "requirements")
+        section = doc[doc.index("## When something is missing") :]
+        assert "predates it" in section
         assert "failed to load" in section
         assert "biopb-mcp-seed-plugins" in section
 
-    def test_guide_tells_the_agent_it_shares_the_namespace(self):
+    def test_the_kernel_doc_tells_the_agent_it_shares_the_namespace(self):
         # The runtime note ("the user ran job-N") says a change happened; this
         # section is what makes that legible -- without it the agent has no model
         # of a second writer, and reads the note as noise.
-        guide = _server.get_kernel_guide()
-        section = guide[guide.index("## You are not the only writer") :]
+        doc = _tool(_server.read_doc, "kernel")
+        section = doc[doc.index("## You are not the only writer") :]
         assert "observe" in section
         assert "poll_job" in section
         # The three rules that keep the two writers off each other: it is told
@@ -225,44 +222,26 @@ class TestResources:
         assert "refuses a user job" in section
         assert "restart_kernel" in section
 
-    def test_guide_skill_section_gated_on_the_catalog_switch(self):
-        # With the catalog off there is no list_skills to hand back a
-        # `checklist:`, so the section documents a tool the agent cannot
-        # call -- the gate the handshake instructions already use.
-        _app.set_skills_enabled(False)
-        off = _server.get_kernel_guide()
-        assert "## Skill requirements" not in off
-        _app.set_skills_enabled(True)
-        on = _server.get_kernel_guide()
-        assert "## Skill requirements" in on
-        # Everything else is the same guide, in both directions (no stale copy).
-        assert on.startswith(off)
-        _app.set_skills_enabled(False)
-        assert _server.get_kernel_guide() == off
-
-    def test_guide_points_at_server_status_for_which_plugins_loaded(self):
+    def test_the_kernel_doc_points_at_server_status_for_plugins(self):
         # The loader is fail-open, so "file on disk" != "plugin loaded"; the
         # report is the only place that distinction is readable.
-        content = _server.get_kernel_guide()
+        content = _tool(_server.read_doc, "kernel")
         assert "## Kernel plugins" in content
         assert "services.namespace_enabled" in content
         # ...and introspection remains the answer to the other question.
         assert "inspect_object" in content
 
-    def test_viewer_resource_mentions_layers(self):
-        content = _server.get_viewer_guide()
-        assert "viewer.layers" in content
+    def test_the_viewer_doc_mentions_layers(self):
+        assert "viewer.layers" in _tool(_server.read_doc, "napari-viewer")
 
-    def test_client_resource_mentions_client(self):
-        content = _server.get_client_guide()
-        assert "client" in content
+    def test_the_client_doc_mentions_client(self):
+        assert "client" in _tool(_server.read_doc, "tensor-server-client")
 
-    def test_viewer_resource_absorbed_the_annotation_guide(self):
-        # guide://annotations was folded in here: one handle, one guide.
-        content = _server.get_viewer_guide()
+    def test_the_viewer_doc_absorbed_the_annotation_guide(self):
+        # One handle, one doc.
+        content = _tool(_server.read_doc, "napari-viewer")
         assert "add_labels" in content
         assert "add_points" in content
-        assert not hasattr(_server, "get_annotations_guide")
 
 
 # -----------------------------------------------------------------------
@@ -332,33 +311,39 @@ class TestInstructions:
         # resource -- see also execute_code's docstring.
         assert 'format="pandas"' in base
         assert "source_url" in base
-        # Skills stay a separate fragment: the base guidance must not point the
-        # agent at list_skills, which returns nothing once the catalog is off.
-        assert "list_skills" not in base
-        # And the base alone is the handshake when skills are off.
-        _app.set_skills_enabled(False)
-        assert _app.mcp._mcp_server.instructions == base
+        # Authoring stays a separate fragment: the base guidance must not ask
+        # for a doc the agent cannot then write.
+        assert "write_doc" not in base
 
-    def test_module_default_mirrors_config_default(self):
-        # The launcher always sets this from config, but the module literal is a
-        # restated default -- pin it, since that is how it diverged once before.
-        from biopb_mcp._config import DEFAULT_CONFIG
+    def test_the_handshake_does_not_promise_a_napari_window(self):
+        """napari is one of two display surfaces and a session need not have it,
+        so the always-on guidance must not be written as though it does -- an
+        agent that believes there is a window reports a visual check nobody
+        could see."""
+        base = _app._BASE_INSTRUCTIONS
+        assert "server_status" in base
+        # The guardrail names the route that works either way.
+        assert "web-viewer" in base
+        # And does not make `viewer` the only place a result can go.
+        assert "Put intermediate results back on `viewer`" not in base
 
-        assert _app._skills_enabled is DEFAULT_CONFIG["services"]["skills_enabled"]
-
-    def test_skills_directive_gated_on_enable(self):
-        # Off: no list_skills mention in the handshake.
-        _app.set_skills_enabled(False)
-        assert "list_skills" not in _app.mcp._mcp_server.instructions
-        # On: the skills fragment is appended to the base guidance.
-        _app.set_skills_enabled(True)
+    def test_the_handshake_carries_the_index(self):
+        # Inlined rather than "now call read_doc('index')": every prompted hop
+        # loses agents (#894).
+        _app._recompose_instructions()
         instr = _app.mcp._mcp_server.instructions
         assert instr.startswith(_app._BASE_INSTRUCTIONS)
-        assert "list_skills" in instr
-        assert "skill://" in instr
-        # Back off: no stale fragment left behind.
-        _app.set_skills_enabled(False)
-        assert _app.mcp._mcp_server.instructions == _app._BASE_INSTRUCTIONS
+        assert _app._INDEX_HEADER in instr
+        assert "- kernel:" in instr
+        assert "write_doc" in instr.split(_app._INDEX_HEADER)[1]
+
+    def test_the_instructions_are_recomposed_per_session(self):
+        """A long-lived HTTP server outlives many sessions, and the index is a
+        file the agent edits, so composing once at launch would hand later
+        sessions an index that has moved."""
+        _app.mcp._mcp_server.instructions = "stale"
+        _app.mcp._mcp_server.create_initialization_options()
+        assert _app.mcp._mcp_server.instructions != "stale"
 
 
 # -----------------------------------------------------------------------
@@ -643,7 +628,7 @@ class TestExecuteCode:
 
     def test_docstring_carries_catalog_contract(self):
         # The tool description is always in the model's context, unlike the
-        # pull-only guide:// resources; the high-failure catalog facts must
+        # docs, which are read on demand; the high-failure catalog facts must
         # live here so the agent sees them at the point of action.
         doc = _server.execute_code.__doc__ or _server.execute_code.fn.__doc__
         assert "source_url" in doc
@@ -1319,6 +1304,9 @@ class TestStartKernel:
         assert "Kernel ready" in result  # still the success path
         assert ":2" in result
         assert "TELL THE USER" in result
+        # And names the surface that still works, so "no window" is a change of
+        # route rather than a dead end.
+        assert "web viewer" in result
 
     def test_virtual_display_is_not_reported_on_the_failure_path(
         self, server_with_host
@@ -1416,6 +1404,40 @@ class TestServerStatus:
         result = _tool(_server.server_status)
         assert "## Observe" in result
         assert "/api" in result
+
+    def test_reports_the_web_viewer_without_a_kernel(self, monkeypatch):
+        """The display surface that does not need this session to have one, so
+        it is reported like Observe: server-process state, no kernel needed."""
+        _app._kernel_host = None
+        result = _tool(_server.server_status)
+        assert "## Web viewer" in result
+        assert "/viewer?id=" in result
+        # Where the parameters live, rather than a copy of them here.
+        assert 'read_doc("web-viewer")' in result
+
+    def test_the_web_viewer_url_follows_a_moved_control(
+        self, server_with_host, monkeypatch
+    ):
+        """The port is configurable, so it is resolved per call rather than
+        written out -- a hard-coded 8813 is wrong on any moved control."""
+        monkeypatch.setattr(_server, "_viewer_base_url", lambda: "http://host:9999")
+        assert "http://host:9999/viewer?id=" in _tool(_server.server_status)
+
+    def test_the_web_viewer_is_reported_without_probing_the_control(
+        self, server_with_host, monkeypatch
+    ):
+        """server_status is called often, and the control serves this session's
+        data plane too -- so `## Tensor Server` already answers whether it is
+        up, and a round trip here would be latency for nothing."""
+        import urllib.request
+
+        def explode(
+            *a, **k
+        ):  # pragma: no cover - the assertion is that it is not called
+            raise AssertionError("server_status probed the control")
+
+        monkeypatch.setattr(urllib.request, "urlopen", explode)
+        assert "## Web viewer" in _tool(_server.server_status)
 
     def test_starting_kernel_skips_query(self, server_with_host):
         # Kernel still booting (launcher serves the handshake first): report the
@@ -1614,61 +1636,58 @@ class TestRun:
 
 
 # -----------------------------------------------------------------------
-# guide://data
+# the data doc
 # -----------------------------------------------------------------------
 
 
-class TestDataGuide:
-    """The data-representation guide, and the places that must point at it.
+class TestReadingPixels:
+    """Where a layer's pixels come from, and the doc that has to say so.
 
     Layer data here is a pyramid of proxies in display axis order, none of which
-    a napari-shaped habit expects -- so the guide has to be discoverable from the
-    handshake and from every guide whose examples touch pixels.
+    a napari-shaped habit expects. That story is `napari-viewer`'s; the server
+    half -- lazy, canonical order, what it costs -- is `tensor-server-client`'s.
     """
 
-    def test_registered_and_advertised_in_the_handshake(self):
-        import asyncio
+    def test_both_halves_are_listed_in_the_index_the_handshake_carries(self):
+        _app._recompose_instructions()
+        instr = _app.mcp._mcp_server.instructions
+        assert "- tensor-server-client:" in instr
+        assert "- napari-viewer:" in instr
 
-        uris = {str(r.uri) for r in asyncio.run(_app.mcp.list_resources())}
-        assert "guide://data" in uris
-        # Pull-only resources are read on demand, so the instructions are the
-        # only place the agent learns this one exists.
-        assert "guide://data" in _app._BASE_INSTRUCTIONS
+    def test_the_server_doc_names_what_a_tensor_arrives_as(self):
+        doc = _tool(_server.read_doc, "tensor-server-client")
+        assert "client.get_tensor" in doc
+        assert "Z, Y, X" in doc  # the canonical order the server guarantees
+        assert "lazy" in doc.lower()
 
-    def test_names_all_three_sources_of_array_data(self):
-        guide = _server._resources.DATA
-        assert "client.get_tensor" in guide  # the server
-        assert "layer.data" in guide  # the viewer
-        assert "multiscale" in guide  # ...which may be a list of levels
-
-    def test_pairs_each_scale_with_the_array_it_belongs_to(self):
-        # The two scale vectors sit on the same axes now, so crossing them no
-        # longer transposes anything -- but for interleaved colour layer.scale
-        # is one shorter, so the guide must still name both.
-        guide = _server._resources.DATA
-        assert "get_physical_scale" in guide
-        assert "layer.scale" in guide
-
-    def test_viewer_guide_reads_layer_data_the_safe_way(self):
+    def test_the_napari_doc_leads_with_the_accessor_not_the_attribute(self):
         # The layer-listing example is the snippet most likely to be copied, so
         # it must teach the accessor rather than the branch idiom
         # (biopb/biopb#974). `layer.data.shape` is fine and stays -- it reports
         # level 0 on either branch; what breaks is *indexing* `.data`, which is
         # what the old form of this test got backwards (biopb/biopb#973).
-        viewer_guide = _server._resources.VIEWER
-        assert "viewer.tensor(" in viewer_guide
-        assert "layer.data[0] if layer.multiscale" not in viewer_guide
+        doc = _tool(_server.read_doc, "napari-viewer")
+        assert "viewer.tensor(" in doc
+        assert "layer.data[0] if layer.multiscale" not in doc
+        # And it arrives before the layer operations that would tempt `.data`.
+        assert doc.index("viewer.tensor(") < doc.index("## Layers")
 
-    def test_data_guide_states_the_real_multiscale_failure(self):
+    def test_the_napari_doc_states_the_real_multiscale_failure(self):
         # biopb/biopb#973: the trap used to be "layer.data.shape raises", which
         # it does not. The failures that are real are silent ones -- np.asarray
-        # of a MultiScaleData returns the *lowest* level -- and a guide that
-        # names the wrong one sends the agent looking for an exception that
-        # never comes.
-        guide = _server._resources.DATA
-        assert "viewer.tensor(" in guide
-        assert "lowest" in guide
-        assert "layer.data.shape` raises" not in guide
+        # of a MultiScaleData returns the *lowest* level -- and a doc that names
+        # the wrong one sends the agent looking for an exception that never
+        # comes.
+        doc = _tool(_server.read_doc, "napari-viewer")
+        assert "lowest" in doc
+        assert "layer.data.shape` raises" not in doc
+
+    def test_the_napari_doc_pairs_each_scale_with_its_array(self):
+        # For interleaved colour layer.scale is one shorter than the array, so
+        # the doc has to name both rather than let them be crossed.
+        doc = _tool(_server.read_doc, "napari-viewer")
+        assert "layer.scale" in doc
+        assert "dim_labels" in doc
 
 
 class TestToolReturnShape:
@@ -1685,9 +1704,9 @@ class TestToolReturnShape:
     Which shape a tool yields is decided by its **return annotation**: an
     annotation FastMCP can build an output schema from gets the tuple, and one
     it cannot gets the bare list. That makes the split easy to change by
-    accident — retyping ``list_skills`` from ``list`` to ``list[dict]`` would
-    silently move it, and reshape what an in-process caller receives without
-    touching a line of that caller. It is also the wire contract: the same
+    accident — retyping a tool from ``str`` to ``list[dict]`` would silently
+    move it, and reshape what an in-process caller receives without touching a
+    line of that caller. It is also the wire contract: the same
     annotation decides whether an ``outputSchema`` is advertised to real MCP
     clients on ``tools/list``.
 
@@ -1698,7 +1717,8 @@ class TestToolReturnShape:
 
     #: (tool, minimal kwargs, declares an outputSchema / returns the tuple)
     SHAPES = [
-        ("list_skills", {}, False),
+        ("read_doc", {"id": "index"}, True),
+        ("write_doc", {"id": "x", "body": "# x\n"}, True),
         ("take_screenshot", {}, False),
         ("execute_code", {"python_code": "1"}, True),
         ("verify_workflow", {"document": "```python\n1\n```"}, True),

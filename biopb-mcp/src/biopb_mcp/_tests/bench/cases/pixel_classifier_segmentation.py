@@ -80,7 +80,7 @@ cold Haiku runs all read the shift as biology ("different cellular density",
 the fourth had lost half its answer. The Sonnet arms did not — they read the
 level shift straight off the histograms, which is the finding that deferred this.
 
-**There is a back door and it should be named** (`skills.md` §10). Per-field
+**There is a back door and it should be named** (`_tests/bench/README.md`). Per-field
 min-max normalisation defends against this shift without anyone asking, and
 three of the four Haiku arms reached for it reflexively (scoring 0.000-0.080 on
 `second_field_collapse` while the fourth scored 0.474). So a green
@@ -99,7 +99,7 @@ which is the failure this skill exists to prevent and the one all four Haiku arm
 hit.
 
 The reference implementation these tolerances come from is in the pull request
-that added this case, per `biopb-mcp/docs/skills.md` §11b.
+that added this case, per `_tests/bench/README.md`.
 """
 
 from __future__ import annotations

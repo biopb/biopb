@@ -1,6 +1,6 @@
 """The engine: one configuration, N samples, outcome classification, the report.
 
-`biopb-mcp/docs/skills.md` §10. Nothing here knows what drift is, or what a
+`_tests/bench/README.md`. Nothing here knows what drift is, or what a
 landmark is. A case's whole contribution is one :class:`~._case.Case` — a task
 prompt, a persona, a fixture spec, a verifier, and the names it wants back out
 of the kernel — and this module runs the corners, classifies what happened, and
@@ -22,7 +22,7 @@ now:
 =====================  =========================  ====================  =========================
                        `--bench-responder=model`  `=silent`             `=briefed`
 =====================  =========================  ====================  =========================
-`--bench-skills=true`  does the whole thing work  does *asking* matter  what the asking cost
+`--bench-docs=true`  does the whole thing work  does *asking* matter  what the asking cost
 `=false`               does the *skill* matter    the floor             the fact without the skill
 =====================  =========================  ====================  =========================
 
@@ -56,6 +56,7 @@ it is made in `test_bench.py`; here a run that cannot happen is a
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
@@ -97,7 +98,11 @@ from ..agentbench._respondent import (
     SilentRespondent,
     model_respondent,
 )
-from ..agentbench._session import SessionUnavailable, live_session
+from ..agentbench._session import (
+    PROCEDURES_HEADING,
+    SessionUnavailable,
+    live_session,
+)
 from ._case import BLOCKING_BUDGET, LAYER_KINDS, TENSOR_HANDLE, Case
 from ._options import RESPONDER, Options
 
@@ -137,7 +142,7 @@ FLAG_UNANSWERED = "asked-but-unanswered"
 #: it was talking in circles — usually because the respondent could not end it.
 FLAG_STALLED = "stalled"
 #: The kernel read something the harness owns — a case's `truth`, or the skill
-#: markdown a `--bench-skills=false` run is meant to lack. Unlike every other
+#: markdown a `--bench-docs=false` run is meant to lack. Unlike every other
 #: flag here, this says the *number* is void rather than qualified: a run that
 #: read its own answer key measured nothing, and no amount of context makes its
 #: row comparable. `execute_code` is arbitrary Python and always will be, so the
@@ -227,9 +232,9 @@ class Result:
     #: 1-based. Part of the artifact path, so two samples never overwrite each
     #: other's transcript.
     sample: int = 1
-    #: Whether this run's session offered the catalog — `--bench-skills`, copied
+    #: Whether this run's session offered the catalog — `--bench-docs`, copied
     #: onto the result so a row can be read without its session file.
-    skills_offered: bool = True
+    docs_offered: bool = True
     #: Who answered this run — `--bench-responder`, copied onto the result for
     #: the same reason, and read by :meth:`flags`: whether asking nothing is an
     #: observation about the agent or the configuration working as asked depends
@@ -237,11 +242,11 @@ class Result:
     responder: str = RESPONDER.default
     trace: object = None
     outcome: Outcome | None = None
-    #: Which skills the catalog offered this run, read at bring-up. Ids rather
+    #: Which procedure docs this run was offered, read at bring-up. Ids rather
     #: than a count, because for a case with no ablation this is *provenance*:
-    #: a task that later gains a covering skill silently re-bases its own
-    #: number, and a run that does not say which catalog it saw cannot be
-    #: compared with one from another release.
+    #: a task that later gains a covering doc silently re-bases its own number,
+    #: and a run that does not say which docs it saw cannot be compared with one
+    #: from another release.
     catalog: tuple[str, ...] = ()
     #: Wall-clock for this sample, including bring-up and teardown. Reported so
     #: the cost of a case is legible from its own report rather than remembered.
@@ -337,7 +342,7 @@ class Result:
             out.append(FLAG_CUT_OFF)
         if self.trace.stopped == STALLED:
             out.append(FLAG_STALLED)
-        if self.catalog == CATALOG_UNREAD or bool(self.catalog) != self.skills_offered:
+        if self.catalog == CATALOG_UNREAD or bool(self.catalog) != self.docs_offered:
             out.append(FLAG_CATALOG_MISMATCH)
         return out
 
@@ -345,7 +350,7 @@ class Result:
         outcome, reason = self.classify()
         return {
             "sample": self.sample,
-            "skills_offered": self.skills_offered,
+            "docs_offered": self.docs_offered,
             "outcome": outcome,
             "reason": reason,
             "flags": self.flags(budget),
@@ -512,80 +517,60 @@ def where_for(case: Case) -> Path:
     return session_dir() / case.namespace / case.case_id
 
 
-def catalog_ids(text: str) -> tuple[str, ...]:
-    """Which skills `list_skills` returned, from the text an agent sees.
+_INDEX_ENTRY = re.compile(r"\A\s*[-*]\s+([A-Za-z0-9_][A-Za-z0-9._/-]*)\s*:")
 
-    Parsed rather than pattern-counted: whether the ablation took effect is the
-    one thing that would silently make a whole table meaningless, so it must not
-    rest on a substring surviving a formatting change. Text this cannot parse
-    counts as *something*, never as nothing — an unreadable answer is not
-    evidence that the catalog was withheld, and reading it as one would turn a
-    broken ablation into a clean-looking table.
+
+def index_entry_ids(text: str) -> tuple[str, ...]:
+    """The doc ids a rendered index lists, in order.
+
+    One line shape, the one the store itself recognises. An index this finds
+    nothing in, from text that is not empty, counts as `("<unparseable>",)` --
+    an unreadable answer is not evidence that the docs were withheld, and
+    reading it as one would turn a broken ablation into a clean-looking table.
     """
-    values = _json_values(text)
-    if values is None:
-        return ("<unparseable>",) if text.strip() else ()
-    entries: list = []
-    for parsed in values:
-        if isinstance(parsed, dict) and not (parsed.get("id") or parsed.get("name")):
-            # A wrapper: a list return can reach a client inside structured
-            # content, and the entries are the only list in it. Checked *after*
-            # the identifying keys, because a lone skill is itself a dict with
-            # a list in it — `tags` — and reading that as the entries reported
-            # a skill's tags as if they were the catalog.
-            parsed = next((v for v in parsed.values() if isinstance(v, list)), parsed)
-        entries.extend(parsed if isinstance(parsed, list) else [parsed])
-    if not entries:
-        return ()
-    return tuple(
-        str(e.get("id") or e.get("name") or "?") if isinstance(e, dict) else str(e)
-        for e in entries
+    ids = tuple(
+        match.group(1)
+        for match in (_INDEX_ENTRY.match(line) for line in text.splitlines())
+        if match
     )
-
-
-def _json_values(text: str) -> list | None:
-    """Every JSON value in *text*, or `None` if it is not JSON at all.
-
-    A stream, not one document. The tool answers with one content block per
-    skill and a client joins them, so two matches arrive as `{...}{...}` —
-    which `json.loads` rejects, and which the old parser therefore filed as
-    unreadable. It counted as *something*, so the check stayed green while the
-    provenance line said `<unparseable>` on more than half the catalogue.
-    """
-    decoder = json.JSONDecoder()
-    values: list = []
-    index, end = 0, len(text)
-    while index < end:
-        while index < end and text[index].isspace():
-            index += 1
-        if index >= end:
-            break
-        try:
-            value, index = decoder.raw_decode(text, index)
-        except ValueError:
-            return None
-        values.append(value)
-    return values
+    if ids:
+        return ids
+    return ("<unparseable>",) if text.strip() else ()
 
 
 def read_catalog(session) -> tuple[str, ...]:
-    """What the catalog offered this run. Best-effort; never fails a run.
+    """Which procedure docs this run's session actually served. Best-effort.
 
-    **Probed with no query, which asks for the whole catalog.** The question is
-    whether the catalog was there at all — `test_the_catalog_matched_the_switch`
-    never names an entry, because this package cannot know which skills ship —
-    and a *filtered* probe answers a narrower one it then has to get right. It
-    used to pass a per-case query, and when the case stopped naming a skill the
-    attribute went with it, leaving this raising `AttributeError` on every run.
+    Read rather than assumed, because whether the ablation took effect is the
+    one thing that would silently make a whole table meaningless. It is read off
+    the index the agent sees: the entries under the seed's procedures heading
+    are what is offered, since the store classifies nothing and the heading is
+    the only classification there is. Under `--bench-docs=false` those entries
+    are on the `ignored:` line instead, so this comes back empty while the
+    reference docs are still listed -- which is the ablation the switch is
+    supposed to perform.
+
+    No doc id appears here, because this package cannot know which docs ship.
+    One heading does, and the seed gate pins it.
 
     A failure returns :data:`CATALOG_UNREAD`, which is neither a catalog nor an
     empty one. The distinction is load-bearing: the sentinel used to be an
-    ordinary non-empty tuple, so a skills-*on* run whose probe had crashed
+    ordinary non-empty tuple, so a docs-*on* run whose probe had crashed
     satisfied "the catalog was non-empty" and the switch check passed having
-    verified nothing — the exact hole #738 was written to close.
+    verified nothing -- the exact hole #738 was written to close.
     """
     try:
-        return catalog_ids(session.call("list_skills").text)
+        text = session.call("read_doc", id="index").text
+        if index_entry_ids(text) == ("<unparseable>",):
+            return CATALOG_UNREAD
+        offered = []
+        under = False
+        for line in text.splitlines():
+            if line.startswith("#"):
+                under = line.strip() == f"## {PROCEDURES_HEADING}"
+            elif under and (match := _INDEX_ENTRY.match(line)):
+                offered.append(match.group(1))
+        return tuple(offered)
     except Exception:  # noqa: BLE001 -- provenance is best-effort, the run is not
         return CATALOG_UNREAD
 
@@ -694,17 +679,17 @@ def run_one(
     ids = {} if ids is None else ids
     plane = _plane.running_plane() if ids else None
     result = Result(
-        sample=sample, skills_offered=options.skills, responder=options.responder
+        sample=sample, docs_offered=options.docs, responder=options.responder
     )
     where = where_for(case) / result.name
     with live_session(
-        skills_enabled=options.skills,
+        docs_enabled=options.docs,
         plugins=case.plugins,
         tensor_url=plane.url if plane is not None else "",
     ) as session:
-        # Read here rather than inferred from behaviour: the agent may well call
-        # `list_skills` under `--bench-skills=false` and simply get nothing back,
-        # and `load_catalog()` is what gates, not whether the tool was registered.
+        # Read here rather than inferred from behaviour: `read_doc` stays
+        # registered under `--bench-docs=false`, so what the agent was offered
+        # is a property of the index it was handed, not of the tool list.
         result.catalog = read_catalog(session)
         load_fixture(session, case, fixture, ids)
         trace = converse(
@@ -799,14 +784,14 @@ def run_case(case: Case, options: Options | None = None) -> Run:
         except SessionUnavailable as exc:
             result = Result(
                 sample=sample,
-                skills_offered=options.skills,
+                docs_offered=options.docs,
                 responder=options.responder,
                 error=f"{NO_SESSION}{exc}",
             )
         except Exception as exc:  # noqa: BLE001 - the row is the point
             result = Result(
                 sample=sample,
-                skills_offered=options.skills,
+                docs_offered=options.docs,
                 responder=options.responder,
                 error=f"{type(exc).__name__}: {exc}",
             )
@@ -903,7 +888,7 @@ def write_summary(run: Run) -> str:
         f"{fixture.about or 'no description'}  ",
         f"Provenance: {fixture.provenance}  ",
         f"Options: `{run.options.describe()}`  ",
-        f"Skills the catalog offered: {catalog_line(results)}  ",
+        f"Procedure docs offered: {catalog_line(results)}  ",
         f"Tolerances: {tolerances}",
         "",
     ]
@@ -959,7 +944,7 @@ def write_summary(run: Run) -> str:
         # `session.json` rather than in a column.
         "- **This report is one configuration.** A delta — what the catalog was",
         "  worth, or the cost of the withheld fact — is this session against",
-        "  another run with a different `--bench-skills` or `--bench-responder`.",
+        "  another run with a different `--bench-docs` or `--bench-responder`.",
         f"  `{session_id()}` and its `session.json` are what make the pair",
         "  comparable.",
     ]

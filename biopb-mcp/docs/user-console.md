@@ -234,7 +234,7 @@ is cheap, honest, and enough.
 
 Two supporting pieces:
 
-- **`guide://kernel` gains a paragraph**: you are not the only writer of this namespace; a
+- **the `kernel` doc gains a paragraph**: you are not the only writer of this namespace; a
   human may run cells from the observe page; on seeing that note, re-verify with `dir()` /
   `viewer.layers` rather than trusting cached state.
 - **Retention**: `_MAX_RETAINED_JOBS = 32` (`_jobs.py:51`) could evict a user job before
@@ -261,7 +261,7 @@ Two supporting pieces:
 Naturally three stacked PRs against `dev`, the control gate reviewable on its own:
 
 1. **`_jobs.py` + `_server.py`** — `origin`, `foreign_digest`, the busy-message branch, the
-   `interrupt_kernel` refusal, the `guide://kernel` paragraph. **Done.**
+   `interrupt_kernel` refusal, the `kernel` doc's paragraph. **Done.**
 2. **`_control.py`** — the `console` root, `host_is_public_bind` gate via
    `serve_control_api`, proxy tests for the public-bind refusal and the traversal cases
    already covered for `api`. **Done.**

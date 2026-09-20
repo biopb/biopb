@@ -12,7 +12,7 @@ hardcoded names; now they are read off whatever the verifier reported, because a
 curated fixture and a synthetic one for the same subject support different
 measurements and the table has to follow.
 
-The run options get the same treatment for the same reason: `--bench-skills`
+The run options get the same treatment for the same reason: `--bench-docs`
 and `--bench-fixtures` decide what an invocation spends *and what its number
 means*, and a switch that silently did not take effect is indistinguishable
 from one that did until two sessions are compared.
@@ -38,6 +38,7 @@ from ..agentbench._conversation import (
     TURN_CAP,
 )
 from ..agentbench._fixture import Attempt, Fixture, Metric, Outcome
+from ..agentbench._session import PROCEDURES_HEADING, ablated_index
 from . import _engine, conftest
 from ._engine import (
     CATALOG_UNREAD,
@@ -57,7 +58,7 @@ from ._engine import (
     WRONG_ANSWER,
     Result,
     Run,
-    catalog_ids,
+    index_entry_ids,
     models_in_play,
     read_catalog,
     respondent_for,
@@ -69,11 +70,11 @@ from ._engine import (
     write_session,
 )
 from ._options import (
+    DOCS,
     FIXTURES,
     RESPONDER,
     SAMPLES_DEST,
     SAMPLES_ENV,
-    SKILLS,
     BadOption,
     Options,
     Setting,
@@ -123,10 +124,10 @@ def scored(value: float, limit: float = 1.0) -> Outcome:
     return outcome(Metric("err_px", value, limit), arrays={"corrected": object()})
 
 
-def result(sample: int = 1, skills: bool = True, **kwargs) -> Result:
+def result(sample: int = 1, docs: bool = True, **kwargs) -> Result:
     kwargs.setdefault("trace", FakeTrace())
-    kwargs.setdefault("catalog", ("a-skill",) if skills else ())
-    return Result(sample=sample, skills_offered=skills, **kwargs)
+    kwargs.setdefault("catalog", ("a-doc",) if docs else ())
+    return Result(sample=sample, docs_offered=docs, **kwargs)
 
 
 # --- the run options -------------------------------------------------------
@@ -147,7 +148,7 @@ def clean_env(monkeypatch):
     """No `BIOPB_BENCH_*` from the developer's shell. There is deliberately no
     dotenv behind these — a file somebody forgot about should not decide what a
     run spends — so clearing the environment is the whole isolation."""
-    for setting in (FIXTURES, SKILLS, RESPONDER):
+    for setting in (FIXTURES, DOCS, RESPONDER):
         monkeypatch.delenv(setting.env, raising=False)
     monkeypatch.delenv(SAMPLES_ENV, raising=False)
     return monkeypatch
@@ -156,7 +157,7 @@ def clean_env(monkeypatch):
 def test_the_defaults_run_everything_once_in_the_shipped_configuration(clean_env):
     chosen = resolve(FakeConfig())
     assert chosen.fixtures == "all"
-    assert chosen.skills is True and chosen.responder == "model"
+    assert chosen.docs is True and chosen.responder == "model"
     assert chosen.samples == 1
     assert not chosen.filtered
 
@@ -227,7 +228,7 @@ def test_a_filter_says_it_is_a_filter(clean_env):
     # The switches and the sample count change what a run measures and how
     # deep it goes, not how much of the catalogue it covers, and all three are
     # already named in the report's own header and in `session.json`.
-    assert not Options(skills=False, responder="silent", samples=4).filtered
+    assert not Options(docs=False, responder="silent", samples=4).filtered
 
 
 def test_the_option_line_names_every_option(clean_env):
@@ -236,7 +237,7 @@ def test_the_option_line_names_every_option(clean_env):
     line = Options(fixtures="curated", samples=2).describe()
     for token in (
         "fixtures=curated",
-        "skills=true",
+        "docs=true",
         "responder=model",
         "samples=2",
     ):
@@ -272,19 +273,19 @@ def test_the_switches_are_what_a_session_is(clean_env):
     no per-case arm set any more: what a run does no longer depends on what
     kind of case it is looking at."""
     default = resolve(FakeConfig())
-    assert default.configuration == "skills=on responder=model"
+    assert default.configuration == "docs=on responder=model"
 
-    ablated = resolve(FakeConfig(**{SKILLS.dest: "false", RESPONDER.dest: "silent"}))
-    assert ablated.skills is False
-    assert ablated.configuration == "skills=off responder=silent"
+    ablated = resolve(FakeConfig(**{DOCS.dest: "false", RESPONDER.dest: "silent"}))
+    assert ablated.docs is False
+    assert ablated.configuration == "docs=off responder=silent"
 
 
-def test_the_skills_switch_is_a_bool_and_not_the_string_false(clean_env):
-    """`--bench-skills=false` arrives from argparse as a string, and a string
-    is truthy. It reaches `live_session(skills_enabled=...)`, so getting this
+def test_the_docs_switch_is_a_bool_and_not_the_string_false(clean_env):
+    """`--bench-docs=false` arrives from argparse as a string, and a string
+    is truthy. It reaches `live_session(docs_enabled=...)`, so getting this
     wrong runs the un-ablated session and reports it as the ablation."""
-    assert resolve(FakeConfig(**{SKILLS.dest: "false"})).skills is False
-    assert resolve(FakeConfig(**{SKILLS.dest: "true"})).skills is True
+    assert resolve(FakeConfig(**{DOCS.dest: "false"})).docs is False
+    assert resolve(FakeConfig(**{DOCS.dest: "true"})).docs is True
 
 
 def test_the_responder_switch_reaches_the_dispatch(monkeypatch):
@@ -579,11 +580,11 @@ def test_the_catalog_flag_fires_in_both_directions():
     """The switch reading wrong either way is the failure that makes a whole
     report meaningless, so it is noticed on the row as well as asserted."""
     withheld_but_present = result(
-        skills=False, outcome=scored(0.1), catalog=("a", "b", "c")
+        docs=False, outcome=scored(0.1), catalog=("a", "b", "c")
     )
     assert FLAG_CATALOG_MISMATCH in withheld_but_present.flags()
 
-    offered_but_absent = result(skills=True, outcome=scored(0.1), catalog=())
+    offered_but_absent = result(docs=True, outcome=scored(0.1), catalog=())
     assert FLAG_CATALOG_MISMATCH in offered_but_absent.flags()
 
 
@@ -591,37 +592,51 @@ def test_a_failed_catalog_probe_is_a_mismatch_and_not_a_catalog():
     """The sentinel must not read as "the catalog was there".
 
     It did, once: a non-empty placeholder satisfied `bool(catalog)`, so a
-    skills-on run whose probe had crashed passed the switch check having
+    docs-on run whose probe had crashed passed the switch check having
     verified nothing. Both directions are asserted because the sentinel is
     wrong under either switch — it is the absence of a reading, not a reading.
     """
     assert CATALOG_UNREAD, "the sentinel is deliberately truthy; test the identity"
-    offered = result(skills=True, outcome=scored(0.1), catalog=CATALOG_UNREAD)
+    offered = result(docs=True, outcome=scored(0.1), catalog=CATALOG_UNREAD)
     assert FLAG_CATALOG_MISMATCH in offered.flags()
 
-    withheld = result(skills=False, outcome=scored(0.1), catalog=CATALOG_UNREAD)
+    withheld = result(docs=False, outcome=scored(0.1), catalog=CATALOG_UNREAD)
     assert FLAG_CATALOG_MISMATCH in withheld.flags()
 
 
-def test_the_catalog_probe_asks_for_the_whole_catalog(monkeypatch):
-    """The probe must not depend on anything a `Case` carries.
+def test_the_catalog_probe_reads_the_index_and_keeps_the_procedures():
+    """The probe must not depend on anything a `Case` carries, and must not
+    name a doc id -- this package cannot know which docs ship.
 
-    This is the regression that shipped: the probe passed a per-case query, the
-    case stopped naming a skill, and `read_catalog` raised `AttributeError` on
-    every run for a whole session — invisibly, because the sentinel it fell back
-    to was truthy and the switch check accepted it.
+    It reads the index the agent sees and keeps the entries under the seed's
+    procedures heading, so the reference docs that survive the ablation do not
+    read as a catalog. One read: the store classifies nothing, so there is
+    nothing to ask each entry.
     """
+    index = (
+        "# docs\n\n## References\n\n- kernel: hook\n\n"
+        f"## {PROCEDURES_HEADING}\n\n- flatfield: hook\n\n## Writing\n\n- authoring: hook\n"
+    )
     calls: list = []
 
     class FakeSession:
         def call(self, tool, **kwargs):
             calls.append((tool, kwargs))
-            return SimpleNamespace(text=json.dumps([{"id": "flatfield"}]))
+            return SimpleNamespace(text=index)
 
     assert read_catalog(FakeSession()) == ("flatfield",)
-    assert calls == [("list_skills", {})], (
-        "the probe filtered the catalog; it asks whether one was offered at all"
-    )
+    assert calls == [("read_doc", {"id": "index"})]
+    # The ablated index: the same file with that section's entries on
+    # `ignored:`, which is what `--bench-docs=false` writes.
+    ablated = ablated_index(index)
+    assert "ignored: flatfield" in ablated
+    assert "- flatfield:" not in ablated and "- kernel: hook" in ablated
+
+    class Ablated:
+        def call(self, tool, **kwargs):
+            return SimpleNamespace(text=ablated)
+
+    assert read_catalog(Ablated()) == ()
 
 
 def test_a_probe_that_raises_reports_that_it_did_not_look():
@@ -691,44 +706,28 @@ def test_a_failed_bring_up_leaves_the_process_environment_as_it_found_it(
     assert _session.ENV_GUARD_LOG not in os.environ
 
 
-def test_the_catalog_is_read_from_what_the_tool_returned():
-    """Whether `--bench-skills` took effect rests on this, so it is parsed
-    rather than pattern-counted — and an empty catalog and an unreadable one
-    are not the same claim. Ids rather than a count, because the list itself is
-    the provenance a later release is compared against."""
-    assert catalog_ids(json.dumps([{"id": "a"}, {"id": "b"}])) == ("a", "b")
-    assert catalog_ids("[]") == ()
-    assert catalog_ids("") == ()
-    # A list return can reach a client wrapped in structured content.
-    assert catalog_ids(json.dumps({"result": [{"id": "a"}]})) == ("a",)
-    assert catalog_ids(json.dumps({"result": []})) == ()
-    # Not JSON at all: whatever this is, it is not evidence that the catalog was
-    # withheld — and reading it as such would turn a switch that never took
+def test_the_index_is_parsed_by_its_own_line_shape():
+    """Whether `--bench-docs` took effect rests on this, so it is parsed rather
+    than pattern-counted — and an empty index and an unreadable one are not the
+    same claim. Ids rather than a count, because the list itself is the
+    provenance a later release is compared against."""
+    assert index_entry_ids("# docs\n\n- a: hook\n- b: hook\n") == ("a", "b")
+    assert index_entry_ids("") == ()
+    # Prose and headings are not entries.
+    assert index_entry_ids("# docs\n\nSome prose.\n\n## Heading\n") == (
+        "<unparseable>",
+    )
+    # Not an index at all: whatever this is, it is not evidence that the docs
+    # were withheld — and reading it as such would turn a switch that never took
     # effect into a clean-looking report.
-    assert catalog_ids("1 skill: drift-correction") == ("<unparseable>",)
+    assert index_entry_ids("1 doc: drift-correction") == ("<unparseable>",)
 
 
-def test_the_catalog_reads_the_two_shapes_the_tool_actually_returns():
-    """The shapes that reached it in practice, both of which it got wrong.
-
-    The tool answers with one content block per skill and the client joins
-    them, so the text is a *stream* of JSON values rather than one document —
-    `{...}{...}` for two matches, which `json.loads` rejects. Filed as
-    unreadable, it still counted as "something", so the switch check stayed
-    green while the provenance line said `<unparseable>` for most of the
-    catalogue.
-
-    A lone match is worse, because it parses. One skill is a dict whose only
-    list is `tags`, and hunting for the entries by type reported *those* as the
-    catalog — every "Skills the catalog offered" line ever written was a tag
-    list. The identifying keys are checked first for exactly that reason.
-    """
-    one = json.dumps({"id": "flatfield", "tags": ["illumination", "correction"]})
-    two = json.dumps({"id": "stitch-tiles", "tags": ["mosaic"]})
-
-    assert catalog_ids(one) == ("flatfield",)
-    assert catalog_ids(one + two) == ("flatfield", "stitch-tiles")
-    assert catalog_ids(f"{one}\n{two}") == ("flatfield", "stitch-tiles")
+def test_the_render_suffixes_do_not_change_the_id():
+    """`render_index` appends `(missing)` / `(local copy)` to an entry, and the
+    probe reads the rendered text, so the id has to survive them."""
+    rendered = "- flatfield: hook (local copy)\n- gone: hook (missing)\n"
+    assert index_entry_ids(rendered) == ("flatfield", "gone")
 
 
 # --- the report ------------------------------------------------------------
@@ -851,9 +850,9 @@ def test_the_report_states_the_configuration_it_ran_under(report):
     invocation, a reader who cannot see the switches cannot tell an ablation
     from the shipped thing — and the two reports look identical otherwise."""
     text, data, _ = report
-    assert "Configuration: **skills=on responder=model**" in text
-    assert data["configuration"] == "skills=on responder=model"
-    assert data["options"]["skills"] is True
+    assert "Configuration: **docs=on responder=model**" in text
+    assert data["configuration"] == "docs=on responder=model"
+    assert data["options"]["docs"] is True
     assert data["options"]["responder"] == "model"
 
 
@@ -893,11 +892,11 @@ def test_an_ablated_report_says_so_in_its_own_header(tmp_path, monkeypatch):
     text = Run(
         case=SKILL_CASE,
         fixture=FIXTURE,
-        options=Options(skills=False),
-        results=[result(skills=False, outcome=scored(4.0))],
+        options=Options(docs=False),
+        results=[result(docs=False, outcome=scored(4.0))],
     ).summary()
 
-    assert "Configuration: **skills=off responder=model**" in text
+    assert "Configuration: **docs=off responder=model**" in text
     assert "none offered" in text
 
 
@@ -905,8 +904,8 @@ def test_the_report_records_which_catalog_the_samples_saw(report):
     """What stops a number being compared across releases that offered
     different catalogs, and what says the switch took effect."""
     text, data, _ = report
-    assert "Skills the catalog offered" in text
-    assert data["samples"][0]["catalog"] == ["a-skill"]
+    assert "Procedure docs offered" in text
+    assert data["samples"][0]["catalog"] == ["a-doc"]
 
 
 def test_the_report_points_at_the_other_session_for_a_delta(report):
@@ -914,7 +913,7 @@ def test_the_report_points_at_the_other_session_for_a_delta(report):
     other half is, or a reader will take one table for the whole finding."""
     text, _, _ = report
     assert "This report is one configuration" in text
-    assert "--bench-skills" in text
+    assert "--bench-docs" in text
 
 
 def test_the_report_lands_under_its_own_case_inside_the_session(report):
@@ -959,19 +958,19 @@ def test_the_session_file_records_the_configuration(tmp_path, monkeypatch):
     run = Run(
         case=SKILL_CASE,
         fixture=FIXTURE,
-        options=Options(skills=False, responder="silent", samples=2),
-        results=[result(sample=n, skills=False, outcome=scored(0.1)) for n in (1, 2)],
+        options=Options(docs=False, responder="silent", samples=2),
+        results=[result(sample=n, docs=False, outcome=scored(0.1)) for n in (1, 2)],
     )
     data = json.loads(write_session(run).read_text())
 
     assert data["session"] == session_id()
     assert data["options"] == {
         "fixtures": "all",
-        "skills": False,
+        "docs": False,
         "responder": "silent",
         "samples": 2,
     }
-    assert data["configuration"] == "skills=off responder=silent"
+    assert data["configuration"] == "docs=off responder=silent"
     # The respondent is what actually answered, not what the provider table
     # would have supplied: a `silent` session never asked it for anything.
     assert data["respondent"] == "silent"
@@ -998,7 +997,7 @@ def test_the_session_file_names_a_briefed_run_by_its_switch(tmp_path, monkeypatc
     )
 
     assert data["respondent"] == "briefed"
-    assert data["configuration"] == "skills=on responder=briefed"
+    assert data["configuration"] == "docs=on responder=briefed"
 
 
 def test_the_session_file_says_which_code_produced_it(tmp_path, monkeypatch):

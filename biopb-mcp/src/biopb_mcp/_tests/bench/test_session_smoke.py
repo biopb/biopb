@@ -62,13 +62,14 @@ def bench_case(request):
     return request.param
 
 
-def test_the_nine_tools_are_there_with_their_schemas(session):
+def test_the_tool_surface_is_there_with_its_schemas(session):
     """What the agent is handed is the server's own advertisement — the point
     of driving real MCP rather than a stand-in. If this ever shrinks, an agent
-    lost a capability the skill bodies assume."""
+    lost a capability the docs assume."""
     names = {t.name for t in session.tools}
     assert names == {
-        "list_skills",
+        "read_doc",
+        "write_doc",
         "start_kernel",
         "take_screenshot",
         "execute_code",
@@ -90,85 +91,62 @@ def test_the_server_instructions_reach_the_client(session):
     and it is the field a generic mcp-proxy drops -- which is why the shim
     vendors its own bridge. A run that never saw it is not the real thing."""
     assert len(session.instructions) > 500, session.instructions[:200]
-    assert "list_skills" in session.instructions
+    # The index rides in the handshake, so what it lists is in context from the
+    # first turn rather than one prompted hop away.
+    assert "read_doc" in session.instructions
+    assert "- drift-correction:" in session.instructions
 
 
-def test_the_skill_body_comes_from_the_shipped_catalog(session):
+def test_the_doc_body_comes_from_the_shipped_store(session):
     """The property that makes this layer worth its cost. This reads
-    `drift-correction` through the same `_skills.py` the runtime uses, so
-    deleting or editing the file changes what a run is scored against — which is
-    exactly what a hand-transcribed procedure could never do."""
-    found = session.call("list_skills", keywords=["stage drift"])
-    assert "drift-correction" in found.text, found.text[:400]
+    `drift-correction` through the same `_docs.py` the runtime uses, so deleting
+    or editing the file changes what a run is scored against — which is exactly
+    what a hand-transcribed procedure could never do.
 
-    body = session.read_resource("skill://drift-correction")
+    Through `call`, the same door the model uses: the store is ordinary tools
+    now, so there is no second accessor that could disagree with it.
+    """
+    body = session.call("read_doc", id="drift-correction").text
     assert 'reference="previous"' in body, "step 3 is missing from the body"
     assert "REF_CHANNEL" in body, "step 2's parameter is missing from the body"
     assert len(body) > 4000, f"body is only {len(body)} chars"
 
 
-def test_the_agent_can_reach_a_skill_body_and_not_only_the_harness(session):
-    """The gap the test above cannot see, because it uses the harness's own
-    accessor.
-
-    `read_resource` is a method on `LiveSession`; for a long time it was *only*
-    that. The agent is driven over chat-completions and is handed `tools`, so a
-    resource — which is not a tool — had no verb behind it. `list_skills`
-    returned a `uri` and the handshake said to read it, and nothing could.
-
-    Measured consequence: a `skill+silent` arm that used `pystackreg` purely
-    because `checklist:` named it, having never read the procedure. So this
-    asserts the body arrives through `call`, the same door the model uses.
-    """
-    names = {t.name for t in session.agent_tools}
-    assert {"read_resource", "list_resources"} <= names, sorted(names)
-    assert {t.name for t in session.tools} < names, (
-        "agent_tools must extend the server's advertisement, not replace it"
-    )
-
-    found = session.call("list_skills", keywords=["stage drift"])
-    uri = next(
-        part.strip('", ')
-        for part in found.text.split()
-        if part.strip('", ').startswith("skill://")
-    )
-    body = session.call("read_resource", uri=uri)
-    assert not body.is_error, body.text
-    assert 'reference="previous"' in body.text, (
-        "the agent reached the resource but not the procedure inside it"
-    )
-
-
-def test_a_uri_that_does_not_resolve_is_an_error_result_not_a_crash(session):
-    """An agent has to be able to read a bad uri and try something else. Raising
+def test_an_id_that_does_not_resolve_is_a_result_not_a_crash(session):
+    """An agent has to be able to read a bad id and try something else. Raising
     out of `call` would end the run instead."""
-    out = session.call("read_resource", uri="")
-    assert out.is_error and "uri" in out.text
-
-    unknown = session.call("read_resource", uri="skill://no-such-skill")
-    assert "no-such-skill" in unknown.text or "catalog" in unknown.text.lower()
+    out = session.call("read_doc", id="no-such-doc")
+    assert "no-such-doc" in out.text
 
 
-def test_the_ablation_survives_the_new_verb():
-    """The one way this change could quietly void the benchmark.
+def test_the_ablation_keeps_procedures_out_of_the_handshake_and_the_tail():
+    """The one way the switch could quietly void the benchmark.
 
-    `noskill` withholds the catalog, not the filesystem. If `read_resource`
-    reached the body around `load_catalog()`, an ablated arm could read
-    `skill://<id>` straight back and the 2x2 would be measuring nothing. It does
-    not, and it is the server's own gate rather than one the harness re-states —
-    but the cost of that being wrong is every skill number in the layer, so it
-    is worth a session of its own.
+    `--bench-docs=false` is an index, not a switch in the store: the seed with
+    its procedures on the `ignored:` line. Two things have to hold for the 2x2
+    to measure anything. The handshake the ablated arm is handed names no
+    procedure, and the *New shipped docs* tail does not put them back -- the
+    tail is what would resurface a merely deleted line. What is *not* gated is
+    `read_doc` of an id the agent already knows; the handshake is the only place
+    it could learn one, so that door is checked shut here too.
     """
     if reason := _session.why_unavailable():
         pytest.skip(reason)
     try:
-        with live_session(skills_enabled=False) as live:
-            assert "read_resource" in {t.name for t in live.agent_tools}
-            out = live.call("read_resource", uri="skill://drift-correction")
-            assert 'reference="previous"' not in out.text, (
-                "the ablation arm just read the skill it is supposed to lack"
+        with live_session(docs_enabled=False) as live:
+            assert "- drift-correction:" not in live.instructions
+            assert "New shipped docs" not in live.instructions
+            rendered = live.call("read_doc", id="index").text
+            assert "- drift-correction:" not in rendered
+            assert "New shipped docs" not in rendered
+            # The reference docs are the baseline, and they stay.
+            assert "- kernel:" in live.instructions
+            # The reference docs are still there: withholding the whole store
+            # would move the baseline the ablated arm establishes.
+            assert (
+                "client.get_tensor"
+                in live.call("read_doc", id="tensor-server-client").text
             )
-            assert "catalog" in out.text.lower(), out.text[:200]
     except SessionUnavailable as exc:
         pytest.skip(str(exc))
 
@@ -187,18 +165,18 @@ def test_the_kernel_runs_the_shipped_package_not_the_checkout(session):
             "import biopb_mcp, importlib.util, os.path\n"
             "print('pkg:', biopb_mcp.__file__)\n"
             "print('tests:', importlib.util.find_spec('biopb_mcp._tests'))\n"
-            # isdir, not load_catalog(): reading the catalog *from the kernel*
-            # is indistinguishable from an ablated arm doing the same, and it
+            # isdir, not a read_doc: reading the store *from the kernel* is
+            # indistinguishable from an ablated arm doing the same, and it
             # would leave that residue in the tripwire for the next test.
-            "print('skills_dir:', os.path.isdir(os.path.join(\n"
-            "    os.path.dirname(biopb_mcp.__file__), 'mcp', '_skills_data')))\n"
+            "print('docs_dir:', os.path.isdir(os.path.join(\n"
+            "    os.path.dirname(biopb_mcp.__file__), 'mcp', '_docs_data')))\n"
         ),
     )
     assert not out.is_error, out.text
     assert "tests: None" in out.text, f"the test tree is importable:\n{out.text}"
     assert "/biopb_mcp/_tests/" not in out.text
-    # Staging must not have cost the child the catalog it is measured on.
-    assert "skills_dir: True" in out.text, out.text
+    # Staging must not have cost the child the docs it is measured on.
+    assert "docs_dir: True" in out.text, out.text
 
 
 def test_reading_the_answer_key_does_not_go_unrecorded(session):
@@ -227,13 +205,13 @@ def test_reading_the_answer_key_does_not_go_unrecorded(session):
     )
 
 
-def test_the_session_serving_a_skill_is_not_mistaken_for_peeking(session):
+def test_the_session_serving_a_doc_is_not_mistaken_for_peeking(session):
     """The other half, and the one that decides whether this is usable: reading
-    `_skills_data` is how `skill://` is served. If that counted, every skill arm
+    `_docs_data` is how `read_doc` is served. If that counted, every docs-on arm
     would flag itself and the signal would be worth nothing."""
-    session.call("read_resource", uri="skill://drift-correction")
-    assert not [e for e in session.peeked() if "_skills_data" in e["path"]], (
-        "serving a skill body registered as the agent peeking at it"
+    session.call("read_doc", id="drift-correction")
+    assert not [e for e in session.peeked() if "_docs_data" in e["path"]], (
+        "serving a doc registered as the agent peeking at it"
     )
 
 
@@ -338,7 +316,7 @@ def test_this_cases_fixture_reaches_a_viewer_and_its_results_come_back(bench_cas
     ids = uploaded_ids(bench_case, fixture)
     plane = _plane.running_plane() if ids else None
     with live_session(
-        skills_enabled=True,
+        docs_enabled=True,
         plugins=bench_case.plugins,
         tensor_url=plane.url if plane is not None else "",
     ) as session:

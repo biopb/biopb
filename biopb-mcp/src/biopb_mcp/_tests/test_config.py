@@ -229,18 +229,17 @@ class TestDefaultConfig:
         for key in ("health_check", "get_op_names", "detection_2d", "detection_3d"):
             assert key in DEFAULT_CONFIG["timeout"]
 
-    def test_skills_are_flat_scalars(self):
-        """The former services.skills object is flattened to scalar leaves."""
+    def test_docs_are_flat_scalars(self):
+        """The services.docs settings are scalar leaves, not a nested object."""
         services = DEFAULT_CONFIG["services"]
-        # Skills ship on: they are package data, so the default install always
-        # has something to answer with and there is nothing to fetch.
-        assert services["skills_enabled"] is True
-        assert services["skills_local_dir"] == ""
-        # Skills are package data, not a fetch (biopb-mcp/docs/skills.md §1).
+        # Docs ship on: they are package data, so the default install always has
+        # something to answer with and there is nothing to fetch.
+        assert services["docs_local_dir"] == ""
+        # Docs are package data, not a fetch (biopb-mcp/docs/knowledge.md §2).
         assert "skills_catalog_url" not in services
         assert "skills_cache_ttl" not in services
-        # No nested object survives.
-        assert "skills" not in services
+        # Nothing of the skills catalog survives, nested or flat.
+        assert not [k for k in services if k.startswith("skills")]
 
     def test_dask_defaults(self):
         """MCP dask defaults to the in-process scheduler: no cluster unless asked

@@ -436,9 +436,6 @@ def _serve_http(config, port, view=False):
 
     _app.set_kernel_host(host)
     _app.set_promote_after(get_setting(config, "kernel.promote_after"))
-    # Advertise the curated-skills catalog only when it is enabled (off by
-    # default) — mirrors what list_skills / the skill:// resource actually serve.
-    _app.set_skills_enabled(get_setting(config, "services.skills_enabled"))
 
     # Tell server_status where this process's log lives, so an agent can find it.
     #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
