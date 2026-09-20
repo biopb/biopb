@@ -2,25 +2,34 @@ package biopb.tensor;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.logging.Logger;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
+import io.grpc.Context;
+
+import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
-import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.PutResult;
+import org.apache.arrow.flight.Result;
+import org.apache.arrow.flight.SyncPutListener;
 import org.apache.arrow.flight.Ticket;
-import org.apache.arrow.flight.grpc.CredentialCallOption;
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -34,25 +43,18 @@ import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 
-import net.imglib2.RandomAccess;
+import biopb.image.RoiAnnotation;
+import biopb.image.RoiDeleteResult;
+import biopb.image.RoiListResult;
+import biopb.image.RoiPruneRequest;
+import biopb.image.RoiPruneResult;
+import biopb.image.RoiPutResult;
+import biopb.image.RoiSetInfo;
+
 import net.imglib2.RandomAccessibleInterval;
-import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
-import net.imglib2.cache.img.ReadOnlyCachedCellImgOptions;
-import net.imglib2.cache.img.SingleCellArrayImg;
-import net.imglib2.cache.img.optional.CacheOptions.CacheType;
-import net.imglib2.img.array.ArrayImg;
-import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
 
-import static biopb.tensor.TensorChunkCodec.cellCount;
-import static biopb.tensor.TensorChunkCodec.createType;
-import static biopb.tensor.TensorChunkCodec.estimateChunkBytes;
-import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
-import static biopb.tensor.TensorChunkCodec.parseTicket;
-import static biopb.tensor.TensorChunkCodec.toIntArray;
-import static biopb.tensor.TensorChunkCodec.toLongArray;
-import static biopb.tensor.TensorChunkCodec.writeChunk;
 
 /**
  * Client for accessing tensors from a TensorFlightServer.
@@ -71,7 +73,7 @@ import static biopb.tensor.TensorChunkCodec.writeChunk;
  * either {@code source_id} for a single-tensor source or {@code source_id/field}
  * for a multi-tensor one. The array_id-first methods ({@link #getTensor(String)},
  * {@link #getDescriptor(String)}, {@link #getPhysicalScale(String)}) take that one
- * identifier; the older {@code (sourceId, tensorId)} overloads remain available.
+ * identifier; there is no {@code (sourceId, tensorId)} form.
  *
  * Usage:
  *
@@ -93,13 +95,12 @@ public class TensorFlightClient implements AutoCloseable {
     private static final Logger LOGGER = Logger.getLogger(TensorFlightClient.class.getName());
     private static final String DEFAULT_REDUCTION_METHOD = "nearest";
 
+    private final FlightSession session;
     private final BufferAllocator allocator;
-    private final FlightClient client;
-    private final CredentialCallOption authOption;
     private final Location location;
     private final String token;
-    private final Map<String, TensorDescriptor> descriptors;
     private final long cacheBytes;
+    private final TensorUploads uploads;
 
     /**
      * Create a new TensorFlightClient.
@@ -164,15 +165,15 @@ public class TensorFlightClient implements AutoCloseable {
     public TensorFlightClient(Location location, long cacheBytes, String token) {
         LOGGER.info(
                 "Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
-        this.location = location;
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
-        this.client = FlightClient.builder(this.allocator, location).build();
-        this.token = token;
-        this.authOption = (token != null && !token.isEmpty())
-                ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token))
-                : null;
-        this.descriptors = new HashMap<>();
+        this.session = new FlightSession(location, token);
+        // Every RPC goes through the session; what is read back out of it here
+        // is what this class answers to callers (location / token) and the
+        // allocator its Arrow results are owned by.
+        this.location = session.location();
+        this.allocator = session.allocator();
+        this.token = session.token();
         this.cacheBytes = cacheBytes;
+        this.uploads = new TensorUploads(session);
     }
 
     /**
@@ -207,36 +208,6 @@ public class TensorFlightClient implements AutoCloseable {
             "source_id, source_url, source_type, is_resolved, tensors";
 
     /**
-     * List available data sources.
-     *
-     * @deprecated Use {@link #querySources}, which hands back rows and leaves
-     *             the structure to you. The descriptors returned here also
-     *             carry no {@code isResolved} -- the generated message has no
-     *             field for it (biopb/biopb#1032).
-     *             This is a thin wrapper around {@code SELECT ... FROM sources}
-     *             that inherits the server's query row cap, so a large catalog
-     *             comes back silently truncated -- and a browse is exactly where
-     *             that matters.
-     *
-     * @return Map of source_id to DataSourceDescriptor
-     */
-    @Deprecated
-    public Map<String, DataSourceDescriptor> listSources() throws IOException {
-        Map<String, DataSourceDescriptor> result = new HashMap<>();
-        try (VectorSchemaRoot root = querySources(
-                "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources ORDER BY source_id")) {
-            for (DataSourceDescriptor sourceDesc : descriptorsFromRows(root)) {
-                result.put(sourceDesc.getSourceId(), sourceDesc);
-                for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
-                    descriptors.put(tensorDesc.getArrayId(), tensorDesc);
-                }
-            }
-        }
-        LOGGER.info("listSources: returned " + result.size() + " sources");
-        return result;
-    }
-
-    /**
      * One source's catalog row by id, or {@code null} when nothing answers to it.
      *
      * <p>One addressed catalog row, so a source past the browse cap still
@@ -251,22 +222,7 @@ public class TensorFlightClient implements AutoCloseable {
             root.close();
             return null;
         }
-        cacheTensors(root, 0);
         return root;
-    }
-
-    /**
-     * Seed the array_id -&gt; descriptor cache from one row's tensors.
-     *
-     * <p>The cache holds {@link TensorDescriptor}, the type GetFlightInfo answers
-     * with and the read path reads, so that is what a row's tensor entries are
-     * read into -- no intermediate structure, because a structure is exactly what
-     * this SDK stopped choosing (biopb/biopb#1032).
-     */
-    private void cacheTensors(VectorSchemaRoot root, int index) {
-        for (TensorDescriptor tensor : tensorsFromRow(root, index)) {
-            descriptors.put(tensor.getArrayId(), tensor);
-        }
     }
 
     /**
@@ -308,64 +264,6 @@ public class TensorFlightClient implements AutoCloseable {
         return out;
     }
 
-    /**
-     * Whether the server has hydrated this row's source enough to know its tensors.
-     *
-     * <p>True for an absent column, the harmless direction for a monotonic flag; a
-     * server whose table predates it fails the SELECT outright, so this only covers
-     * a caller's own narrower projection.
-     */
-    private static boolean isResolved(VectorSchemaRoot root, int index) {
-        Boolean flag = nullableBool(root.getVector("is_resolved"), index);
-        return flag == null || flag;
-    }
-
-    /**
-     * Rebuild lean {@link DataSourceDescriptor}s from {@code sources} catalog rows.
-     *
-     * @deprecated There is no replacement: a row is the data structure. Read the
-     *             {@link VectorSchemaRoot} {@link #querySources} returns, and
-     *             decode it into whatever suits you. This builds the generated
-     *             message, which has no field for {@code is_resolved} and cannot
-     *             gain one without a regenerate in every language
-     *             (biopb/biopb#1032).
-     */
-    @Deprecated
-    public static List<DataSourceDescriptor> descriptorsFromRows(VectorSchemaRoot root) {
-        List<DataSourceDescriptor> out = new ArrayList<>();
-        FieldVector sourceIds = root.getVector("source_id");
-        FieldVector urls = root.getVector("source_url");
-        FieldVector types = root.getVector("source_type");
-        FieldVector resident = root.getVector("data_resident");
-        for (int i = 0; i < root.getRowCount(); i++) {
-            DataSourceDescriptor.Builder desc = DataSourceDescriptor.newBuilder()
-                    .setSourceId(text(sourceIds, i))
-                    .setSourceUrl(text(urls, i))
-                    .setSourceType(text(types, i))
-                    .setMetadataJson("")
-                    .addAllTensors(tensorsFromRow(root, i));
-            // No current server sends data_resident. Residency is a per-source
-            // read on the descriptor GetFlightInfo returns (biopb/biopb#1048);
-            // an older server still sends the column, and this decode answers
-            // it identically against that server.
-            Boolean res = nullableBool(resident, i);
-            if (res != null) {
-                desc.setDataResident(res);
-            }
-            // is_resolved is dropped, and that is the point: there is no field to
-            // put it in. Read it off the row.
-            out.add(desc.build());
-        }
-        return out;
-    }
-
-    private static String text(FieldVector vector, int index) {
-        if (vector == null || vector.isNull(index)) {
-            return "";
-        }
-        return String.valueOf(vector.getObject(index));
-    }
-
     private static Boolean nullableBool(FieldVector vector, int index) {
         if (vector == null || vector.isNull(index)) {
             return null;
@@ -405,7 +303,7 @@ public class TensorFlightClient implements AutoCloseable {
                 .build();
         Schema schema;
         List<ArrowRecordBatch> batches = new ArrayList<>();
-        try (FlightStream stream = client.getStream(new Ticket(ticket.toByteArray()), authOption)) {
+        try (FlightStream stream = session.getStream(new Ticket(ticket.toByteArray()))) {
             schema = stream.getSchema();
 
             // Truncation is the server's own flag on the stream's schema metadata.
@@ -430,6 +328,9 @@ public class TensorFlightClient implements AutoCloseable {
         } catch (Exception e) {
             for (ArrowRecordBatch batch : batches) {
                 batch.close();
+            }
+            if (e instanceof FlightRuntimeException) {
+                throw TensorErrorMapper.map((FlightRuntimeException) e);
             }
             if (e instanceof IOException) {
                 throw (IOException) e;
@@ -568,60 +469,98 @@ public class TensorFlightClient implements AutoCloseable {
      * @throws IOException If the action fails or the server returns no row
      */
     public VectorSchemaRoot resolve(String sourceId) throws IOException {
+        return resolve(sourceId, null, null);
+    }
+
+    /**
+     * Resolve an unresolved source with optional progress and cancellation hooks.
+     *
+     * <p>Both callbacks run on the calling thread after each streamed action
+     * message. Returning true from {@code shouldCancel} stops consuming the
+     * action stream; the server may finish its recall independently and cache
+     * the result for a later call.
+     *
+     * @param sourceId source to resolve
+     * @param onProgress receives server progress heartbeats, or null
+     * @param shouldCancel polled once per action message, or null
+     * @return the terminal catalog row; caller must close it
+     */
+    public VectorSchemaRoot resolve(
+            String sourceId,
+            Consumer<ResolveProgress> onProgress,
+            BooleanSupplier shouldCancel) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
         // point that performs the (possibly minutes-long) recall. The action
         // streams ResolveStreamMessage progress heartbeats to keep the
         // connection warm under proxy idle timeouts; the terminal message
         // carries the source's now-concrete catalog row as an Arrow IPC stream,
         // handed back as-is.
-        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
-                "resolve",
-                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-
-        VectorSchemaRoot row = null;
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        VectorSchemaRoot[] row = { null };
         try {
-            while (iter.hasNext()) {
-                byte[] body = iter.next().getBody();
-                if (body == null || body.length == 0) {
-                    continue;
-                }
-                ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
-                if (msg.getPayloadCase() != ResolveStreamMessage.PayloadCase.SOURCE_ROW) {
-                    continue; // heartbeat (no progress callback on the Java client yet)
-                }
-                try (ArrowStreamReader reader = new ArrowStreamReader(
-                        new ByteArrayInputStream(msg.getSourceRow().toByteArray()), allocator)) {
-                    while (reader.loadNextBatch()) {
-                        VectorSchemaRoot streamed = reader.getVectorSchemaRoot();
-                        // Seed the per-tensor cache while the batch is still
-                        // loaded, then take a copy that outlives the reader --
-                        // the reader owns those buffers and frees them on close
-                        // (the same reason querySources clones its batches).
-                        for (int i = 0; i < streamed.getRowCount(); i++) {
-                            cacheTensors(streamed, i);
+            streamAction("resolve", sourceId.getBytes(StandardCharsets.UTF_8),
+                    ResolveStreamMessage.parser(),
+                    message -> {
+                        if (shouldCancel != null && shouldCancel.getAsBoolean()) {
+                            throw new TensorOperationCancelledException("resolve", sourceId);
                         }
-                        if (row != null) {
-                            row.close();
+                        if (message.getPayloadCase() == ResolveStreamMessage.PayloadCase.PROGRESS) {
+                            if (onProgress != null) {
+                                onProgress.accept(message.getProgress());
+                            }
+                        } else if (message.getPayloadCase() == ResolveStreamMessage.PayloadCase.SOURCE_ROW) {
+                            VectorSchemaRoot fresh = readSourceRow(message.getSourceRow());
+                            if (fresh != null) {
+                                closeQuietly(row[0]);
+                                row[0] = fresh;
+                            }
                         }
-                        row = copyOf(streamed);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            if (row != null) {
-                row.close();
-            }
-            if (e instanceof IOException) {
-                throw (IOException) e;
-            }
-            throw new IOException("resolve failed: " + e.getMessage(), e);
+                        return true;
+                    },
+                    null);
+        } catch (UncheckedIOException error) {
+            closeQuietly(row[0]);
+            throw error.getCause();
+        } catch (RuntimeException | IOException error) {
+            closeQuietly(row[0]);
+            throw error;
         }
-        if (row == null) {
+        if (row[0] == null) {
             throw new IOException("resolve('" + sourceId
                     + "') returned no catalog row (server closed the stream without a result)");
         }
+        return row[0];
+    }
+
+    /**
+     * The catalog row a terminal {@code resolve} message carries.
+     *
+     * <p>Copied out while the batch is still loaded: the reader owns those
+     * buffers and frees them on close, the same reason {@link #querySources}
+     * clones its batches.
+     */
+    private VectorSchemaRoot readSourceRow(ByteString ipc) {
+        VectorSchemaRoot row = null;
+        try (ArrowStreamReader reader = new ArrowStreamReader(
+                new ByteArrayInputStream(ipc.toByteArray()), allocator)) {
+            while (reader.loadNextBatch()) {
+                VectorSchemaRoot fresh = copyOf(reader.getVectorSchemaRoot());
+                closeQuietly(row);
+                row = fresh;
+            }
+        } catch (IOException error) {
+            closeQuietly(row);
+            throw new UncheckedIOException(error);
+        } catch (RuntimeException error) {
+            closeQuietly(row);
+            throw error;
+        }
         return row;
+    }
+
+    private static void closeQuietly(VectorSchemaRoot root) {
+        if (root != null) {
+            root.close();
+        }
     }
 
     /** A standalone copy of {@code src}, owned by this client's allocator. */
@@ -656,32 +595,426 @@ public class TensorFlightClient implements AutoCloseable {
      * @return The terminal {@link WarmProgress} snapshot (files/bytes made
      *         resident). {@code filesTotal == 0} means the source was local and
      *         had nothing to warm, i.e. single-file; "not applicable" raises.
-     * @throws IOException If the action fails, the server is too old to support
-     *         the {@code warm} action, or it returns no terminal status.
+     * @throws IOException If the action fails or it returns no terminal status
+     * @throws UnsupportedOperationException If the server predates the
+     *         {@code warm} action
      */
     public WarmProgress warm(String sourceId) throws IOException {
-        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
-                "warm",
-                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return warm(sourceId, null, null);
+    }
 
-        WarmProgress done = null;
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
-        while (iter.hasNext()) {
-            byte[] body = iter.next().getBody();
-            if (body == null || body.length == 0) {
-                continue;
-            }
-            WarmStreamMessage msg = WarmStreamMessage.parseFrom(body);
-            if (msg.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
-                done = msg.getDone();
-            }
-            // PROGRESS arms are ignored (no progress callback on the Java client yet).
-        }
-        if (done == null) {
+    /**
+     * Warm a source with optional progress and cancellation hooks.
+     *
+     * @param sourceId source to warm
+     * @param onProgress receives non-terminal warm progress, or null
+     * @param shouldCancel polled once per action message, or null
+     * @return the terminal progress snapshot
+     */
+    public WarmProgress warm(
+            String sourceId,
+            Consumer<WarmProgress> onProgress,
+            BooleanSupplier shouldCancel) throws IOException {
+        WarmProgress[] done = { null };
+        streamAction("warm", sourceId.getBytes(StandardCharsets.UTF_8),
+                WarmStreamMessage.parser(),
+                message -> {
+                    if (shouldCancel != null && shouldCancel.getAsBoolean()) {
+                        throw new TensorOperationCancelledException("warm", sourceId);
+                    }
+                    if (message.getPayloadCase() == WarmStreamMessage.PayloadCase.PROGRESS) {
+                        if (onProgress != null) {
+                            onProgress.accept(message.getProgress());
+                        }
+                    } else if (message.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
+                        done[0] = message.getDone();
+                    }
+                    return true;
+                },
+                "Hydrate-ahead is unavailable");
+        if (done[0] == null) {
             throw new IOException("warm('" + sourceId
                     + "') returned no terminal status (server closed the stream without a 'done')");
         }
-        return done;
+        return done[0];
+    }
+
+    // ---- source lifecycle -------------------------------------------------
+
+    /**
+     * Register a local path on the SERVER as a served source at runtime.
+     *
+     * <p>Hands the server a filesystem path (or directory) that it interprets
+     * on its <i>own</i> filesystem, and the server routes it through the same
+     * claim -&gt; adapter -&gt; catalog pipeline the directory watcher uses. A
+     * directory that is not itself a dataset is walked recursively and may
+     * register several sources, so this reports a tally rather than one source.
+     *
+     * @param url Absolute path (or directory) on the server's filesystem
+     * @return the terminal {@link AddSourceResult}
+     * @throws IOException If the action fails, the server is too old to support
+     *         the {@code add_source} action, or it returns no terminal result
+     */
+    public AddSourceResult addSource(String url) throws IOException {
+        return addSource(url, "", null, null);
+    }
+
+    /**
+     * Register a path on the server, with progress and cancellation hooks.
+     *
+     * <p>Because a dropped directory's walk has no known size up front, there
+     * is no percentage -- progress is a running count of sources registered so
+     * far.
+     *
+     * <p>Cancelling cancels the RPC, which the server observes and stops
+     * discovery on; sources already registered stay registered, and this
+     * returns an empty tally rather than raising -- the cancel was
+     * intentional.
+     *
+     * @param url Absolute path (or directory) on the server's filesystem
+     * @param sourceType Explicit adapter type ({@code "zarr"},
+     *        {@code "ome-zarr"}, ...); empty means auto-detect via the
+     *        adapters' claim protocol
+     * @param onProgress receives one {@link AddSourceProgress} per source as it
+     *        registers, or null
+     * @param shouldCancel polled once per action message, or null
+     * @return the terminal {@link AddSourceResult}: {@code added} /
+     *         {@code alreadyPresent} / {@code refreshed} / {@code removed}
+     *         source_ids and {@code failed} (path, reason) pairs. Re-adding a
+     *         registered path REBUILDS it against the file as it is now -- that
+     *         is what {@code refreshed} reports, and it is how a source picks up
+     *         an in-place edit. Registration wrote each source's catalog row, so
+     *         anything beyond the ids is one {@link #querySources} away.
+     */
+    public AddSourceResult addSource(
+            String url,
+            String sourceType,
+            Consumer<AddSourceProgress> onProgress,
+            BooleanSupplier shouldCancel) throws IOException {
+        AddSourceRequest request = AddSourceRequest.newBuilder()
+                .setUrl(url)
+                .setSourceType(sourceType == null ? "" : sourceType)
+                .build();
+        AddSourceResult[] result = { null };
+        streamAction("add_source", request.toByteArray(), AddSourceStreamMessage.parser(),
+                message -> {
+                    if (message.getPayloadCase() == AddSourceStreamMessage.PayloadCase.PROGRESS) {
+                        if (onProgress != null) {
+                            onProgress.accept(message.getProgress());
+                        }
+                    } else if (message.getPayloadCase() == AddSourceStreamMessage.PayloadCase.RESULT) {
+                        result[0] = message.getResult();
+                    }
+                    // Poll AFTER consuming this message, not before: a cancel
+                    // landing exactly on the terminal result must not discard a
+                    // completed tally already captured above.
+                    return shouldCancel == null || !shouldCancel.getAsBoolean();
+                },
+                "Runtime source registration is unavailable");
+        if (result[0] == null) {
+            if (shouldCancel != null && shouldCancel.getAsBoolean()) {
+                // A caller-driven cancel breaks before the terminal result;
+                // report an empty tally rather than an error.
+                return AddSourceResult.getDefaultInstance();
+            }
+            throw new IOException("addSource('" + url
+                    + "') returned no terminal result (server closed the stream without a result)");
+        }
+        return result[0];
+    }
+
+    /**
+     * Deregister a drag-dropped source branch on the SERVER at runtime.
+     *
+     * <p>The narrow counterpart to {@link #addSource}: it removes ONLY
+     * drag-dropped sources, which the server identifies by the {@code dnd://}
+     * origin scheme on their catalog {@code source_url}. Every source at or
+     * under {@code rootUrl} goes as a unit; a non-{@code dnd://} root is
+     * refused by the server.
+     *
+     * @param rootUrl the {@code dnd://} branch root to remove
+     * @return {@code removed} source_ids, and {@code failed} entries whose
+     *         {@code path} carries the source_id
+     */
+    public RemoveSourceResult removeSource(String rootUrl) throws IOException {
+        RemoveSourceRequest request = RemoveSourceRequest.newBuilder()
+                .setRootUrl(rootUrl)
+                .build();
+        byte[] body = doActionOneResult("remove_source", request.toByteArray(),
+                "Source removal is unavailable");
+        try {
+            return RemoveSourceResult.parseFrom(body);
+        } catch (InvalidProtocolBufferException error) {
+            throw new IOException("remove_source returned no RemoveSourceResult", error);
+        }
+    }
+
+    // ---- label sets (biopb-tensor-server/docs/label-tensors.md) -----------
+
+    /**
+     * The {@code array_id}s of the label sets served under an image.
+     *
+     * <p>A label set is an ordinary tensor of its image, named
+     * {@code <image array_id>/labels/<name>}, so this is a catalog query over
+     * the path and nothing more -- {@link #getTensor} / {@link #getDescriptor}
+     * read one like any other tensor.
+     *
+     * @param imageArrayId the image's array_id
+     * @return the sets' array_ids, sorted; empty when the image has none
+     */
+    public List<String> labelSets(String imageArrayId) throws IOException {
+        List<String> sets = new ArrayList<>();
+        try (VectorSchemaRoot root = querySources(
+                "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) WHERE starts_with(t.array_id, "
+                        + sqlLiteral(imageArrayId + "/labels/") + ") ORDER BY t.array_id")) {
+            FieldVector ids = root.getVector("array_id");
+            for (int row = 0; row < root.getRowCount(); row++) {
+                if (ids != null && !ids.isNull(row)) {
+                    sets.add(String.valueOf(ids.getObject(row)));
+                }
+            }
+        }
+        return sets;
+    }
+
+    /**
+     * Delete an uploaded label set, and the store behind it.
+     *
+     * <p><b>Experimental</b>, with the rest of the upload API.
+     *
+     * <p>Only a <i>finished uploaded</i> set: a set the image's own file
+     * carries is the file's, and a server-owned one (a name under {@code @}) is
+     * the server's. Deleting frees the name at once -- the next set uploaded
+     * under it is a distinct tensor with its own cache namespace, so no stale
+     * chunk can be served for it.
+     *
+     * @param arrayId the set's array_id, as {@link #labelSets} reports it
+     * @return {@code {"array_id": ..., "deleted": true}}
+     */
+    public Map<String, Object> deleteLabels(String arrayId) throws IOException {
+        byte[] body = doActionOneResult("delete_labels",
+                arrayId.getBytes(StandardCharsets.UTF_8),
+                "Label set deletion is unavailable");
+        return GSON.fromJson(new String(body, StandardCharsets.UTF_8),
+                new TypeToken<Map<String, Object>>() {
+                }.getType());
+    }
+
+    // ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
+
+    /**
+     * Fetch a tensor's ROI annotations.
+     *
+     * <p>There is no plane or bbox filter: a client hit-tests and re-renders
+     * from the resident set. Annotations are private data, gated by the
+     * tensor's source like its pixels, so they are not on the SQL surface.
+     *
+     * @param arrayId unversioned array_id of the tensor
+     * @return the annotations, a {@code truncated} flag, and {@code sets} --
+     *         every set on the tensor with its stored row count, whatever
+     *         {@code rois} covers
+     */
+    public RoiListResult listRois(String arrayId) throws IOException {
+        return listRois(arrayId, "");
+    }
+
+    /**
+     * Fetch one layer of a tensor's ROI annotations.
+     *
+     * @param arrayId unversioned array_id of the tensor
+     * @param setName restrict to one layer, and the only way to read a reserved
+     *        ({@code @}) set; empty means the client-owned sets
+     * @return the annotations, a {@code truncated} flag, and the tensor's sets
+     */
+    public RoiListResult listRois(String arrayId, String setName) throws IOException {
+        TensorTicket ticket = TensorTicket.newBuilder()
+                .setRoiRead(RoiRead.newBuilder()
+                        .setArrayId(arrayId)
+                        .setSetName(setName == null ? "" : setName)
+                        .build())
+                .build();
+        RoiListResult.Builder result = RoiListResult.newBuilder();
+        try (FlightStream stream = session.getStream(new Ticket(ticket.toByteArray()))) {
+            // `truncated` and the tensor's `sets` ride the stream's schema
+            // metadata, so they are read before the first batch.
+            Map<String, String> metadata = stream.getSchema().getCustomMetadata();
+            if (metadata != null) {
+                result.setTruncated(Boolean.parseBoolean(metadata.get("truncated")));
+                result.addAllSets(parseRoiSets(metadata.get("sets")));
+            }
+            while (stream.next()) {
+                result.addAllRois(RoiRowCodec.roisFromRoot(stream.getRoot()));
+            }
+        } catch (FlightRuntimeException error) {
+            throw TensorErrorMapper.map(error);
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IOException("listRois failed: " + error.getMessage(), error);
+        }
+        return result.build();
+    }
+
+    /** The tensor's sets, as the read stream's {@code sets} metadata reports them. */
+    private static List<RoiSetInfo> parseRoiSets(String json) {
+        List<RoiSetInfo> sets = new ArrayList<>();
+        if (json == null || json.isEmpty()) {
+            return sets;
+        }
+        List<Map<String, Object>> entries = GSON.fromJson(json,
+                new TypeToken<List<Map<String, Object>>>() {
+                }.getType());
+        if (entries == null) {
+            return sets;
+        }
+        for (Map<String, Object> entry : entries) {
+            Object count = entry.get("count");
+            sets.add(RoiSetInfo.newBuilder()
+                    .setSetName(String.valueOf(entry.getOrDefault("set_name", "")))
+                    .setCount(count instanceof Number ? ((Number) count).longValue() : 0L)
+                    .setReserved(Boolean.TRUE.equals(entry.get("reserved")))
+                    .build());
+        }
+        return sets;
+    }
+
+    /**
+     * Create or update ROI annotations on a tensor, as one batch.
+     *
+     * <p>Geometry is {@code biopb.image.ROI} in LEVEL-0 pixel coordinates -- a
+     * shape drawn on a downsampled level must be scaled up by the caller. Only
+     * the 2-D vector arms are accepted (point / rectangle / ellipse / polygon /
+     * polyline); a mask or mesh is refused, because instance segmentation
+     * belongs in a label tensor.
+     *
+     * <p>An annotation with an empty {@code roi_id} is created (the server mints
+     * a uuid4); one that names an existing id is updated. The batch is applied
+     * in a single transaction, last writer wins.
+     *
+     * @param arrayId unversioned array_id every annotation belongs to
+     * @param rois the annotations to store
+     * @return {@code stored} (with server-assigned roi_id / rev / timestamps)
+     *         and {@code conflicts}
+     */
+    public RoiPutResult putRois(String arrayId, List<RoiAnnotation> rois) throws IOException {
+        return putRois(arrayId, rois, false);
+    }
+
+    /**
+     * Create or update ROI annotations, optionally conditional on {@code rev}.
+     *
+     * @param arrayId unversioned array_id every annotation belongs to
+     * @param rois the annotations to store
+     * @param checkRev make each write conditional on {@code rev} matching what
+     *        is stored; mismatches come back in {@code conflicts} and are not
+     *        applied, and the rest of the batch still lands
+     * @return {@code stored} and {@code conflicts}
+     */
+    public RoiPutResult putRois(String arrayId, List<RoiAnnotation> rois, boolean checkRev)
+            throws IOException {
+        PutCommand command = PutCommand.newBuilder()
+                .setRoiPut(RoiPut.newBuilder()
+                        .setArrayId(arrayId)
+                        .setCheckRev(checkRev)
+                        .build())
+                .build();
+        try (VectorSchemaRoot rows = RoiRowCodec.roisToRoot(
+                rois == null ? Collections.emptyList() : rois, allocator)) {
+            return RoiPutResult.parseFrom(roiPutStream(command, rows));
+        } catch (InvalidProtocolBufferException error) {
+            throw new IOException("putRois returned no RoiPutResult", error);
+        }
+    }
+
+    /**
+     * Delete ROI annotations.
+     *
+     * <p>With {@code roiIds}, deletes exactly those. Without, deletes every
+     * annotation on the tensor -- narrowed to {@code setName} when given, which
+     * is how a whole layer is dropped.
+     *
+     * @param arrayId unversioned array_id of the tensor
+     * @param roiIds the ids to delete, or empty for all
+     * @param setName narrow a delete-all to one layer, or empty
+     * @return the ids actually removed
+     */
+    public RoiDeleteResult deleteRois(String arrayId, List<String> roiIds, String setName)
+            throws IOException {
+        PutCommand command = PutCommand.newBuilder()
+                .setRoiDelete(RoiDelete.newBuilder()
+                        .setArrayId(arrayId)
+                        .setSetName(setName == null ? "" : setName)
+                        .build())
+                .build();
+        try (VectorSchemaRoot rows = RoiRowCodec.roiIdsToRoot(
+                roiIds == null ? Collections.emptyList() : roiIds, allocator)) {
+            return RoiDeleteResult.parseFrom(roiPutStream(command, rows));
+        } catch (InvalidProtocolBufferException error) {
+            throw new IOException("deleteRois returned no RoiDeleteResult", error);
+        }
+    }
+
+    /**
+     * Report, and with {@code apply} delete, annotations whose image is gone.
+     *
+     * <p>An annotation is unseen when the catalog has not held its source for
+     * {@code unseenDays} (a row whose source never appeared counts from its
+     * creation). Reserved, server-owned sets are never pruned. Requires the
+     * server-wide token: orphans have no source to authorize against.
+     *
+     * @param unseenDays how long a source must have been absent to count
+     * @param apply false reports only; true deletes
+     * @return the unseen annotations grouped per tensor, and the row count
+     *         deleted (0 on a report)
+     */
+    public RoiPruneResult pruneRois(int unseenDays, boolean apply) throws IOException {
+        RoiPruneRequest request = RoiPruneRequest.newBuilder()
+                .setUnseenDays(unseenDays)
+                .setApply(apply)
+                .build();
+        byte[] body = doActionOneResult("roi_prune", request.toByteArray(),
+                "ROI pruning is unavailable");
+        try {
+            return RoiPruneResult.parseFrom(body);
+        } catch (InvalidProtocolBufferException error) {
+            throw new IOException("roi_prune returned no RoiPruneResult", error);
+        }
+    }
+
+    /**
+     * One DoPut on the {@code roi} flight: the command in the descriptor, the
+     * rows in the stream, the structured reply in the put's app_metadata.
+     */
+    private byte[] roiPutStream(PutCommand command, VectorSchemaRoot rows) throws IOException {
+        try (SyncPutListener reply = new SyncPutListener()) {
+            FlightClient.ClientStreamListener writer = session.startPut(
+                    FlightDescriptor.command(command.toByteArray()), rows, reply);
+            if (rows.getRowCount() > 0) {
+                writer.putNext();
+            }
+            writer.completed();
+            PutResult ack = reply.read();
+            if (ack == null) {
+                writer.getResult();
+                throw new IOException("the server acknowledged the ROI put with no result");
+            }
+            try {
+                ArrowBuf metadata = ack.getApplicationMetadata();
+                byte[] body = new byte[(int) metadata.readableBytes()];
+                metadata.getBytes(0, body);
+                writer.getResult();
+                return body;
+            } finally {
+                ack.close();
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IOException("ROI put interrupted", error);
+        } catch (ExecutionException error) {
+            throw FlightSession.mapped(error.getCause());
+        } catch (FlightRuntimeException error) {
+            throw TensorErrorMapper.map(error);
+        }
     }
 
     /**
@@ -689,9 +1022,10 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>A tensor is identified by its {@code array_id} alone (see the tensor
      * identity policy at the top of {@code proto/biopb/tensor/descriptor.proto}),
-     * so this takes that one identifier rather than a {@code (sourceId, tensorId)}
-     * pair. Works even when the source is beyond the server's query row cap, and
-     * the result is cached. A bare {@code source_id} (single-tensor source, or to
+     * so this takes that one identifier. Works even when the source is beyond
+     * the server's query row cap. One {@code GetFlightInfo} per call -- nothing
+     * is cached, because a descriptor is what the server says now. A bare
+     * {@code source_id} (single-tensor source, or to
      * anchor on a multi-tensor source's default/first tensor) is accepted. To
      * enumerate ALL tensors/scenes of a source, read its catalog row's
      * {@code tensors} column -- NOT this method.
@@ -704,8 +1038,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @return The TensorDescriptor for that tensor
      */
     public TensorDescriptor getDescriptor(String arrayId) {
-        // source_id is the slash-free prefix; the full array_id is the tensor_id.
-        return fetchTensorDescriptor(sourceIdFromArrayId(arrayId), arrayId);
+        return describe(arrayId, readMask("pyramid"));
     }
 
     /**
@@ -718,9 +1051,9 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>{@code physical_scale}/{@code physical_unit} are {@code TensorDescriptor}
      * fields the server fills on every {@code GetFlightInfo} (issue #31), so this
-     * reads the descriptor a prior {@link #getTensor} already cached -- no extra
-     * RPC when it is cached, and it never requests the opt-in {@code metadata_json}
-     * field on that same descriptor. (Contrast {@link #getSourceMetadata}, which
+     * is one describe -- the cheap projection, which never requests the opt-in
+     * {@code metadata_json} field or the O(chunks) endpoint plan.
+     * (Contrast {@link #getSourceMetadata}, which
      * ships the whole OME tree; do not dig physical sizes out of that -- this is
      * the compact projection meant for display scale.)
      *
@@ -730,17 +1063,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @return A PhysicalScale, or {@code null} if no physical scale is known
      */
     public PhysicalScale getPhysicalScale(String arrayId) {
-        String sourceId = sourceIdFromArrayId(arrayId);
-        TensorDescriptor desc = descriptors.get(arrayId);
-        if (desc == null) {
-            // Don't silently recall a whole cloud file just to read its pixel
-            // size: the probe below never resolves on serve, so an unresolved
-            // source refuses there and fetchTensorDescriptor restates it as the
-            // steer to resolve(). That refusal is the server's, so it holds for
-            // every id -- where the old local pre-check only fired for a source
-            // a prior listSources() happened to have cached.
-            desc = fetchTensorDescriptor(sourceId, arrayId);
-        }
+        TensorDescriptor desc = describe(arrayId, readMask());
         if (desc.getPhysicalScaleCount() == 0) {
             return null;
         }
@@ -793,7 +1116,7 @@ public class TensorFlightClient implements AutoCloseable {
             String arrayId,
             long[] scaleHint,
             String reductionMethod) {
-        return getTensor(arrayId, (SliceHint) null, scaleHint, reductionMethod);
+        return getTensor(arrayId, null, scaleHint, reductionMethod);
     }
 
     /**
@@ -805,97 +1128,17 @@ public class TensorFlightClient implements AutoCloseable {
      * @param scaleHint       Per-dimension scale factors
      * @param reductionMethod Requested reduction method
      * @param <T>             The pixel type
-     * @return RandomAccessibleInterval containing the requested tensor
+     * @return lazy RandomAccessibleInterval containing the requested tensor
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
             String arrayId,
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
-        // array_id-first addressing: "source_id/field" routes to source_id with
-        // the full array_id as tensor_id; a bare "source_id" leaves tensorId null
-        // so getTensorContext resolves the source's sole/default tensor.
-        String[] route = resolveArrayId(arrayId);
-        return getTensor(route[0], route[1], sliceHint, scaleHint, reductionMethod);
-    }
 
-    /**
-     * Get a RandomAccessibleInterval for a tensor within a data source.
-     *
-     * @param sourceId Data source identifier
-     * @param tensorId Tensor identifier within the source
-     * @param <T>      The pixel type
-     * @return RandomAccessibleInterval containing the requested tensor
-     */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
-            String sourceId,
-            String tensorId) {
-
-        return getTensor(sourceId, tensorId, null, null, null);
-    }
-
-    /**
-     * Get a RandomAccessibleInterval for a tensor with slice hint.
-     *
-     * @param sourceId  Data source identifier
-     * @param tensorId  Tensor identifier within the source
-     * @param sliceHint Optional slice hint
-     * @param <T>       The pixel type
-     * @return RandomAccessibleInterval containing the requested tensor
-     */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
-            String sourceId,
-            String tensorId,
-            SliceHint sliceHint) {
-
-        return getTensor(sourceId, tensorId, sliceHint, null, null);
-    }
-
-    /**
-     * Get a RandomAccessibleInterval for a tensor with scaled read options.
-     *
-     * @param sourceId        Data source identifier
-     * @param tensorId        Tensor identifier within the source
-     * @param scaleHint       Per-dimension scale factors
-     * @param reductionMethod Requested reduction method
-     * @param <T>             The pixel type
-     * @return RandomAccessibleInterval containing the requested tensor
-     */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
-            String sourceId,
-            String tensorId,
-            long[] scaleHint,
-            String reductionMethod) {
-
-        return getTensor(sourceId, tensorId, null, scaleHint, reductionMethod);
-    }
-
-    /**
-     * Get a RandomAccessibleInterval for a tensor with all options.
-     *
-     * @param sourceId        Data source identifier
-     * @param tensorId        Tensor identifier within the source
-     * @param sliceHint       Optional slice hint
-     * @param scaleHint       Per-dimension scale factors
-     * @param reductionMethod Requested reduction method
-     * @param <T>             The pixel type
-     * @return SerializableTensorImg containing the requested tensor (implements
-     *         RandomAccessibleInterval)
-     */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
-            String sourceId,
-            String tensorId,
-            SliceHint sliceHint,
-            long[] scaleHint,
-            String reductionMethod) {
-
-        RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, scaleHint, reductionMethod);
-        RandomAccessibleInterval<T> rai = createArray(context);
-
-        // tensorId may have arrived null (the bare-source_id array_id path);
-        // pin it to the server-resolved array_id so the serializable wrapper can
-        // re-fetch independently in another process.
-        String resolvedTensorId = context.descriptor.getArrayId();
+        RequestContext context = planRead(arrayId, sliceHint, scaleHint, reductionMethod);
+        RandomAccessibleInterval<T> rai = new Imglib2TensorFactory(session, cacheBytes)
+                .create(context.info);
 
         // Crop to the originally requested region.
         // The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
@@ -905,9 +1148,19 @@ public class TensorFlightClient implements AutoCloseable {
                     context.descriptor.getScaleHintList());
         }
 
-        // Return SerializableTensorImg wrapper for serialization support
-        return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, resolvedTensorId,
-                sliceHint, scaleHint, reductionMethod, context.descriptor, rai);
+        // Preserve source compatibility while externalizing only the v2 handle.
+        return new SerializableTensorImg<>(serializedTensorOf(context.info), cacheBytes, rai);
+    }
+
+    /**
+     * Get a SerializedTensor protobuf for a whole tensor.
+     *
+     * @param arrayId Globally-unique tensor id ({@code source_id} or
+     *                {@code source_id/field})
+     * @return SerializedTensor protobuf object
+     */
+    public SerializedTensor getTensorAsPb(String arrayId) {
+        return getTensorAsPb(arrayId, null, null, null);
     }
 
     /**
@@ -918,28 +1171,31 @@ public class TensorFlightClient implements AutoCloseable {
      * and broadcast to worker processes (e.g., Spark), where each worker
      * can call tensorFromPb() to reconstruct a lazy imglib2 array.
      *
-     * @param sourceId        Data source identifier
-     * @param tensorId        Tensor identifier within the source
+     * @param arrayId         Globally-unique tensor id ({@code source_id} or
+     *                        {@code source_id/field})
      * @param sliceHint       Optional slice hint
      * @param scaleHint       Per-dimension scale factors
      * @param reductionMethod Requested reduction method
      * @return SerializedTensor protobuf object
      */
     public SerializedTensor getTensorAsPb(
-            String sourceId,
-            String tensorId,
+            String arrayId,
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
 
-        LOGGER.fine("getTensorAsPb: sourceId=" + sourceId + ", tensorId=" + tensorId);
-        RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, scaleHint, reductionMethod);
+        LOGGER.fine("getTensorAsPb: arrayId=" + arrayId);
+        RequestContext context = planRead(arrayId, sliceHint, scaleHint, reductionMethod);
 
         // The plan is Arrow's own FlightInfo, carried whole; only where and as
         // whom to read it is ours to add.
+        return serializedTensorOf(context.info);
+    }
+
+    private SerializedTensor serializedTensorOf(FlightInfo info) {
         SerializedTensor.Builder builder = SerializedTensor.newBuilder()
                 .setLocation(location.getUri().toString())
-                .setFlightInfo(ByteString.copyFrom(context.info.serialize()));
+                .setFlightInfo(ByteString.copyFrom(info.serialize()));
         if (token != null && !token.isEmpty()) {
             builder.setAuthToken(token);
         }
@@ -957,17 +1213,15 @@ public class TensorFlightClient implements AutoCloseable {
 
     /** The resolved descriptor a SerializedTensor's plan names. */
     public static TensorDescriptor descriptorOf(SerializedTensor pb) {
-        return parseDescriptorUnchecked(flightInfoOf(pb).getDescriptor().getCommand());
+        return TensorChunkCodec.descriptorOf(flightInfoOf(pb));
     }
 
     /**
      * The lazy imglib2 array a SerializedTensor describes.
      *
      * The one consumer-side helper. The handle is a FlightInfo plus where and
-     * as whom to read it; this decodes the plan's descriptor and the crop it
-     * was asked for, and returns the same lazily-reconstructing
-     * {@link SerializableTensorImg} a live getTensor returns, which plans its
-     * own GetFlightInfo on first access over a pooled connection.
+     * as whom to read it. Its plan is consumed directly on first access; only
+     * the documented endpoint-less progressive-discovery plan is refreshed.
      *
      * @param pb          SerializedTensor protobuf object
      * @param cacheBytes  Maximum cache size in bytes
@@ -978,44 +1232,13 @@ public class TensorFlightClient implements AutoCloseable {
             SerializedTensor pb,
             long cacheBytes) {
 
-        FlightInfo info = flightInfoOf(pb);
-        TensorDescriptor descriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
-
-        // The requested slice rides the plan's app_metadata (the descriptor's
-        // slice_hint is the chunk-aligned realized one).
-        SliceHint requested = null;
-        byte[] meta = info.getAppMetadata();
-        if (meta != null && meta.length > 0) {
-            try {
-                requested = SliceHint.parseFrom(meta);
-            } catch (InvalidProtocolBufferException e) {
-                throw new IllegalArgumentException("FlightInfo.app_metadata is not a SliceHint", e);
-            }
-        }
-
-        return new SerializableTensorImg<>(
-                LocationUris.parse(pb.getLocation()),
-                pb.getAuthToken().isEmpty() ? null : pb.getAuthToken(),
-                cacheBytes,
-                descriptor.getArrayId(),
-                descriptor.getArrayId(),  // tensorId == arrayId; server reduces to field
-                requested,
-                descriptor.getScaleHintList().isEmpty() ? null : toLongArray(descriptor.getScaleHintList()),
-                descriptor.getReductionMethod().isEmpty() ? null : descriptor.getReductionMethod(),
-                descriptor,
-                null);  // reconstructed lazily
+        return new SerializableTensorImg<>(pb, cacheBytes, null);
     }
 
     @Override
     public void close() {
         LOGGER.info("Closing Flight client");
-        try {
-            client.close();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } finally {
-            allocator.close();
-        }
+        session.close();
     }
 
     /**
@@ -1033,24 +1256,13 @@ public class TensorFlightClient implements AutoCloseable {
      * @throws IOException If action fails
      */
     public Map<String, Object> healthCheck() throws IOException {
-        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
-                "health",
-                ByteString.EMPTY.toByteArray());
-
-        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
-        if (iter.hasNext()) {
-            org.apache.arrow.flight.Result result = iter.next();
-            byte[] body = result.getBody();
-            if (body != null && body.length > 0) {
-                return GSON.fromJson(new String(body, java.nio.charset.StandardCharsets.UTF_8),
-                        new TypeToken<Map<String, Object>>() {
-                        }.getType());
-            }
-        }
-
         Map<String, Object> unknown = new HashMap<>();
         unknown.put("status", "UNKNOWN");
-        return unknown;
+        try {
+            return session.health().orElse(unknown);
+        } catch (FlightRuntimeException error) {
+            throw TensorErrorMapper.map(error);
+        }
     }
 
     /**
@@ -1064,8 +1276,8 @@ public class TensorFlightClient implements AutoCloseable {
         // A describe-only GetFlightInfo, not an action: doAction takes the
         // server-wide token, while the caller waiting on a fast-return result
         // holds a per-source read capability and nothing else (biopb/biopb#1048).
-        // Deliberately neither reads nor writes `descriptors` -- a cached copy of
-        // the one field whose purpose is freshness would defeat the poll.
+        // This is deliberately a fresh describe: caching the one field whose
+        // purpose is freshness would defeat the poll.
         TensorReadOption readOpt = TensorReadOption.newBuilder()
                 .setArrayId(sourceId)
                 .setFields(readMask("upload_status"))
@@ -1074,10 +1286,9 @@ public class TensorFlightClient implements AutoCloseable {
 
         TensorDescriptor desc;
         try {
-            FlightInfo info = client.getInfo(
-                    FlightDescriptor.command(cmd.toByteArray()), authOption);
-            desc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
-        } catch (FlightRuntimeException exc) {
+            FlightInfo info = session.getInfo(FlightDescriptor.command(cmd.toByteArray()));
+            desc = TensorChunkCodec.descriptorOf(info);
+        } catch (TensorNotFoundException | FlightRuntimeException exc) {
             // An id the server does not serve. UNKNOWN already means "no upload
             // record here", and an unregistered source is the strongest form of
             // that, so it is the same answer rather than a transport error.
@@ -1087,14 +1298,7 @@ public class TensorFlightClient implements AutoCloseable {
             // Registered, but not an upload -- an ordinary catalog source.
             return unknownUploadStatus(sourceId);
         }
-        UploadStatus status = desc.getUploadStatus();
-        Map<String, Object> out = new HashMap<>();
-        out.put("source_id", sourceId);
-        out.put("state", status.getState().name());
-        out.put("expected_chunks", (double) status.getExpectedChunks());
-        out.put("uploaded_chunks", (double) status.getUploadedChunks());
-        out.put("reason", status.getReason());
-        return out;
+        return TensorUploads.statusMap(sourceId, desc.getUploadStatus());
     }
 
     /** The answer for a source the server tracks no upload for. */
@@ -1108,148 +1312,315 @@ public class TensorFlightClient implements AutoCloseable {
         return unknown;
     }
 
-    // Note: Upload API (uploadCellImg) not yet implemented for Java client.
-    // Use the Python client for upload functionality.
+    // ====================
+    // Upload API (EXPERIMENTAL) -- thin delegators onto the TensorUploads
+    // collaborator. Status polling is a read of one descriptor field and stays
+    // above, with the other catalog reads.
+    // ====================
 
-    private RequestContext getTensorContext(
-            String sourceId,
-            String tensorId,
+    /**
+     * Declare a single-tensor source to fill: the first half of an upload.
+     *
+     * <p><b>Experimental.</b> The upload / writable-source API (tensor
+     * creation, chunk upload, and upload-status polling) may change.
+     *
+     * <p>Declare, then fill. The returned descriptor is the server's echo --
+     * array_id, shape, dtype, chunk_shape, dim_labels -- and is what
+     * {@link #uploadArray}, {@link #uploadChunk} and {@link #finishUpload}
+     * take. A name is taken while its source exists: a second create under it
+     * -- pending, finished or discarded -- is refused. Only the server's
+     * reclaim sweep frees one, after a discarded upload's {@code upload_ttl}.
+     * {@link #finishUpload} is what marks the upload complete.
+     *
+     * @param sourceName {@code "cache:name"} for cache-backed,
+     *        {@code "ome_zarr:name"} for zarr-backed, either prefix with an
+     *        empty name for a server-generated one, or
+     *        {@code "<image array_id>/labels/<name>"} for a label set of an
+     *        image the server already serves -- the one form whose id is the
+     *        request's own rather than a minted source_id. A set is
+     *        unsigned-integer, spans its image's non-channel axes at full
+     *        length, and its all-zero chunks are skipped by
+     *        {@link #uploadArray}
+     * @param shape the tensor's shape
+     * @param dtype the numpy dtype string to store it as (e.g. {@code "<u2"})
+     * @param chunkShape the upload grid; null or empty means one chunk
+     * @param dimLabels optional dimension labels
+     * @param omeMetadataJson optional OME metadata, as a JSON object
+     * @return the new source's descriptor
+     */
+    public TensorDescriptor createTensor(
+            String sourceName,
+            long[] shape,
+            String dtype,
+            long[] chunkShape,
+            List<String> dimLabels,
+            String omeMetadataJson) {
+        return uploads.createTensor(sourceName, shape, dtype, chunkShape, dimLabels, omeMetadataJson);
+    }
+
+    /**
+     * Declare a source shaped like an array you already hold.
+     *
+     * <p><b>Experimental</b>, with the rest of the upload API. The template's
+     * shape and pixel type stand in for the explicit {@code shape}/{@code dtype}
+     * of {@link #createTensor(String, long[], String, long[], List, String)};
+     * it is the array about to be uploaded, or one shaped like it.
+     *
+     * @param sourceName as in
+     *        {@link #createTensor(String, long[], String, long[], List, String)}
+     * @param template the array to be uploaded, or one shaped like it
+     * @param chunkShape the upload grid; null or empty means one chunk
+     * @param dimLabels optional dimension labels
+     * @param omeMetadataJson optional OME metadata, as a JSON object
+     * @param <T> the pixel type
+     * @return the new source's descriptor
+     */
+    public <T extends NativeType<T> & RealType<T>> TensorDescriptor createTensor(
+            String sourceName,
+            RandomAccessibleInterval<T> template,
+            long[] chunkShape,
+            List<String> dimLabels,
+            String omeMetadataJson) {
+        long[] shape = new long[template.numDimensions()];
+        template.dimensions(shape);
+        return uploads.createTensor(sourceName, shape, TensorUploads.numpyDtype(template.getType()),
+                chunkShape, dimLabels, omeMetadataJson);
+    }
+
+    /**
+     * Fill a declared tensor with an array, and seal it.
+     *
+     * <p><b>Experimental</b>, with the rest of the upload API.
+     *
+     * <p>{@code array} must match the descriptor's shape; it is walked on the
+     * descriptor's chunk grid, every block is sent as one chunk, and the source
+     * is finished. An all-zero block of a <i>label set</i> is not sent at all:
+     * the store's fill value already reads as background, so one labelled frame
+     * of a thousand costs one frame (biopb/biopb#1059).
+     *
+     * @param descriptor the descriptor {@link #createTensor} returned
+     * @param array the array to upload
+     * @param <T> the pixel type
+     * @return the sealed upload status, as {@link #getUploadStatus} reports it
+     * @throws IllegalArgumentException if {@code array} does not match the
+     *         declared shape
+     * @throws UploadRefusedException if the upload is over -- sealed or
+     *         discarded
+     */
+    public <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
+            TensorDescriptor descriptor, RandomAccessibleInterval<T> array) {
+        return uploads.uploadArray(descriptor, array);
+    }
+
+    /**
+     * Upload one chunk of a declared tensor.
+     *
+     * <p><b>Experimental</b>, with the rest of the upload API.
+     *
+     * <p>The manual half of {@link #uploadArray}: a caller writing chunks
+     * itself calls this per chunk and {@link #finishUpload} when done. The
+     * chunk's elements are read out of {@code source} at {@code bounds} -- in
+     * that interval's own global coordinates, so the whole array can be passed
+     * for every chunk.
+     *
+     * @param descriptor the descriptor {@link #createTensor} returned
+     * @param bounds chunk start/stop coordinates
+     * @param source the array to read the chunk out of
+     * @param <T> the pixel type
+     * @throws UploadRefusedException if the upload is over -- sealed or
+     *         discarded
+     */
+    public <T extends NativeType<T> & RealType<T>> void uploadChunk(
+            TensorDescriptor descriptor, ChunkBounds bounds, RandomAccessibleInterval<T> source) {
+        uploads.uploadChunk(descriptor, bounds, source);
+    }
+
+    /**
+     * Seal an upload: the source is complete and takes no further chunks.
+     *
+     * <p><b>Experimental</b>, with the rest of the upload API.
+     *
+     * <p>The only route to READY, which is the state a consumer waiting on this
+     * result polls for. {@link #uploadArray}, which writes every chunk itself,
+     * calls it for you.
+     *
+     * @param descriptor the descriptor {@link #createTensor} returned
+     * @return the sealed upload status, as {@link #getUploadStatus} reports it
+     * @throws UploadRefusedException if the upload was discarded
+     */
+    public Map<String, Object> finishUpload(TensorDescriptor descriptor) {
+        return uploads.finishUpload(descriptor);
+    }
+
+    /**
+     * Consume a streaming action, handing each non-empty message to
+     * {@code onMessage}; returning false from it stops consuming.
+     *
+     * <p>The loop shared by {@link #resolve} / {@link #warm} /
+     * {@link #addSource}: the {@code doAction} call, the empty-body heartbeat
+     * skip, the envelope parse, and the old-server {@code "Unknown action"}
+     * remap, applied only when {@code unavailableHint} is given.
+     *
+     * <p><b>Stopping cancels the RPC.</b> The call is created inside a
+     * {@link Context.CancellableContext}, which gRPC ties to it, so cancelling
+     * the scope cancels the call and the server observes it -- the same thing
+     * Python gets by closing its generator, and what lets a server stop a walk
+     * it is halfway through rather than finish it for nobody. It happens on
+     * every exit, so a caller that throws out of {@code onMessage}
+     * (resolve/warm raise on cancel) also releases the server.
+     *
+     * <p>A message that does not parse as {@code M} is skipped. Python can call
+     * that harmless because its SDK refuses a pre-v2 server at connect; this
+     * client has no such handshake yet, so against a v1 server the skip is what
+     * turns a protocol mismatch into "returned no terminal result". Reported at
+     * the caller, which is the best this can do until the health-action
+     * {@code protocol} check is ported.
+     *
+     * <p>Cancellation policy is deliberately NOT decided here: its semantics
+     * differ per caller (resolve/warm raise, addSource returns what it has),
+     * and the poll must run relative to a consumed message, which only the
+     * caller knows the right side of.
+     */
+    private <M extends com.google.protobuf.Message> void streamAction(
+            String type,
+            byte[] body,
+            com.google.protobuf.Parser<M> parser,
+            java.util.function.Predicate<M> onMessage,
+            String unavailableHint) throws IOException {
+        Action action = new Action(type, body);
+        Context.CancellableContext scope = Context.current().withCancellation();
+        try {
+            java.util.Iterator<Result> results;
+            // The call must be created under the scope for gRPC to bind the two;
+            // attaching only for that instant keeps it off the caller's thread.
+            Context previous = scope.attach();
+            try {
+                results = session.doAction(action);
+            } finally {
+                scope.detach(previous);
+            }
+
+            while (results.hasNext()) {
+                byte[] message = results.next().getBody();
+                if (message == null || message.length == 0) {
+                    continue; // legacy empty-body heartbeat (a server predating progress)
+                }
+                M parsed;
+                try {
+                    parsed = parser.parseFrom(message);
+                } catch (InvalidProtocolBufferException ignored) {
+                    continue;
+                }
+                if (!onMessage.test(parsed)) {
+                    return;
+                }
+            }
+        } catch (FlightRuntimeException error) {
+            throw tooOld(error, type, unavailableHint);
+        } finally {
+            // Cancelling a stream already drained is a no-op, so this needs no
+            // flag for "did we stop early".
+            scope.cancel(null);
+        }
+    }
+
+    /**
+     * Run a single-result {@code doAction}, with the same "old server" remap
+     * {@link #streamAction} gives the streaming actions.
+     */
+    private byte[] doActionOneResult(String type, byte[] body, String unavailableHint)
+            throws IOException {
+        Result result;
+        try {
+            java.util.Iterator<Result> results = session.doAction(new Action(type, body));
+            result = results.hasNext() ? results.next() : null;
+        } catch (FlightRuntimeException error) {
+            throw tooOld(error, type, unavailableHint);
+        }
+        if (result == null) {
+            throw new IOException(type + " returned no result");
+        }
+        byte[] answer = result.getBody();
+        return answer == null ? new byte[0] : answer;
+    }
+
+    /**
+     * A feature the server predates, named as such; anything else unchanged.
+     *
+     * <p>{@code unavailableHint} is the feature-specific lead-in (e.g. "Source
+     * removal is unavailable"); without one the Flight error passes through, so
+     * an action every server has cannot be misreported as missing.
+     */
+    private static RuntimeException tooOld(
+            FlightRuntimeException error, String type, String unavailableHint) {
+        if (unavailableHint != null && String.valueOf(error.getMessage()).contains("Unknown action")) {
+            return new UnsupportedOperationException(unavailableHint
+                    + ": the tensor server is too old to support the '" + type
+                    + "' action. Upgrade the server.", error);
+        }
+        return error;
+    }
+
+    /**
+     * Plan one v2 read. The response descriptor, including its transfer grid,
+     * belongs to this request and is never cached.
+     */
+    private RequestContext planRead(
+            String arrayId,
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
-
-        LOGGER.fine("getTensor: sourceId=" + sourceId + ", tensorId=" + tensorId);
-
-        // A fully-qualified tensorId that is already cached (a prior getTensor
-        // or getDescriptor on it) needs neither the catalog row nor a probe --
-        // this is the repeat-read hot path.
-        TensorDescriptor baseDescriptor = tensorId != null ? descriptors.get(tensorId) : null;
-
-        if (baseDescriptor == null) {
-            // One addressed catalog row. No catalog to ask (a capability token
-            // reads one source's pixels, not the catalog) falls through to the
-            // per-tensor probe below, which is the private path.
-            List<TensorDescriptor> tensors = null;
-            boolean resolved = true;
-            try (VectorSchemaRoot row = fetchSourceRow(sourceId)) {
-                if (row != null) {
-                    tensors = tensorsFromRow(row, 0);
-                    resolved = isResolved(row, 0);
-                }
-            } catch (IOException | RuntimeException ignored) {
-                // fall through to the per-tensor probe
-            }
-            if (tensors == null) {
-                // Probe the server directly. Swallow a fetch failure and let the
-                // clean "Source not found" below surface (matches the Python
-                // client). A probe that answers has resolved the tensor by
-                // definition.
-                try {
-                    tensors = java.util.Collections.singletonList(
-                            fetchTensorDescriptor(sourceId, tensorId));
-                    resolved = true;
-                } catch (RuntimeException ignored) {
-                    // fall through to the clean error below
-                }
-            }
-            if (tensors == null) {
-                throw new IllegalArgumentException("Source not found: " + sourceId);
-            }
-
-            // Resolve a null tensorId (the bare-source_id array_id path).
-            if (tensorId == null) {
-                int n = tensors.size();
-                if (n == 1) {
-                    tensorId = tensors.get(0).getArrayId();
-                } else if (n == 0) {
-                    // The server's flag, not the empty tensor list: "nothing to
-                    // address" also describes a source that resolved and had
-                    // nothing readable in it, and telling that user to resolve
-                    // sends them at an operation that can only succeed and
-                    // change nothing (biopb/biopb#1032).
-                    if (!resolved) {
-                        throw unresolvedSourceError(sourceId);
-                    }
-                    throw new IllegalArgumentException(
-                            "Source '" + sourceId + "' has no readable tensors");
-                } else {
-                    throw new IllegalArgumentException(
-                            "Source '" + sourceId + "' has multiple tensors (" + n
-                                    + "); a within-source field must be specified (use \"source_id/field\")");
-                }
-            }
-
-            // Find the tensor entry to get shape for validation; fall back to a
-            // direct server fetch when the cached row is stale/partial.
-            for (TensorDescriptor tensor : tensors) {
-                if (tensor.getArrayId().equals(tensorId)) {
-                    baseDescriptor = tensor;
-                    break;
-                }
-            }
-            if (baseDescriptor == null) {
-                // Stale/partial cached row -- probe the server. Swallow a fetch
-                // failure and surface the clean "not found" below (matches Python).
-                try {
-                    baseDescriptor = fetchTensorDescriptor(sourceId, tensorId);
-                } catch (RuntimeException ignored) {
-                    // fall through to the clean error below
-                }
-            }
-            if (baseDescriptor == null) {
-                throw new IllegalArgumentException(
-                        "Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
-            }
-        }
-
-        // Validate scale hint dimensionality if provided
-        if (scaleHint != null && scaleHint.length > 0) {
-            int rank = baseDescriptor.getShapeCount();
-            if (scaleHint.length != rank) {
-                throw new IllegalArgumentException(
-                        "Scale hint dimensionality mismatch: expected " + rank
-                                + ", got " + scaleHint.length);
-            }
-            for (int axis = 0; axis < scaleHint.length; axis++) {
-                if (scaleHint[axis] <= 0) {
-                    throw new IllegalArgumentException(
-                            "Scale hint must be positive on axis " + axis + ": " + scaleHint[axis]);
-                }
-            }
-        }
-
-        // Normalize reduction method
-        String normalizedReductionMethod = normalizeReductionMethod(reductionMethod);
-
-        // Build TensorReadOption with flattened fields
-        // The read path: `endpoints` is what it came for.
-        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setArrayId(tensorId)
+        TensorReadOption.Builder read = TensorReadOption.newBuilder()
+                .setArrayId(arrayId)
                 .setFields(readMask("endpoints"));
-
         if (sliceHint != null) {
-            readBuilder.setSliceHint(sliceHint);
+            read.setSliceHint(sliceHint);
         }
         if (scaleHint != null) {
-            for (long s : scaleHint) {
-                readBuilder.addScaleHint(s);
+            for (long scale : scaleHint) {
+                read.addScaleHint(scale);
             }
         }
-        if (normalizedReductionMethod != null && !normalizedReductionMethod.isEmpty()) {
-            readBuilder.setReductionMethod(normalizedReductionMethod);
+        String normalized = normalizeReductionMethod(reductionMethod);
+        if (!normalized.isEmpty()) {
+            read.setReductionMethod(normalized);
         }
 
-        FlightRequest cmd = FlightRequest.newBuilder()
-                .setTensorRead(readBuilder.build())
-                .build();
-        FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
+        FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
+        FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
         checkSchemaVersion(info);
-        TensorDescriptor responseDescriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
+        TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(info);
+        refuseAmbiguousDefault(arrayId, descriptor.getArrayId());
+        return new RequestContext(descriptor, info);
+    }
 
-        // Cache the response descriptor
-        descriptors.put(responseDescriptor.getArrayId(), responseDescriptor);
+    /** Describe one tensor without requesting the O(chunks) endpoint plan. */
+    private TensorDescriptor describe(
+            String arrayId, com.google.protobuf.FieldMask fields) {
+        TensorReadOption read = TensorReadOption.newBuilder()
+                .setArrayId(arrayId)
+                .setFields(fields)
+                .build();
+        FlightRequest request = FlightRequest.newBuilder().setTensorRead(read).build();
+        FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
+        checkSchemaVersion(info);
+        return TensorChunkCodec.descriptorOf(info);
+    }
 
-        return new RequestContext(responseDescriptor, info);
+    /** A bare id is valid only when the catalog can confirm it is unambiguous. */
+    private void refuseAmbiguousDefault(String requestedArrayId, String resolvedArrayId) {
+        if (requestedArrayId.equals(resolvedArrayId) || requestedArrayId.indexOf('/') >= 0) {
+            return;
+        }
+        try (VectorSchemaRoot row = fetchSourceRow(sourceIdFromArrayId(requestedArrayId))) {
+            if (row != null && tensorsFromRow(row, 0).size() > 1) {
+                throw new IllegalArgumentException(
+                        "Source '" + requestedArrayId + "' has multiple tensors; use a qualified array_id");
+            }
+        } catch (IOException | FlightRuntimeException ignored) {
+            // A capability token cannot browse the catalog. The server's planned
+            // response is still usable, and older servers cannot state substitution.
+        }
     }
 
     private static String normalizeReductionMethod(String reductionMethod) {
@@ -1278,121 +1649,12 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> createArray(
-            RequestContext context) {
-
-        T type = (T) createType(context.descriptor.getDtype());
-        long[] dims = toLongArray(context.descriptor.getShapeList());
-        int[] cellDimensions = toIntArray(context.descriptor.getChunkShapeList());
-
-        ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
-                context.info.getEndpoints(), dims, cellDimensions,
-                ep -> parseChunkBounds(ep.getAppMetadata()),
-                ep -> ep);
-        if (endpointIndex == null) {
-            return materializeArray(context);
-        }
-
-        long estimatedChunkBytes = estimateChunkBytes(context.descriptor);
-        long maxCells = Math.max(1L, cacheBytes / Math.max(estimatedChunkBytes, 1L));
-        ReadOnlyCachedCellImgOptions options = ReadOnlyCachedCellImgOptions.options()
-                .cellDimensions(cellDimensions)
-                .cacheType(CacheType.BOUNDED)
-                .maxCacheSize(maxCells);
-
-        ReadOnlyCachedCellImgFactory factory = new ReadOnlyCachedCellImgFactory(options);
-        return (RandomAccessibleInterval<T>) factory.create(dims, type,
-                cell -> loadCell(cell, endpointIndex));
-    }
-
-    @SuppressWarnings("unchecked")
-    private <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> materializeArray(
-            RequestContext context) {
-
-        T type = (T) createType(context.descriptor.getDtype());
-        long[] dims = toLongArray(context.descriptor.getShapeList());
-        ArrayImg<T, ?> image = (ArrayImg<T, ?>) new ArrayImgFactory<>(type).create(dims);
-        RandomAccess<T> access = image.randomAccess();
-
-        for (FlightEndpoint endpoint : context.info.getEndpoints()) {
-            TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
-            ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-            double[] values = fetchChunkValues(ticket.getChunkId().toByteArray());
-            writeChunk(access, bounds, values);
-        }
-
-        return image;
-    }
-
-    private <T extends NativeType<T> & RealType<T>> void loadCell(
-            SingleCellArrayImg<T, ?> cell,
-            ChunkGridIndex<FlightEndpoint> endpointIndex) {
-
-        long cellIndex = endpointIndex.indexFor(cell);
-        FlightEndpoint endpoint = endpointIndex.get(cellIndex);
-        if (endpoint == null) {
-            throw new IllegalStateException("No Flight endpoint found for cell index " + cellIndex);
-        }
-
-        TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
-        ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-        double[] values = fetchChunkValues(ticket.getChunkId().toByteArray());
-        writeChunk(cell.randomAccess(), bounds, values);
-    }
-
-    private double[] fetchChunkValues(byte[] chunkId) {
-        LOGGER.fine("fetchChunk: chunkId=" + bytesToHex(chunkId, 16));
-        TensorTicket tensorTicket = TensorTicket.newBuilder()
-                .setChunkId(ByteString.copyFrom(chunkId))
-                .build();
-
-        try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
-            double[] values = new double[0];
-            while (stream.next()) {
-                // Unified binary chunk schema (biopb/biopb#293): "data" is one
-                // opaque byte[] per row, "dtype" names how to reinterpret it.
-                FieldVector dataVector = stream.getRoot().getVector("data");
-                FieldVector dtypeVector = stream.getRoot().getVector("dtype");
-                if (dataVector == null || dtypeVector == null) {
-                    throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
-                }
-
-                int rowCount = stream.getRoot().getRowCount();
-                for (int row = 0; row < rowCount; row++) {
-                    Object rowObj = dataVector.getObject(row);
-                    if (!(rowObj instanceof byte[])) {
-                        throw new IllegalStateException("Data column value is not binary: "
-                                + (rowObj == null ? "null" : rowObj.getClass()));
-                    }
-                    Object dtypeObj = dtypeVector.getObject(row);
-                    double[] decoded = ChunkDecoder.decodeChunkBytes((byte[]) rowObj,
-                            dtypeObj == null ? "" : dtypeObj.toString());
-                    int offset = values.length;
-                    values = Arrays.copyOf(values, offset + decoded.length);
-                    System.arraycopy(decoded, 0, values, offset, decoded.length);
-                }
-            }
-            return values;
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to fetch chunk payload", e);
-        }
-    }
-
-    private static String bytesToHex(byte[] bytes, int limit) {
-        StringBuilder sb = new StringBuilder();
-        int len = Math.min(bytes.length, limit);
-        for (int i = 0; i < len; i++) {
-            sb.append(String.format("%02x", bytes[i]));
-        }
-        if (bytes.length > limit) {
-            sb.append("...");
-        }
-        return sb.toString();
-    }
-
     private static void checkSchemaVersion(FlightInfo info) {
-        // Advisory only: a malformed version string must never fail a read.
+        // Advisory only, and NOT a compatibility gate: tensor_schema_version is
+        // the server package's own release tag, which says nothing about the
+        // wire. The two real gates are the health action's `protocol`
+        // (FlightSession) and the schema's `chunk_wire_protocol`
+        // (Imglib2TensorFactory). A malformed version string must never fail a read.
         try {
             java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
             if (!schemaOpt.isPresent()) {
@@ -1453,14 +1715,6 @@ public class TensorFlightClient implements AutoCloseable {
         return new int[] { major, minor, patch };
     }
 
-    private static TensorDescriptor parseDescriptorUnchecked(byte[] bytes) {
-        try {
-            return TensorDescriptor.parseFrom(bytes);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to parse TensorDescriptor", e);
-        }
-    }
-
     private static final Gson GSON = new Gson();
 
     private static Map<String, Object> parseMetadataJson(String json) {
@@ -1493,23 +1747,6 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Split an array_id into a {@code {sourceId, tensorId}} route for getTensor.
-     *
-     * <p>A qualified {@code "source_id/field"} routes to
-     * {@code {source_id, full-array_id}}; a bare {@code "source_id"} returns
-     * {@code {source_id, null}}, leaving the tensorId unset so getTensorContext
-     * resolves the source's sole/default tensor.
-     *
-     * <p>Package-private for unit testing.
-     */
-    static String[] resolveArrayId(String arrayId) {
-        if (arrayId.indexOf('/') >= 0) {
-            return new String[] { sourceIdFromArrayId(arrayId), arrayId };
-        }
-        return new String[] { arrayId, null };
-    }
-
-    /**
      * Directive error for reading an unresolved (cloud / synced-folder) source.
      *
      * <p>Shared by every read entry point so the guidance is uniform: name the
@@ -1526,22 +1763,6 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Fetch one tensor's descriptor directly from the server.
-     *
-     * <p>Backs {@link #getDescriptor} and {@link #getPhysicalScale}. Uses the
-     * per-tensor GetFlightInfo RPC, which works even when the source is beyond
-     * the server's query row cap. A null/empty tensorId, or a
-     * tensorId equal to the sourceId, anchors on the source's default (first)
-     * tensor via the empty-tensor_id path (the server resolves it, #44); a
-     * within-source field is sent verbatim. This is a CHEAP probe: it does NOT
-     * resolve -- an unresolved (cloud / synced-folder) source is restated as the
-     * {@link #unresolvedSourceError} directive steering the caller to
-     * {@link #resolve}, rather than triggering a download.
-     *
-     * <p>The descriptor is cached in {@code descriptors}, keyed by the
-     * echoed-back array_id.
-     */
-    /**
      * A read mask naming the optional parts wanted.
      *
      * <p>The wire takes a {@link com.google.protobuf.FieldMask} (Flight protocol
@@ -1555,36 +1776,6 @@ public class TensorFlightClient implements AutoCloseable {
             b.addPaths(path);
         }
         return b.build();
-    }
-
-    private TensorDescriptor fetchTensorDescriptor(String sourceId, String tensorId) {
-        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-                .setFields(readMask("metadata_json"))
-                .setArrayId(tensorId == null || tensorId.isEmpty() ? sourceId : tensorId);
-        FlightRequest cmd = FlightRequest.newBuilder()
-                .setTensorRead(readBuilder.build())
-                .build();
-        FlightInfo info;
-        try {
-            info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
-        } catch (FlightRuntimeException exc) {
-            // GetFlightInfo no longer resolves on serve: an unresolved (cloud /
-            // synced-folder) source refuses with an "unresolved" error instead of
-            // silently downloading. Restate it as the shared directive so the
-            // caller is pointed at the explicit, consented resolve().
-            String msg = exc.getMessage();
-            if (msg != null && msg.toLowerCase().contains("unresolved")) {
-                throw unresolvedSourceError(sourceId);
-            }
-            throw exc;
-        }
-        TensorDescriptor tensorDesc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
-        // Cache the structure, never the upload status: a cached PENDING would
-        // shadow the READY a later poll came for (biopb/biopb#1048).
-        descriptors.put(
-                tensorDesc.getArrayId(),
-                tensorDesc.toBuilder().clearUploadStatus().build());
-        return tensorDesc;
     }
 
     /**
@@ -1617,7 +1808,7 @@ public class TensorFlightClient implements AutoCloseable {
         final FlightInfo info;
 
         RequestContext(TensorDescriptor descriptor, FlightInfo info) {
-            this.descriptor = parseDescriptorUnchecked(descriptor.toByteArray());
+            this.descriptor = descriptor;
             this.info = info;
         }
     }

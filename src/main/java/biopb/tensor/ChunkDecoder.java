@@ -28,30 +28,16 @@ final class ChunkDecoder {
     static double[] decodeChunkBytes(byte[] raw, String dtypeStr) {
         String s = dtypeStr == null ? "" : dtypeStr.trim().toLowerCase();
         ByteOrder order = s.startsWith(">") ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
-        String body = s;
-        if (!body.isEmpty()) {
-            char c0 = body.charAt(0);
-            if (c0 == '<' || c0 == '>' || c0 == '|' || c0 == '=') {
-                body = body.substring(1);
-            }
+        // The byte-order mark and the spelled-out aliases are folded away by
+        // the same normalizer createType and bytesPerElement use, so this
+        // decode and the imglib2 type it lands in cannot disagree about a
+        // dtype -- which would be a silent reinterpretation of the bytes.
+        String body = TensorChunkCodec.normalizeDtype(s);
+        char kind = body.isEmpty() ? 'f' : body.charAt(0);   // 'u', 'i' or 'f'
+        if (kind != 'u' && kind != 'i') {
+            kind = 'f';
         }
-
-        char kind;   // 'u' unsigned int, 'i' signed int, 'f' float
-        int size;    // bytes per element
-        switch (body) {
-            case "u1": case "uint8":   kind = 'u'; size = 1; break;
-            case "i1": case "int8":    kind = 'i'; size = 1; break;
-            case "u2": case "uint16":  kind = 'u'; size = 2; break;
-            case "i2": case "int16":   kind = 'i'; size = 2; break;
-            case "u4": case "uint32":  kind = 'u'; size = 4; break;
-            case "i4": case "int32":   kind = 'i'; size = 4; break;
-            case "u8": case "uint64":  kind = 'u'; size = 8; break;
-            case "i8": case "int64":   kind = 'i'; size = 8; break;
-            case "f8": case "float64": kind = 'f'; size = 8; break;
-            case "f2": case "float16": kind = 'f'; size = 2; break;
-            case "f4": case "float32":
-            default:                   kind = 'f'; size = 4; break;
-        }
+        int size = TensorChunkCodec.bytesPerElement(body);   // unknown dtypes assume f4
 
         ByteBuffer buf = ByteBuffer.wrap(raw).order(order);
         int n = size == 0 ? 0 : raw.length / size;

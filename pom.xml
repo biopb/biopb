@@ -132,6 +132,16 @@
 			<version>2.10.1</version>
 		</dependency>
 
+		<!-- JsonFormat: the ROI row schema carries geometry as canonical proto3
+		     JSON, the same text the server's catalog stores. It arrives
+		     transitively through grpc-services; named here because this SDK
+		     compiles against it. -->
+		<dependency>
+			<groupId>com.google.protobuf</groupId>
+			<artifactId>protobuf-java-util</artifactId>
+			<version>${protoc.version}</version>
+		</dependency>
+
 		<dependency>
 			<groupId>junit</groupId>
 			<artifactId>junit</artifactId>

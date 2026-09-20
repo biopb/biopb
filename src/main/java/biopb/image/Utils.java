@@ -7,7 +7,6 @@ import java.util.logging.Logger;
 import com.google.protobuf.ByteString;
 
 import biopb.tensor.LocationUris;
-import biopb.tensor.SerializableTensorImg;
 import biopb.tensor.SerializedTensor;
 import biopb.tensor.TensorFlightClient;
 import net.imglib2.RandomAccessibleInterval;
@@ -718,8 +717,8 @@ public final class Utils {
      * Also handles legacy pixels field for backward compatibility.
      *
      * @param imageData the protobuf message containing serialized image data
-     * @return a RandomAccessibleInterval (ArrayImg for eager_data, or
-     *         SerializableTensorImg for lazy_data)
+     * @return a RandomAccessibleInterval (ArrayImg for eager_data, or a lazy
+     *         Flight-plan-backed interval for lazy_data)
      * @throws IllegalArgumentException if no data field is set or dtype is unsupported
      */
     public static RandomAccessibleInterval<?> deserializeImageData(ImageData imageData) {
@@ -742,13 +741,13 @@ public final class Utils {
     }
 
     /**
-     * Reconstruct a SerializableTensorImg from SerializedTensor protobuf.
+     * Reconstruct a lazy interval from a SerializedTensor protobuf.
      *
      * The returned RandomAccessibleInterval is a lazy imglib2 CellImg that
      * fetches chunks on-demand from the Flight server.
      *
      * @param serializedTensor the SerializedTensor protobuf
-     * @return a SerializableTensorImg wrapping the lazy tensor
+     * @return a lazy interval wrapping the tensor's immutable Flight plan
      */
     private static RandomAccessibleInterval<?> reconstructFromSerializedTensor(SerializedTensor serializedTensor) {
         return TensorFlightClient.tensorFromPb(serializedTensor, 100_000_000L);
