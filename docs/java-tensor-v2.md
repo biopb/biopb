@@ -44,6 +44,10 @@ A server advertises three version signals and only two of them are contracts:
 | `chunk_wire_protocol` | schema metadata on every read plan | the chunk *encoding*. v1 was `data: list<T>`; v2 is one binary blob plus a numpy dtype string (biopb/biopb#293), which is what `ChunkDecoder` reads. |
 | `tensor_schema_version` | same schema | the server package's release tag. Informational -- the server's own comment says so -- and nothing to do with the wire. |
 
+A fourth, `format_version` in the `chunk_locate` reply, versions the cache-file
+handoff this SDK does not implement. That three of the four are contracts and
+one is a release tag sitting in the same metadata dict is biopb/biopb#1070.
+
 `FlightSession` probes the first on first use, so building a client stays free
 of I/O and a v1 server is named rather than sent a request it will parse as
 something else. `Imglib2TensorFactory` checks the second where a plan becomes
