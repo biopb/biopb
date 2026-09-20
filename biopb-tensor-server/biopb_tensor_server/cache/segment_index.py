@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 # serializes the schema exactly once (taken from the first batch written to the
 # segment), so per-batch schema metadata is lost on read-back and every batch
 # would report the first entry's key. A column value is stored per row and
-# round-trips correctly. See scan_segment_records.
+# round-trips correctly. Read back by ``scan_segment_records`` and by
+# ``file_backend`` to confirm a byte range holds the entry it is indexed under.
 CACHE_KEY_FIELD = "__biopb_cache_key__"
 
 # Per-segment sidecar index (biopb/biopb#300). Each sealed segment gets a

@@ -574,14 +574,13 @@ class TestNormalizedCaching:
             finally:
                 CacheManager.reset()
 
-    def test_format_version_was_bumped_for_the_transpose(self):
-        from biopb.tensor._pool import _CACHEFILE_SUPPORTED_FORMAT
+    def test_the_segment_marker_still_refuses_pre_transpose_segments(self):
+        """This server must never read back a v1 segment: it holds
+        pre-transpose bytes under an id that is still valid, so the marker
+        never goes below 2."""
         from biopb_tensor_server.cache.bootstrap import CACHE_FILE_FORMAT_VERSION
 
         assert CACHE_FILE_FORMAT_VERSION >= 2
-        # The layout did not change, so this client parses the new version; an
-        # older one declines the fast path and falls back to do_get.
-        assert _CACHEFILE_SUPPORTED_FORMAT >= CACHE_FILE_FORMAT_VERSION
 
 
 # ==============================================================================

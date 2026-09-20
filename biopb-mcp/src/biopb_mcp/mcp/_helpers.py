@@ -177,7 +177,7 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
         Returns:
             The name of the created viewer layer.
         """
-        from biopb.tensor.client import _split_array_id
+        from biopb.tensor.client import split_array_id
 
         from .._tensor_utils import add_tensor_layer
 
@@ -190,7 +190,7 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
         # a routing convenience (descriptor.proto's identity policy). Splitting
         # it here is what lets this call address like every other tensor call --
         # a bare source_id still lands on `tensor_id=None` below.
-        source_id, qualified_id = _split_array_id(array_id)
+        source_id, qualified_id = split_array_id(array_id)
         if tensor_id is None:
             tensor_id = qualified_id
 

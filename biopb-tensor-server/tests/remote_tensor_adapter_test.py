@@ -418,7 +418,7 @@ class TestRemoteTensorProxy:
                 # and the seeded indexed_at rides as the envelope's content_version.
                 for ce in plan.chunk_endpoints:
                     assert is_proxy_envelope(ce.chunk_id)
-                    route, cv, _inner = peel_proxy_envelope(ce.chunk_id)
+                    route, _epoch, cv, _inner = peel_proxy_envelope(ce.chunk_id)
                     assert route == "hpc__aics"
                     assert cv == b"iat:2026-07-19 00:00:00"
                     assert routing_array_id(ce.chunk_id) == "hpc__aics"

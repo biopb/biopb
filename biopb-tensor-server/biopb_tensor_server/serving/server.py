@@ -44,7 +44,7 @@ from biopb.image.annotation_pb2 import (
     RoiPutResult,
     RoiUnseen,
 )
-from biopb.tensor._session import _split_array_id
+from biopb.tensor._session import split_array_id
 from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -72,7 +72,7 @@ from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
-from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
+from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
@@ -344,7 +344,7 @@ def _roi_source_id(array_id: str) -> str:
     """
     if not array_id:
         raise ValueError("array_id is required")
-    source_id, _ = _split_array_id(array_id)
+    source_id, _ = split_array_id(array_id)
     return source_id
 
 
@@ -1620,7 +1620,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         req = self._parse(FlightRequest(), descriptor.command, "GetFlightInfo command")
         read_opt = req.tensor_read
-        source_id, tensor_id = _split_array_id(read_opt.array_id)
+        source_id, tensor_id = split_array_id(read_opt.array_id)
         if not source_id:
             raise flight.FlightServerError("tensor_read: array_id is required")
 
@@ -1708,8 +1708,17 @@ class TensorFlightServer(flight.FlightServerBase):
             # it to decide whether a cache entry is still valid, and this call is
             # fetch-per-call by contract while a listing is a natural thing to
             # cache. None stays unset -- absent is "no claim", not "unchanged".
-            if source_adapter is not None and source_adapter.content_version:
-                read_plan.descriptor.content_version = source_adapter.content_version
+            #
+            # A claim about the data, so the raw content_version and never the
+            # serving epoch: a consumer builds an identity from this (the HTTP
+            # sidecar's versioned array_id) and stamps its own records with it
+            # (an ROI's ``drawn_against_version``), neither of which may move on
+            # a server upgrade that changed no data.
+            #
+            # From the TENSOR adapter: an uploaded label set's bytes are its own
+            # (``adapters/labels.py``), not the source's.
+            if tensor_adapter.content_version:
+                read_plan.descriptor.content_version = tensor_adapter.content_version
 
             # Populate metadata_json in response descriptor if requested
             if METADATA_JSON in mask:
@@ -1982,7 +1991,6 @@ class TensorFlightServer(flight.FlightServerBase):
             return json.dumps(
                 {
                     "available": True,
-                    "format_version": CACHE_FILE_FORMAT_VERSION,
                     "segment_path": location.segment_path,
                     "byte_offset": location.byte_offset,
                     "byte_length": location.byte_length,

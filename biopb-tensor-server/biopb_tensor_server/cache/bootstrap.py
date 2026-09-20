@@ -36,12 +36,17 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# On-disk segment format version for the localhost cache-file handoff (issue
-# #9). The server reports it in chunk_locate and a client declines the fast
-# path (falls back to do_get) for any version it doesn't understand.
+# On-disk segment format version (issue #9). Server-local: one process, one
+# directory, read at boot to decide whether this build may reuse the segments it
+# finds, and reported to nobody.
 #
-# v2: biopb/biopb#596 implemented axis order normalization. A v1 segment holds the
-# pre-transpose bytes, so reusing it would serve axes in the wrong order.
+# ONE question: "may this build reuse these segment files?". Bump it for a
+# layout change, never for a change in what the bytes mean -- that is
+# ``core.chunk.CHUNK_SEMANTICS_EPOCH``, which reaches every cache rather than
+# only this one.
+#
+# v1 segments hold pre-normalization bytes (biopb/biopb#596) and must never be
+# read back, so the number never goes below 2.
 CACHE_FILE_FORMAT_VERSION = 2
 
 # Name of the on-disk marker file (in the cache root, beside ``lock`` and

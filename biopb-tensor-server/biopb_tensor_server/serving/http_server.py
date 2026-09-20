@@ -81,6 +81,7 @@ from fastapi.responses import JSONResponse
 from google.protobuf import json_format
 from pydantic import BaseModel
 
+from biopb_tensor_server.core.chunk import current_epoch
 from biopb_tensor_server.core.labels import split_label_field
 
 logger = logging.getLogger(__name__)
@@ -715,8 +716,17 @@ def _version_token(content_version: bytes) -> str:
     matter only between two versions OF ONE SOURCE, where the alternative to a
     collision is today's behaviour (no versioning at all), so the trade is
     strictly favourable.
+
+    The serving epoch is hashed in with it: this token is the tile cache's key
+    namespace, and a browser holding an `immutable` URL has no other way to hear
+    about a bump (the Flight plane carries it inside the opaque chunk_id). Read
+    from the local constant -- ``cli.py`` points the sidecar at the Flight plane
+    it ships with. See ``core.chunk.CHUNK_SEMANTICS_EPOCH``.
     """
-    return hashlib.sha256(content_version).hexdigest()[:8]
+    epoch = current_epoch()
+    # Epoch 0 hashes the content alone, as the chunk_id header omits the field.
+    seed = content_version if epoch == 0 else b"%d:" % epoch + content_version
+    return hashlib.sha256(seed).hexdigest()[:8]
 
 
 def _descriptor_version_token(td: Any) -> Optional[str]:
@@ -2692,6 +2702,12 @@ async def get_tile(
             # answering 304 for bytes that changed. Empty when the source
             # publishes no version, which keeps exactly today's semantics.
             ("cv", current_version or ""),
+            # The epoch on its own, because an unversioned source has no `cv`
+            # to carry it and its tile URL never moves; without this the browser
+            # revalidates to the same ETag forever. Such a source still gets no
+            # version token: a token means `immutable` for a year, and an
+            # unversioned source is one whose content can change unannounced.
+            ("epoch", current_epoch()),
         ],
     )
     # The resolution above already refused a superseded token, so a token that

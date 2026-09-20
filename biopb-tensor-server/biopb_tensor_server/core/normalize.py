@@ -30,11 +30,11 @@ client therefore sees a coherent normalized view: normalized bounds, a
 normalized descriptor, and a chunk whose axes match them.
 
 Because the id is unchanged but the *bytes it now resolves to* are transposed,
-cached segments written before this change would be served in the wrong order.
-``CACHE_FILE_FORMAT_VERSION`` is bumped for exactly that reason (see
-``cache.file_backend``); the transpose happens **inside** the cache's
-``compute_fn``, so what lands in a segment is the served representation and the
-localhost mmap fast path stays valid.
+cached segments written before this change would be served in the wrong order;
+a change of this shape bumps ``CHUNK_SEMANTICS_EPOCH`` (``core.chunk``). The
+transpose happens **inside** the cache's ``compute_fn``, so what lands in a
+segment is the served representation and the localhost mmap fast path stays
+valid.
 
 **Plans are delegated, not re-derived.** ``plan_flight_info`` / ``get_read_plan``
 call the wrapped adapter and permute its answer, rather than inheriting the base
@@ -525,8 +525,7 @@ class NormalizingAdapter(TensorAdapter):
         is never wrapped. That ordering is the point: a cached segment must hold
         what the client is served, because the localhost fast path hands the
         client that segment's bytes directly, with the server no longer in the
-        loop to transpose them. Existing segments predate the transpose, which is
-        what ``CACHE_FILE_FORMAT_VERSION`` is bumped for.
+        loop to transpose them.
         """
         perm = self.perm
         if perm is None:

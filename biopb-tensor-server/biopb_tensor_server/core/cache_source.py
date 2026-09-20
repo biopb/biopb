@@ -256,7 +256,7 @@ def chunk_cache_keys(
     ``[start, stop)``.
 
     Minted exactly as ``_get_read_plan`` mints an unscaled endpoint -- same
-    absolute grid, same ``array_id``, same ``content_version`` header --
+    absolute grid, same ``array_id``, same version header --
     because a key that differs by one byte is a probe that never hits.
     """
     shape = tuple(int(dim) for dim in descriptor.shape)

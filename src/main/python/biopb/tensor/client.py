@@ -49,14 +49,11 @@ from biopb.tensor._session import (
     CatalogClient,
     ChunkFetcher,
     ResolveCancelled as ResolveCancelled,
-    _check_wire_protocol as _check_wire_protocol,
     _ClientState,
     _dask_from_flight_info,
-    _extract_schema_metadata as _extract_schema_metadata,
-    _parse_version as _parse_version,
     _refetch_flight_info,
     _requested_slice,
-    _split_array_id as _split_array_id,
+    split_array_id as split_array_id,
 )
 from biopb.tensor._tls import resolve_tls_trust
 from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession

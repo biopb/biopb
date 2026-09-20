@@ -820,28 +820,6 @@ class TestLocalhostDetection:
         assert _is_localhost_location("grpc://example.com:8815") is False
 
 
-class TestExtractSchemaMetadata:
-    def test_extracts_metadata_dict(self):
-        from biopb.tensor.client import _extract_schema_metadata
-
-        schema = pa.schema(
-            [],
-            metadata={
-                b"tensor_schema_version": b"0.4.0",
-                b"other_key": b"other_value",
-            },
-        )
-        metadata = _extract_schema_metadata(schema)
-        assert metadata is not None
-        assert metadata["tensor_schema_version"] == "0.4.0"
-        assert metadata["other_key"] == "other_value"
-
-    def test_returns_none_for_no_metadata(self):
-        from biopb.tensor.client import _extract_schema_metadata
-
-        assert _extract_schema_metadata(pa.schema([])) is None
-
-
 class TestShouldTryCachefile:
     def setup_method(self):
         import biopb.tensor._pool as c
@@ -1199,27 +1177,53 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_newer_segment_format_falls_back(self):
-        """A server segment format newer than the client understands declines
-        the fast path (and is memoized off), but data is still correct via do_get."""
+    def test_a_range_that_names_another_entry_is_refused(self, transfer_target):
+        """The server verifies a range before handing it out, and before
+        reading through it itself.
+
+        An offset that decodes cleanly into the wrong message is the one silent
+        failure on this path: a valid batch of the same shape belonging to
+        someone else. Here one entry is pointed at another's bytes.
+        """
         import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
+        transfer_target(4096)
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
             cmod._cachefile_support.clear()
-            # Pretend this client can't parse the server's (>=1) segment format.
-            # The constant is read by _try_cachefile_transfer in biopb.tensor._pool
-            # (issue #278 item C), so patch it there, not on the client re-export.
-            with patch("biopb.tensor._pool._CACHEFILE_SUPPORTED_FORMAT", 0):
-                client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z").compute(scheduler="threads")
-                assert np.array_equal(got, src)  # correct via do_get fallback
-                assert cmod._cachefile_support.get(loc) is False  # declined + memoized
-                client.close()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            assert np.array_equal(
+                client.get_tensor("z").compute(scheduler="threads"), src
+            )
+            assert len(client.get_tensor("z").chunks[0]) > 1, "need >1 chunk"
+            client.close()
+
+            backend = CacheManager.get_instance()._backend
+            keys = [k for k, i in backend._metadata.items() if i.byte_offset]
+            assert len(keys) > 1
+            # Point the second entry at the first's bytes: a real message, the
+            # right shape, the wrong chunk.
+            victim, donor = keys[1], backend._metadata[keys[0]]
+            backend._metadata[victim] = dataclasses.replace(
+                backend._metadata[victim],
+                byte_offset=donor.byte_offset,
+                byte_length=donor.byte_length,
+            )
+
+            # The handoff refuses it outright rather than publishing the range.
+            assert backend.locate_entry(victim) is None
+            # And the server's own read walks the segment instead, so it still
+            # serves the right bytes -- a repair, not a refusal.
+            cmod._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            assert np.array_equal(
+                client.get_tensor("z").compute(scheduler="threads"), src
+            )
+            client.close()
         finally:
             server.shutdown()
             CacheManager.reset()
@@ -1549,14 +1553,29 @@ class TestDirectSeekRead:
             info = file_backend._metadata[f"seek-{i}".encode()]
             assert info.byte_offset > 0 and info.byte_length > 0
 
-            seeked = file_backend._read_batch_at(segment_id, mmap, info)
+            key = f"seek-{i}".encode()
+            seeked = file_backend._read_batch_at(segment_id, mmap, info, key)
             # Same entry with its range stripped -> forced down the walk.
             walked = file_backend._read_batch_at(
                 segment_id,
                 mmap,
                 dataclasses.replace(info, byte_offset=0, byte_length=0),
+                key,
             )
             assert seeked.equals(walked)
+
+            # A range pointing at another entry is refused and walks instead,
+            # so the two still agree.
+            if i > 0:
+                other = file_backend._metadata[b"seek-0"]
+                misindexed = dataclasses.replace(
+                    info,
+                    byte_offset=other.byte_offset,
+                    byte_length=other.byte_length,
+                )
+                assert file_backend._read_batch_at(
+                    segment_id, mmap, misindexed, key
+                ).equals(walked)
             assert np.array_equal(unpack_chunk_array(seeked), arrs[i])
 
     def test_entry_without_range_still_reads(self, file_backend):

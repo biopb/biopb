@@ -36,6 +36,7 @@ from biopb_tensor_server.core.chunk import (
     encode_chunk_id,
     encode_chunk_id_with_scale,
     encode_proxy_envelope,
+    epoch_of,
     get_bounds_from_chunk_id,
     is_proxy_envelope,
     is_scaled_chunk,
@@ -262,8 +263,9 @@ class TestProxyEnvelope:
         for cv in (CV, None):
             env = encode_proxy_envelope(inner, "local/img", cv)
             assert is_proxy_envelope(env)
-            route, got_cv, got_inner = peel_proxy_envelope(env)
+            route, got_epoch, got_cv, got_inner = peel_proxy_envelope(env)
             assert route == "local/img"
+            assert got_epoch == 0
             assert got_cv == cv  # empty cv decodes back to None
             assert got_inner == inner  # inner forwarded verbatim
 
@@ -274,7 +276,20 @@ class TestProxyEnvelope:
             encode_chunk_id_with_scale("upstream/img", _bounds(), (2, 2)), b"iat:99"
         )
         env = encode_proxy_envelope(inner, "local/img", CV)
-        assert peel_proxy_envelope(env)[2] == inner
+        assert peel_proxy_envelope(env)[3] == inner
+
+    def test_the_proxy_s_own_epoch_moves_its_envelope(self, epoch):
+        """A mirror re-serves the upstream's bytes locally, so a change in what
+        they mean here re-keys here."""
+        inner = encode_chunk_id("upstream/img", _bounds())
+        before = encode_proxy_envelope(inner, "local/img", CV)
+        epoch(3)
+        after = encode_proxy_envelope(inner, "local/img", CV)
+        assert after != before
+        assert peel_proxy_envelope(after)[1] == 3
+        assert peel_proxy_envelope(after)[2] == CV  # upstream's, still readable
+        assert peel_proxy_envelope(after)[3] == inner
+        assert cache_key_for_chunk_id(after) != cache_key_for_chunk_id(before)
 
     def test_discriminators_are_mutually_exclusive(self):
         legacy = encode_chunk_id("src/t", _bounds())
@@ -553,7 +568,7 @@ class TestResolveChunkDataRejectsStaleVersion:
             encode_chunk_id(adapter.array_id, ChunkBounds(start=[0, 0], stop=[5, 5])),
             b"v1",
         )
-        with pytest.raises(StaleChunkError, match="content_version"):
+        with pytest.raises(StaleChunkError, match="no longer serves"):
             adapter.resolve_chunk_data(stale_chunk_id)
 
     def test_stale_version_rejected_even_when_bounds_still_fit(self):
@@ -628,7 +643,110 @@ class TestDoGetCacheHitRejectsStaleVersion:
             # Re-registration: the source is now v2, but a client's held
             # chunk_id (and, if still resident, its cache entry) is still v1.
             adapter._content_version = b"v2"
-            with pytest.raises(StaleChunkError, match="content_version"):
+            with pytest.raises(StaleChunkError, match="no longer serves"):
                 adapter.resolve_chunk_data(scaled_v1, cache_manager)
         finally:
             CacheManager.reset()
+
+
+# ==============================================================================
+# Serving-semantics epoch (biopb/biopb#1076)
+# ==============================================================================
+# content_version says "the data changed"; the epoch says "this key was formed
+# under an older reading of it". Different claims, separately framed, and only
+# the first is published.
+
+
+class TestSemanticsEpoch:
+    def test_epoch_zero_writes_the_pre_epoch_header(self):
+        """A server that has declared no epoch mints the ids it always did.
+
+        Byte-identical, not merely compatible: anything else re-warms every
+        cache in the system.
+        """
+        bounds = _bounds()
+        assert mint_chunk_id("src/t", bounds) == encode_chunk_id("src/t", bounds)
+        versioned = mint_chunk_id("src/t", bounds, content_version=CV)
+        assert versioned == wrap_content_version(encode_chunk_id("src/t", bounds), CV)
+        assert versioned[1] == 1  # the pre-epoch format byte
+
+    def test_the_two_versions_are_framed_separately_not_fused(self, epoch):
+        """Each half is recoverable on its own."""
+        epoch(7)
+        chunk_id = mint_chunk_id("src/t", _bounds(), content_version=CV)
+        assert chunk_id[1] == 2  # the epoch format byte
+        assert content_version_of(chunk_id) == CV
+        assert epoch_of(chunk_id) == 7
+
+    def test_a_bump_versions_a_previously_unversioned_source(self, epoch):
+        """An unstat-able source (cloud, unresolved) has no content signal of
+        its own, but it caches this server's output like any other."""
+        bounds = _bounds()
+        assert epoch_of(mint_chunk_id("src/t", bounds)) == 0
+        epoch(1)
+        versioned = mint_chunk_id("src/t", bounds)
+        assert epoch_of(versioned) == 1
+        # An epoch-only header makes no claim about content.
+        assert content_version_of(versioned) is None
+
+    def test_epochs_are_distinct_and_the_framing_is_injective(self, epoch):
+        """A chunk_id minted under a different epoch compares unequal."""
+        seen = set()
+        for value in (0, 1, 2, 11):
+            epoch(value)
+            seen.add(mint_chunk_id("src/t", _bounds(), content_version=CV))
+            seen.add(mint_chunk_id("src/t", _bounds()))
+        assert len(seen) == 8
+
+    def test_a_content_version_that_looks_like_an_epoch_header_is_safe(self, epoch):
+        """A content_version is arbitrary bytes -- an uploaded label set's is
+        random (``adapters/labels.py``) -- and cannot be confused with an
+        epoch-framed header however it is spelled."""
+        adversarial = b"epoch=1;" + CV
+        plain = mint_chunk_id("src/t", _bounds(), content_version=adversarial)
+        epoch(1)
+        composed = mint_chunk_id("src/t", _bounds(), content_version=CV)
+        assert plain != composed
+        assert content_version_of(plain) == adversarial
+        assert epoch_of(plain) == 0
+
+    def test_a_bump_changes_every_chunk_id_and_cache_key(self, epoch):
+        def plan():
+            adapter = _VersionedStubAdapter((10, 10), CV)
+            return _get_read_plan(
+                adapter.get_tensor_descriptor(),
+                TensorDescriptor(),
+                (5, 5),
+                content_version=adapter.content_version,
+            )
+
+        before = plan()
+        epoch(1)
+        after = plan()
+
+        assert len(before.chunk_endpoints) == len(after.chunk_endpoints) == 4
+        ids_before = {ep.chunk_id for ep in before.chunk_endpoints}
+        ids_after = {ep.chunk_id for ep in after.chunk_endpoints}
+        assert ids_before.isdisjoint(ids_after)
+        assert {cache_key_for_chunk_id(i) for i in ids_before}.isdisjoint(
+            {cache_key_for_chunk_id(i) for i in ids_after}
+        )
+        # The grid itself is untouched: only the namespace moved.
+        assert [ep.bounds for ep in before.chunk_endpoints] == [
+            ep.bounds for ep in after.chunk_endpoints
+        ]
+
+    def test_an_id_from_the_previous_epoch_is_refused(self, epoch):
+        """A client holding a read plan across a bump re-plans rather than
+        being served bytes minted under the old reading."""
+        adapter = _VersionedStubAdapter((10, 10), CV)
+        held = mint_chunk_id(
+            "stub",
+            _bounds(),
+            content_version=adapter.content_version,
+        )
+        adapter.check_chunk_version(held)  # current epoch: fine
+
+        epoch(1)
+        with pytest.raises(StaleChunkError, match="no longer serves"):
+            adapter.check_chunk_version(held)

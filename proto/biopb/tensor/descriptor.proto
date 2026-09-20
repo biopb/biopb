@@ -174,21 +174,28 @@ message TensorDescriptor {
   // preserves mtime and size is invisible to it.
   //
   // A SERVING field, like chunk_shape and pyramid: filled by GetFlightInfo from
-  // the bound adapter, left empty on the structural DataSourceDescriptor.tensors
-  // entries. It is a source-level property repeated on the tensor deliberately
-  // -- consumers need it on the freshest thing in the request, and GetFlightInfo
-  // is fetch-per-call by contract while a catalog listing is a natural thing to
-  // cache (biopb/biopb#834).
+  // the bound TENSOR adapter, left empty on the structural
+  // DataSourceDescriptor.tensors entries. Consumers need it on the freshest
+  // thing in the request, and GetFlightInfo is fetch-per-call by contract while
+  // a catalog listing is a natural thing to cache (biopb/biopb#834). Usually a
+  // source-level property repeated on the tensor, but not always: a tensor whose
+  // bytes are not the source's carries its own (an uploaded label set).
   //
   // Absent means "no claim", not "unchanged": a source whose URL cannot be
   // stat'd (cloud, unresolved) leaves it unset, and consumers must degrade to
   // whatever freshness policy they used before rather than treating absence as
   // a stable version. Servers predating this field also leave it unset.
   //
-  // Consumers use it to namespace caches they cannot otherwise invalidate. The
-  // chunk cache already folds it into chunk_id; the HTTP sidecar folds it into
-  // the array_id it publishes, so a browser cache keyed on a tile URL cannot
-  // outlive the content (biopb/biopb#780).
+  // Read it as a version suffix on the tensor's identity: an identifier built
+  // from it changes when the data changes. The HTTP sidecar does exactly that,
+  // splicing the token into the array_id it publishes so a browser cache keyed
+  // on a tile URL cannot outlive the content (biopb/biopb#780). A chunk cache
+  // needs nothing from this field -- the server folds the same value into
+  // chunk_id, where it invalidates for free.
+  //
+  // A claim about the DATA: it moves only when the data does. How the server
+  // forms an opaque chunk key, which must also change when chunking or
+  // normalization changes, is internal to the server and not visible here.
   optional bytes content_version = 14;
 }
 

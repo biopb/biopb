@@ -15,10 +15,13 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow.flight as flight
 import pytest
+from biopb.tensor._session import _parse_flight_endpoints
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, upload_state
 from biopb_tensor_server.core.adapter_base import catalog_tensors
+from biopb_tensor_server.core.chunk import content_version_of
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
@@ -349,3 +352,79 @@ class TestTheSweep:
             assert not store.exists()
         finally:
             fresh.shutdown()
+
+
+class TestContentVersion:
+    """What the descriptor publishes is what the tickets were minted with.
+
+    An uploaded set's bytes are its own -- they live in the sidecar store, not
+    in the image file, which a set arriving never touches -- so it carries its
+    own ``content_version``, and the descriptor publishes that one and not the
+    image's.
+    """
+
+    def _chunk_ids(self, client, array_id):
+        info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
+        return set(_parse_flight_endpoints(info)[0])
+
+    def _minted(self, client, array_id):
+        """The content_version the read plan's chunk_ids carry."""
+        return {
+            content_version_of(chunk_id)
+            for chunk_id in self._chunk_ids(client, array_id)
+        }
+
+    def test_a_set_publishes_its_own_version_not_its_image_s(self, served, client):
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+
+        image = client.get_descriptor("oz1").content_version
+        labels = client.get_descriptor("oz1/labels/nuclei").content_version
+
+        assert image and labels
+        assert labels != image
+
+    @pytest.mark.parametrize("array_id", ["oz1", "oz1/labels/nuclei"])
+    def test_the_published_version_is_the_minted_one(self, served, client, array_id):
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+
+        published = client.get_descriptor(array_id).content_version
+        assert self._minted(client, array_id) == {published}
+
+    def test_a_reused_name_publishes_a_new_version(self, served, client):
+        """``delete_labels``: "the next set uploaded under it is a distinct
+        tensor with its own cache namespace". Both uploads leave the image file
+        untouched, so an image-derived version could not say so."""
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        first = client.get_descriptor("oz1/labels/nuclei").content_version
+        client.delete_labels("oz1/labels/nuclei")
+
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        second = client.get_descriptor("oz1/labels/nuclei").content_version
+
+        assert first != second
+        assert client.get_descriptor("oz1").content_version  # unmoved either way
+
+    def test_a_semantics_epoch_bump_leaves_the_published_version_alone(
+        self, served, client, epoch
+    ):
+        """The epoch re-keys chunks without claiming the data changed.
+
+        So the chunk_ids move, the published field does not, and the
+        content_version inside the new chunk_ids is still the published one.
+        """
+        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        names = ("oz1", "oz1/labels/nuclei")
+        ids = {a: self._chunk_ids(client, a) for a in names}
+        published = {a: client.get_descriptor(a).content_version for a in names}
+        assert all(self._minted(client, a) == {published[a]} for a in names)
+
+        epoch(1)
+
+        for array_id in names:
+            assert self._chunk_ids(client, array_id).isdisjoint(ids[array_id])
+            assert (
+                client.get_descriptor(array_id).content_version == published[array_id]
+            )
+            # Still recoverable from the re-keyed ids: the epoch moved, the
+            # content claim did not.
+            assert self._minted(client, array_id) == {published[array_id]}

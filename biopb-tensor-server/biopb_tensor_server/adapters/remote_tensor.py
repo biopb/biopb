@@ -58,6 +58,7 @@ from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
     array_id_from_chunk_id,
     cache_key_for_chunk_id,
+    current_epoch,
     encode_chunk_id,
     encode_proxy_envelope,
     is_proxy_envelope,
@@ -871,6 +872,7 @@ class RemoteTensorAdapter(TensorAdapter):
         try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
             endpoints = []
+            content_version = self.content_version  # loop-invariant
             for ep in info.endpoints:
                 ticket = TensorTicket.FromString(ep.ticket.ticket)
                 bounds = ChunkBounds.FromString(ep.app_metadata)
@@ -881,13 +883,13 @@ class RemoteTensorAdapter(TensorAdapter):
                 # array_id (not self.array_id -- a sibling-field chunk keeps its own)
                 # only to build the LOCAL route, so the server dispatches a later
                 # do_get back to the right local tensor view. The upstream's
-                # content_version rides the envelope so the proxy cache namespaces
-                # by upstream content.
+                # The upstream's content_version rides the envelope, so the
+                # proxy cache namespaces by upstream content.
                 upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
                     ticket.chunk_id,
                     self._to_local_array_id(upstream_aid),
-                    self.content_version,
+                    content_version,
                 )
                 endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
             return TensorReadPlan(
@@ -977,8 +979,9 @@ class RemoteTensorAdapter(TensorAdapter):
                 f"proxy source {self.source_id} received a non-envelope chunk_id "
                 f"(stale pre-upgrade ticket); re-open the tensor to refresh."
             )
-        _route, held_version, _inner = peel_proxy_envelope(chunk_id)
-        if held_version is not None and held_version != self.content_version:
+        _route, held_epoch, held_version, _inner = peel_proxy_envelope(chunk_id)
+        stale = held_version is not None and held_version != self.content_version
+        if stale or held_epoch != current_epoch():
             raise StaleChunkError(
                 f"chunk_id for {self.array_id!r} was minted against a "
                 "content_version this mirror no longer has (re-synced "
@@ -1002,7 +1005,7 @@ class RemoteTensorAdapter(TensorAdapter):
         anything is forwarded.
         """
         self.check_chunk_version(chunk_id)
-        _route, _held_version, inner = peel_proxy_envelope(chunk_id)
+        _route, _held_epoch, _held_version, inner = peel_proxy_envelope(chunk_id)
 
         should_cache = cache_manager is not None
 

@@ -50,7 +50,7 @@ from biopb_tensor_server.core.chunk import (
     build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
-    content_version_of,
+    current_epoch,
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
@@ -59,6 +59,7 @@ from biopb_tensor_server.core.chunk import (
     normalized_scale_hint,
     normalized_slice_bounds,
     scaled_virtual_chunk_size,
+    split_chunk_version as _split_chunk_version,
 )
 from biopb_tensor_server.core.chunk_batch import (
     CHUNK_WIRE_SCHEMA,
@@ -265,14 +266,19 @@ class SourceAdapter(ABC):
     # total for every other adapter.
     _capability_token: Optional[str] = None
 
-    # Optional content-version token (biopb/biopb#178). When set, it is folded
-    # into every chunk_id this source mints (via ``get_read_plan``) and hence into
-    # the cache key, so a re-registered source with new bytes gets a fresh cache
-    # namespace instead of serving stale cached chunks. None (the base default,
-    # like ``capability_token``) means "unversioned" -- the pre-#178 behavior, and
-    # byte-identical chunk_ids / cache keys -- so an adapter opts in only when it
-    # has a cheap, reliable change signal (e.g. a local file's stat signature).
-    # An opaque token: the codec never interprets it, only namespaces by it.
+    # Optional content-version token (biopb/biopb#178), folded into every
+    # chunk_id this adapter mints and hence into the cache key, so a
+    # re-registered source with new bytes gets a fresh cache namespace instead
+    # of serving stale chunks. None means unversioned: no header, and an adapter
+    # opts in only when it has a cheap, reliable change signal (a local file's
+    # stat signature). Opaque -- the codec namespaces by it, never reads it.
+    #
+    # Declared on the source because a source is the usual owner of a content
+    # lifetime, but the value is per TENSOR. A tensor whose bytes live elsewhere
+    # carries its own (an uploaded label set, ``adapters/labels.py``); one
+    # reading out of the source file keeps the source's (a discovered NGFF set).
+    # Read it off the adapter that serves the bytes, not off the source the
+    # array_id happens to name.
     _content_version: Optional[bytes] = None
 
     # Display-only override for the catalog ``source_url`` (the descriptor field
@@ -348,15 +354,24 @@ class SourceAdapter(ABC):
 
     @property
     def content_version(self) -> Optional[bytes]:
-        """Opaque content-version token folded into this source's chunk_ids, or
-        None when the source is unversioned (see ``_content_version``)."""
+        """Opaque content-version token folded into this adapter's chunk_ids, or
+        None when its content is unversioned (see ``_content_version``).
+
+        The version of the bytes THIS adapter serves, which for a multi-tensor
+        source is not always the source's own -- see ``_content_version``.
+
+        The content signal alone. A chunk_id also carries the server's
+        serving-semantics epoch, framed separately (``core.chunk``); a cache
+        misses on either, while a consumer asking "did the data change?" -- an
+        ROI's ``drawn_against_version``, the descriptor field -- wants this one.
+        """
         return self._content_version
 
     def check_chunk_version(self, chunk_id: bytes) -> None:
         """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
 
-        Pure in-memory comparison of ``content_version_of(chunk_id)`` against
-        ``self.content_version`` -- no adapter I/O -- so a caller can run it as a
+        Pure in-memory comparison of the chunk_id's framed versions against
+        this source's and this server's -- no adapter I/O -- so a caller can run it as a
         cheap guard ahead of a cache lookup (``server._handle_chunk_locate``) as
         well as ahead of an actual read (:meth:`TensorAdapter.resolve_chunk_data`),
         without paying for a second adapter lookup or (for a native-pyramid
@@ -368,11 +383,14 @@ class SourceAdapter(ABC):
         envelope's own version instead -- it never mints a plain (non-envelope)
         chunk_id, so this base implementation would misparse one of its chunk_ids.
         """
-        held_version = content_version_of(chunk_id)
-        if held_version is not None and held_version != self.content_version:
+        held_epoch, held_version, _inner = _split_chunk_version(chunk_id)
+        stale_content = (
+            held_version is not None and held_version != self.content_version
+        )
+        if stale_content or held_epoch != current_epoch():
             raise StaleChunkError(
                 f"chunk_id for {self.array_id!r} was minted against a "
-                "content_version this source no longer has; re-request the "
+                "version this source no longer serves; re-request the "
                 "read plan (GetFlightInfo) rather than retrying this chunk_id.",
                 reason="stale_content_version",
             )
@@ -1423,8 +1441,6 @@ class TensorAdapter(SourceAdapter):
         Returns:
             Arrow Schema with data, shape, and dtype fields
         """
-        import importlib.metadata
-
         from biopb.tensor._wire_version import (
             TENSOR_WIRE_PROTOCOL_VERSION,
             WIRE_PROTOCOL_METADATA_KEY,
@@ -1433,11 +1449,13 @@ class TensorAdapter(SourceAdapter):
         desc = desc or self.get_tensor_descriptor()
         require_resolved(desc)
 
-        # Schema metadata: the wire-protocol version is the hard compatibility
-        # gate the client enforces (biopb/biopb#293); tensor_schema_version is
-        # kept as an informational package-version tag.
+        # One key, one contract: the wire-protocol version the client enforces
+        # (biopb/biopb#293). A `tensor_schema_version` release tag sat here too
+        # until biopb/biopb#1070 -- it stopped meaning anything when its one
+        # consumer (an shm feature probe) was replaced, and a release tag beside
+        # a byte-encoding gate reads like a second gate. It was: the Java client
+        # implemented it.
         metadata = {
-            "tensor_schema_version": importlib.metadata.version("biopb-tensor-server"),
             WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
         }
 
@@ -1593,8 +1611,8 @@ class TensorAdapter(SourceAdapter):
 
         chunk_size = self.get_transfer_chunk_size()
         # content_version is a SourceAdapter property; every TensorAdapter is a
-        # SourceAdapter, so it is always present -- an unversioned source returns
-        # None.
+        # SourceAdapter, so it is always present -- an unversioned source
+        # returns None. The epoch is the codec's to add.
         return _get_read_plan(
             base_desc,
             request_desc,
@@ -2019,8 +2037,8 @@ def _get_read_plan(
     large to read in one go (e.g., due to Arrow IPC limits).
 
     ``content_version`` (biopb/biopb#178), when set, is folded into every minted
-    chunk_id so the cache namespaces by it. It is constant across the grid, so the
-    wrapper header is precomputed once and prepended per chunk (one concat).
+    chunk_id so the cache namespaces by it -- alongside the serving-semantics
+    epoch, which ``mint_chunk_id`` adds (biopb/biopb#1076).
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)

@@ -162,6 +162,23 @@ def transfer_target(monkeypatch):
 
 
 @pytest.fixture
+def epoch(monkeypatch):
+    """Set the serving-semantics epoch for the duration of a test.
+
+    The epoch (biopb/biopb#1076) re-keys every chunk_id, so a test about
+    invalidation bumps it rather than contriving a content change.
+    """
+
+    def _set(value: int) -> int:
+        from biopb_tensor_server.core import chunk
+
+        monkeypatch.setattr(chunk, "CHUNK_SEMANTICS_EPOCH", int(value))
+        return int(value)
+
+    return _set
+
+
+@pytest.fixture
 def writable_server(tmp_path):
     """A live, writable server on an OS-assigned port.
 

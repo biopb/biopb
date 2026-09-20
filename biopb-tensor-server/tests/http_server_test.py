@@ -2553,6 +2553,49 @@ class TestTileInfoPublishesTheVersion:
             assert _published_array_id(tc) == "tiled/Image:0"
 
 
+class TestTheTileTokenCarriesTheSemanticsEpoch:
+    """The one cache that cannot key by chunk_id.
+
+    A browser holds a versioned tile URL under `immutable, max-age=1y` and sees
+    nothing of the chunk_id the Flight plane re-keys, so the sidecar folds the
+    epoch into its own key namespace.
+    """
+
+    def test_a_bump_moves_the_token(self, epoch):
+        from biopb_tensor_server.serving.http_server import _version_token
+
+        cv = b"1700000000:4096"
+        before = _version_token(cv)
+        epoch(1)
+        assert _version_token(cv) != before
+
+    def test_an_unversioned_source_keeps_no_token_but_moves_its_etag(self, epoch):
+        """A source with no `cv` to carry the epoch gets no token either.
+
+        A token means `immutable` for a year, and an unversioned source is one
+        whose content can change unannounced; the epoch reaches its tiles
+        through the ETag instead.
+        """
+        from biopb_tensor_server.serving.http_server import (
+            _descriptor_version_token,
+        )
+
+        class _Unversioned:
+            content_version = b""
+
+        epoch(1)
+        assert _descriptor_version_token(_Unversioned()) is None
+
+    def test_epoch_zero_leaves_every_tile_url_untouched(self):
+        """At epoch 0 a tile URL is the hash of the content alone."""
+        import hashlib
+
+        from biopb_tensor_server.serving.http_server import _version_token
+
+        cv = b"1700000000:4096"
+        assert _version_token(cv) == hashlib.sha256(cv).hexdigest()[:8]
+
+
 class TestVersionedTileRequests:
     def test_the_published_id_serves_tiles_and_goes_immutable(self):
         with _versioned_tile_client(b"1700000000:4096") as (tc, _):

@@ -305,7 +305,6 @@ def _dask_from_flight_info(
         location,
         token,
         cache_bytes,
-        _extract_schema_metadata(info.schema),
         tls_trust,
     )
     if requested is None:
@@ -320,35 +319,6 @@ def _dask_from_flight_info(
             )
         ]
     return dask_arr
-
-
-def _extract_schema_metadata(schema: pa.Schema) -> Optional[Dict[str, str]]:
-    """Extract schema metadata as Python dict for feature detection.
-
-    Args:
-        schema: PyArrow Schema from FlightInfo
-
-    Returns:
-        Dict with metadata key-value pairs, or None if no metadata
-    """
-    if schema.metadata is None:
-        return None
-
-    return {
-        key.decode("utf-8"): value.decode("utf-8")
-        for key, value in schema.metadata.items()
-    }
-
-
-def _parse_version(version_str: str) -> Tuple[int, int, int]:
-    """Parse semantic version string to (major, minor, patch) tuple."""
-    # Handle dev versions like "0.3.1.dev43+g..."
-    base = version_str.split(".dev")[0].split("+")[0]
-    parts = base.split(".")
-    major = int(parts[0]) if len(parts) > 0 else 0
-    minor = int(parts[1]) if len(parts) > 1 else 0
-    patch = int(parts[2]) if len(parts) > 2 else 0
-    return (major, minor, patch)
 
 
 def _check_flight_protocol(
@@ -484,7 +454,7 @@ def _raise_read_refusal(exc: flight.FlightError, array_id: str) -> None:
     ):
         # Taken from the server rather than a local catalog check, so it also
         # holds for a capability-token holder, who cannot browse the catalog.
-        raise _unresolved_source_error(_split_array_id(array_id)[0]) from exc
+        raise _unresolved_source_error(split_array_id(array_id)[0]) from exc
     addressing = _addressing_error(exc)
     if addressing is not None:
         raise addressing from exc
@@ -506,7 +476,7 @@ def _unresolved_source_error(source_id: str) -> ValueError:
     )
 
 
-def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
+def split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     """Split a tensor's globally-unique ``array_id`` into ``(source_id,
     array_id-or-None)``.
 
@@ -517,6 +487,10 @@ def _split_array_id(array_id: str) -> Tuple[str, Optional[str]]:
     acceptable is the caller's policy, not this function's: see
     :meth:`CatalogClient._resolve_descriptor`, which refuses it (#75), versus
     :meth:`CatalogClient.get_descriptor`, which anchors on the default.
+
+    Public, unlike its neighbours in this private module: callers outside the
+    package honour the same policy (biopb-mcp through ``client.py``'s
+    re-export, the tensor server directly).
     """
     if "/" in array_id:
         return array_id.split("/", 1)[0], array_id
@@ -821,7 +795,7 @@ class CatalogClient:
         capability-token holder, who may read the source but not browse the
         catalog.
         """
-        source_id, tensor_id = _split_array_id(array_id)
+        source_id, tensor_id = split_array_id(array_id)
         row = self._source_tensors_row(source_id)
 
         if row is not None:
@@ -861,7 +835,7 @@ class CatalogClient:
         plate. It goes away once ``GetFlightInfo`` reports the substitution
         itself, which all four bindings must adopt in step.
         """
-        source_id = _split_array_id(array_id)[0]
+        source_id = split_array_id(array_id)[0]
         count = self._source_tensor_count(source_id)
         if count is not None and count > 1:
             raise _ambiguous_default_error(source_id, count)

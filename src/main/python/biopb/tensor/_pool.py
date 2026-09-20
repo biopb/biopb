@@ -76,20 +76,10 @@ logger = logging.getLogger(__name__)
 # mapped-segment size and copies the chunk out once over budget -- see the
 # pinned-segment accounting below (disk-leak workaround, biopb/biopb#571).
 
-# Highest on-disk segment format version this client can parse. The client
-# reads server-written segment bytes directly, so the layout is a cross-process
-# contract: chunk_locate reports the server's CACHE_FILE_FORMAT_VERSION, and we
-# decline the fast path (fall back to do_get) for anything newer than this
-# rather than risk misreading the mmap. Bump in lockstep with the server when
-# this client learns to parse a newer format.
-#
-# 2 (biopb/biopb#596): the server bumped its format because a non-canonical
-# source's cached bytes are now stored transposed into canonical axis order --
-# same segment layout, different content -- so nothing here had to learn a new
-# encoding. An older client sees 2 > 1, declines the fast path, and reads the
-# same normalized chunk over do_get, so the skew degrades to a slower read
-# rather than a wrong one.
-_CACHEFILE_SUPPORTED_FORMAT = 2
+# There is no segment-format version to negotiate. The server verifies that a
+# range it hands out really holds the entry that was asked for, so this read
+# cannot land on another chunk's bytes; a layout this client cannot parse raises
+# and falls back to do_get.
 
 # Per-location capability cache: dask workers are separate processes, so each
 # memoizes independently after its first probe. None = unknown, False = the
@@ -536,18 +526,6 @@ def _try_cachefile_transfer(
     if not info.get("available"):
         return None
 
-    # The segment layout is a cross-process contract; refuse to parse a format
-    # newer than we understand. The server's format won't change mid-session,
-    # so stop probing this location.
-    if int(info.get("format_version", 1)) > _CACHEFILE_SUPPORTED_FORMAT:
-        logger.debug(
-            "chunk_locate reports segment format %s > supported %s; using do_get",
-            info.get("format_version"),
-            _CACHEFILE_SUPPORTED_FORMAT,
-        )
-        _set_cachefile_supported(location, False)
-        return None
-
     try:
         segment_path = info["segment_path"]
         byte_offset = int(info["byte_offset"])
@@ -935,7 +913,6 @@ def _fetch_chunk_distributed(
     bounds_start: Tuple[int, ...],
     bounds_stop: Tuple[int, ...],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]] = None,
     tls_trust: Optional[TlsTrust] = None,
 ) -> np.ndarray:
     """Fetch a chunk from Flight server using worker-local resources.
@@ -954,9 +931,6 @@ def _fetch_chunk_distributed(
         bounds_start: Chunk start coordinates as tuple
         bounds_stop: Chunk stop coordinates as tuple
         cache_bytes: Cache size for worker-local cache
-        schema_metadata: Optional schema metadata dict. Not used by the
-            cache-file fast path (support is probed via chunk_locate); retained
-            for signature compatibility with the chunk-fetch call sites.
 
     Returns:
         numpy array with chunk data
@@ -1055,7 +1029,6 @@ def _fetch_chunk_block(
     location: str,
     token: Optional[str],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]] = None,
     tls_trust: Optional[TlsTrust] = None,
 ) -> np.ndarray:
     """Single-``Blockwise``-layer callback that fetches one block.
@@ -1077,7 +1050,6 @@ def _fetch_chunk_block(
         tuple(bounds_start),
         tuple(bounds_stop),
         cache_bytes,
-        schema_metadata,
         tls_trust,
     )
 
@@ -1173,7 +1145,6 @@ def _build_dask_array_from_chunk_map(
     location: str,
     token: Optional[str],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]],
     tls_trust: Optional[TlsTrust] = None,
 ) -> da.Array:
     """Build the lazy chunk-fetching dask array from a chunk-index map.
@@ -1216,7 +1187,7 @@ def _build_dask_array_from_chunk_map(
         # distinct name, and a false cache hit is impossible.
         chunk_ids = tuple(cid for cid, _start, _stop in dep_map.values())
         name = "biopb-tensor-chunk-" + tokenize(
-            chunk_ids, location, token, cache_bytes, schema_metadata, dtype, chunks
+            chunk_ids, location, token, cache_bytes, dtype, chunks
         )
         dep = BlockwiseDepDict(mapping=dep_map, numblocks=numblocks)
         return _regular_blockwise_array(
@@ -1227,7 +1198,6 @@ def _build_dask_array_from_chunk_map(
             location,
             token,
             cache_bytes,
-            schema_metadata,
             tls_trust,
         )
 
@@ -1245,7 +1215,6 @@ def _build_dask_array_from_chunk_map(
                 tuple(bounds.start),
                 tuple(bounds.stop),
                 cache_bytes,
-                schema_metadata,
                 tls_trust,
             ),
             shape=chunk_shape,
@@ -1262,7 +1231,6 @@ def _regular_blockwise_array(
     location: str,
     token: Optional[str],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]],
     tls_trust: Optional[TlsTrust] = None,
 ) -> da.Array:
     """Wrap a per-block ``BlockwiseDep`` in a single ``Blockwise`` (map_blocks) layer.
@@ -1284,8 +1252,6 @@ def _regular_blockwise_array(
         token,
         None,
         cache_bytes,
-        None,
-        schema_metadata,
         None,
         tls_trust,
         None,
