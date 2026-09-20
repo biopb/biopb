@@ -130,6 +130,11 @@ final class TensorChunkCodec {
      * here. The two must stay in step: a tensor uploaded as {@code <i4} and
      * read back as a {@link FloatType} loses every id above 2^24, silently --
      * which is exactly the case a label set is (biopb/biopb#1059).
+     *
+     * <p>The type is right; the values reaching it are not yet. {@link
+     * ChunkDecoder} still decodes to {@code double[]} and {@link #writeChunk}
+     * still scatters with {@code setReal}, so {@code i8}/{@code u8} lose the
+     * same way above 2^53 -- biopb/biopb#1071.
      */
     static NativeType<?> createType(String dtype) {
         switch (normalizeDtype(dtype)) {
