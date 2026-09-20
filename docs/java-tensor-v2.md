@@ -19,7 +19,6 @@ disk caching are deliberately out of scope until the core protocol is stable.
   `DataSourceDescriptor` row decoders they fed.
 - [x] Own Flight connections after the pool's removal: `FlightSessions` shares
   one per `(location, token)`, as `biopb.tensor._pool` does.
-- [ ] Make a streamed action's cancel reach the server (see below).
 - [ ] Port the connect-time protocol check (`health`'s `protocol`, Python's
   `_check_protocol_version` / `_check_wire_protocol`). Without it a v1 server
   is reported as "returned no terminal result" rather than as too old.
@@ -35,6 +34,15 @@ disk caching are deliberately out of scope until the core protocol is stable.
 | `list_rois` / `put_rois` / `delete_rois` / `prune_rois` | `listRois` / `putRois` / `deleteRois` / `pruneRois` |
 | `create_tensor` / `upload_array` / `upload_chunk` / `finish_upload` | `createTensor` / `uploadArray` / `uploadChunk` / `finishUpload` |
 
+Cancellation transfers, by a different route. Python breaks out of the
+`do_action` generator and pyarrow closes the stream; Arrow Java hands back a
+bare `Iterator<Result>` with no close on it, but the call is still a gRPC call
+-- created inside a `Context.CancellableContext`, it is cancelled with the
+scope, and the server sees it. `streamAction` does that on every exit path.
+Verified against a live server: a cancelled `addSource` over a directory of
+eight images stops it at four, where abandoning the iterator alone let it
+register all eight.
+
 Two things do not transfer, and are not gaps:
 
 - **No dask.** Python's `upload_array` hands the whole upload to `da.store`, so
@@ -48,14 +56,6 @@ Two things do not transfer, and are not gaps:
   exit. `TensorFlightClient` is unaffected -- it owns its session and closes it;
   the cache is for `SerializableTensorImg`, which hands its session to an
   imglib2 cell cache that outlives every call it can see.
-- **A cancel stops the client, not the server.** Python breaks out of the
-  `do_action` generator, which closes the stream and the server observes it;
-  Arrow Java hands back a bare `Iterator<Result>` with no handle on the call,
-  so abandoning it leaves the server to finish. Verified: a cancelled
-  `addSource` over a directory of eight images returns an empty tally and the
-  server still registers all eight. `resolve` is unaffected -- its recall
-  continues server-side in Python too -- but `warm` and `addSource` promise
-  less here than they do there, and their javadocs say so.
 - **No `RoiAnnotation` wire codec to share.** `biopb.image._roi_rows` is one
   module serving both the Python SDK and the server; Java has only a client, so
   `RoiRowCodec` is a second implementation of that row schema and has to track

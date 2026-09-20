@@ -106,6 +106,35 @@ public class TensorLifecycleTest {
     }
 
     @Test
+    public void testCancelStopsTheServerNotJustTheClient() throws Exception {
+        // The call is created inside a gRPC CancellableContext, so stopping the
+        // loop cancels the RPC and the server sees it -- what Python gets by
+        // closing its generator. Without it the server finishes a walk nobody
+        // is reading.
+        try (TestServer server = new TestServer()) {
+            server.producer.addSourceHeartbeats = 2000;
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                java.util.concurrent.atomic.AtomicInteger seen =
+                        new java.util.concurrent.atomic.AtomicInteger();
+                AddSourceResult result = client.addSource("/data/plate", "",
+                        ignored -> seen.incrementAndGet(), () -> seen.get() >= 3);
+
+                Assert.assertEquals(0, result.getAddedCount());
+                // The server stopped on its own poll rather than running to 2000.
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (!server.producer.observedCancel && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(20);
+                }
+                Assert.assertTrue("server never observed the cancel",
+                        server.producer.observedCancel);
+                Assert.assertTrue("server emitted " + server.producer.emitted.get()
+                                + ", i.e. it was not stopped early",
+                        server.producer.emitted.get() < 2000);
+            }
+        }
+    }
+
+    @Test
     public void testAddSourceWithoutTerminalResultFails() throws Exception {
         try (TestServer server = new TestServer()) {
             server.producer.addSourceSendsResult = false;
@@ -666,6 +695,10 @@ public class TensorLifecycleTest {
         volatile java.util.Set<String> knownActions = new java.util.HashSet<>(Arrays.asList(
                 "add_source", "remove_source", "roi_prune", "delete_labels", "create_tensor", "finish"));
         volatile boolean addSourceSendsResult = true;
+        volatile int addSourceHeartbeats = 2;
+        volatile boolean observedCancel = false;
+        final java.util.concurrent.atomic.AtomicInteger emitted =
+                new java.util.concurrent.atomic.AtomicInteger();
         volatile boolean refuseChunks = false;
 
         volatile AddSourceRequest lastAddSource;
@@ -699,7 +732,7 @@ public class TensorLifecycleTest {
                 }
                 switch (action.getType()) {
                     case "add_source":
-                        doAddSource(action, listener);
+                        doAddSource(context, action, listener);
                         break;
                     case "remove_source":
                         lastRemoveSource = RemoveSourceRequest.parseFrom(action.getBody());
@@ -740,9 +773,27 @@ public class TensorLifecycleTest {
             }
         }
 
-        private void doAddSource(Action action, FlightProducer.StreamListener<Result> listener)
-                throws Exception {
+        private void doAddSource(
+                FlightProducer.CallContext context,
+                Action action,
+                FlightProducer.StreamListener<Result> listener) throws Exception {
             lastAddSource = AddSourceRequest.parseFrom(action.getBody());
+            if (addSourceHeartbeats > 2) {
+                // The long-walk shape: emit until the client goes away, polling
+                // cancellation the way the server's own discovery loop does.
+                for (int i = 1; i <= addSourceHeartbeats; i++) {
+                    if (context.isCancelled()) {
+                        observedCancel = true;
+                        return;
+                    }
+                    emitted.incrementAndGet();
+                    listener.onNext(new Result(AddSourceStreamMessage.newBuilder()
+                            .setProgress(AddSourceProgress.newBuilder().setAddedCount(i))
+                            .build().toByteArray()));
+                    Thread.sleep(5);
+                }
+                return;
+            }
             for (int i = 1; i <= 2; i++) {
                 listener.onNext(new Result(AddSourceStreamMessage.newBuilder()
                         .setProgress(AddSourceProgress.newBuilder()

@@ -15,6 +15,8 @@ import java.util.logging.Logger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
+import io.grpc.Context;
+
 import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
@@ -665,13 +667,10 @@ public class TensorFlightClient implements AutoCloseable {
      * is no percentage -- progress is a running count of sources registered so
      * far.
      *
-     * <p><b>Cancelling stops this client, not the server.</b> It returns an
-     * empty tally rather than raising -- the cancel was intentional -- and
-     * everything registered stays registered, but the server finishes the walk
-     * regardless, so the sources it had left to find still appear in the
-     * catalog. (The Python client's cancel does reach the server; Arrow Java's
-     * {@code doAction} hands back a bare iterator with no handle on the call,
-     * so there is nothing here to cancel with. See docs/java-tensor-v2.md.)
+     * <p>Cancelling cancels the RPC, which the server observes and stops
+     * discovery on; sources already registered stay registered, and this
+     * returns an empty tally rather than raising -- the cancel was
+     * intentional.
      *
      * @param url Absolute path (or directory) on the server's filesystem
      * @param sourceType Explicit adapter type ({@code "zarr"},
@@ -1474,6 +1473,14 @@ public class TensorFlightClient implements AutoCloseable {
      * skip, the envelope parse, and the old-server {@code "Unknown action"}
      * remap, applied only when {@code unavailableHint} is given.
      *
+     * <p><b>Stopping cancels the RPC.</b> The call is created inside a
+     * {@link Context.CancellableContext}, which gRPC ties to it, so cancelling
+     * the scope cancels the call and the server observes it -- the same thing
+     * Python gets by closing its generator, and what lets a server stop a walk
+     * it is halfway through rather than finish it for nobody. It happens on
+     * every exit, so a caller that throws out of {@code onMessage}
+     * (resolve/warm raise on cancel) also releases the server.
+     *
      * <p>A message that does not parse as {@code M} is skipped. Python can call
      * that harmless because its SDK refuses a pre-v2 server at connect; this
      * client has no such handshake yet, so against a v1 server the skip is what
@@ -1481,16 +1488,10 @@ public class TensorFlightClient implements AutoCloseable {
      * the caller, which is the best this can do until the health-action
      * {@code protocol} check is ported.
      *
-     * <p>Cancellation is deliberately NOT handled here: its semantics differ
-     * per caller (resolve/warm raise, addSource returns what it has), and the
-     * poll must run relative to a consumed message, which only the caller knows
-     * the right side of.
-     *
-     * <p>Whatever a caller does with it, stopping only abandons the iterator:
-     * Arrow Java's {@code doAction} exposes no handle on the underlying call,
-     * so the server runs its action to completion either way. Verified against
-     * a live server -- a cancelled {@code add_source} still registers every
-     * source under the path.
+     * <p>Cancellation policy is deliberately NOT decided here: its semantics
+     * differ per caller (resolve/warm raise, addSource returns what it has),
+     * and the poll must run relative to a consumed message, which only the
+     * caller knows the right side of.
      */
     private <M extends com.google.protobuf.Message> void streamAction(
             String type,
@@ -1499,8 +1500,18 @@ public class TensorFlightClient implements AutoCloseable {
             java.util.function.Predicate<M> onMessage,
             String unavailableHint) throws IOException {
         Action action = new Action(type, body);
+        Context.CancellableContext scope = Context.current().withCancellation();
         try {
-            java.util.Iterator<Result> results = session.doAction(action);
+            java.util.Iterator<Result> results;
+            // The call must be created under the scope for gRPC to bind the two;
+            // attaching only for that instant keeps it off the caller's thread.
+            Context previous = scope.attach();
+            try {
+                results = session.doAction(action);
+            } finally {
+                scope.detach(previous);
+            }
+
             while (results.hasNext()) {
                 byte[] message = results.next().getBody();
                 if (message == null || message.length == 0) {
@@ -1518,6 +1529,10 @@ public class TensorFlightClient implements AutoCloseable {
             }
         } catch (FlightRuntimeException error) {
             throw tooOld(error, type, unavailableHint);
+        } finally {
+            // Cancelling a stream already drained is a no-op, so this needs no
+            // flag for "did we stop early".
+            scope.cancel(null);
         }
     }
 
