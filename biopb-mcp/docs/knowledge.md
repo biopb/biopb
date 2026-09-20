@@ -231,6 +231,17 @@ seven steps and its ablation ritual are dropped; the index cap and the
 close-out prompt are the whole discipline for local docs. Promotion to the
 shipped seed is still a PR, and that is where review happens.
 
+**Links: one syntax, no policing.** A doc links another as `[[id]]`, and the
+link resolves by `read_doc(id)` — nothing renders or rewrites it. The syntax
+is fixed so links are machine-visible (search, a later "what links here",
+the seed check) instead of four spellings that resolve differently across the
+tiers. A dangling link in a local doc is allowed: it marks something worth
+writing, and a validator the user does not have is never a condition for a
+local doc to load. Shipped docs keep the existing check that every link
+resolves to a shipped doc. When to link is the agent's call, with one
+docstring sentence: link what this doc depends on or hands off to, not
+everything it mentions. Index hooks carry no links.
+
 ## 7. Ablation and tests
 
 **The bench switch withholds procedures, not the store.** With guides in the
