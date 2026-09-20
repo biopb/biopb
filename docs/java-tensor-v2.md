@@ -56,6 +56,14 @@ locally-planned read and a `SerializedTensor` from another process pass
 through. An absent stamp means v1 in both cases: the key postdates that
 version.
 
+Both gates fail closed. A server that does not state a protocol is refused
+however it declines to -- no reply, an empty body, a body that is not JSON, or
+JSON without the key are one fact, and the gate is worth nothing if the
+quietest server walks through it. The single exemption is an
+`UNAUTHENTICATED`/`UNAUTHORIZED` `health`: a per-source capability token cannot
+reach the catalog tier `health` sits on, and the call it is about to make
+authorizes itself.
+
 Neither is the cache-file `format_version` from `chunk_locate`, which versions
 the localhost mmap handoff this SDK does not implement.
 

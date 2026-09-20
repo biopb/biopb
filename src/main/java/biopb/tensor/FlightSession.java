@@ -77,10 +77,12 @@ public final class FlightSession implements AutoCloseable {
      * request reach a v1 server produces a parse error from the wrong proto,
      * or a chunk this client cannot decode.
      *
-     * <p>Deliberately quiet in two cases. A capability token cannot reach the
+     * <p>Deliberately quiet in one case: a capability token cannot reach the
      * catalog tier that {@code health} sits on, and the private call about to
-     * be made authorizes itself; and a server that answers nothing is not a
-     * biopb server at all, so the first real call gives the better error.
+     * be made authorizes itself. Every other way of not stating a protocol --
+     * no reply, an empty body, a body that is not JSON, a JSON body without the
+     * key -- is refused alike. They are one fact, "this server did not say",
+     * and the gate is worth nothing if the quietest server walks through it.
      */
     private void ensureProtocol() {
         if (protocolChecked) {
@@ -97,14 +99,12 @@ public final class FlightSession implements AutoCloseable {
             }
             throw TensorErrorMapper.map(error);
         }
-        if (!health.isPresent()) {
-            protocolChecked = true;
-            return;
-        }
-        // Anything but a stated v2 is a v1 server -- including a body that does
-        // not parse. The key postdates that version, so its absence names the
-        // version rather than leaving it unknown.
-        Object protocol = health.get().get("protocol");
+        // Anything but a stated v2 is a v1 server. The key postdates that
+        // version, so its absence names the version rather than leaving it
+        // unknown -- and a server that is not biopb at all is refused here
+        // rather than at "Data column value is not binary", from inside a cell
+        // load, which is the error this gate exists to replace.
+        Object protocol = health.orElse(Collections.emptyMap()).get("protocol");
         int serverVersion = protocol instanceof Number ? ((Number) protocol).intValue() : 1;
         if (serverVersion != WireVersions.FLIGHT_PROTOCOL_VERSION) {
             throw new UnsupportedOperationException(WireVersions.mismatch(
@@ -116,9 +116,9 @@ public final class FlightSession implements AutoCloseable {
 
     /**
      * The server's {@code health} reply, parsed. Absent means it answered
-     * nothing at all -- which is not a biopb server, so the first real call
-     * gives the better error; an empty map means it answered something that is
-     * not JSON, which {@link #ensureProtocol} reads as a v1 server.
+     * nothing at all; an empty map means it answered something that is not
+     * JSON. {@link #ensureProtocol} refuses both, and {@link
+     * TensorFlightClient#healthCheck} reports the first as {@code UNKNOWN}.
      *
      * <p>Goes straight to the client rather than through {@link #doAction}, so
      * that {@link #ensureProtocol} -- which is the reason this exists -- cannot

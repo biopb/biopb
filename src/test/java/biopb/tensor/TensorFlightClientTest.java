@@ -456,6 +456,28 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testRefusesAServerThatWillNotStateItsProtocol() throws Exception {
+        // Not stating a protocol is one fact however it is spelled, and the
+        // gate is worth nothing if the quietest server walks through it: a
+        // proxy, a wedged server or a non-biopb Flight server would otherwise
+        // be refused only later, by "Data column value is not binary" from
+        // inside a cell load.
+        for (String silence : new String[] {"no-result", "", "not json", "{\"status\":\"SERVING\"}"}) {
+            try (TestFlightServer server = new TestFlightServer()) {
+                server.setHealthSilence(silence);
+                try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                    UnsupportedOperationException error = Assert.assertThrows(
+                            "health answered " + (silence.isEmpty() ? "<empty>" : silence),
+                            UnsupportedOperationException.class,
+                            () -> client.getTensor("test-tensor"));
+                    Assert.assertTrue(error.getMessage(),
+                            error.getMessage().contains("server speaks v1"));
+                }
+            }
+        }
+    }
+
+    @Test
     public void testACapabilityTokenIsNotRefusedForFailingTheProbe() throws Exception {
         // health is on the catalog tier, which a per-source capability cannot
         // reach. Refusing it here would lock the narrowest credential out of the
@@ -860,6 +882,10 @@ public class TensorFlightClientTest {
             producer.healthUnauthenticated = refuse;
         }
 
+        void setHealthSilence(String how) {
+            producer.healthSilence = how;
+        }
+
         /**
          * Shut the server down, then wait for the producer to be idle before
          * closing the allocator.
@@ -910,6 +936,13 @@ public class TensorFlightClientTest {
         final AtomicInteger inFlight = new AtomicInteger();
         // A capability token cannot read the catalog tier health sits on.
         volatile boolean healthUnauthenticated = false;
+        /**
+         * How this fake answers health: null is the ordinary JSON reply, and
+         * anything else is one of the ways a server can decline to state a
+         * protocol -- no result at all, an empty body, a body that is not JSON,
+         * or JSON without the key.
+         */
+        volatile String healthSilence = null;
         // The chunk encoding this fake stamps; null leaves the schema unstamped,
         // which is how a pre-#293 server presents.
         volatile String chunkWireProtocol = "2";
@@ -1134,6 +1167,13 @@ public class TensorFlightClientTest {
                 if (healthUnauthenticated) {
                     listener.onError(CallStatus.UNAUTHENTICATED
                             .withDescription("no catalog access").toRuntimeException());
+                    return;
+                }
+                if (healthSilence != null) {
+                    if (!"no-result".equals(healthSilence)) {
+                        listener.onNext(new Result(healthSilence.getBytes(StandardCharsets.UTF_8)));
+                    }
+                    listener.onCompleted();
                     return;
                 }
                 // Every v2 server answers this, and the SDK probes it once per
