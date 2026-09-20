@@ -64,7 +64,7 @@ def _run_serve(config, **overrides):
         "log_scope_biopb": True,
         "host": None,
         "port": None,
-        "writable": False,
+        "writable": None,
         "token": None,
         "tls": None,
         "tls_cert": None,
@@ -88,7 +88,7 @@ def _run_launch(config, **overrides):
         "log_scope_biopb": True,
         "host": None,
         "port": None,
-        "writable": False,
+        "writable": None,
         "web_port": 8816,
         "web_host": "127.0.0.1",
         "token": None,
@@ -191,6 +191,49 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     _run_launch(Path("unused.json"))
 
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
+
+
+@pytest.mark.parametrize(
+    "argv, forwarded",
+    [
+        ([], None),  # no opinion -> the config file decides
+        (["--writable"], True),  # explicit on
+        (["--no-writable"], False),  # explicit off, overriding a config that says on
+    ],
+)
+def test_writable_flag_is_three_state_through_typer(monkeypatch, argv, forwarded):
+    """Absence of --writable must mean "no opinion", not "off".
+
+    `_setup_flight_server` resolves `writable=None` to the config file's
+    `server.writable`, so the flag has to be able to *not* be given. Declared as
+    a plain `bool` it could not: omitting it arrived as False, which silently
+    pinned every config-driven deployment to read-only -- `server.writable: true`
+    had no effect anywhere, the control plane's supervised data plane included,
+    since it passes no flag by design (biopb#1085).
+
+    This goes through typer's own parsing via CliRunner. The sibling helpers here
+    call the command as a plain function and supply their own defaults, which is
+    exactly why the suite could not see it.
+    """
+    from typer.testing import CliRunner
+
+    captured: dict = {}
+    monkeypatch.setattr(cli, "load_config", lambda path: _fake_server_config())
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
+    monkeypatch.setattr(cli, "run_http_server", lambda **k: None)
+    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
+
+    def _capture_setup(cfg, **kwargs):
+        captured.update(kwargs)
+        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+
+    result = CliRunner().invoke(cli.app, ["launch", "--config", "unused.json", *argv])
+    assert result.exit_code == 0, result.output
+    assert captured["writable"] is forwarded
 
 
 def test_launch_forwards_flight_overrides_and_resolves_token_against_host(

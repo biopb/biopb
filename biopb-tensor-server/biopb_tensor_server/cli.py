@@ -787,7 +787,13 @@ def _setup_flight_server(
     Raises:
         typer.Exit: If no sources configured or no sources loaded successfully
     """
-    # Apply overrides
+    # Apply overrides. `writable` is deliberately three-state: None means the
+    # caller expressed no opinion and the config file decides. Declaring the CLI
+    # option as a plain `bool` instead makes its absence indistinguishable from
+    # `--no-writable`, which silently pinned every config-driven deployment to
+    # read-only -- `server.writable: true` in the config had no effect at all,
+    # including for the control plane's supervised data plane, which passes no
+    # flag by design (biopb#1085).
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
 
@@ -1109,10 +1115,12 @@ def serve(
         "-p",
         help="TCP port for the Flight gRPC server.",
     ),
-    writable: bool = typer.Option(
-        False,
-        "--writable",
-        help="Enable write mode for source creation and data upload",
+    writable: Optional[bool] = typer.Option(
+        None,
+        "--writable/--no-writable",
+        help="Enable write mode for source creation and data upload. Omitted, "
+        "the config file's `server.writable` decides; the flag overrides it "
+        "either way.",
     ),
     token: Optional[str] = typer.Option(
         None,
@@ -1598,10 +1606,12 @@ def launch(
         "-p",
         help="TCP port for the Flight gRPC server.",
     ),
-    writable: bool = typer.Option(
-        False,
-        "--writable",
-        help="Enable write mode for source creation and data upload",
+    writable: Optional[bool] = typer.Option(
+        None,
+        "--writable/--no-writable",
+        help="Enable write mode for source creation and data upload. Omitted, "
+        "the config file's `server.writable` decides; the flag overrides it "
+        "either way.",
     ),
     web_port: int = typer.Option(
         8816,
