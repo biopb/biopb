@@ -38,13 +38,12 @@ disk caching are deliberately out of scope until the core protocol is stable.
 
 ### The two version gates
 
-A server advertises three version signals and only two of them are contracts:
+A server advertises exactly two version signals, and both are contracts:
 
 | signal | where | meaning |
 | --- | --- | --- |
 | `protocol` | `health` action | the protocol *shape* -- which descriptors, tickets and put commands the server understands. v1 routed by a sentinel `source_id`; v2 is the oneofs this client sends. |
 | `chunk_wire_protocol` | schema metadata on every read plan | the chunk *encoding*. v1 was `data: list<T>`; v2 is one binary blob plus a numpy dtype string (biopb/biopb#293), which is what `ChunkDecoder` reads. |
-| `tensor_schema_version` | same schema | the server package's release tag. Informational -- the server's own comment says so -- and nothing to do with the wire. |
 
 Known gaps, each with an issue rather than a note here: uploads are sequential
 where Python's are concurrent (biopb/biopb#1073), and a `grpc+tls://` location
@@ -57,9 +56,12 @@ with `setReal`, so `i8`/`u8` tensors lose ids above 2^53 even though
 `createType` gives them the right imglib2 type -- biopb/biopb#1071. The upload
 side is already exact.
 
-A fourth, `format_version` in the `chunk_locate` reply, versions the cache-file
-handoff this SDK does not implement. That three of the four are contracts and
-one is a release tag sitting in the same metadata dict is biopb/biopb#1070.
+There were two more until biopb/biopb#1070: `tensor_schema_version` on the same
+schema (a release tag, retired years before anything stopped sending it) and
+`format_version` in the `chunk_locate` reply (a segment-layout negotiation whose
+one bump stood in for a content change). Both are gone. This client had
+implemented the first as a compatibility check, which is the argument for
+removing a retired key rather than documenting it.
 
 `FlightSession` probes the first on first use, so building a client stays free
 of I/O and a v1 server is named rather than sent a request it will parse as
@@ -76,9 +78,6 @@ quietest server walks through it. The single exemption is an
 `UNAUTHENTICATED`/`UNAUTHORIZED` `health`: a per-source capability token cannot
 reach the catalog tier `health` sits on, and the call it is about to make
 authorizes itself.
-
-Neither is the cache-file `format_version` from `chunk_locate`, which versions
-the localhost mmap handoff this SDK does not implement.
 
 Cancellation transfers, by a different route. Python breaks out of the
 `do_action` generator and pyarrow closes the stream; Arrow Java hands back a

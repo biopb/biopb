@@ -12,6 +12,7 @@ Replaces the retired /dev/shm shm_transfer path. Covers:
 
 import dataclasses
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -820,28 +821,6 @@ class TestLocalhostDetection:
         assert _is_localhost_location("grpc://example.com:8815") is False
 
 
-class TestExtractSchemaMetadata:
-    def test_extracts_metadata_dict(self):
-        from biopb.tensor.client import _extract_schema_metadata
-
-        schema = pa.schema(
-            [],
-            metadata={
-                b"tensor_schema_version": b"0.4.0",
-                b"other_key": b"other_value",
-            },
-        )
-        metadata = _extract_schema_metadata(schema)
-        assert metadata is not None
-        assert metadata["tensor_schema_version"] == "0.4.0"
-        assert metadata["other_key"] == "other_value"
-
-    def test_returns_none_for_no_metadata(self):
-        from biopb.tensor.client import _extract_schema_metadata
-
-        assert _extract_schema_metadata(pa.schema([])) is None
-
-
 class TestShouldTryCachefile:
     def setup_method(self):
         import biopb.tensor._pool as c
@@ -1199,31 +1178,79 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_newer_segment_format_falls_back(self):
-        """A server segment format newer than the client understands declines
-        the fast path (and is memoized off), but data is still correct via do_get."""
+    def test_a_segment_message_that_is_not_the_chunk_is_refused(self):
+        """The fast path verifies what it decoded, and falls back if it is wrong.
+
+        There is no negotiated segment-format version any more (biopb/biopb#1070):
+        its one bump ever stood in for a content change, which the chunk_id now
+        carries. What it left unguarded is the failure that matters -- an offset
+        that decodes cleanly into the WRONG message hands back another chunk's
+        pixels, silently. Every segment record carries its own cache key, and
+        chunk_locate echoes the key it resolved, so the client can check exactly
+        that. Here every locate is answered with the FIRST chunk's location, so
+        each later chunk is pointed at a valid message of the same shape that
+        belongs to someone else -- which a shape check would wave through.
+        """
         import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
+        from biopb_tensor_server.core import chunk as chunk_mod
 
         tmp = tempfile.mkdtemp()
         cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
-        server, src = self._serve_zarr(tmp, cfg)
-        loc = f"grpc://localhost:{server.port}"
-        try:
-            cmod._cachefile_support.clear()
-            # Pretend this client can't parse the server's (>=1) segment format.
-            # The constant is read by _try_cachefile_transfer in biopb.tensor._pool
-            # (issue #278 item C), so patch it there, not on the client re-export.
-            with patch("biopb.tensor._pool._CACHEFILE_SUPPORTED_FORMAT", 0):
+        with patch.object(chunk_mod, "PREFERRED_ARROW_BATCH_BYTES", 4096):
+            server, src = self._serve_zarr(tmp, cfg)
+            loc = f"grpc://localhost:{server.port}"
+            original = type(server)._handle_chunk_locate
+            first = {}
+
+            def misdirect(self, chunk_id):
+                """Resolve the right entry, then point at the wrong bytes.
+
+                Exactly the shape of a segment-layout drift: the server knows
+                which entry the client asked for -- so its echoed key is
+                correct -- but the byte range no longer names that entry's
+                message. Keeping the key honest is what makes this the failure
+                a client CAN catch, as opposed to a server that resolved the
+                wrong entry outright, which no client-side check can see.
+                """
+                payload = json.loads(original(self, chunk_id))
+                if payload.get("available"):
+                    if first:
+                        payload.update(first["where"])
+                    else:
+                        first["where"] = {
+                            k: payload[k]
+                            for k in (
+                                "segment_path",
+                                "byte_offset",
+                                "byte_length",
+                                "generation_id",
+                            )
+                        }
+                return json.dumps(payload)
+
+            try:
+                cmod._cachefile_support.clear()
                 client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z").compute(scheduler="threads")
-                assert np.array_equal(got, src)  # correct via do_get fallback
-                assert cmod._cachefile_support.get(loc) is False  # declined + memoized
+                # Warm every chunk into the segment cache first, honestly.
+                assert np.array_equal(
+                    client.get_tensor("z").compute(scheduler="threads"), src
+                )
+                assert len(client.get_tensor("z").chunks[0]) > 1, "need >1 chunk"
                 client.close()
-        finally:
-            server.shutdown()
-            CacheManager.reset()
-            shutil.rmtree(tmp, ignore_errors=True)
+
+                cmod._cachefile_support.clear()
+                with patch.object(type(server), "_handle_chunk_locate", misdirect):
+                    client = TensorFlightClient(loc, cache_bytes=0)
+                    got = client.get_tensor("z").compute(scheduler="threads")
+                    # Correct pixels, via the do_get fallback -- not the first
+                    # chunk's bytes smeared over the whole array.
+                    assert np.array_equal(got, src)
+                    client.close()
+            finally:
+                server.shutdown()
+                CacheManager.reset()
+                shutil.rmtree(tmp, ignore_errors=True)
 
     def test_view_is_weak_cached_not_copy_cached(self):
         """A fast-path mmap view lands in the weak view cache (free; dedups a live

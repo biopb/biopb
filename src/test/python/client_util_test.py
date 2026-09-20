@@ -9,39 +9,7 @@ from biopb.tensor._wire_version import (
     TENSOR_WIRE_PROTOCOL_VERSION,
     WIRE_PROTOCOL_METADATA_KEY,
 )
-from biopb.tensor.client import _check_wire_protocol, _parse_version
-
-
-class TestParseVersion:
-    """Tests for _parse_version semantic version parsing."""
-
-    def test_parse_simple_version(self):
-        """Test parsing simple semantic version."""
-        assert _parse_version("1.0.0") == (1, 0, 0)
-        assert _parse_version("2.3.4") == (2, 3, 4)
-        assert _parse_version("0.0.1") == (0, 0, 1)
-
-    def test_parse_dev_version(self):
-        """Test parsing dev versions like '0.3.1.dev43+g...'."""
-        # Handle dev versions - should parse base version
-        assert _parse_version("0.3.1.dev43") == (0, 3, 1)
-        assert _parse_version("1.2.3.dev0+gabc123") == (1, 2, 3)
-
-    def test_parse_two_part_version(self):
-        """Test parsing versions with only two parts."""
-        assert _parse_version("1.0") == (1, 0, 0)
-        assert _parse_version("2.3") == (2, 3, 0)
-
-    def test_parse_single_part_version(self):
-        """Test parsing versions with only one part."""
-        assert _parse_version("1") == (1, 0, 0)
-        assert _parse_version("0") == (0, 0, 0)
-
-    def test_parse_empty_version(self):
-        """Test parsing empty version string raises ValueError."""
-        # Empty version raises ValueError due to int('')
-        with pytest.raises(ValueError):
-            _parse_version("")
+from biopb.tensor.client import _check_wire_protocol
 
 
 def _schema_with_protocol(version):

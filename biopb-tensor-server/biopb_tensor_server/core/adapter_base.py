@@ -1455,8 +1455,6 @@ class TensorAdapter(SourceAdapter):
         Returns:
             Arrow Schema with data, shape, and dtype fields
         """
-        import importlib.metadata
-
         from biopb.tensor._wire_version import (
             TENSOR_WIRE_PROTOCOL_VERSION,
             WIRE_PROTOCOL_METADATA_KEY,
@@ -1465,11 +1463,13 @@ class TensorAdapter(SourceAdapter):
         desc = desc or self.get_tensor_descriptor()
         require_resolved(desc)
 
-        # Schema metadata: the wire-protocol version is the hard compatibility
-        # gate the client enforces (biopb/biopb#293); tensor_schema_version is
-        # kept as an informational package-version tag.
+        # One key, one contract: the wire-protocol version the client enforces
+        # (biopb/biopb#293). A `tensor_schema_version` release tag sat here too
+        # until biopb/biopb#1070 -- it stopped meaning anything when its one
+        # consumer (an shm feature probe) was replaced, and a release tag beside
+        # a byte-encoding gate reads like a second gate. It was: the Java client
+        # implemented it.
         metadata = {
-            "tensor_schema_version": importlib.metadata.version("biopb-tensor-server"),
             WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
         }
 

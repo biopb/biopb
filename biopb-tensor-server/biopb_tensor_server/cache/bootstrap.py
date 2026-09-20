@@ -36,21 +36,24 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# On-disk segment format version for the localhost cache-file handoff (issue
-# #9). The server reports it in chunk_locate and a client declines the fast
-# path (falls back to do_get) for any version it doesn't understand.
+# On-disk segment format version (issue #9). SERVER-LOCAL: one process, one
+# directory, read at boot to decide whether this build may reuse the segments it
+# finds. It is no longer reported to anyone. It used to ride the chunk_locate
+# reply, where a client matched it against a constant of its own -- a version
+# negotiation across two codebases whose one bump in life
+# (biopb/biopb#596) taught the client nothing to parse, because it was standing
+# in for a content change. Content is the chunk_id's job
+# (``CHUNK_SEMANTICS_EPOCH``, biopb/biopb#1076) and identity is checked
+# structurally on the read, so the negotiation went (biopb/biopb#1070).
 #
-# ONE question only: "can you parse this segment file?". Its audience is this
-# server's boot sweep and a localhost mmap client. It is NOT the signal for
-# "have the bytes a chunk_id resolves to changed meaning?" -- that reaches every
-# cache, including ones this server cannot see, and is ``CHUNK_SEMANTICS_EPOCH``
-# in ``core.chunk`` (biopb/biopb#1076). One number carried both questions until
-# then, which is the bug #1076 describes.
+# ONE question: "may this build reuse these segment files?". Bump it for a
+# layout change. Do NOT bump it for a content change -- that is the epoch, and
+# conflating the two is what #1076 describes.
 #
 # v2: biopb/biopb#596 implemented axis order normalization. A v1 segment holds the
 # pre-transpose bytes, so reusing it would serve axes in the wrong order. That is
-# a semantics change and would bump the epoch today; the number stays at 2
-# because lowering it would re-admit those v1 segments.
+# a content change and would bump the epoch today; the number stays at 2 because
+# lowering it would re-admit those v1 segments.
 CACHE_FILE_FORMAT_VERSION = 2
 
 # Name of the on-disk marker file (in the cache root, beside ``lock`` and

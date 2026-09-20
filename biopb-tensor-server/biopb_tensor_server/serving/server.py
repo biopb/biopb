@@ -72,7 +72,7 @@ from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
-from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
+from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
@@ -1992,10 +1992,21 @@ class TensorFlightServer(flight.FlightServerBase):
             if location is None:
                 return json.dumps({"available": False})
 
+            # No `format_version`. It negotiated a segment layout the client
+            # parses, but its one bump ever (biopb/biopb#596) taught the client
+            # nothing to parse -- it stood in for "these bytes mean something
+            # different now", which is CHUNK_SEMANTICS_EPOCH's job and rides the
+            # chunk_id (biopb/biopb#1070, #1076). What is left is structural and
+            # the client checks it structurally: the batch it decodes has to be
+            # the chunk it asked for.
             return json.dumps(
                 {
                     "available": True,
-                    "format_version": CACHE_FILE_FORMAT_VERSION,
+                    # The entry this offset resolves to, echoed so the client can
+                    # verify the message it decodes is that entry (every segment
+                    # record carries the key as a per-row column). Opaque both
+                    # ways -- the client compares bytes and parses nothing.
+                    "cache_key": cache_key.hex(),
                     "segment_path": location.segment_path,
                     "byte_offset": location.byte_offset,
                     "byte_length": location.byte_length,

@@ -305,7 +305,6 @@ def _dask_from_flight_info(
         location,
         token,
         cache_bytes,
-        _extract_schema_metadata(info.schema),
         tls_trust,
     )
     if requested is None:
@@ -320,35 +319,6 @@ def _dask_from_flight_info(
             )
         ]
     return dask_arr
-
-
-def _extract_schema_metadata(schema: pa.Schema) -> Optional[Dict[str, str]]:
-    """Extract schema metadata as Python dict for feature detection.
-
-    Args:
-        schema: PyArrow Schema from FlightInfo
-
-    Returns:
-        Dict with metadata key-value pairs, or None if no metadata
-    """
-    if schema.metadata is None:
-        return None
-
-    return {
-        key.decode("utf-8"): value.decode("utf-8")
-        for key, value in schema.metadata.items()
-    }
-
-
-def _parse_version(version_str: str) -> Tuple[int, int, int]:
-    """Parse semantic version string to (major, minor, patch) tuple."""
-    # Handle dev versions like "0.3.1.dev43+g..."
-    base = version_str.split(".dev")[0].split("+")[0]
-    parts = base.split(".")
-    major = int(parts[0]) if len(parts) > 0 else 0
-    minor = int(parts[1]) if len(parts) > 1 else 0
-    patch = int(parts[2]) if len(parts) > 2 else 0
-    return (major, minor, patch)
 
 
 def _check_flight_protocol(

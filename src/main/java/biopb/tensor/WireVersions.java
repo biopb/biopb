@@ -27,9 +27,12 @@ package biopb.tensor;
  *       point before the bytes are reinterpreted.
  * </ul>
  *
- * <p>Neither is the on-disk cache-file format ({@code format_version} in the
- * {@code chunk_locate} reply), which versions the localhost mmap handoff this
- * SDK does not implement.
+ * <p>Those two are the whole set. A read plan's schema once also carried a
+ * {@code tensor_schema_version} release tag, and {@code chunk_locate} a
+ * {@code format_version} for the localhost mmap handoff this SDK does not
+ * implement; both are gone (biopb/biopb#1070). A version-shaped key beside a
+ * real gate reads like a gate -- this client implemented the first one as a
+ * compatibility check, which it never was.
  */
 final class WireVersions {
 

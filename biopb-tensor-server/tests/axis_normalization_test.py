@@ -574,14 +574,19 @@ class TestNormalizedCaching:
             finally:
                 CacheManager.reset()
 
-    def test_format_version_was_bumped_for_the_transpose(self):
-        from biopb.tensor._pool import _CACHEFILE_SUPPORTED_FORMAT
+    def test_the_segment_marker_still_refuses_pre_transpose_segments(self):
+        """This server must never read back a v1 segment: it holds pre-transpose
+        bytes under an id that is still valid.
+
+        The bump was the only invalidation signal available at the time, and it
+        reached only this server's own cache (biopb/biopb#1076). A change like
+        this one bumps CHUNK_SEMANTICS_EPOCH today, which re-keys the chunks and
+        so reaches every cache. The marker keeps its number regardless --
+        lowering it would re-admit the v1 segments it was raised to exclude.
+        """
         from biopb_tensor_server.cache.bootstrap import CACHE_FILE_FORMAT_VERSION
 
         assert CACHE_FILE_FORMAT_VERSION >= 2
-        # The layout did not change, so this client parses the new version; an
-        # older one declines the fast path and falls back to do_get.
-        assert _CACHEFILE_SUPPORTED_FORMAT >= CACHE_FILE_FORMAT_VERSION
 
 
 # ==============================================================================

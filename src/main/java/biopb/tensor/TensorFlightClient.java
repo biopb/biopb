@@ -1588,7 +1588,6 @@ public class TensorFlightClient implements AutoCloseable {
 
         FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
         FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
-        checkSchemaVersion(info);
         TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(info);
         refuseAmbiguousDefault(arrayId, descriptor.getArrayId());
         return new RequestContext(descriptor, info);
@@ -1603,7 +1602,6 @@ public class TensorFlightClient implements AutoCloseable {
                 .build();
         FlightRequest request = FlightRequest.newBuilder().setTensorRead(read).build();
         FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
-        checkSchemaVersion(info);
         return TensorChunkCodec.descriptorOf(info);
     }
 
@@ -1647,72 +1645,6 @@ public class TensorFlightClient implements AutoCloseable {
                         "Unsupported reduction method: " + reductionMethod
                                 + ". Supported methods: [nearest, area, linear]");
         }
-    }
-
-    private static void checkSchemaVersion(FlightInfo info) {
-        // Advisory only, and NOT a compatibility gate: tensor_schema_version is
-        // the server package's own release tag, which says nothing about the
-        // wire. The two real gates are the health action's `protocol`
-        // (FlightSession) and the schema's `chunk_wire_protocol`
-        // (Imglib2TensorFactory). A malformed version string must never fail a read.
-        try {
-            java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
-            if (!schemaOpt.isPresent()) {
-                return;
-            }
-            Schema schema = schemaOpt.get();
-            Map<String, String> metadata = schema.getCustomMetadata();
-            if (metadata == null) {
-                return;
-            }
-            String serverVersion = metadata.get("tensor_schema_version");
-            if (serverVersion == null || serverVersion.isEmpty()) {
-                return;
-            }
-            String clientVersion = getClientVersion();
-            if (clientVersion == null) {
-                return;
-            }
-            int[] serverParsed = parseVersion(serverVersion);
-            int[] clientParsed = parseVersion(clientVersion);
-            if (clientParsed[0] < serverParsed[0]
-                    || (clientParsed[0] == serverParsed[0] && clientParsed[1] < serverParsed[1])
-                    || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1]
-                            && clientParsed[2] < serverParsed[2])) {
-                LOGGER.warning("Client version " + clientVersion + " is older than server schema version "
-                        + serverVersion + ". Consider upgrading biopb client for compatibility.");
-            }
-        } catch (RuntimeException e) {
-            LOGGER.fine("Skipping schema version check: " + e);
-        }
-    }
-
-    private static String getClientVersion() {
-        // Explicit override wins; otherwise fall back to the packaged
-        // implementation version. (Do NOT use it as System.getProperty's
-        // default -- getProperty never throws, so the manifest fallback below
-        // would be dead code and the jar URL would leak in as a "version".)
-        String override = System.getProperty("biopb.version");
-        if (override != null && !override.isEmpty()) {
-            return override;
-        }
-        Package pkg = TensorFlightClient.class.getPackage();
-        if (pkg != null && pkg.getImplementationVersion() != null) {
-            return pkg.getImplementationVersion();
-        }
-        return null;
-    }
-
-    private static int[] parseVersion(String version) {
-        // Handle dev versions like "0.3.1.dev43+g...". split() takes a regex, so
-        // "." and "+" must be escaped (a bare "+" is a dangling-metacharacter
-        // error, and "." matches any char).
-        String base = version.split("\\.dev")[0].split("\\+")[0];
-        String[] parts = base.split("\\.");
-        int major = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
-        int minor = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
-        int patch = parts.length > 2 ? Integer.parseInt(parts[2]) : 0;
-        return new int[] { major, minor, patch };
     }
 
     private static final Gson GSON = new Gson();

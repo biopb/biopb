@@ -52,8 +52,6 @@ from biopb.tensor._session import (
     _check_wire_protocol as _check_wire_protocol,
     _ClientState,
     _dask_from_flight_info,
-    _extract_schema_metadata as _extract_schema_metadata,
-    _parse_version as _parse_version,
     _refetch_flight_info,
     _requested_slice,
     _split_array_id as _split_array_id,
