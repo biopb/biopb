@@ -8,7 +8,6 @@ one you do not want.
 ## Read first
 
 - kernel: the namespace, kernel plugins, long-running jobs, where a compute runs
-- requirements: check what a procedure needs, and what to do when a piece is missing
 - tensor-server-client: browse the catalog, load a tensor, and what lazy costs
 - upload: put a result on the server — tensors, label sets, ROI annotations
 - web-viewer: show data in the browser — needs no window; send the link, or open it yourself
@@ -17,6 +16,7 @@ one you do not want.
 
 ## Procedures
 
+- requirements: check what a procedure needs, and what to do when a piece is missing
 - flatfield: correct uneven illumination across a set of tiles or fields
 - stitch-tiles: assemble a grid of overlapping tiles into one mosaic
 - align-stack-by-features: register serial sections that shifted and turned
