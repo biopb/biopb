@@ -18,7 +18,9 @@ disk caching are deliberately out of scope until the core protocol is stable.
 - [x] Remove the legacy `(sourceId, tensorId)` entry points and the
   `DataSourceDescriptor` row decoders they fed.
 - [x] Own Flight connections after the pool's removal: `FlightSessions` shares
-  one per `(location, token)`, as `biopb.tensor._pool` does.
+  one per `(location, token)`. The token belongs in the key as it does in both
+  of `biopb.tensor._pool`'s pools; the third component Python's *connection*
+  key has, `TlsTrust.key_id`, has to arrive with TLS (biopb/biopb#1072).
 - [x] Port the two compatibility gates: the `health` action's `protocol`
   (checked once per connection) and the read plan's `chunk_wire_protocol`
   (checked where a plan becomes an image).
