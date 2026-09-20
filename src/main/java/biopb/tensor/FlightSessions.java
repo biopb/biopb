@@ -35,6 +35,7 @@ import org.apache.arrow.flight.Location;
  * at all -- {@link LocationUris} parses a {@code grpc+tls://} location but
  * nothing configures trust for it. <b>Whoever adds TLS must add it to this key
  * in the same change</b>, or the bug arrives silently with the feature.
+ * biopb/biopb#1072 tracks that work and names this as part of it.
  *
  * <p>Sessions live until the JVM exits. That is the point -- there is no
  * reference count to hang a close on, because an image hands its session to an

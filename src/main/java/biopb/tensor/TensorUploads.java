@@ -47,7 +47,11 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
  * <p>Declare, then fill: {@link #createTensor} returns the server's descriptor
  * for the new source, and that descriptor is what every write takes. The Java
  * twin of {@code biopb.tensor._upload}, minus its dask graph -- an imglib2
- * interval is walked on the calling thread, one chunk per grid cell.
+ * interval is walked on the calling thread, one chunk per grid cell, each put
+ * finished before the next is encoded. Python instead stores the whole array
+ * through dask with {@code lock=False} and the chunks go up concurrently, which
+ * the server is built for (it counts arrivals into a set keyed by chunk id).
+ * Closing that gap is biopb/biopb#1073.
  */
 final class TensorUploads {
 

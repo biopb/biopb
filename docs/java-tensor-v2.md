@@ -44,6 +44,12 @@ A server advertises three version signals and only two of them are contracts:
 | `chunk_wire_protocol` | schema metadata on every read plan | the chunk *encoding*. v1 was `data: list<T>`; v2 is one binary blob plus a numpy dtype string (biopb/biopb#293), which is what `ChunkDecoder` reads. |
 | `tensor_schema_version` | same schema | the server package's release tag. Informational -- the server's own comment says so -- and nothing to do with the wire. |
 
+Known gaps, each with an issue rather than a note here: uploads are sequential
+where Python's are concurrent (biopb/biopb#1073), and a `grpc+tls://` location
+gets the JDK default trust store with no way to configure an anchor, a
+fingerprint or a hostname override (biopb/biopb#1072 -- which must also extend
+the connection-cache key, see `FlightSessions`).
+
 Known gap: the chunk value path decodes every dtype to `double` and scatters it
 with `setReal`, so `i8`/`u8` tensors lose ids above 2^53 even though
 `createType` gives them the right imglib2 type -- biopb/biopb#1071. The upload
