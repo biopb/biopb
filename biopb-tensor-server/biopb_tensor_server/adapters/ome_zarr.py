@@ -502,7 +502,7 @@ class OmeZarrAdapter(ZarrAdapter):
         under the same name (biopb/biopb#354).
 
         The store is born carrying the ``pending`` upload marker, so a crash
-        before ``finish`` leaves something a restart recognizes and removes
+        before it is published leaves something a restart recognizes and removes
         rather than a partial store discovery would serve (biopb/biopb#1059).
         """
         import zarr

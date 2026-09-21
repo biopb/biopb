@@ -32,16 +32,17 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._writable import WritableSource
+from biopb_tensor_server.adapters._writable import UploadStatus, WritableSource
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
 from biopb_tensor_server.core.chunk import (
+    content_version_of,
     decode_chunk_id,
     is_scaled_chunk,
     mint_chunk_id,
 )
-from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA
-from biopb_tensor_server.core.errors import UploadDiscardedError
+from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA, unpack_chunk_array
+from biopb_tensor_server.core.errors import StaleChunkError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -196,8 +197,16 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         self._physical_scale_vec = list(physical_scale) if physical_scale else []
         self._physical_unit_vec = list(physical_unit) if physical_unit else []
 
-        # Track actually-written chunks: start coords -> full bounds
+        # The record of what has been uploaded: chunk_id -> the bounds it
+        # covers. It is what tells a gap (never uploaded -- reads as zeros)
+        # from a loss (uploaded, then evicted -- raises), and the two must not
+        # look alike to a reader.
         self._written_chunks: Dict[bytes, ChunkBounds] = {}
+        # Whether any write has landed off the declared grid. ``cache:`` is the
+        # one kind that allows it, and almost nothing does; while it stays
+        # False, a grid-aligned read that misses the record is a gap outright,
+        # with no scan of the record needed to prove it (:meth:`get_data`).
+        self._off_grid_writes = False
 
         # Per-upload generation token folded into every written chunk_id so an
         # upload reusing a (deterministic) source_id after a restart lands in a
@@ -230,10 +239,10 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """The write grid, verbatim -- not re-split at the wire bound.
 
         The base clamps a declared grid to ``MAX_ARROW_BATCH_BYTES`` so an
-        oversized chunk is fetched in pieces. Here the pieces would not exist:
-        an unscaled read serves only the chunk_ids that were written
-        (:meth:`resolve_chunk_data`), so a plan on any other grid asks for
-        bounds that were never stored and fails on its first chunk. An
+        oversized chunk is fetched in pieces. Here the pieces do not exist as
+        chunks: a plan on any other grid asks for bounds no upload stored, and
+        every one of them is then reassembled by a scan of the whole record
+        (:meth:`get_data`) -- correct, and quadratic in the chunk count. An
         uploader that wrote one 67 MB chunk -- a whole result in one DoPut is
         the ordinary runtime case -- is served that chunk whole; the cache
         keeps an oversized entry in memory rather than on disk, and DoGet
@@ -251,13 +260,14 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """Return TensorDescriptor for this cache source.
 
         ``chunk_shape`` is the uploader's write grid, verbatim and unnegotiable.
-        This source has no backend -- ``get_data`` raises and
-        ``resolve_chunk_data`` serves only the chunk_ids that were actually
-        written -- so a read planned on any other grid asks for bounds that were
-        never stored and fails outright. That is exactly what happened while the
-        server re-sized every adapter's grid: a (1,1,1,1024,1024) upload was
-        planned at (1,1,4,1024,1024) and none of the 64 planned chunk_ids
-        existed (biopb/biopb#809). Nothing may re-shape this value.
+        This source has no backend: its chunks are its only copy, and a read
+        planned on any other grid names bounds no upload ever stored. While
+        such a read raised, that was loud -- the server re-sizing every
+        adapter's grid planned a (1,1,1,1024,1024) upload at
+        (1,1,4,1024,1024), and none of the 64 chunk_ids existed
+        (biopb/biopb#809). It is answered now, off the record rather than off a
+        chunk_id, which makes a re-shaped grid quiet and slow instead of loud.
+        Nothing may re-shape this value.
         """
         return TensorDescriptor(
             array_id=self.source_id,
@@ -290,30 +300,73 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         return list(self._physical_scale_vec), list(self._physical_unit_vec)
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read data within bounds.
+        """The region at *bounds*, assembled from the chunks that were uploaded.
 
-        Cache-backed sources have no backend data source - data is only
-        available in cache and must be accessed via chunk_id.
+        There is no backend: an upload's cache entries are its only copy, so
+        this reads them back. A region nobody uploaded reads as **zeros**,
+        which is what makes a published-but-unfinished source servable -- the
+        writer of a label set that covers a tenth of the frame sends a tenth of
+        the chunks, and the rest is background. It is the read gate
+        (``WritableSource.check_readable``), not this, that keeps a hole from
+        being read as data before the producer has said the holes are holes.
 
-        Args:
-            bounds: Chunk bounds (start, stop coordinates per axis)
+        A chunk that *was* uploaded and is no longer in the cache raises: that
+        is loss, not a hole, and the two must not look alike.
 
-        Raises:
-            FlightServerError: Cannot read data from cache-backed source
+        The exact-chunk case is O(1) and is every read a plan makes -- the
+        transfer grid is the uploader's own write grid and nothing may re-shape
+        it (biopb/biopb#809). A miss is a gap outright, still without touching
+        the record, as long as both ends sat on that grid: a grid-aligned
+        request that no grid-aligned write covered is empty by construction.
+        The O(n) scan is what answers the two cases where that reasoning does
+        not hold -- a request off the grid, or a source that has taken a write
+        off it (only the ``cache:`` kind allows one) -- and it is what keeps a
+        misplanned read returning the pixels rather than a blank frame.
         """
         # Validate bounds via the base TensorAdapter.get_data contract.
         super().get_data(bounds)
 
-        # A scaled read whose extent is fully uploaded never arrives here -- the
-        # base assembles it from the cached chunks -- and one that is not is
-        # refused earlier, by _require_full_coverage, where the extent is still
-        # visible. So this is a direct call, and the answer is simply that there
-        # is no backend behind it.
-        raise flight.FlightServerError(
-            f"Cache-backed source {self.source_id} cannot read "
-            f"{list(bounds.start)}..{list(bounds.stop)} from a backend: it has "
-            f"none. Uploaded chunks are served by chunk_id."
+        cache_manager = CacheManager.get_instance()
+        if cache_manager is None:
+            raise RuntimeError("Cache not initialized")
+
+        exact = mint_chunk_id(
+            self.source_id, bounds, content_version=self.content_version
         )
+        if exact in self._written_chunks:
+            return self._uploaded_block(cache_manager, exact, bounds)
+
+        start = [int(v) for v in bounds.start]
+        stop = [int(v) for v in bounds.stop]
+        out = np.zeros(
+            tuple(hi - lo for lo, hi in zip(start, stop, strict=True)),
+            dtype=np.dtype(self._dtype),
+        )
+        if not self._off_grid_writes and self._on_grid(bounds):
+            return out
+        for chunk_id, written in list(self._written_chunks.items()):
+            overlap = _overlap_slices(start, stop, written)
+            if overlap is None:
+                continue
+            dst, src = overlap
+            out[dst] = self._uploaded_block(cache_manager, chunk_id, written)[src]
+        return out
+
+    def _uploaded_block(
+        self, cache_manager: CacheManager, chunk_id: bytes, bounds: ChunkBounds
+    ) -> np.ndarray:
+        """One uploaded chunk, read back out of the cache as an array.
+
+        Copied, not viewed: the caller keeps it past the release, and for the
+        assembly above it is a source to blit from rather than the answer.
+        """
+        entry = cache_manager.get_or_acquire(
+            chunk_id, lambda: _raise_evicted(self.source_id, bounds)
+        )
+        try:
+            return unpack_chunk_array(entry.data)
+        finally:
+            cache_manager.release(chunk_id)
 
     def write_chunk(self, bounds: ChunkBounds, data: np.ndarray) -> None:
         """Write a NumPy chunk: the in-process producer's entry to ``put_chunk``.
@@ -337,6 +390,20 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         Arrow value buffer is stored as the unified binary chunk schema).
         """
         self.write_chunk_arrow(bounds, data, expected_shape, dtype)
+
+    def _on_grid(self, bounds: ChunkBounds) -> bool:
+        """Whether *bounds* is exactly one cell of the declared transfer grid.
+
+        The grid a read plan mints chunk_ids on, so an on-grid write is one a
+        later read asks for by that same id.
+        """
+        grid = self.get_transfer_chunk_size()
+        return all(
+            lo % size == 0 and hi == min(lo + size, dim)
+            for lo, hi, size, dim in zip(
+                bounds.start, bounds.stop, grid, self._shape, strict=True
+            )
+        )
 
     def write_chunk_arrow(
         self,
@@ -399,126 +466,105 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         # this id): resolve_chunk_data gates reads on this map, so a re-upload of
         # an existing chunk must still be readable.
         self._written_chunks[chunk_id] = bounds
+        if not self._off_grid_writes and not self._on_grid(bounds):
+            self._off_grid_writes = True
 
         logger.debug(
             f"write_chunk_arrow: stored {size_bytes} bytes at bounds "
             f"{list(bounds.start)} to {list(bounds.stop)}"
         )
 
-    def _require_full_coverage(self, chunk_id: bytes) -> None:
-        """Raise unless every pixel of a scaled chunk's extent was uploaded.
-
-        Checked here because it is the last place the *extent* is visible. The
-        base streams the extent in units and only notices a gap when one unit
-        cannot be sourced from the cache, by which point it is calling
-        ``get_data`` on some other unit -- one that may well be present, so the
-        error would name the wrong bounds. There is nothing to fall back on
-        either way: a region never uploaded, or since evicted, cannot be
-        reconstructed.
-
-        Uploaded chunks do not overlap (a re-upload lands in a fresh
-        ``content_version`` namespace), so summed intersection volume is an
-        exact coverage test.
-        """
-        _, extent = decode_chunk_id(chunk_id)
-        start, stop = list(extent.start), list(extent.stop)
-
-        wanted = 1
-        for lo, hi in zip(start, stop, strict=True):
-            wanted *= max(0, hi - lo)
-
-        covered = 0
-        for bounds in self._written_chunks.values():
-            overlap = 1
-            for lo, hi, c_lo, c_hi in zip(
-                start, stop, bounds.start, bounds.stop, strict=True
-            ):
-                overlap *= max(0, min(hi, c_hi) - max(lo, c_lo))
-            covered += overlap
-
-        if covered < wanted:
-            raise flight.FlightServerError(
-                f"Cache-backed source {self.source_id} cannot serve a scaled "
-                f"read of {start}..{stop}: {wanted - covered} of {wanted} "
-                f"elements were never uploaded, or have been evicted. An "
-                f"upload's cache entry is its only copy, so there is no backend "
-                f"to rebuild them from."
-            )
-
     def resolve_chunk_data(
         self,
         chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
     ) -> pa.RecordBatch:
-        """Serve a written chunk, or a reduction assembled from written chunks.
+        """Serve an uploaded chunk, or an answer assembled from uploaded chunks.
 
-        A **scaled** chunk_id goes to the base, which builds the reduction out
-        of the full-resolution chunks the cache already holds rather than from a
-        backend (``core.cache_source.cache_sourced_units``). Nothing here has to
-        cooperate: a scaled chunk's extent tiles exactly into the transfer grid
-        this source's chunk_ids are minted on -- the uploader's own write grid,
-        which nothing may re-shape (biopb/biopb#809) -- and every one of those
-        chunks is present, because the cache is where an upload lives. Without
-        this, every rung of the advertised pyramid past the first fails, which
-        is what left an uploaded result unviewable in both the SPA and napari
-        once it was big enough to be pyramided at all (biopb/biopb#265).
+        An **uploaded** unscaled chunk is handed back verbatim: this source has
+        no backend, so the cache entry the upload put there *is* the chunk and
+        re-packing it would copy it for nothing.
 
-        An **unscaled** chunk_id is served only if it was written. A miss cannot
-        be computed -- there is no backend -- so it raises rather than falling
-        through to ``get_data``, which would only raise less clearly.
+        Everything else goes to the base over :meth:`get_data`, which zero-fills
+        what was never uploaded -- an unscaled chunk in a gap, and a scaled
+        chunk whose extent is only partly covered. A scaled read that *is* fully
+        covered is assembled from the cached full-resolution chunks
+        (``core.cache_source``), which is what keeps every rung of an uploaded
+        source's pyramid viewable (biopb/biopb#265).
 
-        Args:
-            chunk_id: Chunk identifier bytes
-            cache_manager: CacheManager instance (required for cache-backed sources)
-
-        Returns:
-            RecordBatch with chunk data
-
-        Raises:
-            FlightServerError: If cache_manager is None or chunk not in cache
+        **Nothing is cached until the upload is FINISHED.** Every answer here
+        stands partly on zeros, and a write that fills one of those gaps has no
+        way to invalidate an answer already stored under its chunk_id -- the
+        ``content_version`` is per-upload, not per-write. So a source that can
+        still change recomputes, and only a sealed one caches. The uploaded
+        chunks are cache entries throughout either way; that is where an upload
+        lives.
         """
         if cache_manager is None:
             raise flight.FlightServerError(
                 f"CacheManager required for cache-backed source {self.source_id}"
             )
 
-        # A tombstone: still registered so a writer learns the reason, and a
-        # reader should learn the same rather than "no chunk here". Shared
-        # with the write path's refusal (WritableSource._refuse_if_discarded);
-        # only the wire error it becomes differs.
-        try:
-            self._refuse_if_discarded()
-        except UploadDiscardedError as e:
-            raise flight.FlightServerError(str(e)) from e
+        # The gate first, and before the version check: a tombstone owes a
+        # reader its reason whatever ticket that reader is holding.
+        self.check_readable()
 
-        if is_scaled_chunk(chunk_id):
-            self._require_full_coverage(chunk_id)
-            return super().resolve_chunk_data(chunk_id, cache_manager)
-
-        # Check if chunk was written
-        if chunk_id not in self._written_chunks:
-            _, bounds = decode_chunk_id(chunk_id)
-            raise flight.FlightServerError(
-                f"Cache-backed source {self.source_id} holds no chunk at "
-                f"{list(bounds.start)}..{list(bounds.stop)}: it was never "
-                f"uploaded, or the cache has since evicted it. An upload's "
-                f"cache entry is its only copy."
+        # A chunk_id from another namespace is not a gap, and this is the one
+        # source that would otherwise read it as one: every id that misses the
+        # record is answered with zeros, so an id minted against a different
+        # ``content_version`` would come back as a blank chunk instead of the
+        # stale-ticket error every other source gives it. The base's
+        # ``check_chunk_version`` lets a legacy unversioned id through by
+        # design, which is exactly the case that hurts here.
+        if content_version_of(chunk_id) != self.content_version:
+            raise StaleChunkError(
+                f"chunk_id for {self.array_id!r} was minted against an upload "
+                f"this source no longer serves; re-request the read plan "
+                f"(GetFlightInfo) rather than retrying this chunk_id.",
+                reason="stale_content_version",
             )
 
-        # Retrieve from cache manager directly
-        entry = cache_manager.get_or_acquire(
-            chunk_id,
-            lambda: (_raise_no_backend(self.source_id), 0),  # Never actually called
-        )
-        data = entry.data
-        cache_manager.release(chunk_id)
+        if not is_scaled_chunk(chunk_id) and chunk_id in self._written_chunks:
+            _, bounds = decode_chunk_id(chunk_id)
+            entry = cache_manager.get_or_acquire(
+                chunk_id, lambda: _raise_evicted(self.source_id, bounds)
+            )
+            data = entry.data
+            cache_manager.release(chunk_id)
+            return data
 
-        return data
+        progress = self.upload
+        sealed = progress is None or progress.status is UploadStatus.FINISHED
+        return super().resolve_chunk_data(chunk_id, cache_manager if sealed else None)
 
 
-def _raise_no_backend(source_id: str):
-    """Helper function that raises when called."""
+def _overlap_slices(
+    start: List[int], stop: List[int], written: ChunkBounds
+) -> Optional[Tuple[Tuple[slice, ...], Tuple[slice, ...]]]:
+    """``(destination, source)`` slices for the part of *written* inside the
+    request, or None where the two do not meet."""
+    dst: List[slice] = []
+    src: List[slice] = []
+    for lo, hi, c_lo, c_hi in zip(
+        start, stop, written.start, written.stop, strict=True
+    ):
+        begin, end = max(lo, int(c_lo)), min(hi, int(c_hi))
+        if begin >= end:
+            return None
+        dst.append(slice(begin - lo, end - lo))
+        src.append(slice(begin - int(c_lo), end - int(c_lo)))
+    return tuple(dst), tuple(src)
+
+
+def _raise_evicted(source_id: str, bounds: ChunkBounds):
+    """The read of a chunk that was uploaded and is no longer in the cache.
+
+    Never a hole: this runs only for a chunk ``_written_chunks`` records, so
+    the bytes existed and are gone. An upload's cache entry is its only copy,
+    so there is nothing to rebuild them from.
+    """
     raise flight.FlightServerError(
-        f"Cannot compute data for cache-backed source {source_id}. "
-        f"Data must be written via write_chunk first."
+        f"Cache-backed source {source_id} has lost the chunk at "
+        f"{list(bounds.start)}..{list(bounds.stop)}: it was uploaded, and the "
+        f"cache has since evicted it. An upload's cache entry is its only copy."
     )

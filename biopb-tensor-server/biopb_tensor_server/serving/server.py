@@ -64,13 +64,18 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
-    FinishUpload,
     PutCommand,
+    SetUploadStatus,
     TensorTicket,
 )
 from google.protobuf.message import DecodeError, Message
 
-from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
+from biopb_tensor_server.adapters._writable import (
+    SETTABLE_STATES,
+    UploadProgress,
+    UploadStatus,
+    upload_of,
+)
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
@@ -314,8 +319,8 @@ def _fill_upload_status(
 def _copy_upload_status(pb: UploadStatusPb, status: Dict[str, Any]) -> None:
     """The manager's status dict onto the wire message.
 
-    Shared by the descriptor field and the ``finish`` reply so the two cannot
-    drift into describing the same upload differently.
+    Shared by the descriptor field and the ``set_upload_status`` reply so the
+    two cannot drift into describing the same upload differently.
     """
     state = _UPLOAD_STATES.get(status["state"])
     if state is None:
@@ -332,7 +337,19 @@ def _copy_upload_status(pb: UploadStatusPb, status: Dict[str, Any]) -> None:
 _UPLOAD_STATES = {
     "PENDING": UploadStatusPb.PENDING,
     "READY": UploadStatusPb.READY,
+    "FINISHED": UploadStatusPb.FINISHED,
     "DISCARDED": UploadStatusPb.DISCARDED,
+}
+
+
+#: The wire enum -> what ``set_upload_status`` may ask for. The inverse of
+#: ``_UPLOAD_STATES`` restricted to the settable states, so a request naming
+#: PENDING or an unrecognized value is refused at the boundary rather than
+#: reaching an adapter that would refuse it anyway with a worse message.
+_UPLOAD_TARGETS = {
+    UploadStatusPb.READY: UploadStatus.READY,
+    UploadStatusPb.FINISHED: UploadStatus.FINISHED,
+    UploadStatusPb.DISCARDED: UploadStatus.DISCARDED,
 }
 
 
@@ -981,8 +998,8 @@ class TensorFlightServer(flight.FlightServerBase):
                 "Create a writable single-tensor source from a TensorDescriptor",
             ),
             flight.ActionType(
-                "finish",
-                "Seal an upload session: the source is complete and takes no further chunks",
+                "set_upload_status",
+                "Move an upload: READY (publish), FINISHED (seal), DISCARDED (give up)",
             ),
             flight.ActionType(
                 "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
@@ -1006,10 +1023,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 "roi_prune",
                 "Report (or with apply, delete) annotations whose source is gone",
             ),
-            flight.ActionType(
-                "delete_labels",
-                "Delete an uploaded label set and its sidecar store",
-            ),
         ]
 
     def do_action(
@@ -1019,11 +1032,14 @@ class TensorFlightServer(flight.FlightServerBase):
     ) -> Iterator[bytes]:
         """Execute a custom action.
 
-        Each arm authorizes itself once it knows what it needs -- most are
-        catalog tier (no source), ``chunk_locate``/``resolve``/``warm`` are
-        private tier once the source_id is parsed out of the request -- the
-        same pattern as ``get_flight_info``/``do_get``/``do_put``, rather than
-        a blanket check keyed off the action name.
+        Every arm takes full access (:meth:`_authorize`). Actions are the
+        control surface: a capability means "read this one tensor", and none of
+        what is reachable here is scoped to one tensor -- ``warm`` walks the
+        page-cache LRU and evicts the segments serving every other source
+        (biopb/biopb#1043), and a mutation on a source is never covered by a
+        read grant on it. ``chunk_locate`` is no exception, though it looks
+        like one: it is the localhost handoff for a read, and the read itself
+        (``do_get``) is where a capability is honoured.
 
         Args:
             context: Server call context
@@ -1081,25 +1097,30 @@ class TensorFlightServer(flight.FlightServerBase):
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
             yield self.uploads.create_tensor(req_desc).SerializeToString()
-        elif action.type == "finish":
+        elif action.type == "set_upload_status":
             self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req = self._parse(
-                FinishUpload(), action.body.to_pybytes(), "finish request"
+                SetUploadStatus(), action.body.to_pybytes(), "set_upload_status request"
             )
-            status = self.uploads.finish(req.source_id)
+            state = _UPLOAD_TARGETS.get(req.state)
+            if state is None:
+                raise flight.FlightServerError(
+                    f"set_upload_status: {UploadStatusPb.State.Name(req.state)} is "
+                    f"not a state an upload can be moved to; use one of "
+                    f"{', '.join(s.value for s in SETTABLE_STATES)}."
+                )
+            status = self.uploads.set_status(req.array_id, state, req.reason)
             reply = UploadStatusPb()
             _copy_upload_status(reply, status)
             yield reply.SerializeToString()
         elif action.type == "chunk_locate":
-            ticket_bytes = action.body.to_pybytes()
-            ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
+            self._authorize(context)
+            ticket = self._parse_ticket(flight.Ticket(action.body.to_pybytes()))
             if ticket.WhichOneof("payload") != "chunk_id":
                 raise flight.FlightServerError("chunk_locate takes a chunk ticket")
-            source_id = routing_array_id(ticket.chunk_id).split("/")[0]
-            self._authorize_read(context, source_id, READ_PIXELS)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
             self._authorize(context)
@@ -1111,12 +1132,12 @@ class TensorFlightServer(flight.FlightServerBase):
             # asdict recurses into the per-pool PoolStats dataclasses under pool_stats.
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
         elif action.type == "resolve":
-            source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize(context)
+            source_id = action.body.to_pybytes().decode("utf-8")
             yield from self._handle_resolve(source_id)
         elif action.type == "warm":
-            source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize(context)
+            source_id = action.body.to_pybytes().decode("utf-8")
             yield from self._handle_warm(source_id, context)
         elif action.type == "add_source":
             self._authorize(context)
@@ -1130,15 +1151,6 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context)
             req = RoiPruneRequest.FromString(action.body.to_pybytes())
             yield self._handle_roi_prune(req)
-        elif action.type == "delete_labels":
-            # Full access, like every other mutation: a read capability on the
-            # parent covers reading its sets, never removing one
-            # (biopb/biopb#1059).
-            self._authorize(context)
-            if not self._writable:
-                raise flight.FlightUnauthenticatedError("Server not in write mode")
-            array_id = action.body.to_pybytes().decode("utf-8")
-            yield json.dumps(self.uploads.delete_labels(array_id)).encode("utf-8")
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
@@ -1964,6 +1976,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 # in-memory comparison -- no adapter I/O -- so it costs nothing
                 # to run on every locate, hit or miss.
                 adapter.check_chunk_version(chunk_id)
+
+                # And the same for the read gate, for the same reason: a warm
+                # chunk of an upload nobody has published yet -- or of one that
+                # has been discarded -- is still sitting in the cache, and this
+                # path would hand out its byte range without the adapter ever
+                # being asked (biopb/biopb#1048).
+                adapter.check_readable()
 
                 # If the chunk is already cached, just locate it. Resolving first
                 # would, on a chunk whose in-RAM entry has been trimmed, re-read the

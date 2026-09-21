@@ -76,11 +76,12 @@ class TestAQuietUploadExpires:
         assert uploads.reap(now=time.monotonic() + TTL / 2) == (0, 0)
         assert client.get_upload_status(desc.array_id)["state"] == "PENDING"
 
-    def test_a_finished_upload_is_never_expired(self, uploads, client):
-        """READY is a published result; its lifetime is its reader's."""
+    def test_a_published_upload_is_never_expired(self, uploads, client):
+        """Past PENDING the upload is a published result; its lifetime is its
+        reader's, and that holds at READY as much as at FINISHED."""
         desc = _make(client)
         _put(client, desc)
-        client.finish_upload(desc)
+        client.set_upload_status(desc, "READY")
 
         assert uploads.reap(now=_past_ttl()) == (0, 0)
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
@@ -176,11 +177,11 @@ class TestATombstoneIsReclaimed:
         uploads.discard(old.array_id, "gone")
         uploads.reap(now=_past_ttl())
         new = _make(client, name="cache:again")
-
-        with pytest.raises(Exception, match="holds no chunk"):
-            client.get_tensor(new.array_id)[:2, :2].compute()
-
         _put(client, new, fill=2)
+        client.set_upload_status(new, "READY")
+
+        # 2s, never the tombstone's 1s: the chunks it left in the cache sit in
+        # a namespace this source's chunk_ids cannot name.
         assert (client.get_tensor(new.array_id)[:2, :2].compute() == 2).all()
 
 

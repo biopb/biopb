@@ -14,7 +14,7 @@ consulted before every write, by hand, in three places.
 progress, status, disposal -- and leaves the format its own half: how a chunk
 is stored (``_store_chunk``), how an upload of this kind is created
 (``create_upload``), and what its store needs told when the upload ends
-(``_dispose_store`` on discard, ``_mark_store_finished`` on finish). The DoPut
+(``_dispose_store`` on discard, ``_publish_store`` on publish). The DoPut
 boundary (``serving.upload_manager``) picks the kind, registers the result,
 keeps the catalog row of a ``durable`` kind in step, and translates
 exceptions; nothing else about an upload lives there.
@@ -37,11 +37,17 @@ from math import ceil
 from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Set, Tuple
 
 import pyarrow as pa
+import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.core.chunk import encode_chunk_id
-from biopb_tensor_server.core.errors import UploadDiscardedError, UploadSealedError
+from biopb_tensor_server.core.errors import (
+    UploadDiscardedError,
+    UploadNotPublishedError,
+    UploadSealedError,
+    UploadTransitionError,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -53,7 +59,22 @@ class UploadStatus(str, Enum):
     """Wire-facing upload state (the string values are the ``upload_status`` API
     contract, parsed by the client SDK).
 
-    Two terminal states, not three: a job that dies has nothing to say that
+    Two gates rather than one. ``READY`` opens the **read** gate and
+    ``FINISHED`` closes the **write** one, because a producer that has written
+    enough to be worth looking at is rarely the same producer that has written
+    everything: a segmentation filling a label set frame by frame can be opened
+    once its first frames land. Between the two an upload is readable *and*
+    writable, and a chunk that has not arrived reads as zeros
+    (``CachedSourceAdapter.get_data``) -- which is only honest once someone has
+    said the holes are meant to be holes, and is why ``PENDING`` refuses reads
+    outright instead.
+
+    What READY does *not* promise is that a reader sees later writes. A
+    ``chunk_id`` names fixed bytes everywhere else in this system and every
+    client caches on that, so a region already read stays as it was read. READY
+    publishes a partial answer; it does not stream one.
+
+    One terminal state, not two: a job that dies has nothing to say that
     ``DISCARDED`` with a reason does not already say (biopb/biopb#1). A separate
     FAILED would never refuse a write -- a crashed job is not writing -- and
     would never be the state its own uploader learns, since that uploader set
@@ -63,8 +84,24 @@ class UploadStatus(str, Enum):
 
     PENDING = "PENDING"
     READY = "READY"
+    FINISHED = "FINISHED"
     DISCARDED = "DISCARDED"
     UNKNOWN = "UNKNOWN"
+
+
+#: The ladder a live upload climbs, lowest first. A transition moves up it or
+#: stands still; ``DISCARDED`` is off the ladder and reachable from every rung.
+#: ``UNKNOWN`` is not a state an upload is ever *in* -- it is what a source
+#: tracking no upload answers -- so it is absent here too.
+_STATE_RANK: Dict[UploadStatus, int] = {
+    UploadStatus.PENDING: 0,
+    UploadStatus.READY: 1,
+    UploadStatus.FINISHED: 2,
+}
+
+#: What ``set_upload_status`` may ask for. ``PENDING`` is where an upload
+#: starts and nothing returns it there, so it is not settable either.
+SETTABLE_STATES = (UploadStatus.READY, UploadStatus.FINISHED, UploadStatus.DISCARDED)
 
 
 def unknown_upload_status(source_id: str) -> Dict[str, Any]:
@@ -142,13 +179,13 @@ def _expected_chunk_count(shape: Sequence[int], chunk_shape: Sequence[int]) -> i
 class UploadProgress:
     """How far an upload has got, and whether anyone still wants it.
 
-    ``READY`` once the producer calls ``finish``, and only then: the chunk
-    count is a coverage *proxy*, and a cache-backed source accepts arbitrary
-    bounds, so off-grid writes can reach the expected count without tiling the
-    array or never reach it at all. Both terminal states seal the source
-    against further writes. ``DISCARDED`` keeps the adapter registered as a
-    tombstone so a writer still unwinding learns *why* its write failed rather
-    than that its source never existed.
+    The state moves only when the producer says so (``set_status``), never on
+    the chunk count: the count is a coverage *proxy*, and a cache-backed source
+    accepts arbitrary bounds, so off-grid writes can reach the expected count
+    without tiling the array or never reach it at all. ``FINISHED`` and
+    ``DISCARDED`` seal the source against further writes; ``DISCARDED`` keeps
+    the adapter registered as a tombstone so a writer still unwinding learns
+    *why* its write failed rather than that its source never existed.
 
     ``updated_at`` bounds that afterlife (``UploadManager.reap``). One field
     serves both halves of reclamation, because for a discarded upload the last
@@ -185,7 +222,17 @@ class UploadProgress:
     @property
     def is_sealed(self) -> bool:
         """No further chunk will be accepted -- finished, or given up on."""
-        return self.status in (UploadStatus.READY, UploadStatus.DISCARDED)
+        return self.status in (UploadStatus.FINISHED, UploadStatus.DISCARDED)
+
+    @property
+    def is_readable(self) -> bool:
+        """Published: DoGet is served, and an unwritten chunk reads as zeros.
+
+        False for ``PENDING`` -- where a hole is indistinguishable from a chunk
+        still in flight -- and for ``DISCARDED``, which answers a reader the
+        same reason it answers a writer.
+        """
+        return self.status in (UploadStatus.READY, UploadStatus.FINISHED)
 
     def touch(self, now: Optional[float] = None) -> None:
         self.updated_at = time.monotonic() if now is None else now
@@ -276,16 +323,18 @@ class WritableSource:
         :meth:`_refuse_write` a moment earlier -- the kind serializes the two.
         """
 
-    def _mark_store_finished(self) -> None:  # noqa: B027 - concrete no-op default
-        """Seal the store on disk; READY is announced only once this returns.
+    def _publish_store(self) -> None:  # noqa: B027 - concrete no-op default
+        """Mark the store on disk as one a restart should keep.
 
-        Called by :meth:`finish` **before** the READY transition, outside
+        Called on the **READY** transition, before it is announced and outside
         ``progress.lock``. A durable store carries a pending marker from
         creation so a crash leaves something a restart can recognize and
-        remove; this is where the marker is flipped, and it is the last write
-        the store's metadata ever sees. Raises ``OSError`` if the seal cannot
-        be written, in which case the upload stays PENDING and ``finish`` is
-        retried.
+        remove; this is where the marker is flipped. It rides READY rather than
+        FINISHED because READY is what publishes the store -- a set listed
+        under its image must not be one the next boot sweeps away -- and a
+        store that is written into afterwards is exactly what READY means.
+        Raises ``OSError`` if the marker cannot be written, in which case the
+        upload stays PENDING and the transition is retried.
         """
 
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
@@ -360,9 +409,9 @@ class WritableSource:
         - *expired*: a PENDING upload with no progress for *ttl* seconds was
           just discarded here, with a reason -- one terminal transition, not
           a second path into oblivion. The check and the transition share the
-          lock hold so a ``finish`` racing the sweep either lands first (and
-          the upload stays READY) or is refused as discarded; it can never be
-          undone. A durable kind's store goes with it (:meth:`_dispose_store`).
+          lock hold so a ``set_status`` racing the sweep either lands first
+          (and the upload keeps the state it reached) or is refused as
+          discarded; it can never be undone. A durable kind's store goes with it (:meth:`_dispose_store`).
         - *tombstone_age*: seconds since this upload was discarded, or
           ``None`` if it was not -- including right after this call just
           discarded it, since a fresh tombstone's age is not yet the sweep's
@@ -383,51 +432,68 @@ class WritableSource:
             return True, None
         return False, age
 
-    def finish(self) -> Dict[str, Any]:
-        """Seal this upload: PENDING -> READY, no further chunks.
+    def set_status(self, target: UploadStatus, reason: str = "") -> Dict[str, Any]:
+        """Move this upload to *target*, or stand still; the only mover there is.
 
-        The only route to READY, and it replaced a count-derived one that could
-        not coexist with it: a source that counted its way to READY stayed
-        writable, where a finished one is sealed -- two security states under
-        one state name. The count was never a completeness check anyway, since
-        ``CachedSourceAdapter`` takes arbitrary bounds; it now only reports
-        progress.
+        The ladder is PENDING -> READY -> FINISHED, and a call may only climb
+        it: setting the state the upload is already in is a no-op (so a retried
+        transition is not an error), and setting one below it raises
+        ``UploadTransitionError`` -- a published result cannot be unpublished,
+        and a sealed one cannot be reopened for writes a reader has already
+        been told are over. A climb of two rungs is one call: setting FINISHED
+        on a PENDING upload passes through READY, doing READY's work on the
+        way, which is what a producer that never wanted a partial read asks
+        for.
 
-        Idempotent, so a retried ``finish`` is not an error -- and, matching
-        :meth:`discard`, a no-op past the first call: the first seal's touch
-        is the one a reclaim sweep should see, not a retry's.
+        ``DISCARDED`` is not on the ladder and is reachable from every rung; it
+        routes to :meth:`discard`, which is total and idempotent.
 
-        The store is sealed on disk (:meth:`_mark_store_finished`) **before**
-        READY is announced, never after: a poller that has seen READY must
-        find the store finished after a crash, not pending and swept away at
-        the next boot. The seal runs outside ``progress.lock`` (it takes the
-        kind's write lock, which orders ahead of this one), so the transition
-        re-checks for a discard that landed in between -- the seal on a store
-        that discard has already removed is what that path reports.
+        The store is published on disk (:meth:`_publish_store`) **before**
+        READY is announced, never after: a reader that has seen READY must find
+        the store kept after a crash, not pending and swept away at the next
+        boot. That runs outside ``progress.lock`` (it takes the kind's write
+        lock, which orders ahead of this one), so the transition re-checks for
+        a discard that landed in between -- publishing a store that discard has
+        already removed is what that path reports.
         """
+        if target is UploadStatus.DISCARDED:
+            return self.discard(reason)
+        if target not in _STATE_RANK or target is UploadStatus.PENDING:
+            raise UploadTransitionError(
+                f"set_upload_status: {target} is not a state an upload can be "
+                f"moved to; use one of "
+                f"{', '.join(state.value for state in SETTABLE_STATES)}."
+            )
         progress = self._upload
         if progress is None:
             return unknown_upload_status(self.source_id)
+
         with progress.lock:
-            if progress.is_discarded:
-                raise UploadDiscardedError(self.source_id, progress.reason)
-            if progress.status is UploadStatus.READY:
+            self._raise_if_discarded_locked(progress)
+            current = progress.status
+            if current is target:
                 return progress.as_status_dict(self.source_id)
-        try:
-            self._mark_store_finished()
-        except OSError:
-            with progress.lock:
-                if progress.is_discarded:
-                    raise UploadDiscardedError(self.source_id, progress.reason)
-            raise
+            if _STATE_RANK[current] > _STATE_RANK[target]:
+                raise UploadTransitionError(
+                    f"set_upload_status: {self.source_id} is {current.value} and "
+                    f"cannot go back to {target.value}."
+                )
+
+        if _STATE_RANK[current] < _STATE_RANK[UploadStatus.READY]:
+            try:
+                self._publish_store()
+            except OSError:
+                with progress.lock:
+                    self._raise_if_discarded_locked(progress)
+                raise
+
         with progress.lock:
-            if progress.is_discarded:
-                raise UploadDiscardedError(self.source_id, progress.reason)
-            if progress.status is not UploadStatus.READY:
-                progress.status = UploadStatus.READY
+            self._raise_if_discarded_locked(progress)
+            if _STATE_RANK[progress.status] < _STATE_RANK[target]:
+                progress.status = target
                 progress.touch()
                 logger.info(
-                    f"Finished upload {self.source_id}: "
+                    f"Upload {self.source_id} -> {target.value}: "
                     f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
                 )
             return progress.as_status_dict(self.source_id)
@@ -467,9 +533,9 @@ class WritableSource:
     def _raise_if_discarded_locked(self, progress: UploadProgress) -> None:
         """Raise :class:`UploadDiscardedError` if *progress* is discarded.
 
-        Caller holds ``progress.lock``. Shared by :meth:`_refuse_write` and
-        :meth:`_refuse_if_discarded`, discarded checked first in the former: it
-        carries a reason, which "already finished" does not.
+        Caller holds ``progress.lock``. Discarded is checked before sealed in
+        :meth:`_refuse_write`: it carries a reason, which "already finished"
+        does not.
         """
         if progress.is_discarded:
             raise UploadDiscardedError(self.source_id, progress.reason)
@@ -492,28 +558,55 @@ class WritableSource:
             if progress.is_sealed:
                 raise UploadSealedError(self.source_id)
 
-    def _refuse_if_discarded(self) -> None:
-        """Raise :class:`UploadDiscardedError` if the upload has been given up on.
+    def resolve_chunk_data(self, chunk_id, cache_manager=None):
+        """Every read of an upload passes the gate, then reads as usual."""
+        self.check_readable()
+        return super().resolve_chunk_data(chunk_id, cache_manager)
 
-        The read path's own check (``CachedSourceAdapter.resolve_chunk_data``):
-        a tombstone answers a still-unwinding reader the same reason it gives a
-        writer rather than "no chunk here". The write path's equivalent is
-        :meth:`_refuse_write`, which also refuses a sealed-but-not-discarded
-        upload. Each boundary maps the exception to its own wire error
-        (write -> ``FlightCancelledError``, read -> ``FlightServerError``).
+    def check_readable(self) -> None:
+        """The two ways a read can arrive at an upload that cannot answer it.
+
+        Overrides the read base's no-op. Here rather than at the Flight
+        boundary because it is the adapter that knows whether it is an upload
+        at all: the same classes serve a discovered zarr store, where
+        ``_upload`` is None and this costs one attribute read.
+
+        ``DISCARDED`` -- a tombstone answers a still-unwinding reader the same
+        reason it gives a writer, rather than "no chunk here"; the store is
+        gone, and zarr would otherwise answer fill values for it while the
+        cache answered the bytes it still holds. The exception is raised for a
+        *writer* (the DoPut boundary turns it into a cancellation, meaning stop
+        sending), so a reader hears it as the read path's terminal error
+        instead. ``PENDING`` -- nobody has said the holes are meant to be holes
+        yet, so a chunk that has not arrived cannot honestly be served as zeros
+        and must not be served as an error the caller reads as data loss
+        either.
+
+        Public, and a sibling of ``check_chunk_version`` rather than a private
+        step of :meth:`resolve_chunk_data`, because the two reads that skip
+        that method have to ask as well: the localhost locate path answers a
+        warm chunk straight out of the cache (``server._handle_chunk_locate``),
+        and ``CachedSourceAdapter`` serves an uploaded chunk from the entry
+        that *is* the chunk. The write path's equivalent is
+        :meth:`_refuse_write`.
         """
         progress = self._upload
         if progress is None:
             return
         with progress.lock:
-            self._raise_if_discarded_locked(progress)
+            if progress.is_discarded:
+                raise flight.FlightServerError(
+                    str(UploadDiscardedError(self.source_id, progress.reason))
+                )
+            if not progress.is_readable:
+                raise UploadNotPublishedError(self.source_id)
 
     def _mark_chunk(self, bounds: ChunkBounds) -> None:
         """Record that the chunk at *bounds* landed.
 
         Counting only: reaching ``expected_chunks`` no longer flips anything,
-        because :meth:`finish` is the only route to READY. What the count is
-        still for is the progress a poller watches.
+        because :meth:`set_status` is the only route off PENDING. What the
+        count is still for is the progress a poller watches.
 
         A seal between :meth:`_refuse_write` and here leaves the chunk stored
         but uncounted: a sealed upload must not be walked back into PENDING by

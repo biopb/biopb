@@ -930,7 +930,7 @@ public class TensorFlightClientTest {
         // to stop conflating.
         private volatile boolean sourceHasTensors = true;
         // The Flight protocol shape this fake claims to speak.
-        volatile int protocolVersion = 2;
+        volatile int protocolVersion = 3;
         final AtomicInteger healthRequests = new AtomicInteger();
         /** Producer calls currently running, so teardown can wait them out. */
         final AtomicInteger inFlight = new AtomicInteger();

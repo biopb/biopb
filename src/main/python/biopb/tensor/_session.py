@@ -155,7 +155,7 @@ class ResolveCancelled(Exception):
 
 def _upload_status_dict(source_id: str, status: UploadStatusPb) -> Dict[str, Any]:
     """The one shape an upload status takes on the SDK, for the poll and for
-    ``finish_upload`` alike."""
+    ``set_upload_status`` alike."""
     return {
         "source_id": source_id,
         "state": UploadStatusPb.State.Name(status.state),
@@ -1110,14 +1110,6 @@ class CatalogClient:
             f"WHERE starts_with(t.array_id, {prefix}) ORDER BY t.array_id"
         )
         return table.column(0).to_pylist()
-
-    def delete_labels(self, array_id: str) -> Dict[str, Any]:
-        """Backs TensorFlightClient.delete_labels; see that method."""
-        action = flight.Action("delete_labels", array_id.encode("utf-8"))
-        result_bytes = self._do_action_one_result(
-            action, unavailable_hint="Label set deletion is unavailable"
-        )
-        return json.loads(result_bytes.decode("utf-8"))
 
     # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
 

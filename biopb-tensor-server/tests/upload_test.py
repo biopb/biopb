@@ -21,6 +21,7 @@ import pytest
 from biopb.tensor import TensorFlightClient, UploadRefused, _upload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
+from biopb_tensor_server.adapters._writable import UploadStatus
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import minimal_ome_metadata
 from biopb_tensor_server.cache import CacheManager
@@ -31,6 +32,7 @@ from biopb_tensor_server.core.chunk import (
     wrap_content_version,
 )
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.errors import StaleChunkError
 from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server
@@ -278,6 +280,7 @@ class TestCachedSourceAdapter:
         adapter.write_chunk(bounds, test_data)
 
         # Retrieve via resolve_chunk_data (not direct cache access)
+        adapter.set_status(UploadStatus.FINISHED)
         chunk_id = encode_chunk_id("test_resolve", bounds)
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
@@ -499,6 +502,10 @@ class TestScaledReads:
                     ChunkBounds(start=[y, x], stop=[y + step, x + step]),
                     np.full((step, step), value, dtype="<u2"),
                 )
+        # Sealed, so reads are open and the reductions are cacheable: a source
+        # that can still take writes serves every scaled read uncached, because
+        # nothing would invalidate one built over a gap the writer later fills.
+        adapter.set_status(UploadStatus.FINISHED)
         return adapter, source
 
     @staticmethod
@@ -539,27 +546,44 @@ class TestScaledReads:
             unpack_chunk_array(batch), source[0:512:2, 0:512:2]
         )
 
-    def test_a_scaled_read_over_a_hole_raises_and_names_it(self, cache):
-        """Missing data always raises -- there is nothing to reconstruct it
-        from. The message has to name the bounds, because by then the caller
-        asked for a coarse tile and the hole is two layers down."""
-        adapter, _ = self._upload(cache, skip={(0, 256)})
+    def test_a_scaled_read_over_a_hole_reduces_it_as_background(self, cache):
+        """A published upload's gaps are background, at every rung. The coarse
+        tile is where that matters most: it is what a viewer opens with, and
+        refusing it used to make one absent chunk hide the whole image."""
+        from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
+
+        adapter, source = self._upload(cache, skip={(0, 256)})
+        source[0:256, 256:512] = 0
         bounds = ChunkBounds(start=[0, 0], stop=[512, 512])
 
-        with pytest.raises(
-            flight.FlightServerError,
-            match=r"scaled read of \[0, 0\]\.\.\[512, 512\]: 65536 of 262144",
-        ):
-            adapter.resolve_chunk_data(self._scaled_id(bounds, (2, 2)), cache)
+        batch = adapter.resolve_chunk_data(self._scaled_id(bounds, (2, 2)), cache)
 
-    def test_an_unwritten_full_resolution_chunk_raises_and_names_it(self, cache):
+        expected = (
+            source[0:512, 0:512].reshape(256, 2, 256, 2).mean(axis=(1, 3)).astype("<u2")
+        )
+        np.testing.assert_array_equal(unpack_chunk_array(batch), expected)
+
+    def test_an_unwritten_full_resolution_chunk_reads_as_zeros(self, cache):
+        from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
+
         adapter, _ = self._upload(cache, skip={(0, 0)})
 
-        with pytest.raises(flight.FlightServerError, match=r"no chunk at \[0, 0\]"):
-            adapter.resolve_chunk_data(
-                encode_chunk_id("up", ChunkBounds(start=[0, 0], stop=[256, 256])),
-                cache,
-            )
+        batch = adapter.resolve_chunk_data(
+            encode_chunk_id("up", ChunkBounds(start=[0, 0], stop=[256, 256])),
+            cache,
+        )
+        assert not unpack_chunk_array(batch).any()
+
+    def test_an_evicted_chunk_is_loss_and_still_raises(self, cache):
+        """The distinction the record of uploaded chunks exists to make: a gap
+        was never sent, an evicted chunk was -- and an upload's cache entry is
+        its only copy, so the second is data gone."""
+        adapter, _ = self._upload(cache)
+        chunk_id = encode_chunk_id("up", ChunkBounds(start=[0, 0], stop=[256, 256]))
+        cache.clear()
+
+        with pytest.raises(flight.FlightServerError, match="has lost the chunk"):
+            adapter.resolve_chunk_data(chunk_id, cache)
 
     def test_every_advertised_rung_serves(self, cache):
         """The regression itself, through the seam the viewers use: whatever the
@@ -1372,6 +1396,7 @@ class TestCachedSourceContentVersion:
             data = np.arange(16, dtype=np.uint8).reshape(4, 4)
             bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
             adapter.write_chunk(bounds, data)
+            adapter.set_status(UploadStatus.FINISHED)
 
             # The base read plan mints version-wrapped chunk_ids; the client echoes
             # one back on read -> it must resolve to the written data.
@@ -1380,9 +1405,10 @@ class TestCachedSourceContentVersion:
             batch = adapter.resolve_chunk_data(wrapped, CacheManager.get_instance())
             np.testing.assert_array_equal(unpack_chunk_array(batch), data)
 
-            # A legacy unwrapped id for the same bounds is a different namespace and
-            # must NOT resolve on a versioned source.
-            with pytest.raises(flight.FlightServerError):
+            # A legacy unwrapped id for the same bounds is a different namespace
+            # and must NOT resolve on a versioned source -- and must not read as
+            # a gap either, which is what zero-filling an unknown id would do.
+            with pytest.raises(StaleChunkError):
                 adapter.resolve_chunk_data(
                     encode_chunk_id("cache_v", bounds), CacheManager.get_instance()
                 )
@@ -1401,10 +1427,12 @@ class TestCachedSourceContentVersion:
 
             a1 = self._adapter(b"gen:1")
             a1.write_chunk(bounds, old)
+            a1.set_status(UploadStatus.FINISHED)
 
             # Re-upload: same deterministic source_id, new generation, new bytes.
             a2 = self._adapter(b"gen:2")
             a2.write_chunk(bounds, new)
+            a2.set_status(UploadStatus.FINISHED)
 
             # Without the version namespace, a2's start_compute would find gen:1's
             # entry and keep the STALE bytes. The fresh namespace serves the new data.
@@ -1435,6 +1463,7 @@ class TestCachedSourceContentVersion:
             data = np.ones((4, 4), dtype=np.uint8)
             bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
             adapter.write_chunk(bounds, data)
+            adapter.set_status(UploadStatus.FINISHED)
             # Unversioned -> legacy unwrapped id resolves, byte-identical to pre-#178.
             batch = adapter.resolve_chunk_data(
                 encode_chunk_id("cache_legacy", bounds), CacheManager.get_instance()
@@ -1531,7 +1560,7 @@ class TestConcurrentChunkUpload:
             client, da.from_array(source, chunks=(1, 40, 40)), "cache:fanout"
         )
 
-        assert client.get_upload_status(source_id)["state"] == "READY"
+        assert client.get_upload_status(source_id)["state"] == "FINISHED"
         np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
 
     def test_the_chunks_really_do_overlap(self, client, monkeypatch):
@@ -1566,7 +1595,7 @@ class TestConcurrentChunkUpload:
             source_id = _upload_whole(client, arr, "cache:serial")
 
         assert state["peak"] == 1
-        assert client.get_upload_status(source_id)["state"] == "READY"
+        assert client.get_upload_status(source_id)["state"] == "FINISHED"
         np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
 
     def test_a_failed_chunk_surfaces_as_itself(self, client, monkeypatch):
@@ -1617,8 +1646,8 @@ class TestConcurrentChunkUpload:
                 ChunkBounds(start=[z, 0, 0], stop=[z + 1, 20, 20]),
                 source[z : z + 1],
             )
-        status = session.finish_upload(desc)
-        assert status["state"] == "READY"
+        status = session.set_upload_status(desc, "FINISHED")
+        assert status["state"] == "FINISHED"
         assert status["uploaded_chunks"] == 5
 
     def test_a_shared_upstream_block_is_computed_once(self, client):
@@ -1684,7 +1713,7 @@ class TestConcurrentChunkUpload:
         for z in range(4):
             revived[(slice(z, z + 1), slice(0, 8), slice(0, 8))] = source[z : z + 1]
 
-        assert session.finish_upload(desc)["state"] == "READY"
+        assert session.set_upload_status(desc, "FINISHED")["state"] == "FINISHED"
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), source
         )
@@ -1879,8 +1908,8 @@ class TestDiscard:
         same operation."""
         desc = self._make_source(client, shape=(2, 2), chunk=(2, 2))
         self._put(client, desc, (0, 0), (2, 2))
-        client.finish_upload(desc)
-        assert client.get_upload_status(desc.array_id)["state"] == "READY"
+        client.set_upload_status(desc, "FINISHED")
+        assert client.get_upload_status(desc.array_id)["state"] == "FINISHED"
 
         assert writable_server.uploads.discard(desc.array_id, "done with it")[
             "state"

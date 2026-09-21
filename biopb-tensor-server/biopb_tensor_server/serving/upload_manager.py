@@ -12,9 +12,8 @@ here is only what a boundary does:
   than registered and the catalog row it keeps in step is the parent's.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
-- **Lookup** -- ``status`` / ``finish`` / ``discard`` / ``write_chunk`` find the
-  adapter and hand over (``_locate``: the registry, or a parent's
-  ``label_uploads``).
+- **Lookup** -- ``status`` / ``set_status`` / ``write_chunk`` find the adapter
+  and hand over (``_locate``: the registry, or a parent's ``label_uploads``).
 - **Reclamation** -- ``reap`` sweeps every upload by its ``updated_at``, in
   the registry and in each source's ``label_uploads``: one quiet past ``ttl``
   is discarded (a job that died) and a tombstone older than ``ttl`` is
@@ -64,6 +63,7 @@ from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.errors import (
     UploadClosedError,
     UploadDiscardedError,
+    UploadTransitionError,
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.labels import split_label_field
@@ -222,25 +222,100 @@ class UploadManager:
             return unknown_upload_status(source_id)
         return upload.as_status_dict(source_id)
 
-    def discard(self, source_id: str, reason: str = "") -> Dict[str, Any]:
+    def discard(self, array_id: str, reason: str = "") -> Dict[str, Any]:
         """Give up on an upload; see ``WritableSource.discard``.
 
-        Total: a source that is not tracking an upload -- never was, or has
-        since been reclaimed -- reads UNKNOWN rather than raising, so a retry
-        after the tombstone is gone is not an error. A durable kind's store
-        goes with the discard (the adapter's own), and its listing here: the
-        catalog row for the registered kinds, the parent's attachment for a
-        label set.
+        Reachable from every state, FINISHED included -- which is what makes it
+        the one way a published upload is ever removed, and why there is no
+        second verb for deleting one. A durable kind's store goes with the
+        discard (the adapter's own), and its listing here: the catalog row for
+        the registered kinds, the parent's attachment for a label set.
+
+        Total, and a statement about the end state rather than a receipt: an
+        id that is not tracking an upload -- never was, has since been
+        reclaimed, or names a set an earlier life of this server uploaded --
+        reads UNKNOWN rather than raising, so a retry after the tombstone is
+        gone is not an error.
         """
-        adapter, parent, field = self._locate(source_id)
+        adapter, parent, field = self._locate(array_id)
         if upload_of(adapter) is None:
-            return unknown_upload_status(source_id)
+            return self._delete_adopted_label_set(array_id)
         status = adapter.discard(reason)
         if parent is None:
-            self._drop_catalog_row(adapter, source_id)
+            self._drop_catalog_row(adapter, array_id)
         else:
             self._unlist_label_set(parent, field)
         return status
+
+    def set_status(
+        self, array_id: str, state: UploadStatus, reason: str = ""
+    ) -> Dict[str, Any]:
+        """The ``set_upload_status`` action: move one upload along its ladder.
+
+        The adapter owns the transition (``WritableSource.set_status``); what
+        is here is the half only the boundary can do -- turning the adapter's
+        typed errors into Flight ones, and publishing a label set into its
+        parent's listing the first time it becomes readable.
+
+        The listing follows READY rather than FINISHED because READY is what
+        makes the set readable at all, and a set nobody can reach is not one to
+        advertise. It happens after the store is published on disk, never
+        before: the catalog must not name a set a restart would sweep away.
+
+        ``DISCARDED`` routes to :meth:`discard`, which is total; every other
+        target requires an upload, because a caller moving one believes it has
+        been writing somewhere it may not have been.
+        """
+        if state is UploadStatus.DISCARDED:
+            return self.discard(array_id, reason)
+        adapter, parent, field = self._locate(array_id)
+        progress = upload_of(adapter)
+        if progress is None:
+            raise flight.FlightServerError(
+                f"set_upload_status: {array_id} is not an upload in progress"
+            )
+        was_readable = progress.is_readable
+        try:
+            status = adapter.set_status(state, reason)
+        except UploadDiscardedError as e:
+            raise _refused(e) from e
+        except UploadTransitionError as e:
+            raise flight.FlightServerError(str(e)) from e
+        except OSError as e:
+            # The store could not be published; the upload stays PENDING and
+            # the caller retries, so this is a server error, not a refusal.
+            raise flight.FlightServerError(
+                f"set_upload_status: could not publish {array_id} on disk: {e}"
+            ) from e
+        if parent is not None and not was_readable and progress.is_readable:
+            parent.attach_label_set(field, adapter)
+            self._sync_parent_row(parent)
+        return status
+
+    def _delete_adopted_label_set(self, array_id: str) -> Dict[str, Any]:
+        """Remove a listed set that this life of the server did not upload.
+
+        A sidecar re-attached at registration carries no upload record, so
+        :meth:`_locate` never reaches it and there is no state to discard --
+        only a store, still the server's own (it was minted under
+        ``write_dir``). Unlisted first, so no read can be routed to a store
+        that is about to go.
+
+        Reaches exactly what ``detach_label_set`` reaches, which is the sets
+        the upload path published. A set the format carries (an NGFF
+        ``labels/`` group; a rasterized ``@ome``) is embedded, not attached, so
+        it stays; anything else is a no-op, and answers UNKNOWN like the rest
+        of :meth:`discard`.
+        """
+        source_id, _, field = array_id.partition("/")
+        parent = self._registry.get(source_id) if field else None
+        adapter = parent.detach_label_set(field) if parent is not None else None
+        if adapter is None:
+            return unknown_upload_status(array_id)
+        adapter.delete_store()
+        self._sync_parent_row(parent)
+        logger.info(f"Deleted label set {array_id}")
+        return unknown_upload_status(array_id)
 
     # -- label sets ------------------------------------------------------------
 
@@ -266,9 +341,9 @@ class UploadManager:
     def _unlist_label_set(self, parent: Any, field: Optional[str]) -> None:
         """Take a set out of its parent's listing, if it was in it.
 
-        A set that never finished was never listed, so this is a no-op for
-        the ordinary discard of an upload in flight and a catalog write only
-        where one is owed.
+        A set that was never published was never listed, so this is a no-op
+        for the ordinary discard of an upload in flight and a catalog write
+        only where one is owed.
         """
         if field is None:
             return
@@ -281,11 +356,11 @@ class UploadManager:
         Reached when the request ``array_id`` carries no ``kind:`` prefix, so
         this is also where an unrecognized id is refused. The set is attached
         to its parent as an upload -- routable from here on, so its producer
-        can poll it to READY, but not listed until ``finish``
+        can poll it, but not listed until it reaches READY
         (``SourceAdapter.label_uploads``). No catalog write happens at create,
         which is the one place this kind differs from ``ome_zarr:``: there is
         no row of its own to write, and the parent's must not advertise a set
-        whose bytes have not arrived.
+        nobody may read yet.
         """
         source_id, _, field = req_desc.array_id.partition("/")
         if split_label_field(field) is None:
@@ -325,39 +400,6 @@ class UploadManager:
         logger.info(f"Created label upload: {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
-    def delete_labels(self, array_id: str) -> Dict[str, Any]:
-        """Remove a finished uploaded set: unlist it, then delete its sidecar.
-
-        The one new action of biopb/biopb#1059, and the only way a set is ever
-        removed short of its parent going. Unlisted first, so no read can be
-        routed to a store that is about to go; the store then goes through the
-        adapter, which owns it (``LabelSetAdapter.delete_store``). The name is
-        free again at once and safely, because the next set under it mints its
-        own ``content_version`` and so cannot hit the cache entries this one
-        leaves behind.
-
-        Refused for anything ``detach_label_set`` does not reach, which is
-        exactly the sets the upload path published -- this server's, or an
-        earlier life's re-attached at registration. A set the format carries
-        (an NGFF ``labels/`` group; a rasterized ``@ome``) is embedded, not
-        attached, and an upload still in flight is not listed at all, so
-        neither can be deleted here.
-        """
-        source_id, _, field = array_id.partition("/")
-        parent = self._registry.get(source_id) if field else None
-        adapter = parent.detach_label_set(field) if parent is not None else None
-        if adapter is None:
-            raise flight.FlightServerError(
-                f"delete_labels: {array_id!r} is not a deletable label set. Only "
-                f"a finished uploaded set can be deleted -- a set the file "
-                f"carries is the file's, and one still uploading is not finished."
-            )
-        parent.detach_label_upload(field)
-        adapter.delete_store()
-        self._sync_parent_row(parent)
-        logger.info(f"Deleted label set {array_id}")
-        return {"array_id": array_id, "deleted": True}
-
     def _drop_catalog_row(self, adapter: WritableSource, source_id: str) -> None:
         """Take a discarded durable upload out of the catalog.
 
@@ -385,11 +427,12 @@ class UploadManager:
     def discard_unfinished_stores(self) -> int:
         """Delete the stores of uploads a previous server never finished.
 
-        A durable store is born ``pending`` and marked ``ready`` by ``finish``
-        (``adapters.zarr`` upload marker). One still pending when this server
-        starts belonged to an upload whose progress died with the process;
-        nothing can finish it, so it is removed rather than left for
-        discovery to serve as a partial source. Runs from the server's
+        A durable store is born ``pending`` and marked ``ready`` when its
+        upload reaches READY (``adapters.zarr`` upload marker). One still
+        pending when this server starts belonged to an upload whose progress
+        died with the process before anyone published it; nothing can publish
+        it now, so it is removed rather than left for discovery to serve as a
+        partial source. Runs from the server's
         constructor, before any source is registered. Returns the count.
 
         The two layouts the server mints: ``write_dir/*.zarr``
@@ -426,38 +469,6 @@ class UploadManager:
         shutil.rmtree(store, ignore_errors=True)
         logger.info(f"Removed unfinished upload store {store}")
         return True
-
-    def finish(self, source_id: str) -> Dict[str, Any]:
-        """Seal an upload; see ``WritableSource.finish``.
-
-        Unlike ``discard``, a source that is tracking no upload is an error
-        rather than UNKNOWN: ``discard`` is total because a retry after the
-        tombstone is reclaimed must not fail, whereas a ``finish`` naming
-        nothing means the caller believes it has been writing somewhere it has
-        not.
-        """
-        adapter, parent, field = self._locate(source_id)
-        if upload_of(adapter) is None:
-            raise flight.FlightServerError(
-                f"finish: {source_id} is not an upload in progress"
-            )
-        try:
-            status = adapter.finish()
-        except UploadDiscardedError as e:
-            raise _refused(e) from e
-        except OSError as e:
-            # The store could not be sealed; the upload stays PENDING and the
-            # caller retries finish, so this is a server error, not a refusal.
-            raise flight.FlightServerError(
-                f"finish: could not seal {source_id} on disk: {e}"
-            ) from e
-        if parent is not None:
-            # Sealed, so it is a tensor now: list it under its image and
-            # re-publish the parent's row. After the store, never before --
-            # the catalog must not name a set a restart would sweep away.
-            parent.attach_label_set(field, adapter)
-            self._sync_parent_row(parent)
-        return status
 
     # -- write path ------------------------------------------------------------
 
@@ -504,7 +515,7 @@ class UploadManager:
         A name is taken for as long as its source is registered. A named
         ``cache:`` upload has a deterministic id, so a second create under the
         same name would land on the first's adapter -- and replacing it would
-        leave the first writer's chunks, and its ``finish``, landing in a
+        leave the first writer's chunks, and its transitions, landing in a
         source that is no longer its own, with nothing to tell it so (status
         is keyed by the id it still holds). Refusing the collision is what
         makes ``source_id`` alone name an attempt. Sealed sources are not an
@@ -623,8 +634,10 @@ class UploadManager:
         expired upload therefore takes two sweeps to vanish, and is a
         tombstone in between.
 
-        READY sources are not touched: a finished upload is a published
-        result, and its lifetime is its reader's, not this sweep's. A durable
+        Only PENDING is swept. Past it the upload has been published, and a
+        published result's lifetime is its reader's, not this sweep's -- so an
+        upload left READY without ever being finished keeps its name and stays
+        writable, which is the cost of letting a producer publish early. A durable
         kind is swept like any other: its store goes with the discard and its
         catalog row is dropped here, since both were the server's own
         (biopb/biopb#1059).

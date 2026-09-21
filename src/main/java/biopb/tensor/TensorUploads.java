@@ -122,8 +122,8 @@ final class TensorUploads {
             throw new IllegalArgumentException("uploadArray: array dtype " + actual
                     + " does not match the declared dtype " + declared + " of " + descriptor.getArrayId());
         }
-        // An all-zero block of a label set is not sent at all: the sidecar's fill
-        // value already reads as background, so one labelled frame of a thousand
+        // An all-zero block of a label set is not sent at all: its unwritten
+        // chunks read back as background, so one labelled frame of a thousand
         // costs one frame (biopb/biopb#1059).
         boolean skipEmpty = isLabelSet(descriptor.getArrayId());
 
@@ -141,7 +141,9 @@ final class TensorUploads {
         // Sealing is what marks the source complete, so a whole-array upload does
         // it on the caller's behalf -- it is the one caller that knows, from
         // having written every block itself, that there is nothing more to send.
-        return finishUpload(descriptor);
+        // FINISHED passes through READY, so the source is published and sealed
+        // in one call.
+        return setUploadStatus(descriptor.getArrayId(), UploadStatus.State.FINISHED, "");
     }
 
     /** Backs {@link TensorFlightClient#uploadChunk}; see that method. */
@@ -210,23 +212,27 @@ final class TensorUploads {
         }
     }
 
-    /** Backs {@link TensorFlightClient#finishUpload}; see that method. */
-    Map<String, Object> finishUpload(TensorDescriptor descriptor) {
-        FinishUpload request = FinishUpload.newBuilder()
-                .setSourceId(descriptor.getArrayId())
+    /** Backs {@link TensorFlightClient#setUploadStatus}; see that method. */
+    Map<String, Object> setUploadStatus(String arrayId, UploadStatus.State state, String reason) {
+        SetUploadStatus request = SetUploadStatus.newBuilder()
+                .setArrayId(arrayId)
+                .setState(state)
+                .setReason(reason == null ? "" : reason)
                 .build();
-        Iterator<Result> results = session.doAction(new Action("finish", request.toByteArray()));
+        Iterator<Result> results =
+                session.doAction(new Action("set_upload_status", request.toByteArray()));
         if (!results.hasNext()) {
-            throw new IllegalStateException("finish: server returned no result");
+            throw new IllegalStateException("set_upload_status: server returned no result");
         }
         UploadStatus status;
         try {
             status = UploadStatus.parseFrom(results.next().getBody());
         } catch (InvalidProtocolBufferException error) {
-            throw new IllegalStateException("finish: server returned no UploadStatus", error);
+            throw new IllegalStateException(
+                    "set_upload_status: server returned no UploadStatus", error);
         }
-        LOGGER.info("finishUpload: sealed " + descriptor.getArrayId());
-        return statusMap(descriptor.getArrayId(), status);
+        LOGGER.info("setUploadStatus: " + arrayId + " -> " + state.name());
+        return statusMap(arrayId, status);
     }
 
     /** The {@code get_upload_status} shape, so a seal and a poll agree. */
@@ -243,12 +249,13 @@ final class TensorUploads {
     /**
      * Whether {@code arrayId} names a label set rather than a source of its own.
      *
-     * <p>The one upload kind whose unwritten chunks are meaningful: a label set
-     * is a zarr with fill value 0, so a chunk that never arrives reads back as
-     * background and skipping it is free (biopb/biopb#1059). A {@code cache:}
-     * source answers a read of an unwritten chunk with "holds no chunk", so the
-     * skip must never be a general behaviour -- hence the check on the shape of
-     * the id rather than a flag the caller could set on anything.
+     * <p>The one upload kind whose unwritten chunks are meaningful <i>by
+     * declaration</i>: a label set is a zarr with fill value 0, so a chunk that
+     * never arrives reads back as background and skipping it is free
+     * (biopb/biopb#1059). Every published upload now reads its gaps as zeros, so
+     * skipping would be safe for the other kinds too -- but it would also stop
+     * reporting them: an all-zero array would upload nothing at all and land
+     * READY with {@code uploaded_chunks} at 0.
      */
     static boolean isLabelSet(String arrayId) {
         return TensorFlightClient.sourceIdFromArrayId(arrayId).indexOf(':') < 0

@@ -39,7 +39,7 @@ final class WireVersions {
     private WireVersions() {}
 
     /** The Flight protocol shape this client speaks. */
-    static final int FLIGHT_PROTOCOL_VERSION = 2;
+    static final int FLIGHT_PROTOCOL_VERSION = 3;
 
     /** The chunk wire encoding this client can decode. */
     static final int TENSOR_WIRE_PROTOCOL_VERSION = 2;

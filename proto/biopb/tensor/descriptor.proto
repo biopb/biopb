@@ -225,16 +225,29 @@ message PyramidLevel {
 // a holder of the per-source read capability the fast-return path hands out
 // must be able to poll its own result to READY (biopb/biopb#1048).
 message UploadStatus {
+  // Two gates, opened in order, and one way out.
+  //
+  // PENDING -> READY -> FINISHED is a ladder: each `set_upload_status` moves
+  // up it or stands still, never back. READY opens the *read* gate and
+  // FINISHED closes the *write* one, so the two are not the same moment and a
+  // producer that wants them to be just sets FINISHED (which passes through
+  // READY). DISCARDED can be set from any of the three.
   enum State {
     // Never sent. Present so a client meeting an unknown state reads it as
     // "I do not know this" rather than as PENDING.
     STATE_UNSPECIFIED = 0;
-    // Chunks are still arriving, or the writer has not sealed the upload.
+    // Filling, and not yet readable: a chunk that has not arrived is
+    // indistinguishable from one that never will, so DoGet is refused.
     PENDING = 1;
-    // Sealed: everything the writer intended to send has landed.
+    // Published: readable, and still writable. A chunk that has not arrived
+    // reads as zeros, so a consumer sees a partial result rather than an
+    // error -- which is the point of the state. Writes still land, so what a
+    // consumer reads here may change.
     READY = 2;
     // Given up on, terminal. `reason` says why.
     DISCARDED = 3;
+    // Complete: no further chunk is accepted, so what is there is final.
+    FINISHED = 4;
   }
   State state = 1;
 
@@ -242,7 +255,9 @@ message UploadStatus {
   int64 expected_chunks = 2;
 
   // Distinct chunks that have landed; frozen at the count reached once
-  // DISCARDED.
+  // DISCARDED. Never a completeness test: a `cache:` source takes arbitrary
+  // bounds, and a set with zero-filled regions is complete with fewer chunks
+  // than the grid has cells. FINISHED is the completeness signal.
   int64 uploaded_chunks = 3;
 
   // Why the upload was discarded; empty otherwise. Consumer-facing -- it is a

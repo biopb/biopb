@@ -46,18 +46,49 @@ cache-backed and right for something the user is only going to look at;
 `"ome_zarr:<name>"` is zarr-backed and persists as files. `"cache:"` with no
 name has the server mint one, which is the fix for the rule below.
 
-**A name is taken while its source exists** — pending, finished *or* discarded —
+**A name is taken while its source exists** — at any of the four states below —
 and creating under it again is refused (`FlightServerError`). Only the server's
 reclaim sweep frees one, after a discarded upload's `upload_ttl`. **Re-running a
 cell therefore needs a new name, or a bare `"cache:"`.**
 
-`upload_array` rechunks onto the declared grid, sends every block and finishes.
+`upload_array` rechunks onto the declared grid, sends every block and seals it.
 It raises `ValueError` when the array does not match the declared shape or
 dtype, and `UploadRefused` once the upload is over. Writing the grid yourself is
-`upload_chunk(desc, bounds, data)` per chunk plus `finish_upload(desc)` — which
-is the only route to READY, the state a consumer waiting on the result polls
-for. `get_upload_status(array_id)` reports `state`, `expected_chunks` and
-`uploaded_chunks` while it is in flight.
+`upload_chunk(desc, bounds, data)` per chunk, then
+`set_upload_status(desc, "FINISHED")`. `get_upload_status(array_id)` reports
+`state`, `expected_chunks` and `uploaded_chunks` while it is in flight.
+
+## The four states
+
+An upload is **PENDING** until you move it, and `set_upload_status` is what
+moves it. The ladder only climbs:
+
+| state | reads | writes |
+|---|---|---|
+| `PENDING` | refused — a missing chunk is one still in flight | accepted |
+| `READY` | served; **a chunk never uploaded reads as zeros** | accepted |
+| `FINISHED` | served | refused |
+| `DISCARDED` | refused | refused |
+
+`"FINISHED"` from PENDING passes through READY, so the ordinary "write
+everything, then publish" needs one call — that is what `upload_array` does.
+
+**`"READY"` is for a result worth looking at before it is done.** Publish, keep
+writing, and a consumer sees the filled regions and background everywhere else
+— a segmentation can be opened after its first frames land.
+
+One caveat, and it is the reason not to publish early by default: **a chunk
+already read is not read again.** A `chunk_id` names fixed bytes everywhere
+else in this system, so the client caches it; a region a consumer has seen as
+background stays background for that consumer even after the writer fills it.
+Re-reading it means a fresh process. Publish early when a partial answer is
+useful *on its own*, not to stream one in.
+
+**`"DISCARDED"` is the only delete there is**, and it works from every state —
+including FINISHED. It takes the server-minted store with it (an `ome_zarr:`
+directory, a label set's sidecar) and unlists the source. Pass a `reason`: it is
+what a poller waiting on the result reads back. The name frees after the
+server's reclaim sweep, not immediately.
 
 ## The round trip, for data too large to hold
 
@@ -82,15 +113,19 @@ client.upload_array(desc, labels)
 ```
 
 A set is **unsigned-integer**, spans its image's non-channel axes at full
-length, and its all-zero chunks are skipped — so a sparse mask is cheap to send.
+length, and its all-zero chunks are skipped by `upload_array` — so a sparse mask
+is cheap to send.
+
 Its `array_id` is the request's own rather than a minted `source_id`, and its
 descriptor carries an NGFF `image-label` block naming the image it belongs to.
 
 - `client.label_sets(image_array_id)` lists what an image has, sorted.
 - `client.get_tensor(set_id)` reads one back like any other tensor.
-- `client.delete_labels(set_id)` removes an *uploaded* set and frees the name at
-  once. It refuses a set the image's own file carries and a server-owned one
-  (a name under `@`) — those are not yours to delete.
+- `client.set_upload_status(set_id, "DISCARDED", "replaced")` removes an
+  *uploaded* set and its sidecar. It leaves alone a set the image's own file
+  carries and a server-owned one (a name under `@`) — those are not yours to
+  delete, and it answers `UNKNOWN` rather than raising for anything it does not
+  reach.
 
 ## ROI annotations
 

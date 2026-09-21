@@ -22,10 +22,19 @@ import pyarrow as pa
 import pyarrow.flight as flight
 
 from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
-from biopb.tensor._session import _upload_status_dict, extra_info
+from biopb.tensor._session import (
+    _unknown_upload_status,
+    _upload_status_dict,
+    extra_info,
+)
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, UploadStatus as UploadStatusPb
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, FinishUpload, PutCommand
+from biopb.tensor.ticket_pb2 import (
+    ChunkBounds,
+    ChunkUpload,
+    PutCommand,
+    SetUploadStatus,
+)
 
 if TYPE_CHECKING:  # import-time cycle-free; _session never imports this module
     from biopb.tensor._session import _ClientState
@@ -34,13 +43,12 @@ logger = logging.getLogger(__name__)
 
 
 class UploadRefused(Exception):
-    """A write or ``finish`` reached an upload that is over.
+    """A write or a transition reached an upload that takes no more chunks.
 
-    ``state`` is the terminal state the source is in -- ``"DISCARDED"`` (its
-    producer gave up; ``reason`` says why) or ``"READY"`` (it was sealed by
-    ``finish_upload`` and takes no more chunks). ``source_id`` names which,
-    because under ``upload_array`` the chunks are in flight concurrently and
-    this is one of N.
+    ``state`` is the state the source is in -- ``"DISCARDED"`` (its producer
+    gave up; ``reason`` says why) or ``"FINISHED"`` (it was sealed and takes no
+    more chunks). ``source_id`` names which, because under ``upload_array`` the
+    chunks are in flight concurrently and this is one of N.
 
     Plain data in ``args``, so under a distributed scheduler it is raised on a
     worker and pickles back intact. A sibling of :class:`ResolveCancelled`.
@@ -78,15 +86,34 @@ def _refused_from(exc: flight.FlightCancelledError) -> Optional[UploadRefused]:
 def _is_label_set(array_id: str) -> bool:
     """Whether *array_id* names a label set rather than a source of its own.
 
-    The one upload kind whose unwritten chunks are meaningful: a label set is
-    a zarr with fill value 0, so a chunk that never arrives reads back as
-    background and skipping it is free (biopb/biopb#1059). A ``cache:`` source
-    answers a read of an unwritten chunk with "holds no chunk", so the skip
-    must never be a general behaviour -- hence the check on the shape of the
-    id rather than a flag the caller could set on anything.
+    The one upload kind whose unwritten chunks are meaningful *by declaration*:
+    a label set is a zarr with fill value 0, so a chunk that never arrives reads
+    back as background and skipping it is free (biopb/biopb#1059). Every
+    published upload now reads its gaps as zeros, so skipping would be safe for
+    the other kinds too -- but it would also stop reporting them: an all-zero
+    array would upload nothing at all and land READY with ``uploaded_chunks``
+    at 0. A set is where the caller is already writing a sparse mask and means
+    it; a ``cache:`` tensor is not.
     """
     prefixed = ":" in array_id.partition("/")[0]
     return not prefixed and "/labels/" in array_id
+
+
+def _state_value(state: Any) -> int:
+    """The wire enum for a state given as a name, or already as the enum.
+
+    Names, because that is the shape the status dicts this SDK returns already
+    use (``status["state"] == "READY"``), so a caller reads a state and writes
+    the same string back.
+    """
+    if isinstance(state, str):
+        try:
+            return UploadStatusPb.State.Value(state.upper())
+        except ValueError as exc:
+            raise ValueError(
+                f"set_upload_status: {state!r} is not an upload state"
+            ) from exc
+    return int(state)
 
 
 def _uniform_chunk_shape(arr: da.Array) -> Tuple[int, ...]:
@@ -183,7 +210,7 @@ class _UploadTarget:
         self._trust = trust or NO_TLS
         self._source_id = source_id
         # Drop an all-zero block instead of sending it -- only for a label
-        # set, where an unwritten chunk reads back as background.
+        # set, where an unwritten chunk is meant to read back as background.
         self._skip_empty = skip_empty
         # ``store`` reads these off the target to check it can hold the array.
         self.shape = tuple(shape)
@@ -204,7 +231,7 @@ class UploadSession:
     """Tensor declaration and chunk upload over one Flight connection.
 
     .. note:: Experimental. This whole API -- ``create_tensor`` /
-       ``upload_array`` / ``upload_chunk`` / ``finish_upload`` -- is
+       ``upload_array`` / ``upload_chunk`` / ``set_upload_status`` -- is
        experimental and its behavior may change.
 
     Declare, then fill: ``create_tensor`` returns the server's descriptor for
@@ -277,16 +304,17 @@ class UploadSession:
         else:
             arr = arr.rechunk(chunk_shape)  # a no-op when already on the grid
 
-        # An all-zero block of a label set is not sent at all: the sidecar's
-        # fill value already reads as background, so one labelled frame of a
-        # thousand costs one frame (biopb/biopb#1059).
+        # An all-zero block of a label set is not sent at all: its unwritten
+        # chunks read back as background, so one labelled frame of a thousand
+        # costs one frame (biopb/biopb#1059).
         self._store_chunks(desc.array_id, arr)
         # Sealing is what marks the source complete, so a whole-array upload
         # does it on the caller's behalf -- it is the one caller that knows,
         # from having written every block itself, that there is nothing more to
-        # send. A caller driving `upload_chunk` by hand does not, and finishes
-        # explicitly.
-        return self.finish_upload(desc)
+        # send. FINISHED passes through READY, so the source is published and
+        # sealed in one call. A caller driving `upload_chunk` by hand does not
+        # know when it is done, and moves the upload explicitly.
+        return self.set_upload_status(desc, UploadStatusPb.FINISHED)
 
     def _store_chunks(self, source_id: str, arr: da.Array) -> None:
         """Hand the whole upload to dask as one graph.
@@ -323,26 +351,40 @@ class UploadSession:
         )
         da.store(arr, target, lock=False)
 
-    def finish_upload(self, desc: TensorDescriptor) -> Dict[str, Any]:
-        """Backs TensorFlightClient.finish_upload; see that method for the full
-        documentation."""
-        req = FinishUpload(source_id=desc.array_id)
-        action = flight.Action("finish", req.SerializeToString())
+    def set_upload_status(
+        self,
+        target: Any,
+        state: Any,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Backs TensorFlightClient.set_upload_status; see that method for the
+        full documentation."""
+        array_id = target if isinstance(target, str) else target.array_id
+        req = SetUploadStatus(
+            array_id=array_id, state=_state_value(state), reason=reason
+        )
+        action = flight.Action("set_upload_status", req.SerializeToString())
         try:
             results = self._state.client.do_action(
                 action, options=self._state.call_options
             )
             result = next(results)
         except StopIteration as exc:
-            raise RuntimeError("finish: server returned no result") from exc
+            raise RuntimeError("set_upload_status: server returned no result") from exc
         except flight.FlightCancelledError as exc:
             refused = _refused_from(exc)
             if refused is None:
                 raise
             raise refused from exc
         status = UploadStatusPb.FromString(result.body.to_pybytes())
-        logger.info(f"finish: sealed {desc.array_id}")
-        return _upload_status_dict(desc.array_id, status)
+        if status.state == UploadStatusPb.STATE_UNSPECIFIED:
+            # The server leaves the whole message unset for an id it tracks no
+            # upload for, which DISCARDED answers with rather than raising.
+            return _unknown_upload_status(array_id)
+        logger.info(
+            f"set_upload_status: {array_id} -> {UploadStatusPb.State.Name(req.state)}"
+        )
+        return _upload_status_dict(array_id, status)
 
     def upload_chunk(
         self,

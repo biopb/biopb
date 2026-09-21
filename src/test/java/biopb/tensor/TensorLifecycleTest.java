@@ -202,12 +202,17 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testDeleteLabelsReturnsTheServersJson() throws Exception {
+    public void testDiscardingALabelSetNamesItByItsArrayId() throws Exception {
+        // Removing an uploaded set is discarding its upload; there is no
+        // delete verb of its own, and a set is named by its array_id.
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, Object> deleted = client.deleteLabels("src_ab12/labels/nuclei");
-                Assert.assertEquals("src_ab12/labels/nuclei", deleted.get("array_id"));
-                Assert.assertEquals(Boolean.TRUE, deleted.get("deleted"));
+                Map<String, Object> status = client.setUploadStatus(
+                        "src_ab12/labels/nuclei", UploadStatus.State.DISCARDED, "replaced");
+                Assert.assertEquals("src_ab12/labels/nuclei",
+                        server.producer.lastSetStatus.getArrayId());
+                Assert.assertEquals("replaced", server.producer.lastSetStatus.getReason());
+                Assert.assertEquals("DISCARDED", status.get("state"));
             }
         }
     }
@@ -408,8 +413,8 @@ public class TensorLifecycleTest {
 
                 // Sealing is what marks the source complete, and a whole-array
                 // upload does it on the caller's behalf.
-                Assert.assertEquals("cache:mine", server.producer.lastFinish.getSourceId());
-                Assert.assertEquals("READY", status.get("state"));
+                Assert.assertEquals("cache:mine", server.producer.lastSetStatus.getArrayId());
+                Assert.assertEquals("FINISHED", status.get("state"));
                 Assert.assertEquals(4.0d, status.get("uploaded_chunks"));
             }
         }
@@ -544,21 +549,20 @@ public class TensorLifecycleTest {
                 // chunk, and the corner block still carries the corner values.
                 Assert.assertEquals(6, server.producer.chunks.get(0).values.size());
                 assertBlockMatches(array, server.producer.chunks.get(0));
-                // The manual half does NOT seal; that is finishUpload's job.
-                Assert.assertNull(server.producer.lastFinish);
+                // The manual half does NOT seal; that is setUploadStatus's job.
+                Assert.assertNull(server.producer.lastSetStatus);
             }
         }
     }
 
     @Test
-    public void testFinishUploadSealsAndReportsTheStatus() throws Exception {
+    public void testSetUploadStatusSealsAndReportsTheStatus() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, Object> status = client.finishUpload(TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
-                        .build());
+                Map<String, Object> status = client.setUploadStatus(
+                        "cache:mine", UploadStatus.State.FINISHED, "");
                 Assert.assertEquals("cache:mine", status.get("source_id"));
-                Assert.assertEquals("READY", status.get("state"));
+                Assert.assertEquals("FINISHED", status.get("state"));
             }
         }
     }
@@ -693,7 +697,7 @@ public class TensorLifecycleTest {
         private final BufferAllocator allocator;
 
         volatile java.util.Set<String> knownActions = new java.util.HashSet<>(Arrays.asList(
-                "add_source", "remove_source", "roi_prune", "delete_labels", "create_tensor", "finish"));
+                "add_source", "remove_source", "roi_prune", "create_tensor", "set_upload_status"));
         volatile boolean addSourceSendsResult = true;
         volatile int addSourceHeartbeats = 2;
         volatile boolean observedCancel = false;
@@ -705,7 +709,7 @@ public class TensorLifecycleTest {
         volatile RemoveSourceRequest lastRemoveSource;
         volatile RoiPruneRequest lastPrune;
         volatile TensorDescriptor lastCreate;
-        volatile FinishUpload lastFinish;
+        volatile SetUploadStatus lastSetStatus;
         volatile RoiRead lastRoiRead;
         volatile RoiPut lastRoiPut;
         volatile RoiDelete lastRoiDelete;
@@ -729,7 +733,7 @@ public class TensorLifecycleTest {
                     // missing add_source still has health, and the SDK probes it
                     // before every first call.
                     listener.onNext(new Result(
-                            "{\"status\":\"SERVING\",\"protocol\":2}".getBytes(StandardCharsets.UTF_8)));
+                            "{\"status\":\"SERVING\",\"protocol\":3}".getBytes(StandardCharsets.UTF_8)));
                     listener.onCompleted();
                     return;
                 }
@@ -758,19 +762,14 @@ public class TensorLifecycleTest {
                                 .setDeleted(lastPrune.getApply() ? 4 : 0)
                                 .build().toByteArray()));
                         break;
-                    case "delete_labels":
-                        String arrayId = new String(action.getBody(), StandardCharsets.UTF_8);
-                        listener.onNext(new Result(("{\"array_id\":\"" + arrayId + "\",\"deleted\":true}")
-                                .getBytes(StandardCharsets.UTF_8)));
-                        break;
                     case "create_tensor":
                         lastCreate = TensorDescriptor.parseFrom(action.getBody());
                         listener.onNext(new Result(lastCreate.toByteArray()));
                         break;
-                    default: // "finish"
-                        lastFinish = FinishUpload.parseFrom(action.getBody());
+                    default: // "set_upload_status"
+                        lastSetStatus = SetUploadStatus.parseFrom(action.getBody());
                         listener.onNext(new Result(UploadStatus.newBuilder()
-                                .setState(UploadStatus.State.READY)
+                                .setState(lastSetStatus.getState())
                                 .setExpectedChunks(chunks.size())
                                 .setUploadedChunks(chunks.size())
                                 .build().toByteArray()));

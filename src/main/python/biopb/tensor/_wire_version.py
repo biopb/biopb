@@ -45,4 +45,11 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   ``SerializedTensor`` is a serialized ``FlightInfo`` plus location and
 #   token; GetFlightInfo stamps the requested ``slice_hint`` on the
 #   FlightInfo's ``app_metadata``.
-FLIGHT_PROTOCOL_VERSION = 2
+# - ``v3`` -- one ``set_upload_status`` action replaces ``finish`` and
+#   ``delete_labels``, and an upload has four states rather than three:
+#   PENDING -> READY -> FINISHED, with DISCARDED reachable from each. READY
+#   opens the read gate (an unwritten chunk reads as zeros) and FINISHED
+#   closes the write one, so publishing a result and sealing it are no longer
+#   the same call. Every action now takes full access, ``chunk_locate``
+#   included.
+FLIGHT_PROTOCOL_VERSION = 3

@@ -12,7 +12,7 @@ Features:
 import json
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import dask.array as da
 import numpy as np
@@ -655,31 +655,6 @@ class TensorFlightClient:
         """
         return self._catalog.label_sets(image_array_id)
 
-    def delete_labels(self, array_id: str) -> Dict[str, Any]:
-        """Delete an uploaded label set, and the store behind it.
-
-        Note:
-            Experimental, with the rest of the upload API.
-
-        Only a *finished uploaded* set: a set the image's own file carries is
-        the file's, and a server-owned one (a name under ``@``) is the
-        server's. Deleting frees the name at once -- the next set uploaded
-        under it is a distinct tensor with its own cache namespace, so no
-        stale chunk can be served for it.
-
-        Args:
-            array_id: The set's ``array_id``, as ``label_sets`` reports it.
-
-        Returns:
-            ``{"array_id": ..., "deleted": True}``.
-
-        Raises:
-            pyarrow.flight.FlightServerError: the set is not one this server
-                may delete, or does not exist.
-            RuntimeError: the server predates the ``delete_labels`` action.
-        """
-        return self._catalog.delete_labels(array_id)
-
     # ---- ROI annotations ----
 
     def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
@@ -906,11 +881,13 @@ class TensorFlightClient:
 
         Declare, then fill. The returned descriptor is the server's echo --
         ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
-        and is what ``upload_array``, ``upload_chunk`` and ``finish_upload``
-        take. A name is taken while its source exists: a second create under
-        it -- pending, finished or discarded -- is refused. Only the server's
-        reclaim sweep frees one, after a discarded upload's ``upload_ttl``.
-        ``finish_upload`` is what marks the upload complete.
+        and is what ``upload_array``, ``upload_chunk`` and
+        ``set_upload_status`` take. A name is taken while its source exists: a
+        second create under it -- at any of the four states -- is refused. Only
+        the server's reclaim sweep frees one, after a discarded upload's
+        ``upload_ttl``.
+        ``set_upload_status`` is what publishes the source and marks it
+        complete.
 
         Args:
             source_name: "cache:name" → cache-backed; "ome_zarr:name" →
@@ -981,7 +958,7 @@ class TensorFlightClient:
             change.
 
         The manual half of ``upload_array``: a caller writing chunks itself
-        calls this per chunk and ``finish_upload`` when done.
+        calls this per chunk and ``set_upload_status`` when done.
 
         Args:
             desc: The descriptor ``create_tensor`` returned
@@ -993,28 +970,56 @@ class TensorFlightClient:
         """
         self._upload.upload_chunk(desc, bounds, data)
 
-    def finish_upload(self, desc: TensorDescriptor) -> Dict[str, Any]:
-        """Seal an upload: the source is complete and takes no further chunks.
+    def set_upload_status(
+        self,
+        target: Union[TensorDescriptor, str],
+        state: Union[str, int],
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Move an upload along its lifecycle; the only thing that moves one.
 
         Note:
             Experimental. The upload / writable-source API (tensor creation,
             chunk upload, and upload-status polling) is experimental and may
             change.
 
-        The only route to READY, which is the state a consumer waiting on this
-        result polls for. ``upload_array``, which writes every chunk itself,
-        calls it for you.
+        The states form a ladder, and a call climbs it or stands still:
+
+        - ``"READY"`` -- **publish**. The source becomes readable, and a chunk
+          that has not been uploaded reads back as zeros. Writes still land, so
+          a consumer can watch a result fill in. This is the state a consumer
+          waiting on a result polls for.
+        - ``"FINISHED"`` -- **seal**. No further chunk is accepted, so what is
+          there is final. Setting it from PENDING publishes on the way, which
+          is what ``upload_array`` does for you.
+        - ``"DISCARDED"`` -- **give up**, from any of the above. Whatever the
+          server minted goes with it: an ``ome_zarr:`` store, a label set's
+          sidecar and its listing. This is how an uploaded label set is
+          deleted; the name frees after the server's reclaim sweep, like any
+          other discarded upload's.
+
+        Setting the state the upload is already in is a no-op; moving back down
+        the ladder is refused.
 
         Args:
-            desc: The descriptor ``create_tensor`` returned
+            target: The descriptor ``create_tensor`` returned, or an
+                ``array_id`` -- a label set's, as ``label_sets`` reports it.
+            state: ``"READY"``, ``"FINISHED"`` or ``"DISCARDED"``.
+            reason: Why, for ``"DISCARDED"``. It is what a poller waiting on
+                this result reads back, so write it for them.
 
         Returns:
-            The sealed upload status, as ``get_upload_status`` reports it.
+            The resulting upload status, as ``get_upload_status`` reports it.
+            ``DISCARDED`` is total -- an id tracking no upload answers
+            ``UNKNOWN`` rather than raising, so it is a statement about the end
+            state, not a receipt.
 
         Raises:
-            UploadRefused: the upload was discarded.
+            UploadRefused: the upload was discarded, so it cannot be moved.
+            pyarrow.flight.FlightServerError: the move is backwards, or the id
+                names no upload in progress.
         """
-        return self._upload.finish_upload(desc)
+        return self._upload.set_upload_status(target, state, reason)
 
     def close(self):
         """Close the Flight client."""

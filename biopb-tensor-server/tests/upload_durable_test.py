@@ -16,6 +16,7 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor import TensorFlightClient, UploadRefused
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from biopb_tensor_server.adapters._writable import UploadStatus
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter, upload_state
 from biopb_tensor_server.cache import CacheManager
@@ -89,7 +90,7 @@ class TestDiscardReleasesTheStore:
         the bytes the cache still holds (and zarr's fill for the rest)."""
         desc = _create(client)
         _put(client, desc, fill=3)
-        client.finish_upload(desc)
+        client.set_upload_status(desc, "FINISHED")
         assert client.get_tensor(desc.array_id)[:2, :2].compute().max() == 3
         adapter = writable_server.sources.get(desc.array_id)
         chunk_id = encode_chunk_id(
@@ -228,7 +229,10 @@ class TestTheBootSweepDropsTheRow:
                     chunk_shape=[2, 2],
                 )
             )
-        first.finish(OmeZarrAdapter.upload_source_id(write_dir / "done.zarr"))
+        first.set_status(
+            OmeZarrAdapter.upload_source_id(write_dir / "done.zarr"),
+            UploadStatus.FINISHED,
+        )
         assert len(_catalog_ids(db)) == 2
 
         # The process dies here. The stores and the rows both survive it.
@@ -243,9 +247,9 @@ class TestTheMarker:
     def test_ready_is_announced_only_after_the_seal(
         self, writable_server, client, tmp_path
     ):
-        """A poller that has seen READY must find the store sealed after a
-        crash; so if the seal cannot be written, finish fails and the upload
-        stays PENDING for a retry."""
+        """A reader that has seen READY must find the store kept after a
+        crash; so if the marker cannot be written, the transition fails and the
+        upload stays PENDING for a retry."""
         desc = _create(client)
         _put(client, desc)
         adapter = writable_server.sources.get(desc.array_id)
@@ -255,32 +259,34 @@ class TestTheMarker:
             raise OSError("disk full")
 
         adapter._write_upload_state = refuse
-        with pytest.raises(flight.FlightServerError, match="could not seal"):
-            client.finish_upload(desc)
+        with pytest.raises(flight.FlightServerError, match="could not publish"):
+            client.set_upload_status(desc, "READY")
         assert client.get_upload_status(desc.array_id)["state"] == "PENDING"
         assert _marker(store) == "pending"
 
         del adapter._write_upload_state
-        assert client.finish_upload(desc)["state"] == "READY"
+        assert client.set_upload_status(desc, "READY")["state"] == "READY"
         assert _marker(store) == "ready"
 
-    def test_finish_after_discard_reports_the_discard(self, writable_server, client):
-        """The seal on a removed store fails on the missing file; what the
-        caller learns is the discard, not the missing file."""
+    def test_a_transition_after_discard_reports_the_discard(
+        self, writable_server, client
+    ):
+        """The marker write on a removed store fails on the missing file; what
+        the caller learns is the discard, not the missing file."""
         desc = _create(client)
         writable_server.uploads.discard(desc.array_id, "gone")
 
         with pytest.raises(UploadRefused, match="gone") as exc:
-            client.finish_upload(desc)
+            client.set_upload_status(desc, "FINISHED")
         assert exc.value.state == "DISCARDED"
 
-    def test_pending_from_create_and_ready_after_finish(self, client, tmp_path):
+    def test_pending_from_create_and_ready_once_published(self, client, tmp_path):
         desc = _create(client)
         store = tmp_path / "durable.zarr"
         assert _marker(store) == "pending"
 
         _put(client, desc)
-        client.finish_upload(desc)
+        client.set_upload_status(desc, "READY")
 
         assert _marker(store) == "ready"
         # The rest of the metadata is untouched by the rewrite.
@@ -331,7 +337,7 @@ class TestAServerRestart:
             _put(client, crashed)
             done = _create(client, "ome_zarr:done")
             _put(client, done)
-            client.finish_upload(done)
+            client.set_upload_status(done, "FINISHED")
         finally:
             first.shutdown()
         assert (tmp_path / "w" / "crashed.zarr").is_dir()
@@ -353,8 +359,8 @@ class TestAServerRestart:
 
 
 class TestDiscoveryDeclinesAPendingStore:
-    def test_both_claims_decline_until_finish(self, client, tmp_path):
-        """A finished upload store is a bare array, which ``ZarrAdapter``
+    def test_both_claims_decline_until_published(self, client, tmp_path):
+        """A published upload store is a bare array, which ``ZarrAdapter``
         claims (``OmeZarrAdapter`` declines a top-level ``.zarray`` by design);
         while pending, neither takes it."""
         desc = _create(client, "ome_zarr:half")
@@ -364,7 +370,7 @@ class TestDiscoveryDeclinesAPendingStore:
         assert OmeZarrAdapter.claim(ctx, DiscoveryState()) is None
         assert ZarrAdapter.claim(ctx, DiscoveryState()) is None
 
-        client.finish_upload(desc)
+        client.set_upload_status(desc, "READY")
         claim = ZarrAdapter.claim(ClaimContext(store), DiscoveryState())
         assert claim is not None and claim.source_type == "zarr"
 

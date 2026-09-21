@@ -777,29 +777,6 @@ public class TensorFlightClient implements AutoCloseable {
         return sets;
     }
 
-    /**
-     * Delete an uploaded label set, and the store behind it.
-     *
-     * <p><b>Experimental</b>, with the rest of the upload API.
-     *
-     * <p>Only a <i>finished uploaded</i> set: a set the image's own file
-     * carries is the file's, and a server-owned one (a name under {@code @}) is
-     * the server's. Deleting frees the name at once -- the next set uploaded
-     * under it is a distinct tensor with its own cache namespace, so no stale
-     * chunk can be served for it.
-     *
-     * @param arrayId the set's array_id, as {@link #labelSets} reports it
-     * @return {@code {"array_id": ..., "deleted": true}}
-     */
-    public Map<String, Object> deleteLabels(String arrayId) throws IOException {
-        byte[] body = doActionOneResult("delete_labels",
-                arrayId.getBytes(StandardCharsets.UTF_8),
-                "Label set deletion is unavailable");
-        return GSON.fromJson(new String(body, StandardCharsets.UTF_8),
-                new TypeToken<Map<String, Object>>() {
-                }.getType());
-    }
-
     // ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
 
     /**
@@ -1326,11 +1303,12 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * <p>Declare, then fill. The returned descriptor is the server's echo --
      * array_id, shape, dtype, chunk_shape, dim_labels -- and is what
-     * {@link #uploadArray}, {@link #uploadChunk} and {@link #finishUpload}
-     * take. A name is taken while its source exists: a second create under it
-     * -- pending, finished or discarded -- is refused. Only the server's
-     * reclaim sweep frees one, after a discarded upload's {@code upload_ttl}.
-     * {@link #finishUpload} is what marks the upload complete.
+     * {@link #uploadArray}, {@link #uploadChunk} and
+     * {@link #setUploadStatus} take. A name is taken while its source exists:
+     * a second create under it -- pending, published or discarded -- is
+     * refused. Only the server's reclaim sweep frees one, after a discarded
+     * upload's {@code upload_ttl}. {@link #setUploadStatus} is what publishes
+     * the source and marks it complete.
      *
      * @param sourceName {@code "cache:name"} for cache-backed,
      *        {@code "ome_zarr:name"} for zarr-backed, either prefix with an
@@ -1418,7 +1396,7 @@ public class TensorFlightClient implements AutoCloseable {
      * <p><b>Experimental</b>, with the rest of the upload API.
      *
      * <p>The manual half of {@link #uploadArray}: a caller writing chunks
-     * itself calls this per chunk and {@link #finishUpload} when done. The
+     * itself calls this per chunk and {@link #setUploadStatus} when done. The
      * chunk's elements are read out of {@code source} at {@code bounds} -- in
      * that interval's own global coordinates, so the whole array can be passed
      * for every chunk.
@@ -1436,20 +1414,52 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Seal an upload: the source is complete and takes no further chunks.
+     * Move an upload along its lifecycle; the only thing that moves one.
      *
      * <p><b>Experimental</b>, with the rest of the upload API.
      *
-     * <p>The only route to READY, which is the state a consumer waiting on this
-     * result polls for. {@link #uploadArray}, which writes every chunk itself,
-     * calls it for you.
+     * <p>The states form a ladder, and a call climbs it or stands still:
      *
-     * @param descriptor the descriptor {@link #createTensor} returned
-     * @return the sealed upload status, as {@link #getUploadStatus} reports it
-     * @throws UploadRefusedException if the upload was discarded
+     * <ul>
+     *   <li>{@code READY} -- <b>publish</b>. The source becomes readable, and a
+     *       chunk that has not been uploaded reads back as zeros. Writes still
+     *       land, so a consumer can watch a result fill in. This is the state a
+     *       consumer waiting on a result polls for.
+     *   <li>{@code FINISHED} -- <b>seal</b>. No further chunk is accepted, so
+     *       what is there is final. Setting it from PENDING publishes on the
+     *       way, which is what {@link #uploadArray} does for you.
+     *   <li>{@code DISCARDED} -- <b>give up</b>, from any of the above.
+     *       Whatever the server minted goes with it: an {@code ome_zarr:}
+     *       store, a label set's sidecar and its listing. This is how an
+     *       uploaded label set is deleted; the name frees after the server's
+     *       reclaim sweep, like any other discarded upload's.
+     * </ul>
+     *
+     * <p>Setting the state the upload is already in is a no-op; moving back
+     * down the ladder is refused.
+     *
+     * @param arrayId what {@link #createTensor} answered with -- a minted
+     *        source_id, or a label set's array_id as {@link #labelSets} reports
+     *        it
+     * @param state {@code READY}, {@code FINISHED} or {@code DISCARDED}
+     * @param reason why, for {@code DISCARDED}; it is what a poller waiting on
+     *        this result reads back, so write it for them
+     * @return the resulting upload status, as {@link #getUploadStatus} reports
+     *         it. {@code DISCARDED} is total -- an id tracking no upload
+     *         answers {@code UNKNOWN} rather than throwing
+     * @throws UploadRefusedException if the upload was discarded, so it cannot
+     *         be moved
      */
-    public Map<String, Object> finishUpload(TensorDescriptor descriptor) {
-        return uploads.finishUpload(descriptor);
+    public Map<String, Object> setUploadStatus(
+            String arrayId, UploadStatus.State state, String reason) {
+        Map<String, Object> status = uploads.setUploadStatus(arrayId, state, reason);
+        // The server leaves the whole message unset for an id it tracks no
+        // upload for, which DISCARDED answers with rather than throwing. Same
+        // shape as a poll's, so a caller reads one state name either way.
+        if ("STATE_UNSPECIFIED".equals(status.get("state"))) {
+            return unknownUploadStatus(arrayId);
+        }
+        return status;
     }
 
     /**

@@ -63,13 +63,35 @@ message ChunkUpload {
   ChunkBounds bounds = 2;
 }
 
-// Body of the `finish` action: seal an upload against further writes.
+// Body of the `set_upload_status` action: move an upload along its ladder.
 //
-// `source_id` alone names the attempt: a name is single-use for the life of
-// the server (`create_tensor` refuses a collision), so the source it finds is
-// the one the caller created.
-message FinishUpload {
-  string source_id = 1;
+// One action for every transition, because they are one decision made
+// repeatedly about one object -- and because the alternative had grown a verb
+// per transition (`finish`, `delete_labels`) that each had to re-derive which
+// object it was talking about.
+message SetUploadStatus {
+  // What is being moved, as `create_tensor` answered with it: the minted
+  // `source_id` of a `cache:` / `ome_zarr:` upload, or a label set's
+  // `<image array_id>/labels/<name>`. An `array_id` rather than a `source_id`
+  // because a set is a *tensor* of a source, not a source -- the two prefixed
+  // kinds are single-tensor, so for them the two ids are the same string, and
+  // naming the tensor is the form that covers both.
+  //
+  // It alone names the attempt: a name is single-use for the life of the
+  // server (`create_tensor` refuses a collision), so what it finds is what the
+  // caller created.
+  string array_id = 1;
+
+  // Where to move it: READY (publish -- open reads), FINISHED (seal -- close
+  // writes), or DISCARDED (give up, and release whatever the server minted
+  // for it). Setting the state it is already in is a no-op, and moving back
+  // down the ladder is refused. PENDING and STATE_UNSPECIFIED are not
+  // settable: an upload starts PENDING and nothing returns it there.
+  biopb.tensor.UploadStatus.State state = 2;
+
+  // Why, for DISCARDED only. Consumer-facing: it is what a poller waiting on
+  // this result reads back.
+  string reason = 3;
 }
 
 // Create-or-update a batch of annotations, applied in one transaction.

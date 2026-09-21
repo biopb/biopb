@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
-import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
@@ -26,7 +25,6 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
-from biopb_tensor_server.core.errors import UploadDiscardedError
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -36,9 +34,10 @@ logger = logging.getLogger(__name__)
 
 # The upload marker a server-minted store carries in its root ``.zattrs``:
 # ``{"biopb": {"upload": {"state": "pending" | "ready"}}}``. Written at create,
-# flipped at ``finish``. A store still ``pending`` when a server starts is a
-# crashed upload -- ``UploadManager.discard_unfinished_stores`` deletes it, and
-# discovery declines it (``is_unfinished_upload``) so a shared root never
+# flipped when the upload reaches READY. A store still ``pending`` when a
+# server starts belonged to an upload nobody ever published -- it is a
+# crashed upload, so ``UploadManager.discard_unfinished_stores`` deletes it and
+# discovery declines it (``is_unfinished_upload``), so a shared root never
 # serves a partial store as a source of its own (biopb/biopb#1059).
 UPLOAD_ATTR = "biopb"
 UPLOAD_PENDING = "pending"
@@ -106,8 +105,8 @@ class ZarrAdapter(WritableSource, TensorAdapter):
 
     An upload's store is the server's own (minted under ``write_dir``), so the
     upload half here also owns its end: discard removes the directory
-    (:meth:`_dispose_store`) and finish clears the pending marker
-    (:meth:`_mark_store_finished`). Neither touches a discovered store, which
+    (:meth:`_dispose_store`) and publishing clears the pending marker
+    (:meth:`_publish_store`). Neither touches a discovered store, which
     never began an upload and so never reaches either.
     """
 
@@ -310,21 +309,6 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
-    def resolve_chunk_data(self, chunk_id: bytes, cache_manager: Any = None) -> Any:
-        """The read path, refused for a tombstone before the cache is consulted.
-
-        The store is gone once discarded, and zarr would answer fill values
-        for its missing chunks -- or the cache would answer the bytes it still
-        holds. Either way a reader would see data behind a source that has
-        none; it learns the reason instead, as a writer does, mapped to the
-        read path's wire error like ``CachedSourceAdapter`` maps it.
-        """
-        try:
-            self._refuse_if_discarded()
-        except UploadDiscardedError as e:
-            raise flight.FlightServerError(str(e)) from e
-        return super().resolve_chunk_data(chunk_id, cache_manager)
-
     def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
         with self._write_lock:
             super().put_chunk(bounds, data, expected_shape, dtype)
@@ -338,7 +322,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             shutil.rmtree(path, ignore_errors=True)
         logger.info(f"Removed the store of discarded upload {self.source_id}: {path}")
 
-    def _mark_store_finished(self) -> None:
+    def _publish_store(self) -> None:
         self._write_upload_state(UPLOAD_READY)
 
     def _write_upload_state(self, state: str) -> None:
@@ -347,7 +331,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         Atomic (write-then-replace) so a crash mid-write cannot leave a store
         with no ``.zattrs`` at all. Raises ``OSError`` when it cannot -- the
         store is gone because discard raced, or the disk refused -- and
-        ``finish`` decides which of the two it was.
+        ``set_status`` decides which of the two it was.
         """
         path = self._upload_store_path
         if path is None:

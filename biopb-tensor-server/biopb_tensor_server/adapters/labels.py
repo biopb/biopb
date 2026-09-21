@@ -164,8 +164,8 @@ class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
 
         A set the file carries, or one read back off a sidecar at startup,
         tracks no upload and is read-only: replacement is a new name or a
-        delete, never a chunk landing under a finished set (design,
-        "No per-instance edits").
+        discard, never a chunk landing under a set this server did not open
+        (design, "No per-instance edits").
         """
         if self.upload is None:
             raise WriteNotSupportedError(
@@ -175,20 +175,17 @@ class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
         super().put_chunk(bounds, data, expected_shape, dtype)
 
     def delete_store(self) -> None:
-        """Remove this set's sidecar; the adapter's half of ``delete_labels``.
+        """Remove this set's sidecar, for a set with no upload record left.
 
         A store the server minted under its ``write_dir`` is the server's to
         throw away (design, "Lifecycle"), and only such a set reaches here --
-        a group inside a user's file carries no store path and this is a
-        no-op on it. A set *this* server uploaded still holds its (READY)
-        progress record, so it goes through ``discard``, which seals that
-        record as well as releasing the store; one adopted from an earlier
-        life holds no record and only the store goes.
+        a group inside a user's file carries no store path and this is a no-op
+        on it. A set *this* server uploaded is removed by discarding its upload
+        instead (``UploadManager.discard``), which seals the record as well as
+        releasing the store; this is the path for one adopted from an earlier
+        life, which holds no record to seal.
         """
-        if self.upload is not None:
-            self.discard("deleted")
-        else:
-            self._dispose_store()
+        self._dispose_store()
 
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
         """The create echo, under the set's own ``array_id``.
@@ -196,7 +193,7 @@ class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
         The two prefixed kinds mint a ``source_id`` and answer with it; a set
         is a tensor of a source that already exists, so the id the request
         carried is the id it keeps -- and is what every later write, poll and
-        finish names.
+        transition names.
         """
         response = super().upload_response(desc)
         response.array_id = self.array_id
@@ -305,8 +302,8 @@ def sidecar_attrs(
     """The ``biopb`` block a sidecar's root ``.zattrs`` carries.
 
     Merged with the NGFF metadata by whoever writes the store. The upload
-    marker rides in the same block: ``pending`` from create, flipped to
-    ``ready`` by ``finish`` (``ZarrAdapter._mark_store_finished``), and
+    marker rides in the same block: ``pending`` from create, flipped when the
+    upload reaches READY (``ZarrAdapter._publish_store``), and
     :func:`sidecar_label_sets` attaches nothing that is not ``ready``.
     """
     attrs = with_upload_state({}, state)

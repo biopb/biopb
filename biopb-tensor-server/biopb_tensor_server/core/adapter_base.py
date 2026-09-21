@@ -368,6 +368,20 @@ class SourceAdapter(ABC):
         """
         return self._content_version
 
+    def check_readable(self) -> None:  # noqa: B027 - concrete no-op default
+        """Raise if this source cannot answer a pixel read right now.
+
+        A no-op for everything that reads a file: a store on disk is readable
+        whenever it is registered. An upload is not -- it is published by its
+        producer, and refuses until then (``WritableSource.check_readable``).
+
+        Asked by every read path that can serve bytes: ``resolve_chunk_data``
+        and, because it answers a warm chunk without calling it, the localhost
+        locate path (``server._handle_chunk_locate``). Pure in-memory, like
+        :meth:`check_chunk_version` beside it, so both are cheap enough to run
+        on every read.
+        """
+
     def check_chunk_version(self, chunk_id: bytes) -> None:
         """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
 
@@ -549,9 +563,9 @@ class SourceAdapter(ABC):
     # The validated, normalized merge of both; None means rebuild.
     _label_sets_view: Optional[Dict[str, TensorAdapter]] = None
     # Sets the upload path is still filling, and the tombstones of ones it gave
-    # up on: routable, so a poll to READY and a straggler's write both find
-    # their adapter, but never listed -- the bytes are not all there yet, or
-    # are gone. A finished one is attached as well, and stays here until the
+    # up on: routable, so a status poll and a straggler's write both find
+    # their adapter, but never listed -- nobody may read them yet, or the bytes
+    # are gone. A published one is attached as well, and stays here until the
     # reclaim sweep takes its tombstone (``UploadManager.reap``).
     _label_uploads: Optional[Dict[str, TensorAdapter]] = None
 
@@ -583,7 +597,7 @@ class SourceAdapter(ABC):
 
         This is the *published* view -- what the catalog lists and what a read
         resolves first. A set still being uploaded is in :attr:`label_uploads`
-        instead, and joins this one at ``finish``.
+        instead, and joins this one when its upload reaches READY.
         """
         view = self._label_sets_view
         if view is not None:
@@ -716,11 +730,11 @@ class SourceAdapter(ABC):
     def attach_label_set(self, field: str, adapter: TensorAdapter) -> None:
         """Make *adapter* answer for label field *field* on this source.
 
-        The registration hook attaches a finished sidecar set; the label upload
-        kind attaches one at ``finish``. Handed over in its own axis order and
-        checked when the sets are next listed, not here: an unresolved source
-        has no tensors to check against yet, and the upload kind validates at
-        create anyway.
+        The registration hook attaches a published sidecar set; the label
+        upload kind attaches one when its upload reaches READY. Handed over in
+        its own axis order and checked when the sets are next listed, not here:
+        an unresolved source has no tensors to check against yet, and the
+        upload kind validates at create anyway.
         """
         self._attach("_attached_label_sets", field, adapter, invalidate=True)
 
@@ -738,7 +752,7 @@ class SourceAdapter(ABC):
         Routable but never listed (see :attr:`label_sets`). Handed out as they
         were attached -- not normalized, because the upload refuses a
         non-canonical order at create -- so the boundary reaches the writable
-        adapter itself (``put_chunk``, ``finish``, ``discard``).
+        adapter itself (``put_chunk``, ``set_status``).
         """
         return self._label_uploads or {}
 
@@ -1925,6 +1939,7 @@ _SOURCE_SCOPED_API = frozenset(
         "capability_token",
         "content_version",
         "check_chunk_version",
+        "check_readable",
         "claim",
         "create_from_config",
         "list_tensor_descriptors",
