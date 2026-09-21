@@ -12,7 +12,7 @@ Features:
 import json
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import dask.array as da
 import numpy as np
@@ -178,7 +178,7 @@ class TensorFlightClient:
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
-        self._upload = UploadSession(self._state)
+        self._upload = UploadSession(self._state, self._catalog)
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
@@ -655,31 +655,6 @@ class TensorFlightClient:
         """
         return self._catalog.label_sets(image_array_id)
 
-    def delete_labels(self, array_id: str) -> Dict[str, Any]:
-        """Delete an uploaded label set, and the store behind it.
-
-        Note:
-            Experimental, with the rest of the upload API.
-
-        Only a *finished uploaded* set: a set the image's own file carries is
-        the file's, and a server-owned one (a name under ``@``) is the
-        server's. Deleting frees the name at once -- the next set uploaded
-        under it is a distinct tensor with its own cache namespace, so no
-        stale chunk can be served for it.
-
-        Args:
-            array_id: The set's ``array_id``, as ``label_sets`` reports it.
-
-        Returns:
-            ``{"array_id": ..., "deleted": True}``.
-
-        Raises:
-            pyarrow.flight.FlightServerError: the set is not one this server
-                may delete, or does not exist.
-            RuntimeError: the server predates the ``delete_labels`` action.
-        """
-        return self._catalog.delete_labels(array_id)
-
     # ---- ROI annotations ----
 
     def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
@@ -888,61 +863,114 @@ class TensorFlightClient:
     # collaborator (see biopb.tensor._upload); #278 item C.
     # ====================
 
-    def create_tensor(
+    def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
+        """Mint an empty source on the server, and answer its ``source_id``.
+
+        A source is a container for tensors; this makes one, and ``add_tensor``
+        fills it. It is registered and readable the moment this returns, with
+        an empty tensor list -- which the catalog models the same way it models
+        a cloud source nobody has resolved yet.
+
+        Unlike an upload, a registered source has no state to move: it is not
+        PENDING, nothing publishes it, and it outlives the process because the
+        server re-registers it at startup rather than because anything
+        discovers it.
+
+        Args:
+            name: A directory component the server names the store after, and
+                what a later ``register_source`` collides with. Empty asks the
+                server to mint one. Compared case- and accent-insensitively,
+                because two such names are one directory on Windows and macOS.
+            metadata: The source's OME metadata block. Source-scoped: every
+                tensor added to it inherits the physical scale, units and
+                channel names from here.
+
+        Returns:
+            The ``source_id``, which is **minted by the server, not derived
+            from the name** -- so it survives the server's ``write_dir``
+            moving, and cannot be guessed from the name by a client that did
+            not create it.
+
+        Raises:
+            FlightServerError: the name cannot be a directory on some platform
+                this store may be served from, or is already taken.
+        """
+        return self._upload.register_source(name, metadata)
+
+    def add_tensor(
         self,
-        source_name: str,
+        array_id: str,
         template: Any,
         *,
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> TensorDescriptor:
-        """Declare a single-tensor source to fill: the first half of an upload.
+        """Declare a tensor to fill: the first half of an upload.
 
         Note:
-            Experimental. The upload / writable-source API (tensor creation,
-            chunk upload, and upload-status polling) is experimental and may
-            change.
+            Experimental. The upload / writable-source API (source
+            registration, tensor creation, chunk upload, and upload-status
+            polling) is experimental and may change.
 
-        Declare, then fill. The returned descriptor is the server's echo --
+        **An upload adds a tensor to a source that already exists**, so
+        ``register_source`` comes first and this never creates one. Declare,
+        then fill: the returned descriptor is the server's echo --
         ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
-        and is what ``upload_array``, ``upload_chunk`` and ``finish_upload``
-        take. A name is taken while its source exists: a second create under
-        it -- pending, finished or discarded -- is refused. Only the server's
-        reclaim sweep frees one, after a discarded upload's ``upload_ttl``.
-        ``finish_upload`` is what marks the upload complete.
+        and is what ``upload_array``, ``upload_chunk`` and
+        ``set_upload_status`` take. ``set_upload_status`` is what publishes the
+        tensor and marks it complete.
+
+        A field is taken while its tensor is served: a second add under it --
+        at any state -- is refused. Only the server's reclaim sweep frees one,
+        after a discarded upload's ``upload_ttl``.
 
         Args:
-            source_name: "cache:name" → cache-backed; "ome_zarr:name" →
-                zarr-backed; "cache:" or "ome_zarr:" → server-generated name;
-                "<image array_id>/labels/<name>" → a label set of an image the
-                server already serves, which is the one form whose id is the
-                request's own rather than a minted ``source_id``. A set is
-                unsigned-integer, spans its image's non-channel axes at full
-                length, and its all-zero chunks are skipped by ``upload_array``
+            array_id: ``"<scheme>://<source_id>/<field>"``, where *scheme* is
+                the store format -- ``zarr`` for an OME-Zarr image group,
+                ``cache`` for the chunks as uploaded -- and *source_id* is what
+                ``register_source`` answered. Or
+                ``"zarr://<image array_id>/labels/<name>"`` for a label set of
+                an image the server already serves, which is the one form whose
+                source may be a discovered file. A set is unsigned-integer,
+                spans its image's non-channel axes at full length, and its
+                all-zero chunks are skipped by ``upload_array``.
+                The scheme names the store format and nothing else: the
+                answered ``array_id`` carries none.
             template: Anything with ``.shape`` and ``.dtype`` -- the array to be
                 uploaded, or one shaped like it. A dask array also supplies the
                 chunk grid (its chunk size per axis).
             chunk_shape: The upload grid, overriding the template's. Required
-                to get anything but one chunk from a non-dask template.
+                to get anything but one chunk from a non-dask template. A
+                request, not a promise: the server plans on its own grid and
+                answers with it (``chunk_shape`` on the returned descriptor).
             dim_labels: Optional dimension labels
-            ome_metadata: Optional OME metadata dict
+            ome_metadata: Ignored except for a label set's ``image-label``
+                block. Metadata is source-scoped and rides on
+                ``register_source``; a tensor inherits its source's.
 
         Returns:
-            The new source's descriptor.
+            The new tensor's descriptor, under the ``array_id`` it keeps.
 
         Raises:
-            pyarrow.flight.FlightServerError: the name is already taken.
+            pyarrow.flight.FlightServerError: the source is not registered, the
+                field is taken, or the name cannot be a directory on some
+                platform this store may be served from.
         """
-        return self._upload.create_tensor(
-            source_name,
+        return self._upload.add_tensor(
+            array_id,
             template,
             chunk_shape=chunk_shape,
             dim_labels=dim_labels,
             ome_metadata=ome_metadata,
         )
 
-    def upload_array(self, desc: TensorDescriptor, arr: Any) -> Dict[str, Any]:
+    def upload_array(
+        self,
+        desc: TensorDescriptor,
+        arr: Any,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+    ) -> Dict[str, Any]:
         """Fill a declared tensor with an array, and seal it.
 
         Note:
@@ -950,22 +978,36 @@ class TensorFlightClient:
             chunk upload, and upload-status polling) is experimental and may
             change.
 
-        *arr* must match the descriptor's shape and dtype; it is rechunked onto
-        the descriptor's chunk grid, every block is sent as one chunk, and the
-        source is finished. A numpy array is accepted and chunked on the grid.
+        *arr* must match the descriptor's shape and dtype. One
+        ``GetFlightInfo`` plans the write; *arr* is rechunked onto the grid the
+        plan came back with, every block is sent as the chunk its ticket names,
+        and the tensor is published. A numpy array is accepted and chunked the
+        same way.
+
+        With a *slice_hint* only that region is planned and uploaded, and the
+        tensor is **not** published -- a partial upload cannot know it is done,
+        so the caller says so with ``set_upload_status``. The region is in the
+        tensor's own coordinates, which are *arr*'s: *arr* still carries the
+        declared shape and the region is read out of it. The server snaps the
+        region outward to its chunk grid, so a little more than was asked for
+        may be written.
 
         Args:
-            desc: The descriptor ``create_tensor`` returned
+            desc: The descriptor ``add_tensor`` returned
             arr: The array to upload (dask or numpy)
+            slice_hint: Optional region to upload, as a slice per axis. An
+                open-ended ``stop`` is filled from the declared shape.
 
         Returns:
-            The sealed upload status, as ``get_upload_status`` reports it.
+            The upload status, as ``get_upload_status`` reports it: sealed
+            without a *slice_hint*, still PENDING with one.
 
         Raises:
-            ValueError: *arr* does not match the declared shape or dtype.
+            ValueError: *arr* does not match the declared shape or dtype, or
+                the region is empty.
             UploadRefused: the upload is over -- sealed or discarded.
         """
-        return self._upload.upload_array(desc, arr)
+        return self._upload.upload_array(desc, arr, slice_hint)
 
     def upload_chunk(
         self,
@@ -981,40 +1023,73 @@ class TensorFlightClient:
             change.
 
         The manual half of ``upload_array``: a caller writing chunks itself
-        calls this per chunk and ``finish_upload`` when done.
+        calls this per chunk and ``set_upload_status`` when done.
+
+        *bounds* must be one whole chunk of the server's grid. The call plans
+        that one chunk first (``GetFlightInfo`` with the region and nothing
+        else, a sub-millisecond round trip on localhost), so bounds that are
+        not a chunk are refused here, naming what the grid snapped them to,
+        rather than written somewhere no read asks for.
 
         Args:
-            desc: The descriptor ``create_tensor`` returned
+            desc: The descriptor ``add_tensor`` returned
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data
 
         Raises:
+            ValueError: *bounds* is not one chunk of this tensor's grid.
             UploadRefused: the upload is over -- sealed or discarded.
         """
         self._upload.upload_chunk(desc, bounds, data)
 
-    def finish_upload(self, desc: TensorDescriptor) -> Dict[str, Any]:
-        """Seal an upload: the source is complete and takes no further chunks.
+    def set_upload_status(
+        self,
+        target: Union[TensorDescriptor, str],
+        state: Union[str, int],
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Move an upload along its lifecycle; the only thing that moves one.
 
         Note:
             Experimental. The upload / writable-source API (tensor creation,
             chunk upload, and upload-status polling) is experimental and may
             change.
 
-        The only route to READY, which is the state a consumer waiting on this
-        result polls for. ``upload_array``, which writes every chunk itself,
-        calls it for you.
+        The states form a ladder, and a call climbs it or stands still:
+
+        - ``"READY"`` -- **publish and seal**. The source becomes readable, a
+          chunk that was never uploaded reads back as zeros, and no further
+          chunk is accepted, so what is there is final. This is the state a
+          consumer waiting on a result polls for, and what ``upload_array``
+          sets for you.
+        - ``"DISCARDED"`` -- **give up**, from any of the above. Whatever the
+          server minted goes with it: an ``ome_zarr:`` store, a label set's
+          sidecar and its listing. This is how an uploaded label set is
+          deleted; the name frees after the server's reclaim sweep, like any
+          other discarded upload's.
+
+        Setting the state the upload is already in is a no-op; moving back down
+        the ladder is refused.
 
         Args:
-            desc: The descriptor ``create_tensor`` returned
+            target: The descriptor ``add_tensor`` returned, or an
+                ``array_id`` -- a label set's, as ``label_sets`` reports it.
+            state: ``"READY"`` or ``"DISCARDED"``.
+            reason: Why, for ``"DISCARDED"``. It is what a poller waiting on
+                this result reads back, so write it for them.
 
         Returns:
-            The sealed upload status, as ``get_upload_status`` reports it.
+            The resulting upload status, as ``get_upload_status`` reports it.
+            ``DISCARDED`` is total -- an id tracking no upload answers
+            ``UNKNOWN`` rather than raising, so it is a statement about the end
+            state, not a receipt.
 
         Raises:
-            UploadRefused: the upload was discarded.
+            UploadRefused: the upload was discarded, so it cannot be moved.
+            pyarrow.flight.FlightServerError: the move is backwards, or the id
+                names no upload in progress.
         """
-        return self._upload.finish_upload(desc)
+        return self._upload.set_upload_status(target, state, reason)
 
     def close(self):
         """Close the Flight client."""
@@ -1080,7 +1155,7 @@ class TensorFlightClient:
             upload, and upload-status polling) is experimental and may change.
 
         Args:
-            source_id: The ``array_id`` of the descriptor ``create_tensor`` returned
+            source_id: The ``array_id`` of the descriptor ``add_tensor`` returned
 
         Returns:
             Dictionary with source_id, state, expected_chunks, and uploaded_chunks.

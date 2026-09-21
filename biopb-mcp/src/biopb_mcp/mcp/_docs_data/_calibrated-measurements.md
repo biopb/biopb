@@ -57,8 +57,9 @@ generated from a previous step. Read [[tensor-server-client]] and [[napari-viewe
    is `client.get_physical_scale(array_id)`.
 
    - **Take it from `IMAGE`, not from `LABELS`.** A Labels layer the agent
-     added itself defaults to all-ones scale, and a segmentation uploaded to
-     `cache:` carries no physical size at all; both must inherit the image's.
+     added itself defaults to all-ones scale, and a segmentation uploaded as a
+     tensor of its own carries no physical size at all; both must inherit the
+     image's.
    - **`LABELS` and `IMAGE` must come from the same resolution level.**
      Level 2 labels scored against a level 0 image are wrong by the downsample
      factor, and nothing in the output says so.

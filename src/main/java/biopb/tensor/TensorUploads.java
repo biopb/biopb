@@ -1,5 +1,6 @@
 package biopb.tensor;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -9,6 +10,8 @@ import java.util.logging.Logger;
 import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.PutResult;
 import org.apache.arrow.flight.Result;
 import org.apache.arrow.flight.SyncPutListener;
@@ -26,6 +29,8 @@ import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.FieldMask;
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
@@ -37,6 +42,7 @@ import net.imglib2.type.numeric.RealType;
 import static biopb.tensor.TensorChunkCodec.advanceRowMajor;
 import static biopb.tensor.TensorChunkCodec.cellCount;
 import static biopb.tensor.TensorChunkCodec.normalizeDtype;
+import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
 import static biopb.tensor.TensorChunkCodec.toLongArray;
 
 /**
@@ -44,14 +50,22 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
  *
  * <p><b>Experimental</b>, with the rest of the upload API.
  *
- * <p>Declare, then fill: {@link #createTensor} returns the server's descriptor
- * for the new source, and that descriptor is what every write takes. The Java
+ * <p><b>An upload adds a tensor to a source that already exists.</b>
+ * {@link #registerSource} mints one, {@link #addTensor} returns the server's
+ * descriptor for the new tensor, and that descriptor is what every write
+ * takes. The scheme on an {@code array_id} names the store format and nothing
+ * else; the answered id carries none. The Java
  * twin of {@code biopb.tensor._upload}, minus its dask graph -- an imglib2
- * interval is walked on the calling thread, one chunk per grid cell, each put
- * finished before the next is encoded. Python instead stores the whole array
- * through dask with {@code lock=False} and the chunks go up concurrently, which
- * the server is built for (it counts arrivals into a set keyed by chunk id).
- * Closing that gap is biopb/biopb#1073.
+ * interval is walked on the calling thread, one chunk per planned endpoint,
+ * each put finished before the next is encoded. Python instead stores the whole
+ * array through dask with {@code lock=False} and the chunks go up concurrently,
+ * which the server is built for (it counts arrivals into a set keyed by chunk
+ * id). Closing that gap is biopb/biopb#1073.
+ *
+ * <p><b>What a chunk is, is the server's.</b> A write plans through
+ * {@code GetFlightInfo} exactly as a read does and sends back the endpoint's
+ * ticket, so there is no grid arithmetic on this side to keep in step with the
+ * server's ({@code java-tensor-v2.md} parity rule).
  */
 final class TensorUploads {
 
@@ -63,16 +77,57 @@ final class TensorUploads {
         this.session = session;
     }
 
-    /** Backs {@link TensorFlightClient#createTensor}; see that method. */
-    TensorDescriptor createTensor(
-            String sourceName,
+    /**
+     * Run a single-result {@code doAction} and hand back its body.
+     *
+     * <p>The three upload actions all want the same four lines -- dispatch,
+     * refuse an empty stream, take the one result -- and each spelled them
+     * again, so a change to how an empty stream reads had three places to
+     * reach. The proto parse stays at the call site, because only it knows
+     * which message it asked for.
+     *
+     * @throws IllegalStateException the server answered with no result at all
+     */
+    private byte[] actionOneResult(String type, byte[] body) {
+        Iterator<Result> results = session.doAction(new Action(type, body));
+        if (!results.hasNext()) {
+            throw new IllegalStateException(type + ": server returned no result");
+        }
+        return results.next().getBody();
+    }
+
+    /** Backs {@link TensorFlightClient#registerSource}; see that method. */
+    String registerSource(String name, String metadataJson) {
+        RegisterSource request = RegisterSource.newBuilder()
+                .setName(name == null ? "" : name)
+                // Opaque here: the server keeps the OME
+                // tree whole, so a malformed one is its refusal to give, with
+                // the message it gives every other create.
+                .setMetadataJson(metadataJson == null ? "" : metadataJson)
+                .build();
+
+        RegisterSourceResult answer;
+        try {
+            answer = RegisterSourceResult.parseFrom(
+                    actionOneResult("register_source", request.toByteArray()));
+        } catch (InvalidProtocolBufferException error) {
+            throw new IllegalStateException(
+                    "register_source: server returned no RegisterSourceResult", error);
+        }
+        LOGGER.info("registerSource: registered " + answer.getSourceId());
+        return answer.getSourceId();
+    }
+
+    /** Backs {@link TensorFlightClient#addTensor}; see that method. */
+    TensorDescriptor addTensor(
+            String arrayId,
             long[] shape,
             String dtype,
             long[] chunkShape,
             List<String> dimLabels,
             String metadataJson) {
         TensorDescriptor.Builder request = TensorDescriptor.newBuilder()
-                .setArrayId(sourceName)
+                .setArrayId(arrayId)
                 .setDtype(dtype);
         for (long dim : shape) {
             request.addShape(dim);
@@ -87,13 +142,9 @@ final class TensorUploads {
             request.setMetadataJson(metadataJson);
         }
 
-        Iterator<Result> results = session.doAction(
-                new Action("create_tensor", request.build().toByteArray()));
-        if (!results.hasNext()) {
-            throw new IllegalStateException("create_tensor: server returned no result");
-        }
-        TensorDescriptor created = TensorChunkCodec.parseDescriptor(results.next().getBody());
-        LOGGER.info("createTensor: created " + created.getArrayId());
+        TensorDescriptor created = TensorChunkCodec.parseDescriptor(
+                actionOneResult("add_tensor", request.build().toByteArray()));
+        LOGGER.info("addTensor: added " + created.getArrayId());
         return created;
     }
 
@@ -101,7 +152,6 @@ final class TensorUploads {
     <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
             TensorDescriptor descriptor, RandomAccessibleInterval<T> array) {
         long[] shape = toLongArray(descriptor.getShapeList());
-        long[] chunkShape = toLongArray(descriptor.getChunkShapeList());
         if (array.numDimensions() != shape.length) {
             throw new IllegalArgumentException("uploadArray: array rank " + array.numDimensions()
                     + " does not match the declared rank " + shape.length + " of " + descriptor.getArrayId());
@@ -122,46 +172,131 @@ final class TensorUploads {
             throw new IllegalArgumentException("uploadArray: array dtype " + actual
                     + " does not match the declared dtype " + declared + " of " + descriptor.getArrayId());
         }
-        // An all-zero block of a label set is not sent at all: the sidecar's fill
-        // value already reads as background, so one labelled frame of a thousand
+        // An all-zero block of a label set is not sent at all: its unwritten
+        // chunks read back as background, so one labelled frame of a thousand
         // costs one frame (biopb/biopb#1059).
         boolean skipEmpty = isLabelSet(descriptor.getArrayId());
 
-        long[] start = new long[shape.length];
-        while (true) {
-            long[] stop = new long[shape.length];
-            for (int axis = 0; axis < shape.length; axis++) {
-                stop[axis] = Math.min(start[axis] + chunkShape[axis], shape[axis]);
-            }
-            uploadChunk(descriptor, boundsOf(start, stop), array, skipEmpty);
-            if (!advance(start, chunkShape, shape)) {
-                break;
-            }
+        // One plan for the whole upload; each entry is one chunk, with the
+        // ticket that names it.
+        for (PlannedChunk chunk : planWrite(descriptor.getArrayId(), null)) {
+            putChunk(descriptor, chunk.ticket, chunk.bounds, array, skipEmpty);
         }
-        // Sealing is what marks the source complete, so a whole-array upload does
-        // it on the caller's behalf -- it is the one caller that knows, from
-        // having written every block itself, that there is nothing more to send.
-        return finishUpload(descriptor);
+        // Publishing is what marks the source complete, so a whole-array upload
+        // does it on the caller's behalf -- it is the one caller that knows,
+        // from having written every block itself, that there is nothing more to
+        // send.
+        return setUploadStatus(descriptor.getArrayId(), UploadStatus.State.READY, "");
     }
 
     /** Backs {@link TensorFlightClient#uploadChunk}; see that method. */
     <T extends NativeType<T> & RealType<T>> void uploadChunk(
             TensorDescriptor descriptor, ChunkBounds bounds, RandomAccessibleInterval<T> source) {
-        uploadChunk(descriptor, bounds, source, false);
+        putChunk(descriptor, plannedTicket(descriptor.getArrayId(), bounds), bounds, source, false);
     }
 
     /**
-     * As {@link #uploadChunk}, but with {@code skipEmpty} the block is encoded
-     * and then dropped unsent if every element was zero.
+     * One endpoint of a write plan: where it goes, and the ticket that says so.
+     *
+     * <p>{@code bounds} is in the <b>tensor's</b> coordinates. An endpoint's
+     * {@code app_metadata} states them relative to the realized region instead
+     * -- that is what a reader wants, since it is assembling an array of just
+     * that region -- so {@link #planWrite} shifts them back by the realized
+     * origin.
+     */
+    private static final class PlannedChunk {
+        final ChunkBounds bounds;
+        final byte[] ticket;
+
+        PlannedChunk(ChunkBounds bounds, byte[] ticket) {
+            this.bounds = bounds;
+            this.ticket = ticket;
+        }
+    }
+
+    /**
+     * The chunks a write must send, as the server plans them.
+     *
+     * <p>The same {@code GetFlightInfo} a read makes, with the {@code
+     * endpoints} mask and no {@code scale_hint}: the mask is the plan alone
+     * because the rest of a describe costs I/O a write has no use for. A
+     * {@code sliceHint} plans only the box that will be written, snapped
+     * outward to the server's grid. Answered while the tensor is still PENDING
+     * -- planning is a metadata read -- and idempotent, so an interrupted
+     * upload re-plans to resume.
+     */
+    private List<PlannedChunk> planWrite(String arrayId, SliceHint sliceHint) {
+        TensorReadOption.Builder read = TensorReadOption.newBuilder()
+                .setArrayId(arrayId)
+                .setFields(FieldMask.newBuilder().addPaths("endpoints").build());
+        if (sliceHint != null) {
+            read.setSliceHint(sliceHint);
+        }
+        FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
+        FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
+        if (info.getEndpoints().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "upload: the server planned no chunks for " + arrayId);
+        }
+        // The realized region the plan snapped to; its start is the origin the
+        // endpoints' bounds are stated against.
+        List<Long> origin = TensorChunkCodec.descriptorOf(info).getSliceHint().getStartList();
+        List<PlannedChunk> plan = new ArrayList<>();
+        for (FlightEndpoint endpoint : info.getEndpoints()) {
+            ChunkBounds relative = parseChunkBounds(endpoint.getAppMetadata());
+            ChunkBounds.Builder absolute = ChunkBounds.newBuilder();
+            for (int axis = 0; axis < relative.getStartCount(); axis++) {
+                long shift = origin.isEmpty() ? 0 : origin.get(axis);
+                absolute.addStart(shift + relative.getStart(axis));
+                absolute.addStop(shift + relative.getStop(axis));
+            }
+            plan.add(new PlannedChunk(absolute.build(), endpoint.getTicket().getBytes()));
+        }
+        return plan;
+    }
+
+    /**
+     * The ticket for the one chunk at {@code bounds}, or a refusal naming the
+     * grid.
+     *
+     * <p>The server snaps a slice outward, so a plan of one endpoint whose
+     * bounds are the ones asked for is the only proof that {@code bounds} is a
+     * chunk. Refused here rather than sent, because a write of part of a chunk
+     * has nowhere to land: the id the planner mints covers the whole cell.
+     */
+    private byte[] plannedTicket(String arrayId, ChunkBounds bounds) {
+        List<PlannedChunk> plan = planWrite(arrayId, SliceHint.newBuilder()
+                .addAllStart(bounds.getStartList())
+                .addAllStop(bounds.getStopList())
+                .build());
+        if (plan.size() != 1 || !plan.get(0).bounds.equals(bounds)) {
+            StringBuilder snapped = new StringBuilder();
+            for (int i = 0; i < Math.min(4, plan.size()); i++) {
+                ChunkBounds cell = plan.get(i).bounds;
+                snapped.append(i == 0 ? "" : ", ").append(cell.getStartList())
+                        .append('-').append(cell.getStopList());
+            }
+            throw new IllegalArgumentException("uploadChunk: " + bounds.getStartList() + "-"
+                    + bounds.getStopList() + " is not one chunk of " + arrayId
+                    + "; the server's grid puts it in " + snapped
+                    + (plan.size() > 4 ? " ..." : "") + ". Write a chunk of that grid, "
+                    + "or use uploadArray.");
+        }
+        return plan.get(0).ticket;
+    }
+
+    /**
+     * Send one planned chunk. With {@code skipEmpty} the block is encoded and
+     * then dropped unsent if every element was zero.
      *
      * <p>Encoding first and deciding after is what keeps the emptiness test and
      * the upload one traversal rather than two -- and, more to the point, keeps
      * {@link #positionOf}'s handling of a cropped view's min in one loop rather
      * than in two that have to agree.
      */
-    private <T extends NativeType<T> & RealType<T>> void uploadChunk(
-            TensorDescriptor descriptor, ChunkBounds bounds, RandomAccessibleInterval<T> source,
-            boolean skipEmpty) {
+    private <T extends NativeType<T> & RealType<T>> void putChunk(
+            TensorDescriptor descriptor, byte[] ticket, ChunkBounds bounds,
+            RandomAccessibleInterval<T> source, boolean skipEmpty) {
         long[] start = toLongArray(bounds.getStartList());
         long[] stop = toLongArray(bounds.getStopList());
         if (start.length != stop.length || start.length != source.numDimensions()) {
@@ -170,10 +305,7 @@ final class TensorUploads {
         }
 
         PutCommand command = PutCommand.newBuilder()
-                .setChunk(ChunkUpload.newBuilder()
-                        .setSourceId(descriptor.getArrayId())
-                        .setBounds(bounds)
-                        .build())
+                .setChunkTicket(ByteString.copyFrom(ticket))
                 .build();
 
         BufferAllocator allocator = session.allocator();
@@ -210,23 +342,23 @@ final class TensorUploads {
         }
     }
 
-    /** Backs {@link TensorFlightClient#finishUpload}; see that method. */
-    Map<String, Object> finishUpload(TensorDescriptor descriptor) {
-        FinishUpload request = FinishUpload.newBuilder()
-                .setSourceId(descriptor.getArrayId())
+    /** Backs {@link TensorFlightClient#setUploadStatus}; see that method. */
+    Map<String, Object> setUploadStatus(String arrayId, UploadStatus.State state, String reason) {
+        SetUploadStatus request = SetUploadStatus.newBuilder()
+                .setArrayId(arrayId)
+                .setState(state)
+                .setReason(reason == null ? "" : reason)
                 .build();
-        Iterator<Result> results = session.doAction(new Action("finish", request.toByteArray()));
-        if (!results.hasNext()) {
-            throw new IllegalStateException("finish: server returned no result");
-        }
         UploadStatus status;
         try {
-            status = UploadStatus.parseFrom(results.next().getBody());
+            status = UploadStatus.parseFrom(
+                    actionOneResult("set_upload_status", request.toByteArray()));
         } catch (InvalidProtocolBufferException error) {
-            throw new IllegalStateException("finish: server returned no UploadStatus", error);
+            throw new IllegalStateException(
+                    "set_upload_status: server returned no UploadStatus", error);
         }
-        LOGGER.info("finishUpload: sealed " + descriptor.getArrayId());
-        return statusMap(descriptor.getArrayId(), status);
+        LOGGER.info("setUploadStatus: " + arrayId + " -> " + state.name());
+        return statusMap(arrayId, status);
     }
 
     /** The {@code get_upload_status} shape, so a seal and a poll agree. */
@@ -243,12 +375,13 @@ final class TensorUploads {
     /**
      * Whether {@code arrayId} names a label set rather than a source of its own.
      *
-     * <p>The one upload kind whose unwritten chunks are meaningful: a label set
-     * is a zarr with fill value 0, so a chunk that never arrives reads back as
-     * background and skipping it is free (biopb/biopb#1059). A {@code cache:}
-     * source answers a read of an unwritten chunk with "holds no chunk", so the
-     * skip must never be a general behaviour -- hence the check on the shape of
-     * the id rather than a flag the caller could set on anything.
+     * <p>The one upload kind whose unwritten chunks are meaningful <i>by
+     * declaration</i>: a label set is a zarr with fill value 0, so a chunk that
+     * never arrives reads back as background and skipping it is free
+     * (biopb/biopb#1059). Every published upload now reads its gaps as zeros, so
+     * skipping would be safe for the other kinds too -- but it would also stop
+     * reporting them: an all-zero array would upload nothing at all and land
+     * READY with {@code uploaded_chunks} at 0.
      */
     static boolean isLabelSet(String arrayId) {
         return TensorFlightClient.sourceIdFromArrayId(arrayId).indexOf(':') < 0
@@ -276,27 +409,6 @@ final class TensorUploads {
         long[] dims = new long[array.numDimensions()];
         array.dimensions(dims);
         return dims;
-    }
-
-    private static ChunkBounds boundsOf(long[] start, long[] stop) {
-        ChunkBounds.Builder bounds = ChunkBounds.newBuilder();
-        for (int axis = 0; axis < start.length; axis++) {
-            bounds.addStart(start[axis]);
-            bounds.addStop(stop[axis]);
-        }
-        return bounds.build();
-    }
-
-    /** Step {@code start} to the next cell of the chunk grid; false when past the last. */
-    private static boolean advance(long[] start, long[] chunkShape, long[] shape) {
-        for (int axis = start.length - 1; axis >= 0; axis--) {
-            start[axis] += chunkShape[axis];
-            if (start[axis] < shape[axis]) {
-                return true;
-            }
-            start[axis] = 0;
-        }
-        return false;
     }
 
     /**

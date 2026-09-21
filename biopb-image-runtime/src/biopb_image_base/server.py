@@ -225,8 +225,14 @@ class EmbeddedTensorCache:
         is what a consumer polling for the result waits on. A fast-return
         servicer calls this when its job succeeds, exactly as it calls
         ``discard`` when the job dies (biopb/biopb#1048).
+
+        READY is one rung of the upload ladder rather than an operation of its
+        own, so it goes through ``set_status``; the name stays because sealing
+        is the only rung a servicer ever asks for.
         """
-        return self._server.uploads.finish(source_id)
+        from biopb_tensor_server.adapters._writable import UploadStatus
+
+        return self._server.uploads.set_status(source_id, UploadStatus.READY)
 
     def get_upload_status(self, source_id: str) -> dict:
         return self._server.uploads.status(source_id)

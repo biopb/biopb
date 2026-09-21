@@ -18,9 +18,11 @@ from biopb.tensor.descriptor_pb2 import UploadStatus as UploadStatusPb
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 
-def _make(client, name="cache:status", shape=(4, 4), chunk=(2, 2)):
-    return client.create_tensor(
-        name, np.empty(shape, dtype=np.uint16), chunk_shape=chunk
+def _make(client, source, field="status", shape=(4, 4), chunk=(2, 2)):
+    return client.add_tensor(
+        f"cache://{source}/{field}",
+        np.empty(shape, dtype=np.uint16),
+        chunk_shape=chunk,
     )
 
 
@@ -32,15 +34,17 @@ def _put(client, desc, start, stop):
 
 
 class TestOnTheDescriptor:
-    def test_a_fresh_upload_reports_pending_with_its_grid(self, client):
-        desc = client.get_descriptor(_make(client).array_id, with_upload_status=True)
+    def test_a_fresh_upload_reports_pending_with_its_grid(self, client, source):
+        desc = client.get_descriptor(
+            _make(client, source).array_id, with_upload_status=True
+        )
         assert desc.HasField("upload_status")
         assert desc.upload_status.state == UploadStatusPb.PENDING
         assert desc.upload_status.expected_chunks == 4  # 4x4 in 2x2
         assert desc.upload_status.uploaded_chunks == 0
 
-    def test_it_advances_as_chunks_land(self, client):
-        desc = _make(client)
+    def test_it_advances_as_chunks_land(self, client, source):
+        desc = _make(client, source)
         _put(client, desc, (0, 0), (2, 2))
         desc = client.get_descriptor(desc.array_id, with_upload_status=True)
         assert desc.upload_status.uploaded_chunks == 1
@@ -82,10 +86,11 @@ class TestCapabilityHolderCanPoll:
     but unable to learn when it was readable.
     """
 
-    def test_the_capability_opens_the_status(self, writable_server):
-        desc = _make(TensorFlightClient(f"grpc://localhost:{writable_server.port}"))
-        adapter = writable_server.sources.get(desc.array_id)
-        adapter.capability_token = "cap-token"
+    def test_the_capability_opens_the_status(self, writable_server, client, source):
+        desc = _make(client, source)
+        # The token gates the *source*: a member is reached through it, so
+        # there is nowhere else for the grant to sit.
+        writable_server.sources.get(source).capability_token = "cap-token"
 
         holder = TensorFlightClient(
             f"grpc://localhost:{writable_server.port}", token="cap-token"
@@ -96,9 +101,9 @@ class TestCapabilityHolderCanPoll:
         finally:
             holder.close()
 
-    def test_a_stranger_is_refused(self, writable_server):
-        desc = _make(TensorFlightClient(f"grpc://localhost:{writable_server.port}"))
-        writable_server.sources.get(desc.array_id).capability_token = "cap-token"
+    def test_a_stranger_is_refused(self, writable_server, client, source):
+        desc = _make(client, source)
+        writable_server.sources.get(source).capability_token = "cap-token"
 
         stranger = TensorFlightClient(
             f"grpc://localhost:{writable_server.port}", token="wrong"
@@ -111,11 +116,13 @@ class TestCapabilityHolderCanPoll:
 
 
 class TestDiscarded:
-    def test_a_tombstone_still_answers_with_its_reason(self, client, writable_server):
+    def test_a_tombstone_still_answers_with_its_reason(
+        self, client, writable_server, source
+    ):
         """Describe is not a chunk read, so it never reaches
-        `_refuse_if_discarded` -- a poller learns why instead of meeting a dead
+        `check_readable` -- a poller learns why instead of meeting a dead
         call. Its bytes stay unreadable; only the status is."""
-        desc = _make(client, shape=(2, 2), chunk=(2, 2))
+        desc = _make(client, source, shape=(2, 2), chunk=(2, 2))
         writable_server.uploads.discard(desc.array_id, "job died")
 
         desc = client.get_descriptor(desc.array_id, with_upload_status=True)
@@ -127,7 +134,7 @@ class TestTheActionIsGone:
     def test_upload_status_is_not_advertised(self, client):
         advertised = {a.type for a in client._state.client.list_actions()}
         assert "upload_status" not in advertised
-        assert "create_tensor" in advertised  # the listing itself still works
+        assert "add_tensor" in advertised  # the listing itself still works
 
     def test_calling_it_fails(self, client):
         """Deleted rather than gated: the policy is satisfied by removing the
@@ -141,18 +148,18 @@ class TestTheActionIsGone:
 
 
 class TestNotCached:
-    def test_there_is_no_descriptor_cache_to_keep_it_in(self, client):
+    def test_there_is_no_descriptor_cache_to_keep_it_in(self, client, source):
         """The SDK keeps no descriptor, so there is nowhere for a stale status
         to live -- a cached PENDING would shadow the READY a poll came for."""
-        desc = _make(client, shape=(2, 2), chunk=(2, 2))
+        desc = _make(client, source, shape=(2, 2), chunk=(2, 2))
         client.get_descriptor(desc.array_id)
 
         assert not hasattr(client._state, "descriptors")
         assert not hasattr(client, "_descriptors")
 
-    def test_a_second_poll_sees_new_progress(self, client):
+    def test_a_second_poll_sees_new_progress(self, client, source):
         """The end-to-end consequence: polling is live, not memoized."""
-        desc = _make(client, shape=(2, 2), chunk=(2, 2))
+        desc = _make(client, source, shape=(2, 2), chunk=(2, 2))
         assert client.get_upload_status(desc.array_id)["uploaded_chunks"] == 0
         _put(client, desc, (0, 0), (2, 2))
         status = client.get_upload_status(desc.array_id)
@@ -187,10 +194,10 @@ class TestSdkDictShape:
         with pytest.raises(ValueError, match=r"client\.resolve"):
             client.get_upload_status("cloud_x")
 
-    def test_the_dict_keeps_its_shape(self, client):
+    def test_the_dict_keeps_its_shape(self, client, source):
         """The wire moved; the SDK's answer did not. `biopb_image_base` mirrors
         this dict in-process, and the two should stay the same shape."""
-        desc = _make(client)
+        desc = _make(client, source)
         status = client.get_upload_status(desc.array_id)
         assert set(status) == {
             "source_id",

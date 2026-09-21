@@ -39,10 +39,22 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   The ``upload_status`` and ``is_resident`` actions are gone: both are live
 #   per-source reads and ride the descriptor GetFlightInfo returns
 #   (biopb/biopb#1048).
-#   A new ``finish`` action seals an upload against further writes and is the
-#   only route to READY; ``create_tensor`` (was ``create_source``) refuses a
-#   name that exists and a refused write carries its state in ``extra_info``.
+#   One ``set_upload_status`` action moves an upload: it climbs PENDING ->
+#   READY, with DISCARDED reachable from either, and READY seals it against
+#   writes and opens it to reads in one move, so a chunk that was never
+#   uploaded reads as zeros. A refused write carries its state in
+#   ``extra_info``.
+#   Uploads add to a source rather than create one: ``register_source`` mints
+#   the source, ``add_tensor`` (was ``create_tensor``, was ``create_source``)
+#   adds ``<scheme>://<source_id>/<field>`` to it and refuses a field that
+#   exists, and DoPut carries a ``chunk_ticket`` from the tensor's own
+#   GetFlightInfo plan rather than bounds the client chose.
+#   Every action takes full access, ``chunk_locate`` included.
 #   ``SerializedTensor`` is a serialized ``FlightInfo`` plus location and
 #   token; GetFlightInfo stamps the requested ``slice_hint`` on the
 #   FlightInfo's ``app_metadata``.
+#
+# The upload surface is still settling (``docs/upload-model.md``), so it moves
+# inside v2 rather than minting a version per revision: the SDKs and the server
+# ship from one repo and move together.
 FLIGHT_PROTOCOL_VERSION = 2

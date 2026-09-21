@@ -85,7 +85,7 @@ each has a parameter that draws it:
 | points, boxes, polygons written with `put_rois` | `rs=<set_name>` |
 
 ```python
-desc = client.create_tensor(f"{image_id}/labels/nuclei", labels)
+desc = client.add_tensor(f"zarr://{image_id}/labels/nuclei", labels)
 client.upload_array(desc, labels)
 url = f"{control_base_url()}/viewer?id={image_id}&lb={desc.array_id}&lo=0.5"
 ```

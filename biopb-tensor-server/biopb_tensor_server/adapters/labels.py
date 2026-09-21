@@ -50,7 +50,11 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
-from biopb_tensor_server.adapters._writable import unsafe_store_name
+from biopb_tensor_server.adapters._writable import (
+    folded_match,
+    unsafe_store_name,
+    upload_grid,
+)
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
     _first_dataset_path,
@@ -164,8 +168,8 @@ class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
 
         A set the file carries, or one read back off a sidecar at startup,
         tracks no upload and is read-only: replacement is a new name or a
-        delete, never a chunk landing under a finished set (design,
-        "No per-instance edits").
+        discard, never a chunk landing under a set this server did not open
+        (design, "No per-instance edits").
         """
         if self.upload is None:
             raise WriteNotSupportedError(
@@ -175,32 +179,17 @@ class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
         super().put_chunk(bounds, data, expected_shape, dtype)
 
     def delete_store(self) -> None:
-        """Remove this set's sidecar; the adapter's half of ``delete_labels``.
+        """Remove this set's sidecar, for a set with no upload record left.
 
         A store the server minted under its ``write_dir`` is the server's to
         throw away (design, "Lifecycle"), and only such a set reaches here --
-        a group inside a user's file carries no store path and this is a
-        no-op on it. A set *this* server uploaded still holds its (READY)
-        progress record, so it goes through ``discard``, which seals that
-        record as well as releasing the store; one adopted from an earlier
-        life holds no record and only the store goes.
+        a group inside a user's file carries no store path and this is a no-op
+        on it. A set *this* server uploaded is removed by discarding its upload
+        instead (``UploadManager.discard``), which seals the record as well as
+        releasing the store; this is the path for one adopted from an earlier
+        life, which holds no record to seal.
         """
-        if self.upload is not None:
-            self.discard("deleted")
-        else:
-            self._dispose_store()
-
-    def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
-        """The create echo, under the set's own ``array_id``.
-
-        The two prefixed kinds mint a ``source_id`` and answer with it; a set
-        is a tensor of a source that already exists, so the id the request
-        carried is the id it keeps -- and is what every later write, poll and
-        finish names.
-        """
-        response = super().upload_response(desc)
-        response.array_id = self.array_id
-        return response
+        self._dispose_store()
 
 
 # -- readers ------------------------------------------------------------------
@@ -305,8 +294,8 @@ def sidecar_attrs(
     """The ``biopb`` block a sidecar's root ``.zattrs`` carries.
 
     Merged with the NGFF metadata by whoever writes the store. The upload
-    marker rides in the same block: ``pending`` from create, flipped to
-    ``ready`` by ``finish`` (``ZarrAdapter._mark_store_finished``), and
+    marker rides in the same block: ``pending`` from create, flipped when the
+    upload reaches READY (``ZarrAdapter._publish_store``), and
     :func:`sidecar_label_sets` attaches nothing that is not ``ready``.
     """
     attrs = with_upload_state({}, state)
@@ -373,10 +362,10 @@ def create_label_upload(
 ) -> LabelSetAdapter:
     """Mint the sidecar for a new uploaded set on *parent* and track its upload.
 
-    The third upload kind (design, "Upload"): unlike ``cache:`` / ``ome_zarr:``
-    it is not selected by a prefix and mints no ``source_id`` -- the request's
-    ``array_id`` is a tensor of a source that already exists, and is the id the
-    set keeps. *field* is that id's within-source half, already split by the
+    The one tensor an ``add_tensor`` may add to a source the server
+    *discovered* rather than minted: a set belongs to an image, and the image
+    is already there. Its store is a sidecar under ``write_dir`` rather than a
+    member directory, because the parent's own bytes are the user's. *field* is that id's within-source half, already split by the
     boundary; *desc* is the request in canonical order (the boundary refuses
     any other), and is filled in with the image's axes when it named none --
     in place, because it is also the descriptor the client is answered with.
@@ -419,16 +408,23 @@ def create_label_upload(
             f"{array_id!r}: a label set is unsigned integer ids with 0 for "
             f"background, not {np.dtype(desc.dtype)}."
         )
-    if field in parent.label_sets or field in parent.label_uploads:
+    # Folded, because NTFS, APFS and HFS+ are case-insensitive and HFS+ stores
+    # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
+    # there, so an unfolded check mints a second set that the next boot on such
+    # a host cannot tell from the first.
+    taken = folded_match(field, (*parent.label_sets, *parent.label_uploads))
+    if taken is not None:
         raise ValueError(
-            f"{array_id!r} already exists. A set's name is taken for as long "
-            f"as it is served; delete it first, or upload under another name."
+            f"{array_id!r} already exists as {taken!r}. A set's name is taken "
+            f"for as long as it is served, and two names differing only by "
+            f"case or accent form are one name on Windows and macOS; delete it "
+            f"first, or upload under another name."
         )
     images = parent._normalized_tensors()
     if not desc.dim_labels:
         # The extent rule leaves exactly one legal set of axes for this image,
         # so a request that named none is filled in rather than refused. In
-        # place, so the descriptor ``create_tensor`` echoes back carries them:
+        # place, so the descriptor ``add_tensor`` echoes back carries them:
         # everything downstream (the sidecar's NGFF, the chunk grid, the
         # client's own later calls) is built from that descriptor.
         image = parent.label_image_descriptor(field, images=images)
@@ -453,7 +449,7 @@ def create_label_upload(
         **sidecar_attrs(parsed.image_field, content_version, state=UPLOAD_PENDING),
     }
     store = sidecar_dir(labels_dir, parent.source_id) / f"{parsed.name}.zarr"
-    # Exclusive, like ``OmeZarrAdapter.create_upload``: the directory must be
+    # Exclusive, like a member's store: the directory must be
     # this create's own, because discard removes it whole. A store on disk under
     # a name the parent does not serve is a crashed upload the boot sweep will
     # take, not something to adopt.
@@ -464,11 +460,12 @@ def create_label_upload(
             f"{array_id!r}: {store} already exists. Restart the server to clear "
             f"a crashed upload, or upload under another name."
         ) from None
+    grid = upload_grid(desc)
     group = zarr.open_group(str(store), mode="w")
     arr = group.create_dataset(
         "0",
         shape=list(desc.shape),
-        chunks=list(desc.chunk_shape),
+        chunks=grid,
         dtype=desc.dtype,
     )
     (store / ".zattrs").write_text(json.dumps(zattrs))
@@ -483,7 +480,7 @@ def create_label_upload(
         parent_array_id=join_fields(parent.source_id, parsed.image_field),
     )
     adapter._upload_store_path = store
-    adapter.begin_upload(desc.shape, desc.chunk_shape)
+    adapter.begin_upload(desc.shape, grid)
     return adapter
 
 

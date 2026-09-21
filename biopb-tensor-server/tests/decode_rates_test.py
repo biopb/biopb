@@ -557,8 +557,10 @@ class TestTheExemptSourceKinds:
             manager.close()
 
     def test_an_upload_is_neither_measured_nor_reclassified(self, tmp_path):
-        """The cache entry is an upload's only copy -- ``get_data`` raises, so
-        there is nothing to measure and a "cheap" stamp would be data loss."""
+        """The cache entry is an upload's only copy -- ``get_data`` reads it
+        back rather than decoding anything, so there is nothing to measure and
+        a "cheap" stamp would be data loss."""
+        from biopb_tensor_server.adapters._writable import UploadStatus
         from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 
         set_active_decode_rates(DecodeRates(cheap_mbps=1e-6))  # everything clears it
@@ -570,6 +572,7 @@ class TestTheExemptSourceKinds:
             )
             bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
             adapter.write_chunk(bounds, np.ones((64, 64), dtype=np.uint8))
+            adapter.set_status(UploadStatus.READY)
             adapter.resolve_chunk_data(encode_chunk_id("up", bounds), manager)
 
             assert active_decode_rates().snapshot() == {}

@@ -185,7 +185,7 @@ def noncanonical_order(
     because in both the order is *owned by another party* who has aligned the
     rest of their state to it (biopb/biopb#596):
 
-    - an upload's declared order (``serving.upload_manager.create_tensor``), whose
+    - an upload's declared order (``serving.upload_manager.add_tensor``), whose
       ``physical_scale`` / ``chunk_shape`` arrive aligned to it and whose
       ``put_chunk`` writes in it;
     - a remote upstream's advertised order (``adapters.remote_tensor``), whose

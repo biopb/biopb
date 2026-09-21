@@ -90,7 +90,7 @@ a shape one, and every layer already answers it with zeros:
 - the sidecar zarr is created with fill value `0` and never materializes an
   unwritten chunk, so a frame-0-only set on a 1000-frame timelapse costs one
   frame on disk;
-- `finish` seals whatever landed (it logs uploaded-of-expected; it does not
+- publishing seals whatever landed (it logs uploaded-of-expected; it does not
   require the grid), so the client sends only the chunks it has;
 - an unwritten zarr chunk reads back as zeros at no I/O; the rasterized OME set
   yields a zero block for any chunk no mask touches.
@@ -166,7 +166,7 @@ ignorant of sidecars:
   `get_embedded_rois` (`OmeZarrAdapter` reads its NGFF `labels/` group there);
   `attach_label_set` / `detach_label_set` are what the registry's
   `on_register` hook (finished sidecars, `sidecar_attacher`) and the upload
-  kind (at `finish`; `delete`) use; `label_sets` is the merged view, every
+  kind (at READY; discard) use; `label_sets` is the merged view, every
   set normalized like any tensor and checked against the image it binds to
   (`label_binding_error`, which the upload's create calls too, so one rule
   answers for every origin).
@@ -234,12 +234,14 @@ special-cased.
 
 ## Upload
 
-The step 7 SDK from biopb/biopb#1048 is reused as it stands, plus one verb:
+The step 7 SDK from biopb/biopb#1048 is reused as it stands, with no verb of
+its own:
 
 ```python
 desc = client.create_tensor("src_ab12/labels/nuclei", labels, chunk_shape=...)
 client.upload_array(desc, labels)        # skips all-zero chunks for this kind
-client.delete_labels("src_ab12/labels/nuclei")   # frees the name again
+# Removing a set is discarding its upload, from whatever state it is in.
+client.set_upload_status("src_ab12/labels/nuclei", "DISCARDED", "replaced")
 ```
 
 Server side this is a third upload kind, selected by the request `array_id`
@@ -258,17 +260,19 @@ other two, the request's `array_id` *is* the final one. The kind:
   rule, now per parent;
 - creates the sidecar array with the pending marker and the minted
   content_version, and registers the set as **pending** on the parent's
-  attachment: routable for `get_flight_info` (so the poll to READY works from
-  create) but not listed.
+  attachment: routable for `get_flight_info` (so the status poll works from
+  create) but not listed, and not readable.
 
-`finish` seals the pending marker, lists the set (`attach_label_set`) and
-re-syncs the parent's catalog row (`sync_source_added` is an upsert; the ROI
-re-import it triggers is already idempotent), in that order — the catalog must
-not name a set a restart would sweep away. The status and TTL machinery apply
-as they stand, with two plumbing changes in `UploadManager`: `status` /
-`finish` / `discard` / `write_chunk` receive a set's `array_id` where they
-receive a `source_id` today, and resolve it through the parent's
-`label_uploads` (`_locate`); and
+Reaching **READY** clears the pending marker, lists the set
+(`attach_label_set`) and re-syncs the parent's catalog row
+(`sync_source_added` is an upsert; the ROI re-import it triggers is already
+idempotent), in that order — the catalog must not name a set a restart would
+sweep away — READY is what makes the set readable at all, and a set nobody can
+reach is not one to advertise. The status
+and TTL machinery apply as they stand, with two plumbing changes in
+`UploadManager`: `status` / `set_status` / `write_chunk` receive a set's
+`array_id` where they receive a `source_id` today, and resolve it through the
+parent's `label_uploads` (`_locate`); and
 `reap` walks that index on every source as well as the registered upload
 sources — a quiet pending set is discarded with its sidecar and unlisted, and
 its tombstone detached a TTL later, which is what frees the name.
@@ -307,8 +311,9 @@ So, for both kinds:
   and `reap` stops skipping durable uploads — a quiet pending set is discarded
   after `upload_ttl`, and its tombstone reclaimed after another.
 - **The upload state is persisted.** A pending marker is written into the
-  store's attrs at create and cleared at `finish`. At startup, a sidecar still
-  carrying it is a crashed upload and is deleted rather than served; the
+  store's attrs at create and cleared when the upload reaches READY. At
+  startup, a sidecar still carrying it is a crashed upload and is deleted
+  rather than served; the
   `ome_zarr:` equivalent is deleted before discovery can claim it, together
   with its catalog row — a persisted catalog outlives the process, and
   `write_dir` is outside every discovery root, so the reconciler never sees
@@ -316,11 +321,14 @@ So, for both kinds:
   is a tensor of its parent, whose row is rebuilt when that parent registers.
   The cache kind never needed any of this because nothing of it survives a
   restart.
-- **`delete_labels`** (`do_action`, full access) removes a *finished* uploaded
-  set: drop it from the attachment, delete the sidecar, re-sync the parent's
-  catalog row. Refused for a reserved or native set. Its cache chunks become
-  unreachable and fall to LRU, as after a reindex. The name is free again at
-  once, safely, because the next set under it mints a new content_version.
+- **Removing a set is discarding its upload.** `set_upload_status(array_id,
+  DISCARDED)` (`do_action`, full access) drops it from the attachment, deletes
+  the sidecar and re-syncs the parent's catalog row — the same three steps
+  whatever state it was in, which is why there is no delete verb beside it. It
+  reaches nothing a reserved or native set is held by. Its cache chunks become
+  unreachable and fall to LRU, as after a reindex. The name frees when the
+  reclaim sweep takes the tombstone, and is safe to reuse because the next set
+  under it mints a new content_version.
 
 A set's lifetime otherwise follows its parent's. `source_id` is a hash of the
 resolved URL, so a moved image loses its sidecar sets exactly as it loses its
@@ -347,14 +355,13 @@ No proto change, no Java build. A `role` column in the `tensors` struct is a
 later addition only if filtering on the path proves fragile.
 
 **Authorization.** A set is part of its parent object: a read capability on
-the parent covers its sets, and nothing else changes. Create, write, finish and
-delete are full access like every other mutation.
+the parent covers its sets, and nothing else changes. Create, write and every
+state transition are full access like every other mutation.
 
 ## Clients
 
-- **SDK**: `create_tensor` / `upload_array` / `finish_upload` as above;
-  `delete_labels(array_id)`; a `label_sets(image_array_id)` convenience over
-  the catalog query.
+- **SDK**: `create_tensor` / `upload_array` / `set_upload_status` as above; a
+  `label_sets(image_array_id)` convenience over the catalog query.
 - **MCP / napari** (implemented): `add_tensor` builds a `Labels` layer when the
   `array_id` names a set; `viewer.tensor(layer)` plus `upload_array` is the
   round trip. The guide text stops describing masks as a client-only artefact.
@@ -471,12 +478,12 @@ Each step is independently mergeable.
    reap covers durable, persisted pending marker and boot cleanup, `write_dir`
    outside discovery roots as a checked rule. Revisits the #1048 decision.
 2. **Label attachment**: wrapper at the registration seam, sidecar
-   enumeration, routing, listing after finish and image-first ordering,
+   enumeration, routing, listing once published and image-first ordering,
    per-set content_version, nearest ladder, `image-label` metadata. The native
    NGFF `labels/` group in `OmeZarrAdapter` rides on this.
-3. **Labels upload kind**: create / write / finish / delete through
-   `UploadManager` keyed by `array_id`; `reap` over attachments; SDK zero-skip
-   and `delete_labels`.
+3. **Labels upload kind**: create / write / publish / discard through
+   `UploadManager` keyed by `array_id`; `reap` over attachments; SDK
+   zero-skip.
 4. **OME-TIFF masks**: rasterizing adapter, the `@ome` set, `BinData` stripped
    from `metadata_json`.
 5. **Clients**: MCP `add_tensor` and guide text; SPA tree and overlay. The two

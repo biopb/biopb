@@ -155,7 +155,7 @@ class ResolveCancelled(Exception):
 
 def _upload_status_dict(source_id: str, status: UploadStatusPb) -> Dict[str, Any]:
     """The one shape an upload status takes on the SDK, for the poll and for
-    ``finish_upload`` alike."""
+    ``set_upload_status`` alike."""
     return {
         "source_id": source_id,
         "state": UploadStatusPb.State.Name(status.state),
@@ -170,7 +170,7 @@ def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
 
     Mirrors the server's own ``unknown_upload_status`` so the two ends agree on
     the shape, and never means "not started yet": the record exists from the
-    moment ``create_tensor`` hands out the id.
+    moment ``add_tensor`` hands out the id.
     """
     return {
         "source_id": source_id,
@@ -541,6 +541,37 @@ def _catalog_ticket(sql: str) -> flight.Ticket:
     """A DoGet ticket that runs ``sql`` on the ``catalog`` flight."""
     ticket = TensorTicket(catalog_query=CatalogQuery(sql=sql))
     return flight.Ticket(ticket.SerializeToString())
+
+
+def do_action_one_result(
+    state: "_ClientState", action: flight.Action, *, unavailable_hint: str
+) -> bytes:
+    """Run a single-result ``do_action``, with the same "old server" remap
+    :meth:`CatalogClient._iter_action_messages` gives the streaming actions.
+
+    A module function rather than a method because both sessions need it: an
+    upload action is as likely to meet a server that predates it as a catalog
+    one is -- more so, since the upload surface moves inside wire v2 rather
+    than minting a version per revision (``_wire_version``).
+
+    *unavailable_hint* is the feature-specific lead-in for the "Unknown action"
+    case (e.g. "Source removal is unavailable"); a genuinely empty result
+    stream (a server that never sends one) raises a plain ``RuntimeError``
+    naming the action.
+    """
+    try:
+        results = state.client.do_action(action, options=state.call_options)
+        result = next(results)
+    except flight.FlightError as exc:
+        if "Unknown action" in str(exc):
+            raise RuntimeError(
+                f"{unavailable_hint}: the tensor server is too old to "
+                f"support the '{action.type}' action. Upgrade the server."
+            ) from exc
+        raise
+    except StopIteration as exc:
+        raise RuntimeError(f"{action.type} returned no result") from exc
+    return result.body.to_pybytes()
 
 
 class CatalogClient:
@@ -1066,29 +1097,9 @@ class CatalogClient:
     def _do_action_one_result(
         self, action: flight.Action, *, unavailable_hint: str
     ) -> bytes:
-        """Run a single-result ``do_action``, with the same "old server"
-        remap :meth:`_iter_action_messages` gives the streaming actions.
-
-        *unavailable_hint* is the feature-specific lead-in for the "Unknown
-        action" case (e.g. "Source removal is unavailable"); a genuinely empty
-        result stream (a server that never sends one) raises a plain
-        ``RuntimeError`` naming the action.
-        """
-        try:
-            results = self._state.client.do_action(
-                action, options=self._state.call_options
-            )
-            result = next(results)
-        except flight.FlightError as exc:
-            if "Unknown action" in str(exc):
-                raise RuntimeError(
-                    f"{unavailable_hint}: the tensor server is too old to "
-                    f"support the '{action.type}' action. Upgrade the server."
-                ) from exc
-            raise
-        except StopIteration as exc:
-            raise RuntimeError(f"{action.type} returned no result") from exc
-        return result.body.to_pybytes()
+        return do_action_one_result(
+            self._state, action, unavailable_hint=unavailable_hint
+        )
 
     def remove_source(self, root_url: str) -> "RemoveSourceResult":
         """Backs TensorFlightClient.remove_source; see that method for the full
@@ -1110,14 +1121,6 @@ class CatalogClient:
             f"WHERE starts_with(t.array_id, {prefix}) ORDER BY t.array_id"
         )
         return table.column(0).to_pylist()
-
-    def delete_labels(self, array_id: str) -> Dict[str, Any]:
-        """Backs TensorFlightClient.delete_labels; see that method."""
-        action = flight.Action("delete_labels", array_id.encode("utf-8"))
-        result_bytes = self._do_action_one_result(
-            action, unavailable_hint="Label set deletion is unavailable"
-        )
-        return json.loads(result_bytes.decode("utf-8"))
 
     # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
 

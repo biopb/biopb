@@ -209,6 +209,17 @@ def client(writable_server):
 
 
 @pytest.fixture
+def source(client):
+    """A registered source to add tensors to; what every upload needs first.
+
+    Nothing on the upload path creates a source (``docs/upload-model.md``), so
+    a test that uploads starts here and names its tensors
+    ``<scheme>://<this>/<field>``.
+    """
+    return client.register_source()
+
+
+@pytest.fixture
 def cache(tmp_path):
     """A file-backed cache with the scaled-read knob on.
 

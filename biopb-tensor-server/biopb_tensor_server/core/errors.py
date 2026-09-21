@@ -164,6 +164,60 @@ class StaleChunkError(TensorResolutionError):
     grpc_code = "NOT_FOUND"
 
 
+class UploadNotPublishedError(TensorResolutionError):
+    """A read of an upload whose producer has not published it yet (PENDING).
+
+    Canonical gRPC ``FAILED_PRECONDITION``: the source exists and the read is
+    well-formed, but the state it is in cannot answer. Retrying is the right
+    move once the producer sets READY, which is exactly what a poller on
+    ``upload_status`` is waiting for -- so this must not read as "no such
+    chunk".
+
+    The gate exists because READY is what makes a hole meaningful: after it, a
+    chunk that never arrived reads as zeros, and before it that same chunk is
+    one still in flight. Serving zeros for both would hand a consumer a
+    half-written result it cannot tell from a finished one.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, source_id: str) -> None:
+        super().__init__(
+            f"Upload '{source_id}' is not readable yet: it is PENDING, and its "
+            "producer has not set READY. Poll `upload_status` on the "
+            "descriptor GetFlightInfo returns.",
+            reason="upload_not_published",
+        )
+        self.source_id = source_id
+
+
+class UploadDiscardedReadError(TensorResolutionError):
+    """A read of an upload whose owner gave up on it (DISCARDED).
+
+    Canonical gRPC ``FAILED_PRECONDITION``, the same code as
+    :class:`UploadNotPublishedError`: the source exists and the read is
+    well-formed, but the state it is in cannot answer, and retrying is
+    pointless -- there is no later state a discard leads to. A still-unwinding
+    reader gets this same reason a writer does (biopb/biopb#1048), rather than
+    the tombstone reading as "no such chunk".
+
+    Distinct from :class:`UploadDiscardedError`, which is the *write*-path
+    exception (off this hierarchy, wire-mapped to ``FlightCancelledError`` by
+    the DoPut boundary) -- a read needs the read boundary's typed taxonomy
+    instead, so its ``grpc_code``/``reason`` reach the client's ``extra_info``.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, source_id: str, reason: str = "") -> None:
+        super().__init__(
+            f"Upload discarded for source '{source_id}'"
+            + (f": {reason}" if reason else ""),
+            reason="upload_discarded",
+        )
+        self.source_id = source_id
+
+
 class UpstreamConfigError(ValueError):
     """An upstream's *configuration* is broken, not the upstream itself.
 
@@ -234,12 +288,12 @@ class UploadDiscardedError(UploadClosedError):
 
 
 class UploadSealedError(UploadClosedError):
-    """A write to an upload its producer has already declared complete.
+    """A write to an upload its producer has already published.
 
-    ``finish`` is a producer's declaration that the source is complete, and
-    reads are not gated on it -- so by the time it lands, a consumer may
-    already have read what is there. Accepting a later write would change bytes
-    someone has seen.
+    READY seals and publishes in one move, so by the time a late write lands a
+    consumer may already have read what is there -- and cached it, on either
+    side of the wire. Accepting the write would change bytes someone has seen
+    and cannot be told about.
     """
 
     wire_reason = "upload_sealed"
@@ -248,9 +302,23 @@ class UploadSealedError(UploadClosedError):
     def __init__(self, source_id: str) -> None:
         super().__init__(
             f"Upload already finished for source '{source_id}': it was sealed "
-            "by `finish` and accepts no further chunks."
+            "by `set_upload_status` and accepts no further chunks."
         )
         self.source_id = source_id
+
+
+class UploadTransitionError(ValueError):
+    """``set_upload_status`` was asked for a state the upload cannot move to.
+
+    Backwards down the PENDING -> READY ladder, or to a state that
+    is not settable at all (PENDING, or an unrecognized one). A caller's
+    mistake, so it surfaces as a terminal Flight error rather than a refusal
+    the upload path retries -- unlike ``UploadClosedError``, which says the
+    upload is over and the caller should stop.
+
+    ``ValueError`` so the boundary's existing guards catch it; it is never on
+    the read path, where the ``TensorResolutionError`` taxonomy lives.
+    """
 
 
 class AnnotationStoreError(RuntimeError):

@@ -10,8 +10,9 @@ or a byte-prefix sniff):
   per table with its schema; GetFlightInfo / DoGet take a ``CatalogQuery``.
   Gated by the server-wide token.
 - ``data`` -- pixels. GetFlightInfo takes a ``TensorReadOption`` and plans
-  chunk endpoints; DoGet serves one ``chunk_id``; DoPut takes a
-  ``ChunkUpload`` (writable servers). Private: gated per source.
+  chunk endpoints; DoGet serves one of those tickets, and DoPut takes the same
+  ticket back as ``chunk_ticket`` (writable servers). Private: gated per
+  source.
 - ``roi`` -- annotations. DoGet serves one tensor's set as ROI rows; DoPut
   takes a ``RoiPut`` / ``RoiDelete``. Private: gated per source.
 
@@ -64,13 +65,20 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
-    FinishUpload,
     PutCommand,
+    RegisterSource,
+    RegisterSourceResult,
+    SetUploadStatus,
     TensorTicket,
 )
 from google.protobuf.message import DecodeError, Message
 
-from biopb_tensor_server.adapters._writable import UploadProgress, upload_of
+from biopb_tensor_server.adapters._writable import (
+    UploadProgress,
+    UploadStatus,
+    unsettable_state_message,
+    upload_of,
+)
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
@@ -78,7 +86,12 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     strip_source_prefix,
 )
-from biopb_tensor_server.core.chunk import cache_key_for_chunk_id, routing_array_id
+from biopb_tensor_server.core.chunk import (
+    cache_key_for_chunk_id,
+    is_proxy_envelope,
+    is_scaled_chunk,
+    routing_array_id,
+)
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
@@ -191,8 +204,8 @@ def _with_label_axes(metadata: dict, source_adapter: Any, desc: Any) -> dict:
 
     NGFF's own ``image-label`` block is left alone: that is a spec block and
     this is not in the spec. It rides in the ``biopb`` namespace beside it,
-    merged into whatever the source already has there -- an ``ome_zarr:``
-    upload's own ``.zattrs`` carry an upload marker -- rather than replacing it.
+    merged into whatever the source already has there -- an uploaded store's
+    own ``.zattrs`` carry an upload marker -- rather than replacing it.
 
     ``source_id`` is the slash-free prefix by the identity policy, so the
     within-source field is everything after the first "/".
@@ -314,8 +327,8 @@ def _fill_upload_status(
 def _copy_upload_status(pb: UploadStatusPb, status: Dict[str, Any]) -> None:
     """The manager's status dict onto the wire message.
 
-    Shared by the descriptor field and the ``finish`` reply so the two cannot
-    drift into describing the same upload differently.
+    Shared by the descriptor field and the ``set_upload_status`` reply so the
+    two cannot drift into describing the same upload differently.
     """
     state = _UPLOAD_STATES.get(status["state"])
     if state is None:
@@ -333,6 +346,16 @@ _UPLOAD_STATES = {
     "PENDING": UploadStatusPb.PENDING,
     "READY": UploadStatusPb.READY,
     "DISCARDED": UploadStatusPb.DISCARDED,
+}
+
+
+#: The wire enum -> what ``set_upload_status`` may ask for. The inverse of
+#: ``_UPLOAD_STATES`` restricted to the settable states, so a request naming
+#: PENDING or an unrecognized value is refused at the boundary rather than
+#: reaching an adapter that would refuse it anyway with a worse message.
+_UPLOAD_TARGETS = {
+    UploadStatusPb.READY: UploadStatus.READY,
+    UploadStatusPb.DISCARDED: UploadStatus.DISCARDED,
 }
 
 
@@ -496,6 +519,13 @@ class TensorFlightServer(flight.FlightServerBase):
         # What a crashed server left half-written goes before anything can
         # register it: the caller's discovery scan runs after this returns.
         self.uploads.discard_unfinished_stores()
+        # ...and what it left *finished* comes back. Nothing discovers
+        # write_dir, so this pass is the only thing that re-registers a source
+        # the server minted in an earlier life (biopb/biopb#1048). Still a
+        # separate walk over a separate subtree -- the sweep takes the
+        # single-store kinds, this takes the collections -- and folding the two
+        # into one pass is what the member sweep will want.
+        self.uploads.adopt_registered_sources()
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
         # stopped in ``shutdown``.
         self.uploads.start_sweep()
@@ -763,12 +793,16 @@ class TensorFlightServer(flight.FlightServerBase):
         raise flight.FlightUnauthenticatedError("Invalid or missing source token")
 
     @staticmethod
-    def _parse(msg: Message, data: bytes, what: str) -> Message:
+    def _parse(
+        msg: Message, data: bytes, what: str, *, allow_empty: bool = False
+    ) -> Message:
         """Decode a wire message, or refuse the call with the reason.
 
         The oneof arm is the dispatch, so a payload that decodes but sets no
         arm is refused here too -- that is what a protocol-1 client's request
-        or bare ticket looks like, and the message says so.
+        or bare ticket looks like, and the message says so. *allow_empty* is
+        for the messages that carry no oneof and whose fields are all optional,
+        where an empty body is a real request rather than a mis-sent one.
         """
         try:
             msg.ParseFromString(data)
@@ -776,7 +810,7 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(
                 f"{what} is not a {type(msg).__name__}: {exc}"
             )
-        if not msg.ListFields():
+        if not allow_empty and not msg.ListFields():
             raise flight.FlightServerError(
                 f"{what} names nothing: expected a {type(msg).__name__} with one arm "
                 f"set (this server speaks Flight protocol v{FLIGHT_PROTOCOL_VERSION})"
@@ -927,6 +961,43 @@ class TensorFlightServer(flight.FlightServerBase):
             )
         return adapter
 
+    def _put_chunk_id(self, ticket_bytes: bytes) -> bytes:
+        """The chunk_id a DoPut ticket names, or the refusal.
+
+        The ticket is a ``FlightEndpoint.ticket`` from this tensor's own read
+        plan, echoed back whole -- so the two things a write must not be are
+        checked here, where the bytes are still a ticket:
+
+        - a **scaled** ticket, which names a downsampled view. There is no
+          store behind one; writing it would either land under an id no read
+          ever asks for or overwrite the full-resolution chunk with reduced
+          pixels.
+        - a **proxy envelope**, whose inner is another server's opaque token.
+          A mirror serves what it fetched, so there is nothing local to write.
+
+        The version and epoch check is the adapter's
+        (:meth:`TensorAdapter.check_chunk_version`), run by the caller once the
+        ticket has routed -- the same gate a read passes.
+        """
+        ticket = self._parse(TensorTicket(), ticket_bytes, "DoPut chunk ticket")
+        if ticket.WhichOneof("payload") != "chunk_id":
+            raise flight.FlightServerError(
+                "DoPut: chunk_ticket must be an endpoint ticket naming a chunk, "
+                "as GetFlightInfo minted it."
+            )
+        chunk_id = ticket.chunk_id
+        if is_proxy_envelope(chunk_id):
+            raise flight.FlightServerError(
+                "DoPut: this tensor is served from another server; its chunks "
+                "are not writable here."
+            )
+        if is_scaled_chunk(chunk_id):
+            raise flight.FlightServerError(
+                "DoPut: a scaled ticket is not writable. Plan the write with "
+                "GetFlightInfo carrying no scale_hint."
+            )
+        return chunk_id
+
     def _require_annotations(self) -> MetadataDatabase:
         """The store behind the ``roi`` flight, or the refusal.
 
@@ -977,12 +1048,16 @@ class TensorFlightServer(flight.FlightServerBase):
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType(
-                "create_tensor",
-                "Create a writable single-tensor source from a TensorDescriptor",
+                "register_source",
+                "Mint an empty source to add tensors to; answers its source_id",
             ),
             flight.ActionType(
-                "finish",
-                "Seal an upload session: the source is complete and takes no further chunks",
+                "add_tensor",
+                "Add a tensor to a source that already exists; answers its descriptor",
+            ),
+            flight.ActionType(
+                "set_upload_status",
+                "Move an upload: READY (publish and seal) or DISCARDED (give up)",
             ),
             flight.ActionType(
                 "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
@@ -1006,10 +1081,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 "roi_prune",
                 "Report (or with apply, delete) annotations whose source is gone",
             ),
-            flight.ActionType(
-                "delete_labels",
-                "Delete an uploaded label set and its sidecar store",
-            ),
         ]
 
     def do_action(
@@ -1019,11 +1090,14 @@ class TensorFlightServer(flight.FlightServerBase):
     ) -> Iterator[bytes]:
         """Execute a custom action.
 
-        Each arm authorizes itself once it knows what it needs -- most are
-        catalog tier (no source), ``chunk_locate``/``resolve``/``warm`` are
-        private tier once the source_id is parsed out of the request -- the
-        same pattern as ``get_flight_info``/``do_get``/``do_put``, rather than
-        a blanket check keyed off the action name.
+        Every arm takes full access (:meth:`_authorize`). Actions are the
+        control surface: a capability means "read this one tensor", and none of
+        what is reachable here is scoped to one tensor -- ``warm`` walks the
+        page-cache LRU and evicts the segments serving every other source
+        (biopb/biopb#1043), and a mutation on a source is never covered by a
+        read grant on it. ``chunk_locate`` is no exception, though it looks
+        like one: it is the localhost handoff for a read, and the read itself
+        (``do_get``) is where a capability is honoured.
 
         Args:
             context: Server call context
@@ -1074,32 +1148,50 @@ class TensorFlightServer(flight.FlightServerBase):
                 "catalog_persisted": db is not None and db.store_path is not None,
             }
             yield json.dumps(health_status).encode("utf-8")
-        elif action.type == "create_tensor":
+        elif action.type == "add_tensor":
             self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
-            yield self.uploads.create_tensor(req_desc).SerializeToString()
-        elif action.type == "finish":
+            yield self.uploads.add_tensor(req_desc).SerializeToString()
+        elif action.type == "register_source":
+            self._authorize(context)
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+
+            # Every field is optional: an empty body asks for a source with a
+            # minted name and no metadata, which is the common case.
+            req = self._parse(
+                RegisterSource(),
+                action.body.to_pybytes(),
+                "register_source request",
+                allow_empty=True,
+            )
+            source_id = self.uploads.register_source(req.name, req.metadata_json)
+            yield RegisterSourceResult(source_id=source_id).SerializeToString()
+        elif action.type == "set_upload_status":
             self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req = self._parse(
-                FinishUpload(), action.body.to_pybytes(), "finish request"
+                SetUploadStatus(), action.body.to_pybytes(), "set_upload_status request"
             )
-            status = self.uploads.finish(req.source_id)
+            state = _UPLOAD_TARGETS.get(req.state)
+            if state is None:
+                raise flight.FlightServerError(
+                    unsettable_state_message(UploadStatusPb.State.Name(req.state))
+                )
+            status = self.uploads.set_status(req.array_id, state, req.reason)
             reply = UploadStatusPb()
             _copy_upload_status(reply, status)
             yield reply.SerializeToString()
         elif action.type == "chunk_locate":
-            ticket_bytes = action.body.to_pybytes()
-            ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
+            self._authorize(context)
+            ticket = self._parse_ticket(flight.Ticket(action.body.to_pybytes()))
             if ticket.WhichOneof("payload") != "chunk_id":
                 raise flight.FlightServerError("chunk_locate takes a chunk ticket")
-            source_id = routing_array_id(ticket.chunk_id).split("/")[0]
-            self._authorize_read(context, source_id, READ_PIXELS)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
             self._authorize(context)
@@ -1111,12 +1203,12 @@ class TensorFlightServer(flight.FlightServerBase):
             # asdict recurses into the per-pool PoolStats dataclasses under pool_stats.
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
         elif action.type == "resolve":
-            source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize(context)
+            source_id = action.body.to_pybytes().decode("utf-8")
             yield from self._handle_resolve(source_id)
         elif action.type == "warm":
-            source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize(context)
+            source_id = action.body.to_pybytes().decode("utf-8")
             yield from self._handle_warm(source_id, context)
         elif action.type == "add_source":
             self._authorize(context)
@@ -1130,15 +1222,6 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context)
             req = RoiPruneRequest.FromString(action.body.to_pybytes())
             yield self._handle_roi_prune(req)
-        elif action.type == "delete_labels":
-            # Full access, like every other mutation: a read capability on the
-            # parent covers reading its sets, never removing one
-            # (biopb/biopb#1059).
-            self._authorize(context)
-            if not self._writable:
-                raise flight.FlightUnauthenticatedError("Server not in write mode")
-            array_id = action.body.to_pybytes().decode("utf-8")
-            yield json.dumps(self.uploads.delete_labels(array_id)).encode("utf-8")
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
@@ -1775,7 +1858,7 @@ class TensorFlightServer(flight.FlightServerBase):
         #
         # A discarded source answers too. The adapter stays registered as a
         # tombstone and describe is not a chunk read, so it never reaches
-        # `_refuse_if_discarded` -- a poller learns the reason instead of
+        # `check_readable` -- a poller learns the reason instead of
         # meeting a dead call.
         if UPLOAD_STATUS in mask:
             # The tensor first: a label set is a tensor of a source that is not
@@ -1965,6 +2048,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 # to run on every locate, hit or miss.
                 adapter.check_chunk_version(chunk_id)
 
+                # And the same for the read gate, for the same reason: a warm
+                # chunk of an upload nobody has published yet -- or of one that
+                # has been discarded -- is still sitting in the cache, and this
+                # path would hand out its byte range without the adapter ever
+                # being asked (biopb/biopb#1048).
+                adapter.check_readable()
+
                 # If the chunk is already cached, just locate it. Resolving first
                 # would, on a chunk whose in-RAM entry has been trimmed, re-read the
                 # whole chunk from its segment server-side for nothing. Only
@@ -2011,11 +2101,21 @@ class TensorFlightServer(flight.FlightServerBase):
         cmd = self._parse(PutCommand(), descriptor.command, "DoPut command")
         arm = cmd.WhichOneof("command")
 
-        if arm == "chunk":
+        if arm == "chunk_ticket":
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
             self._authorize(context)
-            self.uploads.write_chunk(cmd.chunk, reader)
+            chunk_id = self._put_chunk_id(cmd.chunk_ticket)
+            adapter = self._get_adapter_for_chunk(chunk_id)
+            try:
+                # The read path's gate, on the write path: a ticket minted
+                # before a re-registration names bytes this source no longer
+                # serves, and writing under it would land the chunk in the
+                # next upload's cache namespace (biopb/biopb#178).
+                adapter.check_chunk_version(chunk_id)
+            except TensorResolutionError as e:
+                raise to_flight_error(e) from e
+            self.uploads.write_chunk(adapter, chunk_id, reader)
             return
 
         db = self._require_annotations()

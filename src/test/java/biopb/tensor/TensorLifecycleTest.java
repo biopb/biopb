@@ -10,7 +10,10 @@ import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.apache.arrow.flight.Action;
+import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.FlightStream;
@@ -33,6 +36,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import biopb.image.Point;
 import biopb.image.ROI;
@@ -202,12 +206,17 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testDeleteLabelsReturnsTheServersJson() throws Exception {
+    public void testDiscardingALabelSetNamesItByItsArrayId() throws Exception {
+        // Removing an uploaded set is discarding its upload; there is no
+        // delete verb of its own, and a set is named by its array_id.
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, Object> deleted = client.deleteLabels("src_ab12/labels/nuclei");
-                Assert.assertEquals("src_ab12/labels/nuclei", deleted.get("array_id"));
-                Assert.assertEquals(Boolean.TRUE, deleted.get("deleted"));
+                Map<String, Object> status = client.setUploadStatus(
+                        "src_ab12/labels/nuclei", UploadStatus.State.DISCARDED, "replaced");
+                Assert.assertEquals("src_ab12/labels/nuclei",
+                        server.producer.lastSetStatus.getArrayId());
+                Assert.assertEquals("replaced", server.producer.lastSetStatus.getReason());
+                Assert.assertEquals("DISCARDED", status.get("state"));
             }
         }
     }
@@ -338,14 +347,14 @@ public class TensorLifecycleTest {
     // ---- uploads ----------------------------------------------------------
 
     @Test
-    public void testCreateTensorEchoesTheServersDescriptor() throws Exception {
+    public void testAddTensorEchoesTheServersDescriptor() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                TensorDescriptor descriptor = client.createTensor(
-                        "cache:mine", new long[] {4, 6}, "<u2", new long[] {2, 3},
+                TensorDescriptor descriptor = client.addTensor(
+                        "cache://registered_abc123/mine", new long[] {4, 6}, "<u2", new long[] {2, 3},
                         Arrays.asList("y", "x"), "{\"ome\":true}");
 
-                Assert.assertEquals("cache:mine", descriptor.getArrayId());
+                Assert.assertEquals("registered_abc123/mine", descriptor.getArrayId());
                 Assert.assertEquals(Arrays.asList(4L, 6L), descriptor.getShapeList());
                 Assert.assertEquals(Arrays.asList(2L, 3L), descriptor.getChunkShapeList());
                 Assert.assertEquals("<u2", descriptor.getDtype());
@@ -356,13 +365,13 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testCreateTensorTakesShapeAndDtypeFromATemplate() throws Exception {
+    public void testAddTensorTakesShapeAndDtypeFromATemplate() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 RandomAccessibleInterval<UnsignedShortType> template =
                         ArrayImgs.unsignedShorts(new short[24], 4, 6);
-                TensorDescriptor descriptor = client.createTensor(
-                        "cache:mine", template, new long[] {2, 3}, null, null);
+                TensorDescriptor descriptor = client.addTensor(
+                        "cache://registered_abc123/mine", template, new long[] {2, 3}, null, null);
 
                 Assert.assertEquals(Arrays.asList(4L, 6L), descriptor.getShapeList());
                 Assert.assertEquals("<u2", server.producer.lastCreate.getDtype());
@@ -383,12 +392,13 @@ public class TensorLifecycleTest {
                         ArrayImgs.unsignedShorts(values, 6, 4);
 
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(6L, 4L))
                         .addAllChunkShape(Arrays.asList(3L, 2L))
                         .setDtype("<u2")
                         .build();
 
+                server.producer.plannedTensor = descriptor;
                 Map<String, Object> status = client.uploadArray(descriptor, array);
 
                 Assert.assertEquals(4, server.producer.chunks.size());
@@ -406,9 +416,9 @@ public class TensorLifecycleTest {
                 // can be self-consistently wrong.
                 assertReassembles(array, server.producer.chunks, 6, 4);
 
-                // Sealing is what marks the source complete, and a whole-array
-                // upload does it on the caller's behalf.
-                Assert.assertEquals("cache:mine", server.producer.lastFinish.getSourceId());
+                // Publishing is what marks the source complete, and a
+                // whole-array upload does it on the caller's behalf.
+                Assert.assertEquals("registered_abc123/mine", server.producer.lastSetStatus.getArrayId());
                 Assert.assertEquals("READY", status.get("state"));
                 Assert.assertEquals(4.0d, status.get("uploaded_chunks"));
             }
@@ -420,7 +430,7 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(8L, 4L))
                         .addAllChunkShape(Arrays.asList(4L, 2L))
                         .setDtype("<u2")
@@ -442,7 +452,7 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(2L, 2L))
                         .addAllChunkShape(Arrays.asList(2L, 2L))
                         .setDtype("<f4")
@@ -469,13 +479,15 @@ public class TensorLifecycleTest {
                 RandomAccessibleInterval<UnsignedShortType> array =
                         ArrayImgs.unsignedShorts(values, 6, 4);
 
+                server.producer.plannedTensor = labelDescriptor("src_ab12/labels/nuclei");
                 client.uploadArray(labelDescriptor("src_ab12/labels/nuclei"), array);
                 Assert.assertEquals(1, server.producer.chunks.size());
                 Assert.assertEquals(Arrays.asList(0L, 0L),
                         server.producer.chunks.get(0).bounds.getStartList());
 
                 server.producer.chunks.clear();
-                client.uploadArray(labelDescriptor("cache:mine"), array);
+                server.producer.plannedTensor = labelDescriptor("registered_abc123/mine");
+                client.uploadArray(labelDescriptor("registered_abc123/mine"), array);
                 Assert.assertEquals(4, server.producer.chunks.size());
             }
         }
@@ -499,11 +511,12 @@ public class TensorLifecycleTest {
                         whole, new long[] {6, 4}, new long[] {11, 7});
 
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(6L, 4L))
                         .addAllChunkShape(Arrays.asList(3L, 2L))
                         .setDtype("<u2")
                         .build();
+                server.producer.plannedTensor = descriptor;
                 client.uploadArray(descriptor, crop);
 
                 Assert.assertEquals(4, server.producer.chunks.size());
@@ -526,7 +539,7 @@ public class TensorLifecycleTest {
                 RandomAccessibleInterval<UnsignedShortType> array =
                         ArrayImgs.unsignedShorts(values, 6, 4);
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(6L, 4L))
                         .addAllChunkShape(Arrays.asList(3L, 2L))
                         .setDtype("<u2")
@@ -536,6 +549,7 @@ public class TensorLifecycleTest {
                         .addAllStart(Arrays.asList(3L, 2L))
                         .addAllStop(Arrays.asList(6L, 4L))
                         .build();
+                server.producer.plannedTensor = descriptor;
                 client.uploadChunk(descriptor, bounds, array);
 
                 Assert.assertEquals(1, server.producer.chunks.size());
@@ -544,20 +558,59 @@ public class TensorLifecycleTest {
                 // chunk, and the corner block still carries the corner values.
                 Assert.assertEquals(6, server.producer.chunks.get(0).values.size());
                 assertBlockMatches(array, server.producer.chunks.get(0));
-                // The manual half does NOT seal; that is finishUpload's job.
-                Assert.assertNull(server.producer.lastFinish);
+                // The manual half does NOT seal; that is setUploadStatus's job.
+                Assert.assertNull(server.producer.lastSetStatus);
             }
         }
     }
 
     @Test
-    public void testFinishUploadSealsAndReportsTheStatus() throws Exception {
+    public void testRegisterSourceAnswersTheMintedId() throws Exception {
+        // The id is the server's: the client sends a name and gets back
+        // something it could not have derived from it.
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Map<String, Object> status = client.finishUpload(TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
-                        .build());
-                Assert.assertEquals("cache:mine", status.get("source_id"));
+                Assert.assertEquals("registered_abc123", client.registerSource("plate"));
+                Assert.assertEquals("plate", server.producer.lastRegisterSource.getName());
+            }
+        }
+    }
+
+    @Test
+    public void testRegisterSourceCarriesTheMetadataVerbatim() throws Exception {
+        // Opaque, as on addTensor: the client does not parse or re-encode
+        // the OME tree, so what the server stores is what the caller wrote.
+        String metadata = "{\"omero\":{\"channels\":[]}}";
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.registerSource("plate", metadata);
+                Assert.assertEquals(
+                        metadata, server.producer.lastRegisterSource.getMetadataJson());
+            }
+        }
+    }
+
+    @Test
+    public void testRegisterSourceSendsAnEmptyStringForNoMetadata() throws Exception {
+        // Both SDKs have to mean the same thing by omitting the block, and for
+        // a proto string field that is "", which the server reads as absent.
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.registerSource("");
+                Assert.assertEquals("", server.producer.lastRegisterSource.getName());
+                Assert.assertEquals(
+                        "", server.producer.lastRegisterSource.getMetadataJson());
+            }
+        }
+    }
+
+    @Test
+    public void testSetUploadStatusSealsAndReportsTheStatus() throws Exception {
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Map<String, Object> status = client.setUploadStatus(
+                        "registered_abc123/mine", UploadStatus.State.READY, "");
+                Assert.assertEquals("registered_abc123/mine", status.get("source_id"));
                 Assert.assertEquals("READY", status.get("state"));
             }
         }
@@ -572,11 +625,12 @@ public class TensorLifecycleTest {
             server.producer.refuseChunks = true;
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(2L, 2L))
                         .addAllChunkShape(Arrays.asList(2L, 2L))
                         .setDtype("<u2")
                         .build();
+                server.producer.plannedTensor = descriptor;
                 UploadRefusedException error = Assert.assertThrows(
                         UploadRefusedException.class,
                         () -> client.uploadChunk(descriptor,
@@ -586,7 +640,7 @@ public class TensorLifecycleTest {
                                         .build(),
                                 ArrayImgs.unsignedShorts(new short[4], 2, 2)));
                 Assert.assertEquals("DISCARDED", error.getState());
-                Assert.assertEquals("cache:mine", error.getSourceId());
+                Assert.assertEquals("registered_abc123/mine", error.getSourceId());
             }
         }
     }
@@ -693,19 +747,27 @@ public class TensorLifecycleTest {
         private final BufferAllocator allocator;
 
         volatile java.util.Set<String> knownActions = new java.util.HashSet<>(Arrays.asList(
-                "add_source", "remove_source", "roi_prune", "delete_labels", "create_tensor", "finish"));
+                "add_source", "remove_source", "roi_prune", "add_tensor",
+                "register_source", "set_upload_status"));
+        volatile RegisterSource lastRegisterSource = null;
         volatile boolean addSourceSendsResult = true;
         volatile int addSourceHeartbeats = 2;
         volatile boolean observedCancel = false;
         final java.util.concurrent.atomic.AtomicInteger emitted =
                 new java.util.concurrent.atomic.AtomicInteger();
         volatile boolean refuseChunks = false;
+        /**
+         * The tensor {@code getFlightInfo} plans. A write asks the server what
+         * a chunk is, so a test that uploads has to say what it declared --
+         * this fake keeps no catalog.
+         */
+        volatile TensorDescriptor plannedTensor;
 
         volatile AddSourceRequest lastAddSource;
         volatile RemoveSourceRequest lastRemoveSource;
         volatile RoiPruneRequest lastPrune;
         volatile TensorDescriptor lastCreate;
-        volatile FinishUpload lastFinish;
+        volatile SetUploadStatus lastSetStatus;
         volatile RoiRead lastRoiRead;
         volatile RoiPut lastRoiPut;
         volatile RoiDelete lastRoiDelete;
@@ -758,19 +820,24 @@ public class TensorLifecycleTest {
                                 .setDeleted(lastPrune.getApply() ? 4 : 0)
                                 .build().toByteArray()));
                         break;
-                    case "delete_labels":
-                        String arrayId = new String(action.getBody(), StandardCharsets.UTF_8);
-                        listener.onNext(new Result(("{\"array_id\":\"" + arrayId + "\",\"deleted\":true}")
-                                .getBytes(StandardCharsets.UTF_8)));
-                        break;
-                    case "create_tensor":
+                    case "add_tensor":
                         lastCreate = TensorDescriptor.parseFrom(action.getBody());
-                        listener.onNext(new Result(lastCreate.toByteArray()));
+                        // As the real server answers: the scheme named the
+                        // store format and is not part of the tensor's id.
+                        listener.onNext(new Result(lastCreate.toBuilder()
+                                .setArrayId(lastCreate.getArrayId().replaceFirst("^[a-z]+://", ""))
+                                .build().toByteArray()));
                         break;
-                    default: // "finish"
-                        lastFinish = FinishUpload.parseFrom(action.getBody());
+                    case "register_source":
+                        lastRegisterSource = RegisterSource.parseFrom(action.getBody());
+                        listener.onNext(new Result(RegisterSourceResult.newBuilder()
+                                .setSourceId("registered_abc123")
+                                .build().toByteArray()));
+                        break;
+                    default: // "set_upload_status"
+                        lastSetStatus = SetUploadStatus.parseFrom(action.getBody());
                         listener.onNext(new Result(UploadStatus.newBuilder()
-                                .setState(UploadStatus.State.READY)
+                                .setState(lastSetStatus.getState())
                                 .setExpectedChunks(chunks.size())
                                 .setUploadedChunks(chunks.size())
                                 .build().toByteArray()));
@@ -889,6 +956,83 @@ public class TensorLifecycleTest {
             }
         }
 
+        /**
+         * Plan a write the way the server does: chunk bounds on the declared
+         * grid, snapped outward to cover the requested slice, each endpoint
+         * carrying its bounds <b>relative to the realized origin</b> and an
+         * opaque ticket. The ticket here is the absolute bounds, which is all
+         * this fake needs to put the chunk where the test can find it.
+         */
+        @Override
+        public FlightInfo getFlightInfo(
+                FlightProducer.CallContext context, FlightDescriptor descriptor) {
+            TensorReadOption read;
+            try {
+                read = FlightRequest.parseFrom(descriptor.getCommand()).getTensorRead();
+            } catch (InvalidProtocolBufferException error) {
+                throw CallStatus.INVALID_ARGUMENT
+                        .withDescription("not a FlightRequest").toRuntimeException();
+            }
+            TensorDescriptor declared = plannedTensor;
+            int ndim = declared.getShapeCount();
+            long[] shape = new long[ndim];
+            long[] chunk = new long[ndim];
+            long[] origin = new long[ndim];
+            long[] end = new long[ndim];
+            for (int axis = 0; axis < ndim; axis++) {
+                shape[axis] = declared.getShape(axis);
+                chunk[axis] = declared.getChunkShape(axis);
+                long from = read.hasSliceHint() ? read.getSliceHint().getStart(axis) : 0;
+                long to = read.hasSliceHint() ? read.getSliceHint().getStop(axis) : shape[axis];
+                origin[axis] = (from / chunk[axis]) * chunk[axis];
+                end[axis] = Math.min(
+                        ((to + chunk[axis] - 1) / chunk[axis]) * chunk[axis], shape[axis]);
+            }
+
+            List<FlightEndpoint> endpoints = new ArrayList<>();
+            long[] start = origin.clone();
+            while (true) {
+                ChunkBounds.Builder absolute = ChunkBounds.newBuilder();
+                ChunkBounds.Builder relative = ChunkBounds.newBuilder();
+                for (int axis = 0; axis < ndim; axis++) {
+                    long stop = Math.min(start[axis] + chunk[axis], shape[axis]);
+                    absolute.addStart(start[axis]).addStop(stop);
+                    relative.addStart(start[axis] - origin[axis]).addStop(stop - origin[axis]);
+                }
+                TensorTicket ticket = TensorTicket.newBuilder()
+                        .setChunkId(ByteString.copyFrom(absolute.build().toByteArray()))
+                        .build();
+                endpoints.add(FlightEndpoint.builder(new Ticket(ticket.toByteArray()))
+                        .setAppMetadata(relative.build().toByteArray())
+                        .build());
+                int axis = ndim - 1;
+                for (; axis >= 0; axis--) {
+                    start[axis] += chunk[axis];
+                    if (start[axis] < end[axis]) {
+                        break;
+                    }
+                    start[axis] = origin[axis];
+                }
+                if (axis < 0) {
+                    break;
+                }
+            }
+
+            SliceHint.Builder realized = SliceHint.newBuilder();
+            for (int axis = 0; axis < ndim; axis++) {
+                realized.addStart(origin[axis]).addStop(end[axis]);
+            }
+            TensorDescriptor response = TensorDescriptor.newBuilder(declared)
+                    .setSliceHint(realized)
+                    .build();
+            return new FlightInfo(
+                    new Schema(new ArrayList<>()),
+                    FlightDescriptor.command(response.toByteArray()),
+                    endpoints,
+                    -1,
+                    -1);
+        }
+
         @Override
         public Runnable acceptPut(
                 FlightProducer.CallContext context,
@@ -899,8 +1043,8 @@ public class TensorLifecycleTest {
                     PutCommand command = PutCommand.parseFrom(
                             stream.getDescriptor().getCommand());
                     switch (command.getCommandCase()) {
-                        case CHUNK:
-                            acceptChunk(command.getChunk(), stream);
+                        case CHUNK_TICKET:
+                            acceptChunk(command.getChunkTicket(), stream);
                             break;
                         case ROI_PUT:
                             lastRoiPut = command.getRoiPut();
@@ -918,7 +1062,11 @@ public class TensorLifecycleTest {
             };
         }
 
-        private void acceptChunk(ChunkUpload upload, FlightStream stream) {
+        private void acceptChunk(ByteString ticketBytes, FlightStream stream)
+                throws InvalidProtocolBufferException {
+            // The ticket is this fake's own: the chunk's absolute bounds.
+            ChunkBounds bounds = ChunkBounds.parseFrom(
+                    TensorTicket.parseFrom(ticketBytes.toByteArray()).getChunkId());
             List<Integer> values = new ArrayList<>();
             while (stream.next()) {
                 UInt2Vector data = (UInt2Vector) stream.getRoot().getVector("data");
@@ -936,14 +1084,14 @@ public class TensorLifecycleTest {
                 // data and the gRPC code is implied by the class.
                 metadata.insert("x-biopb-error-bin",
                         ("{\"reason\":\"upload_discarded\",\"source_id\":\""
-                                + upload.getSourceId() + "\",\"state\":\"DISCARDED\","
+                                + plannedTensor.getArrayId() + "\",\"state\":\"DISCARDED\","
                                 + "\"detail\":\"producer gave up\"}")
                                 .getBytes(StandardCharsets.UTF_8));
                 throw new org.apache.arrow.flight.CallStatus(
                         org.apache.arrow.flight.FlightStatusCode.CANCELLED, null,
                         "Upload discarded", metadata).toRuntimeException();
             }
-            chunks.add(new Chunk(upload.getBounds(), values));
+            chunks.add(new Chunk(bounds, values));
         }
 
         private void acceptRoiPut(FlightStream stream, FlightProducer.StreamListener<PutResult> ackStream) {

@@ -5,8 +5,8 @@ and a ``/labels/`` segment, it creates a tensor of a source that already
 exists rather than a source. What that costs the boundary is a second place to
 look an upload up (the parent's ``label_uploads``, not the registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
-``create_tensor`` / ``upload_array`` / ``finish_upload`` round trip, plus
-``delete_labels`` to free the name again.
+``add_tensor`` / ``upload_array`` / ``set_upload_status`` round trip, with
+a discard to free the name again.
 
 Design: ``biopb-tensor-server/docs/label-tensors.md``.
 """
@@ -64,8 +64,10 @@ def _labels(shape=SHAPE, dtype="uint32"):
 
 
 def _create(client, array_id, arr=None, **kw):
+    """A label set on a source the server already serves; the one form of
+    ``add_tensor`` whose parent may be a discovered file."""
     arr = _labels() if arr is None else arr
-    return client.create_tensor(array_id, arr, chunk_shape=CHUNK, **kw)
+    return client.add_tensor(f"zarr://{array_id}", arr, chunk_shape=CHUNK, **kw)
 
 
 def _tensor_ids(server, source_id="oz1"):
@@ -80,13 +82,13 @@ def _tensor_ids(server, source_id="oz1"):
 
 
 class TestTheRoundTrip:
-    def test_create_upload_finish_and_read_back(self, served, client):
+    def test_create_upload_seal_and_read_back(self, served, client):
         labels = _labels()
         desc = _create(client, "oz1/labels/nuclei")
         assert desc.array_id == "oz1/labels/nuclei"
 
-        # Routable from create, so the producer can poll to READY -- but not
-        # listed, because none of its bytes have landed.
+        # Routable from create, so the producer can poll it -- but not listed,
+        # because nobody may read it yet.
         assert client.get_upload_status("oz1/labels/nuclei")["state"] == "PENDING"
         assert "oz1/labels/nuclei" not in _tensor_ids(served)
 
@@ -97,7 +99,7 @@ class TestTheRoundTrip:
         assert read.dtype == np.uint32
         np.testing.assert_array_equal(read.compute(), labels)
 
-    def test_finish_lists_it_under_its_image(self, served, client):
+    def test_publishing_lists_it_under_its_image(self, served, client):
         desc = _create(client, "oz1/labels/nuclei")
         client.upload_array(desc, _labels())
 
@@ -146,7 +148,7 @@ class TestWhatTheKindRefuses:
             ("oz1/labels/@ome", None, "are the server's own"),
             ("oz1/labels/x", np.zeros(SHAPE, "float32"), "unsigned integer"),
             ("oz1/labels/x", np.zeros((32, 32), "uint32"), "does not span"),
-            ("oz1/nope", None, "Invalid array_id format"),
+            ("oz1/nope", None, "is not a registered source"),
         ],
     )
     def test_refusals(self, served, client, array_id, arr, why):
@@ -166,6 +168,17 @@ class TestWhatTheKindRefuses:
         with pytest.raises(flight.FlightServerError, match="the set's name"):
             _create(client, f"oz1/labels/{name}")
         assert not list(labels_root(Path(tmp_path)).glob("**/*.zarr"))
+
+    def test_a_case_variant_of_a_taken_set_name_is_refused(self, served, client):
+        """`Nuclei` and `nuclei` are two keys on ext4 and one sidecar directory
+        on NTFS, APFS and HFS+, so the refusal folds (``fold_name``)."""
+        import pyarrow.flight as flight
+
+        client.upload_array(_create(client, "oz1/labels/Nuclei"), _labels())
+        with pytest.raises(flight.FlightServerError, match="already exists"):
+            _create(client, "oz1/labels/nuclei")
+        # A name that differs by more than case is still free.
+        _create(client, "oz1/labels/membrane")
 
     def test_a_taken_name_is_refused_until_it_is_deleted(self, served, client):
         import pyarrow.flight as flight
@@ -212,26 +225,32 @@ class TestTheSidecar:
         assert upload_state(json.loads((store / ".zattrs").read_text())) == UPLOAD_READY
 
     def test_an_all_zero_chunk_is_never_materialized(self, served, client, tmp_path):
-        """The sparse case: only the blocks that carry ids cost anything."""
-        store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "sparse.zarr"
-        sparse = np.zeros(SHAPE, "uint32")
-        sparse[:8, :8] = 1  # the (0, 0) chunk alone, of four
-        desc = _create(client, "oz1/labels/sparse", arr=sparse)
-        status = client.upload_array(desc, sparse)
+        """The sparse case: a planned block with no ids costs nothing.
 
-        assert (status["uploaded_chunks"], status["expected_chunks"]) == (1, 4)
-        chunks = {p.name for p in (store / "0").iterdir() if not p.name.startswith(".")}
-        assert chunks == {"0.0"}
+        The block is the *planned* chunk -- the transfer grid, which is what
+        the store is minted on (``_writable.upload_grid``) -- and this fixture
+        is small enough to be one. A real set is many, and every one of them
+        that carries no ids is skipped the same way.
+        """
+        store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "sparse.zarr"
+        empty = np.zeros(SHAPE, "uint32")
+        desc = _create(client, "oz1/labels/sparse", arr=empty)
+        status = client.upload_array(desc, empty)
+
+        assert status["uploaded_chunks"] == 0
+        assert not [p for p in (store / "0").iterdir() if not p.name.startswith(".")]
         np.testing.assert_array_equal(
-            client.get_tensor("oz1/labels/sparse").compute(), sparse
+            client.get_tensor("oz1/labels/sparse").compute(), empty
         )
 
     def test_the_zero_skip_is_this_kind_s_alone(self, served, client):
-        """A ``cache:`` source answers an unwritten chunk with "holds no chunk",
-        so every block of one is sent however empty it is."""
+        """Every block of an ordinary tensor is sent however empty it is: its
+        unwritten chunks read as background too, but nothing declared them to,
+        and an all-zero array would otherwise upload nothing at all."""
         sparse = np.zeros(SHAPE, "uint32")
         sparse[:8, :8] = 1
-        desc = client.create_tensor("cache:sparse", sparse, chunk_shape=CHUNK)
+        source = client.register_source()
+        desc = client.add_tensor(f"cache://{source}/sparse", sparse, chunk_shape=CHUNK)
         status = client.upload_array(desc, sparse)
         assert (status["uploaded_chunks"], status["expected_chunks"]) == (4, 4)
 
@@ -255,48 +274,69 @@ class TestTheSidecar:
             fresh.shutdown()
 
 
-class TestDelete:
+class TestDiscard:
+    """Removing a set is discarding its upload, from whatever state it is in.
+
+    There is no second verb, because a delete would say nothing a discard does
+    not: unlist the set, release the sidecar the server minted. A published set
+    is as discardable as one still filling.
+    """
+
+    def _gone(self, client, array_id, reason="replaced"):
+        return client.set_upload_status(array_id, "DISCARDED", reason)
+
     def test_it_unlists_the_set_and_removes_the_store(self, served, client, tmp_path):
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "nuclei.zarr"
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
 
-        assert client.delete_labels("oz1/labels/nuclei") == {
-            "array_id": "oz1/labels/nuclei",
-            "deleted": True,
-        }
+        assert self._gone(client, "oz1/labels/nuclei")["state"] == "DISCARDED"
         assert not store.exists()
         assert client.label_sets("oz1") == []
 
-    def test_the_action_is_advertised(self, served, client):
-        assert "delete_labels" in {a.type for a in client._state.client.list_actions()}
+    def test_a_pending_set_is_discardable_too(self, served, client, tmp_path):
+        """It was never listed, so only the store goes."""
+        store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "half.zarr"
+        _create(client, "oz1/labels/half")
+        assert store.is_dir()
 
-    def test_the_name_is_free_again_and_reads_its_own_bytes(self, served, client):
+        assert self._gone(client, "oz1/labels/half", "abandoned")["state"] == (
+            "DISCARDED"
+        )
+        assert not store.exists()
+
+    def test_the_name_is_free_after_the_sweep_and_reads_its_own_bytes(
+        self, served, client
+    ):
+        import time
+
         first, second = _labels(), _labels() * 2
         client.upload_array(_create(client, "oz1/labels/nuclei"), first)
         np.testing.assert_array_equal(
             client.get_tensor("oz1/labels/nuclei").compute(), first
         )
-        client.delete_labels("oz1/labels/nuclei")
+        self._gone(client, "oz1/labels/nuclei")
+
+        # The tombstone holds the name until the reclaim sweep takes it, like
+        # every other discarded upload's.
+        with pytest.raises(flight.FlightServerError):
+            _create(client, "oz1/labels/nuclei")
+        served.uploads.reap(now=time.monotonic() + 10_000)
 
         client.upload_array(_create(client, "oz1/labels/nuclei"), second)
         np.testing.assert_array_equal(
             client.get_tensor("oz1/labels/nuclei").compute(), second
         )
 
-    @pytest.mark.parametrize("array_id", ["oz1/labels/gone", "oz1", "oz1/labels/half"])
-    def test_only_a_finished_uploaded_set_can_be_deleted(
-        self, served, client, array_id
-    ):
-        import pyarrow.flight as flight
-
-        _create(client, "oz1/labels/half")  # pending: not finished, not deletable
-        with pytest.raises(flight.FlightServerError, match="not a deletable"):
-            client.delete_labels(array_id)
+    @pytest.mark.parametrize("array_id", ["oz1/labels/gone", "oz1"])
+    def test_what_is_not_an_upload_answers_unknown(self, served, client, array_id):
+        """Total, like every discard: a name that never was, and an image that
+        is not an upload at all, are both statements about an end state that
+        already holds."""
+        assert self._gone(client, array_id)["state"] == "UNKNOWN"
 
     def test_a_native_set_is_the_file_s(self, writable_server, client, tmp_path):
-        """An NGFF ``labels/`` group inside the user's store is never deleted."""
-        import pyarrow.flight as flight
-
+        """An NGFF ``labels/`` group inside the user's store is never removed:
+        it is embedded rather than attached, so nothing here reaches it."""
         zarr_path, _, _ = create_multiresolution_ome_zarr(
             str(tmp_path / "native"), n_levels=1, base_shape=SHAPE, chunk_size=CHUNK
         )
@@ -305,9 +345,10 @@ class TestDelete:
             writable_server, "oz2", _adapter(Path(zarr_path), source_id="oz2")
         )
         assert client.label_sets("oz2") == ["oz2/labels/own"]
-        with pytest.raises(flight.FlightServerError, match="not a deletable"):
-            client.delete_labels("oz2/labels/own")
+
+        assert self._gone(client, "oz2/labels/own")["state"] == "UNKNOWN"
         assert group.exists()
+        assert client.label_sets("oz2") == ["oz2/labels/own"]
 
 
 class TestTheSweep:
@@ -391,12 +432,15 @@ class TestContentVersion:
         assert self._minted(client, array_id) == {published}
 
     def test_a_reused_name_publishes_a_new_version(self, served, client):
-        """``delete_labels``: "the next set uploaded under it is a distinct
-        tensor with its own cache namespace". Both uploads leave the image file
-        untouched, so an image-derived version could not say so."""
+        """The next set uploaded under a freed name is a distinct tensor with
+        its own cache namespace. Both uploads leave the image file untouched,
+        so an image-derived version could not say so."""
+        import time
+
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
         first = client.get_descriptor("oz1/labels/nuclei").content_version
-        client.delete_labels("oz1/labels/nuclei")
+        client.set_upload_status("oz1/labels/nuclei", "DISCARDED")
+        served.uploads.reap(now=time.monotonic() + 10_000)
 
         client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
         second = client.get_descriptor("oz1/labels/nuclei").content_version

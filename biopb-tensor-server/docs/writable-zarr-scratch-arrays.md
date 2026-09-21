@@ -188,7 +188,7 @@ body and returns a small JSON ack, matching `upload_status`’s convention.
    nothing else (biopb/biopb#1048): writes take full access, because a narrow
    grant must not authorize an operation whose cost is not scoped to the object
    it names. "Only the creator may write" is an upload *session* — a lifecycle
-   object with an explicit `finish`, not a credential — which is that issue's
-   step 3.
+   object with explicit state transitions, not a credential — which is that
+   issue's step 3.
 5. Crash cleanup: orphaned scratch dirs after an unclean shutdown — sweep on
    startup using a manifest or dir naming convention.

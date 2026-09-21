@@ -8,7 +8,7 @@ Covers the rule (``core.axes.canonical_permutation``), the seam that applies it
 2. the guarantee is unconditional on the read path, including for the geometry a
    read plan hands a client and for what lands in the chunk cache;
 3. an axis order this server does not own is refused rather than permuted -- an
-   uploader's declared order at ``create_tensor``, and a remote upstream's
+   uploader's declared order at ``add_tensor``, and a remote upstream's
    advertised order at the proxy's read boundary.
 """
 
@@ -588,17 +588,17 @@ class TestNormalizedCaching:
 # ==============================================================================
 
 
-class TestCreateSourceValidation:
-    def _manager(self):
+class TestAddTensorValidation:
+    def _manager(self, tmp_path=None):
         from biopb_tensor_server.serving.upload_manager import UploadManager
 
-        return UploadManager(SourceRegistry(), None, None)
+        return UploadManager(SourceRegistry(), tmp_path, None)
 
     def test_non_canonical_upload_is_rejected(self):
         with pytest.raises(flight.FlightServerError, match="canonical"):
-            self._manager().create_tensor(
+            self._manager().add_tensor(
                 TensorDescriptor(
-                    array_id="cache:bad",
+                    array_id="cache://any/bad",
                     dim_labels=["x", "y", "z"],
                     shape=[4, 5, 6],
                     chunk_shape=[4, 5, 6],
@@ -608,9 +608,9 @@ class TestCreateSourceValidation:
 
     def test_the_error_names_the_order_to_use(self):
         with pytest.raises(flight.FlightServerError) as exc:
-            self._manager().create_tensor(
+            self._manager().add_tensor(
                 TensorDescriptor(
-                    array_id="cache:bad",
+                    array_id="cache://any/bad",
                     dim_labels=["x", "y"],
                     shape=[4, 5],
                     chunk_shape=[4, 5],
@@ -619,30 +619,36 @@ class TestCreateSourceValidation:
             )
         assert "['y', 'x']" in str(exc.value)
 
-    def _create(self, desc):
-        return self._manager().create_tensor(desc)
+    def _create(self, tmp_path, desc):
+        """Accepting an order takes a source to add the tensor to."""
+        manager = self._manager(tmp_path)
+        source = manager.register_source()
+        desc.array_id = f"cache://{source}/{desc.array_id}"
+        return manager.add_tensor(desc)
 
-    def test_canonical_upload_is_accepted(self):
+    def test_canonical_upload_is_accepted(self, tmp_path):
         desc = self._create(
+            tmp_path,
             TensorDescriptor(
-                array_id="cache:good",
+                array_id="good",
                 dim_labels=["z", "y", "x"],
                 shape=[4, 5, 6],
                 chunk_shape=[4, 5, 6],
                 dtype="<u2",
-            )
+            ),
         )
         assert list(desc.dim_labels) == ["z", "y", "x"]
 
-    def test_unlabeled_upload_is_accepted(self):
+    def test_unlabeled_upload_is_accepted(self, tmp_path):
         """An uploader that declares no semantics is not forced to invent any."""
         desc = self._create(
+            tmp_path,
             TensorDescriptor(
-                array_id="cache:plain",
+                array_id="plain",
                 shape=[4, 5, 6],
                 chunk_shape=[4, 5, 6],
                 dtype="<u2",
-            )
+            ),
         )
         assert list(desc.shape) == [4, 5, 6]
 
@@ -740,7 +746,7 @@ def _legacy_upstream(tmp, arr, labels, name="u"):
 class TestRemoteProxyRefusesRatherThanPermutes:
     """The upstream owns a mirrored source's axis order -- it mints the chunk_ids,
     plans the reads (#295) and sizes the grid -- so the server validates that
-    order instead of permuting behind it, exactly as ``create_tensor`` does for an
+    order instead of permuting behind it, exactly as ``add_tensor`` does for an
     uploader's declared order."""
 
     def test_a_proxy_is_never_wrapped(self):
@@ -884,7 +890,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
             is None
         )
 
-    def test_the_refusal_wording_is_shared_with_create_tensor(self):
+    def test_the_refusal_wording_is_shared_with_add_tensor(self):
         """One rule stated once: both seams that validate an order they do not own
         report it through ``noncanonical_order``."""
         from biopb_tensor_server.core.axes import noncanonical_order
@@ -894,9 +900,9 @@ class TestRemoteProxyRefusesRatherThanPermutes:
         assert why is not None and "['y', 'x']" in why
 
         with pytest.raises(flight.FlightServerError) as upload_exc:
-            UploadManager(SourceRegistry(), None, None).create_tensor(
+            UploadManager(SourceRegistry(), None, None).add_tensor(
                 TensorDescriptor(
-                    array_id="cache:bad",
+                    array_id="cache://any/bad",
                     dim_labels=["x", "y"],
                     shape=[4, 5],
                     chunk_shape=[4, 5],
