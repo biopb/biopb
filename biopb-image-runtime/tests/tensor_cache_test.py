@@ -216,6 +216,30 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
         TensorFlightClient(location).list_sources()
 
 
+def test_finish_seals_the_result_and_refuses_later_writes(
+    embedded_cache: EmbeddedTensorCache,
+):
+    """The success counterpart of discard, and the only route to READY.
+
+    READY is what a consumer polling for the result waits on, and it seals the
+    upload in the same move -- a late chunk has no way to invalidate a read
+    already served under its ``chunk_id``.
+    """
+    import pyarrow.flight as flight
+
+    serialized = embedded_cache.create_array("cache:", ["Y", "X"], _uniform_template())
+    source_id = _array_id(serialized)
+
+    assert embedded_cache.finish(source_id)["state"] == "READY"
+
+    with pytest.raises(flight.FlightCancelledError):
+        embedded_cache.upload_array_chunks(
+            source_id,
+            ChunkBounds(start=[0, 0], stop=[2, 2]),
+            np.ones((2, 2), dtype=np.float32),
+        )
+
+
 def test_discard_refuses_later_writes_with_the_reason(
     embedded_cache: EmbeddedTensorCache,
 ):
