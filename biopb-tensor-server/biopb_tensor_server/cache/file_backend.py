@@ -35,9 +35,11 @@ from biopb_tensor_server.cache.recovery import (
     SieveKSegmentInfo,
 )
 from biopb_tensor_server.cache.segment_index import (
-    CACHE_KEY_FIELD,
     IndexRecord,
     SegmentScan,
+    batch_at_offset,
+    batch_with_key,
+    bracket_message,
 )
 from biopb_tensor_server.cache.types import (
     EVICTION_RANK,
@@ -83,33 +85,6 @@ def _get_size_class(size_bytes: int) -> SizeClass:
         return "bulk"
     else:
         return "large"
-
-
-def _schema_message_length(path: Path) -> Optional[int]:
-    """Byte length of the leading IPC schema message in a segment file.
-
-    The stream writer buffers the schema until the first batch is written, so a
-    segment's *first* append advances the sink cursor across schema + batch
-    together; splitting them needs the schema message's own length. Let pyarrow
-    read its own framing (rather than decoding the encapsulated-message header
-    here) so this can't drift from what the writer emits -- it is the same
-    ``read_message`` call the boot walk opens a segment with, on the ~160 bytes
-    at the head of the file.
-
-    Returns None if that read fails, which costs the *first* entry of this one
-    segment its byte range: ``locate_entry`` reports it unavailable and the
-    client transfers that chunk over do_get instead of mmap. Later entries in
-    the segment bracket directly off the sink cursor and are unaffected, and the
-    seal-time ``.idx`` sidecar re-derives the range from the segment body, so a
-    restart restores the fast path for it.
-    """
-    try:
-        with pa.OSFile(str(path), "rb") as f:
-            pa.ipc.read_message(f)  # the leading schema message
-            length = f.tell()
-    except (OSError, pa.ArrowInvalid, EOFError, StopIteration):
-        return None
-    return length or None
 
 
 @dataclass
@@ -875,31 +850,23 @@ class ArrowFileBackend:
     ) -> Optional[pa.RecordBatch]:
         """The batch at this entry's recorded range, if it really is this entry.
 
-        Decoding at a byte offset trusts the index, and a range that no longer
-        names this key decodes into a *valid* batch belonging to someone else --
-        the one failure here that is silent rather than loud. Every record
-        carries its own key (``CACHE_KEY_FIELD``), so it is checked; None sends
-        the caller down the sequential walk, which is slower but finds the right
-        record.
+        The check that the range still names *key* is the codec's
+        (``segment_index.batch_at_offset``); what is this class's is which
+        segment the mapping belongs to, and the warning that says the index and
+        the body have drifted. None sends the caller down the sequential walk,
+        which is slower but finds the right record.
         """
         schema = self._segment_schema(segment_id, mmap)
         if schema is None:
             return None
-        try:
-            mmap.seek(entry_info.byte_offset)
-            batch = pa.ipc.read_record_batch(pa.ipc.read_message(mmap), schema)
-        except (pa.ArrowInvalid, OSError, EOFError, StopIteration):
-            return None
-        if CACHE_KEY_FIELD not in batch.schema.names:
-            return batch  # pre-key-column segment: nothing to check against
-        if batch.column(CACHE_KEY_FIELD)[0].as_py() != key:
+        batch = batch_at_offset(mmap, schema, entry_info.byte_offset, key)
+        if batch is None:
             logger.warning(
                 "segment %s offset %s does not hold the entry it is indexed "
                 "under; walking the segment instead",
                 segment_id,
                 entry_info.byte_offset,
             )
-            return None
         return batch
 
     def _read_batch_at(
@@ -941,31 +908,17 @@ class ArrowFileBackend:
         write_start: int,
         write_end: int,
     ) -> Tuple[int, int]:
-        """Byte range of the message just appended, from the sink cursor.
+        """Byte range of the message just appended (``segment_index``'s codec).
 
-        Recording the range at write time is what lets every later read and
-        locate go straight to the entry instead of walking the segment for it
-        (biopb/biopb#541).
-
-        ``write_start == 0`` is the segment's first append, where the writer
-        also emitted the schema message it had buffered; the batch starts after
-        it, so its length is read back off the file. Returns ``(0, 0)`` for a
-        range that can't be derived -- the entry is then served over do_get, the
-        designed floor of this path. Caller holds ``_write_lock`` (which keeps
-        the segment's writer/sink state stable), not ``_lock``.
+        Only the path lookup is this class's: the bracketing itself is shared
+        with the uploaded-member store, so both write ranges a reader resolves
+        the same way. Caller holds ``_write_lock`` (which keeps the segment's
+        writer/sink state stable), not ``_lock``.
         """
-        if write_end <= write_start:
-            return 0, 0
-        if write_start > 0:
-            return write_start, write_end - write_start
-
         path = self._pool_paths.get(segment_id)
         if path is None:
             return 0, 0
-        schema_len = _schema_message_length(path)
-        if schema_len is None or not 0 < schema_len < write_end:
-            return 0, 0
-        return schema_len, write_end - schema_len
+        return bracket_message(path, write_start, write_end)
 
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk location of a cached chunk, or None.
@@ -1302,12 +1255,7 @@ class ArrowFileBackend:
                 # Attach the cache key as a per-row column (NOT schema metadata):
                 # Arrow IPC persists the schema once per segment, so schema
                 # metadata can't identify individual batches on rebuild.
-                unified_batch = data
-                key_col = pa.array([key], type=pa.binary())
-                batch_with_key = pa.RecordBatch.from_arrays(
-                    list(unified_batch.columns) + [key_col],
-                    names=list(unified_batch.schema.names) + [CACHE_KEY_FIELD],
-                )
+                keyed_batch = batch_with_key(data, key)
 
                 # The class the entry was reserved with, not this call's.
                 pool_key = (entry.retention, size_class)
@@ -1320,7 +1268,7 @@ class ArrowFileBackend:
                 segment_id = self._open_pools.get(pool_key)
                 if segment_id not in self._pool_writers:
                     segment_id = self._create_segment_for_pool(
-                        pool_key, batch_with_key.schema
+                        pool_key, keyed_batch.schema
                     )
                 writer = self._pool_writers[segment_id]
                 sink = self._pool_sinks[segment_id]
@@ -1334,7 +1282,7 @@ class ArrowFileBackend:
             # release both locks on the way out, so a failed (or stalled) write
             # can no longer leave a lock held across the read path.
             write_start = sink.tell()
-            writer.write_batch(batch_with_key)
+            writer.write_batch(keyed_batch)
             sink.flush()
             byte_offset, byte_length = self._bracket_written_message(
                 segment_id, write_start, sink.tell()

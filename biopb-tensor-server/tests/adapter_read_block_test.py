@@ -51,6 +51,7 @@ UNQUANTIZED = {
     "CziAdapter": "a libCZI ROI composes only the subblocks it touches",
     "RemoteTensorAdapter": "forwards arbitrary bounds upstream",
     "CachedSourceAdapter": "get_data raises; served by chunk_id only",
+    "CacheMember": "inherits CachedSourceAdapter; chunks served as stored",
     "QptiffAdapter": "source-level; serves levels through _QptiffLevelAdapter",
     "DeltaVisionAdapter": "one np.memmap (mrc.DVFile); indexing computes byte offsets",
     "TensorAdapter": "the base class itself",

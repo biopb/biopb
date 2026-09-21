@@ -30,8 +30,12 @@ __all__ = [
     "SIDECAR_FORMAT_VERSION",
     "IndexRecord",
     "SegmentScan",
+    "batch_at_offset",
+    "batch_with_key",
+    "bracket_message",
     "read_sidecar",
     "scan_segment_records",
+    "schema_message_length",
     "write_sidecar",
 ]
 
@@ -290,3 +294,91 @@ def write_sidecar(
             tmp_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# -- the segment codec, shared by everything that writes or reads one ---------
+#
+# The chunk cache is not the only writer of this format: an uploaded
+# ``cache://`` member keeps its chunks in segments of its own
+# (``adapters.cache_member``), outside the cache's budget and eviction. What the
+# two share is the codec below and the index above -- code that writes and
+# reads, nothing that deletes.
+
+
+def batch_with_key(batch: pa.RecordBatch, key: bytes) -> pa.RecordBatch:
+    """*batch* with its entry key appended as a per-row column.
+
+    Per-row and not schema metadata: an IPC stream serializes the schema once
+    for the whole segment, so metadata would report the first entry's key for
+    every batch in it (see ``CACHE_KEY_FIELD``). What every reader here checks
+    a byte range against.
+    """
+    return pa.RecordBatch.from_arrays(
+        list(batch.columns) + [pa.array([key], type=pa.binary())],
+        names=list(batch.schema.names) + [CACHE_KEY_FIELD],
+    )
+
+
+def schema_message_length(path: Path) -> Optional[int]:
+    """Byte length of the leading IPC schema message in a segment file.
+
+    The stream writer buffers the schema until the first batch is written, so a
+    segment's *first* append advances the sink cursor across schema + batch
+    together; splitting them needs the schema message's own length. Let pyarrow
+    read its own framing (rather than decoding the encapsulated-message header
+    here) so this can't drift from what the writer emits -- it is the same
+    ``read_message`` call the boot walk opens a segment with, on the ~160 bytes
+    at the head of the file.
+
+    Returns None if that read fails, which costs the *first* entry of this one
+    segment its byte range: it is then served over do_get rather than by range,
+    and the seal-time sidecar re-derives it from the body for the next life.
+    """
+    try:
+        with pa.OSFile(str(path), "rb") as f:
+            pa.ipc.read_message(f)  # the leading schema message
+            length = f.tell()
+    except (OSError, pa.ArrowInvalid, EOFError, StopIteration):
+        return None
+    return length or None
+
+
+def bracket_message(path: Path, write_start: int, write_end: int) -> Tuple[int, int]:
+    """Byte range of the message just appended, from the sink cursor.
+
+    Recording the range at write time is what lets every later read and locate
+    go straight to the entry instead of walking the segment for it
+    (biopb/biopb#541). Returns ``(0, 0)`` for a range that cannot be derived --
+    offset 0 is never a real entry, since the schema message occupies the start
+    of the file, so it reads as "no range known" everywhere.
+    """
+    if write_end <= write_start:
+        return 0, 0
+    if write_start > 0:
+        return write_start, write_end - write_start
+    schema_len = schema_message_length(path)
+    if schema_len is None or not 0 < schema_len < write_end:
+        return 0, 0
+    return schema_len, write_end - schema_len
+
+
+def batch_at_offset(
+    mm, schema: pa.Schema, byte_offset: int, key: bytes
+) -> Optional[pa.RecordBatch]:
+    """The batch at *byte_offset*, if it really is the entry indexed under *key*.
+
+    Decoding at a byte offset trusts the index, and a range that no longer names
+    this key decodes into a *valid* batch belonging to someone else -- the one
+    failure here that is silent rather than loud. Every record carries its own
+    key, so it is checked; None tells the caller to fall back to a walk.
+    """
+    try:
+        mm.seek(byte_offset)
+        batch = pa.ipc.read_record_batch(pa.ipc.read_message(mm), schema)
+    except (pa.ArrowInvalid, OSError, EOFError, StopIteration):
+        return None
+    if CACHE_KEY_FIELD not in batch.schema.names:
+        return batch  # pre-key-column segment: nothing to check against
+    if batch.column(CACHE_KEY_FIELD)[0].as_py() != key:
+        return None
+    return batch

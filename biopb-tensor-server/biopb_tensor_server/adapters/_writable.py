@@ -281,11 +281,10 @@ def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     any of the three would refuse, and :func:`fold_name` handles the two rules
     that are about collision rather than legality.
 
-    A format whose name never reaches the filesystem does not need this, which
-    is why :func:`unsafe_field_name` applies the rule to every field anyway: a
-    ``cache://`` member keeps its bytes in the file cache today and gets a
-    store of its own at step 7, and a name that was legal only while it stayed
-    off disk would fail to survive that.
+    Every field reaches the filesystem, whatever format it is stored in
+    (:func:`unsafe_field_name`): a ``cache://`` member is a directory of
+    segments and a ``zarr://`` one an image group, so a name legal only off
+    disk would be a tensor no restart could reopen.
     """
     if not name:
         return "is empty"

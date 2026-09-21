@@ -100,7 +100,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorReadOption
 
-    from biopb_tensor_server.cache import CacheManager, RetentionClass
+    from biopb_tensor_server.cache import CacheManager, ChunkLocation, RetentionClass
     from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
     from biopb_tensor_server.core.discovery import (
         ClaimContext,
@@ -1512,6 +1512,18 @@ class TensorAdapter(SourceAdapter):
             ladder = self._ladder_cache = computed_ladder(desc.shape, desc.dim_labels)
         return retention_for_scale(decode_scale_info(chunk_id), ladder)
 
+    def locate_chunk(self, chunk_id: bytes) -> Optional[ChunkLocation]:
+        """Where this chunk's bytes already sit, for the localhost handoff.
+
+        None by default, which sends ``server._handle_chunk_locate`` down its
+        usual route: resolve the chunk into the chunk cache, then answer the
+        byte range there. An adapter whose store *is* the served batch answers
+        its own range instead and skips that copy
+        (``adapters.cache_member.CacheMember``). Never a reason to fail a read
+        -- a None here only means the client takes do_get.
+        """
+        return None
+
     def resolve_chunk_data(
         self,
         chunk_id: bytes,
@@ -1986,6 +1998,7 @@ _TENSOR_SCOPED_API = frozenset(
         "get_scaled_data",
         "get_arrow_schema",
         "resolve_chunk_data",
+        "locate_chunk",
         "get_read_plan",
         "get_native_pyramid_levels",
         "has_native_pyramid",

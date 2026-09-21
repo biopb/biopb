@@ -2055,11 +2055,19 @@ class TensorFlightServer(flight.FlightServerBase):
                 # being asked (biopb/biopb#1048).
                 adapter.check_readable()
 
-                # If the chunk is already cached, just locate it. Resolving first
-                # would, on a chunk whose in-RAM entry has been trimmed, re-read the
-                # whole chunk from its segment server-side for nothing. Only
-                # materialize (same path as do_get) on a genuine cold miss.
-                location = cache_manager.locate_entry(cache_key)
+                # The adapter first: a source whose own store holds the chunk
+                # as the batch a client wants answers its byte range there,
+                # cold, with nothing resolved and nothing copied into the chunk
+                # cache (``adapters.cache_member``). Everything else answers
+                # None and takes the route below.
+                location = adapter.locate_chunk(chunk_id)
+                if location is None:
+                    # If the chunk is already cached, just locate it. Resolving
+                    # first would, on a chunk whose in-RAM entry has been
+                    # trimmed, re-read the whole chunk from its segment
+                    # server-side for nothing. Only materialize (same path as
+                    # do_get) on a genuine cold miss.
+                    location = cache_manager.locate_entry(cache_key)
                 if location is None:
                     # Resolving caches the chunk synchronously, so by the time
                     # this returns the bytes are on disk and the second locate

@@ -64,7 +64,10 @@ The `biopb_tensor_server` package is organized into layered subpackages:
   cache. A bare module name here is an adapter; an underscored one is shared
   machinery: `_scale` and `_ome_rois` (format metadata in, common representation
   out), `_handle_reaper`, and `_writable` — the mixin two of the adapters
-  inherit for progress, completion and disposal.
+  inherit for progress, completion and disposal. `cache/segment_index` and
+  `cache/segment_store` are the Arrow segment format itself, so an uploaded
+  `cache://` member writes what the chunk cache writes: the codec and the boot
+  index are shared, the budget and the eviction are not.
 - Top level — the entry points: `cli`, `__main__`, and `logging_config`, which
   configures the `biopb_tensor_server` logger hierarchy for them.
 
@@ -89,7 +92,7 @@ in three collaborators it composes:
 |---|---|---|
 | `server.sources` | `SourceRegistry` |  The `source_id → SourceAdapter` map and adapter-lifecycle |
 | `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
-| `server.uploads` | `UploadManager` | The writable-server upload boundary. `register_source` mints a container under `write_dir`; `add_tensor` puts `<scheme>://<source_id>/<field>` in one, the scheme naming the store format (`zarr://`, `cache://`) and nothing else. Nothing here creates a source, so the catalog row kept in step is always the parent's. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a tombstone its source still holds, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet, detaches aged tombstones, and takes a source left empty for that long. A store on disk is the server's own under `write_dir`, so discard removes it, and one still marked pending at startup is a crashed upload deleted before discovery runs — while a READY one is re-adopted, which is what makes a finished upload outlive the process |
+| `server.uploads` | `UploadManager` | The writable-server upload boundary. `register_source` mints a container under `write_dir`; `add_tensor` puts `<scheme>://<source_id>/<field>` in one, the scheme naming the store format (`zarr://` an OME-Zarr image group, `cache://` the chunk batches as uploaded in segments of their own) and nothing else. Nothing here creates a source, so the catalog row kept in step is always the parent's. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a tombstone its source still holds, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet, detaches aged tombstones, and takes a source left empty for that long. A store on disk is the server's own under `write_dir`, so discard removes it, and one still marked pending at startup is a crashed upload deleted before discovery runs — while a READY one is re-adopted, which is what makes a finished upload outlive the process |
 
 ### Flight protocol (v2)
 

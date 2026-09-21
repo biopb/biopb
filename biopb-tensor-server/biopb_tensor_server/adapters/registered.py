@@ -48,7 +48,17 @@ from biopb_tensor_server.adapters._writable import (
     unsafe_store_name,
     upload_grid,
 )
-from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+from biopb_tensor_server.adapters.cache_member import (
+    create_cache_member,
+    open_cache_member,
+)
+from biopb_tensor_server.adapters.members import (
+    MEMBER_ATTR,
+    MEMBER_DESCRIPTOR,
+    member_attrs,
+    member_marker,
+    read_member_version,
+)
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
     _first_dataset_path,
@@ -58,7 +68,6 @@ from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
     read_zattrs,
     upload_state,
-    with_upload_state,
 )
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.errors import TensorNotFound
@@ -74,6 +83,9 @@ __all__ = [
     "ZarrMember",
     "create_member",
     "create_registered_source",
+    "member_attrs",
+    "open_any_member",
+    "read_member_version",
     "scan_members",
     "scan_registered_sources",
     "sources_root",
@@ -84,11 +96,6 @@ __all__ = [
 #: separately from the sidecar's ``labels`` block so one directory can never be
 #: read as the other kind.
 SOURCE_ATTR = "source"
-
-#: The ``biopb`` sub-block a *member's* ``.zattrs`` carries, beside the upload
-#: marker: ``{"member": {"content_version": "<hex>"}}``. A member's token is its
-#: own, not its source's, so publishing one never moves a sibling's chunk ids.
-MEMBER_ATTR = "member"
 
 #: The schemes ``add_tensor`` takes, each naming a store format and nothing
 #: else. The set is a wire contract, so the table is closed; what each does with
@@ -299,34 +306,6 @@ class RegisterAdapter(SourceAdapter):
 # -- members ------------------------------------------------------------------
 
 
-def member_attrs(content_version: bytes, state: str) -> dict:
-    """The ``biopb`` block a member's root ``.zattrs`` carries.
-
-    The upload marker and the member's own token, in one block: a crash before
-    READY leaves a directory the boot sweep recognizes and removes, and the
-    token is what namespaces the member's chunk ids against a name reclaimed
-    after a discard.
-    """
-    return with_upload_state(
-        {"biopb": {MEMBER_ATTR: {"content_version": content_version.hex()}}}, state
-    )
-
-
-def read_member_version(zattrs: Any) -> Optional[bytes]:
-    """A member's persisted ``content_version``, or None if it records none.
-
-    None is not an error here the way a missing ``source_id`` is: it means the
-    directory is not a member this server minted, and the caller skips it.
-    """
-    if not isinstance(zattrs, dict):
-        return None
-    block = (zattrs.get("biopb") or {}).get(MEMBER_ATTR) or {}
-    try:
-        return bytes.fromhex(block["content_version"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
 def _is_published(member: TensorAdapter) -> bool:
     """Whether *member* may be enumerated: it is READY, or older than this life.
 
@@ -429,7 +408,7 @@ def open_member(group: Path, *, source_id: str, field: str) -> Optional[ZarrMemb
     )
 
 
-def scan_members(adapter: RegisterAdapter) -> Dict[str, ZarrMember]:
+def scan_members(adapter: RegisterAdapter) -> Dict[str, TensorAdapter]:
     """The published members of *adapter*'s collection, keyed by field.
 
     Derived from the directory rather than from a dict something has to
@@ -439,23 +418,34 @@ def scan_members(adapter: RegisterAdapter) -> Dict[str, ZarrMember]:
     it, and this pass skips whatever the sweep has not reached yet rather than
     adopting a half-written tensor.
 
-    Only ``zarr://`` members are here to find. A ``cache://`` member keeps its
-    bytes in the file cache and writes no directory, so it does not outlive the
-    process that uploaded it -- which is what ``docs/upload-model.md`` step 7
-    closes by giving it a store of its own.
+    The format is read off the directory and not off a name -- a zarr member
+    carries ``.zattrs``, a cache member ``descriptor.json`` -- which is what
+    lets the scheme stay out of the stored ``array_id``.
     """
-    members: Dict[str, ZarrMember] = {}
+    members: Dict[str, TensorAdapter] = {}
     for group in sorted(adapter.store.iterdir()):
         if not group.is_dir() or group.name.startswith("."):
             continue
-        zattrs = read_zattrs(group)
-        if upload_state(zattrs) == UPLOAD_PENDING:
+        if upload_state(member_marker(group)) == UPLOAD_PENDING:
             logger.info(f"member: {group} was left pending; not adopted")
             continue
-        member = open_member(group, source_id=adapter.source_id, field=group.name)
+        member = open_any_member(group, source_id=adapter.source_id, field=group.name)
         if member is not None:
             members[group.name] = member
     return members
+
+
+def open_any_member(
+    group: Path, *, source_id: str, field: str
+) -> Optional[TensorAdapter]:
+    """The member at *group*, in whichever format minted it, or None.
+
+    The one dispatch on layout: the adoption pass has a directory and no idea
+    which format it is, and every other caller is in the same position.
+    """
+    if (group / MEMBER_DESCRIPTOR).exists():
+        return open_cache_member(group, source_id=source_id, field=field)
+    return open_member(group, source_id=source_id, field=field)
 
 
 def create_member(
@@ -485,38 +475,15 @@ def create_member(
             f"discard that tensor, or add this one under another name."
         )
     if scheme == "cache":
-        return _create_cache_member(parent, field, desc)
+        return create_cache_member(
+            parent.member_store(field), parent.source_id, field, desc
+        )
     if scheme == "zarr":
         return _create_zarr_member(parent, field, desc)
     raise ValueError(
         f"{scheme!r} is not a store format: use "
         f"{' or '.join(repr(s) for s in STORE_FORMATS)}."
     )
-
-
-def _create_cache_member(
-    parent: RegisterAdapter, field: str, desc: TensorDescriptor
-) -> CachedSourceAdapter:
-    """A ``cache://`` member: the chunks as uploaded, in the file cache.
-
-    No store to mint, so this is a constructor call -- and no directory, so the
-    member does not survive the process. That is the gap step 7 of
-    ``docs/upload-model.md`` closes, by giving the format a store of its own
-    under the collection; until then a ``cache://`` member is what the old
-    ``cache:`` source was, addressed as a tensor.
-    """
-    adapter = CachedSourceAdapter(
-        source_id=parent.source_id,
-        shape=list(desc.shape),
-        dtype=desc.dtype,
-        chunk_shape=list(desc.chunk_shape),
-        dim_labels=list(desc.dim_labels) if desc.dim_labels else None,
-        physical_scale=list(desc.physical_scale) if desc.physical_scale else None,
-        physical_unit=list(desc.physical_unit) if desc.physical_unit else None,
-        content_version=CachedSourceAdapter.next_content_version(),
-    )
-    adapter._tensor_name = field
-    return adapter
 
 
 def _create_zarr_member(

@@ -54,6 +54,7 @@ from biopb_tensor_server.adapters._writable import (
     upload_of,
 )
 from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
+from biopb_tensor_server.adapters.members import member_marker
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.registered import (
     RegisterAdapter,
@@ -62,7 +63,7 @@ from biopb_tensor_server.adapters.registered import (
     scan_registered_sources,
     sources_root,
 )
-from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, read_zattrs, upload_state
+from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
 from biopb_tensor_server.core.errors import (
@@ -445,7 +446,8 @@ class UploadManager:
         constructor, before any source is registered. Returns the count.
 
         The layouts the server mints: the members of a registered source
-        (``sources/<name>.zarr/<field>``), the label sidecars
+        (``sources/<name>.zarr/<field>``, in either store format), the label
+        sidecars
         (``labels/<source_id>/*.zarr``), and -- for one more release -- the
         single-array stores the removed ``ome_zarr:`` kind left directly under
         ``write_dir``. They differ in what the catalog owes them, which is why
@@ -487,8 +489,13 @@ class UploadManager:
 
     @staticmethod
     def _remove_unfinished(store: Path) -> bool:
-        """Delete *store* if it is still pending; whether it was."""
-        if upload_state(read_zattrs(store)) != UPLOAD_PENDING:
+        """Delete *store* if it is still pending; whether it was.
+
+        Through ``member_marker``, so the marker is read off whichever file
+        this store's format keeps it in -- the sweep decides before any adapter
+        is asked to open the directory, and neither format is privileged.
+        """
+        if upload_state(member_marker(store)) != UPLOAD_PENDING:
             return False
         shutil.rmtree(store, ignore_errors=True)
         logger.info(f"Removed unfinished upload store {store}")

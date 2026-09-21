@@ -1054,7 +1054,7 @@ class TestChunkUpload:
         CacheManager.reset()
 
     def test_upload_chunk_cache_backed_preserves_logical_shape(self, tmp_path):
-        """Cache-backed uploads must store shape metadata for reconstruction."""
+        """A cache-backed upload stores the logical shape, for reconstruction."""
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
@@ -1094,8 +1094,10 @@ class TestChunkUpload:
         chunk_id = encode_chunk_id(desc.array_id, bounds)
         if adapter.content_version is not None:
             chunk_id = wrap_content_version(chunk_id, adapter.content_version)
-        cache_manager = CacheManager.get_instance()
-        stored_batch = _read_cached_batch(cache_manager, chunk_id)
+        adapter.set_status(UploadStatus.READY)
+        # Out of the member's own segments, not the chunk cache: a ``cache://``
+        # member keeps the batch it was sent and serves that one back.
+        stored_batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 

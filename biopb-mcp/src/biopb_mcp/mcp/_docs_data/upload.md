@@ -44,11 +44,14 @@ need to get more than one chunk out of a numpy template. The grid is a request,
 not a promise: the returned descriptor is the server's echo, and the grid on it
 is the server's, which may be coarser than the one you asked for.
 
-**The scheme names the store format and nothing else.** `zarr://` writes an
-OME-Zarr image group under the source and is right for anything to keep;
-`cache://` stores the chunks exactly as uploaded. The answered `array_id`
-carries no scheme — the format is a property of the stored tensor, not of its
-name.
+**The scheme names the store format and nothing else.** Both survive a restart;
+they differ in what a read costs. `zarr://` writes an OME-Zarr image group —
+compressed, readable by anything that opens zarr, and the default for anything
+to keep. `cache://` stores each chunk as the Arrow batch you sent and serves
+that batch back with no decode step, on the grid you uploaded it on; it is the
+one to reach for when the result is written once and read hot. The answered
+`array_id` carries no scheme — the format is a property of the stored tensor,
+not of its name.
 
 **Metadata is the source's, not a tensor's.** Axis labels ride on `add_tensor`
 (`dim_labels=`), but the pixel size, units and channel names go to
