@@ -1345,14 +1345,14 @@ public class TensorFlightClient implements AutoCloseable {
      *        because two such names are one directory on Windows and macOS
      * @param metadataJson the source's OME metadata as a JSON object, or null.
      *        Source-scoped: every tensor added to it inherits the physical
-     *        scale, units and channel names from here
+     *        scale, units and channel names from here. Carried verbatim, as on
+     *        {@link #createTensor(String, long[], String, long[], List, String)}
      * @return the {@code source_id}, <b>minted by the server, not derived from
      *         the name</b> -- so it survives the server's {@code write_dir}
      *         moving, and cannot be guessed by a client that did not create it
-     * @throws IllegalArgumentException {@code metadataJson} is not a JSON object
      * @throws org.apache.arrow.flight.FlightRuntimeException the name cannot be
-     *         a directory on some platform this store may be served from, or is
-     *         already taken
+     *         a directory on some platform this store may be served from, is
+     *         already taken, or {@code metadataJson} is not a JSON object
      */
     public String registerSource(String name, String metadataJson) {
         return uploads.registerSource(name, metadataJson);

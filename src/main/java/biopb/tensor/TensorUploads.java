@@ -1,9 +1,7 @@
 package biopb.tensor;
 
-import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
@@ -28,9 +26,6 @@ import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonSyntaxException;
-import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
@@ -62,12 +57,6 @@ final class TensorUploads {
 
     private static final Logger LOGGER = Logger.getLogger(TensorUploads.class.getName());
 
-    /** {@code register_source} is the one action whose body is JSON, not proto. */
-    private static final Gson GSON = new Gson();
-
-    private static final java.lang.reflect.Type JSON_OBJECT =
-            new TypeToken<Map<String, Object>>() {}.getType();
-
     private final FlightSession session;
 
     TensorUploads(FlightSession session) {
@@ -76,36 +65,28 @@ final class TensorUploads {
 
     /** Backs {@link TensorFlightClient#registerSource}; see that method. */
     String registerSource(String name, String metadataJson) {
-        Map<String, Object> metadata;
-        try {
-            metadata = metadataJson == null || metadataJson.isEmpty()
-                    ? new HashMap<>()
-                    : GSON.fromJson(metadataJson, JSON_OBJECT);
-        } catch (JsonSyntaxException error) {
-            throw new IllegalArgumentException(
-                    "registerSource: metadata is not a JSON object: " + metadataJson, error);
-        }
-        // Ordered, so the body is byte-for-byte the same every call: a JSON
-        // payload that reshuffles itself is one nothing can be asserted on.
-        Map<String, Object> request = new LinkedHashMap<>();
-        request.put("name", name == null ? "" : name);
-        // An absent metadata travels as an empty object rather than a JSON
-        // null, so both SDKs send the server the same "no metadata".
-        request.put("metadata", metadata == null ? new HashMap<>() : metadata);
+        RegisterSource request = RegisterSource.newBuilder()
+                .setName(name == null ? "" : name)
+                // Opaque here, as on `createTensor`: the server keeps the OME
+                // tree whole, so a malformed one is its refusal to give, with
+                // the message it gives every other create.
+                .setMetadataJson(metadataJson == null ? "" : metadataJson)
+                .build();
 
-        Iterator<Result> results = session.doAction(new Action(
-                "register_source", GSON.toJson(request).getBytes(StandardCharsets.UTF_8)));
+        Iterator<Result> results =
+                session.doAction(new Action("register_source", request.toByteArray()));
         if (!results.hasNext()) {
             throw new IllegalStateException("register_source: server returned no result");
         }
-        Map<String, Object> answer = GSON.fromJson(
-                new String(results.next().getBody(), StandardCharsets.UTF_8), JSON_OBJECT);
-        Object sourceId = answer == null ? null : answer.get("source_id");
-        if (sourceId == null) {
-            throw new IllegalStateException("register_source: server returned no source_id");
+        RegisterSourceResult answer;
+        try {
+            answer = RegisterSourceResult.parseFrom(results.next().getBody());
+        } catch (InvalidProtocolBufferException error) {
+            throw new IllegalStateException(
+                    "register_source: server returned no RegisterSourceResult", error);
         }
-        LOGGER.info("registerSource: registered " + sourceId);
-        return String.valueOf(sourceId);
+        LOGGER.info("registerSource: registered " + answer.getSourceId());
+        return answer.getSourceId();
     }
 
     /** Backs {@link TensorFlightClient#createTensor}; see that method. */

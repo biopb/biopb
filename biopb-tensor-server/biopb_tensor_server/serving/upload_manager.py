@@ -578,7 +578,7 @@ class UploadManager:
         logger.info(f"Created {prefix} upload: {source_id}")
         return adapter.upload_response(req_desc)
 
-    def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
+    def register_source(self, name: str = "", metadata_json: str = "") -> str:
         """Mint a source a client can add tensors to; answers its ``source_id``.
 
         Registration, not upload: the collection holds no bytes and has no
@@ -586,12 +586,17 @@ class UploadManager:
         What makes it outlive the process is that :meth:`adopt_registered_sources`
         finds it again, not that anything discovers it -- ``write_dir`` stays
         outside every discovery root.
+
+        *metadata_json* is the source's OME block as the request carried it,
+        parsed here rather than by the caller -- the same boundary, and the
+        same refusal, ``create_tensor`` gives a malformed one.
         """
         if self._write_dir is None:
             raise flight.FlightServerError(
                 "register_source: write_dir is not configured, so there is "
                 "nowhere to put a source"
             )
+        metadata = self._parse_metadata_json(metadata_json) if metadata_json else None
         try:
             adapter = create_registered_source(
                 name, metadata, sources_root(self._write_dir)

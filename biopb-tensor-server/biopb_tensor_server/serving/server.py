@@ -65,6 +65,8 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
     PutCommand,
+    RegisterSource,
+    RegisterSourceResult,
     SetUploadStatus,
     TensorTicket,
 )
@@ -1110,17 +1112,11 @@ class TensorFlightServer(flight.FlightServerBase):
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
-            body = action.body.to_pybytes()
-            req = json.loads(body) if body else {}
-            if not isinstance(req, dict):
-                raise flight.FlightServerError(
-                    "register_source takes a JSON object with optional 'name' "
-                    "and 'metadata'"
-                )
-            source_id = self.uploads.register_source(
-                req.get("name") or "", req.get("metadata")
+            req = self._parse(
+                RegisterSource(), action.body.to_pybytes(), "register_source request"
             )
-            yield json.dumps({"source_id": source_id}).encode("utf-8")
+            source_id = self.uploads.register_source(req.name, req.metadata_json)
+            yield RegisterSourceResult(source_id=source_id).SerializeToString()
         elif action.type == "set_upload_status":
             self._authorize(context)
             if not self._writable:

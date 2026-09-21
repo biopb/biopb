@@ -33,6 +33,8 @@ from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
     ChunkUpload,
     PutCommand,
+    RegisterSource,
+    RegisterSourceResult,
     SetUploadStatus,
 )
 
@@ -248,15 +250,18 @@ class UploadSession:
 
     def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
         """Backs TensorFlightClient.register_source; see that method."""
-        body = json.dumps({"name": name, "metadata": metadata or {}}).encode()
-        action = flight.Action("register_source", body)
+        request = RegisterSource(
+            name=name or "",
+            metadata_json=json.dumps(metadata) if metadata else "",
+        )
+        action = flight.Action("register_source", request.SerializeToString())
         results = self._state.client.do_action(action, options=self._state.call_options)
         try:
             result = next(results)
         except StopIteration as exc:
             raise RuntimeError("register_source: server returned no result") from exc
 
-        source_id = json.loads(result.body.to_pybytes())["source_id"]
+        source_id = RegisterSourceResult.FromString(result.body.to_pybytes()).source_id
         logger.info(f"register_source: registered {source_id}")
         return source_id
 

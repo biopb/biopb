@@ -112,3 +112,37 @@ message RoiDelete {
   string array_id = 1;
   string set_name = 2;
 }
+
+// Body of the `register_source` action: mint an empty source to add tensors
+// to. Answered with a RegisterSourceResult.
+//
+// A source, not an upload: it holds no bytes, has no upload state to move, and
+// is readable (and empty) the moment the action returns. What makes it outlive
+// the process is that the server re-registers it at startup, not that anything
+// discovers it -- `write_dir` stays outside every discovery root.
+message RegisterSource {
+  // A directory component the server names the store after, and what a later
+  // `register_source` collides with. Empty asks the server to mint one.
+  //
+  // Compared case-insensitively and NFC-normalized, because two names that
+  // differ only that way are one directory on NTFS, APFS and HFS+ and two on
+  // ext4. Refused if it cannot be a path component on every platform that may
+  // serve this store -- a Windows device name, a trailing space or dot, a
+  // leading dot, and so on.
+  string name = 1;
+
+  // The source's OME metadata, as a JSON object. Source-scoped: every tensor
+  // added to it inherits the physical scale, units and channel names from
+  // here. A string for the same reason `TensorDescriptor.metadata_json` is --
+  // the server keeps the tree whole and does not model it.
+  string metadata_json = 2;
+}
+
+// What `register_source` answers.
+message RegisterSourceResult {
+  // The new source's id. **Minted by the server, not derived from `name`**, so
+  // it survives the server's `write_dir` moving and cannot be guessed by a
+  // client that did not create the source. Recorded in the store, which is
+  // what lets the next server life adopt it under the same id.
+  string source_id = 1;
+}

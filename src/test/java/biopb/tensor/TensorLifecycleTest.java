@@ -562,54 +562,35 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 Assert.assertEquals("registered_abc123", client.registerSource("plate"));
-                Assert.assertEquals(
-                        "{\"name\":\"plate\",\"metadata\":{}}",
-                        server.producer.lastRegisterSource);
+                Assert.assertEquals("plate", server.producer.lastRegisterSource.getName());
             }
         }
     }
 
     @Test
-    public void testRegisterSourceCarriesTheMetadataObject() throws Exception {
+    public void testRegisterSourceCarriesTheMetadataVerbatim() throws Exception {
+        // Opaque, as on createTensor: the client does not parse or re-encode
+        // the OME tree, so what the server stores is what the caller wrote.
+        String metadata = "{\"omero\":{\"channels\":[]}}";
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                client.registerSource("plate", "{\"omero\":{\"channels\":[]}}");
-                Assert.assertTrue(
-                        server.producer.lastRegisterSource,
-                        server.producer.lastRegisterSource.contains(
-                                "\"metadata\":{\"omero\":{\"channels\":[]}}"));
+                client.registerSource("plate", metadata);
+                Assert.assertEquals(
+                        metadata, server.producer.lastRegisterSource.getMetadataJson());
             }
         }
     }
 
     @Test
-    public void testRegisterSourceSendsAnEmptyObjectForNoMetadata() throws Exception {
-        // Not a JSON null: both SDKs have to send the server the same "no
-        // metadata", or the two disagree about what an omitted block means.
+    public void testRegisterSourceSendsAnEmptyStringForNoMetadata() throws Exception {
+        // Both SDKs have to mean the same thing by omitting the block, and for
+        // a proto string field that is "", which the server reads as absent.
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 client.registerSource("");
+                Assert.assertEquals("", server.producer.lastRegisterSource.getName());
                 Assert.assertEquals(
-                        "{\"name\":\"\",\"metadata\":{}}",
-                        server.producer.lastRegisterSource);
-            }
-        }
-    }
-
-    @Test
-    public void testRegisterSourceRefusesMetadataThatIsNotJson() throws Exception {
-        try (TestServer server = new TestServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                try {
-                    client.registerSource("plate", "not json");
-                    Assert.fail("expected IllegalArgumentException");
-                } catch (IllegalArgumentException expected) {
-                    Assert.assertTrue(
-                            expected.getMessage(),
-                            expected.getMessage().contains("not a JSON object"));
-                }
-                // Nothing was sent: the refusal is client-side.
-                Assert.assertNull(server.producer.lastRegisterSource);
+                        "", server.producer.lastRegisterSource.getMetadataJson());
             }
         }
     }
@@ -758,7 +739,7 @@ public class TensorLifecycleTest {
         volatile java.util.Set<String> knownActions = new java.util.HashSet<>(Arrays.asList(
                 "add_source", "remove_source", "roi_prune", "create_tensor",
                 "register_source", "set_upload_status"));
-        volatile String lastRegisterSource = null;
+        volatile RegisterSource lastRegisterSource = null;
         volatile boolean addSourceSendsResult = true;
         volatile int addSourceHeartbeats = 2;
         volatile boolean observedCancel = false;
@@ -828,11 +809,10 @@ public class TensorLifecycleTest {
                         listener.onNext(new Result(lastCreate.toByteArray()));
                         break;
                     case "register_source":
-                        lastRegisterSource =
-                                new String(action.getBody(), StandardCharsets.UTF_8);
-                        listener.onNext(new Result(
-                                "{\"source_id\":\"registered_abc123\"}"
-                                        .getBytes(StandardCharsets.UTF_8)));
+                        lastRegisterSource = RegisterSource.parseFrom(action.getBody());
+                        listener.onNext(new Result(RegisterSourceResult.newBuilder()
+                                .setSourceId("registered_abc123")
+                                .build().toByteArray()));
                         break;
                     default: // "set_upload_status"
                         lastSetStatus = SetUploadStatus.parseFrom(action.getBody());
