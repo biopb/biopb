@@ -917,7 +917,7 @@ class TensorFlightClient:
         ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
         and is what ``upload_array``, ``upload_chunk`` and
         ``set_upload_status`` take. A name is taken while its source exists: a
-        second create under it -- at any of the four states -- is refused. Only
+        second create under it -- at any of the three states -- is refused. Only
         the server's reclaim sweep frees one, after a discarded upload's
         ``upload_ttl``.
         ``set_upload_status`` is what publishes the source and marks it

@@ -59,8 +59,8 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.registered import (
-    adopt_registered_sources as _adopt_registered_sources,
     create_registered_source,
+    scan_registered_sources,
     sources_root,
 )
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, read_zattrs, upload_state
@@ -329,19 +329,9 @@ class UploadManager:
 
         ``sync_source_added`` is an upsert and ``catalog_tensors`` reads the
         sets off the adapter, so re-registering the parent is the whole of it
-        (the ROI re-import it triggers is idempotent). Best-effort for the
-        same reason every other catalog write on this path is: the catalog
-        must not fail the upload.
+        (the ROI re-import it triggers is idempotent).
         """
-        if self._metadata_db is None:
-            return
-        try:
-            self._metadata_db.sync_source_added(parent.source_id, parent)
-        except Exception as e:
-            logger.warning(
-                f"Failed to re-sync {parent.source_id} to the catalog after a "
-                f"label set changed (served, listing stale until reindex): {e}"
-            )
+        self._sync_row(parent.source_id, parent)
 
     def _unlist_label_set(self, parent: Any, field: Optional[str]) -> None:
         """Take a set out of its parent's listing, if it was in it.
@@ -631,7 +621,7 @@ class UploadManager:
         if self._write_dir is None:
             return 0
         count = 0
-        for source_id, adapter in _adopt_registered_sources(
+        for source_id, adapter in scan_registered_sources(
             sources_root(self._write_dir)
         ).items():
             if self._registry.register_new(source_id, adapter) is None:
@@ -647,7 +637,7 @@ class UploadManager:
         return count
 
     def _sync_row(self, source_id: str, adapter: Any) -> None:
-        """Put *source_id* in the catalog; best-effort.
+        """Put *source_id* in the catalog; the one best-effort catalog write.
 
         Best-effort for the reason every catalog write on this path is: the
         row is how a source is *browsable*, and it must not be able to fail the
@@ -660,7 +650,7 @@ class UploadManager:
             self._metadata_db.sync_source_added(source_id, adapter)
         except Exception as e:
             logger.warning(
-                f"Failed to sync registered source {source_id} to catalog "
+                f"Failed to sync {source_id} to the catalog "
                 f"(readable by id, not listed): {e}"
             )
 

@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters.registered import (
-    adopt_registered_sources,
     create_registered_source,
     read_source_block,
+    scan_registered_sources,
     sources_root,
 )
 
@@ -56,7 +56,7 @@ class TestTheIdIsRecorded:
         moved.parent.mkdir(parents=True)
         sources_dir.rename(moved)
 
-        assert list(adopt_registered_sources(moved)) == [original]
+        assert list(scan_registered_sources(moved)) == [original]
 
     def test_the_content_version_is_minted_not_sampled(self, sources_dir):
         """Two sources registered from the same bytes still differ: the token
@@ -70,7 +70,7 @@ class TestBootAdoption:
     def test_a_registered_source_comes_back(self, sources_dir):
         adapter = create_registered_source("plate", {"omero": {"n": 1}}, sources_dir)
 
-        adopted = adopt_registered_sources(sources_dir)
+        adopted = scan_registered_sources(sources_dir)
 
         assert list(adopted) == [adapter.source_id]
         revived = adopted[adapter.source_id]
@@ -82,7 +82,7 @@ class TestBootAdoption:
         which the catalog already models -- an unresolved source carries one."""
         adapter = create_registered_source("empty", None, sources_dir)
 
-        revived = adopt_registered_sources(sources_dir)[adapter.source_id]
+        revived = scan_registered_sources(sources_dir)[adapter.source_id]
         assert revived.is_resolved()
         assert revived.list_tensor_descriptors() == []
 
@@ -96,7 +96,7 @@ class TestBootAdoption:
         stray.mkdir()
         (stray / ".zattrs").write_text(json.dumps({"omero": {}}))
 
-        assert adopt_registered_sources(sources_dir) == {}
+        assert scan_registered_sources(sources_dir) == {}
         assert not stray.exists()
 
     def test_an_unparseable_token_is_removed_too(self, sources_dir):
@@ -105,11 +105,11 @@ class TestBootAdoption:
         zattrs["biopb"]["source"]["content_version"] = "not-hex"
         (adapter.store / ".zattrs").write_text(json.dumps(zattrs))
 
-        assert adopt_registered_sources(sources_dir) == {}
+        assert scan_registered_sources(sources_dir) == {}
         assert not adapter.store.exists()
 
     def test_nothing_to_adopt_is_not_an_error(self, sources_dir):
-        assert adopt_registered_sources(sources_dir) == {}
+        assert scan_registered_sources(sources_dir) == {}
 
     def test_two_directories_recording_one_id_keep_the_first(self, sources_dir):
         """Guessing which is current would be a coin flip, so the second is
@@ -120,7 +120,7 @@ class TestBootAdoption:
         zattrs["biopb"]["source"]["source_id"] = first.source_id
         (second.store / ".zattrs").write_text(json.dumps(zattrs))
 
-        adopted = adopt_registered_sources(sources_dir)
+        adopted = scan_registered_sources(sources_dir)
 
         assert list(adopted) == [first.source_id]
         assert adopted[first.source_id].store == first.store

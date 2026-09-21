@@ -11,7 +11,7 @@ here, the label sidecars beside them, and (later) the fields on a file source.
 One registrar per subtree is what keeps the same bytes from reaching the
 catalog twice, once under the id its parent gives it and once under a
 path-hash id of its own. Registration therefore happens here, at two moments:
-when the client asks, and at boot, when :func:`adopt_registered_sources` walks
+when the client asks, and at boot, when :func:`scan_registered_sources` walks
 what the last life left behind.
 
 That boot half is the whole reason this module exists. A store minted by the
@@ -40,17 +40,22 @@ from typing import Any, Dict, List, Optional
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
-from biopb_tensor_server.adapters._writable import fold_name, unsafe_store_name
+from biopb_tensor_server.adapters._writable import (
+    folded_match,
+    taken_store_name,
+    unsafe_store_name,
+)
 from biopb_tensor_server.adapters.zarr import read_zattrs
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.source_registry import close_adapter
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "SOURCE_ATTR",
     "RegisterAdapter",
-    "adopt_registered_sources",
+    "scan_registered_sources",
     "create_registered_source",
     "sources_root",
 ]
@@ -103,12 +108,15 @@ def source_attrs(source_id: str, content_version: bytes) -> dict:
 
 
 def read_source_block(store: Path) -> Optional[Dict[str, Any]]:
-    """The ``(source_id, content_version)`` a collection records, or None.
+    """What a collection records: its id, its token, and its own metadata.
 
     None for anything that is not a registered source: no ``.zattrs``, no
     ``biopb`` block, or a token that will not parse. The caller sweeps those
     rather than adopting them -- an id that cannot be read is an id the catalog
     row cannot be matched to.
+
+    The metadata rides along so adoption parses each ``.zattrs`` once, the way
+    ``labels.sidecar_label_sets`` hands its own read down to ``open_label_set``.
     """
     zattrs = read_zattrs(store)
     if zattrs is None:
@@ -121,13 +129,12 @@ def read_source_block(store: Path) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(source_id, str) or not source_id:
         return None
-    return {"source_id": source_id, "content_version": content_version}
-
-
-def _ome_metadata(store: Path) -> dict:
-    """The source's own metadata: its ``.zattrs`` minus the server's block."""
-    zattrs = read_zattrs(store) or {}
-    return {k: v for k, v in zattrs.items() if k != "biopb"}
+    return {
+        "source_id": source_id,
+        "content_version": content_version,
+        # The source's own metadata is everything that is not the server's.
+        "metadata": {k: v for k, v in zattrs.items() if k != "biopb"},
+    }
 
 
 class RegisterAdapter(SourceAdapter):
@@ -158,7 +165,7 @@ class RegisterAdapter(SourceAdapter):
         self.store = Path(store)
         self._source_url = str(self.store)
         self._content_version = content_version
-        self._metadata = metadata if metadata is not None else _ome_metadata(self.store)
+        self._metadata = metadata or {}
         self._members: Dict[str, TensorAdapter] = {}
 
     # ---- the source surface ------------------------------------------------
@@ -176,7 +183,7 @@ class RegisterAdapter(SourceAdapter):
         return dict(self._metadata)
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
-        field = self._field_of(tensor_id)
+        field = self._within_source_field(tensor_id)
         if field is None:
             # No field, and the source's default is its first member -- of
             # which an empty collection has none. Named as a resolution miss
@@ -198,23 +205,19 @@ class RegisterAdapter(SourceAdapter):
             )
         return member
 
-    def _field_of(self, tensor_id: Optional[str]) -> Optional[str]:
-        if not tensor_id or tensor_id == self.source_id:
-            return None
-        prefix = f"{self.source_id}/"
-        return tensor_id[len(prefix) :] if tensor_id.startswith(prefix) else tensor_id
-
     def close(self) -> None:
         for member in self._members.values():
-            close = getattr(member, "close", None)
-            if close is not None:
-                try:
-                    close()
-                except Exception:  # pragma: no cover - teardown is best effort
-                    logger.debug(f"closing member of {self.source_id}", exc_info=True)
+            close_adapter(member)
         self._members.clear()
 
     # ---- members -----------------------------------------------------------
+
+    # The member API below has no production caller yet: ``add_tensor`` fills a
+    # registered source and does not exist on this branch, so an adopted source
+    # lists zero tensors. Adoption will grow a member walk of its own -- the
+    # shape every other multi-tensor source here uses, deriving members from
+    # the directory rather than from a dict something has to remember to fill
+    # (``OmeZarrAdapter._enumerate_hcs_fields``, ``labels.sidecar_label_sets``).
 
     @property
     def members(self) -> Dict[str, TensorAdapter]:
@@ -230,12 +233,10 @@ class RegisterAdapter(SourceAdapter):
     def taken_field(self, field: str) -> Optional[str]:
         """The member *field* would collide with, folded, or None.
 
-        Folded because NTFS, APFS and HFS+ are case-insensitive and HFS+ stores
-        NFD: two fields differing only that way are one directory there and two
-        here (``fold_name``).
+        Not wired to a request yet: ``add_tensor`` is the caller, and it does
+        not exist on this branch (``docs/upload-model.md`` step 5).
         """
-        folded = fold_name(field)
-        return next((f for f in self._members if fold_name(f) == folded), None)
+        return folded_match(field, self._members)
 
     # ---- the store ---------------------------------------------------------
 
@@ -259,18 +260,13 @@ def create_registered_source(
 
     sources_dir = Path(sources_dir)
     sources_dir.mkdir(parents=True, exist_ok=True)
-    # Folded before the mkdir: on a case-insensitive filesystem the exclusive
-    # create below would catch this by itself, on ext4 it would not, and the
-    # difference is a source that splits in two on the next host to serve this
-    # write_dir.
-    folded = fold_name(zarr_name)
-    for existing in sources_dir.glob(f"*{_SUFFIX}"):
-        if fold_name(existing.name[: -len(_SUFFIX)]) == folded:
-            raise ValueError(
-                f"register_source: {existing} already exists, and two names "
-                f"differing only by case or accent form are one directory on "
-                f"Windows and macOS. Discard that source, or use another name."
-            )
+    taken = taken_store_name(sources_dir, zarr_name, _SUFFIX)
+    if taken is not None:
+        raise ValueError(
+            f"register_source: {taken} already exists, and two names differing "
+            f"only by case or accent form are one directory on Windows and "
+            f"macOS. Discard that source, or use another name."
+        )
 
     store = sources_dir / f"{zarr_name}{_SUFFIX}"
     try:
@@ -293,7 +289,7 @@ def create_registered_source(
     return RegisterAdapter(source_id, store, content_version, metadata or {})
 
 
-def adopt_registered_sources(sources_dir: Path) -> Dict[str, RegisterAdapter]:
+def scan_registered_sources(sources_dir: Path) -> Dict[str, RegisterAdapter]:
     """Every registered source under *sources_dir*, keyed by ``source_id``.
 
     The boot half of registration, and the half whose absence made a finished
@@ -320,5 +316,7 @@ def adopt_registered_sources(sources_dir: Path) -> Dict[str, RegisterAdapter]:
                 f"from {adopted[source_id].store}"
             )
             continue
-        adopted[source_id] = RegisterAdapter(source_id, store, block["content_version"])
+        adopted[source_id] = RegisterAdapter(
+            source_id, store, block["content_version"], block["metadata"]
+        )
     return adopted

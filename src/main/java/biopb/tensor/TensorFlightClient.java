@@ -1326,6 +1326,45 @@ public class TensorFlightClient implements AutoCloseable {
      * @param omeMetadataJson optional OME metadata, as a JSON object
      * @return the new source's descriptor
      */
+    public TensorDescriptor createTensor(
+            String sourceName,
+            long[] shape,
+            String dtype,
+            long[] chunkShape,
+            List<String> dimLabels,
+            String omeMetadataJson) {
+        return uploads.createTensor(sourceName, shape, dtype, chunkShape, dimLabels, omeMetadataJson);
+    }
+
+    /**
+     * Declare a source shaped like an array you already hold.
+     *
+     * <p><b>Experimental</b>, with the rest of the upload API. The template's
+     * shape and pixel type stand in for the explicit {@code shape}/{@code dtype}
+     * of {@link #createTensor(String, long[], String, long[], List, String)};
+     * it is the array about to be uploaded, or one shaped like it.
+     *
+     * @param sourceName as in
+     *        {@link #createTensor(String, long[], String, long[], List, String)}
+     * @param template the array to be uploaded, or one shaped like it
+     * @param chunkShape the upload grid; null or empty means one chunk
+     * @param dimLabels optional dimension labels
+     * @param omeMetadataJson optional OME metadata, as a JSON object
+     * @param <T> the pixel type
+     * @return the new source's descriptor
+     */
+    public <T extends NativeType<T> & RealType<T>> TensorDescriptor createTensor(
+            String sourceName,
+            RandomAccessibleInterval<T> template,
+            long[] chunkShape,
+            List<String> dimLabels,
+            String omeMetadataJson) {
+        long[] shape = new long[template.numDimensions()];
+        template.dimensions(shape);
+        return uploads.createTensor(sourceName, shape, TensorUploads.numpyDtype(template.getType()),
+                chunkShape, dimLabels, omeMetadataJson);
+    }
+
     /**
      * Mint an empty source on the server, and answer its {@code source_id}.
      *
@@ -1367,45 +1406,6 @@ public class TensorFlightClient implements AutoCloseable {
      */
     public String registerSource(String name) {
         return registerSource(name, null);
-    }
-
-    public TensorDescriptor createTensor(
-            String sourceName,
-            long[] shape,
-            String dtype,
-            long[] chunkShape,
-            List<String> dimLabels,
-            String omeMetadataJson) {
-        return uploads.createTensor(sourceName, shape, dtype, chunkShape, dimLabels, omeMetadataJson);
-    }
-
-    /**
-     * Declare a source shaped like an array you already hold.
-     *
-     * <p><b>Experimental</b>, with the rest of the upload API. The template's
-     * shape and pixel type stand in for the explicit {@code shape}/{@code dtype}
-     * of {@link #createTensor(String, long[], String, long[], List, String)};
-     * it is the array about to be uploaded, or one shaped like it.
-     *
-     * @param sourceName as in
-     *        {@link #createTensor(String, long[], String, long[], List, String)}
-     * @param template the array to be uploaded, or one shaped like it
-     * @param chunkShape the upload grid; null or empty means one chunk
-     * @param dimLabels optional dimension labels
-     * @param omeMetadataJson optional OME metadata, as a JSON object
-     * @param <T> the pixel type
-     * @return the new source's descriptor
-     */
-    public <T extends NativeType<T> & RealType<T>> TensorDescriptor createTensor(
-            String sourceName,
-            RandomAccessibleInterval<T> template,
-            long[] chunkShape,
-            List<String> dimLabels,
-            String omeMetadataJson) {
-        long[] shape = new long[template.numDimensions()];
-        template.dimensions(shape);
-        return uploads.createTensor(sourceName, shape, TensorUploads.numpyDtype(template.getType()),
-                chunkShape, dimLabels, omeMetadataJson);
     }
 
     /**

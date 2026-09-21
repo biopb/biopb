@@ -35,7 +35,17 @@ import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Set, Tuple
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -101,6 +111,21 @@ _STATE_RANK: Dict[UploadStatus, int] = {
 #: What ``set_upload_status`` may ask for. ``PENDING`` is where an upload
 #: starts and nothing returns it there, so it is not settable either.
 SETTABLE_STATES = (UploadStatus.READY, UploadStatus.DISCARDED)
+
+
+def unsettable_state_message(target: Any) -> str:
+    """The refusal for a state nothing can be moved to.
+
+    Built here because both the wire boundary (which refuses before reaching an
+    adapter) and :meth:`WritableSource.set_status` (which refuses an in-process
+    caller) answer the same question, and a caller should not be able to tell
+    which one turned it down.
+    """
+    name = getattr(target, "value", target)
+    return (
+        f"set_upload_status: {name} is not a state an upload can be moved to; "
+        f"use one of {', '.join(state.value for state in SETTABLE_STATES)}."
+    )
 
 
 def unknown_upload_status(source_id: str) -> Dict[str, Any]:
@@ -171,6 +196,36 @@ def fold_name(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
 
+def folded_match(name: str, candidates: Iterable[str]) -> Optional[str]:
+    """The candidate *name* collides with under :func:`fold_name`, or None.
+
+    The one application of the folding rule, so a fifth store kind cannot copy
+    whichever of four hand-rolled scans it happened to find. Returns the
+    colliding spelling rather than a bool: the refusal is far more useful when
+    it can say what the name is already taken *as*.
+    """
+    folded = fold_name(name)
+    return next((c for c in candidates if fold_name(c) == folded), None)
+
+
+def taken_store_name(
+    directory: Path, name: str, suffix: str = ".zarr"
+) -> Optional[Path]:
+    """The store in *directory* that *name* would collide with, or None.
+
+    The on-disk half of :func:`folded_match`. An exclusive ``mkdir`` catches an
+    exact repeat by itself, and on a case-insensitive filesystem it catches the
+    folded ones too -- but not on ext4, where the store would then be one
+    directory of two on the next host to serve this ``write_dir``. So the fold
+    is checked here rather than left to the filesystem.
+    """
+    if not directory.is_dir():
+        return None
+    stems = {p.name[: -len(suffix)]: p for p in directory.glob(f"*{suffix}")}
+    hit = folded_match(name, stems)
+    return stems[hit] if hit is not None else None
+
+
 def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     """Why *name* cannot be a store's directory name, or None if it can.
 
@@ -233,6 +288,12 @@ def unsafe_field_name(name: str) -> Optional[str]:
 
     A field is a path component of its source's group, so it takes the store
     rules with no extension of its own, plus the reserved words.
+
+    **Not wired to a request yet.** ``add_tensor`` is the caller and it does
+    not exist on this branch, so nothing currently refuses a field named
+    ``labels`` -- there is no way to ask for one. Landed here because the rule
+    is what decides the wire id stays ``<array_id>/labels/<name>``, and that
+    decision is load-bearing for everything else in the design.
     """
     if fold_name(name) in RESERVED_FIELD_NAMES:
         return (
@@ -529,12 +590,8 @@ class WritableSource:
         """
         if target is UploadStatus.DISCARDED:
             return self.discard(reason)
-        if target not in _STATE_RANK or target is UploadStatus.PENDING:
-            raise UploadTransitionError(
-                f"set_upload_status: {target} is not a state an upload can be "
-                f"moved to; use one of "
-                f"{', '.join(state.value for state in SETTABLE_STATES)}."
-            )
+        if target not in SETTABLE_STATES:
+            raise UploadTransitionError(unsettable_state_message(target))
         progress = self._upload
         if progress is None:
             return unknown_upload_status(self.source_id)
@@ -555,17 +612,20 @@ class WritableSource:
                     f"cannot go back to {target.value}."
                 )
 
-        if _STATE_RANK[current] < _STATE_RANK[UploadStatus.READY]:
-            try:
-                self._publish_store()
-            except OSError:
-                with progress.lock:
-                    self._raise_if_discarded_locked(progress)
-                raise
+        # Unconditional: the only settable non-DISCARDED target is READY, and
+        # an upload already there returned above, so *current* is PENDING here.
+        try:
+            self._publish_store()
+        except OSError:
+            with progress.lock:
+                self._raise_if_discarded_locked(progress)
+            raise
 
         with progress.lock:
             self._raise_if_discarded_locked(progress)
-            if _STATE_RANK[progress.status] < _STATE_RANK[target]:
+            # Re-checked after the unlocked publish above, not a ladder test:
+            # what this catches is a status that moved while the lock was down.
+            if progress.status is not target:
                 progress.status = target
                 progress.touch()
                 logger.info(
@@ -633,11 +693,6 @@ class WritableSource:
             self._raise_if_discarded_locked(progress)
             if progress.is_sealed:
                 raise UploadSealedError(self.source_id)
-
-    def resolve_chunk_data(self, chunk_id, cache_manager=None):
-        """Every read of an upload passes the gate, then reads as usual."""
-        self.check_readable()
-        return super().resolve_chunk_data(chunk_id, cache_manager)
 
     def check_readable(self) -> None:
         """The two ways a read can arrive at an upload that cannot answer it.

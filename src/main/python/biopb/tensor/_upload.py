@@ -25,6 +25,7 @@ from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
 from biopb.tensor._session import (
     _unknown_upload_status,
     _upload_status_dict,
+    do_action_one_result,
     extra_info,
 )
 from biopb.tensor._tls import NO_TLS, TlsTrust
@@ -254,14 +255,12 @@ class UploadSession:
             name=name or "",
             metadata_json=json.dumps(metadata) if metadata else "",
         )
-        action = flight.Action("register_source", request.SerializeToString())
-        results = self._state.client.do_action(action, options=self._state.call_options)
-        try:
-            result = next(results)
-        except StopIteration as exc:
-            raise RuntimeError("register_source: server returned no result") from exc
-
-        source_id = RegisterSourceResult.FromString(result.body.to_pybytes()).source_id
+        body = do_action_one_result(
+            self._state,
+            flight.Action("register_source", request.SerializeToString()),
+            unavailable_hint="Registering a source is unavailable",
+        )
+        source_id = RegisterSourceResult.FromString(body).source_id
         logger.info(f"register_source: registered {source_id}")
         return source_id
 

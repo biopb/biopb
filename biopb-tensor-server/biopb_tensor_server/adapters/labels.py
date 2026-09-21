@@ -50,7 +50,10 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
-from biopb_tensor_server.adapters._writable import fold_name, unsafe_store_name
+from biopb_tensor_server.adapters._writable import (
+    folded_match,
+    unsafe_store_name,
+)
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
     _first_dataset_path,
@@ -419,16 +422,8 @@ def create_label_upload(
     # Folded, because NTFS, APFS and HFS+ are case-insensitive and HFS+ stores
     # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
     # there, so an unfolded check mints a second set that the next boot on such
-    # a host cannot tell from the first (``fold_name``).
-    folded = fold_name(field)
-    taken = next(
-        (
-            existing
-            for existing in (*parent.label_sets, *parent.label_uploads)
-            if fold_name(existing) == folded
-        ),
-        None,
-    )
+    # a host cannot tell from the first.
+    taken = folded_match(field, (*parent.label_sets, *parent.label_uploads))
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A set's name is taken "

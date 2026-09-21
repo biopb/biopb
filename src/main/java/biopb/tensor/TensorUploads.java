@@ -63,6 +63,25 @@ final class TensorUploads {
         this.session = session;
     }
 
+    /**
+     * Run a single-result {@code doAction} and hand back its body.
+     *
+     * <p>The three upload actions all want the same four lines -- dispatch,
+     * refuse an empty stream, take the one result -- and each spelled them
+     * again, so a change to how an empty stream reads had three places to
+     * reach. The proto parse stays at the call site, because only it knows
+     * which message it asked for.
+     *
+     * @throws IllegalStateException the server answered with no result at all
+     */
+    private byte[] actionOneResult(String type, byte[] body) {
+        Iterator<Result> results = session.doAction(new Action(type, body));
+        if (!results.hasNext()) {
+            throw new IllegalStateException(type + ": server returned no result");
+        }
+        return results.next().getBody();
+    }
+
     /** Backs {@link TensorFlightClient#registerSource}; see that method. */
     String registerSource(String name, String metadataJson) {
         RegisterSource request = RegisterSource.newBuilder()
@@ -73,14 +92,10 @@ final class TensorUploads {
                 .setMetadataJson(metadataJson == null ? "" : metadataJson)
                 .build();
 
-        Iterator<Result> results =
-                session.doAction(new Action("register_source", request.toByteArray()));
-        if (!results.hasNext()) {
-            throw new IllegalStateException("register_source: server returned no result");
-        }
         RegisterSourceResult answer;
         try {
-            answer = RegisterSourceResult.parseFrom(results.next().getBody());
+            answer = RegisterSourceResult.parseFrom(
+                    actionOneResult("register_source", request.toByteArray()));
         } catch (InvalidProtocolBufferException error) {
             throw new IllegalStateException(
                     "register_source: server returned no RegisterSourceResult", error);
@@ -113,12 +128,8 @@ final class TensorUploads {
             request.setMetadataJson(metadataJson);
         }
 
-        Iterator<Result> results = session.doAction(
-                new Action("create_tensor", request.build().toByteArray()));
-        if (!results.hasNext()) {
-            throw new IllegalStateException("create_tensor: server returned no result");
-        }
-        TensorDescriptor created = TensorChunkCodec.parseDescriptor(results.next().getBody());
+        TensorDescriptor created = TensorChunkCodec.parseDescriptor(
+                actionOneResult("create_tensor", request.build().toByteArray()));
         LOGGER.info("createTensor: created " + created.getArrayId());
         return created;
     }
@@ -244,14 +255,10 @@ final class TensorUploads {
                 .setState(state)
                 .setReason(reason == null ? "" : reason)
                 .build();
-        Iterator<Result> results =
-                session.doAction(new Action("set_upload_status", request.toByteArray()));
-        if (!results.hasNext()) {
-            throw new IllegalStateException("set_upload_status: server returned no result");
-        }
         UploadStatus status;
         try {
-            status = UploadStatus.parseFrom(results.next().getBody());
+            status = UploadStatus.parseFrom(
+                    actionOneResult("set_upload_status", request.toByteArray()));
         } catch (InvalidProtocolBufferException error) {
             throw new IllegalStateException(
                     "set_upload_status: server returned no UploadStatus", error);

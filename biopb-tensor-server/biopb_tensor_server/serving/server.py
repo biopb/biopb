@@ -73,9 +73,9 @@ from biopb.tensor.ticket_pb2 import (
 from google.protobuf.message import DecodeError, Message
 
 from biopb_tensor_server.adapters._writable import (
-    SETTABLE_STATES,
     UploadProgress,
     UploadStatus,
+    unsettable_state_message,
     upload_of,
 )
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
@@ -515,9 +515,10 @@ class TensorFlightServer(flight.FlightServerBase):
         self.uploads.discard_unfinished_stores()
         # ...and what it left *finished* comes back. Nothing discovers
         # write_dir, so this pass is the only thing that re-registers a source
-        # the server minted in an earlier life (biopb/biopb#1048). After the
-        # sweep, so a collection the sweep emptied is adopted as the empty
-        # source it now is.
+        # the server minted in an earlier life (biopb/biopb#1048). Still a
+        # separate walk over a separate subtree -- the sweep takes the
+        # single-store kinds, this takes the collections -- and folding the two
+        # into one pass is what the member sweep will want.
         self.uploads.adopt_registered_sources()
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
         # stopped in ``shutdown``.
@@ -1128,9 +1129,7 @@ class TensorFlightServer(flight.FlightServerBase):
             state = _UPLOAD_TARGETS.get(req.state)
             if state is None:
                 raise flight.FlightServerError(
-                    f"set_upload_status: {UploadStatusPb.State.Name(req.state)} is "
-                    f"not a state an upload can be moved to; use one of "
-                    f"{', '.join(s.value for s in SETTABLE_STATES)}."
+                    unsettable_state_message(UploadStatusPb.State.Name(req.state))
                 )
             status = self.uploads.set_status(req.array_id, state, req.reason)
             reply = UploadStatusPb()
@@ -1807,7 +1806,7 @@ class TensorFlightServer(flight.FlightServerBase):
         #
         # A discarded source answers too. The adapter stays registered as a
         # tombstone and describe is not a chunk read, so it never reaches
-        # `_refuse_if_discarded` -- a poller learns the reason instead of
+        # `check_readable` -- a poller learns the reason instead of
         # meeting a dead call.
         if UPLOAD_STATUS in mask:
             # The tensor first: a label set is a tensor of a source that is not

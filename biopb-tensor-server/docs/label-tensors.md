@@ -166,7 +166,7 @@ ignorant of sidecars:
   `get_embedded_rois` (`OmeZarrAdapter` reads its NGFF `labels/` group there);
   `attach_label_set` / `detach_label_set` are what the registry's
   `on_register` hook (finished sidecars, `sidecar_attacher`) and the upload
-  kind (at `finish`; `delete`) use; `label_sets` is the merged view, every
+  kind (at READY; discard) use; `label_sets` is the merged view, every
   set normalized like any tensor and checked against the image it binds to
   (`label_binding_error`, which the upload's create calls too, so one rule
   answers for every origin).

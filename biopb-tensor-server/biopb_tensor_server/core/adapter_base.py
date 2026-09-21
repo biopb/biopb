@@ -1539,7 +1539,13 @@ class TensorAdapter(SourceAdapter):
                 :meth:`check_chunk_version`, called first, before any bytes
                 are read.
         """
+        # The two read gates, together and ahead of any I/O. Here rather than
+        # in a writable mixin's override because that made the gate depend on
+        # an adapter's base order, and on every override of this method
+        # remembering to call up; both defaults are no-ops, so every adapter
+        # is covered and a new one cannot forget.
         self.check_chunk_version(chunk_id)
+        self.check_readable()
         array_id, bounds = decode_chunk_id(chunk_id)
 
         # Check if scaled chunk (has extra bytes after bounds encoding)

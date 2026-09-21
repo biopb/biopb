@@ -113,7 +113,7 @@ class TestCapabilityHolderCanPoll:
 class TestDiscarded:
     def test_a_tombstone_still_answers_with_its_reason(self, client, writable_server):
         """Describe is not a chunk read, so it never reaches
-        `_refuse_if_discarded` -- a poller learns why instead of meeting a dead
+        `check_readable` -- a poller learns why instead of meeting a dead
         call. Its bytes stay unreadable; only the status is."""
         desc = _make(client, shape=(2, 2), chunk=(2, 2))
         writable_server.uploads.discard(desc.array_id, "job died")
