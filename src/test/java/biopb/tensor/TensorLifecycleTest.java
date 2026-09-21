@@ -556,6 +556,65 @@ public class TensorLifecycleTest {
     }
 
     @Test
+    public void testRegisterSourceAnswersTheMintedId() throws Exception {
+        // The id is the server's: the client sends a name and gets back
+        // something it could not have derived from it.
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertEquals("registered_abc123", client.registerSource("plate"));
+                Assert.assertEquals(
+                        "{\"name\":\"plate\",\"metadata\":{}}",
+                        server.producer.lastRegisterSource);
+            }
+        }
+    }
+
+    @Test
+    public void testRegisterSourceCarriesTheMetadataObject() throws Exception {
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.registerSource("plate", "{\"omero\":{\"channels\":[]}}");
+                Assert.assertTrue(
+                        server.producer.lastRegisterSource,
+                        server.producer.lastRegisterSource.contains(
+                                "\"metadata\":{\"omero\":{\"channels\":[]}}"));
+            }
+        }
+    }
+
+    @Test
+    public void testRegisterSourceSendsAnEmptyObjectForNoMetadata() throws Exception {
+        // Not a JSON null: both SDKs have to send the server the same "no
+        // metadata", or the two disagree about what an omitted block means.
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.registerSource("");
+                Assert.assertEquals(
+                        "{\"name\":\"\",\"metadata\":{}}",
+                        server.producer.lastRegisterSource);
+            }
+        }
+    }
+
+    @Test
+    public void testRegisterSourceRefusesMetadataThatIsNotJson() throws Exception {
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                try {
+                    client.registerSource("plate", "not json");
+                    Assert.fail("expected IllegalArgumentException");
+                } catch (IllegalArgumentException expected) {
+                    Assert.assertTrue(
+                            expected.getMessage(),
+                            expected.getMessage().contains("not a JSON object"));
+                }
+                // Nothing was sent: the refusal is client-side.
+                Assert.assertNull(server.producer.lastRegisterSource);
+            }
+        }
+    }
+
+    @Test
     public void testSetUploadStatusSealsAndReportsTheStatus() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
@@ -697,7 +756,9 @@ public class TensorLifecycleTest {
         private final BufferAllocator allocator;
 
         volatile java.util.Set<String> knownActions = new java.util.HashSet<>(Arrays.asList(
-                "add_source", "remove_source", "roi_prune", "create_tensor", "set_upload_status"));
+                "add_source", "remove_source", "roi_prune", "create_tensor",
+                "register_source", "set_upload_status"));
+        volatile String lastRegisterSource = null;
         volatile boolean addSourceSendsResult = true;
         volatile int addSourceHeartbeats = 2;
         volatile boolean observedCancel = false;
@@ -765,6 +826,13 @@ public class TensorLifecycleTest {
                     case "create_tensor":
                         lastCreate = TensorDescriptor.parseFrom(action.getBody());
                         listener.onNext(new Result(lastCreate.toByteArray()));
+                        break;
+                    case "register_source":
+                        lastRegisterSource =
+                                new String(action.getBody(), StandardCharsets.UTF_8);
+                        listener.onNext(new Result(
+                                "{\"source_id\":\"registered_abc123\"}"
+                                        .getBytes(StandardCharsets.UTF_8)));
                         break;
                     default: // "set_upload_status"
                         lastSetStatus = SetUploadStatus.parseFrom(action.getBody());

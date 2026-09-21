@@ -1326,6 +1326,49 @@ public class TensorFlightClient implements AutoCloseable {
      * @param omeMetadataJson optional OME metadata, as a JSON object
      * @return the new source's descriptor
      */
+    /**
+     * Mint an empty source on the server, and answer its {@code source_id}.
+     *
+     * <p>A source is a container for tensors; this makes one, and
+     * {@code add_tensor} fills it. It is registered and readable the moment
+     * this returns, with an empty tensor list -- which the catalog models the
+     * same way it models a cloud source nobody has resolved yet.
+     *
+     * <p>Unlike an upload, a registered source has no state to move: it is not
+     * {@code PENDING}, nothing publishes it, and it outlives the process
+     * because the server re-registers it at startup rather than because
+     * anything discovers it.
+     *
+     * @param name a directory component the server names the store after, and
+     *        what a later {@code registerSource} collides with; empty asks the
+     *        server to mint one. Compared case- and accent-insensitively,
+     *        because two such names are one directory on Windows and macOS
+     * @param metadataJson the source's OME metadata as a JSON object, or null.
+     *        Source-scoped: every tensor added to it inherits the physical
+     *        scale, units and channel names from here
+     * @return the {@code source_id}, <b>minted by the server, not derived from
+     *         the name</b> -- so it survives the server's {@code write_dir}
+     *         moving, and cannot be guessed by a client that did not create it
+     * @throws IllegalArgumentException {@code metadataJson} is not a JSON object
+     * @throws org.apache.arrow.flight.FlightRuntimeException the name cannot be
+     *         a directory on some platform this store may be served from, or is
+     *         already taken
+     */
+    public String registerSource(String name, String metadataJson) {
+        return uploads.registerSource(name, metadataJson);
+    }
+
+    /**
+     * Mint an empty source with no metadata; see
+     * {@link #registerSource(String, String)}.
+     *
+     * @param name as in {@link #registerSource(String, String)}
+     * @return the server-minted {@code source_id}
+     */
+    public String registerSource(String name) {
+        return registerSource(name, null);
+    }
+
     public TensorDescriptor createTensor(
             String sourceName,
             long[] shape,

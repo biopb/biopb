@@ -34,6 +34,7 @@ disk caching are deliberately out of scope until the core protocol is stable.
 | `add_source` / `remove_source` | `addSource` / `removeSource` |
 | `label_sets` | `labelSets` |
 | `list_rois` / `put_rois` / `delete_rois` / `prune_rois` | `listRois` / `putRois` / `deleteRois` / `pruneRois` |
+| `register_source` | `registerSource` |
 | `create_tensor` / `upload_array` / `upload_chunk` / `set_upload_status` | `createTensor` / `uploadArray` / `uploadChunk` / `setUploadStatus` |
 
 ### The two version gates
