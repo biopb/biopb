@@ -346,17 +346,13 @@ class ZarrAdapter(WritableSource, TensorAdapter):
     def _store_chunk(self, bounds, data, expected_shape, dtype) -> None:
         """Grid-aligned write: *bounds* must be whole zarr chunks.
 
-        One assignment for the whole of *bounds*, however many store chunks
-        that is. A store this server minted is chunked on the grid the planner
-        mints on (``_writable.upload_grid``), so there it is one; any other
-        zarr's blocks may be finer, and the planner's grid is a whole multiple
-        of them either way (``default_transfer_chunk_shape``).
-
-        Alignment is the store's invariant rather than a rule a client can
-        trip: a write takes a planned ticket and the planner mints no other
-        bounds (``docs/upload-model.md`` step 4). What it rules out is a
-        read-modify-write of a chunk some other write also touches -- zarr
-        locks nothing across writers.
+        In practice exactly one: a store this server minted is chunked on the
+        grid the planner mints on (``_writable.upload_grid``), and a write
+        takes a planned ticket (``docs/upload-model.md`` step 4). The check is
+        written as *whole chunks* rather than *one chunk* because that is the
+        property that makes the write safe -- anything else is a
+        read-modify-write of a chunk another write also touches, and zarr locks
+        nothing across writers -- and it holds however the two grids relate.
         """
         grid = list(self.zarr_array.chunks)
         shape = list(self.zarr_array.shape)
