@@ -22,7 +22,11 @@ import signal
 import socket
 import sys
 
-from biopb._locations import MCP_SESSION_LOG_ENV
+from biopb._locations import (
+    LAUNCH_TOKEN_FIELD,
+    MCP_LAUNCH_TOKEN_ENV,
+    MCP_SESSION_LOG_ENV,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,12 @@ ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 # a viewer it launches. Bound from the core SDK rather than repeated, since it is
 # now three processes across two packages that must agree on one string.
 ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
+
+# Env var naming the launch this viewer belongs to, set by the control when it
+# spawns one from the dashboard. Echoed into our registry record so that
+# launcher can pick our session out of the registry; absent for every other way
+# a viewer starts (`biopb mcp view` in a terminal), and then simply not recorded.
+ENV_LAUNCH_TOKEN = MCP_LAUNCH_TOKEN_ENV
 
 
 def _report_port(path, port):
@@ -82,6 +92,13 @@ def _register_view_session(port):
     """
     from biopb import _sessions
 
+    # Whoever launched us gets their token back on the record, so they can
+    # recognise *this* session rather than guessing from a pid they may not even
+    # hold (see MCP_LAUNCH_TOKEN_ENV). Nothing else reads it, and a viewer
+    # started by hand carries none.
+    launched_by = os.environ.get(ENV_LAUNCH_TOKEN)
+    extra = {LAUNCH_TOKEN_FIELD: launched_by} if launched_by else {}
+
     try:
         session_id = _sessions.new_session_id()
         _sessions.register(
@@ -89,6 +106,7 @@ def _register_view_session(port):
             port=port,
             pid=os.getpid(),
             mcp_url=f"http://127.0.0.1:{port}/mcp",
+            **extra,
         )
     except Exception:
         logger.warning("Could not register this session", exc_info=True)

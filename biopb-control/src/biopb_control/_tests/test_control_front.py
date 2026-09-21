@@ -1168,6 +1168,19 @@ def _launchable(monkeypatch, tmp_path, argv):
     monkeypatch.setattr(_control, "_viewer_argv", lambda: argv)
 
 
+def _registering_child_script(session_id: str) -> str:
+    """Source for a stand-in ``--view`` child: register under *session_id*,
+    echoing the launch token it was handed, then stay alive like a real
+    viewer would."""
+    return (
+        "import os, time;"
+        "from biopb import _locations, _sessions;"
+        f"_sessions.register({session_id!r}, port=1234, pid=os.getpid(),"
+        " launch_token=os.environ[_locations.MCP_LAUNCH_TOKEN_ENV]);"
+        "time.sleep(30)"
+    )
+
+
 def _launch_app(tmp_path, console_enabled=True):
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
@@ -1250,24 +1263,82 @@ def test_start_session_is_refused_when_gated(tmp_path, monkeypatch, console_enab
 
 
 def test_start_session_waits_for_the_child_to_register(tmp_path, monkeypatch):
-    # The readiness signal is the child publishing itself, matched on its own
-    # pid: `--view` registers only after its napari window is really open, so a
-    # record under that pid is the proof the launch worked. The stand-in child
-    # does exactly that, then stays alive as a real viewer would.
+    # The readiness signal is the child publishing itself, matched on the launch
+    # token we handed it: `--view` registers only after its napari window is
+    # really open, so a record carrying our token is the proof the launch
+    # worked. The stand-in child does exactly that, then stays alive as a real
+    # viewer would.
     from starlette.testclient import TestClient
 
-    child = (
-        "import os, time;"
-        "from biopb import _sessions;"
-        "_sessions.register('launched', port=1234, pid=os.getpid());"
-        "time.sleep(30)"
-    )
+    child = _registering_child_script("launched")
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", child])
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
     assert body["state"] == "started"
     assert body["session_id"] == "launched"
     assert body["observe_url"] == "/session/launched/observe"
+
+
+def test_a_viewer_behind_a_trampoline_is_still_recognised(tmp_path, monkeypatch):
+    # biopb#1084. On Windows a venv's Scripts/python.exe is often a trampoline
+    # (uv's, pip's console-script launchers) that re-spawns the real interpreter
+    # and waits on it, so the pid we hold is the stub's and the pid the viewer
+    # registers is its own. Matching on the pid never fired: the launch waited
+    # out its whole timeout over a window that was already open, and a session
+    # stopped inside that window came back as "exited before it opened".
+    from starlette.testclient import TestClient
+
+    from biopb_control import _control
+
+    grandchild = _registering_child_script("behind-a-stub")
+    # The stub: spawn the real thing under a pid of its own, then wait on it and
+    # forward its exit code, exactly as the trampolines do.
+    stub = (
+        "import subprocess, sys;"
+        f"sys.exit(subprocess.run([sys.executable, '-c', {grandchild!r}]).returncode)"
+    )
+    _launchable(monkeypatch, tmp_path, [sys.executable, "-c", stub])
+    monkeypatch.setattr(_control, "_VIEWER_START_TIMEOUT", 30.0)
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        body = client.post("/api/sessions/new").json()
+    assert body["state"] == "started"
+    assert body["session_id"] == "behind-a-stub"
+
+
+def test_another_launch_in_flight_is_not_mistaken_for_ours(tmp_path, monkeypatch):
+    # The token is what keeps a concurrent viewer from being reported as this
+    # launch's -- the property the pid match was there for, and the reason a
+    # record carrying *someone else's* token never falls back to a pid compare.
+    from biopb_control import _control
+
+    _launchable(
+        monkeypatch, tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    monkeypatch.setattr(_control, "_VIEWER_START_TIMEOUT", 1.0)
+
+    calls = []
+    real_popen = _control.subprocess.Popen
+
+    def _spy(argv, **kwargs):
+        proc = real_popen(argv, **kwargs)
+        # Somebody else's viewer publishes itself mid-launch, on our pid.
+        _sessions.register(
+            "not-ours",
+            port=1234,
+            pid=proc.pid,
+            launch_token="a-different-launch",
+        )
+        calls.append(proc)
+        return proc
+
+    monkeypatch.setattr(_control.subprocess, "Popen", _spy)
+    try:
+        body = _control._launch_viewer(1.0)
+        assert body["state"] == "starting"
+        assert "session_id" not in body
+    finally:
+        for proc in calls:
+            proc.kill()
 
 
 def test_start_session_reports_a_child_that_dies_first(tmp_path, monkeypatch):
