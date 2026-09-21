@@ -787,7 +787,13 @@ def _setup_flight_server(
     Raises:
         typer.Exit: If no sources configured or no sources loaded successfully
     """
-    # Apply overrides
+    # Apply overrides. `writable` is deliberately three-state: None means the
+    # caller expressed no opinion and the config file decides. Declaring the CLI
+    # option as a plain `bool` instead makes its absence indistinguishable from
+    # `--no-writable`, which silently pinned every config-driven deployment to
+    # read-only -- `server.writable: true` in the config had no effect at all,
+    # including for the control plane's supervised data plane, which passes no
+    # flag by design (biopb#1085).
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
 
@@ -1091,10 +1097,12 @@ def serve(
         "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
-    log_scope_biopb: bool = typer.Option(
-        True,
+    log_scope_biopb: Optional[bool] = typer.Option(
+        None,
         "--log-scope-biopb/--log-scope-all",
-        help="Scope logging to biopb_tensor_server only (default) or affect all packages",
+        help="Scope logging to biopb_tensor_server only, or --log-scope-all to "
+        "affect every package. Omitted, the config file's "
+        "`server.log_scope_to_biopb` decides (which defaults to scoped).",
     ),
     host: str = typer.Option(
         DEFAULT_FLIGHT_HOST,
@@ -1109,10 +1117,12 @@ def serve(
         "-p",
         help="TCP port for the Flight gRPC server.",
     ),
-    writable: bool = typer.Option(
-        False,
-        "--writable",
-        help="Enable write mode for source creation and data upload",
+    writable: Optional[bool] = typer.Option(
+        None,
+        "--writable/--no-writable",
+        help="Enable write mode for source creation and data upload. Omitted, "
+        "the config file's `server.writable` decides; the flag overrides it "
+        "either way.",
     ),
     token: Optional[str] = typer.Option(
         None,
@@ -1168,8 +1178,17 @@ def serve(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
+    # Same three-state rule as `writable` below, and for the same reason: the
+    # config field existed, was documented in the JSON Schema (so the settings
+    # editor offered it), and nothing read it -- the flag's default won every
+    # time (biopb#1085).
+    effective_log_scope = (
+        log_scope_biopb
+        if log_scope_biopb is not None
+        else server_config.log_scope_to_biopb
+    )
     setup_logging(
-        effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
+        effective_log_level, scope_to_biopb=effective_log_scope, log_file=log_file
     )
 
     # The flight bind is the mode switch, so resolve the token against it. A
@@ -1580,10 +1599,12 @@ def launch(
         "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
-    log_scope_biopb: bool = typer.Option(
-        True,
+    log_scope_biopb: Optional[bool] = typer.Option(
+        None,
         "--log-scope-biopb/--log-scope-all",
-        help="Scope logging to biopb_tensor_server only (default) or affect all packages",
+        help="Scope logging to biopb_tensor_server only, or --log-scope-all to "
+        "affect every package. Omitted, the config file's "
+        "`server.log_scope_to_biopb` decides (which defaults to scoped).",
     ),
     host: str = typer.Option(
         DEFAULT_FLIGHT_HOST,
@@ -1598,10 +1619,12 @@ def launch(
         "-p",
         help="TCP port for the Flight gRPC server.",
     ),
-    writable: bool = typer.Option(
-        False,
-        "--writable",
-        help="Enable write mode for source creation and data upload",
+    writable: Optional[bool] = typer.Option(
+        None,
+        "--writable/--no-writable",
+        help="Enable write mode for source creation and data upload. Omitted, "
+        "the config file's `server.writable` decides; the flag overrides it "
+        "either way.",
     ),
     web_port: int = typer.Option(
         8816,
@@ -1684,8 +1707,17 @@ def launch(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
+    # Same three-state rule as `writable` below, and for the same reason: the
+    # config field existed, was documented in the JSON Schema (so the settings
+    # editor offered it), and nothing read it -- the flag's default won every
+    # time (biopb#1085).
+    effective_log_scope = (
+        log_scope_biopb
+        if log_scope_biopb is not None
+        else server_config.log_scope_to_biopb
+    )
     setup_logging(
-        effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
+        effective_log_level, scope_to_biopb=effective_log_scope, log_file=log_file
     )
 
     # Treat SIGTERM (the control supervisor's graceful stop, `docker/slurm stop`)
