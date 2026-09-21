@@ -10,7 +10,10 @@ import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import org.apache.arrow.flight.Action;
+import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.FlightStream;
@@ -33,6 +36,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import biopb.image.Point;
 import biopb.image.ROI;
@@ -394,6 +398,7 @@ public class TensorLifecycleTest {
                         .setDtype("<u2")
                         .build();
 
+                server.producer.plannedTensor = descriptor;
                 Map<String, Object> status = client.uploadArray(descriptor, array);
 
                 Assert.assertEquals(4, server.producer.chunks.size());
@@ -474,12 +479,14 @@ public class TensorLifecycleTest {
                 RandomAccessibleInterval<UnsignedShortType> array =
                         ArrayImgs.unsignedShorts(values, 6, 4);
 
+                server.producer.plannedTensor = labelDescriptor("src_ab12/labels/nuclei");
                 client.uploadArray(labelDescriptor("src_ab12/labels/nuclei"), array);
                 Assert.assertEquals(1, server.producer.chunks.size());
                 Assert.assertEquals(Arrays.asList(0L, 0L),
                         server.producer.chunks.get(0).bounds.getStartList());
 
                 server.producer.chunks.clear();
+                server.producer.plannedTensor = labelDescriptor("cache:mine");
                 client.uploadArray(labelDescriptor("cache:mine"), array);
                 Assert.assertEquals(4, server.producer.chunks.size());
             }
@@ -509,6 +516,7 @@ public class TensorLifecycleTest {
                         .addAllChunkShape(Arrays.asList(3L, 2L))
                         .setDtype("<u2")
                         .build();
+                server.producer.plannedTensor = descriptor;
                 client.uploadArray(descriptor, crop);
 
                 Assert.assertEquals(4, server.producer.chunks.size());
@@ -541,6 +549,7 @@ public class TensorLifecycleTest {
                         .addAllStart(Arrays.asList(3L, 2L))
                         .addAllStop(Arrays.asList(6L, 4L))
                         .build();
+                server.producer.plannedTensor = descriptor;
                 client.uploadChunk(descriptor, bounds, array);
 
                 Assert.assertEquals(1, server.producer.chunks.size());
@@ -621,6 +630,7 @@ public class TensorLifecycleTest {
                         .addAllChunkShape(Arrays.asList(2L, 2L))
                         .setDtype("<u2")
                         .build();
+                server.producer.plannedTensor = descriptor;
                 UploadRefusedException error = Assert.assertThrows(
                         UploadRefusedException.class,
                         () -> client.uploadChunk(descriptor,
@@ -746,6 +756,12 @@ public class TensorLifecycleTest {
         final java.util.concurrent.atomic.AtomicInteger emitted =
                 new java.util.concurrent.atomic.AtomicInteger();
         volatile boolean refuseChunks = false;
+        /**
+         * The tensor {@code getFlightInfo} plans. A write asks the server what
+         * a chunk is, so a test that uploads has to say what it declared --
+         * this fake keeps no catalog.
+         */
+        volatile TensorDescriptor plannedTensor;
 
         volatile AddSourceRequest lastAddSource;
         volatile RemoveSourceRequest lastRemoveSource;
@@ -936,6 +952,83 @@ public class TensorLifecycleTest {
             }
         }
 
+        /**
+         * Plan a write the way the server does: chunk bounds on the declared
+         * grid, snapped outward to cover the requested slice, each endpoint
+         * carrying its bounds <b>relative to the realized origin</b> and an
+         * opaque ticket. The ticket here is the absolute bounds, which is all
+         * this fake needs to put the chunk where the test can find it.
+         */
+        @Override
+        public FlightInfo getFlightInfo(
+                FlightProducer.CallContext context, FlightDescriptor descriptor) {
+            TensorReadOption read;
+            try {
+                read = FlightRequest.parseFrom(descriptor.getCommand()).getTensorRead();
+            } catch (InvalidProtocolBufferException error) {
+                throw CallStatus.INVALID_ARGUMENT
+                        .withDescription("not a FlightRequest").toRuntimeException();
+            }
+            TensorDescriptor declared = plannedTensor;
+            int ndim = declared.getShapeCount();
+            long[] shape = new long[ndim];
+            long[] chunk = new long[ndim];
+            long[] origin = new long[ndim];
+            long[] end = new long[ndim];
+            for (int axis = 0; axis < ndim; axis++) {
+                shape[axis] = declared.getShape(axis);
+                chunk[axis] = declared.getChunkShape(axis);
+                long from = read.hasSliceHint() ? read.getSliceHint().getStart(axis) : 0;
+                long to = read.hasSliceHint() ? read.getSliceHint().getStop(axis) : shape[axis];
+                origin[axis] = (from / chunk[axis]) * chunk[axis];
+                end[axis] = Math.min(
+                        ((to + chunk[axis] - 1) / chunk[axis]) * chunk[axis], shape[axis]);
+            }
+
+            List<FlightEndpoint> endpoints = new ArrayList<>();
+            long[] start = origin.clone();
+            while (true) {
+                ChunkBounds.Builder absolute = ChunkBounds.newBuilder();
+                ChunkBounds.Builder relative = ChunkBounds.newBuilder();
+                for (int axis = 0; axis < ndim; axis++) {
+                    long stop = Math.min(start[axis] + chunk[axis], shape[axis]);
+                    absolute.addStart(start[axis]).addStop(stop);
+                    relative.addStart(start[axis] - origin[axis]).addStop(stop - origin[axis]);
+                }
+                TensorTicket ticket = TensorTicket.newBuilder()
+                        .setChunkId(ByteString.copyFrom(absolute.build().toByteArray()))
+                        .build();
+                endpoints.add(FlightEndpoint.builder(new Ticket(ticket.toByteArray()))
+                        .setAppMetadata(relative.build().toByteArray())
+                        .build());
+                int axis = ndim - 1;
+                for (; axis >= 0; axis--) {
+                    start[axis] += chunk[axis];
+                    if (start[axis] < end[axis]) {
+                        break;
+                    }
+                    start[axis] = origin[axis];
+                }
+                if (axis < 0) {
+                    break;
+                }
+            }
+
+            SliceHint.Builder realized = SliceHint.newBuilder();
+            for (int axis = 0; axis < ndim; axis++) {
+                realized.addStart(origin[axis]).addStop(end[axis]);
+            }
+            TensorDescriptor response = TensorDescriptor.newBuilder(declared)
+                    .setSliceHint(realized)
+                    .build();
+            return new FlightInfo(
+                    new Schema(new ArrayList<>()),
+                    FlightDescriptor.command(response.toByteArray()),
+                    endpoints,
+                    -1,
+                    -1);
+        }
+
         @Override
         public Runnable acceptPut(
                 FlightProducer.CallContext context,
@@ -946,8 +1039,8 @@ public class TensorLifecycleTest {
                     PutCommand command = PutCommand.parseFrom(
                             stream.getDescriptor().getCommand());
                     switch (command.getCommandCase()) {
-                        case CHUNK:
-                            acceptChunk(command.getChunk(), stream);
+                        case CHUNK_TICKET:
+                            acceptChunk(command.getChunkTicket(), stream);
                             break;
                         case ROI_PUT:
                             lastRoiPut = command.getRoiPut();
@@ -965,7 +1058,11 @@ public class TensorLifecycleTest {
             };
         }
 
-        private void acceptChunk(ChunkUpload upload, FlightStream stream) {
+        private void acceptChunk(ByteString ticketBytes, FlightStream stream)
+                throws InvalidProtocolBufferException {
+            // The ticket is this fake's own: the chunk's absolute bounds.
+            ChunkBounds bounds = ChunkBounds.parseFrom(
+                    TensorTicket.parseFrom(ticketBytes.toByteArray()).getChunkId());
             List<Integer> values = new ArrayList<>();
             while (stream.next()) {
                 UInt2Vector data = (UInt2Vector) stream.getRoot().getVector("data");
@@ -983,14 +1080,14 @@ public class TensorLifecycleTest {
                 // data and the gRPC code is implied by the class.
                 metadata.insert("x-biopb-error-bin",
                         ("{\"reason\":\"upload_discarded\",\"source_id\":\""
-                                + upload.getSourceId() + "\",\"state\":\"DISCARDED\","
+                                + plannedTensor.getArrayId() + "\",\"state\":\"DISCARDED\","
                                 + "\"detail\":\"producer gave up\"}")
                                 .getBytes(StandardCharsets.UTF_8));
                 throw new org.apache.arrow.flight.CallStatus(
                         org.apache.arrow.flight.FlightStatusCode.CANCELLED, null,
                         "Upload discarded", metadata).toRuntimeException();
             }
-            chunks.add(new Chunk(upload.getBounds(), values));
+            chunks.add(new Chunk(bounds, values));
         }
 
         private void acceptRoiPut(FlightStream stream, FlightProducer.StreamListener<PutResult> ackStream) {

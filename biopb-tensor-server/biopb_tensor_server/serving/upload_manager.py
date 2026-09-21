@@ -12,8 +12,9 @@ here is only what a boundary does:
   than registered and the catalog row it keeps in step is the parent's.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
-- **Lookup** -- ``status`` / ``set_status`` / ``write_chunk`` find the adapter
-  and hand over (``_locate``: the registry, or a parent's ``label_uploads``).
+- **Lookup** -- ``status`` / ``set_status`` find the adapter and hand over
+  (``_locate``: the registry, or a parent's ``label_uploads``). ``write_chunk``
+  is handed one: a DoPut ticket routes the way a DoGet ticket does.
 - **Reclamation** -- ``reap`` sweeps every upload by its ``updated_at``, in
   the registry and in each source's ``label_uploads``: one quiet past ``ttl``
   is discarded (a job that died) and a tombstone older than ``ttl`` is
@@ -47,7 +48,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Type
 
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.ticket_pb2 import ChunkUpload
 
 from biopb_tensor_server.adapters._writable import (
     UploadStatus,
@@ -65,6 +65,7 @@ from biopb_tensor_server.adapters.registered import (
 )
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, read_zattrs, upload_state
 from biopb_tensor_server.core.axes import noncanonical_order
+from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
 from biopb_tensor_server.core.errors import (
     UploadClosedError,
     UploadDiscardedError,
@@ -655,15 +656,22 @@ class UploadManager:
             )
 
     def write_chunk(
-        self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
+        self,
+        adapter: Any,
+        chunk_id: bytes,
+        reader: flight.MetadataRecordBatchReader,
     ) -> None:
-        """Hand one uploaded chunk to its source's ``put_chunk``.
+        """Hand one uploaded chunk to its tensor's ``put_chunk``.
 
-        Each source format owns its write contract: OmeZarr/Zarr enforce
-        chunk-grid alignment; cache-backed sources accept arbitrary bounds;
-        read-only formats reject the write; an upload that is discarded or
-        sealed refuses. Adapters stay transport-agnostic, so their errors
-        become Flight errors here.
+        *adapter* and *chunk_id* come from the DoPut ticket, routed and
+        version-checked at the boundary exactly as a DoGet ticket is
+        (``server.do_put``): one planner minted it, so the bounds are the
+        plan's own and no alignment grammar is left for the write path to
+        enforce.
+
+        Each source format still owns what it does with the chunk, and an
+        upload that is discarded or sealed refuses. Adapters stay
+        transport-agnostic, so their errors become Flight errors here.
 
         Both refusals map to ``FlightCancelledError`` (:func:`_refused`): they
         share the one thing a writer must act on -- this upload is over, stop
@@ -674,11 +682,7 @@ class UploadManager:
         table = reader.read_all()
         data_column = table.column(0)
 
-        adapter, _, _ = self._locate(upload.source_id)
-        if adapter is None:
-            raise flight.FlightServerError(f"Source not found: {upload.source_id}")
-
-        bounds = upload.bounds
+        bounds = get_bounds_from_chunk_id(chunk_id)
         expected_shape = tuple(
             stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
@@ -691,7 +695,8 @@ class UploadManager:
             raise flight.FlightServerError(str(e)) from e
 
         logger.debug(
-            f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"
+            f"Uploaded chunk to {adapter.array_id}: "
+            f"bounds={list(bounds.start)}-{list(bounds.stop)}"
         )
 
     # -- reclamation -----------------------------------------------------------

@@ -1,5 +1,6 @@
 package biopb.tensor;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -9,6 +10,8 @@ import java.util.logging.Logger;
 import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.PutResult;
 import org.apache.arrow.flight.Result;
 import org.apache.arrow.flight.SyncPutListener;
@@ -26,6 +29,8 @@ import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.FieldMask;
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
@@ -37,6 +42,7 @@ import net.imglib2.type.numeric.RealType;
 import static biopb.tensor.TensorChunkCodec.advanceRowMajor;
 import static biopb.tensor.TensorChunkCodec.cellCount;
 import static biopb.tensor.TensorChunkCodec.normalizeDtype;
+import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
 import static biopb.tensor.TensorChunkCodec.toLongArray;
 
 /**
@@ -47,11 +53,16 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
  * <p>Declare, then fill: {@link #createTensor} returns the server's descriptor
  * for the new source, and that descriptor is what every write takes. The Java
  * twin of {@code biopb.tensor._upload}, minus its dask graph -- an imglib2
- * interval is walked on the calling thread, one chunk per grid cell, each put
- * finished before the next is encoded. Python instead stores the whole array
- * through dask with {@code lock=False} and the chunks go up concurrently, which
- * the server is built for (it counts arrivals into a set keyed by chunk id).
- * Closing that gap is biopb/biopb#1073.
+ * interval is walked on the calling thread, one chunk per planned endpoint,
+ * each put finished before the next is encoded. Python instead stores the whole
+ * array through dask with {@code lock=False} and the chunks go up concurrently,
+ * which the server is built for (it counts arrivals into a set keyed by chunk
+ * id). Closing that gap is biopb/biopb#1073.
+ *
+ * <p><b>What a chunk is, is the server's.</b> A write plans through
+ * {@code GetFlightInfo} exactly as a read does and sends back the endpoint's
+ * ticket, so there is no grid arithmetic on this side to keep in step with the
+ * server's ({@code java-tensor-v2.md} parity rule).
  */
 final class TensorUploads {
 
@@ -138,7 +149,6 @@ final class TensorUploads {
     <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
             TensorDescriptor descriptor, RandomAccessibleInterval<T> array) {
         long[] shape = toLongArray(descriptor.getShapeList());
-        long[] chunkShape = toLongArray(descriptor.getChunkShapeList());
         if (array.numDimensions() != shape.length) {
             throw new IllegalArgumentException("uploadArray: array rank " + array.numDimensions()
                     + " does not match the declared rank " + shape.length + " of " + descriptor.getArrayId());
@@ -164,16 +174,10 @@ final class TensorUploads {
         // costs one frame (biopb/biopb#1059).
         boolean skipEmpty = isLabelSet(descriptor.getArrayId());
 
-        long[] start = new long[shape.length];
-        while (true) {
-            long[] stop = new long[shape.length];
-            for (int axis = 0; axis < shape.length; axis++) {
-                stop[axis] = Math.min(start[axis] + chunkShape[axis], shape[axis]);
-            }
-            uploadChunk(descriptor, boundsOf(start, stop), array, skipEmpty);
-            if (!advance(start, chunkShape, shape)) {
-                break;
-            }
+        // One plan for the whole upload; each entry is one chunk, with the
+        // ticket that names it.
+        for (PlannedChunk chunk : planWrite(descriptor.getArrayId(), null)) {
+            putChunk(descriptor, chunk.ticket, chunk.bounds, array, skipEmpty);
         }
         // Publishing is what marks the source complete, so a whole-array upload
         // does it on the caller's behalf -- it is the one caller that knows,
@@ -185,21 +189,111 @@ final class TensorUploads {
     /** Backs {@link TensorFlightClient#uploadChunk}; see that method. */
     <T extends NativeType<T> & RealType<T>> void uploadChunk(
             TensorDescriptor descriptor, ChunkBounds bounds, RandomAccessibleInterval<T> source) {
-        uploadChunk(descriptor, bounds, source, false);
+        putChunk(descriptor, plannedTicket(descriptor.getArrayId(), bounds), bounds, source, false);
     }
 
     /**
-     * As {@link #uploadChunk}, but with {@code skipEmpty} the block is encoded
-     * and then dropped unsent if every element was zero.
+     * One endpoint of a write plan: where it goes, and the ticket that says so.
+     *
+     * <p>{@code bounds} is in the <b>tensor's</b> coordinates. An endpoint's
+     * {@code app_metadata} states them relative to the realized region instead
+     * -- that is what a reader wants, since it is assembling an array of just
+     * that region -- so {@link #planWrite} shifts them back by the realized
+     * origin.
+     */
+    private static final class PlannedChunk {
+        final ChunkBounds bounds;
+        final byte[] ticket;
+
+        PlannedChunk(ChunkBounds bounds, byte[] ticket) {
+            this.bounds = bounds;
+            this.ticket = ticket;
+        }
+    }
+
+    /**
+     * The chunks a write must send, as the server plans them.
+     *
+     * <p>The same {@code GetFlightInfo} a read makes, with the {@code
+     * endpoints} mask and no {@code scale_hint}: the mask is the plan alone
+     * because the rest of a describe costs I/O a write has no use for. A
+     * {@code sliceHint} plans only the box that will be written, snapped
+     * outward to the server's grid. Answered while the tensor is still PENDING
+     * -- planning is a metadata read -- and idempotent, so an interrupted
+     * upload re-plans to resume.
+     */
+    private List<PlannedChunk> planWrite(String arrayId, SliceHint sliceHint) {
+        TensorReadOption.Builder read = TensorReadOption.newBuilder()
+                .setArrayId(arrayId)
+                .setFields(FieldMask.newBuilder().addPaths("endpoints").build());
+        if (sliceHint != null) {
+            read.setSliceHint(sliceHint);
+        }
+        FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
+        FlightInfo info = session.getInfo(FlightDescriptor.command(request.toByteArray()));
+        if (info.getEndpoints().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "upload: the server planned no chunks for " + arrayId);
+        }
+        // The realized region the plan snapped to; its start is the origin the
+        // endpoints' bounds are stated against.
+        List<Long> origin = TensorChunkCodec.descriptorOf(info).getSliceHint().getStartList();
+        List<PlannedChunk> plan = new ArrayList<>();
+        for (FlightEndpoint endpoint : info.getEndpoints()) {
+            ChunkBounds relative = parseChunkBounds(endpoint.getAppMetadata());
+            ChunkBounds.Builder absolute = ChunkBounds.newBuilder();
+            for (int axis = 0; axis < relative.getStartCount(); axis++) {
+                long shift = origin.isEmpty() ? 0 : origin.get(axis);
+                absolute.addStart(shift + relative.getStart(axis));
+                absolute.addStop(shift + relative.getStop(axis));
+            }
+            plan.add(new PlannedChunk(absolute.build(), endpoint.getTicket().getBytes()));
+        }
+        return plan;
+    }
+
+    /**
+     * The ticket for the one chunk at {@code bounds}, or a refusal naming the
+     * grid.
+     *
+     * <p>The server snaps a slice outward, so a plan of one endpoint whose
+     * bounds are the ones asked for is the only proof that {@code bounds} is a
+     * chunk. Refused here rather than sent, because a write of part of a chunk
+     * has nowhere to land: the id the planner mints covers the whole cell.
+     */
+    private byte[] plannedTicket(String arrayId, ChunkBounds bounds) {
+        List<PlannedChunk> plan = planWrite(arrayId, SliceHint.newBuilder()
+                .addAllStart(bounds.getStartList())
+                .addAllStop(bounds.getStopList())
+                .build());
+        if (plan.size() != 1 || !plan.get(0).bounds.equals(bounds)) {
+            StringBuilder snapped = new StringBuilder();
+            for (int i = 0; i < Math.min(4, plan.size()); i++) {
+                ChunkBounds cell = plan.get(i).bounds;
+                snapped.append(i == 0 ? "" : ", ").append(cell.getStartList())
+                        .append('-').append(cell.getStopList());
+            }
+            throw new IllegalArgumentException("uploadChunk: " + bounds.getStartList() + "-"
+                    + bounds.getStopList() + " is not one chunk of " + arrayId
+                    + "; the server's grid puts it in " + snapped
+                    + (plan.size() > 4 ? " ..." : "") + ". Write a chunk of that grid, "
+                    + "or use uploadArray.");
+        }
+        return plan.get(0).ticket;
+    }
+
+    /**
+     * Send one planned chunk. With {@code skipEmpty} the block is encoded and
+     * then dropped unsent if every element was zero.
      *
      * <p>Encoding first and deciding after is what keeps the emptiness test and
      * the upload one traversal rather than two -- and, more to the point, keeps
      * {@link #positionOf}'s handling of a cropped view's min in one loop rather
      * than in two that have to agree.
      */
-    private <T extends NativeType<T> & RealType<T>> void uploadChunk(
-            TensorDescriptor descriptor, ChunkBounds bounds, RandomAccessibleInterval<T> source,
-            boolean skipEmpty) {
+    private <T extends NativeType<T> & RealType<T>> void putChunk(
+            TensorDescriptor descriptor, byte[] ticket, ChunkBounds bounds,
+            RandomAccessibleInterval<T> source, boolean skipEmpty) {
         long[] start = toLongArray(bounds.getStartList());
         long[] stop = toLongArray(bounds.getStopList());
         if (start.length != stop.length || start.length != source.numDimensions()) {
@@ -208,10 +302,7 @@ final class TensorUploads {
         }
 
         PutCommand command = PutCommand.newBuilder()
-                .setChunk(ChunkUpload.newBuilder()
-                        .setSourceId(descriptor.getArrayId())
-                        .setBounds(bounds)
-                        .build())
+                .setChunkTicket(ByteString.copyFrom(ticket))
                 .build();
 
         BufferAllocator allocator = session.allocator();
@@ -315,27 +406,6 @@ final class TensorUploads {
         long[] dims = new long[array.numDimensions()];
         array.dimensions(dims);
         return dims;
-    }
-
-    private static ChunkBounds boundsOf(long[] start, long[] stop) {
-        ChunkBounds.Builder bounds = ChunkBounds.newBuilder();
-        for (int axis = 0; axis < start.length; axis++) {
-            bounds.addStart(start[axis]);
-            bounds.addStop(stop[axis]);
-        }
-        return bounds.build();
-    }
-
-    /** Step {@code start} to the next cell of the chunk grid; false when past the last. */
-    private static boolean advance(long[] start, long[] chunkShape, long[] shape) {
-        for (int axis = start.length - 1; axis >= 0; axis--) {
-            start[axis] += chunkShape[axis];
-            if (start[axis] < shape[axis]) {
-                return true;
-            }
-            start[axis] = 0;
-        }
-        return false;
     }
 
     /**

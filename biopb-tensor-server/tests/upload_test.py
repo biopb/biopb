@@ -19,8 +19,8 @@ import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
 from biopb.tensor import TensorFlightClient, UploadRefused, _upload
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
+from biopb.tensor.descriptor_pb2 import CatalogQuery, TensorDescriptor
+from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 from biopb_tensor_server.adapters._writable import UploadStatus
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import minimal_ome_metadata
@@ -29,6 +29,7 @@ from biopb_tensor_server.core.chunk import (
     content_version_of,
     encode_chunk_id,
     get_bounds_from_chunk_id,
+    mint_chunk_id,
     wrap_content_version,
 )
 from biopb_tensor_server.core.config import CacheConfig
@@ -1112,6 +1113,19 @@ class TestDoPutErrorTranslation:
         assert response.array_id.startswith("cache_")
 
 
+def _planned_chunk_id(adapter, start, stop):
+    """The chunk_id a read plan of *adapter* would mint for these bounds.
+
+    A write takes the plan's ticket, so a unit test of the write path has to
+    mint what the planner would: same array_id, same content_version.
+    """
+    return mint_chunk_id(
+        adapter.array_id,
+        ChunkBounds(start=start, stop=stop),
+        content_version=adapter.content_version,
+    )
+
+
 class TestChunkUpload:
     """Tests for chunk upload handling."""
 
@@ -1138,11 +1152,9 @@ class TestChunkUpload:
         response_desc = server.uploads.create_tensor(req_desc)
         source_id = response_desc.array_id
 
-        # Upload chunk
-        upload = ChunkUpload(
-            source_id=source_id,
-            bounds=ChunkBounds(start=[0, 0], stop=[50, 50]),
-        )
+        adapter = server.sources.get(source_id)
+        assert adapter is not None
+        chunk_id = _planned_chunk_id(adapter, [0, 0], [50, 50])
 
         # Create mock data
         data = np.ones((50, 50), dtype=np.uint8)
@@ -1154,11 +1166,7 @@ class TestChunkUpload:
                 return pa.Table.from_batches([batch])
 
         # Process upload (returns None now)
-        server.uploads.write_chunk(upload, MockReader())
-
-        # Check chunk was stored
-        adapter = server.sources.get(source_id)
-        assert adapter is not None
+        server.uploads.write_chunk(adapter, chunk_id, MockReader())
 
         CacheManager.reset()
 
@@ -1185,7 +1193,7 @@ class TestChunkUpload:
         source_id = response_desc.array_id
 
         bounds = ChunkBounds(start=[10, 20], stop=[40, 60])
-        upload = ChunkUpload(source_id=source_id, bounds=bounds)
+        adapter = server.sources.get(source_id)
 
         data = np.arange(30 * 40, dtype=np.uint8).reshape(30, 40)
         batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
@@ -1194,11 +1202,12 @@ class TestChunkUpload:
             def read_all(self):
                 return pa.Table.from_batches([batch])
 
-        server.uploads.write_chunk(upload, MockReader())
+        server.uploads.write_chunk(
+            adapter, _planned_chunk_id(adapter, [10, 20], [40, 60]), MockReader()
+        )
 
         # create_source assigns a per-upload content_version (#178), so the chunk
         # is stored under the version-wrapped id the read plan also mints.
-        adapter = server.sources.get(source_id)
         chunk_id = encode_chunk_id(source_id, bounds)
         if adapter.content_version is not None:
             chunk_id = wrap_content_version(chunk_id, adapter.content_version)
@@ -1216,7 +1225,7 @@ class TestChunkUpload:
         CacheManager.reset()
 
     def test_upload_chunk_missing_source(self):
-        """Upload to missing source raises error."""
+        """A ticket naming no registered source is refused at the routing."""
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
@@ -1224,17 +1233,67 @@ class TestChunkUpload:
             writable=True,
         )
 
-        upload = ChunkUpload(
-            source_id="nonexistent",
-            bounds=ChunkBounds(start=[0, 0], stop=[50, 50]),
+        chunk_id = mint_chunk_id(
+            "nonexistent", ChunkBounds(start=[0, 0], stop=[50, 50])
+        )
+        with pytest.raises(flight.FlightError, match="Adapter not found"):
+            server._get_adapter_for_chunk(chunk_id)
+
+    def test_a_scaled_ticket_is_not_writable(self):
+        """A DoPut ticket naming a downsampled view has nowhere to land."""
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        server = TensorFlightServer(
+            location="grpc://localhost:0",
+            writable=True,
         )
 
-        class MockReader:
-            def read_all(self):
-                return pa.Table.from_arrays([pa.array([1, 2, 3])], ["data"])
+        scaled = mint_chunk_id(
+            "cache_x", ChunkBounds(start=[0, 0], stop=[50, 50]), scale_hint=(2, 2)
+        )
+        ticket = TensorTicket(chunk_id=scaled)
+        with pytest.raises(flight.FlightServerError, match="scaled ticket"):
+            server._put_chunk_id(ticket.SerializeToString())
 
-        with pytest.raises(flight.FlightServerError, match="Source not found"):
-            server.uploads.write_chunk(upload, MockReader())
+    def test_a_put_ticket_must_name_a_chunk(self):
+        """The catalog arm of a TensorTicket is not a write."""
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        server = TensorFlightServer(
+            location="grpc://localhost:0",
+            writable=True,
+        )
+
+        ticket = TensorTicket(catalog_query=CatalogQuery(sql="SELECT 1"))
+        with pytest.raises(flight.FlightServerError, match="naming a chunk"):
+            server._put_chunk_id(ticket.SerializeToString())
+
+    def test_a_stale_ticket_is_refused_on_the_write_path(self, tmp_path):
+        """The read path's version gate, on a write (biopb/biopb#178)."""
+        from biopb_tensor_server.serving.server import TensorFlightServer
+
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
+
+        server = TensorFlightServer(location="grpc://localhost:0", writable=True)
+        desc = server.uploads.create_tensor(
+            TensorDescriptor(
+                array_id="cache:stale",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+            )
+        )
+        adapter = server.sources.get(desc.array_id)
+        stale = mint_chunk_id(
+            adapter.array_id,
+            ChunkBounds(start=[0, 0], stop=[50, 50]),
+            content_version=b"an-earlier-upload",
+        )
+        with pytest.raises(StaleChunkError):
+            adapter.check_chunk_version(stale)
+
+        CacheManager.reset()
 
 
 class TestOmeZarrChunkAlignment:
@@ -1267,13 +1326,12 @@ class TestOmeZarrChunkAlignment:
             response_desc = server.uploads.create_tensor(req_desc)
             source_id = response_desc.array_id
 
-            # Upload aligned chunk
-            upload = ChunkUpload(
-                source_id=source_id,
-                bounds=ChunkBounds(start=[0, 0], stop=[50, 50]),  # Aligned
-            )
+            # 100x100 uint8 is one block of the transfer grid the store is
+            # minted on, so the whole tensor is the aligned chunk.
+            adapter = server.sources.get(source_id)
+            chunk_id = _planned_chunk_id(adapter, [0, 0], [100, 100])
 
-            data = np.ones((50, 50), dtype=np.uint8)
+            data = np.ones((100, 100), dtype=np.uint8)
             batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
 
             class MockReader:
@@ -1281,12 +1339,17 @@ class TestOmeZarrChunkAlignment:
                     return pa.Table.from_batches([batch])
 
             # Should succeed
-            server.uploads.write_chunk(upload, MockReader())
+            server.uploads.write_chunk(adapter, chunk_id, MockReader())
 
             CacheManager.reset()
 
     def test_unaligned_chunk_rejected(self):
-        """Unaligned chunk upload is rejected."""
+        """A zarr store still refuses an off-grid write.
+
+        Unreachable over the wire now that a write takes a planned ticket --
+        the planner mints only on-grid bounds -- and kept as the store's own
+        invariant rather than a check a client can trip.
+        """
         pytest.importorskip("zarr")
 
         from biopb_tensor_server.serving.server import TensorFlightServer
@@ -1308,11 +1371,9 @@ class TestOmeZarrChunkAlignment:
             response_desc = server.uploads.create_tensor(req_desc)
             source_id = response_desc.array_id
 
-            # Upload unaligned chunk (start not on grid)
-            upload = ChunkUpload(
-                source_id=source_id,
-                bounds=ChunkBounds(start=[10, 20], stop=[60, 70]),  # Not aligned to 50
-            )
+            # Neither on the grid nor at the tensor edge
+            adapter = server.sources.get(source_id)
+            chunk_id = _planned_chunk_id(adapter, [0, 0], [60, 70])
 
             data = np.ones((50, 50), dtype=np.uint8)
             batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
@@ -1322,7 +1383,7 @@ class TestOmeZarrChunkAlignment:
                     return pa.Table.from_batches([batch])
 
             with pytest.raises(flight.FlightServerError, match="not aligned"):
-                server.uploads.write_chunk(upload, MockReader())
+                server.uploads.write_chunk(adapter, chunk_id, MockReader())
 
 
 class TestBuildMinimalOmeMetadata:
@@ -1699,11 +1760,14 @@ class TestConcurrentChunkUpload:
         desc = session.create_tensor(
             "cache:revived", source, chunk_shape=(1, 8, 8), dim_labels=["z", "y", "x"]
         )
+        plan = _upload._plan_write(session._state, desc.array_id, None)
         target = _upload._UploadTarget(
             session._state.location,
             session._state.token,
             session._state.tls_trust,
             desc.array_id,
+            plan,
+            (0, 0, 0),
             source.shape,
             source.dtype,
         )
@@ -1828,9 +1892,10 @@ class TestDiscard:
         monkeypatch.setattr(_upload, "_put_chunk", put_then_discard)
 
         arr = da.from_array(np.arange(16, dtype=np.uint16).reshape(8, 2), chunks=(2, 2))
+        plan = _upload._plan_write(client._upload._state, desc.array_id, None)
         with pytest.raises(UploadRefused, match="stopped early"):
             with dask.config.set(scheduler="threads", num_workers=1):
-                client._upload._store_chunks(desc.array_id, arr)
+                client._upload._store_chunks(desc.array_id, arr, plan, (0, 0))
 
         status = client.get_upload_status(desc.array_id)
         assert status["state"] == "DISCARDED"

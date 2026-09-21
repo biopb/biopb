@@ -53,6 +53,7 @@ from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 from biopb_tensor_server.adapters._writable import (
     folded_match,
     unsafe_store_name,
+    upload_grid,
 )
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
@@ -471,11 +472,12 @@ def create_label_upload(
             f"{array_id!r}: {store} already exists. Restart the server to clear "
             f"a crashed upload, or upload under another name."
         ) from None
+    grid = upload_grid(desc)
     group = zarr.open_group(str(store), mode="w")
     arr = group.create_dataset(
         "0",
         shape=list(desc.shape),
-        chunks=list(desc.chunk_shape),
+        chunks=grid,
         dtype=desc.dtype,
     )
     (store / ".zattrs").write_text(json.dumps(zattrs))
@@ -490,7 +492,7 @@ def create_label_upload(
         parent_array_id=join_fields(parent.source_id, parsed.image_field),
     )
     adapter._upload_store_path = store
-    adapter.begin_upload(desc.shape, desc.chunk_shape)
+    adapter.begin_upload(desc.shape, grid)
     return adapter
 
 

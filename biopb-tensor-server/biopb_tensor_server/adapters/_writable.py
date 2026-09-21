@@ -41,6 +41,7 @@ from typing import (
     Any,
     Dict,
     Iterable,
+    List,
     Optional,
     Sequence,
     Set,
@@ -52,7 +53,10 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.chunk import encode_chunk_id
+from biopb_tensor_server.core.chunk import (
+    default_transfer_chunk_shape,
+    encode_chunk_id,
+)
 from biopb_tensor_server.core.errors import (
     UploadDiscardedError,
     UploadNotPublishedError,
@@ -111,6 +115,33 @@ _STATE_RANK: Dict[UploadStatus, int] = {
 #: What ``set_upload_status`` may ask for. ``PENDING`` is where an upload
 #: starts and nothing returns it there, so it is not settable either.
 SETTABLE_STATES = (UploadStatus.READY, UploadStatus.DISCARDED)
+
+
+def upload_grid(desc: TensorDescriptor) -> List[int]:
+    """The grid an uploaded zarr store is chunked on, planned on and read on.
+
+    A zarr adapter advertises ``default_transfer_chunk_shape`` as its transfer
+    grid -- one store block per endpoint was measured as too many endpoints
+    (biopb/biopb#684) -- and a write now lands on the grid the planner mints
+    (``docs/upload-model.md`` step 4). Minting the store on that same grid is
+    what keeps them one thing: on disk, on the wire, for reads and for writes,
+    and across a restart, where nothing remembers what the client asked for.
+    The request's ``chunk_shape`` is the seed it is grown from, not the layout.
+
+    The alternative -- store the request's grid and coalesce only on the wire --
+    puts a planned write across several store blocks, splits ``expected_chunks``
+    from what the plan actually sends, and coarsens a sparse set's skip anyway,
+    since the skip is per planned chunk.
+
+    Idempotent: the coalescer is a fixed point on its own output, so the
+    adapter re-deriving the grid from the store's chunks answers this again.
+    """
+    return default_transfer_chunk_shape(
+        list(desc.shape),
+        desc.dtype,
+        list(desc.dim_labels) or None,
+        native=list(desc.chunk_shape),
+    )
 
 
 def unsettable_state_message(target: Any) -> str:

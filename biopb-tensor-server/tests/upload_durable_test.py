@@ -34,7 +34,9 @@ def _create(client, name="ome_zarr:durable"):
     )
 
 
-def _put(client, desc, start=(0, 0), stop=(2, 2), fill=7):
+# The whole 4x4 tensor is one planned chunk: a zarr store is minted on the
+# transfer grid, and 4x4 uint16 is far under it (``_writable.upload_grid``).
+def _put(client, desc, start=(0, 0), stop=(4, 4), fill=7):
     data = np.full(
         [b - a for a, b in zip(start, stop, strict=True)], fill, dtype=np.uint16
     )
@@ -94,7 +96,7 @@ class TestDiscardReleasesTheStore:
         assert client.get_tensor(desc.array_id)[:2, :2].compute().max() == 3
         adapter = writable_server.sources.get(desc.array_id)
         chunk_id = encode_chunk_id(
-            desc.array_id, ChunkBounds(start=[0, 0], stop=[2, 2])
+            desc.array_id, ChunkBounds(start=[0, 0], stop=[4, 4])
         )
 
         writable_server.uploads.discard(desc.array_id, "gone")

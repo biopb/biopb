@@ -44,8 +44,14 @@ message ChunkBounds {
 // oneof arm. A source is created by the `create_tensor` action, not here.
 message PutCommand {
   oneof command {
-    // The stream is one pixel chunk (writable servers only).
-    ChunkUpload chunk = 1;
+    // The stream is one pixel chunk (writable servers only). The bytes are a
+    // `FlightEndpoint.ticket` from this tensor's own GetFlightInfo plan,
+    // echoed back verbatim -- the same ticket DoGet takes once the upload is
+    // READY. One planner decides what a chunk is, on both transports: the
+    // client neither tiles nor decodes, and a write inherits the version and
+    // epoch checks a read already has. A ticket of another tensor, or a
+    // scaled one, is refused.
+    bytes chunk_ticket = 1;
     // The stream is annotations in the ROI row schema; the reply is a
     // biopb.image.RoiPutResult in the put's app_metadata.
     RoiPut roi_put = 2;
@@ -53,14 +59,6 @@ message PutCommand {
     // biopb.image.RoiDeleteResult in the put's app_metadata.
     RoiDelete roi_delete = 3;
   }
-}
-
-// Wrapper for chunk upload DoPut
-message ChunkUpload {
-  // Source identifier (e.g., "cache_abc123" or "ome_zarr_def456")
-  string source_id = 1;
-  // Chunk bounds (start/stop coordinates)
-  ChunkBounds bounds = 2;
 }
 
 // Body of the `set_upload_status` action: move an upload along its ladder.

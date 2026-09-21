@@ -178,7 +178,7 @@ class TensorFlightClient:
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
-        self._upload = UploadSession(self._state)
+        self._upload = UploadSession(self._state, self._catalog)
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
@@ -953,7 +953,12 @@ class TensorFlightClient:
             ome_metadata=ome_metadata,
         )
 
-    def upload_array(self, desc: TensorDescriptor, arr: Any) -> Dict[str, Any]:
+    def upload_array(
+        self,
+        desc: TensorDescriptor,
+        arr: Any,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+    ) -> Dict[str, Any]:
         """Fill a declared tensor with an array, and seal it.
 
         Note:
@@ -961,22 +966,36 @@ class TensorFlightClient:
             chunk upload, and upload-status polling) is experimental and may
             change.
 
-        *arr* must match the descriptor's shape and dtype; it is rechunked onto
-        the descriptor's chunk grid, every block is sent as one chunk, and the
-        source is finished. A numpy array is accepted and chunked on the grid.
+        *arr* must match the descriptor's shape and dtype. One
+        ``GetFlightInfo`` plans the write; *arr* is rechunked onto the grid the
+        plan came back with, every block is sent as the chunk its ticket names,
+        and the tensor is published. A numpy array is accepted and chunked the
+        same way.
+
+        With a *slice_hint* only that region is planned and uploaded, and the
+        tensor is **not** published -- a partial upload cannot know it is done,
+        so the caller says so with ``set_upload_status``. The region is in the
+        tensor's own coordinates, which are *arr*'s: *arr* still carries the
+        declared shape and the region is read out of it. The server snaps the
+        region outward to its chunk grid, so a little more than was asked for
+        may be written.
 
         Args:
             desc: The descriptor ``create_tensor`` returned
             arr: The array to upload (dask or numpy)
+            slice_hint: Optional region to upload, as a slice per axis. An
+                open-ended ``stop`` is filled from the declared shape.
 
         Returns:
-            The sealed upload status, as ``get_upload_status`` reports it.
+            The upload status, as ``get_upload_status`` reports it: sealed
+            without a *slice_hint*, still PENDING with one.
 
         Raises:
-            ValueError: *arr* does not match the declared shape or dtype.
+            ValueError: *arr* does not match the declared shape or dtype, or
+                the region is empty.
             UploadRefused: the upload is over -- sealed or discarded.
         """
-        return self._upload.upload_array(desc, arr)
+        return self._upload.upload_array(desc, arr, slice_hint)
 
     def upload_chunk(
         self,
@@ -994,12 +1013,19 @@ class TensorFlightClient:
         The manual half of ``upload_array``: a caller writing chunks itself
         calls this per chunk and ``set_upload_status`` when done.
 
+        *bounds* must be one whole chunk of the server's grid. The call plans
+        that one chunk first (``GetFlightInfo`` with the region and nothing
+        else, a sub-millisecond round trip on localhost), so bounds that are
+        not a chunk are refused here, naming what the grid snapped them to,
+        rather than written somewhere no read asks for.
+
         Args:
             desc: The descriptor ``create_tensor`` returned
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data
 
         Raises:
+            ValueError: *bounds* is not one chunk of this tensor's grid.
             UploadRefused: the upload is over -- sealed or discarded.
         """
         self._upload.upload_chunk(desc, bounds, data)

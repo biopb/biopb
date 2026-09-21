@@ -10,8 +10,9 @@ or a byte-prefix sniff):
   per table with its schema; GetFlightInfo / DoGet take a ``CatalogQuery``.
   Gated by the server-wide token.
 - ``data`` -- pixels. GetFlightInfo takes a ``TensorReadOption`` and plans
-  chunk endpoints; DoGet serves one ``chunk_id``; DoPut takes a
-  ``ChunkUpload`` (writable servers). Private: gated per source.
+  chunk endpoints; DoGet serves one of those tickets, and DoPut takes the same
+  ticket back as ``chunk_ticket`` (writable servers). Private: gated per
+  source.
 - ``roi`` -- annotations. DoGet serves one tensor's set as ROI rows; DoPut
   takes a ``RoiPut`` / ``RoiDelete``. Private: gated per source.
 
@@ -85,7 +86,12 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     strip_source_prefix,
 )
-from biopb_tensor_server.core.chunk import cache_key_for_chunk_id, routing_array_id
+from biopb_tensor_server.core.chunk import (
+    cache_key_for_chunk_id,
+    is_proxy_envelope,
+    is_scaled_chunk,
+    routing_array_id,
+)
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
@@ -950,6 +956,43 @@ class TensorFlightServer(flight.FlightServerBase):
                 )
             )
         return adapter
+
+    def _put_chunk_id(self, ticket_bytes: bytes) -> bytes:
+        """The chunk_id a DoPut ticket names, or the refusal.
+
+        The ticket is a ``FlightEndpoint.ticket`` from this tensor's own read
+        plan, echoed back whole -- so the two things a write must not be are
+        checked here, where the bytes are still a ticket:
+
+        - a **scaled** ticket, which names a downsampled view. There is no
+          store behind one; writing it would either land under an id no read
+          ever asks for or overwrite the full-resolution chunk with reduced
+          pixels.
+        - a **proxy envelope**, whose inner is another server's opaque token.
+          A mirror serves what it fetched, so there is nothing local to write.
+
+        The version and epoch check is the adapter's
+        (:meth:`TensorAdapter.check_chunk_version`), run by the caller once the
+        ticket has routed -- the same gate a read passes.
+        """
+        ticket = self._parse(TensorTicket(), ticket_bytes, "DoPut chunk ticket")
+        if ticket.WhichOneof("payload") != "chunk_id":
+            raise flight.FlightServerError(
+                "DoPut: chunk_ticket must be an endpoint ticket naming a chunk, "
+                "as GetFlightInfo minted it."
+            )
+        chunk_id = ticket.chunk_id
+        if is_proxy_envelope(chunk_id):
+            raise flight.FlightServerError(
+                "DoPut: this tensor is served from another server; its chunks "
+                "are not writable here."
+            )
+        if is_scaled_chunk(chunk_id):
+            raise flight.FlightServerError(
+                "DoPut: a scaled ticket is not writable. Plan the write with "
+                "GetFlightInfo carrying no scale_hint."
+            )
+        return chunk_id
 
     def _require_annotations(self) -> MetadataDatabase:
         """The store behind the ``roi`` flight, or the refusal.
@@ -2049,11 +2092,21 @@ class TensorFlightServer(flight.FlightServerBase):
         cmd = self._parse(PutCommand(), descriptor.command, "DoPut command")
         arm = cmd.WhichOneof("command")
 
-        if arm == "chunk":
+        if arm == "chunk_ticket":
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
             self._authorize(context)
-            self.uploads.write_chunk(cmd.chunk, reader)
+            chunk_id = self._put_chunk_id(cmd.chunk_ticket)
+            adapter = self._get_adapter_for_chunk(chunk_id)
+            try:
+                # The read path's gate, on the write path: a ticket minted
+                # before a re-registration names bytes this source no longer
+                # serves, and writing under it would land the chunk in the
+                # next upload's cache namespace (biopb/biopb#178).
+                adapter.check_chunk_version(chunk_id)
+            except TensorResolutionError as e:
+                raise to_flight_error(e) from e
+            self.uploads.write_chunk(adapter, chunk_id, reader)
             return
 
         db = self._require_annotations()

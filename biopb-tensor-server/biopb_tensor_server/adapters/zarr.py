@@ -343,71 +343,46 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             tmp.write_text(json.dumps(with_upload_state(zattrs, state)))
             os.replace(tmp, zattrs_path)
 
-    def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
-        """Write chunk data to zarr array.
-
-        Args:
-            chunk_idx: Chunk coordinates (e.g., (0, 1, 2))
-            data: Numpy array with chunk data
-        """
-        chunks = self.zarr_array.chunks
-        slices = tuple(
-            slice(idx * chunks[d], (idx + 1) * chunks[d])
-            for d, idx in enumerate(chunk_idx)
-        )
-
-        # Handle edge chunks - pad if data smaller than expected
-        expected_shape = tuple(s.stop - s.start for s in slices)
-        if data.shape != expected_shape:
-            padded = np.zeros(expected_shape, dtype=self.zarr_array.dtype)
-            src_slices = tuple(
-                slice(0, min(d, es))
-                for d, es in zip(data.shape, expected_shape, strict=True)
-            )
-            padded[src_slices] = data[src_slices]
-            data = padded
-
-        self.zarr_array[slices] = data
-
     def _store_chunk(self, bounds, data, expected_shape, dtype) -> None:
-        """Chunk-aligned write: ``bounds`` must land on the zarr chunk grid.
+        """Grid-aligned write: *bounds* must be whole zarr chunks.
 
-        Absorbs the alignment/reshape the DoPut handler used to perform inline,
-        then delegates the store to ``write_chunk``. The grid comes straight off
-        ``self.zarr_array.chunks`` -- the same grid ``write_chunk`` writes into
-        (and equal to the descriptor's ``chunk_shape``) -- so validation and
-        storage never disagree, and the method stays purely source-level.
+        One assignment for the whole of *bounds*, however many store chunks
+        that is. A store this server minted is chunked on the grid the planner
+        mints on (``_writable.upload_grid``), so there it is one; any other
+        zarr's blocks may be finer, and the planner's grid is a whole multiple
+        of them either way (``default_transfer_chunk_shape``).
+
+        Alignment is the store's invariant rather than a rule a client can
+        trip: a write takes a planned ticket and the planner mints no other
+        bounds (``docs/upload-model.md`` step 4). What it rules out is a
+        read-modify-write of a chunk some other write also touches -- zarr
+        locks nothing across writers.
         """
+        grid = list(self.zarr_array.chunks)
+        shape = list(self.zarr_array.shape)
+
+        for d, (start, stop, cell, dim) in enumerate(
+            zip(bounds.start, bounds.stop, grid, shape, strict=True)
+        ):
+            if start % cell != 0:
+                raise ValueError(
+                    f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={cell}"
+                )
+            if stop % cell != 0 and stop != dim:
+                raise ValueError(
+                    f"Chunk stop[{d}]={stop} is not aligned to "
+                    f"chunk_shape[{d}]={cell}, and is not the tensor edge ({dim})"
+                )
+
         arr = data.to_numpy()
         if expected_shape:
             arr = arr.reshape(expected_shape)
-        chunk_shape = list(self.zarr_array.chunks)
-
-        # start must align to the chunk grid
-        for d, (start, chunk_size) in enumerate(
-            zip(bounds.start, chunk_shape, strict=True)
-        ):
-            if start % chunk_size != 0:
-                raise ValueError(
-                    f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={chunk_size}"
-                )
-
-        # size may only shrink at the edge, never exceed the nominal chunk
-        actual_size = [
-            stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
-        ]
-        for d, (actual, expected) in enumerate(
-            zip(actual_size, chunk_shape, strict=True)
-        ):
-            if actual > expected:
-                raise ValueError(
-                    f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
-                )
-
-        chunk_idx = tuple(
-            int(s // cs) for s, cs in zip(bounds.start, chunk_shape, strict=True)
-        )
-        self.write_chunk(chunk_idx, arr)
+        self.zarr_array[
+            tuple(
+                slice(int(start), int(stop))
+                for start, stop in zip(bounds.start, bounds.stop, strict=True)
+            )
+        ] = arr
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(

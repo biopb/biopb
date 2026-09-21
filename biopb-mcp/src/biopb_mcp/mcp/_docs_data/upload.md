@@ -32,7 +32,9 @@ array_id = desc.array_id
 `create_tensor` takes anything with `.shape` and `.dtype` as the template; a
 dask array also supplies the chunk grid, and `chunk_shape=` overrides it — which
 you need to get more than one chunk out of a numpy template. The returned
-descriptor is the server's echo and is what every later call takes.
+descriptor is the server's echo and is what every later call takes; the grid on
+it is the server's, which for an `ome_zarr:` store may be coarser than the one
+you asked for.
 
 **An upload carries shape, dtype and chunks, and nothing else.** Axis labels and
 pixel size travel only if you pass them — `dim_labels=` and `ome_metadata=` on
@@ -51,12 +53,17 @@ and creating under it again is refused (`FlightServerError`). Only the server's
 reclaim sweep frees one, after a discarded upload's `upload_ttl`. **Re-running a
 cell therefore needs a new name, or a bare `"cache:"`.**
 
-`upload_array` rechunks onto the declared grid, sends every block and seals it.
-It raises `ValueError` when the array does not match the declared shape or
-dtype, and `UploadRefused` once the upload is over. Writing the grid yourself is
-`upload_chunk(desc, bounds, data)` per chunk, then
-`set_upload_status(desc, "READY")`. `get_upload_status(array_id)` reports
-`state`, `expected_chunks` and `uploaded_chunks` while it is in flight.
+`upload_array` asks the server for the chunk grid, rechunks onto it, sends
+every block and seals it. It raises `ValueError` when the array does not match
+the declared shape or dtype, and `UploadRefused` once the upload is over.
+`upload_array(desc, arr, slice_hint=(slice(0, 4), ...))` uploads that region
+only and does **not** seal — say so yourself with `set_upload_status`.
+
+Writing the grid yourself is `upload_chunk(desc, bounds, data)` per chunk, then
+`set_upload_status(desc, "READY")`. **The server decides what a chunk is**:
+`bounds` must be one whole cell of its grid, and anything else is refused with
+the cell it falls in. `get_upload_status(array_id)` reports `state`,
+`expected_chunks` and `uploaded_chunks` while it is in flight.
 
 ## The three states
 

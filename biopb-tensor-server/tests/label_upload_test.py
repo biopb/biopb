@@ -223,18 +223,22 @@ class TestTheSidecar:
         assert upload_state(json.loads((store / ".zattrs").read_text())) == UPLOAD_READY
 
     def test_an_all_zero_chunk_is_never_materialized(self, served, client, tmp_path):
-        """The sparse case: only the blocks that carry ids cost anything."""
-        store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "sparse.zarr"
-        sparse = np.zeros(SHAPE, "uint32")
-        sparse[:8, :8] = 1  # the (0, 0) chunk alone, of four
-        desc = _create(client, "oz1/labels/sparse", arr=sparse)
-        status = client.upload_array(desc, sparse)
+        """The sparse case: a planned block with no ids costs nothing.
 
-        assert (status["uploaded_chunks"], status["expected_chunks"]) == (1, 4)
-        chunks = {p.name for p in (store / "0").iterdir() if not p.name.startswith(".")}
-        assert chunks == {"0.0"}
+        The block is the *planned* chunk -- the transfer grid, which is what
+        the store is minted on (``_writable.upload_grid``) -- and this fixture
+        is small enough to be one. A real set is many, and every one of them
+        that carries no ids is skipped the same way.
+        """
+        store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "sparse.zarr"
+        empty = np.zeros(SHAPE, "uint32")
+        desc = _create(client, "oz1/labels/sparse", arr=empty)
+        status = client.upload_array(desc, empty)
+
+        assert status["uploaded_chunks"] == 0
+        assert not [p for p in (store / "0").iterdir() if not p.name.startswith(".")]
         np.testing.assert_array_equal(
-            client.get_tensor("oz1/labels/sparse").compute(), sparse
+            client.get_tensor("oz1/labels/sparse").compute(), empty
         )
 
     def test_the_zero_skip_is_this_kind_s_alone(self, served, client):

@@ -16,6 +16,7 @@ from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 from biopb_tensor_server.adapters._writable import (
     taken_store_name,
     unsafe_store_name,
+    upload_grid,
 )
 from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
@@ -546,11 +547,12 @@ class OmeZarrAdapter(ZarrAdapter):
                 "taken while its store is on disk; discard the upload that owns "
                 "it, or upload under another name."
             ) from None
+        grid = upload_grid(desc)
         arr = zarr.create(
             store=zarr.DirectoryStore(str(zarr_path)),
             shape=desc.shape,
             dtype=desc.dtype,
-            chunks=desc.chunk_shape,
+            chunks=grid,
         )
         with open(zarr_path / ".zattrs", "w") as f:
             json.dump(zattrs, f)
@@ -561,7 +563,7 @@ class OmeZarrAdapter(ZarrAdapter):
             list(desc.dim_labels) if desc.dim_labels else None,
         )
         adapter._upload_store_path = zarr_path
-        adapter.begin_upload(desc.shape, desc.chunk_shape)
+        adapter.begin_upload(desc.shape, grid)
         return adapter
 
     def __init__(
