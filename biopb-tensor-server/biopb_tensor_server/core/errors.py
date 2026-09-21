@@ -261,17 +261,16 @@ class UploadDiscardedError(UploadClosedError):
 
 
 class UploadSealedError(UploadClosedError):
-    """A write to an upload its producer has already declared complete.
+    """A write to an upload its producer has already published.
 
-    FINISHED is a producer's declaration that the source is final, and reads
-    have been open since READY -- so by the time it lands, a consumer may
-    already have read what is there. Accepting a later write would change bytes
-    someone has seen, and would break the one promise FINISHED makes that READY
-    does not.
+    READY seals and publishes in one move, so by the time a late write lands a
+    consumer may already have read what is there -- and cached it, on either
+    side of the wire. Accepting the write would change bytes someone has seen
+    and cannot be told about.
     """
 
     wire_reason = "upload_sealed"
-    state = "FINISHED"
+    state = "READY"
 
     def __init__(self, source_id: str) -> None:
         super().__init__(
@@ -284,7 +283,7 @@ class UploadSealedError(UploadClosedError):
 class UploadTransitionError(ValueError):
     """``set_upload_status`` was asked for a state the upload cannot move to.
 
-    Backwards down the PENDING -> READY -> FINISHED ladder, or to a state that
+    Backwards down the PENDING -> READY ladder, or to a state that
     is not settable at all (PENDING, or an unrecognized one). A caller's
     mistake, so it surfaces as a terminal Flight error rather than a refusal
     the upload path retries -- unlike ``UploadClosedError``, which says the

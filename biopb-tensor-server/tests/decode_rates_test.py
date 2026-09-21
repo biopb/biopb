@@ -572,7 +572,7 @@ class TestTheExemptSourceKinds:
             )
             bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
             adapter.write_chunk(bounds, np.ones((64, 64), dtype=np.uint8))
-            adapter.set_status(UploadStatus.FINISHED)
+            adapter.set_status(UploadStatus.READY)
             adapter.resolve_chunk_data(encode_chunk_id("up", bounds), manager)
 
             assert active_decode_rates().snapshot() == {}

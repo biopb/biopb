@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
@@ -59,20 +60,20 @@ class UploadStatus(str, Enum):
     """Wire-facing upload state (the string values are the ``upload_status`` API
     contract, parsed by the client SDK).
 
-    Two gates rather than one. ``READY`` opens the **read** gate and
-    ``FINISHED`` closes the **write** one, because a producer that has written
-    enough to be worth looking at is rarely the same producer that has written
-    everything: a segmentation filling a label set frame by frame can be opened
-    once its first frames land. Between the two an upload is readable *and*
-    writable, and a chunk that has not arrived reads as zeros
-    (``CachedSourceAdapter.get_data``) -- which is only honest once someone has
-    said the holes are meant to be holes, and is why ``PENDING`` refuses reads
-    outright instead.
+    One gate, not two. ``READY`` seals the upload against writes and opens it
+    to reads in the same move, so there is no state in which a read and a write
+    can both land. A read is cacheable and a write cannot undo one: a chunk
+    that never arrived reads as zeros (``CachedSourceAdapter.get_data``), and a
+    later write filling that hole has no way to invalidate an answer already
+    stored under its ``chunk_id`` -- least of all in the client's own pool,
+    which the server cannot reach. ``PENDING`` therefore refuses reads outright
+    rather than zero-filling: before someone says the holes are meant to be
+    holes, zeros and not-yet-arrived are the same picture.
 
-    What READY does *not* promise is that a reader sees later writes. A
-    ``chunk_id`` names fixed bytes everywhere else in this system and every
-    client caches on that, so a region already read stays as it was read. READY
-    publishes a partial answer; it does not stream one.
+    Reopening a READY upload is not expressible today, and nothing here
+    forecloses it: invalidation would be a fresh ``content_version`` token in
+    the store, which every cache on both sides of the wire keys by. See
+    ``docs/upload-model.md``.
 
     One terminal state, not two: a job that dies has nothing to say that
     ``DISCARDED`` with a reason does not already say (biopb/biopb#1). A separate
@@ -84,7 +85,6 @@ class UploadStatus(str, Enum):
 
     PENDING = "PENDING"
     READY = "READY"
-    FINISHED = "FINISHED"
     DISCARDED = "DISCARDED"
     UNKNOWN = "UNKNOWN"
 
@@ -96,12 +96,11 @@ class UploadStatus(str, Enum):
 _STATE_RANK: Dict[UploadStatus, int] = {
     UploadStatus.PENDING: 0,
     UploadStatus.READY: 1,
-    UploadStatus.FINISHED: 2,
 }
 
 #: What ``set_upload_status`` may ask for. ``PENDING`` is where an upload
 #: starts and nothing returns it there, so it is not settable either.
-SETTABLE_STATES = (UploadStatus.READY, UploadStatus.FINISHED, UploadStatus.DISCARDED)
+SETTABLE_STATES = (UploadStatus.READY, UploadStatus.DISCARDED)
 
 
 def unknown_upload_status(source_id: str) -> Dict[str, Any]:
@@ -126,9 +125,50 @@ def upload_of(adapter: object) -> Optional[UploadProgress]:
     return getattr(adapter, "upload", None)
 
 
-#: What a store's directory name may be at most, extension included. 255 bytes
-#: is the single-component limit ext4, APFS and NTFS share.
+#: What a store's directory name may be at most, extension included. 255
+#: **bytes** is the single-component limit ext4, APFS and NTFS share, so a
+#: non-ASCII name is measured encoded -- it passes a character count and still
+#: overflows the directory entry.
 _MAX_STORE_NAME = 255
+
+#: Names MS-DOS gave to devices, which Windows still refuses as files -- with
+#: any extension, so ``CON`` mints a ``CON.zarr`` that cannot be opened there.
+#: Matched on the stem before the first dot, case-insensitively, as Windows
+#: does.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{d}" for d in range(1, 10)]
+    + [f"LPT{d}" for d in range(1, 10)]
+)
+
+#: Refused on NTFS. Separators, ``:`` and NUL are refused separately, with
+#: their own messages.
+_WINDOWS_FORBIDDEN = '<>"|?*'
+
+#: Field names an upload may not take. ``labels`` is both the NGFF group name
+#: and the wire segment that addresses a set, so a field called ``labels``
+#: makes ``<array_id>/labels/<name>`` ambiguous by construction (parsed by
+#: ``core.labels.split_label_field``). Reserved rather than marked with an
+#: ``@``: marking would move every stored ``array_id``, ``rois.array_id``
+#: included, and that is user data. See ``docs/upload-model.md``.
+#:
+#: A set *named* ``labels`` stays legal -- the parse is right-to-left, so
+#: ``<field>/labels/labels`` is unambiguous.
+RESERVED_FIELD_NAMES = frozenset({"labels"})
+
+
+def fold_name(name: str) -> str:
+    """The form two names are compared in: NFC, case-folded.
+
+    Names that differ only by case or by Unicode normalization are **one**
+    directory on NTFS, APFS and HFS+ and two on ext4 -- and HFS+ stores NFD, so
+    a name sent composed comes back decomposed. Comparing folded is what keeps
+    one name one identity wherever the same ``write_dir`` is served from.
+
+    Only the comparison folds; the name is stored and displayed as the caller
+    wrote it, so ``Nuclei`` stays ``Nuclei``.
+    """
+    return unicodedata.normalize("NFC", name).casefold()
 
 
 def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
@@ -146,17 +186,21 @@ def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     Refused rather than sanitized, because the name is an identity as well as
     a path: it is what ``create_tensor`` refuses a collision on, so folding two
     different requests onto one store would trade a traversal for a mix-up.
-    Both separators and ``:`` are refused on every platform rather than the
-    host's own, so a name minted on Linux cannot escape when the same
-    ``write_dir`` is later served from Windows.
+
+    **Every rule here is checked on every platform, not the running one.** A
+    store minted on Linux has to open, and keep its identity, when the same
+    ``write_dir`` is later served from Windows or macOS -- so this refuses what
+    any of the three would refuse, and :func:`fold_name` handles the two rules
+    that are about collision rather than legality.
 
     A kind whose name never reaches the filesystem does not need this:
     ``cache:`` hashes it into a ``source_id`` (``upload_source_id``).
     """
     if not name:
         return "is empty"
-    if len(name) + len(suffix) > _MAX_STORE_NAME:
-        return f"is longer than {_MAX_STORE_NAME - len(suffix)} characters"
+    # Bytes, not characters: _MAX_STORE_NAME is a directory-entry limit.
+    if len(name.encode("utf-8")) + len(suffix) > _MAX_STORE_NAME:
+        return f"is longer than {_MAX_STORE_NAME - len(suffix)} bytes"
     if "/" in name or "\\" in name:
         return "contains a path separator"
     if ":" in name:
@@ -165,7 +209,38 @@ def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
         return "contains a NUL"
     if name in (".", ".."):
         return "is a relative path component"
+    if name.startswith("."):
+        return "starts with '.', which hides it and collides with zarr's own metadata"
+    # Windows strips a trailing space or dot silently, so "x." and "x" would be
+    # one directory there and two identities here -- the mix-up this refuses
+    # rather than sanitizes.
+    if name[-1] in " .":
+        return "ends with a space or '.', which Windows strips"
+    if any(ch in _WINDOWS_FORBIDDEN for ch in name):
+        return f"contains one of {_WINDOWS_FORBIDDEN}, refused on NTFS"
+    if any(ord(ch) < 32 for ch in name):
+        return "contains a control character"
+    if name.split(".")[0].upper() in _WINDOWS_DEVICE_NAMES:
+        return (
+            f"is {name.split('.')[0].upper()}, a Windows device name, which is "
+            f"reserved there with any extension"
+        )
     return None
+
+
+def unsafe_field_name(name: str) -> Optional[str]:
+    """Why *name* cannot be an uploaded tensor's field, or None if it can.
+
+    A field is a path component of its source's group, so it takes the store
+    rules with no extension of its own, plus the reserved words.
+    """
+    if fold_name(name) in RESERVED_FIELD_NAMES:
+        return (
+            "is reserved: a label set is addressed as "
+            "'<array_id>/labels/<name>', so a field of that name would be "
+            "unaddressable"
+        )
+    return unsafe_store_name(name, suffix="")
 
 
 def _expected_chunk_count(shape: Sequence[int], chunk_shape: Sequence[int]) -> int:
@@ -182,7 +257,7 @@ class UploadProgress:
     The state moves only when the producer says so (``set_status``), never on
     the chunk count: the count is a coverage *proxy*, and a cache-backed source
     accepts arbitrary bounds, so off-grid writes can reach the expected count
-    without tiling the array or never reach it at all. ``FINISHED`` and
+    without tiling the array or never reach it at all. ``READY`` and
     ``DISCARDED`` seal the source against further writes; ``DISCARDED`` keeps
     the adapter registered as a tombstone so a writer still unwinding learns
     *why* its write failed rather than that its source never existed.
@@ -221,8 +296,8 @@ class UploadProgress:
 
     @property
     def is_sealed(self) -> bool:
-        """No further chunk will be accepted -- finished, or given up on."""
-        return self.status in (UploadStatus.FINISHED, UploadStatus.DISCARDED)
+        """No further chunk will be accepted -- published, or given up on."""
+        return self.status in (UploadStatus.READY, UploadStatus.DISCARDED)
 
     @property
     def is_readable(self) -> bool:
@@ -230,9 +305,10 @@ class UploadProgress:
 
         False for ``PENDING`` -- where a hole is indistinguishable from a chunk
         still in flight -- and for ``DISCARDED``, which answers a reader the
-        same reason it answers a writer.
+        same reason it answers a writer. The complement of :attr:`is_sealed`
+        only on a live upload: both are true at READY, which is the point.
         """
-        return self.status in (UploadStatus.READY, UploadStatus.FINISHED)
+        return self.status is UploadStatus.READY
 
     def touch(self, now: Optional[float] = None) -> None:
         self.updated_at = time.monotonic() if now is None else now
@@ -329,10 +405,9 @@ class WritableSource:
         Called on the **READY** transition, before it is announced and outside
         ``progress.lock``. A durable store carries a pending marker from
         creation so a crash leaves something a restart can recognize and
-        remove; this is where the marker is flipped. It rides READY rather than
-        FINISHED because READY is what publishes the store -- a set listed
-        under its image must not be one the next boot sweeps away -- and a
-        store that is written into afterwards is exactly what READY means.
+        remove; this is where the marker is flipped. READY is what publishes
+        the store, and a set listed under its image must not be one the next
+        boot sweeps away, so the marker flips here and not at create.
         Raises ``OSError`` if the marker cannot be written, in which case the
         upload stays PENDING and the transition is retried.
         """
@@ -435,15 +510,11 @@ class WritableSource:
     def set_status(self, target: UploadStatus, reason: str = "") -> Dict[str, Any]:
         """Move this upload to *target*, or stand still; the only mover there is.
 
-        The ladder is PENDING -> READY -> FINISHED, and a call may only climb
-        it: setting the state the upload is already in is a no-op (so a retried
-        transition is not an error), and setting one below it raises
+        The ladder is PENDING -> READY, and a call may only climb it: setting
+        the state the upload is already in is a no-op (so a retried transition
+        is not an error), and setting one below it raises
         ``UploadTransitionError`` -- a published result cannot be unpublished,
-        and a sealed one cannot be reopened for writes a reader has already
-        been told are over. A climb of two rungs is one call: setting FINISHED
-        on a PENDING upload passes through READY, doing READY's work on the
-        way, which is what a producer that never wanted a partial read asks
-        for.
+        nor reopened for writes a reader has already been told are over.
 
         ``DISCARDED`` is not on the ladder and is reachable from every rung; it
         routes to :meth:`discard`, which is total and idempotent.
@@ -473,6 +544,11 @@ class WritableSource:
             current = progress.status
             if current is target:
                 return progress.as_status_dict(self.source_id)
+            # Unreachable while the ladder has one climbable rung: the only
+            # settable non-DISCARDED target is READY, and a source already
+            # there returned above. Kept as the ladder's own guard -- it is
+            # what a second rung (a reopen, ``docs/upload-model.md``) would
+            # need, and it is cheaper to leave than to rediscover.
             if _STATE_RANK[current] > _STATE_RANK[target]:
                 raise UploadTransitionError(
                     f"set_upload_status: {self.source_id} is {current.value} and "

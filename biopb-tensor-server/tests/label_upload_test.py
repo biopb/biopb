@@ -91,7 +91,7 @@ class TestTheRoundTrip:
         assert "oz1/labels/nuclei" not in _tensor_ids(served)
 
         status = client.upload_array(desc, labels)
-        assert status["state"] == "FINISHED"
+        assert status["state"] == "READY"
 
         read = client.get_tensor("oz1/labels/nuclei")
         assert read.dtype == np.uint32
@@ -166,6 +166,17 @@ class TestWhatTheKindRefuses:
         with pytest.raises(flight.FlightServerError, match="the set's name"):
             _create(client, f"oz1/labels/{name}")
         assert not list(labels_root(Path(tmp_path)).glob("**/*.zarr"))
+
+    def test_a_case_variant_of_a_taken_set_name_is_refused(self, served, client):
+        """`Nuclei` and `nuclei` are two keys on ext4 and one sidecar directory
+        on NTFS, APFS and HFS+, so the refusal folds (``fold_name``)."""
+        import pyarrow.flight as flight
+
+        client.upload_array(_create(client, "oz1/labels/Nuclei"), _labels())
+        with pytest.raises(flight.FlightServerError, match="already exists"):
+            _create(client, "oz1/labels/nuclei")
+        # A name that differs by more than case is still free.
+        _create(client, "oz1/labels/membrane")
 
     def test_a_taken_name_is_refused_until_it_is_deleted(self, served, client):
         import pyarrow.flight as flight

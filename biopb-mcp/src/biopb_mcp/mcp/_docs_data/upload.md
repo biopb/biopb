@@ -46,7 +46,7 @@ cache-backed and right for something the user is only going to look at;
 `"ome_zarr:<name>"` is zarr-backed and persists as files. `"cache:"` with no
 name has the server mint one, which is the fix for the rule below.
 
-**A name is taken while its source exists** — at any of the four states below —
+**A name is taken while its source exists** — at any of the three states below —
 and creating under it again is refused (`FlightServerError`). Only the server's
 reclaim sweep frees one, after a discarded upload's `upload_ttl`. **Re-running a
 cell therefore needs a new name, or a bare `"cache:"`.**
@@ -55,10 +55,10 @@ cell therefore needs a new name, or a bare `"cache:"`.**
 It raises `ValueError` when the array does not match the declared shape or
 dtype, and `UploadRefused` once the upload is over. Writing the grid yourself is
 `upload_chunk(desc, bounds, data)` per chunk, then
-`set_upload_status(desc, "FINISHED")`. `get_upload_status(array_id)` reports
+`set_upload_status(desc, "READY")`. `get_upload_status(array_id)` reports
 `state`, `expected_chunks` and `uploaded_chunks` while it is in flight.
 
-## The four states
+## The three states
 
 An upload is **PENDING** until you move it, and `set_upload_status` is what
 moves it. The ladder only climbs:
@@ -66,26 +66,22 @@ moves it. The ladder only climbs:
 | state | reads | writes |
 |---|---|---|
 | `PENDING` | refused — a missing chunk is one still in flight | accepted |
-| `READY` | served; **a chunk never uploaded reads as zeros** | accepted |
-| `FINISHED` | served | refused |
+| `READY` | served; **a chunk never uploaded reads as zeros** | refused |
 | `DISCARDED` | refused | refused |
 
-`"FINISHED"` from PENDING passes through READY, so the ordinary "write
-everything, then publish" needs one call — that is what `upload_array` does.
+**`"READY"` publishes and seals in one move.** Once a consumer can read it, it
+takes no more chunks — so a partial upload is published by declaring it done,
+not by leaving it open. A chunk you never sent reads back as zeros, which is
+how a sparse result (one labelled frame of a thousand) costs one frame.
 
-**`"READY"` is for a result worth looking at before it is done.** Publish, keep
-writing, and a consumer sees the filled regions and background everywhere else
-— a segmentation can be opened after its first frames land.
-
-One caveat, and it is the reason not to publish early by default: **a chunk
-already read is not read again.** A `chunk_id` names fixed bytes everywhere
-else in this system, so the client caches it; a region a consumer has seen as
-background stays background for that consumer even after the writer fills it.
-Re-reading it means a fresh process. Publish early when a partial answer is
-useful *on its own*, not to stream one in.
+The reason the two are one moment: **a chunk already read is not read again.**
+A `chunk_id` names fixed bytes everywhere else in this system, so both the
+server and the client cache on it. A region a consumer saw as background would
+stay background for that consumer even after a later write filled it, and
+nothing could tell them otherwise. Sealing at publish removes the case.
 
 **`"DISCARDED"` is the only delete there is**, and it works from every state —
-including FINISHED. It takes the server-minted store with it (an `ome_zarr:`
+including READY. It takes the server-minted store with it (an `ome_zarr:`
 directory, a label set's sidecar) and unlists the source. Pass a `reason`: it is
 what a poller waiting on the result reads back. The name frees after the
 server's reclaim sweep, not immediately.

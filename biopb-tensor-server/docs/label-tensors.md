@@ -267,8 +267,8 @@ Reaching **READY** clears the pending marker, lists the set
 (`attach_label_set`) and re-syncs the parent's catalog row
 (`sync_source_added` is an upsert; the ROI re-import it triggers is already
 idempotent), in that order — the catalog must not name a set a restart would
-sweep away. READY rather than FINISHED because READY is what makes the set
-readable at all, and a set nobody can reach is not one to advertise. The status
+sweep away — READY is what makes the set readable at all, and a set nobody can
+reach is not one to advertise. The status
 and TTL machinery apply as they stand, with two plumbing changes in
 `UploadManager`: `status` / `set_status` / `write_chunk` receive a set's
 `array_id` where they receive a `source_id` today, and resolve it through the

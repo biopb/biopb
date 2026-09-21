@@ -46,9 +46,10 @@ class UploadRefused(Exception):
     """A write or a transition reached an upload that takes no more chunks.
 
     ``state`` is the state the source is in -- ``"DISCARDED"`` (its producer
-    gave up; ``reason`` says why) or ``"FINISHED"`` (it was sealed and takes no
-    more chunks). ``source_id`` names which, because under ``upload_array`` the
-    chunks are in flight concurrently and this is one of N.
+    gave up; ``reason`` says why) or ``"READY"`` (it was published, which seals
+    it against further chunks). ``source_id`` names which, because under
+    ``upload_array`` the chunks are in flight concurrently and this is one of
+    N.
 
     Plain data in ``args``, so under a distributed scheduler it is raised on a
     worker and pickles back intact. A sibling of :class:`ResolveCancelled`.
@@ -245,6 +246,20 @@ class UploadSession:
     def __init__(self, state: "_ClientState"):
         self._state = state
 
+    def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
+        """Backs TensorFlightClient.register_source; see that method."""
+        body = json.dumps({"name": name, "metadata": metadata or {}}).encode()
+        action = flight.Action("register_source", body)
+        results = self._state.client.do_action(action, options=self._state.call_options)
+        try:
+            result = next(results)
+        except StopIteration as exc:
+            raise RuntimeError("register_source: server returned no result") from exc
+
+        source_id = json.loads(result.body.to_pybytes())["source_id"]
+        logger.info(f"register_source: registered {source_id}")
+        return source_id
+
     def create_tensor(
         self,
         source_name: str,
@@ -308,13 +323,12 @@ class UploadSession:
         # chunks read back as background, so one labelled frame of a thousand
         # costs one frame (biopb/biopb#1059).
         self._store_chunks(desc.array_id, arr)
-        # Sealing is what marks the source complete, so a whole-array upload
+        # Publishing is what marks the source complete, so a whole-array upload
         # does it on the caller's behalf -- it is the one caller that knows,
         # from having written every block itself, that there is nothing more to
-        # send. FINISHED passes through READY, so the source is published and
-        # sealed in one call. A caller driving `upload_chunk` by hand does not
-        # know when it is done, and moves the upload explicitly.
-        return self.set_upload_status(desc, UploadStatusPb.FINISHED)
+        # send. A caller driving `upload_chunk` by hand does not know when it
+        # is done, and moves the upload explicitly.
+        return self.set_upload_status(desc, UploadStatusPb.READY)
 
     def _store_chunks(self, source_id: str, arr: da.Array) -> None:
         """Hand the whole upload to dask as one graph.

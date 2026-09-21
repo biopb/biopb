@@ -82,11 +82,11 @@ message SetUploadStatus {
   // caller created.
   string array_id = 1;
 
-  // Where to move it: READY (publish -- open reads), FINISHED (seal -- close
-  // writes), or DISCARDED (give up, and release whatever the server minted
-  // for it). Setting the state it is already in is a no-op, and moving back
-  // down the ladder is refused. PENDING and STATE_UNSPECIFIED are not
-  // settable: an upload starts PENDING and nothing returns it there.
+  // Where to move it: READY (publish -- seal writes, open reads) or DISCARDED
+  // (give up, and release whatever the server minted for it). Setting the
+  // state it is already in is a no-op, and moving back down the ladder is
+  // refused. PENDING and STATE_UNSPECIFIED are not settable: an upload starts
+  // PENDING and nothing returns it there yet.
   biopb.tensor.UploadStatus.State state = 2;
 
   // Why, for DISCARDED only. Consumer-facing: it is what a poller waiting on

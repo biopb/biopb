@@ -1421,13 +1421,11 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>The states form a ladder, and a call climbs it or stands still:
      *
      * <ul>
-     *   <li>{@code READY} -- <b>publish</b>. The source becomes readable, and a
-     *       chunk that has not been uploaded reads back as zeros. Writes still
-     *       land, so a consumer can watch a result fill in. This is the state a
-     *       consumer waiting on a result polls for.
-     *   <li>{@code FINISHED} -- <b>seal</b>. No further chunk is accepted, so
-     *       what is there is final. Setting it from PENDING publishes on the
-     *       way, which is what {@link #uploadArray} does for you.
+     *   <li>{@code READY} -- <b>publish and seal</b>. The source becomes
+     *       readable, a chunk that was never uploaded reads back as zeros, and
+     *       no further chunk is accepted, so what is there is final. This is
+     *       the state a consumer waiting on a result polls for, and what
+     *       {@link #uploadArray} sets for you.
      *   <li>{@code DISCARDED} -- <b>give up</b>, from any of the above.
      *       Whatever the server minted goes with it: an {@code ome_zarr:}
      *       store, a label set's sidecar and its listing. This is how an
@@ -1441,7 +1439,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @param arrayId what {@link #createTensor} answered with -- a minted
      *        source_id, or a label set's array_id as {@link #labelSets} reports
      *        it
-     * @param state {@code READY}, {@code FINISHED} or {@code DISCARDED}
+     * @param state {@code READY} or {@code DISCARDED}
      * @param reason why, for {@code DISCARDED}; it is what a poller waiting on
      *        this result reads back, so write it for them
      * @return the resulting upload status, as {@link #getUploadStatus} reports

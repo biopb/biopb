@@ -138,12 +138,11 @@ final class TensorUploads {
                 break;
             }
         }
-        // Sealing is what marks the source complete, so a whole-array upload does
-        // it on the caller's behalf -- it is the one caller that knows, from
-        // having written every block itself, that there is nothing more to send.
-        // FINISHED passes through READY, so the source is published and sealed
-        // in one call.
-        return setUploadStatus(descriptor.getArrayId(), UploadStatus.State.FINISHED, "");
+        // Publishing is what marks the source complete, so a whole-array upload
+        // does it on the caller's behalf -- it is the one caller that knows,
+        // from having written every block itself, that there is nothing more to
+        // send.
+        return setUploadStatus(descriptor.getArrayId(), UploadStatus.State.READY, "");
     }
 
     /** Backs {@link TensorFlightClient#uploadChunk}; see that method. */

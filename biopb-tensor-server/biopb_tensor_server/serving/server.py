@@ -337,7 +337,6 @@ def _copy_upload_status(pb: UploadStatusPb, status: Dict[str, Any]) -> None:
 _UPLOAD_STATES = {
     "PENDING": UploadStatusPb.PENDING,
     "READY": UploadStatusPb.READY,
-    "FINISHED": UploadStatusPb.FINISHED,
     "DISCARDED": UploadStatusPb.DISCARDED,
 }
 
@@ -348,7 +347,6 @@ _UPLOAD_STATES = {
 #: reaching an adapter that would refuse it anyway with a worse message.
 _UPLOAD_TARGETS = {
     UploadStatusPb.READY: UploadStatus.READY,
-    UploadStatusPb.FINISHED: UploadStatus.FINISHED,
     UploadStatusPb.DISCARDED: UploadStatus.DISCARDED,
 }
 
@@ -513,6 +511,12 @@ class TensorFlightServer(flight.FlightServerBase):
         # What a crashed server left half-written goes before anything can
         # register it: the caller's discovery scan runs after this returns.
         self.uploads.discard_unfinished_stores()
+        # ...and what it left *finished* comes back. Nothing discovers
+        # write_dir, so this pass is the only thing that re-registers a source
+        # the server minted in an earlier life (biopb/biopb#1048). After the
+        # sweep, so a collection the sweep emptied is adopted as the empty
+        # source it now is.
+        self.uploads.adopt_registered_sources()
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
         # stopped in ``shutdown``.
         self.uploads.start_sweep()
@@ -998,8 +1002,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 "Create a writable single-tensor source from a TensorDescriptor",
             ),
             flight.ActionType(
+                "register_source",
+                "Mint an empty source to add tensors to; answers its source_id",
+            ),
+            flight.ActionType(
                 "set_upload_status",
-                "Move an upload: READY (publish), FINISHED (seal), DISCARDED (give up)",
+                "Move an upload: READY (publish and seal) or DISCARDED (give up)",
             ),
             flight.ActionType(
                 "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
@@ -1097,6 +1105,22 @@ class TensorFlightServer(flight.FlightServerBase):
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
             yield self.uploads.create_tensor(req_desc).SerializeToString()
+        elif action.type == "register_source":
+            self._authorize(context)
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+
+            body = action.body.to_pybytes()
+            req = json.loads(body) if body else {}
+            if not isinstance(req, dict):
+                raise flight.FlightServerError(
+                    "register_source takes a JSON object with optional 'name' "
+                    "and 'metadata'"
+                )
+            source_id = self.uploads.register_source(
+                req.get("name") or "", req.get("metadata")
+            )
+            yield json.dumps({"source_id": source_id}).encode("utf-8")
         elif action.type == "set_upload_status":
             self._authorize(context)
             if not self._writable:

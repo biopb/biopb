@@ -863,6 +863,40 @@ class TensorFlightClient:
     # collaborator (see biopb.tensor._upload); #278 item C.
     # ====================
 
+    def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
+        """Mint an empty source on the server, and answer its ``source_id``.
+
+        A source is a container for tensors; this makes one, and ``add_tensor``
+        fills it. It is registered and readable the moment this returns, with
+        an empty tensor list -- which the catalog models the same way it models
+        a cloud source nobody has resolved yet.
+
+        Unlike an upload, a registered source has no state to move: it is not
+        PENDING, nothing publishes it, and it outlives the process because the
+        server re-registers it at startup rather than because anything
+        discovers it.
+
+        Args:
+            name: A directory component the server names the store after, and
+                what a later ``register_source`` collides with. Empty asks the
+                server to mint one. Compared case- and accent-insensitively,
+                because two such names are one directory on Windows and macOS.
+            metadata: The source's OME metadata block. Source-scoped: every
+                tensor added to it inherits the physical scale, units and
+                channel names from here.
+
+        Returns:
+            The ``source_id``, which is **minted by the server, not derived
+            from the name** -- so it survives the server's ``write_dir``
+            moving, and cannot be guessed from the name by a client that did
+            not create it.
+
+        Raises:
+            FlightServerError: the name cannot be a directory on some platform
+                this store may be served from, or is already taken.
+        """
+        return self._upload.register_source(name, metadata)
+
     def create_tensor(
         self,
         source_name: str,
@@ -985,13 +1019,11 @@ class TensorFlightClient:
 
         The states form a ladder, and a call climbs it or stands still:
 
-        - ``"READY"`` -- **publish**. The source becomes readable, and a chunk
-          that has not been uploaded reads back as zeros. Writes still land, so
-          a consumer can watch a result fill in. This is the state a consumer
-          waiting on a result polls for.
-        - ``"FINISHED"`` -- **seal**. No further chunk is accepted, so what is
-          there is final. Setting it from PENDING publishes on the way, which
-          is what ``upload_array`` does for you.
+        - ``"READY"`` -- **publish and seal**. The source becomes readable, a
+          chunk that was never uploaded reads back as zeros, and no further
+          chunk is accepted, so what is there is final. This is the state a
+          consumer waiting on a result polls for, and what ``upload_array``
+          sets for you.
         - ``"DISCARDED"`` -- **give up**, from any of the above. Whatever the
           server minted goes with it: an ``ome_zarr:`` store, a label set's
           sidecar and its listing. This is how an uploaded label set is
@@ -1004,7 +1036,7 @@ class TensorFlightClient:
         Args:
             target: The descriptor ``create_tensor`` returned, or an
                 ``array_id`` -- a label set's, as ``label_sets`` reports it.
-            state: ``"READY"``, ``"FINISHED"`` or ``"DISCARDED"``.
+            state: ``"READY"`` or ``"DISCARDED"``.
             reason: Why, for ``"DISCARDED"``. It is what a poller waiting on
                 this result reads back, so write it for them.
 

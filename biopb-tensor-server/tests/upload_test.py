@@ -280,7 +280,7 @@ class TestCachedSourceAdapter:
         adapter.write_chunk(bounds, test_data)
 
         # Retrieve via resolve_chunk_data (not direct cache access)
-        adapter.set_status(UploadStatus.FINISHED)
+        adapter.set_status(UploadStatus.READY)
         chunk_id = encode_chunk_id("test_resolve", bounds)
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
@@ -505,7 +505,7 @@ class TestScaledReads:
         # Sealed, so reads are open and the reductions are cacheable: a source
         # that can still take writes serves every scaled read uncached, because
         # nothing would invalidate one built over a gap the writer later fills.
-        adapter.set_status(UploadStatus.FINISHED)
+        adapter.set_status(UploadStatus.READY)
         return adapter, source
 
     @staticmethod
@@ -1396,7 +1396,7 @@ class TestCachedSourceContentVersion:
             data = np.arange(16, dtype=np.uint8).reshape(4, 4)
             bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
             adapter.write_chunk(bounds, data)
-            adapter.set_status(UploadStatus.FINISHED)
+            adapter.set_status(UploadStatus.READY)
 
             # The base read plan mints version-wrapped chunk_ids; the client echoes
             # one back on read -> it must resolve to the written data.
@@ -1427,12 +1427,12 @@ class TestCachedSourceContentVersion:
 
             a1 = self._adapter(b"gen:1")
             a1.write_chunk(bounds, old)
-            a1.set_status(UploadStatus.FINISHED)
+            a1.set_status(UploadStatus.READY)
 
             # Re-upload: same deterministic source_id, new generation, new bytes.
             a2 = self._adapter(b"gen:2")
             a2.write_chunk(bounds, new)
-            a2.set_status(UploadStatus.FINISHED)
+            a2.set_status(UploadStatus.READY)
 
             # Without the version namespace, a2's start_compute would find gen:1's
             # entry and keep the STALE bytes. The fresh namespace serves the new data.
@@ -1463,7 +1463,7 @@ class TestCachedSourceContentVersion:
             data = np.ones((4, 4), dtype=np.uint8)
             bounds = ChunkBounds(start=[0, 0], stop=[4, 4])
             adapter.write_chunk(bounds, data)
-            adapter.set_status(UploadStatus.FINISHED)
+            adapter.set_status(UploadStatus.READY)
             # Unversioned -> legacy unwrapped id resolves, byte-identical to pre-#178.
             batch = adapter.resolve_chunk_data(
                 encode_chunk_id("cache_legacy", bounds), CacheManager.get_instance()
@@ -1560,7 +1560,7 @@ class TestConcurrentChunkUpload:
             client, da.from_array(source, chunks=(1, 40, 40)), "cache:fanout"
         )
 
-        assert client.get_upload_status(source_id)["state"] == "FINISHED"
+        assert client.get_upload_status(source_id)["state"] == "READY"
         np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
 
     def test_the_chunks_really_do_overlap(self, client, monkeypatch):
@@ -1595,7 +1595,7 @@ class TestConcurrentChunkUpload:
             source_id = _upload_whole(client, arr, "cache:serial")
 
         assert state["peak"] == 1
-        assert client.get_upload_status(source_id)["state"] == "FINISHED"
+        assert client.get_upload_status(source_id)["state"] == "READY"
         np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
 
     def test_a_failed_chunk_surfaces_as_itself(self, client, monkeypatch):
@@ -1646,8 +1646,8 @@ class TestConcurrentChunkUpload:
                 ChunkBounds(start=[z, 0, 0], stop=[z + 1, 20, 20]),
                 source[z : z + 1],
             )
-        status = session.set_upload_status(desc, "FINISHED")
-        assert status["state"] == "FINISHED"
+        status = session.set_upload_status(desc, "READY")
+        assert status["state"] == "READY"
         assert status["uploaded_chunks"] == 5
 
     def test_a_shared_upstream_block_is_computed_once(self, client):
@@ -1713,7 +1713,7 @@ class TestConcurrentChunkUpload:
         for z in range(4):
             revived[(slice(z, z + 1), slice(0, 8), slice(0, 8))] = source[z : z + 1]
 
-        assert session.set_upload_status(desc, "FINISHED")["state"] == "FINISHED"
+        assert session.set_upload_status(desc, "READY")["state"] == "READY"
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), source
         )
@@ -1908,8 +1908,8 @@ class TestDiscard:
         same operation."""
         desc = self._make_source(client, shape=(2, 2), chunk=(2, 2))
         self._put(client, desc, (0, 0), (2, 2))
-        client.set_upload_status(desc, "FINISHED")
-        assert client.get_upload_status(desc.array_id)["state"] == "FINISHED"
+        client.set_upload_status(desc, "READY")
+        assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
         assert writable_server.uploads.discard(desc.array_id, "done with it")[
             "state"

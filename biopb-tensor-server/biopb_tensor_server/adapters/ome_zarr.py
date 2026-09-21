@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
-from biopb_tensor_server.adapters._writable import unsafe_store_name
+from biopb_tensor_server.adapters._writable import fold_name, unsafe_store_name
 from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
     ZarrAdapter,
@@ -523,6 +523,21 @@ class OmeZarrAdapter(ZarrAdapter):
         )
 
         zarr_path = write_dir / f"{zarr_name}.zarr"
+        # The mkdir below is exclusive, and on a case-insensitive filesystem it
+        # would catch `Nuclei` against an existing `nuclei` by itself. On ext4
+        # it would not, and the store would then be one directory of two on the
+        # next host to serve this write_dir -- so the fold is checked here
+        # rather than left to the filesystem (``fold_name``).
+        folded = fold_name(zarr_name)
+        if write_dir.is_dir():
+            for existing in write_dir.glob("*.zarr"):
+                if fold_name(existing.name[: -len(".zarr")]) == folded:
+                    raise ValueError(
+                        f"ome_zarr:{zarr_name}: {existing} already exists, and "
+                        f"two names differing only by case or accent form are "
+                        f"one directory on Windows and macOS. Discard the "
+                        f"upload that owns it, or upload under another name."
+                    )
         # Exclusive: the directory must be this create's own, because discard
         # will remove it whole. A name whose store is already on disk -- a
         # finished upload from an earlier server life, or anything else put

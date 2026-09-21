@@ -225,13 +225,13 @@ message PyramidLevel {
 // a holder of the per-source read capability the fast-return path hands out
 // must be able to poll its own result to READY (biopb/biopb#1048).
 message UploadStatus {
-  // Two gates, opened in order, and one way out.
+  // One gate, and one way out.
   //
-  // PENDING -> READY -> FINISHED is a ladder: each `set_upload_status` moves
-  // up it or stands still, never back. READY opens the *read* gate and
-  // FINISHED closes the *write* one, so the two are not the same moment and a
-  // producer that wants them to be just sets FINISHED (which passes through
-  // READY). DISCARDED can be set from any of the three.
+  // PENDING -> READY is a ladder: `set_upload_status` moves up it or stands
+  // still, never back. READY seals the upload against writes and opens it to
+  // reads in one move, so no state is both readable and writable -- a read is
+  // cacheable and a later write cannot invalidate one already taken.
+  // DISCARDED can be set from either rung.
   enum State {
     // Never sent. Present so a client meeting an unknown state reads it as
     // "I do not know this" rather than as PENDING.
@@ -239,15 +239,12 @@ message UploadStatus {
     // Filling, and not yet readable: a chunk that has not arrived is
     // indistinguishable from one that never will, so DoGet is refused.
     PENDING = 1;
-    // Published: readable, and still writable. A chunk that has not arrived
-    // reads as zeros, so a consumer sees a partial result rather than an
-    // error -- which is the point of the state. Writes still land, so what a
-    // consumer reads here may change.
+    // Published and sealed: readable, no longer writable. A chunk that never
+    // arrived reads as zeros, so a consumer sees a partial result rather than
+    // an error -- which is the point of the state. What is there is final.
     READY = 2;
     // Given up on, terminal. `reason` says why.
     DISCARDED = 3;
-    // Complete: no further chunk is accepted, so what is there is final.
-    FINISHED = 4;
   }
   State state = 1;
 
@@ -257,7 +254,7 @@ message UploadStatus {
   // Distinct chunks that have landed; frozen at the count reached once
   // DISCARDED. Never a completeness test: a `cache:` source takes arbitrary
   // bounds, and a set with zero-filled regions is complete with fewer chunks
-  // than the grid has cells. FINISHED is the completeness signal.
+  // than the grid has cells. READY is the completeness signal.
   int64 uploaded_chunks = 3;
 
   // Why the upload was discarded; empty otherwise. Consumer-facing -- it is a

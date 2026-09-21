@@ -32,7 +32,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._writable import UploadStatus, WritableSource
+from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
 from biopb_tensor_server.core.chunk import (
@@ -492,13 +492,12 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         (``core.cache_source``), which is what keeps every rung of an uploaded
         source's pyramid viewable (biopb/biopb#265).
 
-        **Nothing is cached until the upload is FINISHED.** Every answer here
-        stands partly on zeros, and a write that fills one of those gaps has no
-        way to invalidate an answer already stored under its chunk_id -- the
-        ``content_version`` is per-upload, not per-write. So a source that can
-        still change recomputes, and only a sealed one caches. The uploaded
-        chunks are cache entries throughout either way; that is where an upload
-        lives.
+        Caching an answer built over zeros is safe **because READY seals**:
+        nothing readable is still writable, so no write can fill a gap an
+        answer already stored under its chunk_id stands on. That was not true
+        while READY and writable were different states, and it is the reason
+        they are one. The uploaded chunks are cache entries throughout either
+        way; that is where an upload lives.
         """
         if cache_manager is None:
             raise flight.FlightServerError(
@@ -533,9 +532,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             cache_manager.release(chunk_id)
             return data
 
-        progress = self.upload
-        sealed = progress is None or progress.status is UploadStatus.FINISHED
-        return super().resolve_chunk_data(chunk_id, cache_manager if sealed else None)
+        return super().resolve_chunk_data(chunk_id, cache_manager)
 
 
 def _overlap_slices(

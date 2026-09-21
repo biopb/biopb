@@ -90,7 +90,7 @@ class TestDiscardReleasesTheStore:
         the bytes the cache still holds (and zarr's fill for the rest)."""
         desc = _create(client)
         _put(client, desc, fill=3)
-        client.set_upload_status(desc, "FINISHED")
+        client.set_upload_status(desc, "READY")
         assert client.get_tensor(desc.array_id)[:2, :2].compute().max() == 3
         adapter = writable_server.sources.get(desc.array_id)
         chunk_id = encode_chunk_id(
@@ -195,8 +195,145 @@ class TestTheNameCannotEscapeWriteDir:
     def test_ordinary_names_are_still_accepted(self):
         from biopb_tensor_server.adapters._writable import unsafe_store_name
 
-        for name in ["nuclei", "my data (1)", "run-2026.09.19", "_x", "..hidden"]:
+        for name in ["nuclei", "my data (1)", "run-2026.09.19", "_x", "nuclei2"]:
             assert unsafe_store_name(name) is None
+
+
+class TestANameIsAPathOnEveryPlatform:
+    """A store minted on Linux has to open, and keep its identity, when the
+    same ``write_dir`` is later served from Windows or macOS -- so the rules
+    are the union of what the three refuse, checked on whichever is running.
+    """
+
+    @pytest.mark.parametrize(
+        "name,why",
+        [
+            ("CON", "device name"),
+            ("con", "device name"),
+            ("COM1.zarr", "device name"),
+            ("LPT9", "device name"),
+            ("nul", "device name"),
+            ("trailing.", "Windows strips"),
+            ("trailing ", "Windows strips"),
+            (".hidden", "starts with"),
+            ("..hidden", "starts with"),
+            ('quote"d', "NTFS"),
+            ("pipe|d", "NTFS"),
+            ("star*", "NTFS"),
+            ("q?", "NTFS"),
+            ("lt<gt>", "NTFS"),
+            ("bell\x07", "control character"),
+        ],
+    )
+    def test_refused(self, name, why):
+        from biopb_tensor_server.adapters._writable import unsafe_store_name
+
+        reason = unsafe_store_name(name)
+        assert reason is not None, f"{name!r} should be refused"
+        assert why in reason
+
+    def test_a_device_name_is_refused_whatever_follows_the_dot(self):
+        """Windows reserves them with any extension, and the server appends
+        ``.zarr`` -- so ``CON`` alone mints a file that cannot be opened."""
+        from biopb_tensor_server.adapters._writable import unsafe_store_name
+
+        assert unsafe_store_name("CON.anything") is not None
+        assert unsafe_store_name("CONSTANT") is None  # only the exact stem
+
+    def test_the_length_limit_counts_bytes_not_characters(self):
+        """255 is a directory-entry limit, so a non-ASCII name passes a
+        character count and still overflows it."""
+        from biopb_tensor_server.adapters._writable import unsafe_store_name
+
+        assert unsafe_store_name("a" * 250) is None
+        assert unsafe_store_name("é" * 250) is not None
+        assert "bytes" in unsafe_store_name("é" * 250)
+
+    def test_the_refusal_reaches_the_client(self, writable_server, client, tmp_path):
+        with pytest.raises(flight.FlightServerError, match="cannot name a store"):
+            client.create_tensor(
+                "ome_zarr:CON", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+            )
+        assert not list(tmp_path.glob("**/*.zarr"))
+
+
+class TestNamesCollideFolded:
+    """Two names that differ only by case or normalization are one directory
+    on NTFS, APFS and HFS+ and two on ext4. The refusal folds, so the store
+    does not split in two on the next host to serve this ``write_dir``.
+    """
+
+    def test_fold_name_equates_case_and_normal_form(self):
+        import unicodedata
+
+        from biopb_tensor_server.adapters._writable import fold_name
+
+        assert fold_name("Nuclei") == fold_name("nuclei")
+        assert fold_name(unicodedata.normalize("NFD", "café")) == fold_name("café")
+
+    def test_the_name_itself_is_not_folded(self, writable_server, client, tmp_path):
+        """Only the comparison folds: the store is written under the spelling
+        the caller chose, so ``Nuclei`` stays ``Nuclei`` on disk."""
+        client.create_tensor(
+            "ome_zarr:Nuclei", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+        )
+        assert [s.name for s in tmp_path.glob("**/*.zarr")] == ["Nuclei.zarr"]
+
+    def test_a_case_variant_of_a_taken_store_name_is_refused(
+        self, writable_server, client
+    ):
+        client.create_tensor(
+            "ome_zarr:Nuclei", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+        )
+        with pytest.raises(flight.FlightServerError, match="already exists"):
+            client.create_tensor(
+                "ome_zarr:nuclei", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+            )
+
+    def test_an_unrelated_name_is_still_free(self, writable_server, client):
+        client.create_tensor(
+            "ome_zarr:Nuclei", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+        )
+        client.create_tensor(
+            "ome_zarr:membrane", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+        )
+
+
+class TestLabelsIsReservedAsAField:
+    """``labels`` is the NGFF group name and the wire segment that addresses a
+    set, so a field of that name would make ``<array_id>/labels/<name>``
+    ambiguous. Reserved rather than marked with an ``@``, which would have
+    moved every stored ``array_id`` -- ``rois.array_id`` included.
+    """
+
+    def test_the_reserved_word_is_refused_whatever_its_case(self):
+        from biopb_tensor_server.adapters._writable import unsafe_field_name
+
+        for name in ["labels", "Labels", "LABELS"]:
+            assert "reserved" in (unsafe_field_name(name) or "")
+
+    def test_an_ordinary_field_is_accepted(self):
+        from biopb_tensor_server.adapters._writable import unsafe_field_name
+
+        for name in ["nuclei", "labelled", "labels2", "my field"]:
+            assert unsafe_field_name(name) is None
+
+    def test_a_field_takes_the_store_rules_too(self):
+        """It is a path component like any other, minus the extension."""
+        from biopb_tensor_server.adapters._writable import unsafe_field_name
+
+        assert unsafe_field_name("CON") is not None
+        assert unsafe_field_name("a/b") is not None
+        assert unsafe_field_name(".hidden") is not None
+
+    def test_a_set_named_labels_stays_legal(self):
+        """The parse is right-to-left, so ``<field>/labels/labels`` is
+        unambiguous -- only the *field* is reserved."""
+        from biopb_tensor_server.core.labels import split_label_field
+
+        parsed = split_label_field("labels/labels")
+        assert parsed is not None
+        assert parsed.name == "labels"
 
 
 class TestTheBootSweepDropsTheRow:
@@ -231,7 +368,7 @@ class TestTheBootSweepDropsTheRow:
             )
         first.set_status(
             OmeZarrAdapter.upload_source_id(write_dir / "done.zarr"),
-            UploadStatus.FINISHED,
+            UploadStatus.READY,
         )
         assert len(_catalog_ids(db)) == 2
 
@@ -277,7 +414,7 @@ class TestTheMarker:
         writable_server.uploads.discard(desc.array_id, "gone")
 
         with pytest.raises(UploadRefused, match="gone") as exc:
-            client.set_upload_status(desc, "FINISHED")
+            client.set_upload_status(desc, "READY")
         assert exc.value.state == "DISCARDED"
 
     def test_pending_from_create_and_ready_once_published(self, client, tmp_path):
@@ -337,7 +474,7 @@ class TestAServerRestart:
             _put(client, crashed)
             done = _create(client, "ome_zarr:done")
             _put(client, done)
-            client.set_upload_status(done, "FINISHED")
+            client.set_upload_status(done, "READY")
         finally:
             first.shutdown()
         assert (tmp_path / "w" / "crashed.zarr").is_dir()

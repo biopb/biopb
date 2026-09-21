@@ -411,10 +411,10 @@ public class TensorLifecycleTest {
                 // can be self-consistently wrong.
                 assertReassembles(array, server.producer.chunks, 6, 4);
 
-                // Sealing is what marks the source complete, and a whole-array
-                // upload does it on the caller's behalf.
+                // Publishing is what marks the source complete, and a
+                // whole-array upload does it on the caller's behalf.
                 Assert.assertEquals("cache:mine", server.producer.lastSetStatus.getArrayId());
-                Assert.assertEquals("FINISHED", status.get("state"));
+                Assert.assertEquals("READY", status.get("state"));
                 Assert.assertEquals(4.0d, status.get("uploaded_chunks"));
             }
         }
@@ -560,9 +560,9 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 Map<String, Object> status = client.setUploadStatus(
-                        "cache:mine", UploadStatus.State.FINISHED, "");
+                        "cache:mine", UploadStatus.State.READY, "");
                 Assert.assertEquals("cache:mine", status.get("source_id"));
-                Assert.assertEquals("FINISHED", status.get("state"));
+                Assert.assertEquals("READY", status.get("state"));
             }
         }
     }
@@ -733,7 +733,7 @@ public class TensorLifecycleTest {
                     // missing add_source still has health, and the SDK probes it
                     // before every first call.
                     listener.onNext(new Result(
-                            "{\"status\":\"SERVING\",\"protocol\":3}".getBytes(StandardCharsets.UTF_8)));
+                            "{\"status\":\"SERVING\",\"protocol\":2}".getBytes(StandardCharsets.UTF_8)));
                     listener.onCompleted();
                     return;
                 }

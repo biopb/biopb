@@ -8,9 +8,9 @@ Three rules (biopb/biopb#1048 steps 4 and 5):
   (step 6's sweep, ``upload_reclaim_test.py``, is what frees a discarded name);
 - ``set_upload_status`` is the **only** thing that moves an upload, replacing a
   chunk count that was never a completeness check;
-- the ladder has **two gates, not one**: READY opens reads and FINISHED closes
-  writes, so a producer can publish a result before it has finished writing it,
-  and what it has not written reads as zeros.
+- the ladder has **one gate**: READY seals writes and opens reads together,
+  so nothing readable is still writable, and a chunk that was never written
+  reads as zeros.
 """
 
 import numpy as np
@@ -74,16 +74,16 @@ class TestOneNameOneAdapter:
         assert writable_server.sources.get(desc.array_id) is adapter
         assert client.get_upload_status(desc.array_id)["uploaded_chunks"] == 1
 
-    def test_a_finished_name_is_refused_too(self, client):
-        """Sealed is not free. A name that could be reclaimed by finishing is
-        a name a straggler can be raced for."""
+    def test_a_published_name_is_refused_too(self, client):
+        """Published is not free. A name that could be reclaimed by publishing
+        is a name a straggler can be raced for."""
         desc = _make(client, name="cache:done")
         _put(client, desc, (0, 0), (2, 2))
-        _set(client, desc, "FINISHED")
+        _set(client, desc, "READY")
 
         with pytest.raises(flight.FlightServerError, match="already exists"):
             _make(client, name="cache:done")
-        assert client.get_upload_status(desc.array_id)["state"] == "FINISHED"
+        assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
     def test_the_refusal_leaves_nothing_behind(self, writable_server, client):
         """The refused adapter is never registered -- the registry's count is
@@ -124,22 +124,14 @@ class TestTheLadder:
         assert status["state"] == "PENDING"
         assert status["uploaded_chunks"] == status["expected_chunks"] == 4
 
-    def test_ready_publishes_and_finished_seals(self, client):
+    def test_ready_publishes_and_seals(self, client):
+        """One call, one moment: the result becomes readable and stops taking
+        chunks together."""
         desc = _make(client)
         _fill(client, desc)
 
         assert _set(client, desc, "READY")["state"] == "READY"
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
-        assert _set(client, desc, "FINISHED")["state"] == "FINISHED"
-        assert client.get_upload_status(desc.array_id)["state"] == "FINISHED"
-
-    def test_finished_from_pending_skips_a_rung(self, client):
-        """One call for the ordinary case: a producer that never wanted a
-        partial read publishes and seals at once."""
-        desc = _make(client)
-        _fill(client, desc)
-
-        assert _set(client, desc, "FINISHED")["state"] == "FINISHED"
         assert (np.asarray(client.get_tensor(desc.array_id)) == 7).all()
 
     def test_no_state_requires_a_full_grid(self, client):
@@ -152,35 +144,27 @@ class TestTheLadder:
         desc = _make(client)
         _put(client, desc, (0, 0), (2, 2))
 
-        status = _set(client, desc, "FINISHED")
-        assert status["state"] == "FINISHED"
+        status = _set(client, desc, "READY")
+        assert status["state"] == "READY"
         assert status["uploaded_chunks"] == 1
         assert status["expected_chunks"] == 4
 
-    def test_a_write_after_ready_still_lands(self, client):
-        """READY is not a seal. This is the whole point of splitting it off."""
+    def test_a_write_after_ready_is_refused_as_sealed(self, client):
+        """The seal is the half of READY that makes its reads cacheable."""
         desc = _make(client)
         _put(client, desc, (0, 0), (2, 2))
         _set(client, desc, "READY")
 
-        _put(client, desc, (2, 2), (4, 4))  # no raise
-        assert client.get_upload_status(desc.array_id)["uploaded_chunks"] == 2
-
-    def test_a_write_after_finished_is_refused_as_sealed(self, client):
-        desc = _make(client)
-        _put(client, desc, (0, 0), (2, 2))
-        _set(client, desc, "FINISHED")
-
         with pytest.raises(UploadRefused) as exc:
             _put(client, desc, (2, 2), (4, 4))
-        assert exc.value.state == "FINISHED"
+        assert exc.value.state == "READY"
         assert exc.value.source_id == desc.array_id
 
     def test_the_sealed_source_keeps_what_it_had(self, client):
         """A refused write changes nothing -- the seal is not a rollback."""
         desc = _make(client)
         _put(client, desc, (0, 0), (2, 2))
-        _set(client, desc, "FINISHED")
+        _set(client, desc, "READY")
         with pytest.raises(UploadRefused):
             _put(client, desc, (2, 2), (4, 4))
 
@@ -190,41 +174,35 @@ class TestTheLadder:
         desc = _make(client)
         _put(client, desc, (0, 0), (2, 2))
 
-        _set(client, desc, "FINISHED")
-        assert _set(client, desc, "FINISHED")["state"] == "FINISHED"  # not an error
-
-    def test_the_ladder_does_not_descend(self, client):
-        """A published result cannot be unpublished, and a sealed one cannot be
-        reopened for writes a reader has already been told are over."""
-        desc = _make(client)
-        _set(client, desc, "FINISHED")
-
-        with pytest.raises(flight.FlightServerError, match="cannot go back"):
-            _set(client, desc, "READY")
-        assert client.get_upload_status(desc.array_id)["state"] == "FINISHED"
+        _set(client, desc, "READY")
+        assert _set(client, desc, "READY")["state"] == "READY"  # not an error
 
     def test_pending_is_not_settable(self, client):
-        """An upload starts there and nothing returns it there."""
+        """An upload starts there and nothing returns it there -- which is also
+        what keeps the ladder from descending, now that it has one rung to
+        climb."""
         desc = _make(client)
+        _set(client, desc, "READY")
 
         with pytest.raises(flight.FlightServerError, match="not a state"):
             _set(client, desc, "PENDING")
+        assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
     def test_a_discarded_upload_cannot_be_moved(self, writable_server, client):
         desc = _make(client, name="cache:doomed")
         writable_server.uploads.discard(desc.array_id, "job died")
 
         with pytest.raises(UploadRefused, match="job died") as exc:
-            _set(client, desc, "FINISHED")
+            _set(client, desc, "READY")
         assert exc.value.state == "DISCARDED"
         assert exc.value.reason == "job died"
 
-    def test_a_finished_upload_can_still_be_discarded(self, client):
-        """Sealing publishes a result; it does not make it permanent. Discard
-        is reachable from every rung, which is what makes it the only delete."""
+    def test_a_published_upload_can_still_be_discarded(self, client):
+        """Publishing a result does not make it permanent. Discard is reachable
+        from every rung, which is what makes it the only delete."""
         desc = _make(client)
         _put(client, desc, (0, 0), (2, 2))
-        _set(client, desc, "FINISHED")
+        _set(client, desc, "READY")
 
         assert _set(client, desc, "DISCARDED", "withdrawn")["state"] == "DISCARDED"
         with pytest.raises(flight.FlightError, match="withdrawn"):
@@ -234,7 +212,7 @@ class TestTheLadder:
         """Unlike DISCARDED, which is total: a climb that names nothing means
         the caller believes it has been writing somewhere it has not."""
         with pytest.raises(flight.FlightServerError, match="not an upload"):
-            client.set_upload_status("no-such-source", "FINISHED")
+            client.set_upload_status("no-such-source", "READY")
 
     def test_discarding_something_that_is_not_an_upload_is_not(self, client):
         """A statement about the end state, not a receipt: a retry after the
@@ -288,15 +266,14 @@ class TestTheReadGate:
         assert (arr[2:, :] == 0).all()
         assert (arr[:, 2:] == 0).all()
 
-    def test_a_chunk_written_after_publishing_is_served(self, writable_server, client):
-        """What READY buys, at the seam that provides it.
+    def test_a_read_gap_can_never_be_contradicted(self, writable_server, client):
+        """Why the two gates are one.
 
-        Asserted against the adapter rather than through ``get_tensor``: the
-        SDK caches a chunk under its ``chunk_id``, which names fixed bytes
-        everywhere else in this system, so a consumer that has already read a
-        region keeps what it read. Watching a result fill in means re-reading
-        from a process that has not, which is a client-side question; what the
-        server owes is that the bytes are there to be read.
+        A gap reads as zeros and that answer is cacheable -- here it is served
+        from the cache the second time. Nothing may later fill the gap, because
+        an entry already handed out under its ``chunk_id`` cannot be recalled,
+        least of all from the client's own pool. The seal is what removes the
+        case rather than racing it.
         """
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.core.chunk import mint_chunk_id
@@ -314,10 +291,9 @@ class TestTheReadGate:
         cache = CacheManager.get_instance()
         assert not unpack_chunk_array(adapter.resolve_chunk_data(chunk_id, cache)).any()
 
-        _put(client, desc, (2, 2), (4, 4))
-        assert (
-            unpack_chunk_array(adapter.resolve_chunk_data(chunk_id, cache)) == 7
-        ).all()
+        with pytest.raises(UploadRefused):
+            _put(client, desc, (2, 2), (4, 4))
+        assert not unpack_chunk_array(adapter.resolve_chunk_data(chunk_id, cache)).any()
 
     def test_a_discarded_source_reports_its_reason(self, writable_server, client):
         """Disposal is the one terminal state a reader does meet: the adapter
@@ -330,15 +306,14 @@ class TestTheReadGate:
         with pytest.raises(flight.FlightError, match="client went away"):
             client.get_tensor(desc.array_id).compute()
 
-    def test_sealing_changes_nothing_for_a_reader(self, client):
-        """FINISHED bounds the writes, not the reads: a sealed source reads
-        exactly as the same source read a moment earlier."""
+    def test_a_repeated_publish_changes_nothing_for_a_reader(self, client):
+        """Setting READY again is a no-op all the way down, not a re-publish."""
         desc = _make(client)
         _fill(client, desc)
         _set(client, desc, "READY")
         before = np.asarray(client.get_tensor(desc.array_id))
 
-        _set(client, desc, "FINISHED")
+        _set(client, desc, "READY")
 
         np.testing.assert_array_equal(
             before, np.asarray(client.get_tensor(desc.array_id))

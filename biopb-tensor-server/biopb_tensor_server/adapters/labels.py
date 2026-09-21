@@ -50,7 +50,7 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
-from biopb_tensor_server.adapters._writable import unsafe_store_name
+from biopb_tensor_server.adapters._writable import fold_name, unsafe_store_name
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
     _first_dataset_path,
@@ -416,10 +416,25 @@ def create_label_upload(
             f"{array_id!r}: a label set is unsigned integer ids with 0 for "
             f"background, not {np.dtype(desc.dtype)}."
         )
-    if field in parent.label_sets or field in parent.label_uploads:
+    # Folded, because NTFS, APFS and HFS+ are case-insensitive and HFS+ stores
+    # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
+    # there, so an unfolded check mints a second set that the next boot on such
+    # a host cannot tell from the first (``fold_name``).
+    folded = fold_name(field)
+    taken = next(
+        (
+            existing
+            for existing in (*parent.label_sets, *parent.label_uploads)
+            if fold_name(existing) == folded
+        ),
+        None,
+    )
+    if taken is not None:
         raise ValueError(
-            f"{array_id!r} already exists. A set's name is taken for as long "
-            f"as it is served; delete it first, or upload under another name."
+            f"{array_id!r} already exists as {taken!r}. A set's name is taken "
+            f"for as long as it is served, and two names differing only by "
+            f"case or accent form are one name on Windows and macOS; delete it "
+            f"first, or upload under another name."
         )
     images = parent._normalized_tensors()
     if not desc.dim_labels:

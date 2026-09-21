@@ -77,8 +77,8 @@ class TestAQuietUploadExpires:
         assert client.get_upload_status(desc.array_id)["state"] == "PENDING"
 
     def test_a_published_upload_is_never_expired(self, uploads, client):
-        """Past PENDING the upload is a published result; its lifetime is its
-        reader's, and that holds at READY as much as at FINISHED."""
+        """Past PENDING the upload is a published result, and its lifetime is
+        its reader's rather than its writer's."""
         desc = _make(client)
         _put(client, desc)
         client.set_upload_status(desc, "READY")

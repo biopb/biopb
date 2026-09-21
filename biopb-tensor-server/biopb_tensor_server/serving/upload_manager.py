@@ -58,6 +58,11 @@ from biopb_tensor_server.adapters._writable import (
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.adapters.registered import (
+    adopt_registered_sources as _adopt_registered_sources,
+    create_registered_source,
+    sources_root,
+)
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, read_zattrs, upload_state
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.errors import (
@@ -225,7 +230,7 @@ class UploadManager:
     def discard(self, array_id: str, reason: str = "") -> Dict[str, Any]:
         """Give up on an upload; see ``WritableSource.discard``.
 
-        Reachable from every state, FINISHED included -- which is what makes it
+        Reachable from every state, READY included -- which is what makes it
         the one way a published upload is ever removed, and why there is no
         second verb for deleting one. A durable kind's store goes with the
         discard (the adapter's own), and its listing here: the catalog row for
@@ -257,8 +262,8 @@ class UploadManager:
         typed errors into Flight ones, and publishing a label set into its
         parent's listing the first time it becomes readable.
 
-        The listing follows READY rather than FINISHED because READY is what
-        makes the set readable at all, and a set nobody can reach is not one to
+        The listing follows READY because READY is what makes the set readable
+        at all, and a set nobody can reach is not one to
         advertise. It happens after the store is published on disk, never
         before: the catalog must not name a set a restart would sweep away.
 
@@ -567,17 +572,92 @@ class UploadManager:
         # Only a durable upload belongs in the catalog; a volatile one is
         # readable by its returned id but not enumerable (biopb/biopb#265).
         # Best-effort: a catalog write must not fail the upload.
-        if kind.durable and self._metadata_db is not None:
-            try:
-                self._metadata_db.sync_source_added(source_id, registered)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to sync uploaded source {source_id} to catalog "
-                    f"(readable by id, not listed): {e}"
-                )
+        if kind.durable:
+            self._sync_row(source_id, registered)
 
         logger.info(f"Created {prefix} upload: {source_id}")
         return adapter.upload_response(req_desc)
+
+    def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
+        """Mint a source a client can add tensors to; answers its ``source_id``.
+
+        Registration, not upload: the collection holds no bytes and has no
+        upload state, so it is readable (and empty) the moment this returns.
+        What makes it outlive the process is that :meth:`adopt_registered_sources`
+        finds it again, not that anything discovers it -- ``write_dir`` stays
+        outside every discovery root.
+        """
+        if self._write_dir is None:
+            raise flight.FlightServerError(
+                "register_source: write_dir is not configured, so there is "
+                "nowhere to put a source"
+            )
+        try:
+            adapter = create_registered_source(
+                name, metadata, sources_root(self._write_dir)
+            )
+        except (ValueError, OSError) as e:
+            raise flight.FlightServerError(str(e)) from e
+
+        registered = self._registry.register_new(adapter.source_id, adapter)
+        if registered is None:
+            # A minted id that is already registered means the mint collided,
+            # which 48 random bits make a non-event -- but the store is already
+            # on disk, so release it rather than leave the server's own bytes
+            # for the next boot to adopt under an id it cannot serve.
+            adapter.dispose_store()
+            close_adapter(adapter)
+            raise flight.FlightServerError(
+                f"register_source: {adapter.source_id} is already registered; retry."
+            )
+        self._sync_row(adapter.source_id, registered)
+        return adapter.source_id
+
+    def adopt_registered_sources(self) -> int:
+        """Re-register what the last life left under ``<write_dir>/sources``.
+
+        The half of registration that was missing (biopb/biopb#1048): the
+        upload path registered a minted store in the life that created it, and
+        nothing brought it back, so its catalog row outlived the adapter behind
+        it. Runs at startup after the pending sweep and before the caller's
+        discovery scan, so an adopted id is already registered by the time
+        anything can ask for it. Returns the count.
+        """
+        if self._write_dir is None:
+            return 0
+        count = 0
+        for source_id, adapter in _adopt_registered_sources(
+            sources_root(self._write_dir)
+        ).items():
+            if self._registry.register_new(source_id, adapter) is None:
+                # Something else already holds the id. Leave its store alone --
+                # this pass adopts, it does not arbitrate.
+                logger.warning(f"Registered source {source_id} is already served")
+                close_adapter(adapter)
+                continue
+            self._sync_row(source_id, adapter)
+            count += 1
+        if count:
+            logger.info(f"Adopted {count} registered source(s)")
+        return count
+
+    def _sync_row(self, source_id: str, adapter: Any) -> None:
+        """Put *source_id* in the catalog; best-effort.
+
+        Best-effort for the reason every catalog write on this path is: the
+        row is how a source is *browsable*, and it must not be able to fail the
+        registration that made it *readable*. A leaked row is the worst case,
+        and the boot sweep is what collects those.
+        """
+        if self._metadata_db is None:
+            return
+        try:
+            self._metadata_db.sync_source_added(source_id, adapter)
+        except Exception as e:
+            logger.warning(
+                f"Failed to sync registered source {source_id} to catalog "
+                f"(readable by id, not listed): {e}"
+            )
 
     def write_chunk(
         self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
