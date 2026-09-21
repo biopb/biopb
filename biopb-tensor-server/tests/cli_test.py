@@ -42,6 +42,7 @@ def _fake_server_config(**overrides):
         "host": "127.0.0.1",
         "port": 8815,
         "log_level": "INFO",
+        "log_scope_to_biopb": True,
         "tls": False,
         "tls_cert": None,
         "tls_key": None,
@@ -61,7 +62,7 @@ def _run_serve(config, **overrides):
     kwargs = {
         "config": config,
         "log_level": None,
-        "log_scope_biopb": True,
+        "log_scope_biopb": None,
         "host": None,
         "port": None,
         "writable": None,
@@ -85,7 +86,7 @@ def _run_launch(config, **overrides):
     kwargs = {
         "config": config,
         "log_level": None,
-        "log_scope_biopb": True,
+        "log_scope_biopb": None,
         "host": None,
         "port": None,
         "writable": None,
@@ -193,14 +194,33 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
 
 
-def _patched_launch_internals(monkeypatch) -> dict:
+def _cfg(tmp_path) -> Path:
+    """A config file that exists. `--config` is `exists=True`, so a real parse
+    needs the path to be there; the contents never matter to these tests because
+    `load_config` is faked."""
+    path = tmp_path / "biopb.json"
+    path.write_text("{}", encoding="utf-8")
+    return path
+
+
+def _patched_launch_internals(monkeypatch, server_config=None) -> dict:
     """No-op every `launch`/`_setup_flight_server` collaborator except the
     latter, whose kwargs land in the returned dict -- shared scaffolding for
-    tests that only care what `launch` computed and forwarded."""
+    tests that only care what `launch` computed and forwarded.
+
+    `setup_logging` is a no-op too, but its `scope_to_biopb` is recorded under
+    `log_scope` first: that one `launch` resolves against the config itself
+    rather than handing to `_setup_flight_server`.
+    """
     captured: dict = {}
-    monkeypatch.setattr(cli, "load_config", lambda path: _fake_server_config())
+    config = server_config if server_config is not None else _fake_server_config()
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
     monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
-    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli,
+        "setup_logging",
+        lambda *a, **k: captured.update(log_scope=k.get("scope_to_biopb")),
+    )
     monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
     monkeypatch.setattr(cli, "run_http_server", lambda **k: None)
     monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
@@ -221,7 +241,9 @@ def _patched_launch_internals(monkeypatch) -> dict:
         (["--no-writable"], False),  # explicit off, overriding a config that says on
     ],
 )
-def test_writable_flag_is_three_state_through_typer(monkeypatch, argv, forwarded):
+def test_writable_flag_is_three_state_through_typer(
+    monkeypatch, tmp_path, argv, forwarded
+):
     """Absence of --writable must mean "no opinion", not "off".
 
     `_setup_flight_server` resolves `writable=None` to the config file's
@@ -233,15 +255,52 @@ def test_writable_flag_is_three_state_through_typer(monkeypatch, argv, forwarded
 
     This goes through typer's own parsing via CliRunner. The sibling helpers here
     call the command as a plain function and supply their own defaults, which is
-    exactly why the suite could not see it.
+    exactly why the suite could not see it -- and why the config path has to be a
+    real file: `--config` is declared `exists=True`, which only a real parse
+    enforces.
     """
     from typer.testing import CliRunner
 
     captured = _patched_launch_internals(monkeypatch)
 
-    result = CliRunner().invoke(cli.app, ["launch", "--config", "unused.json", *argv])
+    result = CliRunner().invoke(
+        cli.app, ["launch", "--config", str(_cfg(tmp_path)), *argv]
+    )
     assert result.exit_code == 0, result.output
     assert captured["writable"] is forwarded
+
+
+@pytest.mark.parametrize(
+    "argv, cfg_value, expected",
+    [
+        ([], True, True),  # no opinion -> the config decides...
+        ([], False, False),  # ...either way
+        (["--log-scope-biopb"], False, True),  # explicit on overrides the config
+        (["--log-scope-all"], True, False),  # explicit off overrides the config
+    ],
+)
+def test_log_scope_flag_defers_to_the_config(
+    monkeypatch, tmp_path, argv, cfg_value, expected
+):
+    """`server.log_scope_to_biopb` must actually reach setup_logging.
+
+    The second field the `writable` audit turned up, with a worse prognosis: a
+    documented ServerConfig field, carried into the JSON Schema so the settings
+    editor offers it, and with no readers at all. Both commands kept their own
+    `--log-scope-biopb/--log-scope-all` defaulting True and handed that straight
+    to setup_logging, so the config key was inert whatever it said (biopb#1085).
+    """
+    from typer.testing import CliRunner
+
+    captured = _patched_launch_internals(
+        monkeypatch, _fake_server_config(log_scope_to_biopb=cfg_value)
+    )
+
+    result = CliRunner().invoke(
+        cli.app, ["launch", "--config", str(_cfg(tmp_path)), *argv]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["log_scope"] is expected
 
 
 def test_launch_forwards_flight_overrides_and_resolves_token_against_host(

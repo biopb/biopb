@@ -1097,10 +1097,12 @@ def serve(
         "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
-    log_scope_biopb: bool = typer.Option(
-        True,
+    log_scope_biopb: Optional[bool] = typer.Option(
+        None,
         "--log-scope-biopb/--log-scope-all",
-        help="Scope logging to biopb_tensor_server only (default) or affect all packages",
+        help="Scope logging to biopb_tensor_server only, or --log-scope-all to "
+        "affect every package. Omitted, the config file's "
+        "`server.log_scope_to_biopb` decides (which defaults to scoped).",
     ),
     host: str = typer.Option(
         DEFAULT_FLIGHT_HOST,
@@ -1176,8 +1178,17 @@ def serve(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
+    # Same three-state rule as `writable` below, and for the same reason: the
+    # config field existed, was documented in the JSON Schema (so the settings
+    # editor offered it), and nothing read it -- the flag's default won every
+    # time (biopb#1085).
+    effective_log_scope = (
+        log_scope_biopb
+        if log_scope_biopb is not None
+        else server_config.log_scope_to_biopb
+    )
     setup_logging(
-        effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
+        effective_log_level, scope_to_biopb=effective_log_scope, log_file=log_file
     )
 
     # The flight bind is the mode switch, so resolve the token against it. A
@@ -1588,10 +1599,12 @@ def launch(
         "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
-    log_scope_biopb: bool = typer.Option(
-        True,
+    log_scope_biopb: Optional[bool] = typer.Option(
+        None,
         "--log-scope-biopb/--log-scope-all",
-        help="Scope logging to biopb_tensor_server only (default) or affect all packages",
+        help="Scope logging to biopb_tensor_server only, or --log-scope-all to "
+        "affect every package. Omitted, the config file's "
+        "`server.log_scope_to_biopb` decides (which defaults to scoped).",
     ),
     host: str = typer.Option(
         DEFAULT_FLIGHT_HOST,
@@ -1694,8 +1707,17 @@ def launch(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
+    # Same three-state rule as `writable` below, and for the same reason: the
+    # config field existed, was documented in the JSON Schema (so the settings
+    # editor offered it), and nothing read it -- the flag's default won every
+    # time (biopb#1085).
+    effective_log_scope = (
+        log_scope_biopb
+        if log_scope_biopb is not None
+        else server_config.log_scope_to_biopb
+    )
     setup_logging(
-        effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
+        effective_log_level, scope_to_biopb=effective_log_scope, log_file=log_file
     )
 
     # Treat SIGTERM (the control supervisor's graceful stop, `docker/slurm stop`)
