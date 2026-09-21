@@ -170,7 +170,7 @@ def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
 
     Mirrors the server's own ``unknown_upload_status`` so the two ends agree on
     the shape, and never means "not started yet": the record exists from the
-    moment ``create_tensor`` hands out the id.
+    moment ``add_tensor`` hands out the id.
     """
     return {
         "source_id": source_id,

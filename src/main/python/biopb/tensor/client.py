@@ -897,56 +897,68 @@ class TensorFlightClient:
         """
         return self._upload.register_source(name, metadata)
 
-    def create_tensor(
+    def add_tensor(
         self,
-        source_name: str,
+        array_id: str,
         template: Any,
         *,
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> TensorDescriptor:
-        """Declare a single-tensor source to fill: the first half of an upload.
+        """Declare a tensor to fill: the first half of an upload.
 
         Note:
-            Experimental. The upload / writable-source API (tensor creation,
-            chunk upload, and upload-status polling) is experimental and may
-            change.
+            Experimental. The upload / writable-source API (source
+            registration, tensor creation, chunk upload, and upload-status
+            polling) is experimental and may change.
 
-        Declare, then fill. The returned descriptor is the server's echo --
+        **An upload adds a tensor to a source that already exists**, so
+        ``register_source`` comes first and this never creates one. Declare,
+        then fill: the returned descriptor is the server's echo --
         ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
         and is what ``upload_array``, ``upload_chunk`` and
-        ``set_upload_status`` take. A name is taken while its source exists: a
-        second create under it -- at any of the three states -- is refused. Only
-        the server's reclaim sweep frees one, after a discarded upload's
-        ``upload_ttl``.
-        ``set_upload_status`` is what publishes the source and marks it
-        complete.
+        ``set_upload_status`` take. ``set_upload_status`` is what publishes the
+        tensor and marks it complete.
+
+        A field is taken while its tensor is served: a second add under it --
+        at any state -- is refused. Only the server's reclaim sweep frees one,
+        after a discarded upload's ``upload_ttl``.
 
         Args:
-            source_name: "cache:name" → cache-backed; "ome_zarr:name" →
-                zarr-backed; "cache:" or "ome_zarr:" → server-generated name;
-                "<image array_id>/labels/<name>" → a label set of an image the
-                server already serves, which is the one form whose id is the
-                request's own rather than a minted ``source_id``. A set is
-                unsigned-integer, spans its image's non-channel axes at full
-                length, and its all-zero chunks are skipped by ``upload_array``
+            array_id: ``"<scheme>://<source_id>/<field>"``, where *scheme* is
+                the store format -- ``zarr`` for an OME-Zarr image group,
+                ``cache`` for the chunks as uploaded -- and *source_id* is what
+                ``register_source`` answered. Or
+                ``"zarr://<image array_id>/labels/<name>"`` for a label set of
+                an image the server already serves, which is the one form whose
+                source may be a discovered file. A set is unsigned-integer,
+                spans its image's non-channel axes at full length, and its
+                all-zero chunks are skipped by ``upload_array``.
+                The scheme names the store format and nothing else: the
+                answered ``array_id`` carries none.
             template: Anything with ``.shape`` and ``.dtype`` -- the array to be
                 uploaded, or one shaped like it. A dask array also supplies the
                 chunk grid (its chunk size per axis).
             chunk_shape: The upload grid, overriding the template's. Required
-                to get anything but one chunk from a non-dask template.
+                to get anything but one chunk from a non-dask template. A
+                request, not a promise: the server plans on its own grid and
+                answers with it (``chunk_shape`` on the returned descriptor).
             dim_labels: Optional dimension labels
-            ome_metadata: Optional OME metadata dict
+            ome_metadata: Ignored except for a label set's ``image-label``
+                block. Metadata is source-scoped and rides on
+                ``register_source``; a tensor inherits its source's.
 
         Returns:
-            The new source's descriptor.
+            The new tensor's descriptor, under the ``array_id`` it keeps.
 
         Raises:
-            pyarrow.flight.FlightServerError: the name is already taken.
+            pyarrow.flight.FlightServerError: the source is not registered, the
+                field is taken, or the name cannot be a directory on some
+                platform this store may be served from.
         """
-        return self._upload.create_tensor(
-            source_name,
+        return self._upload.add_tensor(
+            array_id,
             template,
             chunk_shape=chunk_shape,
             dim_labels=dim_labels,
@@ -981,7 +993,7 @@ class TensorFlightClient:
         may be written.
 
         Args:
-            desc: The descriptor ``create_tensor`` returned
+            desc: The descriptor ``add_tensor`` returned
             arr: The array to upload (dask or numpy)
             slice_hint: Optional region to upload, as a slice per axis. An
                 open-ended ``stop`` is filled from the declared shape.
@@ -1020,7 +1032,7 @@ class TensorFlightClient:
         rather than written somewhere no read asks for.
 
         Args:
-            desc: The descriptor ``create_tensor`` returned
+            desc: The descriptor ``add_tensor`` returned
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data
 
@@ -1060,7 +1072,7 @@ class TensorFlightClient:
         the ladder is refused.
 
         Args:
-            target: The descriptor ``create_tensor`` returned, or an
+            target: The descriptor ``add_tensor`` returned, or an
                 ``array_id`` -- a label set's, as ``label_sets`` reports it.
             state: ``"READY"`` or ``"DISCARDED"``.
             reason: Why, for ``"DISCARDED"``. It is what a poller waiting on
@@ -1143,7 +1155,7 @@ class TensorFlightClient:
             upload, and upload-status polling) is experimental and may change.
 
         Args:
-            source_id: The ``array_id`` of the descriptor ``create_tensor`` returned
+            source_id: The ``array_id`` of the descriptor ``add_tensor`` returned
 
         Returns:
             Dictionary with source_id, state, expected_chunks, and uploaded_chunks.

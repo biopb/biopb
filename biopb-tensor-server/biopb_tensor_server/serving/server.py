@@ -204,8 +204,8 @@ def _with_label_axes(metadata: dict, source_adapter: Any, desc: Any) -> dict:
 
     NGFF's own ``image-label`` block is left alone: that is a spec block and
     this is not in the spec. It rides in the ``biopb`` namespace beside it,
-    merged into whatever the source already has there -- an ``ome_zarr:``
-    upload's own ``.zattrs`` carry an upload marker -- rather than replacing it.
+    merged into whatever the source already has there -- an uploaded store's
+    own ``.zattrs`` carry an upload marker -- rather than replacing it.
 
     ``source_id`` is the slash-free prefix by the identity policy, so the
     within-source field is everything after the first "/".
@@ -793,12 +793,16 @@ class TensorFlightServer(flight.FlightServerBase):
         raise flight.FlightUnauthenticatedError("Invalid or missing source token")
 
     @staticmethod
-    def _parse(msg: Message, data: bytes, what: str) -> Message:
+    def _parse(
+        msg: Message, data: bytes, what: str, *, allow_empty: bool = False
+    ) -> Message:
         """Decode a wire message, or refuse the call with the reason.
 
         The oneof arm is the dispatch, so a payload that decodes but sets no
         arm is refused here too -- that is what a protocol-1 client's request
-        or bare ticket looks like, and the message says so.
+        or bare ticket looks like, and the message says so. *allow_empty* is
+        for the messages that carry no oneof and whose fields are all optional,
+        where an empty body is a real request rather than a mis-sent one.
         """
         try:
             msg.ParseFromString(data)
@@ -806,7 +810,7 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(
                 f"{what} is not a {type(msg).__name__}: {exc}"
             )
-        if not msg.ListFields():
+        if not allow_empty and not msg.ListFields():
             raise flight.FlightServerError(
                 f"{what} names nothing: expected a {type(msg).__name__} with one arm "
                 f"set (this server speaks Flight protocol v{FLIGHT_PROTOCOL_VERSION})"
@@ -1044,12 +1048,12 @@ class TensorFlightServer(flight.FlightServerBase):
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType(
-                "create_tensor",
-                "Create a writable single-tensor source from a TensorDescriptor",
-            ),
-            flight.ActionType(
                 "register_source",
                 "Mint an empty source to add tensors to; answers its source_id",
+            ),
+            flight.ActionType(
+                "add_tensor",
+                "Add a tensor to a source that already exists; answers its descriptor",
             ),
             flight.ActionType(
                 "set_upload_status",
@@ -1144,20 +1148,25 @@ class TensorFlightServer(flight.FlightServerBase):
                 "catalog_persisted": db is not None and db.store_path is not None,
             }
             yield json.dumps(health_status).encode("utf-8")
-        elif action.type == "create_tensor":
+        elif action.type == "add_tensor":
             self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
-            yield self.uploads.create_tensor(req_desc).SerializeToString()
+            yield self.uploads.add_tensor(req_desc).SerializeToString()
         elif action.type == "register_source":
             self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
+            # Every field is optional: an empty body asks for a source with a
+            # minted name and no metadata, which is the common case.
             req = self._parse(
-                RegisterSource(), action.body.to_pybytes(), "register_source request"
+                RegisterSource(),
+                action.body.to_pybytes(),
+                "register_source request",
+                allow_empty=True,
             )
             source_id = self.uploads.register_source(req.name, req.metadata_json)
             yield RegisterSourceResult(source_id=source_id).SerializeToString()

@@ -50,8 +50,11 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
  *
  * <p><b>Experimental</b>, with the rest of the upload API.
  *
- * <p>Declare, then fill: {@link #createTensor} returns the server's descriptor
- * for the new source, and that descriptor is what every write takes. The Java
+ * <p><b>An upload adds a tensor to a source that already exists.</b>
+ * {@link #registerSource} mints one, {@link #addTensor} returns the server's
+ * descriptor for the new tensor, and that descriptor is what every write
+ * takes. The scheme on an {@code array_id} names the store format and nothing
+ * else; the answered id carries none. The Java
  * twin of {@code biopb.tensor._upload}, minus its dask graph -- an imglib2
  * interval is walked on the calling thread, one chunk per planned endpoint,
  * each put finished before the next is encoded. Python instead stores the whole
@@ -97,7 +100,7 @@ final class TensorUploads {
     String registerSource(String name, String metadataJson) {
         RegisterSource request = RegisterSource.newBuilder()
                 .setName(name == null ? "" : name)
-                // Opaque here, as on `createTensor`: the server keeps the OME
+                // Opaque here: the server keeps the OME
                 // tree whole, so a malformed one is its refusal to give, with
                 // the message it gives every other create.
                 .setMetadataJson(metadataJson == null ? "" : metadataJson)
@@ -115,16 +118,16 @@ final class TensorUploads {
         return answer.getSourceId();
     }
 
-    /** Backs {@link TensorFlightClient#createTensor}; see that method. */
-    TensorDescriptor createTensor(
-            String sourceName,
+    /** Backs {@link TensorFlightClient#addTensor}; see that method. */
+    TensorDescriptor addTensor(
+            String arrayId,
             long[] shape,
             String dtype,
             long[] chunkShape,
             List<String> dimLabels,
             String metadataJson) {
         TensorDescriptor.Builder request = TensorDescriptor.newBuilder()
-                .setArrayId(sourceName)
+                .setArrayId(arrayId)
                 .setDtype(dtype);
         for (long dim : shape) {
             request.addShape(dim);
@@ -140,8 +143,8 @@ final class TensorUploads {
         }
 
         TensorDescriptor created = TensorChunkCodec.parseDescriptor(
-                actionOneResult("create_tensor", request.build().toByteArray()));
-        LOGGER.info("createTensor: created " + created.getArrayId());
+                actionOneResult("add_tensor", request.build().toByteArray()));
+        LOGGER.info("addTensor: added " + created.getArrayId());
         return created;
     }
 

@@ -1245,7 +1245,7 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Get upload status for a writable source.
      *
-     * @param sourceId Source identifier returned by create_tensor()
+     * @param sourceId the array_id add_tensor() returned
      * @return Map containing source_id, state, expected_chunks, uploaded_chunks and reason
      * @throws IOException If the action fails
      */
@@ -1296,72 +1296,82 @@ public class TensorFlightClient implements AutoCloseable {
     // ====================
 
     /**
-     * Declare a single-tensor source to fill: the first half of an upload.
+     * Declare a tensor to fill: the first half of an upload.
      *
-     * <p><b>Experimental.</b> The upload / writable-source API (tensor
-     * creation, chunk upload, and upload-status polling) may change.
+     * <p><b>Experimental.</b> The upload / writable-source API (source
+     * registration, tensor creation, chunk upload, and upload-status polling)
+     * may change.
      *
-     * <p>Declare, then fill. The returned descriptor is the server's echo --
-     * array_id, shape, dtype, chunk_shape, dim_labels -- and is what
-     * {@link #uploadArray}, {@link #uploadChunk} and
-     * {@link #setUploadStatus} take. A name is taken while its source exists:
-     * a second create under it -- pending, published or discarded -- is
-     * refused. Only the server's reclaim sweep frees one, after a discarded
-     * upload's {@code upload_ttl}. {@link #setUploadStatus} is what publishes
-     * the source and marks it complete.
+     * <p><b>An upload adds a tensor to a source that already exists</b>, so
+     * {@link #registerSource} comes first and this never creates one. Declare,
+     * then fill: the returned descriptor is the server's echo -- array_id,
+     * shape, dtype, chunk_shape, dim_labels -- and is what
+     * {@link #uploadArray}, {@link #uploadChunk} and {@link #setUploadStatus}
+     * take. {@link #setUploadStatus} is what publishes the tensor and marks it
+     * complete.
      *
-     * @param sourceName {@code "cache:name"} for cache-backed,
-     *        {@code "ome_zarr:name"} for zarr-backed, either prefix with an
-     *        empty name for a server-generated one, or
-     *        {@code "<image array_id>/labels/<name>"} for a label set of an
-     *        image the server already serves -- the one form whose id is the
-     *        request's own rather than a minted source_id. A set is
-     *        unsigned-integer, spans its image's non-channel axes at full
-     *        length, and its all-zero chunks are skipped by
-     *        {@link #uploadArray}
+     * <p>A field is taken while its tensor is served: a second add under it --
+     * pending, published or discarded -- is refused. Only the server's reclaim
+     * sweep frees one, after a discarded upload's {@code upload_ttl}.
+     *
+     * @param arrayId {@code "<scheme>://<source_id>/<field>"}, where
+     *        <i>scheme</i> is the store format -- {@code zarr} for an OME-Zarr
+     *        image group, {@code cache} for the chunks as uploaded -- and
+     *        <i>source_id</i> is what {@link #registerSource} answered. Or
+     *        {@code "zarr://<image array_id>/labels/<name>"} for a label set of
+     *        an image the server already serves, which is the one form whose
+     *        source may be a discovered file. A set is unsigned-integer, spans
+     *        its image's non-channel axes at full length, and its all-zero
+     *        chunks are skipped by {@link #uploadArray}. The scheme names the
+     *        store format and nothing else: the answered id carries none
      * @param shape the tensor's shape
      * @param dtype the numpy dtype string to store it as (e.g. {@code "<u2"})
-     * @param chunkShape the upload grid; null or empty means one chunk
+     * @param chunkShape the upload grid; null or empty means one chunk. A
+     *        request, not a promise: the server plans on its own grid and
+     *        answers with it
      * @param dimLabels optional dimension labels
-     * @param omeMetadataJson optional OME metadata, as a JSON object
-     * @return the new source's descriptor
+     * @param omeMetadataJson ignored except for a label set's
+     *        {@code image-label} block. Metadata is source-scoped and rides on
+     *        {@link #registerSource}; a tensor inherits its source's
+     * @return the new tensor's descriptor, under the id it keeps
      */
-    public TensorDescriptor createTensor(
-            String sourceName,
+    public TensorDescriptor addTensor(
+            String arrayId,
             long[] shape,
             String dtype,
             long[] chunkShape,
             List<String> dimLabels,
             String omeMetadataJson) {
-        return uploads.createTensor(sourceName, shape, dtype, chunkShape, dimLabels, omeMetadataJson);
+        return uploads.addTensor(arrayId, shape, dtype, chunkShape, dimLabels, omeMetadataJson);
     }
 
     /**
-     * Declare a source shaped like an array you already hold.
+     * Declare a tensor shaped like an array you already hold.
      *
      * <p><b>Experimental</b>, with the rest of the upload API. The template's
      * shape and pixel type stand in for the explicit {@code shape}/{@code dtype}
-     * of {@link #createTensor(String, long[], String, long[], List, String)};
+     * of {@link #addTensor(String, long[], String, long[], List, String)};
      * it is the array about to be uploaded, or one shaped like it.
      *
-     * @param sourceName as in
-     *        {@link #createTensor(String, long[], String, long[], List, String)}
+     * @param arrayId as in
+     *        {@link #addTensor(String, long[], String, long[], List, String)}
      * @param template the array to be uploaded, or one shaped like it
      * @param chunkShape the upload grid; null or empty means one chunk
      * @param dimLabels optional dimension labels
-     * @param omeMetadataJson optional OME metadata, as a JSON object
+     * @param omeMetadataJson as in
+     *        {@link #addTensor(String, long[], String, long[], List, String)}
      * @param <T> the pixel type
-     * @return the new source's descriptor
+     * @return the new tensor's descriptor
      */
-    public <T extends NativeType<T> & RealType<T>> TensorDescriptor createTensor(
-            String sourceName,
+    public <T extends NativeType<T> & RealType<T>> TensorDescriptor addTensor(
+            String arrayId,
             RandomAccessibleInterval<T> template,
             long[] chunkShape,
             List<String> dimLabels,
             String omeMetadataJson) {
         long[] shape = new long[template.numDimensions()];
         template.dimensions(shape);
-        return uploads.createTensor(sourceName, shape, TensorUploads.numpyDtype(template.getType()),
+        return uploads.addTensor(arrayId, shape, TensorUploads.numpyDtype(template.getType()),
                 chunkShape, dimLabels, omeMetadataJson);
     }
 
@@ -1385,7 +1395,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @param metadataJson the source's OME metadata as a JSON object, or null.
      *        Source-scoped: every tensor added to it inherits the physical
      *        scale, units and channel names from here. Carried verbatim, as on
-     *        {@link #createTensor(String, long[], String, long[], List, String)}
+     *        {@link #addTensor(String, long[], String, long[], List, String)}
      * @return the {@code source_id}, <b>minted by the server, not derived from
      *         the name</b> -- so it survives the server's {@code write_dir}
      *         moving, and cannot be guessed by a client that did not create it
@@ -1419,7 +1429,7 @@ public class TensorFlightClient implements AutoCloseable {
      * the store's fill value already reads as background, so one labelled frame
      * of a thousand costs one frame (biopb/biopb#1059).
      *
-     * @param descriptor the descriptor {@link #createTensor} returned
+     * @param descriptor the descriptor {@link #addTensor} returned
      * @param array the array to upload
      * @param <T> the pixel type
      * @return the sealed upload status, as {@link #getUploadStatus} reports it
@@ -1444,7 +1454,7 @@ public class TensorFlightClient implements AutoCloseable {
      * that interval's own global coordinates, so the whole array can be passed
      * for every chunk.
      *
-     * @param descriptor the descriptor {@link #createTensor} returned
+     * @param descriptor the descriptor {@link #addTensor} returned
      * @param bounds chunk start/stop coordinates
      * @param source the array to read the chunk out of
      * @param <T> the pixel type
@@ -1470,18 +1480,18 @@ public class TensorFlightClient implements AutoCloseable {
      *       the state a consumer waiting on a result polls for, and what
      *       {@link #uploadArray} sets for you.
      *   <li>{@code DISCARDED} -- <b>give up</b>, from any of the above.
-     *       Whatever the server minted goes with it: an {@code ome_zarr:}
-     *       store, a label set's sidecar and its listing. This is how an
-     *       uploaded label set is deleted; the name frees after the server's
-     *       reclaim sweep, like any other discarded upload's.
+     *       Whatever the server minted goes with it: a {@code zarr://}
+     *       member's store, a label set's sidecar, and the tensor's place in
+     *       its source's listing. This is how an uploaded tensor is deleted;
+     *       the field frees after the server's reclaim sweep, like any other
+     *       discarded upload's.
      * </ul>
      *
      * <p>Setting the state the upload is already in is a no-op; moving back
      * down the ladder is refused.
      *
-     * @param arrayId what {@link #createTensor} answered with -- a minted
-     *        source_id, or a label set's array_id as {@link #labelSets} reports
-     *        it
+     * @param arrayId what {@link #addTensor} answered with, or a label set's
+     *        array_id as {@link #labelSets} reports it
      * @param state {@code READY} or {@code DISCARDED}
      * @param reason why, for {@code DISCARDED}; it is what a poller waiting on
      *        this result reads back, so write it for them

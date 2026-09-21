@@ -347,14 +347,14 @@ public class TensorLifecycleTest {
     // ---- uploads ----------------------------------------------------------
 
     @Test
-    public void testCreateTensorEchoesTheServersDescriptor() throws Exception {
+    public void testAddTensorEchoesTheServersDescriptor() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                TensorDescriptor descriptor = client.createTensor(
-                        "cache:mine", new long[] {4, 6}, "<u2", new long[] {2, 3},
+                TensorDescriptor descriptor = client.addTensor(
+                        "cache://registered_abc123/mine", new long[] {4, 6}, "<u2", new long[] {2, 3},
                         Arrays.asList("y", "x"), "{\"ome\":true}");
 
-                Assert.assertEquals("cache:mine", descriptor.getArrayId());
+                Assert.assertEquals("registered_abc123/mine", descriptor.getArrayId());
                 Assert.assertEquals(Arrays.asList(4L, 6L), descriptor.getShapeList());
                 Assert.assertEquals(Arrays.asList(2L, 3L), descriptor.getChunkShapeList());
                 Assert.assertEquals("<u2", descriptor.getDtype());
@@ -365,13 +365,13 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testCreateTensorTakesShapeAndDtypeFromATemplate() throws Exception {
+    public void testAddTensorTakesShapeAndDtypeFromATemplate() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 RandomAccessibleInterval<UnsignedShortType> template =
                         ArrayImgs.unsignedShorts(new short[24], 4, 6);
-                TensorDescriptor descriptor = client.createTensor(
-                        "cache:mine", template, new long[] {2, 3}, null, null);
+                TensorDescriptor descriptor = client.addTensor(
+                        "cache://registered_abc123/mine", template, new long[] {2, 3}, null, null);
 
                 Assert.assertEquals(Arrays.asList(4L, 6L), descriptor.getShapeList());
                 Assert.assertEquals("<u2", server.producer.lastCreate.getDtype());
@@ -392,7 +392,7 @@ public class TensorLifecycleTest {
                         ArrayImgs.unsignedShorts(values, 6, 4);
 
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(6L, 4L))
                         .addAllChunkShape(Arrays.asList(3L, 2L))
                         .setDtype("<u2")
@@ -418,7 +418,7 @@ public class TensorLifecycleTest {
 
                 // Publishing is what marks the source complete, and a
                 // whole-array upload does it on the caller's behalf.
-                Assert.assertEquals("cache:mine", server.producer.lastSetStatus.getArrayId());
+                Assert.assertEquals("registered_abc123/mine", server.producer.lastSetStatus.getArrayId());
                 Assert.assertEquals("READY", status.get("state"));
                 Assert.assertEquals(4.0d, status.get("uploaded_chunks"));
             }
@@ -430,7 +430,7 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(8L, 4L))
                         .addAllChunkShape(Arrays.asList(4L, 2L))
                         .setDtype("<u2")
@@ -452,7 +452,7 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(2L, 2L))
                         .addAllChunkShape(Arrays.asList(2L, 2L))
                         .setDtype("<f4")
@@ -486,8 +486,8 @@ public class TensorLifecycleTest {
                         server.producer.chunks.get(0).bounds.getStartList());
 
                 server.producer.chunks.clear();
-                server.producer.plannedTensor = labelDescriptor("cache:mine");
-                client.uploadArray(labelDescriptor("cache:mine"), array);
+                server.producer.plannedTensor = labelDescriptor("registered_abc123/mine");
+                client.uploadArray(labelDescriptor("registered_abc123/mine"), array);
                 Assert.assertEquals(4, server.producer.chunks.size());
             }
         }
@@ -511,7 +511,7 @@ public class TensorLifecycleTest {
                         whole, new long[] {6, 4}, new long[] {11, 7});
 
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(6L, 4L))
                         .addAllChunkShape(Arrays.asList(3L, 2L))
                         .setDtype("<u2")
@@ -539,7 +539,7 @@ public class TensorLifecycleTest {
                 RandomAccessibleInterval<UnsignedShortType> array =
                         ArrayImgs.unsignedShorts(values, 6, 4);
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(6L, 4L))
                         .addAllChunkShape(Arrays.asList(3L, 2L))
                         .setDtype("<u2")
@@ -578,7 +578,7 @@ public class TensorLifecycleTest {
 
     @Test
     public void testRegisterSourceCarriesTheMetadataVerbatim() throws Exception {
-        // Opaque, as on createTensor: the client does not parse or re-encode
+        // Opaque, as on addTensor: the client does not parse or re-encode
         // the OME tree, so what the server stores is what the caller wrote.
         String metadata = "{\"omero\":{\"channels\":[]}}";
         try (TestServer server = new TestServer()) {
@@ -609,8 +609,8 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 Map<String, Object> status = client.setUploadStatus(
-                        "cache:mine", UploadStatus.State.READY, "");
-                Assert.assertEquals("cache:mine", status.get("source_id"));
+                        "registered_abc123/mine", UploadStatus.State.READY, "");
+                Assert.assertEquals("registered_abc123/mine", status.get("source_id"));
                 Assert.assertEquals("READY", status.get("state"));
             }
         }
@@ -625,7 +625,7 @@ public class TensorLifecycleTest {
             server.producer.refuseChunks = true;
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 TensorDescriptor descriptor = TensorDescriptor.newBuilder()
-                        .setArrayId("cache:mine")
+                        .setArrayId("registered_abc123/mine")
                         .addAllShape(Arrays.asList(2L, 2L))
                         .addAllChunkShape(Arrays.asList(2L, 2L))
                         .setDtype("<u2")
@@ -640,7 +640,7 @@ public class TensorLifecycleTest {
                                         .build(),
                                 ArrayImgs.unsignedShorts(new short[4], 2, 2)));
                 Assert.assertEquals("DISCARDED", error.getState());
-                Assert.assertEquals("cache:mine", error.getSourceId());
+                Assert.assertEquals("registered_abc123/mine", error.getSourceId());
             }
         }
     }
@@ -747,7 +747,7 @@ public class TensorLifecycleTest {
         private final BufferAllocator allocator;
 
         volatile java.util.Set<String> knownActions = new java.util.HashSet<>(Arrays.asList(
-                "add_source", "remove_source", "roi_prune", "create_tensor",
+                "add_source", "remove_source", "roi_prune", "add_tensor",
                 "register_source", "set_upload_status"));
         volatile RegisterSource lastRegisterSource = null;
         volatile boolean addSourceSendsResult = true;
@@ -820,9 +820,13 @@ public class TensorLifecycleTest {
                                 .setDeleted(lastPrune.getApply() ? 4 : 0)
                                 .build().toByteArray()));
                         break;
-                    case "create_tensor":
+                    case "add_tensor":
                         lastCreate = TensorDescriptor.parseFrom(action.getBody());
-                        listener.onNext(new Result(lastCreate.toByteArray()));
+                        // As the real server answers: the scheme named the
+                        // store format and is not part of the tensor's id.
+                        listener.onNext(new Result(lastCreate.toBuilder()
+                                .setArrayId(lastCreate.getArrayId().replaceFirst("^[a-z]+://", ""))
+                                .build().toByteArray()));
                         break;
                     case "register_source":
                         lastRegisterSource = RegisterSource.parseFrom(action.getBody());

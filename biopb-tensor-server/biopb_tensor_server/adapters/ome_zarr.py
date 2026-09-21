@@ -13,16 +13,10 @@ from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
-from biopb_tensor_server.adapters._writable import (
-    taken_store_name,
-    unsafe_store_name,
-    upload_grid,
-)
 from biopb_tensor_server.adapters.zarr import (
-    UPLOAD_PENDING,
     ZarrAdapter,
     is_unfinished_upload,
-    with_upload_state,
+    is_upload_subsystem_store,
 )
 from biopb_tensor_server.core.adapter_base import catalog_entry
 from biopb_tensor_server.core.axes import canonical_axis
@@ -292,7 +286,7 @@ class OmeZarrAdapter(ZarrAdapter):
         zattrs_ctx = ctx.join(".zattrs")
         if not zattrs_ctx.exists():
             return None
-        if is_unfinished_upload(ctx):
+        if is_unfinished_upload(ctx) or is_upload_subsystem_store(ctx):
             return None
 
         # Cloud-storage phase 2: if the .zattrs sidecar is a non-resident cloud
@@ -477,94 +471,17 @@ class OmeZarrAdapter(ZarrAdapter):
 
     @staticmethod
     def upload_source_id(zarr_path: Path) -> str:
-        """The ``source_id`` an ``ome_zarr:`` upload of the store at *zarr_path* takes.
+        """The ``source_id`` the removed ``ome_zarr:`` kind gave the store at
+        *zarr_path*.
 
-        A function of the resolved path, so it is the same in the life that
-        created the store and in the one that finds it left behind: the boot
-        sweep names the catalog row of a store it removes without having
-        created it (``UploadManager.discard_unfinished_stores``). The
-        ``cache:`` counterpart keys off the name instead, having no path
-        (``CachedSourceAdapter.upload_source_id``).
+        Migration only. The kind is gone (``docs/upload-model.md``, step 5) and
+        nothing mints these ids any more, but a persisted catalog still carries
+        the rows its uploads wrote, and only this hash of the path can name
+        them for ``UploadManager._drop_legacy_ome_zarr_stores`` to drop. Goes
+        when a release has passed and no catalog can still hold one.
         """
         digest = hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()
         return f"ome_zarr_{digest[:12]}"
-
-    @classmethod
-    def create_upload(
-        cls,
-        name: str,
-        desc: TensorDescriptor,
-        *,
-        metadata: Optional[dict],
-        write_dir: Optional[Path],
-    ) -> "OmeZarrAdapter":
-        """Create a real ``.zarr`` under *write_dir* and an adapter tracking its upload.
-
-        Nothing touches disk until the ``.zattrs`` payload is resolved: a bad
-        request must not leave a partial store behind, since ``zarr.create``
-        refuses an existing one and the orphan would block a corrected retry
-        under the same name (biopb/biopb#354).
-
-        The store is born carrying the ``pending`` upload marker, so a crash
-        before it is published leaves something a restart recognizes and removes
-        rather than a partial store discovery would serve (biopb/biopb#1059).
-        """
-        import zarr
-
-        if write_dir is None:
-            raise ValueError("write_dir not configured for zarr-backed sources")
-        zarr_name = name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
-        # The name becomes a directory under write_dir, which discard later
-        # removes whole, so it has to stay inside it (``unsafe_store_name``).
-        why = unsafe_store_name(zarr_name)
-        if why is not None:
-            raise ValueError(
-                f"ome_zarr:{zarr_name!r} cannot name a store: the name {why}."
-            )
-        zattrs = with_upload_state(
-            metadata if metadata is not None else minimal_ome_metadata(desc),
-            UPLOAD_PENDING,
-        )
-
-        zarr_path = write_dir / f"{zarr_name}.zarr"
-        taken = taken_store_name(write_dir, zarr_name)
-        if taken is not None:
-            raise ValueError(
-                f"ome_zarr:{zarr_name}: {taken} already exists, and two names "
-                f"differing only by case or accent form are one directory on "
-                f"Windows and macOS. Discard the upload that owns it, or "
-                f"upload under another name."
-            )
-        # Exclusive: the directory must be this create's own, because discard
-        # will remove it whole. A name whose store is already on disk -- a
-        # finished upload from an earlier server life, or anything else put
-        # there -- is refused rather than adopted.
-        try:
-            zarr_path.mkdir(parents=True)
-        except FileExistsError:
-            raise ValueError(
-                f"ome_zarr:{zarr_name}: {zarr_path} already exists. A name is "
-                "taken while its store is on disk; discard the upload that owns "
-                "it, or upload under another name."
-            ) from None
-        grid = upload_grid(desc)
-        arr = zarr.create(
-            store=zarr.DirectoryStore(str(zarr_path)),
-            shape=desc.shape,
-            dtype=desc.dtype,
-            chunks=grid,
-        )
-        with open(zarr_path / ".zattrs", "w") as f:
-            json.dump(zattrs, f)
-
-        adapter = cls(
-            arr,
-            cls.upload_source_id(zarr_path),
-            list(desc.dim_labels) if desc.dim_labels else None,
-        )
-        adapter._upload_store_path = zarr_path
-        adapter.begin_upload(desc.shape, grid)
-        return adapter
 
     def __init__(
         self,

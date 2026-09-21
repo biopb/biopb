@@ -10,8 +10,9 @@ fused source+tensor adapter pattern used by OmeZarrAdapter, etc.
 - Upload progress and disposal live on the adapter (``adapters._writable``); a
   discarded adapter stays registered as a tombstone until reclaimed
 
-Registration flow (bypasses discovery): DoPut → ``create_upload`` →
-server.sources registry
+Registration flow (bypasses discovery): ``add_tensor`` mints one as a
+``cache://`` member of a registered source (``adapters.registered``), or an
+in-process caller constructs and registers one itself (``biopb-image-base``)
 
 Chunk ID format: array_id + "/" + chunk_key
 Chunk data: stored in CacheManager keyed by full chunk_id
@@ -45,8 +46,6 @@ from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA, unpack_chunk
 from biopb_tensor_server.core.errors import StaleChunkError
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from biopb_tensor_server.core.config import SourceConfig
 
 logger = logging.getLogger(__name__)
@@ -90,11 +89,13 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
 
     @staticmethod
     def upload_source_id(name: str) -> str:
-        """The source_id a ``cache:<name>`` upload lands on.
+        """The ``source_id`` a cache-backed source of this *name* lands on.
 
-        Deterministic for a name, so the name is taken while its source is
-        registered (``UploadManager.create_tensor`` refuses the collision, and
-        only the reclaim sweep frees a discarded one); minted for an empty one.
+        Deterministic for a name, minted for an empty one. No longer reachable
+        over the wire -- ``add_tensor`` adds a ``cache://`` tensor to a source
+        that already has an id (``docs/upload-model.md``, step 5) -- but still
+        how an in-process caller names one it registers itself, which is what
+        ``biopb-image-base``'s embedded cache does for a servicer's result.
         """
         if name:
             return f"cache_{hashlib.sha256(name.encode()).hexdigest()[:12]}"
@@ -124,28 +125,6 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             gen = max(time.time_ns(), cls._last_generation + 1)
             cls._last_generation = gen
         return f"gen:{gen}".encode()
-
-    @classmethod
-    def create_upload(
-        cls,
-        name: str,
-        desc: TensorDescriptor,
-        *,
-        metadata: Optional[dict],
-        write_dir: Optional[Path],
-    ) -> CachedSourceAdapter:
-        """A cache-backed upload: no store to create, so this is a constructor call."""
-        return cls(
-            source_id=cls.upload_source_id(name),
-            shape=list(desc.shape),
-            dtype=desc.dtype,
-            chunk_shape=list(desc.chunk_shape),
-            dim_labels=list(desc.dim_labels) if desc.dim_labels else None,
-            ome_metadata=metadata,
-            physical_scale=list(desc.physical_scale) if desc.physical_scale else None,
-            physical_unit=list(desc.physical_unit) if desc.physical_unit else None,
-            content_version=cls.next_content_version(),
-        )
 
     def __init__(
         self,
@@ -270,7 +249,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         Nothing may re-shape this value.
         """
         return TensorDescriptor(
-            array_id=self.source_id,
+            array_id=self.array_id,
             dim_labels=self._dim_labels,
             shape=list(self._shape),
             chunk_shape=list(self._chunk_shape),
@@ -331,7 +310,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             raise RuntimeError("Cache not initialized")
 
         exact = mint_chunk_id(
-            self.source_id, bounds, content_version=self.content_version
+            self.array_id, bounds, content_version=self.content_version
         )
         if exact in self._written_chunks:
             return self._uploaded_block(cache_manager, exact, bounds)
@@ -361,7 +340,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         assembly above it is a source to blit from rather than the answer.
         """
         entry = cache_manager.get_or_acquire(
-            chunk_id, lambda: _raise_evicted(self.source_id, bounds)
+            chunk_id, lambda: _raise_evicted(self.array_id, bounds)
         )
         try:
             return unpack_chunk_array(entry.data)
@@ -434,7 +413,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         # (core.cache_source.chunk_cache_keys) mints the same way, and a key
         # that differs by one byte is a probe that never hits.
         chunk_id = mint_chunk_id(
-            self.source_id, bounds, content_version=self.content_version
+            self.array_id, bounds, content_version=self.content_version
         )
 
         if isinstance(data, pa.ChunkedArray):
@@ -501,7 +480,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """
         if cache_manager is None:
             raise flight.FlightServerError(
-                f"CacheManager required for cache-backed source {self.source_id}"
+                f"CacheManager required for cache-backed source {self.array_id}"
             )
 
         # The gate first, and before the version check: a tombstone owes a
@@ -526,7 +505,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         if not is_scaled_chunk(chunk_id) and chunk_id in self._written_chunks:
             _, bounds = decode_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
-                chunk_id, lambda: _raise_evicted(self.source_id, bounds)
+                chunk_id, lambda: _raise_evicted(self.array_id, bounds)
             )
             data = entry.data
             cache_manager.release(chunk_id)

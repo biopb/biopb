@@ -12,12 +12,13 @@ consulted before every write, by hand, in three places.
 :class:`WritableSource` is a mixin for the two writable formats
 (``CachedSourceAdapter``, ``ZarrAdapter``). It owns the shared half --
 progress, status, disposal -- and leaves the format its own half: how a chunk
-is stored (``_store_chunk``), how an upload of this kind is created
-(``create_upload``), and what its store needs told when the upload ends
-(``_dispose_store`` on discard, ``_publish_store`` on publish). The DoPut
-boundary (``serving.upload_manager``) picks the kind, registers the result,
-keeps the catalog row of a ``durable`` kind in step, and translates
-exceptions; nothing else about an upload lives there.
+is stored (``_store_chunk``) and what its store needs told when the upload
+ends (``_dispose_store`` on discard, ``_publish_store`` on publish). Minting
+one belongs to whoever owns the layout (``adapters.registered.create_member``,
+``adapters.labels.create_label_upload``); the DoPut boundary
+(``serving.upload_manager``) attaches the result to its source, keeps the
+catalog row in step, and translates exceptions. Nothing else about an upload
+lives there.
 
 Wrappers: ``SourceRegistry.register`` may wrap an adapter (``normalize_adapter``),
 and a wrapper forwards attributes rather than inheriting this class. Uploads are
@@ -260,17 +261,18 @@ def taken_store_name(
 def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     """Why *name* cannot be a store's directory name, or None if it can.
 
-    A kind that puts its bytes on disk names the directory after what the
-    client asked for -- ``ome_zarr:<name>`` becomes ``<write_dir>/<name>.zarr``
+    A format that puts its bytes on disk names the directory after what the
+    client asked for -- a registered source becomes
+    ``<write_dir>/sources/<name>.zarr``, its member becomes ``<that>/<field>``,
     and a label set becomes ``<write_dir>/labels/<source_id>/<name>.zarr`` --
     so the name is untrusted input that turns into a path component, of a
     directory the server later creates and, on discard, deletes whole. It must
     therefore name one component *inside* the directory the server chose:
-    ``ome_zarr:../../x`` otherwise mints and later removes a store two levels
-    above ``write_dir``.
+    ``../../x`` otherwise mints and later removes a store two levels above
+    ``write_dir``.
 
     Refused rather than sanitized, because the name is an identity as well as
-    a path: it is what ``create_tensor`` refuses a collision on, so folding two
+    a path: it is what ``add_tensor`` refuses a collision on, so folding two
     different requests onto one store would trade a traversal for a mix-up.
 
     **Every rule here is checked on every platform, not the running one.** A
@@ -279,8 +281,11 @@ def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     any of the three would refuse, and :func:`fold_name` handles the two rules
     that are about collision rather than legality.
 
-    A kind whose name never reaches the filesystem does not need this:
-    ``cache:`` hashes it into a ``source_id`` (``upload_source_id``).
+    A format whose name never reaches the filesystem does not need this, which
+    is why :func:`unsafe_field_name` applies the rule to every field anyway: a
+    ``cache://`` member keeps its bytes in the file cache today and gets a
+    store of its own at step 7, and a name that was legal only while it stayed
+    off disk would fail to survive that.
     """
     if not name:
         return "is empty"
@@ -318,13 +323,9 @@ def unsafe_field_name(name: str) -> Optional[str]:
     """Why *name* cannot be an uploaded tensor's field, or None if it can.
 
     A field is a path component of its source's group, so it takes the store
-    rules with no extension of its own, plus the reserved words.
-
-    **Not wired to a request yet.** ``add_tensor`` is the caller and it does
-    not exist on this branch, so nothing currently refuses a field named
-    ``labels`` -- there is no way to ask for one. Landed here because the rule
-    is what decides the wire id stays ``<array_id>/labels/<name>``, and that
-    decision is load-bearing for everything else in the design.
+    rules with no extension of its own, plus the reserved words. Applied by
+    ``adapters.registered.create_member`` to every field, whatever format it
+    asked for.
     """
     if fold_name(name) in RESERVED_FIELD_NAMES:
         return (
@@ -448,24 +449,6 @@ class WritableSource:
 
     # -- the format's half -----------------------------------------------------
 
-    @classmethod
-    def create_upload(
-        cls,
-        name: str,
-        desc: TensorDescriptor,
-        *,
-        metadata: Optional[dict],
-        write_dir: Optional[Path],
-    ) -> WritableSource:
-        """Build an adapter for a new upload of this kind, with its upload begun.
-
-        *name* is what followed the ``kind:`` prefix in the request (may be
-        empty: the kind then mints one). *metadata* is the request's parsed
-        ``metadata_json``, or None when it carried none. Raises ``ValueError``
-        for a request this kind cannot serve; the boundary translates it.
-        """
-        raise NotImplementedError
-
     def _store_chunk(
         self,
         bounds: ChunkBounds,
@@ -505,17 +488,25 @@ class WritableSource:
         """
 
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
-        """The descriptor ``create_tensor`` answers with.
+        """The descriptor ``add_tensor`` answers with.
 
-        Echoes the request under the minted ``source_id``. Physical calibration
-        is deliberately not echoed here: a kind adds it only if a later read
-        will reproduce it verbatim (issue #272).
+        Echoes the request under the tensor's own ``array_id`` -- which every
+        later write, poll and transition names.
+
+        The **grid is the store's, not the request's**. A request's
+        ``chunk_shape`` is the seed the layout is grown from and a zarr store
+        coalesces it (``upload_grid``), so echoing what was asked for would
+        hand back a grid no plan mints and every ``upload_chunk`` on it would
+        be refused. This is the same number ``get_flight_info`` advertises.
+
+        Physical calibration is deliberately not echoed here: a format adds it
+        only if a later read will reproduce it verbatim (issue #272).
         """
         return TensorDescriptor(
-            array_id=self.source_id,
+            array_id=self.array_id,
             dim_labels=desc.dim_labels,
             shape=desc.shape,
-            chunk_shape=desc.chunk_shape,
+            chunk_shape=list(self.get_transfer_chunk_size()),
             dtype=desc.dtype,
         )
 
@@ -536,7 +527,7 @@ class WritableSource:
         A durable kind releases its store on the first discard
         (:meth:`_dispose_store`); its catalog row is the boundary's to drop.
         """
-        source_id = self.source_id
+        source_id = self.array_id
         progress = self._upload
         if progress is None:
             return unknown_upload_status(source_id)
@@ -565,7 +556,7 @@ class WritableSource:
         progress.final_chunk_count = progress.uploaded_chunks
         progress.uploaded_chunk_ids = set()
         progress.touch(now)
-        logger.info(f"Discarded upload {self.source_id}: {reason or 'no reason given'}")
+        logger.info(f"Discarded upload {self.array_id}: {reason or 'no reason given'}")
         return True
 
     def reap_step(self, now: float, ttl: float) -> Tuple[bool, Optional[float]]:
@@ -625,13 +616,13 @@ class WritableSource:
             raise UploadTransitionError(unsettable_state_message(target))
         progress = self._upload
         if progress is None:
-            return unknown_upload_status(self.source_id)
+            return unknown_upload_status(self.array_id)
 
         with progress.lock:
             self._raise_if_discarded_locked(progress)
             current = progress.status
             if current is target:
-                return progress.as_status_dict(self.source_id)
+                return progress.as_status_dict(self.array_id)
             # Unreachable while the ladder has one climbable rung: the only
             # settable non-DISCARDED target is READY, and a source already
             # there returned above. Kept as the ladder's own guard -- it is
@@ -639,7 +630,7 @@ class WritableSource:
             # need, and it is cheaper to leave than to rediscover.
             if _STATE_RANK[current] > _STATE_RANK[target]:
                 raise UploadTransitionError(
-                    f"set_upload_status: {self.source_id} is {current.value} and "
+                    f"set_upload_status: {self.array_id} is {current.value} and "
                     f"cannot go back to {target.value}."
                 )
 
@@ -660,10 +651,10 @@ class WritableSource:
                 progress.status = target
                 progress.touch()
                 logger.info(
-                    f"Upload {self.source_id} -> {target.value}: "
+                    f"Upload {self.array_id} -> {target.value}: "
                     f"{progress.uploaded_chunks}/{progress.expected_chunks} chunks"
                 )
-            return progress.as_status_dict(self.source_id)
+            return progress.as_status_dict(self.array_id)
 
     # -- the shared half -------------------------------------------------------
 
@@ -681,9 +672,9 @@ class WritableSource:
     def upload_status(self) -> Dict[str, Any]:
         progress = self._upload
         if progress is None:
-            return unknown_upload_status(self.source_id)
+            return unknown_upload_status(self.array_id)
         with progress.lock:
-            return progress.as_status_dict(self.source_id)
+            return progress.as_status_dict(self.array_id)
 
     def put_chunk(
         self,
@@ -705,17 +696,17 @@ class WritableSource:
         does not.
         """
         if progress.is_discarded:
-            raise UploadDiscardedError(self.source_id, progress.reason)
+            raise UploadDiscardedError(self.array_id, progress.reason)
 
     def _refuse_write(self) -> None:
         """The two ways a write can arrive too late.
 
-        There is no third: a source's id has one adapter for as long as it is
-        registered (``UploadManager.create_tensor`` refuses a name collision),
-        so a write cannot land in a stranger's source by naming its own. The
-        one exception is by design: a discarded name is reclaimed after
-        ``upload_ttl`` seconds, and a straggler quiet for that long writes
-        into whoever took the name next.
+        There is no third: an ``array_id`` has one adapter for as long as it is
+        served (``UploadManager.add_tensor`` refuses a field collision), so a
+        write cannot land in a stranger's tensor by naming its own. The one
+        exception is by design: a discarded field is reclaimed after
+        ``upload_ttl`` seconds, and a straggler quiet for that long writes into
+        whoever took the field next.
         """
         progress = self._upload
         if progress is None:
@@ -723,7 +714,7 @@ class WritableSource:
         with progress.lock:
             self._raise_if_discarded_locked(progress)
             if progress.is_sealed:
-                raise UploadSealedError(self.source_id)
+                raise UploadSealedError(self.array_id)
 
     def check_readable(self) -> None:
         """The two ways a read can arrive at an upload that cannot answer it.
@@ -758,10 +749,10 @@ class WritableSource:
         with progress.lock:
             if progress.is_discarded:
                 raise flight.FlightServerError(
-                    str(UploadDiscardedError(self.source_id, progress.reason))
+                    str(UploadDiscardedError(self.array_id, progress.reason))
                 )
             if not progress.is_readable:
-                raise UploadNotPublishedError(self.source_id)
+                raise UploadNotPublishedError(self.array_id)
 
     def _mark_chunk(self, bounds: ChunkBounds) -> None:
         """Record that the chunk at *bounds* landed.
@@ -777,7 +768,7 @@ class WritableSource:
         progress = self._upload
         if progress is None:
             return
-        chunk_id = encode_chunk_id(self.source_id, bounds)
+        chunk_id = encode_chunk_id(self.array_id, bounds)
         with progress.lock:
             if progress.is_sealed:
                 return

@@ -301,7 +301,7 @@ class SourceAdapter(ABC):
     # rest of their state to it -- today only the remote proxy, whose upstream
     # mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the grid.
     # Permuting behind such an owner is the same desynchronization the write path
-    # already refuses at ``create_tensor``, so those sources are validated and
+    # already refuses at ``add_tensor``, so those sources are validated and
     # refused at their read boundary instead. See ``core.normalize`` and
     # ``core.axes.noncanonical_order``.
     _normalizable_axes: bool = True
@@ -789,7 +789,7 @@ class SourceAdapter(ABC):
     def _label_set_for(self, set_field: str) -> Optional[TensorAdapter]:
         """The adapter answering for label field *set_field*, listed or in flight.
 
-        A set being uploaded is addressable from ``create_tensor`` onwards --
+        A set being uploaded is addressable from ``add_tensor`` onwards --
         that is how its producer polls it to READY (biopb/biopb#1048) -- so
         both views are consulted, the published one first.
         """

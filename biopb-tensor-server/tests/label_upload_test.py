@@ -5,7 +5,7 @@ and a ``/labels/`` segment, it creates a tensor of a source that already
 exists rather than a source. What that costs the boundary is a second place to
 look an upload up (the parent's ``label_uploads``, not the registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
-``create_tensor`` / ``upload_array`` / ``set_upload_status`` round trip, with
+``add_tensor`` / ``upload_array`` / ``set_upload_status`` round trip, with
 a discard to free the name again.
 
 Design: ``biopb-tensor-server/docs/label-tensors.md``.
@@ -64,8 +64,10 @@ def _labels(shape=SHAPE, dtype="uint32"):
 
 
 def _create(client, array_id, arr=None, **kw):
+    """A label set on a source the server already serves; the one form of
+    ``add_tensor`` whose parent may be a discovered file."""
     arr = _labels() if arr is None else arr
-    return client.create_tensor(array_id, arr, chunk_shape=CHUNK, **kw)
+    return client.add_tensor(f"zarr://{array_id}", arr, chunk_shape=CHUNK, **kw)
 
 
 def _tensor_ids(server, source_id="oz1"):
@@ -146,7 +148,7 @@ class TestWhatTheKindRefuses:
             ("oz1/labels/@ome", None, "are the server's own"),
             ("oz1/labels/x", np.zeros(SHAPE, "float32"), "unsigned integer"),
             ("oz1/labels/x", np.zeros((32, 32), "uint32"), "does not span"),
-            ("oz1/nope", None, "Invalid array_id format"),
+            ("oz1/nope", None, "is not a registered source"),
         ],
     )
     def test_refusals(self, served, client, array_id, arr, why):
@@ -242,12 +244,13 @@ class TestTheSidecar:
         )
 
     def test_the_zero_skip_is_this_kind_s_alone(self, served, client):
-        """Every block of a ``cache:`` source is sent however empty it is: its
+        """Every block of an ordinary tensor is sent however empty it is: its
         unwritten chunks read as background too, but nothing declared them to,
         and an all-zero array would otherwise upload nothing at all."""
         sparse = np.zeros(SHAPE, "uint32")
         sparse[:8, :8] = 1
-        desc = client.create_tensor("cache:sparse", sparse, chunk_shape=CHUNK)
+        source = client.register_source()
+        desc = client.add_tensor(f"cache://{source}/sparse", sparse, chunk_shape=CHUNK)
         status = client.upload_array(desc, sparse)
         assert (status["uploaded_chunks"], status["expected_chunks"]) == (4, 4)
 

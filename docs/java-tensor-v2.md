@@ -35,7 +35,7 @@ disk caching are deliberately out of scope until the core protocol is stable.
 | `label_sets` | `labelSets` |
 | `list_rois` / `put_rois` / `delete_rois` / `prune_rois` | `listRois` / `putRois` / `deleteRois` / `pruneRois` |
 | `register_source` | `registerSource` |
-| `create_tensor` / `upload_array` / `upload_chunk` / `set_upload_status` | `createTensor` / `uploadArray` / `uploadChunk` / `setUploadStatus` |
+| `add_tensor` / `upload_array` / `upload_chunk` / `set_upload_status` | `addTensor` / `uploadArray` / `uploadChunk` / `setUploadStatus` |
 
 ### The two version gates
 
@@ -43,7 +43,7 @@ A server advertises exactly two version signals, and both are contracts:
 
 | signal | where | meaning |
 | --- | --- | --- |
-| `protocol` | `health` action | the protocol *shape* -- which descriptors, tickets and put commands the server understands. v1 routed by a sentinel `source_id`; v2 is the oneofs this client sends; v3 replaced `finish` / `delete_labels` with one `set_upload_status` and gave an upload a READY state that is readable but still writable. |
+| `protocol` | `health` action | the protocol *shape* -- which descriptors, tickets and put commands the server understands. v1 routed by a sentinel `source_id`; v2 is the oneofs this client sends; v3 replaced `finish` / `delete_labels` with one `set_upload_status`, and made an upload add a tensor to a source that already exists (`register_source` / `add_tensor`, `PutCommand.chunk_ticket`) rather than create one. |
 | `chunk_wire_protocol` | schema metadata on every read plan | the chunk *encoding*. v1 was `data: list<T>`; v2 is one binary blob plus a numpy dtype string (biopb/biopb#293), which is what `ChunkDecoder` reads. |
 
 Known gaps, each with an issue rather than a note here: uploads are sequential

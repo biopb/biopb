@@ -398,12 +398,13 @@ class _UploadTarget:
 class UploadSession:
     """Tensor declaration and chunk upload over one Flight connection.
 
-    .. note:: Experimental. This whole API -- ``create_tensor`` /
-       ``upload_array`` / ``upload_chunk`` / ``set_upload_status`` -- is
-       experimental and its behavior may change.
+    .. note:: Experimental. This whole API -- ``register_source`` /
+       ``add_tensor`` / ``upload_array`` / ``upload_chunk`` /
+       ``set_upload_status`` -- is experimental and its behavior may change.
 
-    Declare, then fill: ``create_tensor`` returns the server's descriptor for
-    the new source, and that descriptor is what every write takes.
+    Declare, then fill: ``register_source`` mints something to add to,
+    ``add_tensor`` returns the server's descriptor for the new tensor, and that
+    descriptor is what every write takes.
 
     Takes the shared ``_ClientState`` its two sibling collaborators take
     (``CatalogClient``, ``ChunkFetcher``). ``TensorFlightClient`` constructs one
@@ -431,16 +432,16 @@ class UploadSession:
         logger.info(f"register_source: registered {source_id}")
         return source_id
 
-    def create_tensor(
+    def add_tensor(
         self,
-        source_name: str,
+        array_id: str,
         template: Any,
         *,
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
     ) -> TensorDescriptor:
-        """Backs TensorFlightClient.create_tensor; see that method for the full
+        """Backs TensorFlightClient.add_tensor; see that method for the full
         documentation."""
         shape = tuple(int(n) for n in template.shape)
         dtype = np.dtype(template.dtype)
@@ -451,7 +452,7 @@ class UploadSession:
                 else shape
             )
         req_desc = TensorDescriptor(
-            array_id=source_name,
+            array_id=array_id,
             shape=list(shape),
             dtype=dtype.str,
             chunk_shape=[int(c) for c in chunk_shape],
@@ -459,15 +460,15 @@ class UploadSession:
             metadata_json=json.dumps(ome_metadata) if ome_metadata else "",
         )
 
-        action = flight.Action("create_tensor", req_desc.SerializeToString())
+        action = flight.Action("add_tensor", req_desc.SerializeToString())
         results = self._state.client.do_action(action, options=self._state.call_options)
         try:
             result = next(results)
         except StopIteration as exc:
-            raise RuntimeError("create_tensor: server returned no result") from exc
+            raise RuntimeError("add_tensor: server returned no result") from exc
 
         desc = TensorDescriptor.FromString(result.body.to_pybytes())
-        logger.info(f"create_tensor: created {desc.array_id}")
+        logger.info(f"add_tensor: added {desc.array_id}")
         return desc
 
     def upload_array(

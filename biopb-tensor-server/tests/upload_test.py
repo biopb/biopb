@@ -632,94 +632,76 @@ class TestChunkEncoding:
         assert list(decoded_bounds.stop) == [40, 50, 60]
 
 
-class TestServerDoPutHandler:
-    """Tests for server-side do_put handler."""
+class TestAddTensor:
+    """``add_tensor`` adds to a source that already exists; it creates none."""
 
-    def test_create_source_cache_backed(self):
-        """Create cache-backed source."""
+    @staticmethod
+    def _server(tmp_path, **kwargs):
         from biopb_tensor_server.serving.server import TensorFlightServer
 
-        server = TensorFlightServer(
-            location="grpc://localhost:0",  # Use random port
-            writable=True,
+        kwargs.setdefault("write_dir", Path(tmp_path))
+        return TensorFlightServer(
+            location="grpc://localhost:0", writable=True, **kwargs
         )
 
-        # Create source request
-        req_desc = TensorDescriptor(
-            array_id="cache:my-test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-            dim_labels=["y", "x"],
+    def test_a_cache_tensor_is_attached_to_its_source(self, tmp_path):
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
+
+        response = server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"cache://{source}/my-test",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+                dim_labels=["y", "x"],
+            )
         )
 
-        # Process creation
-        response_desc = server.uploads.create_tensor(req_desc)
+        # The id it keeps is the one it was asked for, minus the scheme: the
+        # format is a property of the stored tensor, not of its name.
+        assert response.array_id == f"{source}/my-test"
+        member = server.sources.get(source).members["my-test"]
+        assert isinstance(member, CachedSourceAdapter)
 
-        # Check response
-        assert response_desc is not None
-        assert response_desc.array_id.startswith("cache_")
-
-        # Check adapter was registered
-        adapter = server.sources.get(response_desc.array_id)
-        assert adapter is not None
-        assert isinstance(adapter, CachedSourceAdapter)
-
-    def test_create_source_threads_physical_scale(self):
-        """A calibrated upload survives the create_source round-trip (issue #272).
-
-        The DoPut request descriptor already carries physical_scale / physical_unit;
-        create_source must thread them onto the CachedSourceAdapter (so the read
-        hot path advertises them) and echo them on the response descriptor.
+    def test_the_physical_scale_survives_the_round_trip(self, tmp_path):
+        """A calibrated cache upload echoes its calibration and serves it back
+        (issue #272): the response advertises only what a later read
+        reproduces, and this format stores *and* re-serves it verbatim.
         """
-        from biopb_tensor_server.serving.server import TensorFlightServer
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
 
-        server = TensorFlightServer(
-            location="grpc://localhost:0",
-            writable=True,
+        response = server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"cache://{source}/calibrated",
+                shape=[10, 100, 100],
+                dtype="uint16",
+                chunk_shape=[1, 50, 50],
+                dim_labels=["z", "y", "x"],
+                physical_scale=[2.0, 0.325, 0.325],
+                physical_unit=["µm", "µm", "µm"],
+            )
         )
 
-        req_desc = TensorDescriptor(
-            array_id="cache:calibrated",
-            shape=[10, 100, 100],
-            dtype="uint16",
-            chunk_shape=[1, 50, 50],
-            dim_labels=["z", "y", "x"],
-            physical_scale=[2.0, 0.325, 0.325],
-            physical_unit=["µm", "µm", "µm"],
-        )
+        assert list(response.physical_scale) == [2.0, 0.325, 0.325]
+        assert list(response.physical_unit) == ["µm", "µm", "µm"]
 
-        response_desc = server.uploads.create_tensor(req_desc)
-
-        # The response echoes the uploader's calibration.
-        assert list(response_desc.physical_scale) == [2.0, 0.325, 0.325]
-        assert list(response_desc.physical_unit) == ["µm", "µm", "µm"]
-
-        # The registered adapter surfaces it on the read hot path.
-        adapter = server.sources.get(response_desc.array_id)
-        scale, unit = adapter._physical_scale()
+        member = server.sources.get(source).members["calibrated"]
+        scale, unit = member._physical_scale()
         assert scale == [2.0, 0.325, 0.325]
         assert unit == ["µm", "µm", "µm"]
 
-    def test_create_source_ome_zarr_does_not_echo_physical_scale(self):
-        """The physical-scale echo is scoped to cache sources (issue #272).
+    def test_a_zarr_tensor_does_not_echo_the_physical_scale(self, tmp_path):
+        """The echo is scoped to the format that reproduces it. A member's
+        minimal NGFF drops the calibration, so echoing it here would advertise
+        a vector a later read will not answer with."""
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
 
-        Only CachedSourceAdapter stores AND re-serves the uploaded calibration,
-        so only cache responses echo it. The ome_zarr branch persists scale via
-        the .zattrs (the minimal-metadata path drops it), so echoing req_desc
-        here would advertise a vector a later read won't reproduce -- it must not.
-        """
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = TensorFlightServer(
-                location="grpc://localhost:0",
-                writable=True,
-                write_dir=Path(tmpdir),
-            )
-
-            req_desc = TensorDescriptor(
-                array_id="ome_zarr:calibrated",
+        response = server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"zarr://{source}/calibrated",
                 shape=[100, 100],
                 dtype="uint8",
                 chunk_shape=[50, 50],
@@ -727,194 +709,170 @@ class TestServerDoPutHandler:
                 physical_scale=[0.5, 0.5],
                 physical_unit=["µm", "µm"],
             )
-
-            response_desc = server.uploads.create_tensor(req_desc)
-
-            # No unpersisted calibration is advertised on the zarr response.
-            assert list(response_desc.physical_scale) == []
-            assert list(response_desc.physical_unit) == []
-
-    def test_create_source_cache_server_generated_name(self):
-        """Create cache-backed source with server-generated name."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer(
-            location="grpc://localhost:0",
-            writable=True,
         )
 
-        req_desc = TensorDescriptor(
-            array_id="cache:",  # No name - server generates
-            shape=[100, 100],
-            dtype="float32",
-            chunk_shape=[50, 50],
-        )
+        assert list(response.physical_scale) == []
+        assert list(response.physical_unit) == []
 
-        response_desc = server.uploads.create_tensor(req_desc)
-        assert response_desc.array_id.startswith("cache_")
+    def test_a_zarr_tensor_mints_its_store_under_the_collection(self, tmp_path):
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
 
-    def test_create_source_not_writable_raises(self):
-        """Non-writable server rejects source creation."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer(
-            location="grpc://localhost:0",
-            writable=False,
-        )
-
-        req_desc = TensorDescriptor(
-            array_id="cache:test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-        )
-
-        # The writable check is in do_put, not the UploadManager. This test
-        # verifies create_source itself works on a non-writable server (the check
-        # happens at the do_put boundary).
-        response_desc = server.uploads.create_tensor(req_desc)
-        # Source should be created (do_put would reject before reaching this).
-        assert response_desc is not None
-
-    def test_create_source_ome_zarr_requires_write_dir(self):
-        """Zarr-backed source requires write_dir."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer(
-            location="grpc://localhost:0",
-            writable=True,
-            write_dir=None,  # No write_dir
-        )
-
-        req_desc = TensorDescriptor(
-            array_id="ome_zarr:test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-        )
-
-        with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
-            server.uploads.create_tensor(req_desc)
-
-    def test_create_source_ome_zarr_with_write_dir(self):
-        """Create zarr-backed source with write_dir."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = TensorFlightServer(
-                location="grpc://localhost:0",
-                writable=True,
-                write_dir=Path(tmpdir),
-            )
-
-            req_desc = TensorDescriptor(
-                array_id="ome_zarr:my-zarr",
+        server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"zarr://{source}/my-zarr",
                 shape=[100, 100],
                 dtype="uint8",
                 chunk_shape=[50, 50],
                 dim_labels=["y", "x"],
             )
+        )
 
-            response_desc = server.uploads.create_tensor(req_desc)
-            assert response_desc.array_id.startswith("ome_zarr_")
+        collection = server.sources.get(source).store
+        assert [d.name for d in collection.iterdir() if d.is_dir()] == ["my-zarr"]
 
-            # Check zarr directory was created
-            zarr_dirs = list(Path(tmpdir).glob("*.zarr"))
-            assert len(zarr_dirs) == 1
-
-    def test_ome_zarr_upload_synced_to_catalog(self):
-        """File-backed (durable) uploads are added to the catalog so they are
-        discoverable via list_sources/query_sources (biopb/biopb#265)."""
+    def test_the_source_is_catalogued_and_the_tensor_shows_once_ready(self, tmp_path):
+        """A member has no catalog row of its own -- it is a tensor of its
+        source, and the source's row is what carries it (biopb/biopb#265)."""
         from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-        from biopb_tensor_server.serving.server import TensorFlightServer
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = MetadataDatabase()
-            server = TensorFlightServer(
-                location="grpc://localhost:0",
-                writable=True,
-                write_dir=Path(tmpdir),
-                metadata_db=db,
-            )
-            req_desc = TensorDescriptor(
-                array_id="ome_zarr:persist",
+        db = MetadataDatabase()
+        server = self._server(tmp_path, metadata_db=db)
+        source = server.uploads.register_source()
+        assert _catalog_ids(db) == {source}
+
+        desc = server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"zarr://{source}/persist",
                 shape=[64, 64],
                 dtype="uint8",
                 chunk_shape=[32, 32],
                 dim_labels=["y", "x"],
             )
-            response_desc = server.uploads.create_tensor(req_desc)
+        )
 
-            # The durable upload appears in the catalog.
-            assert response_desc.array_id in _catalog_ids(db)
+        assert _catalog_ids(db) == {source}
+        parent = server.sources.get(source)
+        assert parent.list_tensor_descriptors() == []  # PENDING is not listed
 
-    def test_cache_upload_not_synced_but_readable_by_id(self):
-        """Ephemeral cache-backed uploads are NOT catalogued (no removal hook ->
-        the row would dangle), but stay readable by their returned id."""
-        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+        server.uploads.set_status(desc.array_id, UploadStatus.READY)
+        assert [d.array_id for d in parent.list_tensor_descriptors()] == [desc.array_id]
+
+    def test_an_unregistered_source_is_refused(self, tmp_path):
+        server = self._server(tmp_path)
+        with pytest.raises(
+            flight.FlightServerError, match="names no registered source"
+        ):
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id="cache://nobody/x",
+                    shape=[10, 10],
+                    dtype="uint8",
+                    chunk_shape=[5, 5],
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "array_id", ["cache:test", "bare", "cache://", "cache://source-only", "//x/y"]
+    )
+    def test_an_id_that_names_no_tensor_is_refused(self, tmp_path, array_id):
+        """The grammar is the refusal: a bare id is never an upload, and
+        neither is a source with no field after it."""
+        server = self._server(tmp_path)
+        with pytest.raises(flight.FlightServerError, match="names no tensor"):
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id=array_id, shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+                )
+            )
+
+    def test_an_unknown_scheme_is_refused(self, tmp_path):
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
+        with pytest.raises(flight.FlightServerError, match="not a store format"):
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id=f"bogus://{source}/x",
+                    shape=[10, 10],
+                    dtype="uint8",
+                    chunk_shape=[5, 5],
+                )
+            )
+
+    def test_metadata_on_a_tensor_is_refused_rather_than_dropped(self, tmp_path):
+        """Metadata is source-scoped, so a tensor carrying some is a request
+        the server cannot honour -- said so, rather than silently ignored."""
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
+        with pytest.raises(flight.FlightServerError, match="metadata is the source's"):
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id=f"zarr://{source}/x",
+                    shape=[10, 10],
+                    dtype="uint8",
+                    chunk_shape=[5, 5],
+                    metadata_json='{"omero": {}}',
+                )
+            )
+
+    def test_no_write_dir_means_nowhere_to_put_a_tensor(self, tmp_path):
         from biopb_tensor_server.serving.server import TensorFlightServer
 
-        db = MetadataDatabase()
         server = TensorFlightServer(
-            location="grpc://localhost:0", writable=True, metadata_db=db
+            location="grpc://localhost:0", writable=True, write_dir=None
         )
-        req_desc = TensorDescriptor(
-            array_id="cache:ephemeral",
-            shape=[64, 64],
-            dtype="uint8",
-            chunk_shape=[32, 32],
-        )
-        response_desc = server.uploads.create_tensor(req_desc)
+        with pytest.raises(
+            flight.FlightServerError, match="write_dir is not configured"
+        ):
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id="cache://x/y",
+                    shape=[10, 10],
+                    dtype="uint8",
+                    chunk_shape=[5, 5],
+                )
+            )
 
-        # Not enumerable via the catalog...
-        assert response_desc.array_id not in _catalog_ids(db)
-        # ...but still registered and readable by its returned id.
-        assert isinstance(
-            server.sources.get(response_desc.array_id), CachedSourceAdapter
-        )
-
-    def test_create_source_invalid_prefix(self):
-        """Invalid array_id prefix raises error."""
+    def test_the_writable_check_is_at_the_boundary_not_here(self, tmp_path):
+        """``do_put`` and the action gate on write mode; the manager does not,
+        so an in-process caller on a read-only server still works."""
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
-            location="grpc://localhost:0",
-            writable=True,
+            location="grpc://localhost:0", writable=False, write_dir=Path(tmp_path)
+        )
+        source = server.uploads.register_source()
+        assert server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"cache://{source}/x",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+            )
         )
 
-        req_desc = TensorDescriptor(
-            array_id="invalid:test",  # Invalid prefix
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-        )
-
-        with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
-            server.uploads.create_tensor(req_desc)
-
-    def test_create_tensor_action_round_trip(self, tmp_path):
-        """Live client create_source should return the server-assigned source_id."""
+    def test_the_action_round_trips_through_a_live_client(self, tmp_path):
         from biopb.tensor import TensorFlightClient
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
-        config = CacheConfig(file_cache_dir=tmp_path / "cache")
-        CacheManager.initialize(config)
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
         server = TensorFlightServer(
-            location="grpc://127.0.0.1:0",
-            writable=True,
+            location="grpc://127.0.0.1:0", writable=True, write_dir=tmp_path / "w"
         )
-        thread = threading.Thread(target=server.serve, daemon=True)
-        thread.start()
+        threading.Thread(target=server.serve, daemon=True).start()
 
         client = TensorFlightClient(f"grpc://127.0.0.1:{server.port}")
         try:
-            source_id = client.create_tensor(
-                "cache:test-action", np.empty((10, 10), np.uint8), chunk_shape=(5, 5)
+            source = client.register_source()
+            array_id = client.add_tensor(
+                f"cache://{source}/test-action",
+                np.empty((10, 10), np.uint8),
+                chunk_shape=(5, 5),
             ).array_id
-            assert source_id.startswith("cache_")
-            assert source_id in server.sources
+            assert array_id == f"{source}/test-action"
+            assert source in server.sources
         finally:
             client.close()
             server.shutdown()
@@ -922,14 +880,12 @@ class TestServerDoPutHandler:
 
 
 class TestDoPutErrorTranslation:
-    """A create-source failure must surface as itself (biopb/biopb#354).
+    """An ``add_tensor`` failure must surface as itself (biopb/biopb#354).
 
-    A source is created by the ``create_tensor`` action only; DoPut takes a
-    ``PutCommand`` and refuses anything else up front, so the historical
-    parse-and-guess discrimination (which mis-reported a genuine create error
-    as "Invalid upload command") has no path left. ``_do_put`` here is the
-    action, kept under its old name so each error case is still checked on
-    both entry points.
+    A tensor is created by the action only; DoPut takes a ``PutCommand`` and
+    refuses anything else up front, so the historical parse-and-guess
+    discrimination (which mis-reported a genuine create error as "Invalid
+    upload command") has no path left.
     """
 
     class _MockWriter:
@@ -942,175 +898,104 @@ class TestDoPutErrorTranslation:
             self.written.append(buf)
 
     @staticmethod
-    def _server(**kwargs):
+    def _server(tmp_path, **kwargs):
         from biopb_tensor_server.serving.server import TensorFlightServer
 
+        kwargs.setdefault("write_dir", Path(tmp_path))
         return TensorFlightServer(
             location="grpc://localhost:0", writable=True, **kwargs
         )
 
-    def _do_put(self, server, req_desc):
-        action = flight.Action("create_tensor", req_desc.SerializeToString())
+    def _action(self, server, req_desc):
+        action = flight.Action("add_tensor", req_desc.SerializeToString())
         return list(server.do_action(None, action))
 
-    def test_do_put_refuses_a_bare_descriptor(self):
+    def test_do_put_refuses_a_bare_descriptor(self, tmp_path):
         """The old create-over-DoPut wire shape is refused, not guessed at."""
-        server = self._server()
+        server = self._server(tmp_path)
         req_desc = TensorDescriptor(
-            array_id="cache:ok", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+            array_id="cache://x/ok", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
         )
         descriptor = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
         with pytest.raises(flight.FlightServerError, match="PutCommand"):
             server.do_put(None, descriptor, None, self._MockWriter())
 
-    def _create_tensor_action(self, server, req_desc):
-        action = flight.Action("create_tensor", req_desc.SerializeToString())
-        list(server.do_action(None, action))
-
-    # -- invalid array_id prefix ------------------------------------------------
-
-    def test_do_put_invalid_prefix_surfaces_real_error(self):
-        server = self._server()
+    def test_an_unusable_id_surfaces_its_real_error(self, tmp_path):
+        server = self._server(tmp_path)
         req_desc = TensorDescriptor(
             array_id="bogus:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
         )
         with pytest.raises(flight.FlightServerError) as exc:
-            self._do_put(server, req_desc)
-        assert "Invalid array_id format" in str(exc.value)
+            self._action(server, req_desc)
+        assert "names no tensor" in str(exc.value)
         assert "Invalid upload command" not in str(exc.value)
 
-    def test_action_invalid_prefix_surfaces_real_error(self):
-        server = self._server()
+    def test_a_missing_write_dir_surfaces_its_real_error(self, tmp_path):
+        server = self._server(tmp_path, write_dir=None)
         req_desc = TensorDescriptor(
-            array_id="bogus:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
-        )
-        with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
-            self._create_tensor_action(server, req_desc)
-
-    # -- missing write_dir ------------------------------------------------------
-
-    def test_do_put_missing_write_dir_surfaces_real_error(self):
-        server = self._server(write_dir=None)
-        req_desc = TensorDescriptor(
-            array_id="ome_zarr:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
+            array_id="zarr://x/test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
         )
         with pytest.raises(flight.FlightServerError) as exc:
-            self._do_put(server, req_desc)
-        assert "write_dir not configured" in str(exc.value)
+            self._action(server, req_desc)
+        assert "write_dir is not configured" in str(exc.value)
         assert "Invalid upload command" not in str(exc.value)
 
-    def test_action_missing_write_dir_surfaces_real_error(self):
-        server = self._server(write_dir=None)
-        req_desc = TensorDescriptor(
-            array_id="ome_zarr:test", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
-        )
-        with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
-            self._create_tensor_action(server, req_desc)
+    def test_a_refused_zarr_member_leaves_no_store_behind(self, tmp_path):
+        """A rejected request must leave no partial store: an orphan would
+        block a corrected retry under the same field (biopb/biopb#354)."""
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
+        collection = server.sources.get(source).store
 
-    # -- malformed metadata_json ------------------------------------------------
-
-    def test_do_put_malformed_metadata_json_surfaces_real_error(self):
-        server = self._server()
-        req_desc = TensorDescriptor(
-            array_id="cache:test",
+        bad = TensorDescriptor(
+            array_id=f"zarr://{source}/retry",
             shape=[10, 10],
             dtype="uint8",
             chunk_shape=[5, 5],
-            metadata_json="{not valid json",
+            metadata_json='{"omero": {}}',
         )
-        with pytest.raises(flight.FlightServerError) as exc:
-            self._do_put(server, req_desc)
-        assert "invalid metadata_json" in str(exc.value)
-        assert "Invalid upload command" not in str(exc.value)
+        with pytest.raises(flight.FlightServerError, match="metadata is the source's"):
+            self._action(server, bad)
+        assert [d.name for d in collection.iterdir() if d.is_dir()] == []
 
-    def test_action_malformed_metadata_json_surfaces_real_error(self):
-        server = self._server()
-        req_desc = TensorDescriptor(
-            array_id="cache:test",
+        # Same field, now well-formed: nothing was left for the mkdir to
+        # collide with.
+        good = TensorDescriptor(
+            array_id=f"zarr://{source}/retry",
             shape=[10, 10],
             dtype="uint8",
             chunk_shape=[5, 5],
-            metadata_json="{not valid json",
         )
+        (written,) = self._action(server, good)
+        assert TensorDescriptor.FromString(bytes(written)).array_id == f"{source}/retry"
+
+    def test_malformed_source_metadata_surfaces_its_real_error(self, tmp_path):
+        """Metadata rides on ``register_source`` now, so that is where a
+        malformed block is refused."""
+        server = self._server(tmp_path)
         with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
-            self._create_tensor_action(server, req_desc)
+            server.uploads.register_source("", "{not valid json")
 
-    def test_do_put_malformed_metadata_json_ome_zarr(self):
-        """The ome_zarr branch's metadata_json is validated too, not just cache --
-        and metadata is parsed *before* any disk write, so a rejected request
-        leaves no orphaned .zarr behind (which would block a corrected retry
-        under the same name; biopb/biopb#354)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = self._server(write_dir=Path(tmpdir))
-            req_desc = TensorDescriptor(
-                array_id="ome_zarr:test",
-                shape=[10, 10],
-                dtype="uint8",
-                chunk_shape=[5, 5],
-                metadata_json="{not valid json",
-            )
-            with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
-                self._do_put(server, req_desc)
-            # Nothing was written to disk -- no partial store to block a retry.
-            assert list(Path(tmpdir).iterdir()) == []
+    def test_non_object_source_metadata_surfaces_its_real_error(self, tmp_path):
+        """Well-formed JSON that is not an object is rejected: callers spread
+        the result into a mapping, so a scalar or list must fail at the
+        boundary rather than downstream (biopb/biopb#354)."""
+        server = self._server(tmp_path)
+        with pytest.raises(flight.FlightServerError, match="expected a JSON object"):
+            server.uploads.register_source("", "[1, 2, 3]")
 
-    def test_do_put_ome_zarr_retry_after_bad_metadata_succeeds(self):
-        """A malformed-metadata create must not poison a corrected retry under
-        the same name: parse-first leaves no store for zarr.create to collide
-        with (biopb/biopb#354)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server = self._server(write_dir=Path(tmpdir))
-            bad = TensorDescriptor(
-                array_id="ome_zarr:retry",
-                shape=[10, 10],
-                dtype="uint8",
-                chunk_shape=[5, 5],
-                metadata_json="{not valid json",
-            )
-            with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
-                self._do_put(server, bad)
-
-            # Same name, now well-formed: previously the orphaned store made
-            # zarr.create raise instead of creating the source.
-            good = TensorDescriptor(
-                array_id="ome_zarr:retry",
-                shape=[10, 10],
-                dtype="uint8",
-                chunk_shape=[5, 5],
-            )
-            (written,) = self._do_put(server, good)
-            response = TensorDescriptor.FromString(bytes(written))
-            assert response.array_id.startswith("ome_zarr_")
-
-    def test_do_put_non_object_metadata_json_surfaces_real_error(self):
-        """Well-formed JSON that is not an object is rejected: callers spread the
-        result into a mapping, so a scalar/list must fail at the create boundary
-        rather than downstream (biopb/biopb#354)."""
-        server = self._server()
+    def test_a_valid_add_writes_its_resolved_descriptor(self, tmp_path):
+        server = self._server(tmp_path)
+        source = server.uploads.register_source()
         req_desc = TensorDescriptor(
-            array_id="cache:test",
+            array_id=f"cache://{source}/ok",
             shape=[10, 10],
             dtype="uint8",
             chunk_shape=[5, 5],
-            metadata_json="[1, 2, 3]",
         )
-        with pytest.raises(flight.FlightServerError) as exc:
-            self._do_put(server, req_desc)
-        assert "expected a JSON object" in str(exc.value)
-        assert "Invalid upload command" not in str(exc.value)
+        (written,) = self._action(server, req_desc)
 
-    # -- the good path still writes the resolved descriptor ---------------------
-
-    def test_do_put_valid_create_writes_response(self):
-        """A well-formed create still round-trips its resolved descriptor."""
-        server = self._server()
-        req_desc = TensorDescriptor(
-            array_id="cache:ok", shape=[10, 10], dtype="uint8", chunk_shape=[5, 5]
-        )
-        (written,) = self._do_put(server, req_desc)
-
-        response = TensorDescriptor.FromString(bytes(written))
-        assert response.array_id.startswith("cache_")
+        assert TensorDescriptor.FromString(bytes(written)).array_id == f"{source}/ok"
 
 
 def _planned_chunk_id(adapter, start, stop):
@@ -1138,22 +1023,20 @@ class TestChunkUpload:
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
-            location="grpc://localhost:0",
-            writable=True,
+            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
         )
 
-        # Create source first
-        req_desc = TensorDescriptor(
-            array_id="cache:test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
+        source = server.uploads.register_source()
+        server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"cache://{source}/test",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+            )
         )
-        response_desc = server.uploads.create_tensor(req_desc)
-        source_id = response_desc.array_id
 
-        adapter = server.sources.get(source_id)
-        assert adapter is not None
+        adapter = server.sources.get(source).members["test"]
         chunk_id = _planned_chunk_id(adapter, [0, 0], [50, 50])
 
         # Create mock data
@@ -1179,21 +1062,21 @@ class TestChunkUpload:
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
-            location="grpc://localhost:0",
-            writable=True,
+            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
         )
 
-        req_desc = TensorDescriptor(
-            array_id="cache:test-shape",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
+        source = server.uploads.register_source()
+        desc = server.uploads.add_tensor(
+            TensorDescriptor(
+                array_id=f"cache://{source}/test-shape",
+                shape=[100, 100],
+                dtype="uint8",
+                chunk_shape=[50, 50],
+            )
         )
-        response_desc = server.uploads.create_tensor(req_desc)
-        source_id = response_desc.array_id
 
         bounds = ChunkBounds(start=[10, 20], stop=[40, 60])
-        adapter = server.sources.get(source_id)
+        adapter = server.sources.get(source).members["test-shape"]
 
         data = np.arange(30 * 40, dtype=np.uint8).reshape(30, 40)
         batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
@@ -1206,9 +1089,9 @@ class TestChunkUpload:
             adapter, _planned_chunk_id(adapter, [10, 20], [40, 60]), MockReader()
         )
 
-        # create_source assigns a per-upload content_version (#178), so the chunk
-        # is stored under the version-wrapped id the read plan also mints.
-        chunk_id = encode_chunk_id(source_id, bounds)
+        # An upload gets a per-upload content_version (#178), so the chunk is
+        # stored under the version-wrapped id the read plan also mints.
+        chunk_id = encode_chunk_id(desc.array_id, bounds)
         if adapter.content_version is not None:
             chunk_id = wrap_content_version(chunk_id, adapter.content_version)
         cache_manager = CacheManager.get_instance()
@@ -1275,16 +1158,19 @@ class TestChunkUpload:
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
-        server = TensorFlightServer(location="grpc://localhost:0", writable=True)
-        desc = server.uploads.create_tensor(
+        server = TensorFlightServer(
+            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
+        )
+        source = server.uploads.register_source()
+        server.uploads.add_tensor(
             TensorDescriptor(
-                array_id="cache:stale",
+                array_id=f"cache://{source}/stale",
                 shape=[100, 100],
                 dtype="uint8",
                 chunk_shape=[50, 50],
             )
         )
-        adapter = server.sources.get(desc.array_id)
+        adapter = server.sources.get(source).members["stale"]
         stale = mint_chunk_id(
             adapter.array_id,
             ChunkBounds(start=[0, 0], stop=[50, 50]),
@@ -1296,8 +1182,8 @@ class TestChunkUpload:
         CacheManager.reset()
 
 
-class TestOmeZarrChunkAlignment:
-    """Tests for chunk alignment validation for zarr-backed sources."""
+class TestZarrChunkAlignment:
+    """Tests for chunk alignment validation for zarr-backed members."""
 
     def test_aligned_chunk_accepted(self):
         """Aligned chunk upload is accepted."""
@@ -1316,19 +1202,19 @@ class TestOmeZarrChunkAlignment:
                 write_dir=Path(tmpdir),
             )
 
-            # Create zarr-backed source
-            req_desc = TensorDescriptor(
-                array_id="ome_zarr:test",
-                shape=[100, 100],
-                dtype="uint8",
-                chunk_shape=[50, 50],
+            source = server.uploads.register_source()
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id=f"zarr://{source}/test",
+                    shape=[100, 100],
+                    dtype="uint8",
+                    chunk_shape=[50, 50],
+                )
             )
-            response_desc = server.uploads.create_tensor(req_desc)
-            source_id = response_desc.array_id
 
             # 100x100 uint8 is one block of the transfer grid the store is
             # minted on, so the whole tensor is the aligned chunk.
-            adapter = server.sources.get(source_id)
+            adapter = server.sources.get(source).members["test"]
             chunk_id = _planned_chunk_id(adapter, [0, 0], [100, 100])
 
             data = np.ones((100, 100), dtype=np.uint8)
@@ -1361,18 +1247,18 @@ class TestOmeZarrChunkAlignment:
                 write_dir=Path(tmpdir),
             )
 
-            # Create zarr-backed source with chunk_shape [50, 50]
-            req_desc = TensorDescriptor(
-                array_id="ome_zarr:test",
-                shape=[100, 100],
-                dtype="uint8",
-                chunk_shape=[50, 50],
+            source = server.uploads.register_source()
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id=f"zarr://{source}/test",
+                    shape=[100, 100],
+                    dtype="uint8",
+                    chunk_shape=[50, 50],
+                )
             )
-            response_desc = server.uploads.create_tensor(req_desc)
-            source_id = response_desc.array_id
 
             # Neither on the grid nor at the tensor edge
-            adapter = server.sources.get(source_id)
+            adapter = server.sources.get(source).members["test"]
             chunk_id = _planned_chunk_id(adapter, [0, 0], [60, 70])
 
             data = np.ones((50, 50), dtype=np.uint8)
@@ -1543,24 +1429,23 @@ class TestCachedSourceContentVersion:
     def test_each_upload_of_a_name_gets_its_own_generation(self):
         """Two adapters built for one name share the id and differ in gen.
 
-        Built directly rather than through ``create_source``, which refuses the
+        Built directly rather than through ``add_tensor``, which refuses the
         second: the case this guards is an upload after a *restart*, where the
         registry is empty but the persisted file cache may still hold the
         prior upload's chunks under the same deterministic id.
         """
-        req = TensorDescriptor(
-            array_id="cache:reupload",
-            shape=[8, 8],
-            dtype="uint8",
-            chunk_shape=[8, 8],
-            dim_labels=["y", "x"],
-        )
-        a1 = CachedSourceAdapter.create_upload(
-            "reupload", req, metadata=None, write_dir=None
-        )
-        a2 = CachedSourceAdapter.create_upload(
-            "reupload", req, metadata=None, write_dir=None
-        )
+
+        def build():
+            return CachedSourceAdapter(
+                source_id=CachedSourceAdapter.upload_source_id("reupload"),
+                shape=[8, 8],
+                dtype="uint8",
+                chunk_shape=[8, 8],
+                dim_labels=["y", "x"],
+                content_version=CachedSourceAdapter.next_content_version(),
+            )
+
+        a1, a2 = build(), build()
 
         assert a1.source_id == a2.source_id  # deterministic id -> same source
         assert a1.content_version is not None and a2.content_version is not None
@@ -1568,9 +1453,9 @@ class TestCachedSourceContentVersion:
         assert a1.content_version != a2.content_version  # a fresh namespace each
 
 
-def _upload_whole(client, arr, name):
+def _upload_whole(client, arr, array_id):
     """Declare from the array, fill it, seal it; the id for reading back."""
-    desc = client.create_tensor(name, arr)
+    desc = client.add_tensor(array_id, arr)
     client.upload_array(desc, arr)
     return desc.array_id
 
@@ -1610,21 +1495,23 @@ class TestConcurrentChunkUpload:
         monkeypatch.setattr(_upload, "_put_chunk", counting)
         return state
 
-    def test_a_fanned_out_upload_round_trips_every_chunk(self, client):
+    def test_a_fanned_out_upload_round_trips_every_chunk(self, client, source):
         """The whole point: concurrent chunks, byte-identical on the way back.
 
         Values differ per chunk, which is what makes a swapped or dropped chunk
         visible -- a uniform array would round-trip through almost any bug.
         """
-        source = np.arange(12 * 40 * 40, dtype=np.uint16).reshape(12, 40, 40)
+        expected = np.arange(12 * 40 * 40, dtype=np.uint16).reshape(12, 40, 40)
         source_id = _upload_whole(
-            client, da.from_array(source, chunks=(1, 40, 40)), "cache:fanout"
+            client,
+            da.from_array(expected, chunks=(1, 40, 40)),
+            f"cache://{source}/fanout",
         )
 
         assert client.get_upload_status(source_id)["state"] == "READY"
-        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
+        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), expected)
 
-    def test_the_chunks_really_do_overlap(self, client, monkeypatch):
+    def test_the_chunks_really_do_overlap(self, client, source, monkeypatch):
         """Concurrency, observed rather than assumed.
 
         Without this the suite would pass just as happily on something that
@@ -1636,12 +1523,14 @@ class TestConcurrentChunkUpload:
         arr = da.from_array(np.zeros((16, 20, 20), dtype=np.uint8), chunks=(1, 20, 20))
 
         with dask.config.set(scheduler="threads", num_workers=4):
-            _upload_whole(client, arr, "cache:overlap")
+            _upload_whole(client, arr, f"cache://{source}/overlap")
 
         assert state["peak"] > 1, "uploads ran one at a time"
         assert state["peak"] <= 4, f"asked for 4 at once, ran {state['peak']}"
 
-    def test_the_caller_can_still_ask_for_a_serial_upload(self, client, monkeypatch):
+    def test_the_caller_can_still_ask_for_a_serial_upload(
+        self, client, source, monkeypatch
+    ):
         """Throttling is dask's own dial, not an argument this SDK invents.
 
         `upload_array` names no scheduler, so a link or a backend that wants
@@ -1649,17 +1538,17 @@ class TestConcurrentChunkUpload:
         call -- and that has to actually reach `da.store`.
         """
         state = self._counting_put(monkeypatch)
-        source = np.arange(6 * 20 * 20, dtype=np.uint16).reshape(6, 20, 20)
-        arr = da.from_array(source, chunks=(1, 20, 20))
+        expected = np.arange(6 * 20 * 20, dtype=np.uint16).reshape(6, 20, 20)
+        arr = da.from_array(expected, chunks=(1, 20, 20))
 
         with dask.config.set(scheduler="threads", num_workers=1):
-            source_id = _upload_whole(client, arr, "cache:serial")
+            source_id = _upload_whole(client, arr, f"cache://{source}/serial")
 
         assert state["peak"] == 1
         assert client.get_upload_status(source_id)["state"] == "READY"
-        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), source)
+        np.testing.assert_array_equal(client.get_tensor(source_id).compute(), expected)
 
-    def test_a_failed_chunk_surfaces_as_itself(self, client, monkeypatch):
+    def test_a_failed_chunk_surfaces_as_itself(self, client, source, monkeypatch):
         """A chunk that raises must reach the caller, with its own type.
 
         Callers catch on type (`flight.FlightError` and friends), so a write
@@ -1684,9 +1573,9 @@ class TestConcurrentChunkUpload:
         arr = da.from_array(np.zeros((10, 20, 20), dtype=np.uint8), chunks=(1, 20, 20))
 
         with pytest.raises(ChunkRefused):
-            _upload_whole(client, arr, "cache:doomed")
+            _upload_whole(client, arr, f"cache://{source}/doomed")
 
-    def test_out_of_order_arrival_still_completes_the_upload(self, client):
+    def test_out_of_order_arrival_still_completes_the_upload(self, client, source):
         """Readiness counts chunks into a set, so order is not observable.
 
         Fanning out makes arrival order arbitrary; this pins the server-side
@@ -1694,10 +1583,10 @@ class TestConcurrentChunkUpload:
         backwards and asking for READY.
         """
         session = client._upload
-        source = np.arange(5 * 20 * 20, dtype=np.uint16).reshape(5, 20, 20)
-        desc = session.create_tensor(
-            "cache:backwards",
-            source,
+        expected = np.arange(5 * 20 * 20, dtype=np.uint16).reshape(5, 20, 20)
+        desc = session.add_tensor(
+            f"cache://{source}/backwards",
+            expected,
             chunk_shape=(1, 20, 20),
             dim_labels=["z", "y", "x"],
         )
@@ -1705,13 +1594,13 @@ class TestConcurrentChunkUpload:
             session.upload_chunk(
                 desc,
                 ChunkBounds(start=[z, 0, 0], stop=[z + 1, 20, 20]),
-                source[z : z + 1],
+                expected[z : z + 1],
             )
         status = session.set_upload_status(desc, "READY")
         assert status["state"] == "READY"
         assert status["uploaded_chunks"] == 5
 
-    def test_a_shared_upstream_block_is_computed_once(self, client):
+    def test_a_shared_upstream_block_is_computed_once(self, client, source):
         """Why `da.store` and not a compute-and-ship loop per chunk.
 
         `upload_array` rechunks onto the upload grid whenever the caller's
@@ -1740,14 +1629,16 @@ class TestConcurrentChunkUpload:
             np.zeros((32, 64, 64), dtype=np.uint16), chunks=(4, 64, 64)
         )
         _upload_whole(
-            client, coarse.map_blocks(count).rechunk((1, 64, 64)), "cache:shared"
+            client,
+            coarse.map_blocks(count).rechunk((1, 64, 64)),
+            f"cache://{source}/shared",
         )
 
         # Eight source blocks; dask's rechunk splits two, hence ten. What
         # matters is the order of magnitude against a loop's 34.
         assert len(runs) <= 10
 
-    def test_the_store_target_survives_a_trip_to_a_worker(self, client):
+    def test_the_store_target_survives_a_trip_to_a_worker(self, client, source):
         """`da.store` puts the target in the graph, so it must pickle -- and work.
 
         A target holding an `UploadSession` would drag a `FlightClient` along,
@@ -1756,9 +1647,12 @@ class TestConcurrentChunkUpload:
         this asserts the revived target, holding no session, dials for itself.
         """
         session = client._upload
-        source = np.arange(4 * 8 * 8, dtype=np.uint16).reshape(4, 8, 8)
-        desc = session.create_tensor(
-            "cache:revived", source, chunk_shape=(1, 8, 8), dim_labels=["z", "y", "x"]
+        expected = np.arange(4 * 8 * 8, dtype=np.uint16).reshape(4, 8, 8)
+        desc = session.add_tensor(
+            f"cache://{source}/revived",
+            expected,
+            chunk_shape=(1, 8, 8),
+            dim_labels=["z", "y", "x"],
         )
         plan = _upload._plan_write(session._state, desc.array_id, None)
         target = _upload._UploadTarget(
@@ -1768,18 +1662,18 @@ class TestConcurrentChunkUpload:
             desc.array_id,
             plan,
             (0, 0, 0),
-            source.shape,
-            source.dtype,
+            expected.shape,
+            expected.dtype,
         )
 
         revived = pickle.loads(pickle.dumps(target))
 
         for z in range(4):
-            revived[(slice(z, z + 1), slice(0, 8), slice(0, 8))] = source[z : z + 1]
+            revived[(slice(z, z + 1), slice(0, 8), slice(0, 8))] = expected[z : z + 1]
 
         assert session.set_upload_status(desc, "READY")["state"] == "READY"
         np.testing.assert_array_equal(
-            client.get_tensor(desc.array_id).compute(), source
+            client.get_tensor(desc.array_id).compute(), expected
         )
 
 
@@ -1802,9 +1696,11 @@ class TestDiscard:
         return adapter
 
     @staticmethod
-    def _make_source(client, name="cache:discard-me", shape=(4, 4), chunk=(2, 2)):
-        return client.create_tensor(
-            name, np.empty(shape, dtype=np.uint16), chunk_shape=chunk
+    def _make_source(client, source, field="discard-me", shape=(4, 4), chunk=(2, 2)):
+        return client.add_tensor(
+            f"cache://{source}/{field}",
+            np.empty(shape, dtype=np.uint16),
+            chunk_shape=chunk,
         )
 
     @staticmethod
@@ -1815,22 +1711,22 @@ class TestDiscard:
         client.upload_chunk(desc, ChunkBounds(start=list(start), stop=list(stop)), data)
 
     def test_discard_leaves_a_tombstone_that_refuses_reads_too(
-        self, writable_server, client
+        self, writable_server, client, source
     ):
         """The adapter stays registered, terminal, so both a writer and a
         reader still unwinding learn the reason instead of "not found"."""
-        desc = self._make_source(client, shape=(2, 2), chunk=(2, 2))
+        desc = self._make_source(client, source, shape=(2, 2), chunk=(2, 2))
         self._put(client, desc, (0, 0), (2, 2))
-        adapter = writable_server.sources.get(desc.array_id)
+        adapter = writable_server.sources.get(source).members["discard-me"]
 
         status = writable_server.uploads.discard(desc.array_id, "client went away")
 
         assert status["state"] == "DISCARDED"
         assert status["reason"] == "client went away"
-        assert writable_server.sources.get(desc.array_id) is adapter
+        assert writable_server.sources.get(source).members["discard-me"] is adapter
         assert client.get_upload_status(desc.array_id)["state"] == "DISCARDED"
-        # It is a tombstone, not a source: not listed, and its bytes are gone.
-        assert desc.array_id not in client.list_sources()
+        # It is a tombstone, not a tensor: its source no longer lists it.
+        assert writable_server.sources.get(source).list_tensor_descriptors() == []
         chunk_id = encode_chunk_id(
             desc.array_id, ChunkBounds(start=[0, 0], stop=[2, 2])
         )
@@ -1838,7 +1734,7 @@ class TestDiscard:
             adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
     def test_a_write_after_discard_says_discarded_not_missing(
-        self, writable_server, client
+        self, writable_server, client, source
     ):
         """The reason the tombstone exists.
 
@@ -1846,7 +1742,7 @@ class TestDiscard:
         tell a job unwinding after its own discard that the source never
         existed.
         """
-        desc = self._make_source(client)
+        desc = self._make_source(client, source)
         writable_server.uploads.discard(desc.array_id, "superseded")
 
         with pytest.raises(UploadRefused) as exc:
@@ -1858,10 +1754,12 @@ class TestDiscard:
         assert exc.value.reason == "superseded"
         assert exc.value.source_id == desc.array_id
 
-    def test_a_forgotten_source_is_missing_not_discarded(self, writable_server, client):
+    def test_a_forgotten_source_is_missing_not_discarded(
+        self, writable_server, client, source
+    ):
         """An unregistered source still means "not found" -- the states are distinct."""
-        desc = self._make_source(client)
-        writable_server.unregister_source(desc.array_id)
+        desc = self._make_source(client, source)
+        writable_server.unregister_source(source)
 
         with pytest.raises(flight.FlightError) as exc:
             self._put(client, desc, (0, 0), (2, 2))
@@ -1870,7 +1768,7 @@ class TestDiscard:
         assert "not found" in str(exc.value).lower()
 
     def test_an_in_flight_upload_stops_at_a_chunk_boundary(
-        self, writable_server, client, monkeypatch
+        self, writable_server, client, source, monkeypatch
     ):
         """Discard mid-upload surfaces through `da.store` as the cancelled error.
 
@@ -1879,7 +1777,7 @@ class TestDiscard:
         it stands rather than rewinding it -- the chunk already written stays
         counted on the tombstone.
         """
-        desc = self._make_source(client, shape=(8, 2), chunk=(2, 2))
+        desc = self._make_source(client, source, shape=(8, 2), chunk=(2, 2))
         real = _upload._put_chunk
         written = []
 
@@ -1904,7 +1802,9 @@ class TestDiscard:
         # How far it got is reported, but the chunk ids behind that number are
         # not kept: a tombstone outlives its upload and must not scale with it.
         assert (
-            writable_server.sources.get(desc.array_id).upload.uploaded_chunk_ids
+            writable_server.sources.get(source)
+            .members["discard-me"]
+            .upload.uploaded_chunk_ids
             == set()
         )
 
@@ -1920,9 +1820,9 @@ class TestDiscard:
         assert status["uploaded_chunks"] == 0
 
     def test_discard_is_idempotent_and_keeps_the_first_reason(
-        self, writable_server, client
+        self, writable_server, client, source
     ):
-        desc = self._make_source(client)
+        desc = self._make_source(client, source)
         writable_server.uploads.discard(desc.array_id, "first")
 
         again = writable_server.uploads.discard(desc.array_id, "second")
@@ -1948,30 +1848,33 @@ class TestDiscard:
         assert writable_server.uploads.status(source_id)["state"] == "UNKNOWN"
         assert writable_server.uploads.discard(source_id, "x")["state"] == "UNKNOWN"
 
-    def test_a_discarded_name_stays_taken(self, writable_server, client):
-        """A tombstone holds its name like any other source.
+    def test_a_discarded_field_stays_taken(self, writable_server, client, source):
+        """A tombstone holds its field like any other tensor.
 
-        A named cache source's id is a hash of that name, so a retry would land
-        on the tombstone -- and `create_tensor` refuses every collision rather
-        than replacing what holds the id (`upload_session_test.py` has why).
-        The retry goes under a new name; the tombstone keeps answering for the
-        old one with its reason.
+        ``add_tensor`` refuses every collision rather than replacing what holds
+        the id (`upload_session_test.py` has why), so a retry goes under a new
+        field; the tombstone keeps answering for the old one with its reason.
+        Only the reclaim sweep frees it.
         """
         first = self._make_source(
-            client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2)
+            client, source, field="retry-me", shape=(2, 2), chunk=(2, 2)
         )
         writable_server.uploads.discard(first.array_id, "gave up")
 
-        with pytest.raises(flight.FlightServerError, match="already exists"):
-            self._make_source(client, name="cache:retry-me", shape=(2, 2), chunk=(2, 2))
+        with pytest.raises(flight.FlightServerError, match="already has a tensor"):
+            self._make_source(
+                client, source, field="retry-me", shape=(2, 2), chunk=(2, 2)
+            )
 
         assert client.get_upload_status(first.array_id)["state"] == "DISCARDED"
         assert client.get_upload_status(first.array_id)["reason"] == "gave up"
 
-    def test_a_completed_upload_can_still_be_discarded(self, writable_server, client):
+    def test_a_completed_upload_can_still_be_discarded(
+        self, writable_server, client, source
+    ):
         """Disposal is not only for failures: dropping a finished result is the
         same operation."""
-        desc = self._make_source(client, shape=(2, 2), chunk=(2, 2))
+        desc = self._make_source(client, source, shape=(2, 2), chunk=(2, 2))
         self._put(client, desc, (0, 0), (2, 2))
         client.set_upload_status(desc, "READY")
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
@@ -1980,35 +1883,39 @@ class TestDiscard:
             "state"
         ] == ("DISCARDED")
 
-    def test_a_zarr_backed_discard_takes_its_store_and_row_with_it(
-        self, writable_server, client, tmp_path
+    def test_a_zarr_backed_discard_takes_its_store_with_it(
+        self, writable_server, client, source
     ):
-        """The store was minted under write_dir and the row written at create,
-        so both are the server's own to release (biopb/biopb#1059)."""
-        source_id = client.create_tensor(
-            "ome_zarr:letgo", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
+        """The store was minted under write_dir, so it is the server's own to
+        release (biopb/biopb#1059). The *source's* row stays: it is still there
+        to add another tensor to."""
+        array_id = client.add_tensor(
+            f"zarr://{source}/letgo", np.empty((4, 4), np.uint16), chunk_shape=(2, 2)
         ).array_id
-        assert (tmp_path / "letgo.zarr").is_dir()
-        assert source_id in _catalog_ids(writable_server.metadata_db)
+        store = writable_server.sources.get(source).member_store("letgo")
+        assert store.is_dir()
+        assert source in _catalog_ids(writable_server.metadata_db)
 
-        status = writable_server.uploads.discard(source_id, "nope")
+        status = writable_server.uploads.discard(array_id, "nope")
 
         assert status["state"] == "DISCARDED"
-        assert not (tmp_path / "letgo.zarr").exists()
-        assert source_id not in _catalog_ids(writable_server.metadata_db)
-        assert client.get_upload_status(source_id)["state"] == "DISCARDED"
+        assert not store.exists()
+        assert source in _catalog_ids(writable_server.metadata_db)
+        assert client.get_upload_status(array_id)["state"] == "DISCARDED"
 
-    def test_the_poll_sees_the_reason(self, writable_server, client):
+    def test_the_poll_sees_the_reason(self, writable_server, client, source):
         """A discarded upload is terminal and the status says why, which is
         what a caller's poll loop stops on instead of running to a timeout."""
-        desc = self._make_source(client)
+        desc = self._make_source(client, source)
         writable_server.uploads.discard(desc.array_id, "client disconnected")
 
         status = client.get_upload_status(desc.array_id)
         assert status["state"] == "DISCARDED"
         assert status["reason"] == "client disconnected"
 
-    def test_the_record_tracks_when_it_last_moved(self, writable_server, client):
+    def test_the_record_tracks_when_it_last_moved(
+        self, writable_server, client, source
+    ):
         """`updated_at` is what will bound a tombstone's life, and what tells a
         stalled upload from a slow one. Both halves read the same field, so both
         are checked here: progress writes it, and discard writes it.
@@ -2018,8 +1925,8 @@ class TestDiscard:
         CPython 3.13 (GetTickCount64), and both operations finish well inside one
         tick -- so `after > before` is not merely flaky there, it is false.
         """
-        desc = self._make_source(client, shape=(4, 2), chunk=(2, 2))
-        state = writable_server.sources.get(desc.array_id).upload
+        desc = self._make_source(client, source, shape=(4, 2), chunk=(2, 2))
+        state = writable_server.sources.get(source).members["discard-me"].upload
         assert state.updated_at > 0  # stamped at creation
 
         state.updated_at = -1.0
@@ -2031,16 +1938,17 @@ class TestDiscard:
         assert state.updated_at > 0
 
     def test_a_second_discard_does_not_extend_the_tombstone(
-        self, writable_server, client
+        self, writable_server, client, source
     ):
         """Otherwise a retrying caller could keep a tombstone alive forever."""
-        desc = self._make_source(client)
+        desc = self._make_source(client, source)
+        member = writable_server.sources.get(source).members["discard-me"]
         writable_server.uploads.discard(desc.array_id, "first")
-        first = writable_server.sources.get(desc.array_id).upload.updated_at
+        first = member.upload.updated_at
 
         writable_server.uploads.discard(desc.array_id, "second")
 
-        assert writable_server.sources.get(desc.array_id).upload.updated_at == first
+        assert member.upload.updated_at == first
 
     def test_a_straggler_does_not_extend_the_tombstone(self):
         """The mark guard returns before touching the clock."""
@@ -2051,42 +1959,54 @@ class TestDiscard:
 
         assert adapter.upload.updated_at == at_discard
 
-    def test_the_clock_stays_off_the_wire(self, writable_server, client):
+    def test_the_clock_stays_off_the_wire(self, writable_server, client, source):
         """A monotonic reading means nothing in another process, so it is not in
         the status contract. A client-facing "discarded at" would be a wall clock
         and a separate field."""
-        desc = self._make_source(client)
+        desc = self._make_source(client, source)
         writable_server.uploads.discard(desc.array_id, "x")
 
         assert "updated_at" not in client.get_upload_status(desc.array_id)
 
 
 def _durable_upload(server):
-    req_desc = TensorDescriptor(
-        array_id="ome_zarr:owned",
-        shape=[8, 8],
-        dtype="uint8",
-        chunk_shape=[4, 4],
-        dim_labels=["y", "x"],
+    """A registered source with one published ``zarr://`` tensor on it."""
+    source_id = server.uploads.register_source()
+    desc = server.uploads.add_tensor(
+        TensorDescriptor(
+            array_id=f"zarr://{source_id}/owned",
+            shape=[8, 8],
+            dtype="uint8",
+            chunk_shape=[4, 4],
+            dim_labels=["y", "x"],
+        )
     )
-    return server.uploads.create_tensor(req_desc)
+    server.uploads.set_status(desc.array_id, UploadStatus.READY)
+    return source_id, desc
 
 
-def test_a_durable_upload_lands_in_the_servers_catalog():
-    """The upload path catalogues a durable upload itself, like any other
-    registering caller -- so list_sources sees it."""
+def test_a_registered_source_lands_in_the_servers_catalog():
+    """The upload path catalogues the *source* itself, like any other
+    registering caller -- so list_sources sees it, and its published tensors
+    ride in that one row."""
     with tempfile.TemporaryDirectory() as tmpdir:
         server = catalog_server(
             location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
         )
         try:
-            response_desc = _durable_upload(server)
-            assert response_desc.array_id in _catalog_ids(server.metadata_db)
+            source_id, desc = _durable_upload(server)
+            assert source_id in _catalog_ids(server.metadata_db)
+            # A member has no row of its own; it is a tensor of that one.
+            assert desc.array_id not in _catalog_ids(server.metadata_db)
+            assert [
+                d.array_id
+                for d in server.sources.get(source_id).list_tensor_descriptors()
+            ] == [desc.array_id]
         finally:
             server.shutdown()
 
 
-def test_a_durable_upload_to_a_catalog_less_server_is_addressable_not_listed():
+def test_an_upload_to_a_catalog_less_server_is_addressable_not_listed():
     """metadata_db=None is a deployment shape, not a broken one: the upload
     succeeds and its id comes back, and there is simply nowhere to list it."""
     import pyarrow.flight as flight
@@ -2097,9 +2017,9 @@ def test_a_durable_upload_to_a_catalog_less_server_is_addressable_not_listed():
             location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
         )
         try:
-            response_desc = _durable_upload(server)
-            assert response_desc.array_id  # readable by the id it hands back
-            assert server.sources.get(response_desc.array_id.split("/")[0]) is not None
+            source_id, desc = _durable_upload(server)
+            assert desc.array_id  # readable by the id it hands back
+            assert server.sources.get(source_id) is not None
             with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
                 list(server.list_flights(None, b""))
         finally:

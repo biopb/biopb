@@ -12,46 +12,56 @@ Three kinds, and the choice matters more than the mechanics:
 
 | what you have | upload it as | shown by |
 |---|---|---|
-| an image, or any array | a **tensor** — `"cache:<name>"` | `id=<array_id>` |
-| a segmentation, mask or instance labelling | a **label set** — `"<image array_id>/labels/<name>"` | `lb=<its array_id>` over the image |
+| an image, or any array | a **tensor** — `"<scheme>://<source_id>/<field>"` | `id=<array_id>` |
+| a segmentation, mask or instance labelling | a **label set** — `"zarr://<image array_id>/labels/<name>"` | `lb=<its array_id>` over the image |
 | points, boxes, polygons, scribbles | **ROI annotations** — `put_rois` | `rs=<set_name>` |
 
 **Prefer a label set to a plain tensor for anything derived from an image.** Its
 id is the image's own plus `/labels/<name>`, so the two stay registered and one
-link shows both; the same labels uploaded as `cache:` are a separate image the
-user has to line up by eye.
+link shows both; the same labels uploaded as a tensor of your own are a separate
+image the user has to line up by eye.
 
-## Declare, then fill
+## Register, declare, then fill
+
+**An upload adds a tensor to a source that already exists.** Nothing on the
+upload path creates one, so a result needs a container first:
 
 ```python
-desc = client.create_tensor("cache:my_result", arr)   # shape, dtype, grid from arr
+source = client.register_source("my_results")         # once per batch of results
+desc = client.add_tensor(f"zarr://{source}/my_result", arr)  # shape, dtype, grid from arr
 client.upload_array(desc, arr)                        # writes every chunk, seals it
-array_id = desc.array_id
+array_id = desc.array_id                              # "<source>/my_result"
 ```
 
-`create_tensor` takes anything with `.shape` and `.dtype` as the template; a
-dask array also supplies the chunk grid, and `chunk_shape=` overrides it — which
-you need to get more than one chunk out of a numpy template. The returned
-descriptor is the server's echo and is what every later call takes; the grid on
-it is the server's, which for an `ome_zarr:` store may be coarser than the one
-you asked for.
+A source is a container and nothing else: it holds no bytes, it is readable
+(and empty) the moment `register_source` returns, and a `source_id` comes back
+**minted by the server**, not derived from the name you passed. Keep adding to
+one; one source per batch of related results is the shape to aim for.
 
-**An upload carries shape, dtype and chunks, and nothing else.** Axis labels and
-pixel size travel only if you pass them — `dim_labels=` and `ome_metadata=` on
-`create_tensor` — so a result uploaded without them comes back uncalibrated and
-measures in pixels. Copy them off the input's descriptor rather than writing
-them out; [[napari-viewer]] is this failure from the reading end, where an
-uncalibrated layer measures in pixels.
+`add_tensor` takes anything with `.shape` and `.dtype` as the template; a dask
+array also supplies the chunk grid, and `chunk_shape=` overrides it — which you
+need to get more than one chunk out of a numpy template. The grid is a request,
+not a promise: the returned descriptor is the server's echo, and the grid on it
+is the server's, which may be coarser than the one you asked for.
 
-**The destination prefix decides where it lands.** `"cache:<name>"` is
-cache-backed and right for something the user is only going to look at;
-`"ome_zarr:<name>"` is zarr-backed and persists as files. `"cache:"` with no
-name has the server mint one, which is the fix for the rule below.
+**The scheme names the store format and nothing else.** `zarr://` writes an
+OME-Zarr image group under the source and is right for anything to keep;
+`cache://` stores the chunks exactly as uploaded. The answered `array_id`
+carries no scheme — the format is a property of the stored tensor, not of its
+name.
 
-**A name is taken while its source exists** — at any of the three states below —
-and creating under it again is refused (`FlightServerError`). Only the server's
-reclaim sweep frees one, after a discarded upload's `upload_ttl`. **Re-running a
-cell therefore needs a new name, or a bare `"cache:"`.**
+**Metadata is the source's, not a tensor's.** Axis labels ride on `add_tensor`
+(`dim_labels=`), but the pixel size, units and channel names go to
+`register_source(name, metadata)` and every tensor added to it inherits them —
+a tensor that carries its own is refused rather than silently stripped. Copy
+them off the input's descriptor rather than writing them out; [[napari-viewer]]
+is this failure from the reading end, where an uncalibrated layer measures in
+pixels.
+
+**A field is taken while its tensor is served** — at any of the three states
+below — and adding under it again is refused (`FlightServerError`). Only the
+server's reclaim sweep frees one, after a discarded upload's `upload_ttl`.
+**Re-running a cell therefore needs a new field name.**
 
 `upload_array` asks the server for the chunk grid, rechunks onto it, sends
 every block and seals it. It raises `ValueError` when the array does not match
@@ -88,10 +98,12 @@ stay background for that consumer even after a later write filled it, and
 nothing could tell them otherwise. Sealing at publish removes the case.
 
 **`"DISCARDED"` is the only delete there is**, and it works from every state —
-including READY. It takes the server-minted store with it (an `ome_zarr:`
-directory, a label set's sidecar) and unlists the source. Pass a `reason`: it is
-what a poller waiting on the result reads back. The name frees after the
-server's reclaim sweep, not immediately.
+including READY. It takes the server-minted store with it (a `zarr://` member's
+directory, a label set's sidecar) and takes the tensor out of its source's
+listing; the source itself stays, ready for the next one. Pass a `reason`: it is
+what a poller waiting on the result reads back. The field frees after the
+server's reclaim sweep, not immediately — and a source left empty for that long
+goes with it.
 
 ## The round trip, for data too large to hold
 
@@ -102,7 +114,8 @@ result at once, so this works on data far larger than memory:
 arr = client.get_tensor("raw_data_id")   # lazy, nothing read yet
 mask = arr > 0.5                         # still lazy, still nothing read
 
-desc = client.create_tensor("cache:thresholded_v1", mask)
+source = client.register_source("thresholds")
+desc = client.add_tensor(f"zarr://{source}/thresholded_v1", mask)
 client.upload_array(desc, mask)          # the eager step: chunk by chunk
 ```
 
@@ -111,16 +124,20 @@ client.upload_array(desc, mask)          # the eager step: chunk by chunk
 Same two calls, a different name:
 
 ```python
-desc = client.create_tensor(f"{image_id}/labels/nuclei", labels)
+desc = client.add_tensor(f"zarr://{image_id}/labels/nuclei", labels)
 client.upload_array(desc, labels)
 ```
+
+A label set is the one form whose source may be an image the server
+**discovered** — it belongs to that image, which is already there, so it needs
+no `register_source` of its own.
 
 A set is **unsigned-integer**, spans its image's non-channel axes at full
 length, and its all-zero chunks are skipped by `upload_array` — so a sparse mask
 is cheap to send.
 
-Its `array_id` is the request's own rather than a minted `source_id`, and its
-descriptor carries an NGFF `image-label` block naming the image it belongs to.
+Its `array_id` is the request's own minus the scheme, and its descriptor
+carries an NGFF `image-label` block naming the image it belongs to.
 
 - `client.label_sets(image_array_id)` lists what an image has, sorted.
 - `client.get_tensor(set_id)` reads one back like any other tensor.

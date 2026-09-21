@@ -89,7 +89,7 @@ in three collaborators it composes:
 |---|---|---|
 | `server.sources` | `SourceRegistry` |  The `source_id → SourceAdapter` map and adapter-lifecycle |
 | `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
-| `server.uploads` | `UploadManager` | The writable-server DoPut boundary: picks the upload kind by `array_id` prefix (`cache:`/`ome_zarr:`), registers what the adapter class builds, translates adapter errors to Flight errors. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a registered tombstone, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet and unregisters aged tombstones. A durable (`ome_zarr:`) upload is swept like any other: its store is the server's own under `write_dir`, so discard removes it and drops the catalog row, and a store still marked pending at startup is a crashed upload and is deleted before discovery runs |
+| `server.uploads` | `UploadManager` | The writable-server upload boundary. `register_source` mints a container under `write_dir`; `add_tensor` puts `<scheme>://<source_id>/<field>` in one, the scheme naming the store format (`zarr://`, `cache://`) and nothing else. Nothing here creates a source, so the catalog row kept in step is always the parent's. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a tombstone its source still holds, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet, detaches aged tombstones, and takes a source left empty for that long. A store on disk is the server's own under `write_dir`, so discard removes it, and one still marked pending at startup is a crashed upload deleted before discovery runs — while a READY one is re-adopted, which is what makes a finished upload outlive the process |
 
 ### Flight protocol (v2)
 
@@ -114,9 +114,9 @@ token when one is configured; the private tiers require a source's capability
 token when the adapter carries one, else the server-wide token. A private
 source may still be catalogued -- the token gates reading, not knowing.
 
-Custom `do_action` verbs: `health` (reports `protocol`), `create_tensor`,
-`set_upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, `add_source`,
-`remove_source` (below), and `roi_prune`.
+Custom `do_action` verbs: `health` (reports `protocol`), `register_source`,
+`add_tensor`, `set_upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`,
+`add_source`, `remove_source` (below), and `roi_prune`.
 
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 
@@ -222,7 +222,7 @@ through the shared `core/axes.py::noncanonical_order`:
 
 | | |
 |---|---|
-| **Writes** | `create_tensor` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
+| **Writes** | `add_tensor` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
 | **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy opts out of wrapping (`_normalizable_axes = False`) and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
 
 ### Adapter file-handle policy (biopb/biopb#71)

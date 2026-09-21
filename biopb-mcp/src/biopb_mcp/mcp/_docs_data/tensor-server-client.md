@@ -116,9 +116,11 @@ The write side is [[upload]] — tensors, label sets and ROI annotations, and wh
 each refuses. The short form:
 
 ```python
-desc = client.create_tensor("cache:my_result", arr)
+source = client.register_source("my_results")
+desc = client.add_tensor(f"zarr://{source}/my_result", arr)
 client.upload_array(desc, arr)
 ```
 
-A name is taken while its source exists, so re-running a cell needs a new one or
-a bare `"cache:"` for a server-minted name.
+An upload adds a tensor to a source that already exists, so `register_source`
+comes first — keep adding to the one it answered with. A field is taken while
+its tensor is served, so re-running a cell needs a new field name.

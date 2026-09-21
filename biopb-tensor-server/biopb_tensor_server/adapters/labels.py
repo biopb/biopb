@@ -191,18 +191,6 @@ class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
         """
         self._dispose_store()
 
-    def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
-        """The create echo, under the set's own ``array_id``.
-
-        The two prefixed kinds mint a ``source_id`` and answer with it; a set
-        is a tensor of a source that already exists, so the id the request
-        carried is the id it keeps -- and is what every later write, poll and
-        transition names.
-        """
-        response = super().upload_response(desc)
-        response.array_id = self.array_id
-        return response
-
 
 # -- readers ------------------------------------------------------------------
 
@@ -374,10 +362,10 @@ def create_label_upload(
 ) -> LabelSetAdapter:
     """Mint the sidecar for a new uploaded set on *parent* and track its upload.
 
-    The third upload kind (design, "Upload"): unlike ``cache:`` / ``ome_zarr:``
-    it is not selected by a prefix and mints no ``source_id`` -- the request's
-    ``array_id`` is a tensor of a source that already exists, and is the id the
-    set keeps. *field* is that id's within-source half, already split by the
+    The one tensor an ``add_tensor`` may add to a source the server
+    *discovered* rather than minted: a set belongs to an image, and the image
+    is already there. Its store is a sidecar under ``write_dir`` rather than a
+    member directory, because the parent's own bytes are the user's. *field* is that id's within-source half, already split by the
     boundary; *desc* is the request in canonical order (the boundary refuses
     any other), and is filled in with the image's axes when it named none --
     in place, because it is also the descriptor the client is answered with.
@@ -436,7 +424,7 @@ def create_label_upload(
     if not desc.dim_labels:
         # The extent rule leaves exactly one legal set of axes for this image,
         # so a request that named none is filled in rather than refused. In
-        # place, so the descriptor ``create_tensor`` echoes back carries them:
+        # place, so the descriptor ``add_tensor`` echoes back carries them:
         # everything downstream (the sidecar's NGFF, the chunk grid, the
         # client's own later calls) is built from that descriptor.
         image = parent.label_image_descriptor(field, images=images)
@@ -461,7 +449,7 @@ def create_label_upload(
         **sidecar_attrs(parsed.image_field, content_version, state=UPLOAD_PENDING),
     }
     store = sidecar_dir(labels_dir, parent.source_id) / f"{parsed.name}.zarr"
-    # Exclusive, like ``OmeZarrAdapter.create_upload``: the directory must be
+    # Exclusive, like a member's store: the directory must be
     # this create's own, because discard removes it whole. A store on disk under
     # a name the parent does not serve is a crashed upload the boot sweep will
     # take, not something to adopt.

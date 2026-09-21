@@ -84,13 +84,41 @@ def is_unfinished_upload(ctx: ClaimContext) -> bool:
     cloud placeholder is deferred by the claims themselves, and a store nobody
     marked is not an upload.
     """
+    return _biopb_block(ctx).get("upload", {}).get("state") == UPLOAD_PENDING
+
+
+def is_upload_subsystem_store(ctx: ClaimContext) -> bool:
+    """Whether the directory at *ctx* belongs to the upload subsystem.
+
+    A registered source is a ``.zarr`` group like any other, so nothing in its
+    shape stops a claim taking it -- and if it were taken, the same bytes would
+    reach the catalog twice: once under the id ``register_source`` minted, once
+    under a path hash of discovery's own. The rule that keeps them apart is
+    ``write_dir`` being outside every discovery root; this is the second line,
+    for a ``write_dir`` misplaced inside one (``write_dir_under_root`` warns).
+
+    Recognized by the ``biopb`` block the subsystem writes and nothing else
+    does (``adapters.registered.source_attrs``), so a user's own zarr group is
+    unaffected however it is laid out.
+    """
+    return "source" in _biopb_block(ctx)
+
+
+def _biopb_block(ctx: ClaimContext) -> dict:
+    """The ``biopb`` bookkeeping block of the ``.zattrs`` at *ctx*, or empty.
+
+    Read only when the file is present and resident: a non-resident cloud
+    placeholder is deferred by the claims themselves, and a store nobody
+    marked carries no block.
+    """
     zattrs_ctx = ctx.join(".zattrs")
     if not zattrs_ctx.exists() or not zattrs_ctx.is_resident():
-        return False
+        return {}
     try:
-        return upload_state(json.loads(ctx.read_text(".zattrs"))) == UPLOAD_PENDING
+        block = json.loads(ctx.read_text(".zattrs")).get(UPLOAD_ATTR)
     except Exception:
-        return False
+        return {}
+    return block if isinstance(block, dict) else {}
 
 
 class ZarrAdapter(WritableSource, TensorAdapter):
@@ -100,8 +128,9 @@ class ZarrAdapter(WritableSource, TensorAdapter):
     For remote storage, uses zarr.FSStore with fsspec filesystem.
 
     Writable: a chunk-aligned ``put_chunk`` lands in the store. Only an adapter
-    built by ``OmeZarrAdapter.create_upload`` tracks an upload; a catalogued
-    store accepts writes untracked.
+    minted as an upload (``adapters.registered.create_member``,
+    ``adapters.labels.create_label_upload``) tracks one; a catalogued store
+    accepts writes untracked.
 
     An upload's store is the server's own (minted under ``write_dir``), so the
     upload half here also owns its end: discard removes the directory
@@ -130,7 +159,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         # Must be a directory ending in .zarr
         if not ctx.is_dir() or not ctx.name.endswith(".zarr"):
             return None
-        if is_unfinished_upload(ctx):
+        if is_unfinished_upload(ctx) or is_upload_subsystem_store(ctx):
             return None
 
         # Check for zarr structure files
