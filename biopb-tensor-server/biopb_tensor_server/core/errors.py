@@ -191,6 +191,33 @@ class UploadNotPublishedError(TensorResolutionError):
         self.source_id = source_id
 
 
+class UploadDiscardedReadError(TensorResolutionError):
+    """A read of an upload whose owner gave up on it (DISCARDED).
+
+    Canonical gRPC ``FAILED_PRECONDITION``, the same code as
+    :class:`UploadNotPublishedError`: the source exists and the read is
+    well-formed, but the state it is in cannot answer, and retrying is
+    pointless -- there is no later state a discard leads to. A still-unwinding
+    reader gets this same reason a writer does (biopb/biopb#1048), rather than
+    the tombstone reading as "no such chunk".
+
+    Distinct from :class:`UploadDiscardedError`, which is the *write*-path
+    exception (off this hierarchy, wire-mapped to ``FlightCancelledError`` by
+    the DoPut boundary) -- a read needs the read boundary's typed taxonomy
+    instead, so its ``grpc_code``/``reason`` reach the client's ``extra_info``.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, source_id: str, reason: str = "") -> None:
+        super().__init__(
+            f"Upload discarded for source '{source_id}'"
+            + (f": {reason}" if reason else ""),
+            reason="upload_discarded",
+        )
+        self.source_id = source_id
+
+
 class UpstreamConfigError(ValueError):
     """An upstream's *configuration* is broken, not the upstream itself.
 

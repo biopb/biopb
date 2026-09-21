@@ -142,6 +142,15 @@ def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
     return flight.FlightCancelledError(str(exc), json.dumps(payload).encode())
 
 
+def _is_member_field(parent: Any, field: Optional[str]) -> bool:
+    """Whether *field* names a member of *parent* rather than a label set.
+
+    A member exists only on a :class:`RegisterAdapter`; every other field --
+    including every field on a source that isn't one -- is a label set.
+    """
+    return isinstance(parent, RegisterAdapter) and split_label_field(field) is None
+
+
 def _label_uploads(adapter: Any) -> Dict[str, Any]:
     """The label sets an adapter is still filling, or none.
 
@@ -317,7 +326,7 @@ class UploadManager:
         parent = self._registry.get(source_id) if field else None
         if parent is None:
             return unknown_upload_status(array_id)
-        if isinstance(parent, RegisterAdapter) and split_label_field(field) is None:
+        if _is_member_field(parent, field):
             adapter = parent.detach_member(field)
         else:
             adapter = parent.detach_label_set(field)
@@ -347,7 +356,7 @@ class UploadManager:
         already attached -- that is what routes its own writes -- and becomes
         *listed* by becoming readable, so all it owes is the row.
         """
-        if not isinstance(parent, RegisterAdapter) or split_label_field(field):
+        if not _is_member_field(parent, field):
             parent.attach_label_set(field, adapter)
         self._sync_parent_row(parent)
 
@@ -360,7 +369,7 @@ class UploadManager:
         """
         if parent is None or field is None:
             return
-        if isinstance(parent, RegisterAdapter) and split_label_field(field) is None:
+        if _is_member_field(parent, field):
             # Nothing to detach: a member leaves the listing by ceasing to be
             # readable, and stays reachable as the tombstone a straggler polls
             # until the reclaim sweep drops it. Only the row is owed.
@@ -782,36 +791,72 @@ class UploadManager:
                     logger.info(f"Reclaimed discarded upload {source_id}")
             # ...and the label sets being uploaded onto it, which are tracked
             # on the source rather than in the registry.
-            for field, label_set in list(_label_uploads(adapter).items()):
-                expired_now, stale = _reap_step(label_set, now, ttl)
-                outcome = _reap_outcome(expired_now, stale)
-                if outcome == "expired":
-                    self._unlist(adapter, field)
-                    expired += 1
-                elif outcome == "reclaimed":
-                    adapter.detach_label_upload(field)
-                    reclaimed += 1
-                    logger.info(f"Reclaimed discarded label upload {source_id}/{field}")
+            label_expired, label_reclaimed, _ = self._reap_tensors(
+                adapter,
+                source_id,
+                _label_uploads(adapter),
+                # Lazy: an adapter with none to reap may not define this at
+                # all ("outside this package", per _label_uploads). Bound as a
+                # default so the callable doesn't chase the loop's own name.
+                lambda field, adapter=adapter: adapter.detach_label_upload(field),
+                "label upload",
+                now,
+                ttl,
+            )
+            expired += label_expired
+            reclaimed += label_reclaimed
             # ...and the members, which are tracked the same way.
             if not isinstance(adapter, RegisterAdapter):
                 continue
-            emptied_now = False
-            for field, member in adapter.members.items():
-                expired_now, stale = _reap_step(member, now, ttl)
-                outcome = _reap_outcome(expired_now, stale)
-                if outcome == "expired":
-                    self._unlist(adapter, field)
-                    expired += 1
-                elif outcome == "reclaimed":
-                    adapter.detach_member(field)
-                    reclaimed += 1
-                    emptied_now = True
-                    logger.info(f"Reclaimed discarded tensor {source_id}/{field}")
+            member_expired, member_reclaimed, emptied_now = self._reap_tensors(
+                adapter,
+                source_id,
+                adapter.members,
+                adapter.detach_member,
+                "tensor",
+                now,
+                ttl,
+            )
+            expired += member_expired
+            reclaimed += member_reclaimed
             if not emptied_now and self._reclaim_empty_source(
                 source_id, adapter, now, ttl
             ):
                 reclaimed += 1
         return expired, reclaimed
+
+    def _reap_tensors(
+        self,
+        adapter: Any,
+        source_id: str,
+        tensors: Dict[str, Any],
+        detach: Any,
+        kind: str,
+        now: float,
+        ttl: float,
+    ) -> Tuple[int, int, bool]:
+        """One reap pass over a field->upload mapping on *adapter*.
+
+        Shared by label sets and members: same expire-then-reclaim step, only
+        the detach verb and log wording differ. Returns
+        ``(expired, reclaimed, reclaimed_any)`` -- the last only meaningful to
+        the member caller, which uses it to decide whether the source itself
+        just went empty.
+        """
+        expired = reclaimed = 0
+        reclaimed_any = False
+        for field, tensor in list(tensors.items()):
+            expired_now, stale = _reap_step(tensor, now, ttl)
+            outcome = _reap_outcome(expired_now, stale)
+            if outcome == "expired":
+                self._unlist(adapter, field)
+                expired += 1
+            elif outcome == "reclaimed":
+                detach(field)
+                reclaimed += 1
+                reclaimed_any = True
+                logger.info(f"Reclaimed discarded {kind} {source_id}/{field}")
+        return expired, reclaimed, reclaimed_any
 
     def _reclaim_empty_source(
         self, source_id: str, adapter: RegisterAdapter, now: float, ttl: float

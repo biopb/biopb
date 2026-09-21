@@ -22,6 +22,7 @@ from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
+from biopb_tensor_server.core.errors import UploadDiscardedReadError
 from biopb_tensor_server.serving.upload_manager import write_dir_under_root
 
 from tests import catalog_server
@@ -113,7 +114,7 @@ class TestDiscardReleasesTheStore:
 
         writable_server.uploads.discard(desc.array_id, "gone")
 
-        with pytest.raises(flight.FlightServerError, match="gone"):
+        with pytest.raises(UploadDiscardedReadError, match="gone"):
             adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
     def test_discard_is_idempotent_on_a_store_already_gone(

@@ -50,7 +50,6 @@ from typing import (
 )
 
 import pyarrow as pa
-import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
@@ -60,6 +59,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.errors import (
     UploadDiscardedError,
+    UploadDiscardedReadError,
     UploadNotPublishedError,
     UploadSealedError,
     UploadTransitionError,
@@ -748,9 +748,7 @@ class WritableSource:
             return
         with progress.lock:
             if progress.is_discarded:
-                raise flight.FlightServerError(
-                    str(UploadDiscardedError(self.array_id, progress.reason))
-                )
+                raise UploadDiscardedReadError(self.array_id, progress.reason)
             if not progress.is_readable:
                 raise UploadNotPublishedError(self.array_id)
 

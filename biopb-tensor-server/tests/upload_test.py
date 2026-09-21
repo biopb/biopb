@@ -33,7 +33,7 @@ from biopb_tensor_server.core.chunk import (
     wrap_content_version,
 )
 from biopb_tensor_server.core.config import CacheConfig
-from biopb_tensor_server.core.errors import StaleChunkError
+from biopb_tensor_server.core.errors import StaleChunkError, UploadDiscardedReadError
 from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server
@@ -1730,7 +1730,7 @@ class TestDiscard:
         chunk_id = encode_chunk_id(
             desc.array_id, ChunkBounds(start=[0, 0], stop=[2, 2])
         )
-        with pytest.raises(flight.FlightServerError, match="client went away"):
+        with pytest.raises(UploadDiscardedReadError, match="client went away"):
             adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
     def test_a_write_after_discard_says_discarded_not_missing(

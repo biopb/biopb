@@ -41,7 +41,8 @@ message ChunkBounds {
 }
 
 // FlightDescriptor.command bytes of a DoPut; what the stream carries is the
-// oneof arm. A source is created by the `create_tensor` action, not here.
+// oneof arm. A tensor is added to a source by the `add_tensor` action, and a
+// source itself by `register_source`; DoPut creates neither.
 message PutCommand {
   oneof command {
     // The stream is one pixel chunk (writable servers only). The bytes are a
@@ -68,15 +69,15 @@ message PutCommand {
 // per transition (`finish`, `delete_labels`) that each had to re-derive which
 // object it was talking about.
 message SetUploadStatus {
-  // What is being moved, as `create_tensor` answered with it: the minted
-  // `source_id` of a `cache:` / `ome_zarr:` upload, or a label set's
-  // `<image array_id>/labels/<name>`. An `array_id` rather than a `source_id`
-  // because a set is a *tensor* of a source, not a source -- the two prefixed
-  // kinds are single-tensor, so for them the two ids are the same string, and
-  // naming the tensor is the form that covers both.
+  // What is being moved, as `add_tensor` answered with it:
+  // `<source_id>/<field>` for a member of a registered source, or a label
+  // set's `<image array_id>/labels/<name>`. An `array_id` rather than a
+  // `source_id` because what an upload tracks is always a *tensor* of a
+  // source, never the source itself -- `register_source` creates that, and
+  // takes no upload.
   //
   // It alone names the attempt: a name is single-use for the life of the
-  // server (`create_tensor` refuses a collision), so what it finds is what the
+  // server (`add_tensor` refuses a collision), so what it finds is what the
   // caller created.
   string array_id = 1;
 
