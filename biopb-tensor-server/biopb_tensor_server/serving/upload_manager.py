@@ -71,6 +71,10 @@ from biopb_tensor_server.adapters.registered import (
     scan_registered_sources,
     sources_root,
 )
+from biopb_tensor_server.adapters.scratch import (
+    SCRATCH_SOURCE_ID,
+    ScratchSource,
+)
 from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
     upload_expires_at,
@@ -727,6 +731,28 @@ class UploadManager:
             )
         self._sync_row(adapter.source_id, registered)
         return adapter.source_id
+
+    def install_scratch(self, max_ttl: Optional[float]) -> Optional[str]:
+        """Put the scratch source on the registry and in the catalog.
+
+        Both halves of what a registered source used to need, and neither is a
+        walk: there is nothing to mint on request, because the id is fixed, and
+        nothing to adopt at boot, because the source keeps no directory of its
+        own -- its tensors come back through the ``on_register`` hook that
+        gives every source its uploaded fields (``fields.fields_attacher``).
+
+        *max_ttl* caps every upload added here, an unset one included; None
+        leaves them undated. Returns the id, or None on a server with no
+        ``write_dir``: with nowhere to put a tensor, a scratch source is one
+        nothing can be added to.
+        """
+        if self._write_dir is None:
+            return None
+        adapter = ScratchSource(self._write_dir, max_ttl)
+        registered = self._registry.register(SCRATCH_SOURCE_ID, adapter)
+        self._sync_row(SCRATCH_SOURCE_ID, registered)
+        logger.info(f"Serving the scratch source as {SCRATCH_SOURCE_ID}")
+        return SCRATCH_SOURCE_ID
 
     def adopt_registered_sources(self) -> int:
         """Re-register what the last life left under ``<write_dir>/sources``.

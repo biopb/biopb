@@ -909,6 +909,7 @@ def _setup_flight_server(
         tls_cert_chain=tls_cert_chain,
         tls_private_key=tls_private_key,
         upload_ttl=server_config.upload_ttl,
+        scratch_ttl=server_config.scratch_ttl,
     )
 
     if tls_cert_chain is not None:

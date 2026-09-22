@@ -85,6 +85,7 @@ from biopb_tensor_server.adapters.fields import (
     upload_attacher,
 )
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
+from biopb_tensor_server.adapters.scratch import DEFAULT_SCRATCH_TTL
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -441,6 +442,7 @@ class TensorFlightServer(flight.FlightServerBase):
         tls_cert_chain: Optional[bytes] = None,
         tls_private_key: Optional[bytes] = None,
         upload_ttl: float = DEFAULT_UPLOAD_TTL,
+        scratch_ttl: float = DEFAULT_SCRATCH_TTL,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -455,6 +457,11 @@ class TensorFlightServer(flight.FlightServerBase):
             upload_ttl: Seconds before a PENDING upload with no writes is
                 discarded and a discarded one is unregistered
                 (``UploadManager.reap``); 0 disables the sweep.
+            scratch_ttl: Ceiling, in seconds, on how long a tensor uploaded to
+                the scratch source is kept -- applied to an upload that asked
+                for no lifetime as well, so a scrap heap cannot fill up by
+                omission. 0 lets uploads there live until someone discards
+                them.
             metadata_db: The catalog -- the browse surface behind the
                 ``catalog`` and ``roi`` flights. ``None`` builds a catalog-less
                 server: its sources are addressed by ``source_id`` and served,
@@ -543,6 +550,13 @@ class TensorFlightServer(flight.FlightServerBase):
         # single-store kinds, this takes the collections -- and folding the two
         # into one pass is what the member sweep will want.
         self.uploads.adopt_registered_sources()
+        # The scratch source, for a server that can be written to: one source
+        # at a fixed id, so an intermediate result has somewhere to go without
+        # a round trip first. Registered here rather than discovered, like
+        # everything under write_dir, and registered *before* mark_ready so it
+        # is never briefly missing from a server that is serving.
+        if writable:
+            self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
         # stopped in ``shutdown``.
         self.uploads.start_sweep()
