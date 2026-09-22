@@ -622,7 +622,7 @@ class TestAddTensorValidation:
     def _create(self, tmp_path, desc):
         """Accepting an order takes a source to add the tensor to."""
         manager = self._manager(tmp_path)
-        source = manager.register_source()
+        source = manager.install_scratch(None)
         desc.array_id = f"cache://{source}/@fields/{desc.array_id}"
         return manager.add_tensor(desc)
 

@@ -565,46 +565,6 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testRegisterSourceAnswersTheMintedId() throws Exception {
-        // The id is the server's: the client sends a name and gets back
-        // something it could not have derived from it.
-        try (TestServer server = new TestServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Assert.assertEquals("registered_abc123", client.registerSource("plate"));
-                Assert.assertEquals("plate", server.producer.lastRegisterSource.getName());
-            }
-        }
-    }
-
-    @Test
-    public void testRegisterSourceCarriesTheMetadataVerbatim() throws Exception {
-        // Opaque, as on addTensor: the client does not parse or re-encode
-        // the OME tree, so what the server stores is what the caller wrote.
-        String metadata = "{\"omero\":{\"channels\":[]}}";
-        try (TestServer server = new TestServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                client.registerSource("plate", metadata);
-                Assert.assertEquals(
-                        metadata, server.producer.lastRegisterSource.getMetadataJson());
-            }
-        }
-    }
-
-    @Test
-    public void testRegisterSourceSendsAnEmptyStringForNoMetadata() throws Exception {
-        // Both SDKs have to mean the same thing by omitting the block, and for
-        // a proto string field that is "", which the server reads as absent.
-        try (TestServer server = new TestServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                client.registerSource("");
-                Assert.assertEquals("", server.producer.lastRegisterSource.getName());
-                Assert.assertEquals(
-                        "", server.producer.lastRegisterSource.getMetadataJson());
-            }
-        }
-    }
-
-    @Test
     public void testSetUploadStatusSealsAndReportsTheStatus() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
@@ -748,8 +708,7 @@ public class TensorLifecycleTest {
 
         volatile java.util.Set<String> knownActions = new java.util.HashSet<>(Arrays.asList(
                 "add_source", "remove_source", "roi_prune", "add_tensor",
-                "register_source", "set_upload_status"));
-        volatile RegisterSource lastRegisterSource = null;
+                "set_upload_status"));
         volatile boolean addSourceSendsResult = true;
         volatile int addSourceHeartbeats = 2;
         volatile boolean observedCancel = false;
@@ -826,12 +785,6 @@ public class TensorLifecycleTest {
                         // store format and is not part of the tensor's id.
                         listener.onNext(new Result(lastCreate.toBuilder()
                                 .setArrayId(lastCreate.getArrayId().replaceFirst("^[a-z]+://", ""))
-                                .build().toByteArray()));
-                        break;
-                    case "register_source":
-                        lastRegisterSource = RegisterSource.parseFrom(action.getBody());
-                        listener.onNext(new Result(RegisterSourceResult.newBuilder()
-                                .setSourceId("registered_abc123")
                                 .build().toByteArray()));
                         break;
                     default: // "set_upload_status"

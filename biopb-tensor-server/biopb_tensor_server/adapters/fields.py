@@ -1,7 +1,7 @@
 """A tensor uploaded onto a source, whatever kind of source it is.
 
 This is the one upload layout. A *discovered* source is a file of the user's
-and the upload path may not write into it; a *registered* source holds no bytes
+and the upload path may not write into it; the *scratch* source holds no bytes
 at all. Neither has anywhere of its own to put a tensor, so a field keeps its
 bytes in a member directory under ``<write_dir>/fields/<source_id>/<name>/``,
 bound as a tensor of the source it was added to -- id
@@ -29,8 +29,11 @@ from typing import Any, Callable, Dict, Optional
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.adapters._writable import folded_match, unsafe_field_name
+from biopb_tensor_server.adapters.member_formats import (
+    create_member_at,
+    open_any_member,
+)
 from biopb_tensor_server.adapters.members import member_marker
-from biopb_tensor_server.adapters.registered import create_member_at, open_any_member
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
 from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.attached import attached_field, split_attached_field
@@ -50,9 +53,9 @@ logger = logging.getLogger(__name__)
 def fields_root(write_dir: Path) -> Path:
     """Where every source's uploaded fields live: ``<write_dir>/fields/``.
 
-    The one definition of the layout, as ``registered.sources_root`` and
-    ``labels.labels_root`` are for the containers and the sidecars: the attacher
-    reads it, the upload kind writes under it, and the boot sweep globs it.
+    The one definition of the layout, as ``labels.labels_root`` is for the
+    sidecars: the attacher reads it, the upload kind writes under it, and the
+    boot sweep globs it.
     """
     return Path(write_dir) / "fields"
 
@@ -75,9 +78,9 @@ def create_field_upload(
 
     *field* is the id's within-source half, ``@fields/<name>``, already split by
     the boundary. The store is a member directory in either format
-    (``registered.create_member_at``) under :func:`source_fields_dir`, never
-    inside the parent's own store -- a discovered source's bytes are the user's,
-    and a registered source has none.
+    (``member_formats.create_member_at``) under :func:`source_fields_dir`,
+    never inside the parent's own store -- a discovered source's bytes are the
+    user's, and the scratch source has none.
 
     Raises ``ValueError`` for a request the kind cannot serve -- a field that is
     not one of these, an unusable or marked name, a name already taken on this
@@ -147,7 +150,7 @@ def fields_attacher(fields_dir: Path) -> Callable[[str, Any], None]:
 
     Runs at the one registration chokepoint, because a field is keyed by
     ``source_id`` and no format knows about it -- the shape
-    ``labels.sidecar_attacher`` already has. This is also how a registered
+    ``labels.sidecar_attacher`` already has. This is also how the scratch
     source gets its tensors back at boot: it has no format to enumerate them,
     so adoption is this pass and nothing else. A field that will not open costs
     the field, never the source.

@@ -204,54 +204,6 @@ class TestATombstoneIsReclaimed:
         assert (client.get_tensor(new.array_id)[:2, :2].compute() == 2).all()
 
 
-class TestAnEmptySourceIsReclaimed:
-    """An abandoned ``register_source`` leaves nothing behind.
-
-    The source is on the same clock as the tensors it holds, measured from the
-    last time one arrived or left -- so a create nobody ever added to, and a
-    source whose last tensor was discarded and then reclaimed, go the same way.
-    """
-
-    def test_a_source_that_never_received_a_tensor_goes(
-        self, uploads, client, writable_server
-    ):
-        source = client.register_source()
-        store = writable_server.sources.get(source).store
-        assert store.is_dir()
-
-        assert uploads.reap(now=_past_ttl()) == (0, 1)
-
-        assert source not in writable_server.sources
-        assert not store.exists()
-        rows = writable_server.metadata_db.query("SELECT source_id FROM sources")
-        assert source not in rows.column(0).to_pylist()
-
-    def test_a_source_still_being_filled_is_never_taken(
-        self, uploads, client, writable_server, source
-    ):
-        """Pending counts as live: an upload in flight never has the source
-        pulled out from under it, however long the filling takes."""
-        _make(client, source)
-
-        assert uploads.reap(now=time.monotonic() + TTL / 2) == (0, 0)
-        assert source in writable_server.sources
-
-    def test_the_source_outlives_the_tombstone_it_still_holds(
-        self, uploads, client, writable_server, source
-    ):
-        """Two sweeps, never one: a discarded tensor is still reachable to
-        whoever is polling it, so its source has to outlive it."""
-        desc = _make(client, source)
-        uploads.discard(desc.array_id, "gone")
-
-        # The tombstone goes; the source is touched by losing it and stays.
-        assert uploads.reap(now=_past_ttl()) == (0, 1)
-        assert source in writable_server.sources
-
-        assert uploads.reap(now=_past_ttl(margin=2 * TTL)) == (0, 1)
-        assert source not in writable_server.sources
-
-
 class TestTheSweepThread:
     def test_the_server_starts_the_sweep(self, writable_server):
         assert writable_server.uploads._thread is not None

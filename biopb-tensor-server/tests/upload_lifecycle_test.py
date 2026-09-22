@@ -101,12 +101,22 @@ class TestOneFieldOneAdapter:
         with pytest.raises(flight.FlightServerError, match="advice.*another name"):
             _make(client, source, field="advice")
 
-    def test_the_same_field_on_two_sources_never_collides(self, client, source):
+    def test_the_same_field_on_two_sources_never_collides(
+        self, writable_server, client, source, tmp_path
+    ):
         """A field is taken on its own source, not server-wide: that is the
         whole point of adding to a source rather than minting one."""
-        other = client.register_source()
+        import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        store = tmp_path / "theirs.zarr"
+        zarr.create(store=zarr.DirectoryStore(str(store)), shape=(4, 4), dtype="uint16")
+        writable_server.register_source(
+            "theirs", ZarrAdapter(zarr.open_array(str(store), mode="r"), "theirs")
+        )
+
         first = _make(client, source, field="same")
-        second = _make(client, other, field="same")
+        second = _make(client, "theirs", field="same")
         assert first.array_id != second.array_id
 
 

@@ -863,40 +863,6 @@ class TensorFlightClient:
     # collaborator (see biopb.tensor._upload); #278 item C.
     # ====================
 
-    def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
-        """Mint an empty source on the server, and answer its ``source_id``.
-
-        A source is a container for tensors; this makes one, and ``add_tensor``
-        fills it. It is registered and readable the moment this returns, with
-        an empty tensor list -- which the catalog models the same way it models
-        a cloud source nobody has resolved yet.
-
-        Unlike an upload, a registered source has no state to move: it is not
-        PENDING, nothing publishes it, and it outlives the process because the
-        server re-registers it at startup rather than because anything
-        discovers it.
-
-        Args:
-            name: A directory component the server names the store after, and
-                what a later ``register_source`` collides with. Empty asks the
-                server to mint one. Compared case- and accent-insensitively,
-                because two such names are one directory on Windows and macOS.
-            metadata: The source's OME metadata block. Source-scoped: every
-                tensor added to it inherits the physical scale, units and
-                channel names from here.
-
-        Returns:
-            The ``source_id``, which is **minted by the server, not derived
-            from the name** -- so it survives the server's ``write_dir``
-            moving, and cannot be guessed from the name by a client that did
-            not create it.
-
-        Raises:
-            FlightServerError: the name cannot be a directory on some platform
-                this store may be served from, or is already taken.
-        """
-        return self._upload.register_source(name, metadata)
-
     def add_tensor(
         self,
         array_id: str,
@@ -910,13 +876,14 @@ class TensorFlightClient:
         """Declare a tensor to fill: the first half of an upload.
 
         Note:
-            Experimental. The upload / writable-source API (source
-            registration, tensor creation, chunk upload, and upload-status
-            polling) is experimental and may change.
+            Experimental. The upload API (tensor creation, chunk upload, and
+            upload-status polling) is experimental and may change.
 
-        **An upload adds a tensor to a source that already exists**, so
-        ``register_source`` comes first and this never creates one. Declare,
-        then fill: the returned descriptor is the server's echo --
+        **An upload adds a tensor to a source that already exists** and never
+        creates one. A result that belongs to no source of yours goes on the
+        server's scratch source, at the fixed id ``"scratch"`` -- every
+        writable server serves one, so there is nothing to ask for first.
+        Declare, then fill: the returned descriptor is the server's echo --
         ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
         and is what ``upload_array``, ``upload_chunk`` and
         ``set_upload_status`` take. ``set_upload_status`` is what publishes the
@@ -930,8 +897,8 @@ class TensorFlightClient:
             array_id: ``"<scheme>://<source_id>/@fields/<name>"``, where
                 *scheme* is the store format -- ``zarr`` for an OME-Zarr image
                 group, ``cache`` for the chunks as uploaded -- and *source_id*
-                is a source the server already serves, whether it was
-                discovered or answered by ``register_source``.
+                is a source the server already serves -- one the server
+                discovered, or ``"scratch"``.
 
                 The ``@fields`` segment is not optional. An uploaded tensor
                 keeps its own store beside its source, and the marked segment
@@ -956,23 +923,24 @@ class TensorFlightClient:
                 answers with it (``chunk_shape`` on the returned descriptor).
             dim_labels: Optional dimension labels
             ome_metadata: Ignored except for a label set's ``image-label``
-                block. Metadata is source-scoped and rides on
-                ``register_source``; a tensor inherits its source's.
+                block. Metadata is source-scoped: a tensor inherits its
+                source's, and the scratch source has none.
             ttl_seconds: How long to keep this tensor, in seconds. ``None``
                 asks for no deadline, which is what a source the server
-                discovered gives you. A source may **cap** the lifetime -- a
+                discovered gives you. A source may **cap** the lifetime -- the
                 scratch source caps every upload on it, an unset request
-                included -- so the answer's own ``ttl_seconds`` is the
-                lifetime actually granted, which may be shorter than this.
-                Past it the tensor is discarded as if you had discarded it.
+                included, because it is a temp store -- so the answer's own
+                ``ttl_seconds`` is the lifetime actually granted, which may be
+                shorter than this. Past it the tensor is discarded as if you
+                had discarded it.
 
         Returns:
             The new tensor's descriptor, under the ``array_id`` it keeps. Its
             ``ttl_seconds`` is the lifetime granted, absent for no deadline.
 
         Raises:
-            pyarrow.flight.FlightServerError: the source is not registered, the
-                field is taken, or the name cannot be a directory on some
+            pyarrow.flight.FlightServerError: the source is not served here,
+                the field is taken, or the name cannot be a directory on some
                 platform this store may be served from.
         """
         return self._upload.add_tensor(

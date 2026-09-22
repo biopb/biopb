@@ -2,7 +2,7 @@
 
 A member is one uploaded tensor's store, under ``<write_dir>/fields/``.
 There are two layouts -- an OME-Zarr
-image group (``adapters.registered.ZarrMember``) and a segment store
+image group (``adapters.member_formats.ZarrMember``) and a segment store
 (``adapters.cache_member.CacheMember``) -- and this is the vocabulary they
 share: the bookkeeping block, the upload marker, and how a directory is read
 back as one format or the other.

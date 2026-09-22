@@ -127,30 +127,6 @@ class SourceRegistry:
         logger.debug(f"Registered source: {source_id}")
         return adapter
 
-    def register_new(
-        self, source_id: str, adapter: SourceAdapter
-    ) -> Optional[SourceAdapter]:
-        """:meth:`register`, refused if *source_id* is already taken.
-
-        Returns the registered adapter, or ``None`` when the id is held -- by
-        anything, a live upload or a sealed one. Atomic, so two concurrent
-        creates of one name cannot both be told they own it. The caller still
-        owns *adapter* on a refusal and closes it.
-
-        Only ``register_source`` calls this rather than :meth:`register`
-        directly: a minted source id must not be able to displace one already
-        handed out, however unlikely the collision. Discovery and the reconciler still call
-        :meth:`register` (silent overwrite) because their source_id is
-        ``generate_source_id``'s hash of the resolved source URL -- a
-        collision there is definitionally the same source being re-registered
-        (a rescan, a content update at the same path), never a distinct
-        source claiming a name that is not its own.
-        """
-        with self._lock:
-            if source_id in self._sources:
-                return None
-            return self.register(source_id, adapter)
-
     def unregister(self, source_id: str) -> Optional[SourceAdapter]:
         """Remove a source and release its adapter's resources.
 

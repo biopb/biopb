@@ -25,6 +25,7 @@ from biopb_tensor_server.adapters.fields import (
     source_fields_dir,
 )
 from biopb_tensor_server.adapters.members import MEMBER_DESCRIPTOR
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.attached import attached_field
@@ -126,7 +127,7 @@ class TestItSurvivesARestart:
         first = self._server(tmp_path)
         try:
             client = TensorFlightClient(f"grpc://localhost:{first.port}")
-            source = client.register_source("keepme")
+            source = SCRATCH_SOURCE_ID
             desc = _add(client, source, "img")
             client.upload_array(desc, _arr(9))
             client.close()
@@ -154,7 +155,7 @@ class TestItSurvivesARestart:
         first = self._server(tmp_path)
         try:
             client = TensorFlightClient(f"grpc://localhost:{first.port}")
-            source = client.register_source("ids")
+            source = SCRATCH_SOURCE_ID
             desc = _add(client, source, "img")
             client.upload_array(desc, _arr())
             before = _chunk_id(_member(first, source, "img"), [0, 0], [2, 3])
@@ -176,7 +177,7 @@ class TestItSurvivesARestart:
         first = self._server(tmp_path)
         try:
             client = TensorFlightClient(f"grpc://localhost:{first.port}")
-            source = client.register_source("crashed")
+            source = SCRATCH_SOURCE_ID
             desc = _add(client, source, "half")
             client.upload_chunk(
                 desc, ChunkBounds(start=[0, 0], stop=[2, 3]), _arr(5, CHUNK)

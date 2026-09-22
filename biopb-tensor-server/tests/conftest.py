@@ -26,6 +26,7 @@ os.environ.setdefault("TERM", "dumb")
 
 import pytest
 from biopb.tensor.client import TensorFlightClient
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.fixtures import (
@@ -209,14 +210,21 @@ def client(writable_server):
 
 
 @pytest.fixture
-def source(client):
-    """A registered source to add tensors to; what every upload needs first.
+def source(writable_server):
+    """The source to add tensors to; what every upload needs first.
 
-    Nothing on the upload path creates a source, so
-    a test that uploads starts here and names its tensors
-    ``<scheme>://<this>/<field>``.
+    Nothing on the upload path creates one, so a test that uploads starts here
+    and names its tensors ``<scheme>://<this>/@fields/<name>``. It is the
+    server's scratch source, which is always there -- there is nothing to
+    create, and the id is the same every time.
+
+    Its lifetime cap is cleared, so an upload here gets no deadline unless the
+    test asks for one. A test that cares about the cap sets ``max_upload_ttl``
+    on the adapter itself (``upload_ttl_test``) or runs a server of its own
+    (``scratch_source_test``).
     """
-    return client.register_source()
+    writable_server.sources.get(SCRATCH_SOURCE_ID).max_upload_ttl = None
+    return SCRATCH_SOURCE_ID
 
 
 @pytest.fixture

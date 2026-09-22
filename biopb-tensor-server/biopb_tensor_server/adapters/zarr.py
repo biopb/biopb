@@ -121,18 +121,21 @@ def is_unfinished_upload(ctx: ClaimContext) -> bool:
 def is_upload_subsystem_store(ctx: ClaimContext) -> bool:
     """Whether the directory at *ctx* belongs to the upload subsystem.
 
-    A registered source is a ``.zarr`` group like any other, so nothing in its
-    shape stops a claim taking it -- and if it were taken, the same bytes would
-    reach the catalog twice: once under the id ``register_source`` minted, once
-    under a path hash of discovery's own. The rule that keeps them apart is
-    ``write_dir`` being outside every discovery root; this is the second line,
-    for a ``write_dir`` misplaced inside one (``write_dir_under_root`` warns).
+    An uploaded tensor's store is a ``.zarr`` group like any other, so nothing
+    in its shape stops a claim taking it -- and if it were taken, the same
+    bytes would reach the catalog twice: once as a tensor of the source it was
+    added to, once as a source of its own under a path hash of discovery's. The
+    rule that keeps them apart is ``write_dir`` being outside every discovery
+    root; this is the second line, for a ``write_dir`` misplaced inside one
+    (``write_dir_under_root`` warns).
 
-    Recognized by the ``biopb`` block the subsystem writes and nothing else
-    does (``adapters.registered.source_attrs``), so a user's own zarr group is
-    unaffected however it is laid out.
+    Keyed on the ``biopb`` block the subsystem writes and nothing else does
+    (``adapters.members.member_attrs``), so a user's own zarr group is
+    unaffected however it is laid out -- and on the block rather than on the
+    upload marker, because a member is the subsystem's for as long as it
+    exists, not only while it is filling.
     """
-    return "source" in _biopb_block(ctx)
+    return "member" in _biopb_block(ctx)
 
 
 def _biopb_block(ctx: ClaimContext) -> dict:

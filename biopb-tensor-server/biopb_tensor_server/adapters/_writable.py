@@ -36,7 +36,6 @@ import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
-from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -67,7 +66,7 @@ from biopb_tensor_server.core.errors import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -242,24 +241,6 @@ def folded_match(name: str, candidates: Iterable[str]) -> Optional[str]:
     """
     folded = fold_name(name)
     return next((c for c in candidates if fold_name(c) == folded), None)
-
-
-def taken_store_name(
-    directory: Path, name: str, suffix: str = ".zarr"
-) -> Optional[Path]:
-    """The store in *directory* that *name* would collide with, or None.
-
-    The on-disk half of :func:`folded_match`. An exclusive ``mkdir`` catches an
-    exact repeat by itself, and on a case-insensitive filesystem it catches the
-    folded ones too -- but not on ext4, where the store would then be one
-    directory of two on the next host to serve this ``write_dir``. So the fold
-    is checked here rather than left to the filesystem.
-    """
-    if not directory.is_dir():
-        return None
-    stems = {p.name[: -len(suffix)]: p for p in directory.glob(f"*{suffix}")}
-    hit = folded_match(name, stems)
-    return stems[hit] if hit is not None else None
 
 
 def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:

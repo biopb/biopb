@@ -44,11 +44,14 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   writes and opens it to reads in one move, so a chunk that was never
 #   uploaded reads as zeros. A refused write carries its state in
 #   ``extra_info``.
-#   Uploads add to a source rather than create one: ``register_source`` mints
-#   the source, ``add_tensor`` (was ``create_tensor``, was ``create_source``)
-#   adds ``<scheme>://<source_id>/@fields/<name>`` to it and refuses a name
-#   that exists, and DoPut carries a ``chunk_ticket`` from the tensor's own
-#   GetFlightInfo plan rather than bounds the client chose.
+#   Uploads add to a source rather than create one: ``add_tensor`` (was
+#   ``create_tensor``, was ``create_source``) adds
+#   ``<scheme>://<source_id>/@fields/<name>`` to a source that already exists
+#   and refuses a name that is taken, and DoPut carries a ``chunk_ticket``
+#   from the tensor's own GetFlightInfo plan rather than bounds the client
+#   chose. There is no ``register_source``: an intermediate result goes on the
+#   ``scratch`` source, which every writable server serves at that fixed id and
+#   which caps how long anything on it is kept.
 #   Every action takes full access, ``chunk_locate`` included.
 #   ``SerializedTensor`` is a serialized ``FlightInfo`` plus location and
 #   token; GetFlightInfo stamps the requested ``slice_hint`` on the

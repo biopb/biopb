@@ -1,17 +1,17 @@
 """An upload adds a tensor to a source that already exists (step 5).
 
-``register_source`` mints a container and nothing else; ``add_tensor`` puts
-``<scheme>://<source_id>/@fields/<name>`` on it. The scheme names the store
-format and nothing else, so the answered ``array_id`` carries none and the
-format is read back off the directory at the next registration.
+``add_tensor`` puts ``<scheme>://<source_id>/@fields/<name>`` on a source the
+server already serves -- for an intermediate result, the scratch source. The
+scheme names the store format and nothing else, so the answered ``array_id``
+carries none and the format is read back off the directory at the next
+registration.
 
 What that buys, and what is tested here: a finished upload survives a restart
 (the gap this whole design closes, biopb/biopb#1048), several tensors share one
-source's metadata and one catalog row, and a pending one is routable to its own
-writer without being visible to a reader.
+source's catalog row, and a pending one is routable to its own writer without
+being visible to a reader.
 """
 
-import json
 import threading
 
 import numpy as np
@@ -23,6 +23,7 @@ from biopb_tensor_server.adapters.fields import (
     fields_root,
     source_fields_dir,
 )
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import CacheConfig
@@ -108,19 +109,16 @@ class TestOneSourceManyTensors:
         )
         assert rows.count(source) == 1
 
-    def test_metadata_is_the_sources_and_every_tensor_inherits_it(
-        self, writable_server, client
+    def test_the_scratch_source_carries_no_metadata_to_inherit(
+        self, writable_server, client, source
     ):
-        """Source-scoped, as the design has it: the physical scale a reader
-        sees on a tensor is the one that rode in on ``register_source``."""
-        source = client.register_source(
-            "calibrated", {"omero": {"channels": [{"label": "dapi"}]}}
-        )
+        """Metadata is source-scoped, and a scrap heap describes no
+        acquisition: the tensors on it have nothing to do with each other. A
+        tensor that wants a physical scale is uploaded onto the source that
+        has one."""
         client.upload_array(_add(client, source, "img"), _arr())
 
-        assert writable_server.sources.get(source).get_metadata()["omero"] == {
-            "channels": [{"label": "dapi"}]
-        }
+        assert writable_server.sources.get(source).get_metadata() == {}
 
 
 class TestItSurvivesARestart:
@@ -143,7 +141,7 @@ class TestItSurvivesARestart:
         first = self._server(tmp_path)
         try:
             client = TensorFlightClient(f"grpc://localhost:{first.port}")
-            source = client.register_source("keepme")
+            source = SCRATCH_SOURCE_ID
             desc = _add(client, source, "img")
             client.upload_array(desc, _arr(9))
             client.close()
@@ -161,13 +159,13 @@ class TestItSurvivesARestart:
             second.shutdown()
             CacheManager.reset()
 
-    def test_the_source_id_survives_the_write_dir_moving(self, tmp_path):
-        """Recorded, not derived: a hash of the path would not survive this,
-        and the catalog row could then never be matched to its store."""
+    def test_the_tensors_survive_the_write_dir_moving(self, tmp_path):
+        """Nothing records an absolute path: a field is found under
+        ``<write_dir>/fields/<source_id>/``, and the source_id is fixed."""
         first = self._server(tmp_path)
         try:
             client = TensorFlightClient(f"grpc://localhost:{first.port}")
-            source = client.register_source("moving")
+            source = SCRATCH_SOURCE_ID
             client.upload_array(_add(client, source, "img"), _arr())
             client.close()
         finally:
@@ -188,23 +186,6 @@ class TestItSurvivesARestart:
         finally:
             second.shutdown()
             CacheManager.reset()
-
-    def test_a_store_recording_no_id_is_swept_rather_than_served(self, tmp_path):
-        """An id that cannot be read is an id the catalog row cannot be matched
-        to, so leaving it would accumulate bytes nothing can reach or name."""
-        from biopb_tensor_server.adapters.registered import (
-            scan_registered_sources,
-            sources_root,
-        )
-
-        root = sources_root(tmp_path)
-        store = root / "anonymous.zarr"
-        store.mkdir(parents=True)
-        (store / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
-        (store / ".zattrs").write_text(json.dumps({"multiscales": []}))
-
-        assert scan_registered_sources(root) == {}
-        assert not store.exists()
 
 
 class TestWhatItRefuses:
@@ -235,11 +216,9 @@ class TestWhatItRefuses:
                 chunk_shape=CHUNK,
             )
 
-    def test_a_source_that_is_not_registered(self, client):
-        with pytest.raises(
-            flight.FlightServerError, match="names no registered source"
-        ):
-            _add(client, "registered_nope", "img")
+    def test_a_source_that_is_not_served_here(self, client):
+        with pytest.raises(flight.FlightServerError, match="names no source"):
+            _add(client, "zarr_nope", "img")
 
     def test_a_bare_field_is_refused_on_a_discovered_source_too(
         self, writable_server, client, tmp_path
@@ -317,7 +296,7 @@ class TestTheStoreFollowsThePlan:
     ):
         """Its own, not its source's: publishing one member must not move a
         sibling's chunk ids, and a restart must not move either."""
-        from biopb_tensor_server.adapters.registered import read_member_version
+        from biopb_tensor_server.adapters.members import read_member_version
         from biopb_tensor_server.adapters.zarr import read_zattrs
 
         parent = writable_server.sources.get(source)

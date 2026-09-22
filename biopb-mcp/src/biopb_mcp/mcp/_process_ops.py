@@ -16,15 +16,15 @@ on both input and output:
   (the server pulls pixels from the tensor server directly, no kernel
   round-trip) -> result uploaded back to the tensor server -> new ``array_id``.
 
-An uploaded result is a tensor of a source registered for this connection
-(:func:`_result_source`), and it is kept: what used to be a volatile ``cache:``
-source a restart lost is now a persistent one the reclaim sweep collects only
-if nobody adds to it.
+An uploaded result is a tensor of the tensor server's scratch source, at the
+fixed id ``scratch``. It survives a restart -- what used to be a volatile
+``cache:`` source a restart lost -- and it is kept for as long as that server's
+scratch lifetime, which is what an intermediate result of a chain wants: long
+enough to chain from, not forever.
 """
 
 import logging
 import os
-import weakref
 from collections.abc import Callable
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
@@ -53,45 +53,15 @@ _NDIM_LABELS = {
 }
 
 
+#: The tensor server's scratch source, which every writable server serves at
+#: this fixed id. An upload adds a tensor to a source that already exists, and
+#: an op result belongs to no source of the user's, so this is where it goes.
+SCRATCH_SOURCE_ID = "scratch"
+
+
 def _infer_dim_labels(ndim: int) -> Optional[List[str]]:
     """Return biopb's default axis labels for *ndim*, or None if unsupported."""
     return _NDIM_LABELS.get(ndim)
-
-
-#: The source each connected tensor server's op results are added to, one per
-#: client. Keyed weakly so it goes when the connection does, and re-registered
-#: on the next call if it ever did.
-_RESULT_SOURCES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-
-#: What that source is called on disk. A display name only -- the id it is
-#: addressed by is the server's, minted and recorded, never derived from this.
-_RESULT_SOURCE_NAME = "agent-results"
-
-
-def _result_source(client) -> str:
-    """The registered source this session's op results are added to.
-
-    An upload adds a tensor to a source that already exists, so an op that
-    returns an ``array_id`` needs one to add to. One per connection rather than
-    one per result: a source is a container, and a result nobody keeps is
-    reclaimed with it (``upload_ttl``).
-
-    Results are **persistent**, which is the change -- they used to live in a
-    volatile ``cache:`` source that a restart lost. See
-    One registered source per tensor-server connection: a
-    per-session source the kernel discards on exit is the other shape, and this
-    is the one a user would keep.
-    """
-    source_id = _RESULT_SOURCES.get(client)
-    if source_id is None:
-        # A minted name: the fixed one is taken for as long as its directory
-        # exists, so a second session on the same server would be refused it.
-        source_id = client.register_source(
-            f"{_RESULT_SOURCE_NAME}-{os.urandom(4).hex()}"
-        )
-        _RESULT_SOURCES[client] = source_id
-        logger.info(f"op results go to {source_id}")
-    return source_id
 
 
 def _make_channel(url: str, options=None) -> grpc.Channel:
@@ -180,7 +150,7 @@ def _build_op(
                 result = da.from_array(result, chunks=result.shape)
             field = f"{_sanitize_name(op_name) or 'result'}-{os.urandom(4).hex()}"
             desc = client.add_tensor(
-                f"cache://{_result_source(client)}/@fields/{field}", result
+                f"cache://{SCRATCH_SOURCE_ID}/@fields/{field}", result
             )
             client.upload_array(desc, result)
             return desc.array_id

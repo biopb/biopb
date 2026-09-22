@@ -21,6 +21,7 @@ from biopb_tensor_server.adapters.fields import (
     source_fields_dir,
 )
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.adapters.zarr import ZarrAdapter, upload_state
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import catalog_tensors
@@ -418,12 +419,12 @@ class TestTheBootSweepDropsTheLegacyRow:
 class TestTheBootSweepRemovesAPendingMember:
     def test_a_crashed_member_is_removed_and_a_published_one_adopted(self, tmp_path):
         """The sweep removes what a crash left; the registration hook adopts
-        what it did not. A registered source's tensors are uploaded fields, so
+        what it did not. The scratch source's tensors are uploaded fields, so
         both halves are the ones every source already gets."""
         server = _restart_server(tmp_path)
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
-            source = client.register_source("coll")
+            source = SCRATCH_SOURCE_ID
             crashed = _create(client, source, "crashed")
             _put(client, crashed)
             done = _create(client, source, "done")
@@ -522,8 +523,8 @@ class TestTheMarker:
     def test_the_metadata_a_member_carries_is_its_own_ngff(
         self, writable_server, client, source
     ):
-        """A member declares shape, dtype, grid and axes and nothing else: the
-        OME block is source-scoped and rode in on ``register_source``."""
+        """A member declares shape, dtype, grid and axes and nothing else: an
+        OME block is source-scoped, and a member inherits its source's."""
         desc = _create(client, source)
         zattrs = json.loads((_store(writable_server, source) / ".zattrs").read_text())
         axes = zattrs["multiscales"][0]["axes"]
@@ -535,24 +536,22 @@ class TestDiscoveryDeclinesAPendingStore:
     def test_both_claims_decline_until_published(self, writable_server, client, source):
         """Two lines of defence, and this is the second: nothing under
         ``write_dir`` is discovered at all. If a ``write_dir`` were misplaced
-        inside a root, a collection is still a plain ``.zarr`` group and
-        nothing in its *shape* would stop a claim taking it -- so the claims
-        recognize the subsystem's own block and decline, published or not."""
+        inside a root, a member is still a plain ``.zarr`` group and nothing in
+        its *shape* would stop a claim taking it -- so the claims recognize the
+        subsystem's own block and decline, published or not."""
         desc = _create(client, source)
-        collection = writable_server.sources.get(source).store
         member = _store(writable_server, source)
 
-        for store in (collection, member):
-            ctx = ClaimContext(store)
-            assert OmeZarrAdapter.claim(ctx, DiscoveryState()) is None
-            assert ZarrAdapter.claim(ctx, DiscoveryState()) is None
+        ctx = ClaimContext(member)
+        assert OmeZarrAdapter.claim(ctx, DiscoveryState()) is None
+        assert ZarrAdapter.claim(ctx, DiscoveryState()) is None
 
         _put(client, desc)
         client.set_upload_status(desc, "READY")
 
-        # Publishing changes nothing here: the collection is the upload
-        # subsystem's for as long as it exists, not just while it is filling.
-        assert ZarrAdapter.claim(ClaimContext(collection), DiscoveryState()) is None
+        # Publishing changes nothing here: a member is the upload subsystem's
+        # for as long as it exists, not just while it is filling.
+        assert ZarrAdapter.claim(ClaimContext(member), DiscoveryState()) is None
 
     def test_a_users_own_zarr_group_is_unaffected(self, tmp_path):
         """The decline keys on the block the subsystem writes, so an ordinary

@@ -99,17 +99,16 @@ class TestWhereTheBytesGo:
             == before
         )
 
-    def test_a_registered_source_takes_the_same_layout(self, client, source, tmp_path):
-        """One kind of source, one layout. A registered source holds no bytes
-        either, so its tensors go where a discovered source's do."""
+    def test_the_scratch_source_takes_the_same_layout(self, client, source, tmp_path):
+        """One kind of source, one layout. The scratch source holds no bytes
+        either, so its tensors go where a discovered source's do -- and it has
+        no directory of its own for them to go into instead."""
         desc = _add(client, source, "raw")
         client.upload_array(desc, _arr())
 
         assert desc.array_id == f"{source}/@fields/raw"
         assert (fields_root(tmp_path) / source / "raw").is_dir()
-        # Its container holds identity and metadata, and no tensor.
-        container = next((tmp_path / "sources").iterdir())
-        assert [p.name for p in container.iterdir() if p.is_dir()] == []
+        assert not (tmp_path / "sources").exists()
 
     def test_a_bare_field_is_refused(self, client, source):
         """The upload path mints no native tensor id (``core.attached``)."""

@@ -28,6 +28,7 @@ from biopb_tensor_server.adapters.fields import (
     source_fields_dir,
 )
 from biopb_tensor_server.adapters.ome_zarr import minimal_ome_metadata
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.chunk import (
@@ -651,7 +652,7 @@ class TestAddTensor:
 
     def test_a_cache_tensor_is_attached_to_its_source(self, tmp_path):
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
 
         response = server.uploads.add_tensor(
             TensorDescriptor(
@@ -675,7 +676,7 @@ class TestAddTensor:
         reproduces, and this format stores *and* re-serves it verbatim.
         """
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
 
         response = server.uploads.add_tensor(
             TensorDescriptor(
@@ -702,7 +703,7 @@ class TestAddTensor:
         minimal NGFF drops the calibration, so echoing it here would advertise
         a vector a later read will not answer with."""
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
 
         response = server.uploads.add_tensor(
             TensorDescriptor(
@@ -721,7 +722,7 @@ class TestAddTensor:
 
     def test_a_zarr_tensor_mints_its_store_beside_its_source(self, tmp_path):
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
 
         server.uploads.add_tensor(
             TensorDescriptor(
@@ -733,11 +734,11 @@ class TestAddTensor:
             )
         )
 
+        # Beside its source, never inside one: a discovered source's bytes
+        # are the user's and the scratch source has none, so there is one
+        # layout and this is it.
         fields = source_fields_dir(fields_root(tmp_path), source)
         assert [d.name for d in fields.iterdir() if d.is_dir()] == ["my-zarr"]
-        # Not inside the container, which holds identity and metadata only.
-        container = server.sources.get(source).store
-        assert [d.name for d in container.iterdir() if d.is_dir()] == []
 
     def test_the_source_is_catalogued_and_the_tensor_shows_once_ready(self, tmp_path):
         """A member has no catalog row of its own -- it is a tensor of its
@@ -746,7 +747,7 @@ class TestAddTensor:
 
         db = MetadataDatabase()
         server = self._server(tmp_path, metadata_db=db)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
         assert _catalog_ids(db) == {source}
 
         desc = server.uploads.add_tensor(
@@ -768,9 +769,7 @@ class TestAddTensor:
 
     def test_an_unregistered_source_is_refused(self, tmp_path):
         server = self._server(tmp_path)
-        with pytest.raises(
-            flight.FlightServerError, match="names no registered source"
-        ):
+        with pytest.raises(flight.FlightServerError, match="names no source"):
             server.uploads.add_tensor(
                 TensorDescriptor(
                     array_id="cache://nobody/x",
@@ -796,7 +795,7 @@ class TestAddTensor:
 
     def test_an_unknown_scheme_is_refused(self, tmp_path):
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
         with pytest.raises(flight.FlightServerError, match="not a store format"):
             server.uploads.add_tensor(
                 TensorDescriptor(
@@ -811,7 +810,7 @@ class TestAddTensor:
         """Metadata is source-scoped, so a tensor carrying some is a request
         the server cannot honour -- said so, rather than silently ignored."""
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
         with pytest.raises(flight.FlightServerError, match="metadata is the source's"):
             server.uploads.add_tensor(
                 TensorDescriptor(
@@ -849,7 +848,9 @@ class TestAddTensor:
         server = TensorFlightServer(
             location="grpc://localhost:0", writable=False, write_dir=Path(tmp_path)
         )
-        source = server.uploads.register_source()
+        # A read-only server serves no scratch source -- nothing may be added
+        # to it over the wire -- so the in-process caller installs one.
+        source = server.uploads.install_scratch(None)
         assert server.uploads.add_tensor(
             TensorDescriptor(
                 array_id=f"cache://{source}/@fields/x",
@@ -873,7 +874,7 @@ class TestAddTensor:
 
         client = TensorFlightClient(f"grpc://127.0.0.1:{server.port}")
         try:
-            source = client.register_source()
+            source = SCRATCH_SOURCE_ID
             array_id = client.add_tensor(
                 f"cache://{source}/@fields/test-action",
                 np.empty((10, 10), np.uint8),
@@ -952,8 +953,9 @@ class TestDoPutErrorTranslation:
         """A rejected request must leave no partial store: an orphan would
         block a corrected retry under the same field (biopb/biopb#354)."""
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
-        collection = server.sources.get(source).store
+        source = SCRATCH_SOURCE_ID
+        collection = source_fields_dir(fields_root(tmp_path), source)
+        collection.mkdir(parents=True, exist_ok=True)
 
         bad = TensorDescriptor(
             array_id=f"zarr://{source}/@fields/retry",
@@ -980,24 +982,25 @@ class TestDoPutErrorTranslation:
             == f"{source}/@fields/retry"
         )
 
-    def test_malformed_source_metadata_surfaces_its_real_error(self, tmp_path):
-        """Metadata rides on ``register_source`` now, so that is where a
-        malformed block is refused."""
+    def test_malformed_label_metadata_surfaces_its_real_error(self, tmp_path):
+        """A label set's ``image-label`` block is the one metadata the upload
+        path still takes, so it is the one place a malformed block is
+        refused."""
         server = self._server(tmp_path)
         with pytest.raises(flight.FlightServerError, match="invalid metadata_json"):
-            server.uploads.register_source("", "{not valid json")
+            server.uploads._parse_metadata_json("{not valid json")
 
-    def test_non_object_source_metadata_surfaces_its_real_error(self, tmp_path):
+    def test_non_object_label_metadata_surfaces_its_real_error(self, tmp_path):
         """Well-formed JSON that is not an object is rejected: callers spread
         the result into a mapping, so a scalar or list must fail at the
         boundary rather than downstream (biopb/biopb#354)."""
         server = self._server(tmp_path)
         with pytest.raises(flight.FlightServerError, match="expected a JSON object"):
-            server.uploads.register_source("", "[1, 2, 3]")
+            server.uploads._parse_metadata_json("[1, 2, 3]")
 
     def test_a_valid_add_writes_its_resolved_descriptor(self, tmp_path):
         server = self._server(tmp_path)
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
         req_desc = TensorDescriptor(
             array_id=f"cache://{source}/@fields/ok",
             shape=[10, 10],
@@ -1040,7 +1043,7 @@ class TestChunkUpload:
             location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
         )
 
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
         server.uploads.add_tensor(
             TensorDescriptor(
                 array_id=f"cache://{source}/@fields/test",
@@ -1079,7 +1082,7 @@ class TestChunkUpload:
             location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
         )
 
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
         desc = server.uploads.add_tensor(
             TensorDescriptor(
                 array_id=f"cache://{source}/@fields/test-shape",
@@ -1177,7 +1180,7 @@ class TestChunkUpload:
         server = TensorFlightServer(
             location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
         )
-        source = server.uploads.register_source()
+        source = SCRATCH_SOURCE_ID
         server.uploads.add_tensor(
             TensorDescriptor(
                 array_id=f"cache://{source}/@fields/stale",
@@ -1218,7 +1221,7 @@ class TestZarrChunkAlignment:
                 write_dir=Path(tmpdir),
             )
 
-            source = server.uploads.register_source()
+            source = SCRATCH_SOURCE_ID
             server.uploads.add_tensor(
                 TensorDescriptor(
                     array_id=f"zarr://{source}/@fields/test",
@@ -1263,7 +1266,7 @@ class TestZarrChunkAlignment:
                 write_dir=Path(tmpdir),
             )
 
-            source = server.uploads.register_source()
+            source = SCRATCH_SOURCE_ID
             server.uploads.add_tensor(
                 TensorDescriptor(
                     array_id=f"zarr://{source}/@fields/test",
@@ -2000,7 +2003,7 @@ class TestDiscard:
 
 def _durable_upload(server):
     """A registered source with one published ``zarr://`` tensor on it."""
-    source_id = server.uploads.register_source()
+    source_id = SCRATCH_SOURCE_ID
     desc = server.uploads.add_tensor(
         TensorDescriptor(
             array_id=f"zarr://{source_id}/@fields/owned",

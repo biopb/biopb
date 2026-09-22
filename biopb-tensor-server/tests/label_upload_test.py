@@ -19,6 +19,7 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor._session import _parse_flight_endpoints
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, upload_state
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.chunk import content_version_of
@@ -146,7 +147,7 @@ class TestWhatTheKindRefuses:
     @pytest.mark.parametrize(
         "array_id,arr,why",
         [
-            ("nope/@labels/x", None, "names no registered source"),
+            ("nope/@labels/x", None, "names no source"),
             ("oz1/@labels/@ome", None, "are the server's own"),
             ("oz1/@labels/x", np.zeros(SHAPE, "float32"), "unsigned integer"),
             ("oz1/@labels/x", np.zeros((32, 32), "uint32"), "does not span"),
@@ -251,7 +252,7 @@ class TestTheSidecar:
         and an all-zero array would otherwise upload nothing at all."""
         sparse = np.zeros(SHAPE, "uint32")
         sparse[:8, :8] = 1
-        source = client.register_source()
+        source = SCRATCH_SOURCE_ID
         desc = client.add_tensor(
             f"cache://{source}/@fields/sparse", sparse, chunk_shape=CHUNK
         )

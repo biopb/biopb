@@ -66,8 +66,6 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
     PutCommand,
-    RegisterSource,
-    RegisterSourceResult,
     SetUploadStatus,
     TensorTicket,
 )
@@ -543,13 +541,6 @@ class TensorFlightServer(flight.FlightServerBase):
         # What a crashed server left half-written goes before anything can
         # register it: the caller's discovery scan runs after this returns.
         self.uploads.discard_unfinished_stores()
-        # ...and what it left *finished* comes back. Nothing discovers
-        # write_dir, so this pass is the only thing that re-registers a source
-        # the server minted in an earlier life (biopb/biopb#1048). Still a
-        # separate walk over a separate subtree -- the sweep takes the
-        # single-store kinds, this takes the collections -- and folding the two
-        # into one pass is what the member sweep will want.
-        self.uploads.adopt_registered_sources()
         # The scratch source, for a server that can be written to: one source
         # at a fixed id, so an intermediate result has somewhere to go without
         # a round trip first. Registered here rather than discovered, like
@@ -1093,10 +1084,6 @@ class TensorFlightServer(flight.FlightServerBase):
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType(
-                "register_source",
-                "Mint an empty source to add tensors to; answers its source_id",
-            ),
-            flight.ActionType(
                 "add_tensor",
                 "Add a tensor to a source that already exists; answers its descriptor",
             ),
@@ -1200,21 +1187,6 @@ class TensorFlightServer(flight.FlightServerBase):
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
             yield self.uploads.add_tensor(req_desc).SerializeToString()
-        elif action.type == "register_source":
-            self._authorize(context)
-            if not self._writable:
-                raise flight.FlightUnauthenticatedError("Server not in write mode")
-
-            # Every field is optional: an empty body asks for a source with a
-            # minted name and no metadata, which is the common case.
-            req = self._parse(
-                RegisterSource(),
-                action.body.to_pybytes(),
-                "register_source request",
-                allow_empty=True,
-            )
-            source_id = self.uploads.register_source(req.name, req.metadata_json)
-            yield RegisterSourceResult(source_id=source_id).SerializeToString()
         elif action.type == "set_upload_status":
             self._authorize(context)
             if not self._writable:

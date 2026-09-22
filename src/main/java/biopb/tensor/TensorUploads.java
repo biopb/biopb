@@ -50,10 +50,9 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
  *
  * <p><b>Experimental</b>, with the rest of the upload API.
  *
- * <p><b>An upload adds a tensor to a source that already exists.</b>
- * {@link #registerSource} mints one, {@link #addTensor} returns the server's
- * descriptor for the new tensor, and that descriptor is what every write
- * takes. The scheme on an {@code array_id} names the store format and nothing
+ * <p><b>An upload adds a tensor to a source that already exists</b> and
+ * creates none. {@link #addTensor} returns the server's descriptor for the new
+ * tensor, and that descriptor is what every write takes. The scheme on an {@code array_id} names the store format and nothing
  * else; the answered id carries none. The Java
  * twin of {@code biopb.tensor._upload}, minus its dask graph -- an imglib2
  * interval is walked on the calling thread, one chunk per planned endpoint,
@@ -80,7 +79,7 @@ final class TensorUploads {
     /**
      * Run a single-result {@code doAction} and hand back its body.
      *
-     * <p>The three upload actions all want the same four lines -- dispatch,
+     * <p>The upload actions all want the same four lines -- dispatch,
      * refuse an empty stream, take the one result -- and each spelled them
      * again, so a change to how an empty stream reads had three places to
      * reach. The proto parse stays at the call site, because only it knows
@@ -94,28 +93,6 @@ final class TensorUploads {
             throw new IllegalStateException(type + ": server returned no result");
         }
         return results.next().getBody();
-    }
-
-    /** Backs {@link TensorFlightClient#registerSource}; see that method. */
-    String registerSource(String name, String metadataJson) {
-        RegisterSource request = RegisterSource.newBuilder()
-                .setName(name == null ? "" : name)
-                // Opaque here: the server keeps the OME
-                // tree whole, so a malformed one is its refusal to give, with
-                // the message it gives every other create.
-                .setMetadataJson(metadataJson == null ? "" : metadataJson)
-                .build();
-
-        RegisterSourceResult answer;
-        try {
-            answer = RegisterSourceResult.parseFrom(
-                    actionOneResult("register_source", request.toByteArray()));
-        } catch (InvalidProtocolBufferException error) {
-            throw new IllegalStateException(
-                    "register_source: server returned no RegisterSourceResult", error);
-        }
-        LOGGER.info("registerSource: registered " + answer.getSourceId());
-        return answer.getSourceId();
     }
 
     /** Backs {@link TensorFlightClient#addTensor}; see that method. */
