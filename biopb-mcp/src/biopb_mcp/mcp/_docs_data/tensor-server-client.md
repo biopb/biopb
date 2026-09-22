@@ -116,11 +116,12 @@ The write side is [[upload]] — tensors, label sets and ROI annotations, and wh
 each refuses. The short form:
 
 ```python
-source = client.register_source("my_results")
-desc = client.add_tensor(f"zarr://{source}/my_result", arr)
+desc = client.add_tensor("zarr://scratch/@fields/my_result", arr)
 client.upload_array(desc, arr)
 ```
 
-An upload adds a tensor to a source that already exists, so `register_source`
-comes first — keep adding to the one it answered with. A field is taken while
-its tensor is served, so re-running a cell needs a new field name.
+An upload adds a tensor to a source that already exists and creates none, so a
+result of your own goes on `scratch` — the temp store every writable server
+serves at that fixed id. It is a temp store in earnest: what lands there has a
+deadline (`desc.ttl_seconds` is the one you got). A field is taken while its
+tensor is served, so re-running a cell needs a new field name.

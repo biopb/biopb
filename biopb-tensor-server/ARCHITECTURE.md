@@ -92,7 +92,7 @@ in three collaborators it composes:
 |---|---|---|
 | `server.sources` | `SourceRegistry` |  The `source_id → SourceAdapter` map and adapter-lifecycle |
 | `server.activity` | `ActivityTracker` |  In-flight activity tracking. Fed by every heavy read — `do_get`, `warm`, and `chunk_locate` |
-| `server.uploads` | `UploadManager` | The writable-server upload boundary. `register_source` mints a container under `write_dir`; `add_tensor` puts `<scheme>://<source_id>/@fields/<name>` on one — on any source, since a bare field is a native tensor id the upload path never mints — the scheme naming the store format (`zarr://` an OME-Zarr image group, `cache://` the chunk batches as uploaded in segments of their own) and nothing else. Nothing here creates a source, so the catalog row kept in step is always the parent's. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a tombstone its source still holds, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet, detaches aged tombstones, and takes a source left empty for that long. A store on disk is the server's own under `write_dir`, so discard removes it, and one still marked pending at startup is a crashed upload deleted before discovery runs — while a READY one is re-adopted, which is what makes a finished upload outlive the process |
+| `server.uploads` | `UploadManager` | The writable-server upload boundary. `add_tensor` puts `<scheme>://<source_id>/@fields/<name>` on a source that already exists — any source, since a bare field is a native tensor id the upload path never mints — the scheme naming the store format (`zarr://` an OME-Zarr image group, `cache://` the chunk batches as uploaded in segments of their own) and nothing else. **Nothing here creates a source**, so the catalog row kept in step is always the parent's; a result that belongs to no source of the user's goes on the scratch source (`adapters.scratch`, fixed id `scratch`), which this installs at startup on a writable server. Progress and discard live on the adapter (`adapters._writable.WritableSource`), so a discarded upload is a tombstone its source still holds, not a second record. Its `reap` sweep (`upload_ttl`) discards uploads that went quiet or ran past their `ttl_seconds` deadline, and detaches aged tombstones. A store on disk is the server's own under `write_dir`, so discard removes it, and one still marked pending — or past its deadline — at startup is deleted before discovery runs, while a live READY one is re-adopted, which is what makes a finished upload outlive the process |
 
 ### Flight protocol (v2)
 
@@ -117,7 +117,7 @@ token when one is configured; the private tiers require a source's capability
 token when the adapter carries one, else the server-wide token. A private
 source may still be catalogued -- the token gates reading, not knowing.
 
-Custom `do_action` verbs: `health` (reports `protocol`), `register_source`,
+Custom `do_action` verbs: `health` (reports `protocol`),
 `add_tensor`, `set_upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`,
 `add_source`, `remove_source` (below), and `roi_prune`.
 

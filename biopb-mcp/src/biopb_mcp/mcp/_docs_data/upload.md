@@ -12,7 +12,7 @@ Three kinds, and the choice matters more than the mechanics:
 
 | what you have | upload it as | shown by |
 |---|---|---|
-| an image, or any array | a **tensor** — `"<scheme>://<source_id>/<field>"` | `id=<array_id>` |
+| an image, or any array | a **tensor** — `"<scheme>://<source_id>/@fields/<name>"` | `id=<array_id>` |
 | a segmentation, mask or instance labelling | a **label set** — `"zarr://<image array_id>/@labels/<name>"` | `lb=<its array_id>` over the image |
 | points, boxes, polygons, scribbles | **ROI annotations** — `put_rois` | `rs=<set_name>` |
 
@@ -21,22 +21,32 @@ id is the image's own plus `/@labels/<name>`, so the two stay registered and one
 link shows both; the same labels uploaded as a tensor of your own are a separate
 image the user has to line up by eye.
 
-## Register, declare, then fill
+## Declare, then fill
 
-**An upload adds a tensor to a source that already exists.** Nothing on the
-upload path creates one, so a result needs a container first:
+**An upload adds a tensor to a source that already exists** and creates none.
+A result of your own belongs to no source the server discovered, so it goes on
+the **scratch source** — one per writable server, at the fixed id `scratch`,
+always there:
 
 ```python
-source = client.register_source("my_results")         # once per batch of results
-desc = client.add_tensor(f"zarr://{source}/my_result", arr)  # shape, dtype, grid from arr
+desc = client.add_tensor("zarr://scratch/@fields/my_result", arr)  # shape, dtype, grid from arr
 client.upload_array(desc, arr)                        # writes every chunk, seals it
-array_id = desc.array_id                              # "<source>/my_result"
+array_id = desc.array_id                              # "scratch/@fields/my_result"
 ```
 
-A source is a container and nothing else: it holds no bytes, it is readable
-(and empty) the moment `register_source` returns, and a `source_id` comes back
-**minted by the server**, not derived from the name you passed. Keep adding to
-one; one source per batch of related results is the shape to aim for.
+Nothing is registered first and nothing comes back to remember: `scratch` is
+the id, every time, on every writable server.
+
+**The scratch source is a temp store, and says so.** Every tensor on it gets a
+deadline — the server's cap (a day, typically) when you ask for nothing, or
+`ttl_seconds=` when you want less. `desc.ttl_seconds` on the answer is the
+lifetime you actually got. Past it the tensor is discarded as if you had
+discarded it. So scratch is for an intermediate result of a chain, not for the
+finished thing a user will come back to next week.
+
+**The `@fields/` segment is not optional.** A bare `"<source_id>/<name>"` is
+what a *format* calls its own tensors, so the upload path refuses it — that is
+what keeps your result's id from colliding with one of a file's own.
 
 `add_tensor` takes anything with `.shape` and `.dtype` as the template; a dask
 array also supplies the chunk grid, and `chunk_shape=` overrides it — which you
@@ -53,12 +63,14 @@ one to reach for when the result is written once and read hot. The answered
 `array_id` carries no scheme — the format is a property of the stored tensor,
 not of its name.
 
-**Metadata is the source's, not a tensor's.** Axis labels ride on `add_tensor`
-(`dim_labels=`), but the pixel size, units and channel names go to
-`register_source(name, metadata)` and every tensor added to it inherits them —
-a tensor that carries its own is refused rather than silently stripped. Copy
-them off the input's descriptor rather than writing them out; [[napari-viewer]]
-is this failure from the reading end, where an uncalibrated layer measures in
+**Metadata is the source's, not a tensor's.** Axis labels ride on
+`add_tensor` (`dim_labels=`), but the pixel size, units and channel names are
+the source's and a tensor inherits them — a tensor that carries its own is
+refused rather than silently stripped. The scratch source has none to give:
+the tensors on it have nothing to do with each other. So for anything whose
+scale matters, upload it onto the image's own source, or say so in the ROI or
+label set that refers back to the calibrated image. [[napari-viewer]] is this
+failure from the reading end, where an uncalibrated layer measures in
 pixels.
 
 **A field is taken while its tensor is served** — at any of the three states
@@ -105,8 +117,8 @@ including READY. It takes the server-minted store with it (a `zarr://` member's
 directory, a label set's sidecar) and takes the tensor out of its source's
 listing; the source itself stays, ready for the next one. Pass a `reason`: it is
 what a poller waiting on the result reads back. The field frees after the
-server's reclaim sweep, not immediately — and a source left empty for that long
-goes with it.
+server's reclaim sweep, not immediately, so a re-run under the same name has to
+wait for it either way.
 
 ## The round trip, for data too large to hold
 
@@ -117,8 +129,7 @@ result at once, so this works on data far larger than memory:
 arr = client.get_tensor("raw_data_id")   # lazy, nothing read yet
 mask = arr > 0.5                         # still lazy, still nothing read
 
-source = client.register_source("thresholds")
-desc = client.add_tensor(f"zarr://{source}/thresholded_v1", mask)
+desc = client.add_tensor("zarr://scratch/@fields/thresholded_v1", mask)
 client.upload_array(desc, mask)          # the eager step: chunk by chunk
 ```
 
@@ -131,9 +142,9 @@ desc = client.add_tensor(f"zarr://{image_id}/@labels/nuclei", labels)
 client.upload_array(desc, labels)
 ```
 
-A label set is the one form whose source may be an image the server
-**discovered** — it belongs to that image, which is already there, so it needs
-no `register_source` of its own.
+A label set names the image it belongs to rather than a source, so it lands
+beside an image the server **discovered** just as readily as beside one on
+scratch — and it inherits that image's axes and scale.
 
 A set is **unsigned-integer**, spans its image's non-channel axes at full
 length, and its all-zero chunks are skipped by `upload_array` — so a sparse mask

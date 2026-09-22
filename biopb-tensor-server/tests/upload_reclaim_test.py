@@ -1,18 +1,19 @@
 """Reclamation: a sweep over every upload by ``updated_at``, with one TTL for
-its three halves.
+its two halves.
 
 - a PENDING upload with no write for ``ttl`` seconds is **discarded** -- the job
   that owned it died -- with a reason, so a straggler's write is refused the
   way it would be after an explicit discard;
 - a tombstone that has stood for ``ttl`` seconds is **detached**: its status
-  reads UNKNOWN and its field is free again;
-- a registered source that has been **empty** for ``ttl`` seconds goes too,
-  which is what stops an abandoned ``register_source`` leaving a directory and
-  a catalog row nothing can reach.
+  reads UNKNOWN and its field is free again.
 
-Finished uploads are published results and are never reclaimed. A store on disk
-is swept like any other upload: it and the catalog listing were the server's
-own (biopb/biopb#1059), so a discard takes both with it.
+Idleness is PENDING's alone, which is what is tested here: past PENDING nothing
+is expected to make progress, so a published result is never reclaimed *for
+being quiet*. It is reclaimed for running past a deadline it was given, which
+is the other half of the sweep and is ``upload_ttl_test``'s.
+
+A store on disk is swept like any other upload: it and the catalog listing were
+the server's own (biopb/biopb#1059), so a discard takes both with it.
 """
 
 import time

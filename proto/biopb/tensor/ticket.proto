@@ -41,8 +41,8 @@ message ChunkBounds {
 }
 
 // FlightDescriptor.command bytes of a DoPut; what the stream carries is the
-// oneof arm. A tensor is added to a source by the `add_tensor` action, and a
-// source itself by `register_source`; DoPut creates neither.
+// oneof arm. A tensor is added to a source by the `add_tensor` action; DoPut
+// creates nothing, and nothing creates a source.
 message PutCommand {
   oneof command {
     // The stream is one pixel chunk (writable servers only). The bytes are a
@@ -70,11 +70,11 @@ message PutCommand {
 // object it was talking about.
 message SetUploadStatus {
   // What is being moved, as `add_tensor` answered with it:
-  // `<source_id>/<field>` for a member of a registered source, or a label
-  // set's `<image array_id>/labels/<name>`. An `array_id` rather than a
+  // `<source_id>/@fields/<name>` for an uploaded tensor, or a label set's
+  // `<image array_id>/@labels/<name>`. An `array_id` rather than a
   // `source_id` because what an upload tracks is always a *tensor* of a
-  // source, never the source itself -- `register_source` creates that, and
-  // takes no upload.
+  // source, never the source itself -- a source is discovered, or is the
+  // scratch source the server serves, and neither takes an upload.
   //
   // It alone names the attempt: a name is single-use for the life of the
   // server (`add_tensor` refuses a collision), so what it finds is what the
