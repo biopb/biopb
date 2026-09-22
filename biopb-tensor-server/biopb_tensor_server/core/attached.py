@@ -1,23 +1,19 @@
-"""The marked segment an attached tensor's id carries (docs/upload-model.md, Names).
+"""The marked segment an attached tensor's id carries.
 
 A tensor the *upload path* put on a source -- rather than one the source's own
 format produced -- is addressed under a segment marked with :data:`MARKER`::
 
-    <source_id>/@fields/<name>     a field on a source the server discovered
+    <source_id>/@fields/<name>       a field on a source the server discovered
     <image array_id>/@labels/<name>  a label set of one of its tensors
 
-Marking is what makes such an id unable to collide with a native one:
-``<source_id>/<field>`` is exactly the shape of a native tensor id, so an
-attached field named ``0`` or ``scene1`` would shadow a scene of the user's own
-file -- silently, since the attached tensors are listed after the format's own.
-``<source_id>/@fields/0`` cannot, and that is why neither segment needs a
-namespace rule of its own: a user's scene may plausibly be called ``fields``,
-and may not plausibly be called ``@fields``.
+The mark is what keeps such an id off a native one. ``<source_id>/<field>`` is
+exactly the shape of a native tensor id, so an attached field named ``0`` or
+``scene1`` would shadow a scene of the user's own file -- silently, since the
+attached tensors are listed after the format's own. ``<source_id>/@fields/0``
+cannot, so neither segment needs a namespace rule of its own.
 
-This module holds that grammar and the one gate that says whether an attached
-tensor may be *listed*. What a field *is* lives in
-:mod:`biopb_tensor_server.adapters.fields`; the label half of the grammar is
-:mod:`biopb_tensor_server.core.labels`.
+What a field *is* lives in :mod:`biopb_tensor_server.adapters.fields`; the label
+half of the grammar is :mod:`biopb_tensor_server.core.labels`.
 """
 
 from __future__ import annotations
@@ -71,16 +67,14 @@ def is_published(adapter: object) -> bool:
 
     An attached tensor is routable from the moment ``add_tensor`` mints it --
     that is what carries its own writes and its status polls -- and listed only
-    once it is readable. One gate rather than a second dict of the published
-    ones: the tensor's own upload record already answers the question.
+    once it is readable.
 
-    "No record" reads as published, because the only tensor without one was
-    adopted at boot -- its record died with the process that filled it, and only
-    a published store is adopted.
+    "No record" reads as published: the only tensor without one was adopted at
+    boot, and only a published store is adopted.
 
-    The upload is read by attribute, the way ``_writable.upload_of`` reads it
-    and for the same reason (the mixin's contract is duck-typed); spelled out
-    again here because ``core`` does not import ``adapters``.
+    The upload is read by attribute, like ``_writable.upload_of`` and for the
+    same reason; spelled out again because ``core`` does not import
+    ``adapters``.
     """
     progress = getattr(adapter, "upload", None)
     return progress is None or progress.is_readable

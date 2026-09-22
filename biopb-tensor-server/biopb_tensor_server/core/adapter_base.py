@@ -212,9 +212,9 @@ def catalog_tensors(adapter: Any) -> List[TensorDescriptor]:
     on it, and SQL reaches for ``tensors[1]`` -- and neither a label set
     (biopb/biopb#1059) nor an uploaded field may ever be that.
 
-    A registered source's members are its ``list_tensor_descriptors``, not
-    attached fields: a field's id carries ``@fields`` and a member's does not,
-    so nothing is listed twice.
+    A registered source's members come from its ``list_tensor_descriptors``,
+    not from ``attached_fields``: a member's id carries no marked segment, so
+    nothing is listed twice.
     """
     tensors = [catalog_entry(t) for t in adapter.list_tensor_descriptors()]
     attached = getattr(adapter, "attached_fields", None) or {}
@@ -559,20 +559,19 @@ class SourceAdapter(ABC):
         """
         return {}, None
 
-    # -- attached tensors (biopb/biopb#1059, docs/upload-model.md) -------------
+    # -- attached tensors (biopb/biopb#1059) -----------------------------------
     # A tensor of this source the format did not produce: a label set the server
     # minted for an upload, a field uploaded onto a source it discovered, a
     # member of a source it registered. Not chained through __init__ (adapters
     # set their own attributes), so the slots are class-level None,
     # materialized on use.
     #
-    # **One index, whatever the kind**, keyed by within-source field, holding
-    # every such tensor from ``add_tensor`` until the reclaim sweep detaches it.
+    # One index whatever the kind, keyed by within-source field, holding every
+    # such tensor from ``add_tensor`` until the reclaim sweep detaches it.
     # Whether one may be *listed* is its own upload record's answer
-    # (:func:`~biopb_tensor_server.core.attached.is_published`) rather than a
-    # second dict's: an upload in flight, and the tombstone of one that was
-    # discarded, stay routable here so that a status poll and a straggler's
-    # write both find their adapter.
+    # (:func:`~biopb_tensor_server.core.attached.is_published`), so an upload in
+    # flight and the tombstone of one that was discarded stay routable here: a
+    # status poll and a straggler's write both have to find their adapter.
     _attached_tensors: Optional[Dict[str, TensorAdapter]] = None
     # The sets the source's own file carries, kept apart because only these are
     # the file's: a native set cannot be detached, an attached one can.
@@ -642,9 +641,9 @@ class SourceAdapter(ABC):
 
         What a label set is checked against, and read once per check rather
         than per set -- ``list_tensor_descriptors`` re-derives on an HCS plate.
-        The uploaded fields are in it because a set may bind to one: an uploaded
-        field is a tensor of this source like any other, and what makes it
-        different is only where its bytes live.
+        The uploaded fields are in it because a set may bind to one: a field is
+        a tensor of this source like any other, and only its bytes live
+        elsewhere.
         """
         from biopb_tensor_server.core.normalize import _normalize_descriptor
 
@@ -725,9 +724,9 @@ class SourceAdapter(ABC):
         """Every tensor the upload path put on this source, keyed by field.
 
         The **routable** set -- published, still filling, or a tombstone --
-        handed out as it was attached rather than normalized, because an upload
-        refuses a non-canonical order at create and the boundary needs to reach
-        the writable adapter itself (``put_chunk``, ``set_status``).
+        handed out as attached rather than normalized, because an upload refuses
+        a non-canonical order at create and the boundary needs the writable
+        adapter itself (``put_chunk``, ``set_status``).
 
         What may be *read* is the checked views over this: :attr:`label_sets`
         and :attr:`attached_fields`.
@@ -748,9 +747,7 @@ class SourceAdapter(ABC):
         are next listed, not here: an unresolved source has no tensors to check
         a set against yet, and the upload kinds validate at create anyway.
 
-        Attaching is not listing: what a reader may see is the tensor's own
-        upload record's answer, so re-attaching a published one is how the
-        boundary says the listing changed (:meth:`attachment_changed`).
+        Attaching is not listing (:meth:`attachment_changed`).
         """
         self._attach("_attached_tensors", field, adapter)
 
@@ -766,7 +763,7 @@ class SourceAdapter(ABC):
 
         Attaching and detaching say so themselves; this is for the transition
         that changes what may be listed without touching the index -- an upload
-        reaching READY, or being discarded into a tombstone that stays routable.
+        reaching READY, or discarded into a tombstone that stays routable.
         """
         self._label_sets_view = None
 
@@ -814,9 +811,9 @@ class SourceAdapter(ABC):
         """The published fields uploaded onto this source, keyed by field.
 
         A tensor of this source whose bytes the upload path owns, under the
-        marked ``@fields`` segment that keeps its id off a native one
-        (``docs/upload-model.md``, Names). Listed after the format's own
-        (:func:`catalog_tensors`) and unchecked, unlike a label set: a field
+        marked segment that keeps its id off a native one
+        (:mod:`~biopb_tensor_server.core.attached`). Listed after the format's
+        own (:func:`catalog_tensors`) and unchecked, unlike a label set: a field
         binds to nothing, so there is nothing for it to fail to span.
         """
         return {
@@ -834,7 +831,7 @@ class SourceAdapter(ABC):
         while the format's own routing is untouched. An id under a marked
         segment that names nothing attached here is handed to the format anyway
         rather than refused: a proxy's upstream may serve it, and a format that
-        does not raises its own ``TensorNotFound``.
+        cannot raises its own ``TensorNotFound``.
         """
         attached = self._attached_for(self._within_source_field(tensor_id))
         if attached is not None:
@@ -846,8 +843,8 @@ class SourceAdapter(ABC):
 
         Only a **marked** field reaches one: a label set through its
         right-to-left parse, an uploaded field through the whole of its
-        ``@fields/<name>``. Everything else is the format's own routing, which
-        is what a registered source's members go through.
+        ``@fields/<name>``. Everything else -- a registered source's members
+        included -- is the format's own routing.
         """
         parsed = split_label_field(field)
         if parsed is not None:
@@ -2046,7 +2043,7 @@ _SOURCE_SCOPED_API = frozenset(
         "put_chunk",
         "close",
         "release_registration_cache",
-        # attached tensors (biopb/biopb#1059, docs/upload-model.md)
+        # attached tensors (biopb/biopb#1059)
         "get_embedded_labels",
         "label_sets",
         "label_uploads",

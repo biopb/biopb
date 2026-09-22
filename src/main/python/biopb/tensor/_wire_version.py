@@ -54,7 +54,7 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   token; GetFlightInfo stamps the requested ``slice_hint`` on the
 #   FlightInfo's ``app_metadata``.
 #
-# The upload surface is still settling (``docs/upload-model.md``), so it moves
+# The upload surface is still settling, so it moves
 # inside v2 rather than minting a version per revision: the SDKs and the server
 # ship from one repo and move together.
 FLIGHT_PROTOCOL_VERSION = 2

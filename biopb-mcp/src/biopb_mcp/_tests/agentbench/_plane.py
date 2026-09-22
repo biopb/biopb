@@ -30,23 +30,21 @@ plane outlives the sessions that come and go against it.
 **Isolated by construction, not by cleanup.** The plane must be writable — the
 skills' own steps upload results (`drift-correction` step 7, `stitch-tiles`
 step 7) — so an agent can create sources, and it can also *drop* one:
-`set_upload_status(..., DISCARDED)` is total and reaches a published tensor,
-which is how a fixture would go away mid-run. So isolation cannot come from
-cleaning up between sessions, and it cannot come from the data being
-undeletable either. It comes from the id:
+`set_upload_status(..., DISCARDED)` is total and reaches a published tensor. So
+isolation comes neither from cleaning up between sessions nor from the data
+being undeletable. It comes from the id:
 
     source_id = f"registered_{os.urandom(6).hex()}"    (adapters/registered.py)
 
-The id an agent sees is **unrelated to the name the harness uploaded under** --
-minted from the process's randomness and recorded in the store, never derived
-from anything. The adapter keeps the id and the url, so the name appears
-nowhere in a descriptor, a layer or the catalog, and a name stays taken for as
-long as its directory is on disk, so a second `register_source` under it is
+The id an agent sees is **unrelated to the name the harness uploaded under**:
+minted from the process's randomness and recorded in the store. The name
+appears nowhere in a descriptor, a layer or the catalog, and it stays taken for
+as long as its directory is on disk, so a second `register_source` under it is
 refused rather than replacing the fixture in place.
 
 That is an argument, so it is also checked: :meth:`TensorPlane.fingerprint`
 samples a corner of the served array, and `bench/_engine` compares it after
-every sample -- reading it as contaminated whether the bytes *changed* or the
+every sample -- reading it as contaminated whether the bytes changed or the
 tensor stopped being readable at all. A changed fingerprint does not fail a
 test — it flags the row, the same way `read-harness-internals` does, because
 `execute_code` is arbitrary Python and the layer's defence is that nothing can
@@ -138,13 +136,13 @@ class TensorPlane:
         """Put one fixture array on the plane and return its ``array_id``.
 
         Two calls, because an upload adds a tensor to a source that already
-        exists and creates none (``biopb-tensor-server/docs/upload-model.md``):
-        :meth:`register_source` mints the container, ``add_tensor`` puts one
-        ``cache://`` tensor in it, and ``upload_array`` fills and publishes it.
+        exists and creates none: ``register_source`` mints the container,
+        ``add_tensor`` puts one ``cache://`` tensor in it, and ``upload_array``
+        fills and publishes it.
 
-        *key* names it only within this run: the name actually sent is salted
-        with :attr:`secret`, and the id the server answers with is not derived
-        from it at all.
+        *key* names it only within this run: the name sent is salted with
+        :attr:`secret`, and the id the server answers with is not derived from
+        it.
 
         ``chunks`` is explicit rather than left to the uploader's default,
         because where laziness is the point the chunking *is* the thing under
@@ -197,13 +195,10 @@ def _write_plane_config(root: Path) -> Path:
     read nor written — the same discipline `_session._write_config` applies to
     the MCP config.
 
-    **`writable` and `write_dir` are nested under `server`, and the nesting is
-    the whole of it**: the loader reads them from ``data.get("server", {})``
-    (`core/config.py`), so a top-level spelling is silently ignored. It was
-    spelled that way here until the upload path grew a store to need
-    `write_dir` for, and nothing said so -- `--writable` was covering for the
-    other key from the command line. `test_the_plane_is_writable` now asserts
-    the nested shape for that reason.
+    **`writable` and `write_dir` are nested under `server`.** The loader reads
+    them from ``data.get("server", {})`` (`core/config.py`), so a top-level
+    spelling is silently ignored -- and `--writable` on the command line would
+    cover for one of them while `write_dir` had no effect at all.
     """
     (root / "cache").mkdir(parents=True, exist_ok=True)
     (root / "write").mkdir(parents=True, exist_ok=True)

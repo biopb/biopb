@@ -274,9 +274,7 @@ _WARM_POLL_SECONDS = 0.1
 def _upload_attacher(write_dir: Path):
     """The registry's ``on_register`` hook over every layout the upload path owns.
 
-    Fields first, so a source's own tensors are followed by what was uploaded
-    onto it and then by its label sets -- the order ``catalog_tensors`` lists
-    them in.
+    Fields before sets, the order ``catalog_tensors`` lists them in.
     """
     return upload_attacher(
         fields_attacher(fields_root(write_dir)),
@@ -499,10 +497,10 @@ class TensorFlightServer(flight.FlightServerBase):
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory())
         super().__init__(location, middleware=middleware, **kwargs)
-        # What the upload path put beside a source -- its fields under
-        # write_dir/fields/<source_id>/ and its label sidecars under
-        # write_dir/labels/<source_id>/ -- is attached to it at registration,
-        # which is the one chokepoint that sees every source (biopb/biopb#1059).
+        # What the upload path put beside a source -- fields under
+        # write_dir/fields/<source_id>/, label sidecars under
+        # write_dir/labels/<source_id>/ -- is attached at registration, the one
+        # chokepoint that sees every source (biopb/biopb#1059).
         self.sources = SourceRegistry(
             on_register=_upload_attacher(Path(write_dir))
             if write_dir is not None

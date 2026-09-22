@@ -212,7 +212,7 @@ def client(writable_server):
 def source(client):
     """A registered source to add tensors to; what every upload needs first.
 
-    Nothing on the upload path creates a source (``docs/upload-model.md``), so
+    Nothing on the upload path creates a source, so
     a test that uploads starts here and names its tensors
     ``<scheme>://<this>/<field>``.
     """

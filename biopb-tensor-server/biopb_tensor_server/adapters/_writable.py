@@ -89,7 +89,7 @@ class UploadStatus(str, Enum):
     Reopening a READY upload is not expressible today, and nothing here
     forecloses it: invalidation would be a fresh ``content_version`` token in
     the store, which every cache on both sides of the wire keys by. See
-    ``docs/upload-model.md``.
+    ``WritableSource``.
 
     One terminal state, not two: a job that dies has nothing to say that
     ``DISCARDED`` with a reason does not already say (biopb/biopb#1). A separate
@@ -125,7 +125,7 @@ def upload_grid(desc: TensorDescriptor) -> List[int]:
     A zarr adapter advertises ``default_transfer_chunk_shape`` as its transfer
     grid -- one store block per endpoint was measured as too many endpoints
     (biopb/biopb#684) -- and a write now lands on the grid the planner mints
-    (``docs/upload-model.md`` step 4). Minting the store on that same grid is
+    (the planner mints it). Minting the store on that same grid is
     what keeps them one thing: on disk, on the wire, for reads and for writes,
     and across a restart, where nothing remembers what the client asked for.
     The request's ``chunk_shape`` is the seed it is grown from, not the layout.
@@ -210,17 +210,11 @@ _WINDOWS_FORBIDDEN = '<>"|?*'
 #: parse holds wherever a field appears and a client cannot mint a segment that
 #: would be read as the server's.
 #:
-#: This replaced reserving the bare word ``labels``. Marking was first rejected
-#: as moving every stored ``array_id``; it does not, because the only tables
-#: keyed on one -- ``rois``, ``decode_rates`` -- have shipped in no stable
-#: release, and ``rois`` carries them forward on its migration ladder anyway.
-#: What marking buys is that an attached tensor's id can never collide with a
-#: native one: a scene of the user's own file may plausibly be called
-#: ``labels``, and may not plausibly be called ``@labels``. See
-#: ``docs/upload-model.md``, Names.
-#:
-#: A set *named* ``labels`` stays legal -- the parse is right-to-left, so
-#: ``<field>/@labels/labels`` is unambiguous.
+#: Marking the segment rather than reserving the bare word is what keeps an
+#: attached tensor's id off a native one: a scene of the user's own file may
+#: plausibly be called ``labels`` and may not plausibly be called ``@labels``.
+#: A set *named* ``labels`` therefore stays legal -- the parse is
+#: right-to-left, so ``<field>/@labels/labels`` is unambiguous.
 RESERVED_MARKER = MARKER
 
 
@@ -334,9 +328,9 @@ def unsafe_field_name(name: str) -> Optional[str]:
 
     A field is a path component of its source's group, so it takes the store
     rules with no extension of its own, plus the marker. Applied to every name a
-    client chooses for a tensor -- a member of a registered source
-    (``adapters.registered.create_member``), a field on a discovered one
-    (``adapters.fields.create_field_upload``) -- whatever format it asked for.
+    client chooses for a tensor, whatever format it asked for
+    (``adapters.registered.create_member``,
+    ``adapters.fields.create_field_upload``).
     """
     if name.startswith(RESERVED_MARKER):
         return (
@@ -637,7 +631,7 @@ class WritableSource:
             # Unreachable while the ladder has one climbable rung: the only
             # settable non-DISCARDED target is READY, and a source already
             # there returned above. Kept as the ladder's own guard -- it is
-            # what a second rung (a reopen, ``docs/upload-model.md``) would
+            # what a second rung (a reopen) would
             # need, and it is cheaper to leave than to rediscover.
             if _STATE_RANK[current] > _STATE_RANK[target]:
                 raise UploadTransitionError(

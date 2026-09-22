@@ -1,7 +1,7 @@
 """The ``cache://`` store format: a member whose chunks are kept as uploaded.
 
-``docs/upload-model.md`` step 7. A ``zarr://`` member decodes on every read; this
-one does not, because what was uploaded is what is served. Its directory is
+A ``zarr://`` member decodes on every read; this one does not, because what
+was uploaded is what is served. Its directory is
 
     <write_dir>/sources/<name>.zarr/<field>/
         descriptor.json     shape, dtype, grid, axes, the token, the marker
@@ -10,11 +10,9 @@ one does not, because what was uploaded is what is served. Its directory is
 
 The bytes are the tensor and not a cache of it: the segments sit under the
 member, outside ``max_total_bytes``, outside the eviction sweep and outside the
-retention classes. What is shared with the chunk cache is the format and the
-boot index (:mod:`~biopb_tensor_server.cache.segment_store`), which is why a
-``cache://`` member now survives the process that uploaded it -- before this it
-was the old volatile ``cache:`` source addressed as a tensor, and its chunks
-died with the cache entry they were in.
+retention classes, so a member outlives the process that uploaded it. What it
+shares with the chunk cache is the format and the boot index
+(:mod:`~biopb_tensor_server.cache.segment_store`), not a budget.
 
 **The index keys by bounds, never by chunk id.** A chunk id carries the
 server's serving-semantics epoch, which moves on an upgrade that changes what

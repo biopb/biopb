@@ -1,6 +1,6 @@
 """A ``cache://`` member keeps its own bytes (step 7).
 
-``docs/upload-model.md``: the format exists to skip the decode step -- what was
+The format exists to skip the decode step -- what was
 uploaded as a batch is served as that batch -- and, since this step, to do it
 from a store of its own under the member rather than from a chunk-cache entry
 that an eviction could take away.

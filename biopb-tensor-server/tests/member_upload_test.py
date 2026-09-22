@@ -1,6 +1,6 @@
 """An upload adds a tensor to a source that already exists (step 5).
 
-``docs/upload-model.md``: ``register_source`` mints a container and nothing
+``register_source`` mints a container and nothing
 else; ``add_tensor`` puts ``<scheme>://<source_id>/<field>`` in it. The scheme
 names the store format and nothing else, so the answered ``array_id`` carries
 none and the format is read back off the directory at the next registration.

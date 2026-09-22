@@ -226,10 +226,9 @@ class RegisterAdapter(SourceAdapter):
         is what routes its own writes, and it is enumerated only once READY
         (``core.attached.is_published``).
 
-        These are the collection's *own* tensors rather than tensors attached
-        to it, which is why they are listed here and not appended the way an
-        uploaded field is (``catalog_tensors``): a collection holds nothing
-        else, and a member's id carries no marked segment.
+        These are the collection's *own* tensors, which is why they are listed
+        here rather than appended the way an uploaded field is
+        (``catalog_tensors``): a collection holds nothing else.
         """
         return [
             member.get_tensor_descriptor()
@@ -266,9 +265,8 @@ class RegisterAdapter(SourceAdapter):
     def close(self) -> None:
         """Release every tensor attached to the collection, members and sets.
 
-        A collection holds nothing but what was attached to it, so closing it is
-        closing those -- the sidecar sets included, which a discovered source
-        leaves to whoever owns its file.
+        A collection holds nothing but what was attached to it, sidecar sets
+        included -- unlike a discovered source, whose file is not the server's.
         """
         attached = self._attached_tensors
         for tensor in (attached or {}).values():
@@ -291,12 +289,9 @@ class RegisterAdapter(SourceAdapter):
     def members(self) -> Dict[str, TensorAdapter]:
         """The collection's own tensors: what was attached under a bare field.
 
-        A view of the one attachment index (``SourceAdapter.attached_tensors``)
-        rather than a second dict of its own, so a member, a sidecar label set
-        and a field on a discovered source are located, published, unlisted and
-        reaped by the same code. The label sets attached to a member are the
-        rest of that index, and are told apart by the marked segment in their
-        field, never by which map they were put in.
+        A view of ``SourceAdapter.attached_tensors``: the label sets attached to
+        a member are the rest of that index, told apart by the marked segment in
+        their field.
         """
         return {
             field: tensor
@@ -429,9 +424,9 @@ def open_member(
         content_version=content_version,
     )
     # Minted by an earlier life of this server, under its own ``write_dir``, so
-    # it is still the server's to delete (``delete_store``) -- the same note
-    # ``sidecar_label_sets`` puts on a re-opened set. Without it the store hook
-    # has no path and a delete silently leaves the bytes behind.
+    # it is still the server's to delete -- the same note ``sidecar_label_sets``
+    # puts on a re-opened set. Without it ``delete_store`` has no path and
+    # silently leaves the bytes behind.
     member._upload_store_path = group
     return member
 
@@ -521,11 +516,10 @@ def create_member_at(
 ) -> TensorAdapter:
     """Mint a member directory at *store* in the format *scheme* names.
 
-    The one place a store format is chosen. What the name rules are and where
-    the directory goes belong to whoever owns the layout -- a member of a
-    registered source is :func:`create_member`, a field on a discovered one is
-    ``adapters.fields.create_field_upload`` -- and both land here, which is what
-    gives a field both store formats rather than zarr alone.
+    The one place a store format is chosen. The name rules and the directory
+    belong to whoever owns the layout -- :func:`create_member` for a member of a
+    registered source, ``adapters.fields.create_field_upload`` for a field on a
+    discovered one -- so both kinds get both formats.
     """
     if scheme == "cache":
         return create_cache_member(store, source_id, field, desc)

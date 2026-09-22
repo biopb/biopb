@@ -1,7 +1,7 @@
 """Arrow segments in a directory of their own: the chunk cache's format, no cache.
 
 An uploaded ``cache://`` member keeps the chunks exactly as they were uploaded
-(``docs/upload-model.md``, Store formats), and the format it keeps them in is
+and the format it keeps them in is
 the one the file cache already writes: one Arrow batch per chunk in
 ``seg_NNNN.arrow``, with a ``seg_NNNN.idx`` sidecar written at seal so the next
 life restores the index without faulting the bodies (biopb/biopb#300).

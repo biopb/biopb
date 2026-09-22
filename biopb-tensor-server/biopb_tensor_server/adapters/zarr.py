@@ -377,7 +377,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
 
         In practice exactly one: a store this server minted is chunked on the
         grid the planner mints on (``_writable.upload_grid``), and a write
-        takes a planned ticket (``docs/upload-model.md`` step 4). The check is
+        takes a planned ticket. The check is
         written as *whole chunks* rather than *one chunk* because that is the
         property that makes the write safe -- anything else is a
         read-modify-write of a chunk another write also touches, and zarr locks

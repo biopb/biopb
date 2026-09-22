@@ -474,7 +474,7 @@ class OmeZarrAdapter(ZarrAdapter):
         """The ``source_id`` the removed ``ome_zarr:`` kind gave the store at
         *zarr_path*.
 
-        Migration only. The kind is gone (``docs/upload-model.md``, step 5) and
+        Migration only. The ``ome_zarr:`` kind is gone and
         nothing mints these ids any more, but a persisted catalog still carries
         the rows its uploads wrote, and only this hash of the path can name
         them for ``UploadManager._drop_legacy_ome_zarr_stores`` to drop. Goes

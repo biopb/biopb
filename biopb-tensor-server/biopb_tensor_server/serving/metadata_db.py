@@ -117,17 +117,17 @@ def _mark_label_segment(array_id: str) -> str:
 
 
 def _migrate_rois_v1_to_v2(conn: duckdb.DuckDBPyConnection) -> None:
-    """Carry annotations onto the marked label segment (``docs/upload-model.md``).
+    """Carry annotations onto the marked label segment.
 
-    A set's wire id became ``<image>/@labels/<name>``, so every annotation
-    filed against the old form would otherwise anchor on a tensor id that is
-    never minted again -- the silent orphaning ``_require_bare_array_id``
-    exists to prevent, and the reason this table has a ladder at all rather
-    than being dropped like ``decode_rates``.
+    A set's wire id became ``<image>/@labels/<name>``, so an annotation filed
+    against the old form would otherwise anchor on a tensor id that is never
+    minted again -- the silent orphaning ``_require_bare_array_id`` exists to
+    prevent, and the reason this table has a ladder rather than being dropped
+    like ``decode_rates``.
 
-    Rewritten in Python rather than SQL because the segment to mark is the one
-    the v1 parser picked, and mirroring that beats a ``replace()`` that would
-    also hit a *set* named ``labels`` or an image field containing one.
+    In Python rather than SQL because the segment to mark is the one the v1
+    parser picked; a ``replace()`` would also hit a *set* named ``labels`` or
+    an image field containing one.
     """
     rows = conn.execute(
         "SELECT DISTINCT array_id FROM rois WHERE array_id LIKE '%labels/%'"

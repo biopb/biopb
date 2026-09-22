@@ -12,11 +12,10 @@ level.
 
 **The marker is on the wire id only; the NGFF group on disk stays ``labels/``**
 (``adapters.labels.native_label_sets`` opens it by that name, and never through
-this constant). Marking rather than reserving the bare word is what makes an
-attached tensor's id unable to collide with a native one -- a scene of the
-user's own file can plausibly be called ``labels``, and cannot plausibly be
-called ``@labels`` -- which is the same argument ``@ome`` is chosen by
-(``RESERVED_PREFIX``). See ``docs/upload-model.md``, Names.
+this constant). Marking the segment is what keeps an attached tensor's id off a
+native one -- a scene of the user's own file can plausibly be called ``labels``
+and cannot plausibly be called ``@labels`` -- the same argument ``@ome`` is
+chosen by (``RESERVED_PREFIX``).
 
 This module is pure: strings and shapes. What a set *is* lives in
 :mod:`biopb_tensor_server.adapters.labels`, and how a source answers for one in

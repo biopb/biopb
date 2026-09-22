@@ -1,7 +1,7 @@
 """What a member of a registered source carries, whatever format it is in.
 
 A member is one uploaded tensor under its source's directory
-(``docs/upload-model.md``, Store formats). There are two layouts -- an OME-Zarr
+There are two layouts -- an OME-Zarr
 image group (``adapters.registered.ZarrMember``) and a segment store
 (``adapters.cache_member.CacheMember``) -- and this is the vocabulary they
 share: the bookkeeping block, the upload marker, and how a directory is read

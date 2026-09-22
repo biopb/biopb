@@ -1,34 +1,22 @@
-"""A tensor uploaded onto a source the server discovered (docs/upload-model.md).
+"""A tensor uploaded onto a source the server discovered.
 
 A registered source is a container the upload path minted and may fill; a
 *discovered* source is a file of the user's, and the upload path may not write
 into it. So a field added to one keeps its bytes in a member directory of its
-own, under ``<write_dir>/fields/<source_id>/<name>/``, and is bound as a tensor
-of the source it was added to -- id ``<source_id>/@fields/<name>``.
+own, under ``<write_dir>/fields/<source_id>/<name>/``, bound as a tensor of the
+source it was added to -- id ``<source_id>/@fields/<name>`` (``core.attached``).
 
-**This is the label sidecar generalized, and the generalization is a
-subtraction.** A label set carries three things a plain field does not: a
-binding rule (it must name a tensor of the source and span it), a format's own
-embedded sets, and the axis mapping the server publishes for it. A field binds
-to nothing, is read from nothing, and maps to nothing -- so what is left is the
-shared half, which was already generic and only *named* for labels:
-``SourceAdapter.attach_tensor`` / ``detach_tensor``, the attached-tensor index,
-``resolve_tensor``'s fall-through, ``catalog_tensors``' append-after-natives,
-and attach-on-READY. This module adds the layout and the second
-``on_register`` attacher, and nothing else.
-
-**The marked segment is why no namespace rule is needed.**
-``<source_id>/<field>`` is exactly the shape of a native tensor id, so a field
-named ``0`` or ``scene1`` would shadow a scene of the user's own file --
-silently, since the attached tensors are listed after the format's own.
-``<source_id>/@fields/0`` cannot (``core.attached``).
+A field is a label sidecar without the label half: it binds to no image, is
+read from no format, and maps to no axes. So the shared machinery serves it
+unchanged -- ``SourceAdapter.attach_tensor``, ``resolve_tensor``,
+``catalog_tensors``, attach-on-READY -- and what is here is the layout and the
+``on_register`` attacher over it.
 
 **An orphaned field outlives its source.** A discovery root that goes away
 leaves ``<write_dir>/fields/<source_id>/`` behind with nothing to attach it to.
-A label sidecar has the same shape of problem and answers it by simply not
-attaching; a field is different in kind -- it is the only copy of data a user
-uploaded, where a set is usually derived -- so it is kept rather than swept, and
-a source that returns re-attaches it.
+A label sidecar answers that by simply not attaching; a field is the only copy
+of data a user uploaded, where a set is usually derived, so it is kept rather
+than swept and a source that returns re-attaches it.
 """
 
 from __future__ import annotations
@@ -85,8 +73,8 @@ def create_field_upload(
 
     *field* is the id's within-source half, ``@fields/<name>``, already split by
     the boundary. The store is a member directory in either format
-    (``registered.create_member_at``) under :func:`source_fields_dir`, rather
-    than inside the parent's own store: the parent's bytes are the user's.
+    (``registered.create_member_at``) under :func:`source_fields_dir`, never
+    inside the parent's own store: those bytes are the user's.
 
     Raises ``ValueError`` for a request the kind cannot serve -- a field that is
     not one of these, an unusable or marked name, a name already taken on this
@@ -129,7 +117,7 @@ def scan_source_fields(source_id: str, fields_dir: Path) -> Dict[str, TensorAdap
     both use. A field still PENDING is one a crash left behind: the boot sweep
     removes it, and this pass skips whatever the sweep has not reached rather
     than adopting a half-written tensor. The format is read off the directory,
-    which is what lets the scheme stay out of the stored ``array_id``.
+    which is what keeps the scheme out of the stored ``array_id``.
     """
     root = source_fields_dir(fields_dir, source_id)
     if not root.is_dir():
@@ -172,10 +160,9 @@ def upload_attacher(
 ) -> Callable[[str, Any], None]:
     """Several attachers as the one hook the registry takes.
 
-    What the upload path leaves beside a source is more than one layout, and a
-    failure in either is the registry's to log rather than the registration's to
-    fail (``SourceRegistry.register``) -- but one that escaped here would cost
-    the *other* attacher's tensors too, so each is caught on its own.
+    Each is caught on its own: a throw that escaped here would cost the *other*
+    attacher's tensors, and a failed attach costs its tensors rather than the
+    registration (``SourceRegistry.register``).
     """
 
     def attach(source_id: str, adapter: Any) -> None:

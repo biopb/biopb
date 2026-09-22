@@ -1,6 +1,6 @@
 """The write plan: one planner, one ticket, both transports (step 4).
 
-``docs/upload-model.md``: an upload no longer describes where its bytes go.
+An upload no longer describes where its bytes go.
 ``GetFlightInfo`` plans the tensor exactly as it does for a read -- answered
 while the upload is still PENDING, since planning is a metadata read -- and
 DoPut carries back one of the plan's tickets and the batch for that chunk.

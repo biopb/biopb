@@ -1,14 +1,12 @@
-"""A tensor uploaded onto a source the server discovered (step 8b).
+"""A tensor uploaded onto a source the server discovered.
 
-``docs/upload-model.md``, "Fields on a file source": a discovered source's bytes
-are the user's, so a field added to one lives beside it, under
-``<write_dir>/fields/<source_id>/<name>/``, and is bound as
+A discovered source's bytes are the user's, so a field added to one lives
+beside it, under ``<write_dir>/fields/<source_id>/<name>/``, bound as
 ``<source_id>/@fields/<name>``.
 
-What the marked segment buys is what most of this file is about: an uploaded
-field cannot shadow a scene of the user's own file, however it is named, so the
-kind needs no namespace rule of its own -- and `labels`, `0` and `scene1` are all
-ordinary field names again.
+Most of this file is about what the mark buys: an uploaded field cannot shadow
+a scene of the user's own file however it is named, so `labels`, `0` and
+`scene1` are all ordinary field names.
 """
 
 import json
@@ -77,8 +75,8 @@ class TestTheAnsweredId:
     def test_both_store_formats_round_trip_their_pixels(
         self, client, discovered, scheme
     ):
-        """Both, not zarr alone: a member directory is format-agnostic since
-        ``open_any_member``, so a field gets what a member gets."""
+        """A member directory is format-agnostic (``open_any_member``), so a
+        field gets both formats, not zarr alone."""
         desc = _add(client, discovered, f"px-{scheme}", scheme=scheme)
         client.upload_array(desc, _arr(7))
         np.testing.assert_array_equal(
@@ -109,7 +107,7 @@ class TestWhereTheBytesGo:
 
 
 class TestItCannotShadowTheFilesOwnTensors:
-    """The whole reason the segment is marked (``docs/upload-model.md``, Names)."""
+    """The whole reason the segment is marked (``core.attached``)."""
 
     def test_a_field_named_like_a_scene_is_its_own_tensor(
         self, writable_server, client, discovered
@@ -127,7 +125,7 @@ class TestItCannotShadowTheFilesOwnTensors:
         assert "theirs/@fields/0" in listed
 
     def test_labels_is_an_ordinary_field_name(self, client, discovered):
-        """Step 8a stopped reserving the word; nothing here takes it back."""
+        """The bare word is not reserved: only the marker is."""
         desc = _add(client, discovered, "labels")
         assert desc.array_id == "theirs/@fields/labels"
 
@@ -168,7 +166,7 @@ class TestListingAndReading:
 
     def test_a_label_set_binds_to_an_uploaded_field(self, client, discovered):
         """A field is a tensor of its source like any other, so a set may span
-        one -- which is what putting the fields in ``_normalized_tensors`` buys."""
+        one (``SourceAdapter._normalized_tensors`` reads the attached fields)."""
         desc = _add(client, discovered, "raw")
         client.upload_array(desc, _arr())
 
@@ -208,8 +206,8 @@ class TestWhatItRefuses:
 
 
 class TestAcrossARestart:
-    """The half that makes an uploaded field worth having: it outlives the
-    process that received it, and re-attaches to its source."""
+    """What makes an uploaded field worth having: it outlives the process that
+    received it, and re-attaches to its source."""
 
     def test_a_published_field_comes_back(self, writable_server, client, tmp_path):
         register_and_catalog(writable_server, "theirs", _their_file(tmp_path))

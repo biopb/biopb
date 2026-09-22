@@ -63,7 +63,7 @@ can never collide with a native one: `<source_id>/<field>` is exactly the shape
 of a native tensor id, so a field named `labels` -- or, once fields attach to a
 discovered source, one named `0` -- would otherwise shadow the file's own scene.
 A scene may plausibly be called `labels`; none is plausibly called `@labels`.
-See `docs/upload-model.md`, Names.
+See `core/attached.py`.
 
 **Reserved names.** A name starting with `@` is server-owned, in the same
 spirit as the `@ome` ROI set: `@labels/@ome` is the set rasterized from an

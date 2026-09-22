@@ -617,10 +617,9 @@ def contaminated(ids: Mapping[str, str]) -> tuple[str, ...]:
     Python — and a run that ran against different data than it reports is not a
     weak row, it is a wrong one.
 
-    Unreadable counts as contaminated. A published tensor can be *discarded*
-    (`set_upload_status`), which takes its store with it, so "the bytes
-    changed" and "the bytes are gone" are one flag and neither may raise out of
-    here into a failed run.
+    Unreadable counts as contaminated: a published tensor can be *discarded*
+    (`set_upload_status`), which takes its store with it, and neither that nor
+    a changed corner may raise out of here into a failed run.
     """
     plane = _plane.running_plane()
     if plane is None:

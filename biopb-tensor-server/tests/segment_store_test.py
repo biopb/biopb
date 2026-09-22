@@ -1,7 +1,7 @@
 """The segment store on its own: the chunk cache's format, without the cache.
 
 ``cache/segment_store`` is what an uploaded ``cache://`` member keeps its bytes
-in (``docs/upload-model.md`` step 7). The member's own behaviour is
+in. The member's own behaviour is
 ``cache_member_test``; here is the store: rotation, what a boot restores, and
 the byte range a locate publishes.
 """

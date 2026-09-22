@@ -100,7 +100,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
 
         Deterministic for a name, minted for an empty one. No longer reachable
         over the wire -- ``add_tensor`` adds a ``cache://`` tensor to a source
-        that already has an id (``docs/upload-model.md``, step 5) -- but still
+        that already has an id -- but still
         how an in-process caller names one it registers itself, which is what
         ``biopb-image-base``'s embedded cache does for a servicer's result.
         """

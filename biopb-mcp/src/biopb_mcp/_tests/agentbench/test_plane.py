@@ -47,12 +47,10 @@ def test_the_plane_is_writable(tmp_path):
     skill step that uploads a result (`drift-correction` step 7,
     `stitch-tiles` step 7) rather than measure it.
 
-    Asserted **under `server`**, which is where the loader reads it from
+    Asserted **under `server`**, where the loader reads it from
     (`core/config.py`, ``data.get("server", {})``). Spelled at the top level it
-    is ignored, and this test passed on it for as long as it was: it was
-    checking the harness's own dict, while `--writable` on the command line was
-    doing the work. `write_dir` had no flag to cover for it and so had no
-    effect at all.
+    is ignored, and a test that checked it there would be checking the
+    harness's own dict.
     """
     config = json.loads(_plane._write_plane_config(tmp_path).read_text())
     assert config["server"]["writable"] is True
@@ -142,10 +140,10 @@ def test_a_discarded_fixture_stops_being_readable(plane):
     """What the id *cannot* protect against, pinned so it stays visible.
 
     A published tensor can be discarded, which takes its store with it, so an
-    agent that has the id can make the fixture go away even though it cannot
-    name the source or swap the bytes. That is why `_engine.contaminated`
-    treats unreadable as contaminated rather than letting it raise: "the bytes
-    changed" and "the bytes are gone" are the same flag.
+    agent holding the id can make the fixture go away even though it cannot
+    name the source or swap the bytes. Hence `_engine.contaminated` treating
+    unreadable as contaminated: "the bytes changed" and "the bytes are gone"
+    are one flag.
     """
     import pyarrow.flight as flight
 

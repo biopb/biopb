@@ -306,7 +306,7 @@ class TestTheMarkerIsRefusedAsAField:
 
     This replaced reserving the bare word ``labels``, which is now an ordinary
     field name: marking is what makes an attached tensor's id unable to collide
-    with a native one (``docs/upload-model.md``, Names).
+    with a native one (``core.attached``).
     """
 
     def test_a_name_opening_with_the_marker_is_refused(self):
@@ -351,7 +351,7 @@ class TestTheMarkerIsRefusedAsAField:
 
 
 class TestTheBootSweepDropsTheLegacyRow:
-    """``ome_zarr:`` is gone (``docs/upload-model.md``, Migration), and its
+    """``ome_zarr:`` is gone, and its
     stores sit directly under ``write_dir`` where nothing can adopt them. A
     persisted catalog still carries the rows they wrote, and nothing else will
     drop them -- write_dir is outside every discovery root, so the reconciler

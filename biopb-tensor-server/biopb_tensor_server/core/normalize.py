@@ -336,8 +336,7 @@ class NormalizingAdapter(TensorAdapter):
     # resolve_* methods, inherited here, find them through these properties and
     # route everything else through the normalizing get_tensor_adapter /
     # get_level_adapter above and below. Declared rather than left to
-    # __getattr__ because the base declares them, so they resolve on the wrapper
-    # before __getattr__ ever runs.
+    # __getattr__, which the base's own declarations would shadow.
     @property
     def label_sets(self) -> Dict[str, TensorAdapter]:
         return self._inner.label_sets
