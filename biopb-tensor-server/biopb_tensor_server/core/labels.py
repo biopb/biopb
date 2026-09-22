@@ -1,14 +1,24 @@
 """The shape of a label tensor's name, and what it must span (biopb/biopb#1059).
 
-A label set is a tensor of its image, addressed by the NGFF layout::
+A label set is a tensor of its image, addressed under a **marked** segment::
 
-    <image array_id>/labels/<name>[/<level>]
+    <image array_id>/@labels/<name>[/<level>]
 
-so its within-source field is ``[<image field>/]labels/<name>``. ``name`` is
+so its within-source field is ``[<image field>/]@labels/<name>``. ``name`` is
 slash-free, which is what lets the field be split unambiguously: the **last**
-``labels`` segment that has a name after it is the one, whatever the image
+``@labels`` segment that has a name after it is the one, whatever the image
 field before it contains, and anything after the name is a native pyramid
-level. This module is pure: strings and shapes. What a set *is* lives in
+level.
+
+**The marker is on the wire id only; the NGFF group on disk stays ``labels/``**
+(``adapters.labels.native_label_sets`` opens it by that name, and never through
+this constant). Marking rather than reserving the bare word is what makes an
+attached tensor's id unable to collide with a native one -- a scene of the
+user's own file can plausibly be called ``labels``, and cannot plausibly be
+called ``@labels`` -- which is the same argument ``@ome`` is chosen by
+(``RESERVED_PREFIX``). See ``docs/upload-model.md``, Names.
+
+This module is pure: strings and shapes. What a set *is* lives in
 :mod:`biopb_tensor_server.adapters.labels`, and how a source answers for one in
 :class:`~biopb_tensor_server.core.adapter_base.SourceAdapter`.
 
@@ -33,13 +43,19 @@ __all__ = [
     "split_label_field",
 ]
 
-#: The path segment that marks a label set under its image.
-LABELS_SEGMENT = "labels"
+#: The segment that marks a label set under its image, in a **wire id**. The
+#: NGFF group on disk is ``labels/`` and is opened by that literal name: the two
+#: were one string until the marker, and nothing derives a path from this.
+LABELS_SEGMENT = "@labels"
 
 #: A name under this prefix is server-owned, in the spirit of the ``@ome`` ROI
-#: set: ``labels/@ome`` is the set rasterized from an OME-TIFF's masks, and a
+#: set: ``@labels/@ome`` is the set rasterized from an OME-TIFF's masks, and a
 #: native NGFF set keeps whatever name the file gave it. Clients read a
 #: reserved set; they never upload or delete one.
+#:
+#: The same prefix marks a *segment* (:data:`LABELS_SEGMENT`), which is why an
+#: uploaded field may not open with it (``_writable.unsafe_field_name``): one
+#: prefix, one meaning -- this name is the server's, not yours.
 RESERVED_PREFIX = "@"
 
 
@@ -70,9 +86,9 @@ def label_field(image_field: Optional[str], name: str) -> str:
 def split_label_field(field: Optional[str]) -> Optional[LabelField]:
     """Take a within-source field apart, or ``None`` if it names no label set.
 
-    ``"labels/nuclei"`` -> ``("", "nuclei", None)``;
-    ``"A/1/labels/nuclei/2"`` -> ``("A/1", "nuclei", "2")``. A trailing
-    ``labels`` with nothing after it is not a set.
+    ``"@labels/nuclei"`` -> ``("", "nuclei", None)``;
+    ``"A/1/@labels/nuclei/2"`` -> ``("A/1", "nuclei", "2")``. A trailing
+    ``@labels`` with nothing after it is not a set.
     """
     if not field:
         return None

@@ -99,7 +99,7 @@ class TestRasterizedMaskAdapter:
     def _adapter(self, masks, dim_labels=("Y", "X"), shape=(4, 4)):
         return RasterizedMaskAdapter(
             "src",
-            "Image:0/labels/@ome",
+            "Image:0/@labels/@ome",
             dim_labels=list(dim_labels),
             shape=list(shape),
             masks=masks,
@@ -212,7 +212,7 @@ class TestRasterizedMaskAdapter:
     def test_descriptor_and_metadata(self):
         adapter = self._adapter([])
         desc = adapter.get_tensor_descriptor()
-        assert desc.array_id == "src/Image:0/labels/@ome"
+        assert desc.array_id == "src/Image:0/@labels/@ome"
         assert desc.dtype == "<u4"
         assert list(desc.shape) == [4, 4]
         meta = adapter.get_tensor_metadata()
@@ -311,9 +311,9 @@ class TestFastMetadataRealBitmap:
         adapter = OmeTiffAdapter(path, "src1")
 
         sets = adapter.get_embedded_labels()
-        assert list(sets.keys()) == ["Image:0/labels/@ome"]
-        label_set = sets["Image:0/labels/@ome"]
-        assert label_set.array_id == "src1/Image:0/labels/@ome"
+        assert list(sets.keys()) == ["Image:0/@labels/@ome"]
+        label_set = sets["Image:0/@labels/@ome"]
+        assert label_set.array_id == "src1/Image:0/@labels/@ome"
         desc = label_set.get_tensor_descriptor()
         out = label_set.get_data(
             ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
@@ -322,7 +322,7 @@ class TestFastMetadataRealBitmap:
         assert out[tuple([0] * (out.ndim - 2) + [0, 0])] == 0
 
         # And through the base SourceAdapter machinery: extent must match.
-        assert "Image:0/labels/@ome" in adapter.label_sets
+        assert "Image:0/@labels/@ome" in adapter.label_sets
 
         adapter.release_registration_cache()
 
@@ -333,7 +333,7 @@ class TestFastMetadataRealBitmap:
         assert adapter._parsed_metadata_probed is False
         for scene in adapter._tensor_adapters.values():
             assert base64.b64encode(raw).decode("ascii") not in scene._reduced_ome_xml
-        cached_label_set = adapter.label_sets["Image:0/labels/@ome"]
+        cached_label_set = adapter.label_sets["Image:0/@labels/@ome"]
         assert (
             cached_label_set.get_data(
                 ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))

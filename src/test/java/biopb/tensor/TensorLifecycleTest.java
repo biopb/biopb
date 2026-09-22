@@ -197,10 +197,10 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 Assert.assertEquals(
-                        Arrays.asList("src_ab12/labels/@ome", "src_ab12/labels/nuclei"),
+                        Arrays.asList("src_ab12/@labels/@ome", "src_ab12/@labels/nuclei"),
                         client.labelSets("src_ab12"));
                 // The prefix is the image's own path, quoted for the SQL surface.
-                Assert.assertTrue(server.producer.lastSql.contains("'src_ab12/labels/'"));
+                Assert.assertTrue(server.producer.lastSql.contains("'src_ab12/@labels/'"));
             }
         }
     }
@@ -212,8 +212,8 @@ public class TensorLifecycleTest {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 Map<String, Object> status = client.setUploadStatus(
-                        "src_ab12/labels/nuclei", UploadStatus.State.DISCARDED, "replaced");
-                Assert.assertEquals("src_ab12/labels/nuclei",
+                        "src_ab12/@labels/nuclei", UploadStatus.State.DISCARDED, "replaced");
+                Assert.assertEquals("src_ab12/@labels/nuclei",
                         server.producer.lastSetStatus.getArrayId());
                 Assert.assertEquals("replaced", server.producer.lastSetStatus.getReason());
                 Assert.assertEquals("DISCARDED", status.get("state"));
@@ -479,8 +479,8 @@ public class TensorLifecycleTest {
                 RandomAccessibleInterval<UnsignedShortType> array =
                         ArrayImgs.unsignedShorts(values, 6, 4);
 
-                server.producer.plannedTensor = labelDescriptor("src_ab12/labels/nuclei");
-                client.uploadArray(labelDescriptor("src_ab12/labels/nuclei"), array);
+                server.producer.plannedTensor = labelDescriptor("src_ab12/@labels/nuclei");
+                client.uploadArray(labelDescriptor("src_ab12/@labels/nuclei"), array);
                 Assert.assertEquals(1, server.producer.chunks.size());
                 Assert.assertEquals(Arrays.asList(0L, 0L),
                         server.producer.chunks.get(0).bounds.getStartList());
@@ -916,8 +916,8 @@ public class TensorLifecycleTest {
             try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
                 root.allocateNew();
                 VarCharVector ids = (VarCharVector) root.getVector("array_id");
-                ids.setSafe(0, "src_ab12/labels/@ome".getBytes(StandardCharsets.UTF_8));
-                ids.setSafe(1, "src_ab12/labels/nuclei".getBytes(StandardCharsets.UTF_8));
+                ids.setSafe(0, "src_ab12/@labels/@ome".getBytes(StandardCharsets.UTF_8));
+                ids.setSafe(1, "src_ab12/@labels/nuclei".getBytes(StandardCharsets.UTF_8));
                 root.setRowCount(2);
                 listener.start(root);
                 listener.putNext();

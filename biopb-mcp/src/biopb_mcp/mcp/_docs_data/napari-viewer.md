@@ -174,12 +174,12 @@ and all, so read it with `viewer.tensor()` rather than `.data` whenever you did
 not add the array yourself.
 
 **A mask can live on the server.** A *label set* is a tensor of its image, named
-`<image array_id>/labels/<name>`, so a segmentation is not necessarily something
+`<image array_id>/@labels/<name>`, so a segmentation is not necessarily something
 a client made and holds:
 
 ```python
-client.label_sets("src0")            # -> ['src0/labels/@ome', 'src0/labels/nuclei']
-viewer.add_tensor("src0/labels/nuclei")   # a Labels layer, not an Image one
+client.label_sets("src0")            # -> ['src0/@labels/@ome', 'src0/@labels/nuclei']
+viewer.add_tensor("src0/@labels/nuclei")   # a Labels layer, not an Image one
 ```
 
 `add_tensor` reads the name and builds the right kind of layer, with the image's

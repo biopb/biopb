@@ -44,21 +44,32 @@ producer's.
 A label set is one integer tensor whose `array_id` is
 
 ```
-<image array_id>/labels/<name>
+<image array_id>/@labels/<name>
 ```
 
-`src_ab12/labels/nuclei` on a single-tensor source, `src_ab12/Image:0/labels/nuclei`
-or `src_ab12/A/1/labels/nuclei` on a multi-tensor one. This is the NGFF layout
-(`labels/<name>` under the image group), so an on-disk OME-Zarr set, an
-uploaded set and a rasterized OME-TIFF set all present identically, and the
-tensor identity policy already allows it (a field may contain `/`; HCS uses
-`well/field`). The parent image is recovered by splitting at the **last**
-`/labels/`; `name` is therefore non-empty and slash-free.
+`src_ab12/@labels/nuclei` on a single-tensor source, `src_ab12/Image:0/@labels/nuclei`
+or `src_ab12/A/1/@labels/nuclei` on a multi-tensor one. It mirrors the NGFF
+layout (`labels/<name>` under the image group) with the segment **marked**, so
+an on-disk OME-Zarr set, an uploaded set and a rasterized OME-TIFF set all
+present identically, and the tensor identity policy already allows it (a field
+may contain `/`; HCS uses `well/field`). The parent image is recovered by
+splitting at the **last** `/@labels/`; `name` is therefore non-empty and
+slash-free.
+
+**The marker is on the id, not on disk.** The group inside an OME-Zarr store is
+`labels/` and stays that way, because it is NGFF's and not ours; nothing derives
+one name from the other. What the marker buys is that an attached tensor's id
+can never collide with a native one: `<source_id>/<field>` is exactly the shape
+of a native tensor id, so a field named `labels` -- or, once fields attach to a
+discovered source, one named `0` -- would otherwise shadow the file's own scene.
+A scene may plausibly be called `labels`; none is plausibly called `@labels`.
+See `docs/upload-model.md`, Names.
 
 **Reserved names.** A name starting with `@` is server-owned, in the same
-spirit as the `@ome` ROI set: `labels/@ome` is the set rasterized from an
+spirit as the `@ome` ROI set: `@labels/@ome` is the set rasterized from an
 OME-TIFF's masks, and a native NGFF set keeps its on-disk name. Clients can read
-a reserved set and never create or delete one.
+a reserved set and never create or delete one. The same prefix marks the
+segment, so one rule reads both: `@` means *the server owns this name*.
 
 **Dtype.** Unsigned integer; `0` is background. The upload refuses anything
 else. `uint32` is the recommendation, `uint16` is fine for small counts.
@@ -176,7 +187,7 @@ ignorant of sidecars:
   DoPut boundary looks an upload up in and what the reclaim sweep walks.
 - `resolve_tensor(tensor_id)` and `resolve_chunk_adapter(field)` are the two
   lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
-  `.../labels/<name>[/<level>]` field answers from `label_sets`, everything
+  `.../@labels/<name>[/<level>]` field answers from `label_sets`, everything
   else delegates to the format. A label-shaped id the source has no set for is
   handed to the format anyway — a proxy's upstream may serve it.
 - `catalog_tensors` appends the sets after `list_tensor_descriptors`. A
@@ -186,7 +197,7 @@ ignorant of sidecars:
 A set's adapter is `LabelSetAdapter` (`adapters/labels.py`): `OmeZarrAdapter`
 opened on the label group, bound under the parent's `source_id` with the set's
 field as its tensor name, so its chunk ids and native levels ride under
-`<image>/labels/<name>` (a level's name and `content_version` compose from its
+`<image>/@labels/<name>` (a level's name and `content_version` compose from its
 adapter's, for images and sets alike).
 
 ## Reads
@@ -238,17 +249,17 @@ The step 7 SDK from biopb/biopb#1048 is reused as it stands, with no verb of
 its own:
 
 ```python
-desc = client.create_tensor("src_ab12/labels/nuclei", labels, chunk_shape=...)
+desc = client.create_tensor("src_ab12/@labels/nuclei", labels, chunk_shape=...)
 client.upload_array(desc, labels)        # skips all-zero chunks for this kind
 # Removing a set is discarding its upload, from whatever state it is in.
-client.set_upload_status("src_ab12/labels/nuclei", "DISCARDED", "replaced")
+client.set_upload_status("src_ab12/@labels/nuclei", "DISCARDED", "replaced")
 ```
 
 Server side this is a third upload kind, selected by the request `array_id`
-carrying no `cache:` / `ome_zarr:` prefix and a `/labels/` segment. Unlike the
+carrying no `cache:` / `ome_zarr:` prefix and a `/@labels/` segment. Unlike the
 other two, the request's `array_id` *is* the final one. The kind:
 
-- resolves the parent by splitting at the last `/labels/` and refuses if the
+- resolves the parent by splitting at the last `/@labels/` and refuses if the
   parent is absent, unresolved, or does not serve pixels;
 - refuses a non-unsigned-integer dtype, a reserved name, a name that would not
   stay inside the sidecar directory (`unsafe_store_name` — the name becomes a
@@ -344,7 +355,7 @@ is built from it, and the identity policy requires the catalog and
 
 ```sql
 SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t)
-WHERE t.array_id LIKE 'src_ab12/labels/%'
+WHERE t.array_id LIKE 'src_ab12/@labels/%'
 ```
 
 The typed signal rides in the descriptor `get_flight_info` returns: an NGFF

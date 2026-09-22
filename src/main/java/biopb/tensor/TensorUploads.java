@@ -385,7 +385,7 @@ final class TensorUploads {
      */
     static boolean isLabelSet(String arrayId) {
         return TensorFlightClient.sourceIdFromArrayId(arrayId).indexOf(':') < 0
-                && arrayId.contains("/labels/");
+                && arrayId.contains("/" + TensorFlightClient.LABELS_SEGMENT + "/");
     }
 
     /** The numpy dtype string an imglib2 type uploads as. */

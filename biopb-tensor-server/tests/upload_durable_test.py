@@ -299,18 +299,32 @@ class TestNamesCollideFolded:
         _create(client, source, "membrane")
 
 
-class TestLabelsIsReservedAsAField:
-    """``labels`` is the NGFF group name and the wire segment that addresses a
-    set, so a field of that name would make ``<array_id>/labels/<name>``
-    ambiguous. Reserved rather than marked with an ``@``, which would have
-    moved every stored ``array_id`` -- ``rois.array_id`` included.
+class TestTheMarkerIsRefusedAsAField:
+    """``@`` opens a segment the *server* owns in a wire id -- ``@labels`` for
+    a set. An uploaded field may not open with it, so one parse holds wherever
+    a field appears and a client cannot mint a segment read as the server's.
+
+    This replaced reserving the bare word ``labels``, which is now an ordinary
+    field name: marking is what makes an attached tensor's id unable to collide
+    with a native one (``docs/upload-model.md``, Names).
     """
 
-    def test_the_reserved_word_is_refused_whatever_its_case(self):
+    def test_a_name_opening_with_the_marker_is_refused(self):
         from biopb_tensor_server.adapters._writable import unsafe_field_name
 
-        for name in ["labels", "Labels", "LABELS"]:
-            assert "reserved" in (unsafe_field_name(name) or "")
+        for name in ["@labels", "@fields", "@ome", "@anything"]:
+            assert "server" in (unsafe_field_name(name) or "")
+
+    def test_labels_is_now_an_ordinary_field(self):
+        """The reservation is gone with the marker: a field called ``labels``
+        is addressable, and a set on it reads ``labels/@labels/<name>``."""
+        from biopb_tensor_server.adapters._writable import unsafe_field_name
+        from biopb_tensor_server.core.labels import split_label_field
+
+        assert unsafe_field_name("labels") is None
+        parsed = split_label_field("labels/@labels/nuclei")
+        assert parsed is not None
+        assert (parsed.image_field, parsed.name) == ("labels", "nuclei")
 
     def test_an_ordinary_field_is_accepted(self):
         from biopb_tensor_server.adapters._writable import unsafe_field_name
@@ -327,11 +341,11 @@ class TestLabelsIsReservedAsAField:
         assert unsafe_field_name(".hidden") is not None
 
     def test_a_set_named_labels_stays_legal(self):
-        """The parse is right-to-left, so ``<field>/labels/labels`` is
-        unambiguous -- only the *field* is reserved."""
+        """The parse is right-to-left, so ``@labels/labels`` is unambiguous --
+        the marker is on the segment, never on the name."""
         from biopb_tensor_server.core.labels import split_label_field
 
-        parsed = split_label_field("labels/labels")
+        parsed = split_label_field("@labels/labels")
         assert parsed is not None
         assert parsed.name == "labels"
 

@@ -13,11 +13,11 @@ Three kinds, and the choice matters more than the mechanics:
 | what you have | upload it as | shown by |
 |---|---|---|
 | an image, or any array | a **tensor** — `"<scheme>://<source_id>/<field>"` | `id=<array_id>` |
-| a segmentation, mask or instance labelling | a **label set** — `"zarr://<image array_id>/labels/<name>"` | `lb=<its array_id>` over the image |
+| a segmentation, mask or instance labelling | a **label set** — `"zarr://<image array_id>/@labels/<name>"` | `lb=<its array_id>` over the image |
 | points, boxes, polygons, scribbles | **ROI annotations** — `put_rois` | `rs=<set_name>` |
 
 **Prefer a label set to a plain tensor for anything derived from an image.** Its
-id is the image's own plus `/labels/<name>`, so the two stay registered and one
+id is the image's own plus `/@labels/<name>`, so the two stay registered and one
 link shows both; the same labels uploaded as a tensor of your own are a separate
 image the user has to line up by eye.
 
@@ -127,7 +127,7 @@ client.upload_array(desc, mask)          # the eager step: chunk by chunk
 Same two calls, a different name:
 
 ```python
-desc = client.add_tensor(f"zarr://{image_id}/labels/nuclei", labels)
+desc = client.add_tensor(f"zarr://{image_id}/@labels/nuclei", labels)
 client.upload_array(desc, labels)
 ```
 

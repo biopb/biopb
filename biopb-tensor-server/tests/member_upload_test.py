@@ -207,7 +207,7 @@ class TestWhatItRefuses:
     @pytest.mark.parametrize(
         "field,why",
         [
-            ("labels", "reserved"),
+            ("@labels", "server owns"),
             ("CON", "device name"),
             ("..", "cannot name a tensor"),
             (".hidden", "starts with"),
@@ -226,7 +226,7 @@ class TestWhatItRefuses:
         client.upload_array(_add(client, source, "img"), _arr())
         with pytest.raises(flight.FlightServerError, match="a label set is NGFF"):
             client.add_tensor(
-                f"cache://{source}/img/labels/nuclei",
+                f"cache://{source}/img/@labels/nuclei",
                 np.zeros(SHAPE, np.uint32),
                 chunk_shape=CHUNK,
             )
@@ -267,11 +267,11 @@ class TestALabelSetOnAMember:
         labels = np.zeros(SHAPE, np.uint32)
         labels[:2, :3] = 4
         desc = client.add_tensor(
-            f"zarr://{image.array_id}/labels/nuclei", labels, chunk_shape=CHUNK
+            f"zarr://{image.array_id}/@labels/nuclei", labels, chunk_shape=CHUNK
         )
         client.upload_array(desc, labels)
 
-        assert desc.array_id == f"{source}/img/labels/nuclei"
+        assert desc.array_id == f"{source}/img/@labels/nuclei"
         assert client.label_sets(image.array_id) == [desc.array_id]
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), labels
@@ -284,7 +284,7 @@ class TestALabelSetOnAMember:
 
         with pytest.raises(flight.FlightServerError):
             client.add_tensor(
-                f"zarr://{image.array_id}/labels/nuclei",
+                f"zarr://{image.array_id}/@labels/nuclei",
                 np.zeros(SHAPE, np.uint32),
                 chunk_shape=CHUNK,
             )

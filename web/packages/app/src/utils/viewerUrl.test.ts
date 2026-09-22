@@ -150,7 +150,7 @@ describe("encodeViewerState", () => {
       camera3d: { target: [12.5, 30, 7.2], zoom: -2.125, rotationX: 20, rotationOrbit: -45 },
       camera2d: null,
       visibleSets: ["default", "@ome"],
-      labelOverlay: `${TENSOR.array_id}/labels/nuclei`,
+      labelOverlay: `${TENSOR.array_id}/@labels/nuclei`,
       labelOpacity: 0.35,
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
@@ -287,7 +287,7 @@ describe("the annotation sets", () => {
 });
 
 describe("the label overlay", () => {
-  const SET = `${TENSOR.array_id}/labels/nuclei`;
+  const SET = `${TENSOR.array_id}/@labels/nuclei`;
 
   it("is absent when the link names no set", () => {
     expect(decode("").labelOverlay).toBeNull();

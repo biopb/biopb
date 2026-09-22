@@ -157,7 +157,7 @@ A source can also answer for **label sets** it did not produce (biopb/biopb#1059
 (`get_embedded_labels`, an OME-Zarr's NGFF `labels/` group) with what was
 attached to it (finished sidecars under `write_dir/labels/<source_id>/`, by a
 registration hook), each checked to span the image it binds to. The serve path resolves tensors through `resolve_tensor` /
-`resolve_chunk_adapter`, which try a `.../labels/<name>` field against the sets
+`resolve_chunk_adapter`, which try a `.../@labels/<name>` field against the sets
 before delegating to the format; `catalog_tensors` lists sets after the image
 tensors. See **[docs/label-tensors.md](docs/label-tensors.md)**.
 

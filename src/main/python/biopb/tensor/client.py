@@ -640,7 +640,7 @@ class TensorFlightClient:
         """The ``array_id``s of the label sets served under an image.
 
         A label set is an ordinary tensor of its image, named
-        ``<image array_id>/labels/<name>``, so this is a catalog query over
+        ``<image array_id>/@labels/<name>``, so this is a catalog query over
         the path and nothing more -- ``get_tensor`` / ``get_descriptor`` read
         one like any other tensor. A set's descriptor carries an NGFF
         ``image-label`` block in its ``metadata_json``, whose ``source.image``
@@ -930,7 +930,7 @@ class TensorFlightClient:
                 the store format -- ``zarr`` for an OME-Zarr image group,
                 ``cache`` for the chunks as uploaded -- and *source_id* is what
                 ``register_source`` answered. Or
-                ``"zarr://<image array_id>/labels/<name>"`` for a label set of
+                ``"zarr://<image array_id>/@labels/<name>"`` for a label set of
                 an image the server already serves, which is the one form whose
                 source may be a discovered file. A set is unsigned-integer,
                 spans its image's non-channel axes at full length, and its

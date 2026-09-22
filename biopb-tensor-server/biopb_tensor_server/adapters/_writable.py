@@ -202,16 +202,24 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 #: their own messages.
 _WINDOWS_FORBIDDEN = '<>"|?*'
 
-#: Field names an upload may not take. ``labels`` is both the NGFF group name
-#: and the wire segment that addresses a set, so a field called ``labels``
-#: makes ``<array_id>/labels/<name>`` ambiguous by construction (parsed by
-#: ``core.labels.split_label_field``). Reserved rather than marked with an
-#: ``@``: marking would move every stored ``array_id``, ``rois.array_id``
-#: included, and that is user data. See ``docs/upload-model.md``.
+#: The marker that opens a segment the *server* owns in a wire id: ``@labels``
+#: for a set (``core.labels.LABELS_SEGMENT``), and whatever a later attachment
+#: kind adds. An uploaded field may not open with it, so one parse holds
+#: wherever a field appears and a client cannot mint a segment that would be
+#: read as the server's.
+#:
+#: This replaced reserving the bare word ``labels``. Marking was first rejected
+#: as moving every stored ``array_id``; it does not, because the only tables
+#: keyed on one -- ``rois``, ``decode_rates`` -- have shipped in no stable
+#: release, and ``rois`` carries them forward on its migration ladder anyway.
+#: What marking buys is that an attached tensor's id can never collide with a
+#: native one: a scene of the user's own file may plausibly be called
+#: ``labels``, and may not plausibly be called ``@labels``. See
+#: ``docs/upload-model.md``, Names.
 #:
 #: A set *named* ``labels`` stays legal -- the parse is right-to-left, so
-#: ``<field>/labels/labels`` is unambiguous.
-RESERVED_FIELD_NAMES = frozenset({"labels"})
+#: ``<field>/@labels/labels`` is unambiguous.
+RESERVED_MARKER = "@"
 
 
 def fold_name(name: str) -> str:
@@ -264,7 +272,8 @@ def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     A format that puts its bytes on disk names the directory after what the
     client asked for -- a registered source becomes
     ``<write_dir>/sources/<name>.zarr``, its member becomes ``<that>/<field>``,
-    and a label set becomes ``<write_dir>/labels/<source_id>/<name>.zarr`` --
+    and a label set becomes ``<write_dir>/labels/<source_id>/<name>.zarr``
+    (that directory is named for what it holds, not for the wire segment) --
     so the name is untrusted input that turns into a path component, of a
     directory the server later creates and, on discard, deletes whole. It must
     therefore name one component *inside* the directory the server chose:
@@ -326,11 +335,10 @@ def unsafe_field_name(name: str) -> Optional[str]:
     ``adapters.registered.create_member`` to every field, whatever format it
     asked for.
     """
-    if fold_name(name) in RESERVED_FIELD_NAMES:
+    if name.startswith(RESERVED_MARKER):
         return (
-            "is reserved: a label set is addressed as "
-            "'<array_id>/labels/<name>', so a field of that name would be "
-            "unaddressable"
+            f"opens with {RESERVED_MARKER!r}, which marks a segment the server "
+            f"owns -- a label set is addressed as '<array_id>/@labels/<name>'"
         )
     return unsafe_store_name(name, suffix="")
 

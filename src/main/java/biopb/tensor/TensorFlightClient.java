@@ -95,6 +95,18 @@ public class TensorFlightClient implements AutoCloseable {
     private static final Logger LOGGER = Logger.getLogger(TensorFlightClient.class.getName());
     private static final String DEFAULT_REDUCTION_METHOD = "nearest";
 
+    /**
+     * The segment that marks a label set under its image, in a wire id:
+     * {@code <image array_id>/@labels/<name>}. Mirrors the Python SDK's
+     * {@code _labels.LABELS_SEGMENT} and the server's {@code core.labels}.
+     *
+     * <p>The marker is on the id only -- an OME-Zarr store's own NGFF group
+     * stays {@code labels/}. It is what stops an uploaded tensor's id from
+     * colliding with a native one, since a scene may plausibly be called
+     * {@code labels} and not {@code @labels}.
+     */
+    static final String LABELS_SEGMENT = "@labels";
+
     private final FlightSession session;
     private final BufferAllocator allocator;
     private final Location location;
@@ -755,7 +767,7 @@ public class TensorFlightClient implements AutoCloseable {
      * The {@code array_id}s of the label sets served under an image.
      *
      * <p>A label set is an ordinary tensor of its image, named
-     * {@code <image array_id>/labels/<name>}, so this is a catalog query over
+     * {@code <image array_id>/@labels/<name>}, so this is a catalog query over
      * the path and nothing more -- {@link #getTensor} / {@link #getDescriptor}
      * read one like any other tensor.
      *
@@ -766,7 +778,8 @@ public class TensorFlightClient implements AutoCloseable {
         List<String> sets = new ArrayList<>();
         try (VectorSchemaRoot root = querySources(
                 "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) WHERE starts_with(t.array_id, "
-                        + sqlLiteral(imageArrayId + "/labels/") + ") ORDER BY t.array_id")) {
+                        + sqlLiteral(imageArrayId + "/" + LABELS_SEGMENT + "/")
+                        + ") ORDER BY t.array_id")) {
             FieldVector ids = root.getVector("array_id");
             for (int row = 0; row < root.getRowCount(); row++) {
                 if (ids != null && !ids.isNull(row)) {
@@ -1318,7 +1331,7 @@ public class TensorFlightClient implements AutoCloseable {
      *        <i>scheme</i> is the store format -- {@code zarr} for an OME-Zarr
      *        image group, {@code cache} for the chunks as uploaded -- and
      *        <i>source_id</i> is what {@link #registerSource} answered. Or
-     *        {@code "zarr://<image array_id>/labels/<name>"} for a label set of
+     *        {@code "zarr://<image array_id>/@labels/<name>"} for a label set of
      *        an image the server already serves, which is the one form whose
      *        source may be a discovered file. A set is unsigned-integer, spans
      *        its image's non-channel axes at full length, and its all-zero

@@ -1,23 +1,28 @@
 /**
  * Where a label set's `array_id` says it belongs.
  *
- * A label set is an ordinary tensor of its image, addressed by the NGFF layout
- * `<image array_id>/labels/<name>` (biopb/biopb#1059). Nothing else in the wire
- * format marks one: the catalog has no `role` column, and a listing's per-tensor
- * entry carries no `metadata_json` to read the `image-label` block out of. The
- * path *is* the statement, so this module is the one place that reads it.
+ * A label set is an ordinary tensor of its image, addressed under a marked
+ * segment: `<image array_id>/@labels/<name>` (biopb/biopb#1059). Nothing else in
+ * the wire format marks one: the catalog has no `role` column, and a listing's
+ * per-tensor entry carries no `metadata_json` to read the `image-label` block
+ * out of. The path *is* the statement, so this module is the one place that
+ * reads it.
  *
  * Mirror of the server's `core/labels.py::split_label_field`, and deliberately
- * the same rule rather than a looser one: the **last** `labels` segment with a
+ * the same rule rather than a looser one: the **last** `@labels` segment with a
  * name after it is the one, whatever the image's own field contains, and a name
  * is slash-free, so anything past it is a native pyramid level.
+ *
+ * The marker is on the id, not on disk: an OME-Zarr store's own group stays
+ * `labels/`. It is what stops an uploaded tensor's id colliding with a native
+ * one, since a scene may plausibly be called `labels` and not `@labels`.
  */
 
 import { sliderAxes } from "./tensor-array.js";
 import type { TileInfo } from "./types.js";
 
-/** The path segment that marks a label set under its image. */
-export const LABELS_SEGMENT = "labels";
+/** The segment that marks a label set under its image, in a wire id. */
+export const LABELS_SEGMENT = "@labels";
 
 /**
  * A name under this prefix is the server's own -- the set rasterized from a
@@ -39,14 +44,14 @@ export interface LabelAddress {
 /**
  * Take a label set's `array_id` apart, or null when it names no set.
  *
- * `"src0/labels/nuclei"` -> image `"src0"`, name `"nuclei"`. Pass a *stable*
+ * `"src0/@labels/nuclei"` -> image `"src0"`, name `"nuclei"`. Pass a *stable*
  * id: a content-pinned `id@token` is not one, so split it with
  * {@link splitArrayVersion} first.
  */
 export function splitLabelArrayId(arrayId: string): LabelAddress | null {
   const parts = arrayId.split("/");
   // From 1: `parts[0]` is the source_id, which is slash-free and cannot be the
-  // `labels` segment of a field. A bare source called "labels" is a source.
+  // `@labels` segment of a field. A bare source called "@labels" is a source.
   for (let i = parts.length - 2; i >= 1; i--) {
     if (parts[i] !== LABELS_SEGMENT || !parts[i + 1]) continue;
     return {

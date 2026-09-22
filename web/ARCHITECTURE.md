@@ -120,7 +120,7 @@ model are in `README.md`; the architectural notes that aren't there:
   and the slice selection (`t`/`z`/`c`, `scaleFactors`, `reductionMethod`). Actions:
   `initClient` / `loadSources` / `selectSource` / `setSlice` / `clearSession`.
 - **Label overlays** (`labelLayers.ts`, `labelPalette.ts`, `useLabelOverlay.ts`).
-  A label set is an ordinary tensor at `<image array_id>/labels/<name>`, so the
+  A label set is an ordinary tensor at `<image array_id>/@labels/<name>`, so the
   path is the only thing that marks one — `splitLabelArrayId` is the single
   reading of that rule, and the tree groups sets under their image with it. How
   the set's axes line up with the image's is *read*, not derived: the server
