@@ -76,7 +76,7 @@ from biopb_tensor_server.core.errors import (
     UploadTransitionError,
     WriteNotSupportedError,
 )
-from biopb_tensor_server.core.labels import split_label_field
+from biopb_tensor_server.core.labels import LABELS_SEGMENT, split_label_field
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
@@ -101,9 +101,9 @@ DEFAULT_UPLOAD_TTL = 3600.0
 #: ``array_id``, which is also the id it keeps and is answered with.
 _ID_GRAMMAR = (
     "'<scheme>://<source_id>/<field>' to add a tensor to a registered source, "
-    "'<scheme>://<source_id>/@fields/<name>' to add one to a source the server "
-    "discovered, or 'zarr://<array_id>/@labels/<name>' to add a label set to "
-    "one of its tensors"
+    f"'<scheme>://<source_id>/{FIELDS_SEGMENT}/<name>' to add one to a source "
+    f"the server discovered, or 'zarr://<array_id>/{LABELS_SEGMENT}/<name>' to "
+    "add a label set to one of its tensors"
 )
 
 

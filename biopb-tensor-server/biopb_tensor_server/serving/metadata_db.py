@@ -75,6 +75,7 @@ from google.protobuf import json_format
 from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.errors import AnnotationStoreError
+from biopb_tensor_server.core.labels import last_named_segment
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -108,11 +109,11 @@ def _mark_label_segment(array_id: str) -> str:
     if not slash:
         return array_id
     parts = field.split("/")
-    for i in range(len(parts) - 2, -1, -1):
-        if parts[i] == "labels" and parts[i + 1]:
-            parts[i] = "@labels"
-            return head + "/" + "/".join(parts)
-    return array_id
+    i = last_named_segment(parts, "labels")
+    if i is None:
+        return array_id
+    parts[i] = "@labels"
+    return head + "/" + "/".join(parts)
 
 
 def _migrate_rois_v1_to_v2(conn: duckdb.DuckDBPyConnection) -> None:

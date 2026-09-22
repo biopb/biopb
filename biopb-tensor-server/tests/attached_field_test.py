@@ -51,6 +51,16 @@ def _add(client, source, name, scheme="zarr", arr=None, **kw):
     )
 
 
+def _serve(tmp_path):
+    """A fresh server on *tmp_path*'s ``write_dir`` -- a restart, in-process."""
+    server = catalog_server(
+        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+    )
+    server.mark_ready()
+    threading.Thread(target=server.serve, daemon=True).start()
+    return server
+
+
 @pytest.fixture
 def discovered(writable_server, tmp_path):
     """A source the server discovered, registered and catalogued."""
@@ -201,14 +211,6 @@ class TestAcrossARestart:
     """The half that makes an uploaded field worth having: it outlives the
     process that received it, and re-attaches to its source."""
 
-    def _serve(self, tmp_path):
-        server = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
-        )
-        server.mark_ready()
-        threading.Thread(target=server.serve, daemon=True).start()
-        return server
-
     def test_a_published_field_comes_back(self, writable_server, client, tmp_path):
         register_and_catalog(writable_server, "theirs", _their_file(tmp_path))
         desc = _add(client, "theirs", "raw")
@@ -216,7 +218,7 @@ class TestAcrossARestart:
         writable_server.shutdown()
         client.close()
 
-        second = self._serve(tmp_path)
+        second = _serve(tmp_path)
         try:
             register_and_catalog(second, "theirs", _their_file(tmp_path))
             again = TensorFlightClient(f"grpc://localhost:{second.port}")
@@ -237,7 +239,7 @@ class TestAcrossARestart:
         writable_server.shutdown()
         client.close()
 
-        second = self._serve(tmp_path)
+        second = _serve(tmp_path)
         try:
             assert not store.exists()
         finally:
@@ -253,7 +255,7 @@ class TestAcrossARestart:
         writable_server.shutdown()
         client.close()
 
-        second = self._serve(tmp_path)  # nothing registers "theirs" this time
+        second = _serve(tmp_path)  # nothing registers "theirs" this time
         try:
             assert (fields_root(tmp_path) / "theirs" / "raw").is_dir()
             assert "@fields/raw" in scan_source_fields("theirs", fields_root(tmp_path))
@@ -301,11 +303,7 @@ class TestDiscardAndDelete:
         writable_server.shutdown()
         client.close()
 
-        second = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
-        )
-        second.mark_ready()
-        threading.Thread(target=second.serve, daemon=True).start()
+        second = _serve(tmp_path)
         try:
             register_and_catalog(second, "theirs", _their_file(tmp_path))
             again = TensorFlightClient(f"grpc://localhost:{second.port}")

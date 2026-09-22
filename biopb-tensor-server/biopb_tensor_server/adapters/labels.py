@@ -70,6 +70,7 @@ from biopb_tensor_server.adapters.zarr import (
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.core.labels import (
+    LABELS_SEGMENT,
     RESERVED_PREFIX,
     join_fields,
     label_extent,
@@ -384,7 +385,7 @@ def create_label_upload(
     if parsed is None or parsed.level is not None:
         raise ValueError(
             f"{array_id!r} does not name a label set: an uploaded set is "
-            f"'<image array_id>/labels/<name>' with a slash-free name."
+            f"'<image array_id>/{LABELS_SEGMENT}/<name>' with a slash-free name."
         )
     if parsed.name.startswith(RESERVED_PREFIX):
         raise ValueError(
