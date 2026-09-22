@@ -151,9 +151,9 @@ FLAG_PEEKED = "read-harness-internals"
 #: A fixture array on the run's plane is no longer the bytes the harness put
 #: there. Like `read-harness-internals` this voids rather than qualifies the
 #: number — and it voids every *later* sample too, since the plane outlives the
-#: session. A fixture id is a one-way hash of a name the agent never sees, so
-#: reaching this needs deliberate effort; the flag exists so that effort cannot
-#: pass unnoticed.
+#: session. A fixture id is unrelated to the name the harness uploaded under,
+#: so reaching this needs deliberate effort; the flag exists so that effort
+#: cannot pass unnoticed.
 FLAG_CONTAMINATED = "fixture-overwritten"
 
 #: A missing session is worth telling apart from any other harness failure: it
@@ -609,13 +609,18 @@ def uploaded_ids(case: Case, fixture: Fixture) -> dict[str, str]:
 
 
 def contaminated(ids: Mapping[str, str]) -> tuple[str, ...]:
-    """Fixture arrays whose served bytes are no longer what was uploaded.
+    """Fixture arrays that are no longer the bytes the harness uploaded.
 
-    A fixture id is `sha256(a per-run secret name)[:12]` and the name is never
-    sent anywhere, so this should be unreachable. It is checked anyway, because
-    the alternative is trusting an argument about a surface that runs arbitrary
+    A fixture id is unrelated to the per-run secret name it was registered
+    under, so this should be unreachable. It is checked anyway, because the
+    alternative is trusting an argument about a surface that runs arbitrary
     Python — and a run that ran against different data than it reports is not a
     weak row, it is a wrong one.
+
+    Unreadable counts as contaminated. A published tensor can be *discarded*
+    (`set_upload_status`), which takes its store with it, so "the bytes
+    changed" and "the bytes are gone" are one flag and neither may raise out of
+    here into a failed run.
     """
     plane = _plane.running_plane()
     if plane is None:

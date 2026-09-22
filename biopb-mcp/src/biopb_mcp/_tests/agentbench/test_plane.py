@@ -8,15 +8,13 @@ developer's own catalog.
 
 The other half spawns a real server, so it is marked `bench` and never runs in
 CI. It is worth its seconds because it is the only place the isolation
-argument is *checked* rather than argued:
-
-    source_id = f"cache_{sha256(source_name)[:12]}"
-
-the id is a one-way hash of a name the harness never sends, so an agent holding
-the id cannot reach the fixture. `test_a_reupload_under_the_same_name_is_refused`
-checks the server's half: a name is single-use, so even the name would not let
-you swap the data out from under the id. The fingerprint check in
-`bench/_engine` stays as the mechanism that would notice if either ever gave.
+argument is *checked* rather than argued: the id the server answers with is
+minted from its own randomness and is unrelated to the name the harness
+uploaded under, which is never sent anywhere an agent can read.
+`test_a_reupload_under_the_same_name_is_refused` checks the server's half: a
+name is taken while its store is on disk, so even the name would not let you
+swap the data out from under the id. The fingerprint check in `bench/_engine`
+stays as the mechanism that would notice if either ever gave.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ def test_the_plane_gets_its_own_cache_and_write_directories(tmp_path):
     config = json.loads(_plane._write_plane_config(tmp_path).read_text())
 
     assert config["sources"] == [], "everything it serves arrives by upload"
-    for key in (config["cache"]["file_cache_dir"], config["write_dir"]):
+    for key in (config["cache"]["file_cache_dir"], config["server"]["write_dir"]):
         assert Path(key).is_dir(), f"{key} was declared but not created"
         assert Path(key).is_relative_to(tmp_path)
 
@@ -47,9 +45,18 @@ def test_the_plane_gets_its_own_cache_and_write_directories(tmp_path):
 def test_the_plane_is_writable(tmp_path):
     """The server defaults to read-only, and a read-only plane would fail every
     skill step that uploads a result (`drift-correction` step 7,
-    `stitch-tiles` step 7) rather than measure it."""
+    `stitch-tiles` step 7) rather than measure it.
+
+    Asserted **under `server`**, which is where the loader reads it from
+    (`core/config.py`, ``data.get("server", {})``). Spelled at the top level it
+    is ignored, and this test passed on it for as long as it was: it was
+    checking the harness's own dict, while `--writable` on the command line was
+    doing the work. `write_dir` had no flag to cover for it and so had no
+    effect at all.
+    """
     config = json.loads(_plane._write_plane_config(tmp_path).read_text())
-    assert config["writable"] is True
+    assert config["server"]["writable"] is True
+    assert config["server"]["write_dir"], "an upload needs somewhere to put a store"
 
 
 def test_a_machine_without_the_server_says_so_rather_than_failing(monkeypatch):
@@ -103,9 +110,9 @@ def test_the_chunking_the_case_asked_for_is_the_chunking_it_gets(plane):
 
 @pytest.mark.bench
 def test_an_agent_holding_the_id_cannot_name_the_source(plane):
-    """The isolation property, stated as what is *absent*: the id is
-    `sha256(name)[:12]`, and nothing the agent can see carries the name — not
-    the descriptor, not the source url, not the layer."""
+    """The isolation property, stated as what is *absent*: the id is minted
+    from the server's own randomness, and nothing the agent can see carries the
+    name — not the descriptor, not the source url, not the layer."""
     array_id = plane.upload("secretly-named", np.zeros((2, 2), np.float32))
     descriptor = plane.client.get_descriptor(array_id)
 
@@ -116,9 +123,9 @@ def test_an_agent_holding_the_id_cannot_name_the_source(plane):
 
 @pytest.mark.bench
 def test_a_reupload_under_the_same_name_is_refused(plane):
-    """The id is deterministic in the name, and the name is taken for the life
-    of the server: a second upload under it is refused rather than replacing
-    the fixture in place, and what the id serves is unchanged."""
+    """A name is taken for as long as its store is on disk: a second upload
+    under it is refused rather than replacing the fixture in place, and what
+    the id serves is unchanged."""
     import pyarrow.flight as flight
 
     original = np.zeros((4, 4), np.float32)
@@ -128,3 +135,24 @@ def test_a_reupload_under_the_same_name_is_refused(plane):
     with pytest.raises(flight.FlightServerError, match="already exists"):
         plane.upload("overwrite-me", np.ones((4, 4), np.float32))
     assert plane.fingerprint(array_id) == before
+
+
+@pytest.mark.bench
+def test_a_discarded_fixture_stops_being_readable(plane):
+    """What the id *cannot* protect against, pinned so it stays visible.
+
+    A published tensor can be discarded, which takes its store with it, so an
+    agent that has the id can make the fixture go away even though it cannot
+    name the source or swap the bytes. That is why `_engine.contaminated`
+    treats unreadable as contaminated rather than letting it raise: "the bytes
+    changed" and "the bytes are gone" are the same flag.
+    """
+    import pyarrow.flight as flight
+
+    array_id = plane.upload("droppable", np.zeros((4, 4), np.float32))
+    assert plane.fingerprint(array_id)
+
+    plane.client.set_upload_status(array_id, "DISCARDED")
+
+    with pytest.raises(flight.FlightError):
+        plane.fingerprint(array_id)
