@@ -398,10 +398,10 @@ class TestASidecarIsAttachedAtRegistration:
         late = open_label_set(
             group, source_id="oz1", image_field="", name="late", content_version=b"x"
         )
-        registered.attach_label_set("@labels/late", late)
+        registered.attach_tensor("@labels/late", late)
         assert registered.resolve_tensor("@labels/late").array_id == "oz1/@labels/late"
-        assert registered.detach_label_set("@labels/late") is not None
-        assert registered.detach_label_set("@labels/nuclei") is None  # the file's
+        assert registered.detach_tensor("@labels/late") is not None
+        assert registered.detach_tensor("@labels/nuclei") is None  # the file's
         with pytest.raises(TensorNotFound):
             registered.resolve_tensor("@labels/late")
 

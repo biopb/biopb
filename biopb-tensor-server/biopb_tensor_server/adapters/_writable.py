@@ -53,6 +53,7 @@ import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.core.attached import MARKER
 from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
     encode_chunk_id,
@@ -203,10 +204,11 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 _WINDOWS_FORBIDDEN = '<>"|?*'
 
 #: The marker that opens a segment the *server* owns in a wire id: ``@labels``
-#: for a set (``core.labels.LABELS_SEGMENT``), and whatever a later attachment
-#: kind adds. An uploaded field may not open with it, so one parse holds
-#: wherever a field appears and a client cannot mint a segment that would be
-#: read as the server's.
+#: for a set (``core.labels.LABELS_SEGMENT``), ``@fields`` for a field uploaded
+#: onto a discovered source (``core.attached.FIELDS_SEGMENT``), and whatever a
+#: later attachment kind adds. An uploaded field may not open with it, so one
+#: parse holds wherever a field appears and a client cannot mint a segment that
+#: would be read as the server's.
 #:
 #: This replaced reserving the bare word ``labels``. Marking was first rejected
 #: as moving every stored ``array_id``; it does not, because the only tables
@@ -219,7 +221,7 @@ _WINDOWS_FORBIDDEN = '<>"|?*'
 #:
 #: A set *named* ``labels`` stays legal -- the parse is right-to-left, so
 #: ``<field>/@labels/labels`` is unambiguous.
-RESERVED_MARKER = "@"
+RESERVED_MARKER = MARKER
 
 
 def fold_name(name: str) -> str:
@@ -331,14 +333,16 @@ def unsafe_field_name(name: str) -> Optional[str]:
     """Why *name* cannot be an uploaded tensor's field, or None if it can.
 
     A field is a path component of its source's group, so it takes the store
-    rules with no extension of its own, plus the reserved words. Applied by
-    ``adapters.registered.create_member`` to every field, whatever format it
-    asked for.
+    rules with no extension of its own, plus the marker. Applied to every name a
+    client chooses for a tensor -- a member of a registered source
+    (``adapters.registered.create_member``), a field on a discovered one
+    (``adapters.fields.create_field_upload``) -- whatever format it asked for.
     """
     if name.startswith(RESERVED_MARKER):
         return (
             f"opens with {RESERVED_MARKER!r}, which marks a segment the server "
-            f"owns -- a label set is addressed as '<array_id>/@labels/<name>'"
+            f"owns -- a label set is addressed as '<array_id>/@labels/<name>' "
+            f"and a field on a discovered source as '<source_id>/@fields/<name>'"
         )
     return unsafe_store_name(name, suffix="")
 

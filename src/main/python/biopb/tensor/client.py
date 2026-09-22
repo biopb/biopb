@@ -929,12 +929,19 @@ class TensorFlightClient:
             array_id: ``"<scheme>://<source_id>/<field>"``, where *scheme* is
                 the store format -- ``zarr`` for an OME-Zarr image group,
                 ``cache`` for the chunks as uploaded -- and *source_id* is what
-                ``register_source`` answered. Or
-                ``"zarr://<image array_id>/@labels/<name>"`` for a label set of
-                an image the server already serves, which is the one form whose
-                source may be a discovered file. A set is unsigned-integer,
-                spans its image's non-channel axes at full length, and its
-                all-zero chunks are skipped by ``upload_array``.
+                ``register_source`` answered.
+
+                The other two forms put a tensor on a source the server
+                **discovered**, whose own bytes are the user's, so each keeps
+                its own store beside that source and carries a marked segment
+                that cannot collide with one of the file's own tensors:
+                ``"<scheme>://<source_id>/@fields/<name>"`` for a plain field,
+                and ``"zarr://<image array_id>/@labels/<name>"`` for a label set
+                of an image the server already serves. A set is
+                unsigned-integer, spans its image's non-channel axes at full
+                length, and its all-zero chunks are skipped by
+                ``upload_array``.
+
                 The scheme names the store format and nothing else: the
                 answered ``array_id`` carries none.
             template: Anything with ``.shape`` and ``.dtype`` -- the array to be

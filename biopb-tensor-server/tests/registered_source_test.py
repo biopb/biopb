@@ -159,7 +159,7 @@ class TestTheSourceSurface:
     def test_a_member_is_listed_and_addressable(self, sources_dir):
         adapter = create_registered_source("plate", None, sources_dir)
         member = _FakeMember(f"{adapter.source_id}/img")
-        adapter.attach_member("img", member)
+        adapter.attach_tensor("img", member)
 
         assert [d.array_id for d in adapter.list_tensor_descriptors()] == [
             f"{adapter.source_id}/img"
@@ -173,13 +173,13 @@ class TestTheSourceSurface:
         from biopb_tensor_server.core.errors import TensorNotFound
 
         adapter = create_registered_source("plate", None, sources_dir)
-        adapter.attach_member("img", _FakeMember("x/img"))
+        adapter.attach_tensor("img", _FakeMember("x/img"))
         with pytest.raises(TensorNotFound, match="has no tensor"):
             adapter.get_tensor_adapter("nope")
 
     def test_a_field_collides_folded(self, sources_dir):
         adapter = create_registered_source("plate", None, sources_dir)
-        adapter.attach_member("Nuclei", _FakeMember("x/Nuclei"))
+        adapter.attach_tensor("Nuclei", _FakeMember("x/Nuclei"))
 
         assert adapter.taken_field("nuclei") == "Nuclei"
         assert adapter.taken_field("membrane") is None

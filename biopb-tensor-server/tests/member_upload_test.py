@@ -237,11 +237,12 @@ class TestWhatItRefuses:
         ):
             _add(client, "registered_nope", "img")
 
-    def test_a_discovered_source_takes_only_label_sets(
+    def test_a_discovered_source_takes_no_bare_field(
         self, writable_server, client, tmp_path
     ):
         """It is the user's data: the server mints stores under ``write_dir``
-        and nowhere else, so a plain tensor has nowhere to go."""
+        and nowhere else, so a tensor of a discovered source goes beside it,
+        under the marked segment -- which the refusal names."""
         import zarr
 
         store = tmp_path / "theirs.zarr"
@@ -252,7 +253,7 @@ class TestWhatItRefuses:
         writable_server.register_source("theirs", adapter)
 
         with pytest.raises(
-            flight.FlightServerError, match="takes no tensors of its own"
+            flight.FlightServerError, match=r"zarr://theirs/@fields/<name>"
         ):
             _add(client, "theirs", "img")
 

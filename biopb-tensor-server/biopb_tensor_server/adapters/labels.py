@@ -412,7 +412,7 @@ def create_label_upload(
     # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
     # there, so an unfolded check mints a second set that the next boot on such
     # a host cannot tell from the first.
-    taken = folded_match(field, (*parent.label_sets, *parent.label_uploads))
+    taken = folded_match(field, (*parent.label_sets, *parent.attached_tensors))
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A set's name is taken "
@@ -495,6 +495,6 @@ def sidecar_attacher(labels_dir: Path) -> Callable[[str, Any], None]:
 
     def attach(source_id: str, adapter: Any) -> None:
         for field, label_set in sidecar_label_sets(source_id, labels_dir).items():
-            adapter.attach_label_set(field, label_set)
+            adapter.attach_tensor(field, label_set)
 
     return attach
