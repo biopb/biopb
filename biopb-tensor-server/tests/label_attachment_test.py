@@ -124,21 +124,21 @@ def registered(image):
     return SourceRegistry().register("oz1", _adapter(image))
 
 
-NATIVE = {"labels/nuclei", "labels/flat", "labels/xy"}
+NATIVE = {"@labels/nuclei", "@labels/flat", "@labels/xy"}
 
 
 class TestTheFieldShape:
     def test_split(self):
-        assert split_label_field("labels/nuclei") == ("", "nuclei", None)
-        assert split_label_field("A/1/labels/nuclei/2") == ("A/1", "nuclei", "2")
-        assert split_label_field("labels/nuclei").set_field == "labels/nuclei"
+        assert split_label_field("@labels/nuclei") == ("", "nuclei", None)
+        assert split_label_field("A/1/@labels/nuclei/2") == ("A/1", "nuclei", "2")
+        assert split_label_field("@labels/nuclei").set_field == "@labels/nuclei"
         assert split_label_field("labels") is None
         assert split_label_field("A/1") is None
         assert split_label_field(None) is None
 
     def test_compose(self):
-        assert label_field("", "n") == "labels/n"
-        assert label_field("A/1", "n") == "A/1/labels/n"
+        assert label_field("", "n") == "@labels/n"
+        assert label_field("A/1", "n") == "A/1/@labels/n"
 
     def test_extent_mismatch_says_why(self):
         assert (
@@ -192,10 +192,10 @@ class TestANativeSetIsATensorOfItsImage:
         assert ids[0] == "oz1"
         assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE}
 
-        nuclei = registered.resolve_tensor("oz1/labels/nuclei")
+        nuclei = registered.resolve_tensor("oz1/@labels/nuclei")
         assert isinstance(nuclei, LabelSetAdapter)
-        assert nuclei.array_id == "oz1/labels/nuclei"
-        assert registered.resolve_tensor("labels/nuclei") is nuclei
+        assert nuclei.array_id == "oz1/@labels/nuclei"
+        assert registered.resolve_tensor("@labels/nuclei") is nuclei
         desc = nuclei.get_tensor_descriptor()
         assert (list(desc.shape), desc.dtype) == ([64, 64], "<u4")
 
@@ -207,7 +207,7 @@ class TestANativeSetIsATensorOfItsImage:
 
     def test_an_unknown_set_is_the_formats_miss(self, registered):
         with pytest.raises(TensorNotFound):
-            registered.resolve_tensor("labels/nope")
+            registered.resolve_tensor("@labels/nope")
 
     def test_the_formats_own_routing_is_untouched(self, image):
         raw = _adapter(image)
@@ -219,16 +219,16 @@ class TestANativeSetIsATensorOfItsImage:
     def test_a_native_level_routes_under_the_set(self, registered):
         """``nuclei``'s arrays carry their own ``.zattrs``, which used to stop
         the level-opening walk one directory too early."""
-        nuclei = registered.resolve_tensor("labels/nuclei")
+        nuclei = registered.resolve_tensor("@labels/nuclei")
 
-        level = registered.resolve_chunk_adapter("labels/nuclei/1")
-        assert level.array_id == "oz1/labels/nuclei/1"
+        level = registered.resolve_chunk_adapter("@labels/nuclei/1")
+        assert level.array_id == "oz1/@labels/nuclei/1"
         assert list(level.get_tensor_descriptor().shape) == [32, 32]
         assert level.content_version == nuclei.content_version
-        assert registered.resolve_chunk_adapter("labels/nuclei") is nuclei
+        assert registered.resolve_chunk_adapter("@labels/nuclei") is nuclei
 
     def test_content_version_is_the_images_for_set_and_levels_alike(self, registered):
-        nuclei = registered.resolve_tensor("labels/nuclei")
+        nuclei = registered.resolve_tensor("@labels/nuclei")
         assert nuclei.content_version == registered.content_version is not None
         # The image's own native levels share it too: one token per source.
         assert (
@@ -238,28 +238,28 @@ class TestANativeSetIsATensorOfItsImage:
 
     def test_the_ladder_is_native_or_nearest_never_area(self, registered):
         cfg = PyramidConfig(reduction_method="area")
-        nuclei = registered.resolve_tensor("labels/nuclei")
+        nuclei = registered.resolve_tensor("@labels/nuclei")
         native = nuclei._advertised_pyramid(nuclei.get_tensor_descriptor(), cfg)
         assert all(
             lvl.reduction_method == "precompute" and lvl.native for lvl in native
         )
 
-        flat = registered.resolve_tensor("labels/flat")
+        flat = registered.resolve_tensor("@labels/flat")
         computed = flat._advertised_pyramid(flat.get_tensor_descriptor(), cfg)
         assert computed and all(lvl.reduction_method == "nearest" for lvl in computed)
 
     def test_metadata_names_the_image(self, registered):
-        meta = registered.resolve_tensor("labels/nuclei").get_tensor_metadata()
+        meta = registered.resolve_tensor("@labels/nuclei").get_tensor_metadata()
         assert meta["image-label"]["source"] == {"image": "oz1"}
         assert meta["image-label"]["colors"][0]["label-value"] == 7
         assert meta["multiscales"][0]["datasets"][1]["path"] == "1"
 
     def test_a_set_is_read_only(self, registered):
         with pytest.raises(WriteNotSupportedError):
-            registered.resolve_tensor("labels/nuclei").put_chunk(None, None, (), None)
+            registered.resolve_tensor("@labels/nuclei").put_chunk(None, None, (), None)
 
     def test_a_non_canonical_set_is_normalized_like_any_tensor(self, registered):
-        xy = registered.resolve_tensor("labels/xy")
+        xy = registered.resolve_tensor("@labels/xy")
         assert isinstance(xy, NormalizingAdapter)
         assert list(xy.get_tensor_descriptor().dim_labels) == ["y", "x"]
         assert [
@@ -285,15 +285,15 @@ class TestOverTheWire:
             .to_pylist()[0]
         )
         assert rows[0] == "oz1"
-        assert "oz1/labels/nuclei" in rows
+        assert "oz1/@labels/nuclei" in rows
 
     def test_read_the_set_and_its_native_level(self, served, client):
-        full = client.get_tensor("oz1/labels/nuclei")
+        full = client.get_tensor("oz1/@labels/nuclei")
         assert full.shape == SHAPE and full.dtype == np.uint32
         assert full[:8, :8].compute().tolist() == np.full((8, 8), 7).tolist()
 
         desc = client.get_descriptor(
-            "oz1/labels/nuclei", with_metadata=True, with_pyramid=True
+            "oz1/@labels/nuclei", with_metadata=True, with_pyramid=True
         )
         assert [lvl.reduction_method for lvl in desc.pyramid] == [
             "precompute",
@@ -320,7 +320,7 @@ class TestOverTheWire:
         assert "labels" not in (meta.get("biopb") or {})
 
         coarse = client.get_tensor(
-            "oz1/labels/nuclei", scale_hint=[2, 2], reduction_method="precompute"
+            "oz1/@labels/nuclei", scale_hint=[2, 2], reduction_method="precompute"
         )
         assert coarse[:4, :4].compute().max() == 8
 
@@ -357,8 +357,8 @@ class TestASidecarIsAttachedAtRegistration:
             "oz1", _adapter(image)
         )
 
-        assert set(adapter.label_sets) == NATIVE | {"labels/mine"}
-        mine = adapter.resolve_tensor("oz1/labels/mine")
+        assert set(adapter.label_sets) == NATIVE | {"@labels/mine"}
+        mine = adapter.resolve_tensor("oz1/@labels/mine")
         assert mine.content_version == b"\x01\x02"
         assert mine.get_tensor_metadata()["image-label"]["source"] == {"image": "oz1"}
         assert "biopb" not in mine.get_tensor_metadata()
@@ -374,7 +374,7 @@ class TestASidecarIsAttachedAtRegistration:
             "oz1", _adapter(image)
         )
 
-        assert set(adapter.label_sets) == NATIVE | {"labels/fits"}
+        assert set(adapter.label_sets) == NATIVE | {"@labels/fits"}
 
     def test_a_store_without_a_token_is_corrupt_and_skipped(self, image, tmp_path):
         labels_dir = tmp_path / "labels"
@@ -386,24 +386,24 @@ class TestASidecarIsAttachedAtRegistration:
         adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
             "oz1", _adapter(image)
         )
-        assert "labels/untokened" not in adapter.label_sets
+        assert "@labels/untokened" not in adapter.label_sets
 
     def test_no_hook_means_no_sidecars(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
         adapter = SourceRegistry().register("oz1", _adapter(image))
-        assert "labels/mine" not in adapter.label_sets
+        assert "@labels/mine" not in adapter.label_sets
 
     def test_attach_and_detach_by_hand(self, registered, tmp_path):
         group = _sidecar(tmp_path / "labels", "oz1", "late")
         late = open_label_set(
             group, source_id="oz1", image_field="", name="late", content_version=b"x"
         )
-        registered.attach_label_set("labels/late", late)
-        assert registered.resolve_tensor("labels/late").array_id == "oz1/labels/late"
-        assert registered.detach_label_set("labels/late") is not None
-        assert registered.detach_label_set("labels/nuclei") is None  # the file's
+        registered.attach_tensor("@labels/late", late)
+        assert registered.resolve_tensor("@labels/late").array_id == "oz1/@labels/late"
+        assert registered.detach_tensor("@labels/late") is not None
+        assert registered.detach_tensor("@labels/nuclei") is None  # the file's
         with pytest.raises(TensorNotFound):
-            registered.resolve_tensor("labels/late")
+            registered.resolve_tensor("@labels/late")
 
     def test_the_server_wires_its_write_dir(self, writable_server, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
@@ -415,7 +415,7 @@ class TestASidecarIsAttachedAtRegistration:
             .column(0)
             .to_pylist()
         )
-        assert "oz1/labels/mine" in ids
+        assert "oz1/@labels/mine" in ids
 
 
 class TestTheSdkReadsTheSameRule:
@@ -449,12 +449,12 @@ class TestTheSdkReadsTheSameRule:
     @pytest.mark.parametrize(
         "array_id,expected",
         [
-            ("src0/labels/nuclei", ("src0", "nuclei", None)),
-            ("src0/A/1/labels/nuclei", ("src0/A/1", "nuclei", None)),
-            ("src0/labels/nuclei/2", ("src0", "nuclei", "2")),
+            ("src0/@labels/nuclei", ("src0", "nuclei", None)),
+            ("src0/A/1/@labels/nuclei", ("src0/A/1", "nuclei", None)),
+            ("src0/@labels/nuclei/2", ("src0", "nuclei", "2")),
             # The last ``labels`` with a name after it wins, whatever the
             # image's own field holds.
-            ("src0/labels/a/labels/b", ("src0/labels/a", "b", None)),
+            ("src0/@labels/a/@labels/b", ("src0/@labels/a", "b", None)),
         ],
     )
     def test_splits_an_array_id_like_the_server_splits_a_field(
@@ -472,7 +472,7 @@ class TestTheSdkReadsTheSameRule:
         [
             "src0",  # a plain tensor
             "src0/labels",  # a trailing segment names no set
-            "labels/nuclei",  # source_id is slash-free, so this is a source
+            "@labels/nuclei",  # source_id is slash-free, so this is a source
         ],
     )
     def test_names_no_set(self, array_id):

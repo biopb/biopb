@@ -78,7 +78,7 @@ def _result_source(client) -> str:
 
     Results are **persistent**, which is the change -- they used to live in a
     volatile ``cache:`` source that a restart lost. See
-    ``biopb-tensor-server/docs/upload-model.md``, Open questions 1: a
+    One registered source per tensor-server connection: a
     per-session source the kernel discards on exit is the other shape, and this
     is the one a user would keep.
     """

@@ -331,23 +331,42 @@ class NormalizingAdapter(TensorAdapter):
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
         return self._view(self._inner.get_tensor_adapter(tensor_id))
 
-    # Label sets live on the wrapped adapter, already normalized one by one
-    # when they were read or attached (SourceAdapter.label_sets); the base's
-    # resolve_* methods, inherited here, find them through this property and
+    # Attached tensors live on the wrapped adapter, already normalized one by
+    # one when they were read or attached (SourceAdapter.label_sets); the base's
+    # resolve_* methods, inherited here, find them through these properties and
     # route everything else through the normalizing get_tensor_adapter /
-    # get_level_adapter above and below.
+    # get_level_adapter above and below. Declared rather than left to
+    # __getattr__, which the base's own declarations would shadow.
     @property
     def label_sets(self) -> Dict[str, TensorAdapter]:
         return self._inner.label_sets
 
+    @property
+    def label_uploads(self) -> Dict[str, TensorAdapter]:
+        return self._inner.label_uploads
+
+    @property
+    def attached_fields(self) -> Dict[str, TensorAdapter]:
+        return self._inner.attached_fields
+
+    @property
+    def attached_tensors(self) -> Dict[str, TensorAdapter]:
+        return self._inner.attached_tensors
+
+    def attached_tensor(self, field: str) -> Optional[TensorAdapter]:
+        return self._inner.attached_tensor(field)
+
     def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
         return self._inner.get_embedded_labels()
 
-    def attach_label_set(self, field: str, adapter: TensorAdapter) -> None:
-        self._inner.attach_label_set(field, adapter)
+    def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
+        self._inner.attach_tensor(field, adapter)
 
-    def detach_label_set(self, field: str) -> Optional[TensorAdapter]:
-        return self._inner.detach_label_set(field)
+    def detach_tensor(self, field: str) -> Optional[TensorAdapter]:
+        return self._inner.detach_tensor(field)
+
+    def attachment_changed(self) -> None:
+        self._inner.attachment_changed()
 
     def _view(self, inner: SourceAdapter) -> SourceAdapter:
         """Wrap a tensor-level view of this source, deciding nothing.

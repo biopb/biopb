@@ -189,7 +189,7 @@ describe("TreeRow with label sets", () => {
         dtype: "uint16",
       },
       {
-        array_id: "zarr_b1/labels/nuclei",
+        array_id: "zarr_b1/@labels/nuclei",
         dim_labels: ["t", "y", "x"],
         shape: [50, 512, 512],
         chunk_shape: [],
@@ -228,11 +228,11 @@ describe("TreeRow with label sets", () => {
   });
 
   it("marks the set that is drawn, and only that one", () => {
-    expect(open("zarr_b1/labels/nuclei")).toContain('aria-pressed="true"');
+    expect(open("zarr_b1/@labels/nuclei")).toContain('aria-pressed="true"');
     expect(open(null)).toContain('aria-pressed="false"');
     // A set of a different image never appears among these rows, so the mark
     // follows the id and needs no scoping of its own.
-    expect(open("other/labels/nuclei")).toContain('aria-pressed="false"');
+    expect(open("other/@labels/nuclei")).toContain('aria-pressed="false"');
   });
 
   it("counts images in the pill, not tensors", () => {

@@ -53,6 +53,7 @@ import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.core.attached import MARKER
 from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
     encode_chunk_id,
@@ -88,7 +89,7 @@ class UploadStatus(str, Enum):
     Reopening a READY upload is not expressible today, and nothing here
     forecloses it: invalidation would be a fresh ``content_version`` token in
     the store, which every cache on both sides of the wire keys by. See
-    ``docs/upload-model.md``.
+    ``WritableSource``.
 
     One terminal state, not two: a job that dies has nothing to say that
     ``DISCARDED`` with a reason does not already say (biopb/biopb#1). A separate
@@ -124,7 +125,7 @@ def upload_grid(desc: TensorDescriptor) -> List[int]:
     A zarr adapter advertises ``default_transfer_chunk_shape`` as its transfer
     grid -- one store block per endpoint was measured as too many endpoints
     (biopb/biopb#684) -- and a write now lands on the grid the planner mints
-    (``docs/upload-model.md`` step 4). Minting the store on that same grid is
+    (the planner mints it). Minting the store on that same grid is
     what keeps them one thing: on disk, on the wire, for reads and for writes,
     and across a restart, where nothing remembers what the client asked for.
     The request's ``chunk_shape`` is the seed it is grown from, not the layout.
@@ -202,16 +203,19 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 #: their own messages.
 _WINDOWS_FORBIDDEN = '<>"|?*'
 
-#: Field names an upload may not take. ``labels`` is both the NGFF group name
-#: and the wire segment that addresses a set, so a field called ``labels``
-#: makes ``<array_id>/labels/<name>`` ambiguous by construction (parsed by
-#: ``core.labels.split_label_field``). Reserved rather than marked with an
-#: ``@``: marking would move every stored ``array_id``, ``rois.array_id``
-#: included, and that is user data. See ``docs/upload-model.md``.
+#: The marker that opens a segment the *server* owns in a wire id: ``@labels``
+#: for a set (``core.labels.LABELS_SEGMENT``), ``@fields`` for a field uploaded
+#: onto a discovered source (``core.attached.FIELDS_SEGMENT``), and whatever a
+#: later attachment kind adds. An uploaded field may not open with it, so one
+#: parse holds wherever a field appears and a client cannot mint a segment that
+#: would be read as the server's.
 #:
-#: A set *named* ``labels`` stays legal -- the parse is right-to-left, so
-#: ``<field>/labels/labels`` is unambiguous.
-RESERVED_FIELD_NAMES = frozenset({"labels"})
+#: Marking the segment rather than reserving the bare word is what keeps an
+#: attached tensor's id off a native one: a scene of the user's own file may
+#: plausibly be called ``labels`` and may not plausibly be called ``@labels``.
+#: A set *named* ``labels`` therefore stays legal -- the parse is
+#: right-to-left, so ``<field>/@labels/labels`` is unambiguous.
+RESERVED_MARKER = MARKER
 
 
 def fold_name(name: str) -> str:
@@ -264,7 +268,8 @@ def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     A format that puts its bytes on disk names the directory after what the
     client asked for -- a registered source becomes
     ``<write_dir>/sources/<name>.zarr``, its member becomes ``<that>/<field>``,
-    and a label set becomes ``<write_dir>/labels/<source_id>/<name>.zarr`` --
+    and a label set becomes ``<write_dir>/labels/<source_id>/<name>.zarr``
+    (that directory is named for what it holds, not for the wire segment) --
     so the name is untrusted input that turns into a path component, of a
     directory the server later creates and, on discard, deletes whole. It must
     therefore name one component *inside* the directory the server chose:
@@ -281,11 +286,10 @@ def unsafe_store_name(name: str, suffix: str = ".zarr") -> Optional[str]:
     any of the three would refuse, and :func:`fold_name` handles the two rules
     that are about collision rather than legality.
 
-    A format whose name never reaches the filesystem does not need this, which
-    is why :func:`unsafe_field_name` applies the rule to every field anyway: a
-    ``cache://`` member keeps its bytes in the file cache today and gets a
-    store of its own at step 7, and a name that was legal only while it stayed
-    off disk would fail to survive that.
+    Every field reaches the filesystem, whatever format it is stored in
+    (:func:`unsafe_field_name`): a ``cache://`` member is a directory of
+    segments and a ``zarr://`` one an image group, so a name legal only off
+    disk would be a tensor no restart could reopen.
     """
     if not name:
         return "is empty"
@@ -323,15 +327,16 @@ def unsafe_field_name(name: str) -> Optional[str]:
     """Why *name* cannot be an uploaded tensor's field, or None if it can.
 
     A field is a path component of its source's group, so it takes the store
-    rules with no extension of its own, plus the reserved words. Applied by
-    ``adapters.registered.create_member`` to every field, whatever format it
-    asked for.
+    rules with no extension of its own, plus the marker. Applied to every name a
+    client chooses for a tensor, whatever format it asked for
+    (``adapters.registered.create_member``,
+    ``adapters.fields.create_field_upload``).
     """
-    if fold_name(name) in RESERVED_FIELD_NAMES:
+    if name.startswith(RESERVED_MARKER):
         return (
-            "is reserved: a label set is addressed as "
-            "'<array_id>/labels/<name>', so a field of that name would be "
-            "unaddressable"
+            f"opens with {RESERVED_MARKER!r}, which marks a segment the server "
+            f"owns -- a label set is addressed as '<array_id>/@labels/<name>' "
+            f"and a field on a discovered source as '<source_id>/@fields/<name>'"
         )
     return unsafe_store_name(name, suffix="")
 
@@ -626,7 +631,7 @@ class WritableSource:
             # Unreachable while the ladder has one climbable rung: the only
             # settable non-DISCARDED target is READY, and a source already
             # there returned above. Kept as the ladder's own guard -- it is
-            # what a second rung (a reopen, ``docs/upload-model.md``) would
+            # what a second rung (a reopen) would
             # need, and it is cheaper to leave than to rediscover.
             if _STATE_RANK[current] > _STATE_RANK[target]:
                 raise UploadTransitionError(

@@ -4,7 +4,7 @@ import type { TileInfo } from "./types.js";
 
 describe("splitLabelArrayId", () => {
   it("takes a set on a sole-tensor source apart", () => {
-    expect(splitLabelArrayId("src0/labels/nuclei")).toEqual({
+    expect(splitLabelArrayId("src0/@labels/nuclei")).toEqual({
       imageArrayId: "src0",
       name: "nuclei",
       level: null,
@@ -12,7 +12,7 @@ describe("splitLabelArrayId", () => {
   });
 
   it("keeps the image's own field", () => {
-    expect(splitLabelArrayId("plate/A/1/labels/nuclei")).toEqual({
+    expect(splitLabelArrayId("plate/A/1/@labels/nuclei")).toEqual({
       imageArrayId: "plate/A/1",
       name: "nuclei",
       level: null,
@@ -20,7 +20,7 @@ describe("splitLabelArrayId", () => {
   });
 
   it("reads a native level under the set", () => {
-    expect(splitLabelArrayId("src0/labels/nuclei/2")).toEqual({
+    expect(splitLabelArrayId("src0/@labels/nuclei/2")).toEqual({
       imageArrayId: "src0",
       name: "nuclei",
       level: "2",
@@ -30,8 +30,8 @@ describe("splitLabelArrayId", () => {
   it("takes the LAST labels segment, so an image field may hold one", () => {
     // The server splits the same way: an image whose own field says "labels"
     // is not what makes its sets' ids ambiguous, because a name is slash-free.
-    expect(splitLabelArrayId("src0/labels/a/labels/b")).toEqual({
-      imageArrayId: "src0/labels/a",
+    expect(splitLabelArrayId("src0/@labels/a/@labels/b")).toEqual({
+      imageArrayId: "src0/@labels/a",
       name: "b",
       level: null,
     });
@@ -44,7 +44,7 @@ describe("splitLabelArrayId", () => {
 
   it("is null for a trailing labels segment with no name", () => {
     expect(splitLabelArrayId("src0/labels")).toBeNull();
-    expect(splitLabelArrayId("src0/labels/")).toBeNull();
+    expect(splitLabelArrayId("src0/@labels/")).toBeNull();
   });
 
   it("does not read the source_id as the segment", () => {
@@ -85,7 +85,7 @@ const IMAGE = grid({
   plane: { y: 3, x: 4, s: null },
 });
 const SET = grid({
-  array_id: "src0/labels/nuclei",
+  array_id: "src0/@labels/nuclei",
   dim_labels: ["t", "z", "y", "x"],
   shape: [50, 20, 64, 64],
   selectable: { t: 0, z: 1, c: null },

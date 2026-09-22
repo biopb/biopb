@@ -559,7 +559,7 @@ def add_tensor_layer(
 
     **A label set becomes a ``Labels`` layer**, not an image one. The set is an
     ordinary tensor and its ``array_id`` is the only thing that says so
-    (``<image array_id>/labels/<name>``), so the decision is made here rather
+    (``<image array_id>/@labels/<name>``), so the decision is made here rather
     than at each call site -- the Tensor Browser and the MCP ``add_tensor``
     would otherwise have to agree about it separately. Everything up to the add
     is the same pipeline; what differs is the colour model and that the levels

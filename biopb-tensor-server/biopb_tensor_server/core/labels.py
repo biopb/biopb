@@ -1,14 +1,23 @@
 """The shape of a label tensor's name, and what it must span (biopb/biopb#1059).
 
-A label set is a tensor of its image, addressed by the NGFF layout::
+A label set is a tensor of its image, addressed under a **marked** segment::
 
-    <image array_id>/labels/<name>[/<level>]
+    <image array_id>/@labels/<name>[/<level>]
 
-so its within-source field is ``[<image field>/]labels/<name>``. ``name`` is
+so its within-source field is ``[<image field>/]@labels/<name>``. ``name`` is
 slash-free, which is what lets the field be split unambiguously: the **last**
-``labels`` segment that has a name after it is the one, whatever the image
+``@labels`` segment that has a name after it is the one, whatever the image
 field before it contains, and anything after the name is a native pyramid
-level. This module is pure: strings and shapes. What a set *is* lives in
+level.
+
+**The marker is on the wire id only; the NGFF group on disk stays ``labels/``**
+(``adapters.labels.native_label_sets`` opens it by that name, and never through
+this constant). Marking the segment is what keeps an attached tensor's id off a
+native one -- a scene of the user's own file can plausibly be called ``labels``
+and cannot plausibly be called ``@labels`` -- the same argument ``@ome`` is
+chosen by (``RESERVED_PREFIX``).
+
+This module is pure: strings and shapes. What a set *is* lives in
 :mod:`biopb_tensor_server.adapters.labels`, and how a source answers for one in
 :class:`~biopb_tensor_server.core.adapter_base.SourceAdapter`.
 
@@ -19,6 +28,7 @@ from __future__ import annotations
 
 from typing import List, NamedTuple, Optional, Sequence, Tuple
 
+from biopb_tensor_server.core.attached import MARKER as RESERVED_PREFIX
 from biopb_tensor_server.core.axes import canonical_axis
 
 __all__ = [
@@ -30,17 +40,25 @@ __all__ = [
     "label_extent",
     "label_image_axes",
     "label_field",
+    "last_named_segment",
     "split_label_field",
 ]
 
-#: The path segment that marks a label set under its image.
-LABELS_SEGMENT = "labels"
+#: The segment that marks a label set under its image, in a **wire id**. The
+#: NGFF group on disk is ``labels/`` and is opened by that literal name: the two
+#: were one string until the marker, and nothing derives a path from this.
+LABELS_SEGMENT = f"{RESERVED_PREFIX}labels"
 
 #: A name under this prefix is server-owned, in the spirit of the ``@ome`` ROI
-#: set: ``labels/@ome`` is the set rasterized from an OME-TIFF's masks, and a
+#: set: ``@labels/@ome`` is the set rasterized from an OME-TIFF's masks, and a
 #: native NGFF set keeps whatever name the file gave it. Clients read a
 #: reserved set; they never upload or delete one.
-RESERVED_PREFIX = "@"
+#:
+#: The same prefix marks a *segment* (:data:`LABELS_SEGMENT`), which is why an
+#: uploaded field may not open with it (``_writable.unsafe_field_name``): one
+#: prefix, one meaning -- this name is the server's, not yours. Re-exported
+#: from :mod:`~biopb_tensor_server.core.attached` (its ``MARKER``) rather than
+#: redeclared, so the two modules cannot disagree on what the prefix is.
 
 
 class LabelField(NamedTuple):
@@ -67,21 +85,36 @@ def label_field(image_field: Optional[str], name: str) -> str:
     return join_fields(image_field, LABELS_SEGMENT, name)
 
 
+def last_named_segment(parts: Sequence[str], segment: str) -> Optional[int]:
+    """Index of the last *segment* in *parts* that has something after it.
+
+    The one right-to-left scan both a live split and the v1->v2 marker
+    migration (``serving.metadata_db._mark_label_segment``, which runs it
+    against the pre-marker ``"labels"`` literal) need: whatever the field
+    before it contains, the last occurrence with a name after it is the one
+    that names a set, never an earlier segment that merely shares the word.
+    """
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i] == segment and parts[i + 1]:
+            return i
+    return None
+
+
 def split_label_field(field: Optional[str]) -> Optional[LabelField]:
     """Take a within-source field apart, or ``None`` if it names no label set.
 
-    ``"labels/nuclei"`` -> ``("", "nuclei", None)``;
-    ``"A/1/labels/nuclei/2"`` -> ``("A/1", "nuclei", "2")``. A trailing
-    ``labels`` with nothing after it is not a set.
+    ``"@labels/nuclei"`` -> ``("", "nuclei", None)``;
+    ``"A/1/@labels/nuclei/2"`` -> ``("A/1", "nuclei", "2")``. A trailing
+    ``@labels`` with nothing after it is not a set.
     """
     if not field:
         return None
     parts = field.split("/")
-    for i in range(len(parts) - 2, -1, -1):
-        if parts[i] == LABELS_SEGMENT and parts[i + 1]:
-            level = "/".join(parts[i + 2 :]) or None
-            return LabelField("/".join(parts[:i]), parts[i + 1], level)
-    return None
+    i = last_named_segment(parts, LABELS_SEGMENT)
+    if i is None:
+        return None
+    level = "/".join(parts[i + 2 :]) or None
+    return LabelField("/".join(parts[:i]), parts[i + 1], level)
 
 
 def _axis_key(label: str) -> str:

@@ -48,7 +48,17 @@ from biopb_tensor_server.adapters._writable import (
     unsafe_store_name,
     upload_grid,
 )
-from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+from biopb_tensor_server.adapters.cache_member import (
+    create_cache_member,
+    open_cache_member,
+)
+from biopb_tensor_server.adapters.members import (
+    MEMBER_ATTR,
+    MEMBER_DESCRIPTOR,
+    member_attrs,
+    member_marker,
+    read_member_version,
+)
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
     _first_dataset_path,
@@ -58,10 +68,11 @@ from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
     read_zattrs,
     upload_state,
-    with_upload_state,
 )
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.attached import is_published
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.source_registry import close_adapter
 
 logger = logging.getLogger(__name__)
@@ -73,7 +84,11 @@ __all__ = [
     "RegisterAdapter",
     "ZarrMember",
     "create_member",
+    "create_member_at",
     "create_registered_source",
+    "member_attrs",
+    "open_any_member",
+    "read_member_version",
     "scan_members",
     "scan_registered_sources",
     "sources_root",
@@ -84,11 +99,6 @@ __all__ = [
 #: separately from the sidecar's ``labels`` block so one directory can never be
 #: read as the other kind.
 SOURCE_ATTR = "source"
-
-#: The ``biopb`` sub-block a *member's* ``.zattrs`` carries, beside the upload
-#: marker: ``{"member": {"content_version": "<hex>"}}``. A member's token is its
-#: own, not its source's, so publishing one never moves a sibling's chunk ids.
-MEMBER_ATTR = "member"
 
 #: The schemes ``add_tensor`` takes, each naming a store format and nothing
 #: else. The set is a wire contract, so the table is closed; what each does with
@@ -195,7 +205,6 @@ class RegisterAdapter(SourceAdapter):
         self._source_url = str(self.store)
         self._content_version = content_version
         self._metadata = metadata or {}
-        self._members: Dict[str, TensorAdapter] = {}
         #: When this source last received a tensor -- monotonic, like an
         #: upload's ``updated_at``, and stamped at registration so a create
         #: nobody ever added to is on the same clock as one whose tensors have
@@ -214,15 +223,17 @@ class RegisterAdapter(SourceAdapter):
         """The members a reader may see: the published ones.
 
         A member is attached the moment ``add_tensor`` mints it, because that
-        is what routes its own writes, and it is enumerated only once READY.
-        One gate rather than two dicts (``label_uploads`` beside
-        ``label_sets``): the member's own upload record already answers the
-        question, so a second map would be the same fact stored twice.
+        is what routes its own writes, and it is enumerated only once READY
+        (``core.attached.is_published``).
+
+        These are the collection's *own* tensors, which is why they are listed
+        here rather than appended the way an uploaded field is
+        (``catalog_tensors``): a collection holds nothing else.
         """
         return [
             member.get_tensor_descriptor()
-            for member in self._members.values()
-            if _is_published(member)
+            for member in self.members.values()
+            if is_published(member)
         ]
 
     def get_metadata(self) -> dict:
@@ -235,7 +246,7 @@ class RegisterAdapter(SourceAdapter):
             # which an empty collection has none. Named as a resolution miss
             # rather than a server error: asking a source with no tensors for
             # its tensor is a caller's mistake about what it holds.
-            member = next(iter(self._members.values()), None)
+            member = next(iter(self.members.values()), None)
             if member is None:
                 raise TensorNotFound(
                     f"{self.source_id} has no tensors yet: add one with "
@@ -243,7 +254,7 @@ class RegisterAdapter(SourceAdapter):
                     reason="empty_source",
                 )
             return member
-        member = self._members.get(field)
+        member = self.members.get(field)
         if member is None:
             raise TensorNotFound(
                 f"{self.source_id} has no tensor {field!r}.",
@@ -252,9 +263,16 @@ class RegisterAdapter(SourceAdapter):
         return member
 
     def close(self) -> None:
-        for member in self._members.values():
-            close_adapter(member)
-        self._members.clear()
+        """Release every tensor attached to the collection, members and sets.
+
+        A collection holds nothing but what was attached to it, sidecar sets
+        included -- unlike a discovered source, whose file is not the server's.
+        """
+        attached = self._attached_tensors
+        for tensor in (attached or {}).values():
+            close_adapter(tensor)
+        if attached is not None:
+            attached.clear()
 
     # ---- members -----------------------------------------------------------
 
@@ -269,15 +287,26 @@ class RegisterAdapter(SourceAdapter):
 
     @property
     def members(self) -> Dict[str, TensorAdapter]:
-        return dict(self._members)
+        """The collection's own tensors: what was attached under a bare field.
 
-    def attach_member(self, field: str, adapter: TensorAdapter) -> None:
-        """Take *field* into the source. The member owns its own bytes."""
-        self._members[field] = adapter
+        A view of ``SourceAdapter.attached_tensors``: the label sets attached to
+        a member are the rest of that index, told apart by the marked segment in
+        their field.
+        """
+        return {
+            field: tensor
+            for field, tensor in (self._attached_tensors or {}).items()
+            if split_label_field(field) is None
+        }
+
+    def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
+        """Attach, and start the empty-source clock over.
+
+        A collection that is being filled is never a candidate for the reclaim
+        sweep, however long the filling takes (``_reclaim_empty_source``).
+        """
+        super().attach_tensor(field, adapter)
         self.touched_at = time.monotonic()
-
-    def detach_member(self, field: str) -> Optional[TensorAdapter]:
-        return self._members.pop(field, None)
 
     def taken_field(self, field: str) -> Optional[str]:
         """The member *field* would collide with, folded, or None.
@@ -287,7 +316,7 @@ class RegisterAdapter(SourceAdapter):
         there, so an unfolded check mints a second store the next boot on such
         a host cannot tell from the first.
         """
-        return folded_match(field, self._members)
+        return folded_match(field, self.members)
 
     # ---- the store ---------------------------------------------------------
 
@@ -297,45 +326,6 @@ class RegisterAdapter(SourceAdapter):
 
 
 # -- members ------------------------------------------------------------------
-
-
-def member_attrs(content_version: bytes, state: str) -> dict:
-    """The ``biopb`` block a member's root ``.zattrs`` carries.
-
-    The upload marker and the member's own token, in one block: a crash before
-    READY leaves a directory the boot sweep recognizes and removes, and the
-    token is what namespaces the member's chunk ids against a name reclaimed
-    after a discard.
-    """
-    return with_upload_state(
-        {"biopb": {MEMBER_ATTR: {"content_version": content_version.hex()}}}, state
-    )
-
-
-def read_member_version(zattrs: Any) -> Optional[bytes]:
-    """A member's persisted ``content_version``, or None if it records none.
-
-    None is not an error here the way a missing ``source_id`` is: it means the
-    directory is not a member this server minted, and the caller skips it.
-    """
-    if not isinstance(zattrs, dict):
-        return None
-    block = (zattrs.get("biopb") or {}).get(MEMBER_ATTR) or {}
-    try:
-        return bytes.fromhex(block["content_version"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def _is_published(member: TensorAdapter) -> bool:
-    """Whether *member* may be enumerated: it is READY, or older than this life.
-
-    A member adopted at boot tracks no upload -- the record died with the
-    process that filled it -- and only READY members are adopted, so "no
-    record" reads as published. A member of *this* life answers from its own.
-    """
-    progress = getattr(member, "upload", None)
-    return progress is None or progress.is_readable
 
 
 class ZarrMember(OmeZarrAdapter):
@@ -395,17 +385,23 @@ class ZarrMember(OmeZarrAdapter):
         self._dispose_store()
 
 
-def open_member(group: Path, *, source_id: str, field: str) -> Optional[ZarrMember]:
+def open_member(
+    group: Path, *, source_id: str, field: str, zattrs: Optional[dict] = None
+) -> Optional[ZarrMember]:
     """A :class:`ZarrMember` on the OME-Zarr group at *group*, or None.
 
     None, with a warning, for anything this server did not mint as a member: no
     readable ``.zattrs``, no recorded token, or no level-0 array. Skipped rather
     than served, because a member with no token has no chunk-id namespace of
     its own and would collide with whatever last held the name.
+
+    *zattrs*, when the caller already has it (``scan_members`` reads it as the
+    boot marker), is used as-is rather than read again.
     """
     import zarr
 
-    zattrs = read_zattrs(group)
+    if zattrs is None:
+        zattrs = read_zattrs(group)
     if zattrs is None:
         logger.warning(f"member: {group} has no readable .zattrs; skipped")
         return None
@@ -419,7 +415,7 @@ def open_member(group: Path, *, source_id: str, field: str) -> Optional[ZarrMemb
     except Exception as e:
         logger.warning(f"member: cannot open {group}/{level0}: {e}; skipped")
         return None
-    return ZarrMember(
+    member = ZarrMember(
         arr,
         source_id,
         field,
@@ -427,9 +423,15 @@ def open_member(group: Path, *, source_id: str, field: str) -> Optional[ZarrMemb
         root_path=str(group),
         content_version=content_version,
     )
+    # Minted by an earlier life of this server, under its own ``write_dir``, so
+    # it is still the server's to delete -- the same note ``sidecar_label_sets``
+    # puts on a re-opened set. Without it ``delete_store`` has no path and
+    # silently leaves the bytes behind.
+    member._upload_store_path = group
+    return member
 
 
-def scan_members(adapter: RegisterAdapter) -> Dict[str, ZarrMember]:
+def scan_members(adapter: RegisterAdapter) -> Dict[str, TensorAdapter]:
     """The published members of *adapter*'s collection, keyed by field.
 
     Derived from the directory rather than from a dict something has to
@@ -439,23 +441,43 @@ def scan_members(adapter: RegisterAdapter) -> Dict[str, ZarrMember]:
     it, and this pass skips whatever the sweep has not reached yet rather than
     adopting a half-written tensor.
 
-    Only ``zarr://`` members are here to find. A ``cache://`` member keeps its
-    bytes in the file cache and writes no directory, so it does not outlive the
-    process that uploaded it -- which is what ``docs/upload-model.md`` step 7
-    closes by giving it a store of its own.
+    The format is read off the directory and not off a name -- a zarr member
+    carries ``.zattrs``, a cache member ``descriptor.json`` -- which is what
+    lets the scheme stay out of the stored ``array_id``.
     """
-    members: Dict[str, ZarrMember] = {}
+    members: Dict[str, TensorAdapter] = {}
     for group in sorted(adapter.store.iterdir()):
         if not group.is_dir() or group.name.startswith("."):
             continue
-        zattrs = read_zattrs(group)
-        if upload_state(zattrs) == UPLOAD_PENDING:
+        marker = member_marker(group)
+        if upload_state(marker) == UPLOAD_PENDING:
             logger.info(f"member: {group} was left pending; not adopted")
             continue
-        member = open_member(group, source_id=adapter.source_id, field=group.name)
+        member = open_any_member(
+            group, source_id=adapter.source_id, field=group.name, marker=marker
+        )
         if member is not None:
             members[group.name] = member
     return members
+
+
+def open_any_member(
+    group: Path, *, source_id: str, field: str, marker: Optional[dict] = None
+) -> Optional[TensorAdapter]:
+    """The member at *group*, in whichever format minted it, or None.
+
+    The one dispatch on layout: the adoption pass has a directory and no idea
+    which format it is, and every other caller is in the same position.
+
+    *marker*, when the caller already read it (``scan_members``'s own
+    ``member_marker`` call), is handed to whichever format this dispatches to
+    instead of being read from disk a second time.
+    """
+    if (group / MEMBER_DESCRIPTOR).exists():
+        return open_cache_member(
+            group, source_id=source_id, field=field, descriptor=marker
+        )
+    return open_member(group, source_id=source_id, field=field, zattrs=marker)
 
 
 def create_member(
@@ -469,7 +491,7 @@ def create_member(
     not come through here (``labels.create_label_upload``).
 
     Raises ``ValueError`` for a request no format can serve -- an unusable or
-    reserved field name, a field already taken, an unknown scheme -- and
+    marked field name, a field already taken, an unknown scheme -- and
     nothing touches disk until every one of them has passed, so a refused
     request leaves no store behind.
     """
@@ -484,45 +506,35 @@ def create_member(
             f"by case or accent form are one directory on Windows and macOS; "
             f"discard that tensor, or add this one under another name."
         )
+    return create_member_at(
+        parent.member_store(field), parent.source_id, field, scheme, desc
+    )
+
+
+def create_member_at(
+    store: Path, source_id: str, field: str, scheme: str, desc: TensorDescriptor
+) -> TensorAdapter:
+    """Mint a member directory at *store* in the format *scheme* names.
+
+    The one place a store format is chosen. The name rules and the directory
+    belong to whoever owns the layout -- :func:`create_member` for a member of a
+    registered source, ``adapters.fields.create_field_upload`` for a field on a
+    discovered one -- so both kinds get both formats.
+    """
     if scheme == "cache":
-        return _create_cache_member(parent, field, desc)
+        return create_cache_member(store, source_id, field, desc)
     if scheme == "zarr":
-        return _create_zarr_member(parent, field, desc)
+        return _create_zarr_member(store, source_id, field, desc)
     raise ValueError(
         f"{scheme!r} is not a store format: use "
         f"{' or '.join(repr(s) for s in STORE_FORMATS)}."
     )
 
 
-def _create_cache_member(
-    parent: RegisterAdapter, field: str, desc: TensorDescriptor
-) -> CachedSourceAdapter:
-    """A ``cache://`` member: the chunks as uploaded, in the file cache.
-
-    No store to mint, so this is a constructor call -- and no directory, so the
-    member does not survive the process. That is the gap step 7 of
-    ``docs/upload-model.md`` closes, by giving the format a store of its own
-    under the collection; until then a ``cache://`` member is what the old
-    ``cache:`` source was, addressed as a tensor.
-    """
-    adapter = CachedSourceAdapter(
-        source_id=parent.source_id,
-        shape=list(desc.shape),
-        dtype=desc.dtype,
-        chunk_shape=list(desc.chunk_shape),
-        dim_labels=list(desc.dim_labels) if desc.dim_labels else None,
-        physical_scale=list(desc.physical_scale) if desc.physical_scale else None,
-        physical_unit=list(desc.physical_unit) if desc.physical_unit else None,
-        content_version=CachedSourceAdapter.next_content_version(),
-    )
-    adapter._tensor_name = field
-    return adapter
-
-
 def _create_zarr_member(
-    parent: RegisterAdapter, field: str, desc: TensorDescriptor
+    store: Path, source_id: str, field: str, desc: TensorDescriptor
 ) -> ZarrMember:
-    """A ``zarr://`` member: an OME-Zarr image group under the collection.
+    """A ``zarr://`` member: an OME-Zarr image group at *store*.
 
     Born carrying the ``pending`` marker, so a crash before it is published
     leaves a directory the boot sweep recognizes and removes rather than a
@@ -535,7 +547,6 @@ def _create_zarr_member(
         **minimal_ome_metadata(desc),
         **member_attrs(content_version, UPLOAD_PENDING),
     }
-    store = parent.member_store(field)
     # Exclusive: the directory must be this create's own, because a discard
     # removes it whole. One already on disk under a field the source does not
     # serve is a crashed upload for the boot sweep, not something to adopt.
@@ -555,7 +566,7 @@ def _create_zarr_member(
 
     adapter = ZarrMember(
         arr,
-        parent.source_id,
+        source_id,
         field,
         zattrs=zattrs,
         root_path=str(store),
@@ -641,6 +652,6 @@ def scan_registered_sources(sources_dir: Path) -> Dict[str, RegisterAdapter]:
             source_id, store, block["content_version"], block["metadata"]
         )
         for field, member in scan_members(adapter).items():
-            adapter.attach_member(field, member)
+            adapter.attach_tensor(field, member)
         adopted[source_id] = adapter
     return adopted

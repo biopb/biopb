@@ -1,21 +1,23 @@
-"""Cache-backed source adapter for ephemeral uploaded data.
+"""An uploaded tensor whose chunks are served exactly as they were sent.
 
-Design: One adapter instance per cache-backed source, following the existing
-fused source+tensor adapter pattern used by OmeZarrAdapter, etc.
+One adapter per uploaded tensor, fusing the source and tensor roles the way
+``OmeZarrAdapter`` does. It holds the tensor's metadata (shape, dtype, grid,
+axes) and a record of which bounds have arrived; the bytes themselves go
+wherever the subclass puts them.
 
-- CachedSourceAdapter instances registered in server.sources registry (same as other adapters)
-- Metadata (shape, dtype, chunk_shape) stored in adapter instance
-- Chunk data stored in CacheManager keyed by chunk_id
-- When cache evicts chunks, adapter returns Flight error on read (source "gone")
-- Upload progress and disposal live on the adapter (``adapters._writable``); a
-  discarded adapter stays registered as a tombstone until reclaimed
+**This class puts them in the chunk cache**, which makes it volatile: the cache
+entry is the upload's only copy, an eviction is a loss and not a gap, and
+nothing survives the process. That is what the embedded result cache wants --
+``biopb-image-base`` constructs one directly for a fast-return servicer's
+output, which is read once and gone. A ``cache://`` member of a registered
+source wants the opposite and subclasses it
+(``adapters.cache_member.CacheMember``), keeping the same batches in segments
+under its own directory.
 
-Registration flow (bypasses discovery): ``add_tensor`` mints one as a
-``cache://`` member of a registered source (``adapters.registered``), or an
-in-process caller constructs and registers one itself (``biopb-image-base``)
-
-Chunk ID format: array_id + "/" + chunk_key
-Chunk data: stored in CacheManager keyed by full chunk_id
+Upload progress and disposal live on the adapter (``adapters._writable``); a
+discarded one stays registered as a tombstone until the sweep reclaims it.
+Chunks are stored under the chunk_id a read plan mints, so a client's echoed
+id resolves without a translation step.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import logging
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -52,15 +54,20 @@ logger = logging.getLogger(__name__)
 
 
 class CachedSourceAdapter(WritableSource, TensorAdapter):
-    """Adapter for cache-backed uploaded sources.
+    """An uploaded tensor kept in the chunk cache.
 
-    One instance per source, registered in server.sources registry. Every
-    instance is an upload, so the constructor begins tracking one.
+    One instance per uploaded tensor, registered in the server's registry. It
+    begins an upload in the constructor, since every instance is one -- except
+    a member adopted from an earlier life, which is published already
+    (``track_upload``).
 
-    Chunk ID format: array_id + "/" + chunk_key (bounds start coords as "0/1/2")
-    Chunk data stored in CacheManager keyed by full chunk_id.
+    The bytes go through :meth:`_store_chunk_batch` and come back through
+    :meth:`_read_chunk_batch`, the two methods a durable format overrides
+    (``adapters.cache_member``). Everything else -- the record of what arrived,
+    the gap-versus-loss rule, the region assembly -- is the same either way.
 
-    Cache-backed sources allow arbitrary chunk bounds (no uniformity enforcement).
+    Arbitrary chunk bounds are accepted here; no other format takes a write off
+    its own grid.
     """
 
     # Process-monotonic generation clock for the content_version of every
@@ -93,7 +100,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
 
         Deterministic for a name, minted for an empty one. No longer reachable
         over the wire -- ``add_tensor`` adds a ``cache://`` tensor to a source
-        that already has an id (``docs/upload-model.md``, step 5) -- but still
+        that already has an id -- but still
         how an in-process caller names one it registers itself, which is what
         ``biopb-image-base``'s embedded cache does for a servicer's result.
         """
@@ -137,6 +144,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         physical_scale: Optional[List[float]] = None,
         physical_unit: Optional[List[str]] = None,
         content_version: Optional[bytes] = None,
+        track_upload: bool = True,
     ):
         """Initialize cache-backed source adapter.
 
@@ -158,6 +166,10 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
                 prior upload's persisted chunks (which ``CacheManager.put`` would
                 decline to overwrite, serving stale data). None leaves the source
                 unversioned (legacy bytes).
+            track_upload: Whether this instance begins an upload. False for a
+                member adopted from an earlier life (``adapters.cache_member``):
+                its record died with the process that filled it, it is
+                published already, and nothing may write to it again.
         """
         self.source_id = source_id
         # Optional per-source capability token. When set, reading this source
@@ -197,7 +209,36 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         self._source_url = f"cache://{source_id}"
         self._source_type = "cache"
 
-        self.begin_upload(self._shape, self._chunk_shape)
+        if track_upload:
+            self.begin_upload(self._shape, self._chunk_shape)
+
+    def adopt_uploaded(self, bounds: Iterable[Optional[ChunkBounds]]) -> None:
+        """Record chunks a store already holds, as *this* build's chunk ids.
+
+        The read path is keyed by chunk id and a durable store is keyed by
+        bounds (``adapters.cache_member``), so the ids are minted here, once,
+        at registration: a chunk id also carries the serving-semantics epoch,
+        which moves on an upgrade that changes what the bytes mean, while the
+        bytes on disk do not.
+        """
+        for chunk_bounds in bounds:
+            if chunk_bounds is None:
+                continue  # a key this build did not write; not servable
+            chunk_id = mint_chunk_id(
+                self.array_id, chunk_bounds, content_version=self.content_version
+            )
+            self._record_write(chunk_id, chunk_bounds)
+
+    def _record_write(self, chunk_id: bytes, bounds: ChunkBounds) -> None:
+        """Note that *chunk_id* covers *bounds*, and whether that left the grid.
+
+        Shared by adoption (a store's own boot-time replay) and a live upload
+        (:meth:`write_chunk_arrow`) -- both are "this id now exists", differing
+        only in how the id was minted.
+        """
+        self._written_chunks[chunk_id] = bounds
+        if not self._off_grid_writes and not self._on_grid(bounds):
+            self._off_grid_writes = True
 
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
         """Echo the uploader's physical calibration on the response.
@@ -305,15 +346,11 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         # Validate bounds via the base TensorAdapter.get_data contract.
         super().get_data(bounds)
 
-        cache_manager = CacheManager.get_instance()
-        if cache_manager is None:
-            raise RuntimeError("Cache not initialized")
-
         exact = mint_chunk_id(
             self.array_id, bounds, content_version=self.content_version
         )
         if exact in self._written_chunks:
-            return self._uploaded_block(cache_manager, exact, bounds)
+            return self._uploaded_block(exact, bounds)
 
         start = [int(v) for v in bounds.start]
         stop = [int(v) for v in bounds.stop]
@@ -328,24 +365,57 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             if overlap is None:
                 continue
             dst, src = overlap
-            out[dst] = self._uploaded_block(cache_manager, chunk_id, written)[src]
+            out[dst] = self._uploaded_block(chunk_id, written)[src]
         return out
 
-    def _uploaded_block(
-        self, cache_manager: CacheManager, chunk_id: bytes, bounds: ChunkBounds
-    ) -> np.ndarray:
-        """One uploaded chunk, read back out of the cache as an array.
+    def _uploaded_block(self, chunk_id: bytes, bounds: ChunkBounds) -> np.ndarray:
+        """One uploaded chunk, read back as an array.
 
         Copied, not viewed: the caller keeps it past the release, and for the
         assembly above it is a source to blit from rather than the answer.
         """
+        return unpack_chunk_array(self._read_chunk_batch(chunk_id, bounds))
+
+    # -- where this kind's bytes live ------------------------------------------
+    #
+    # The chunk cache, for this class: an upload's cache entry is its only copy,
+    # which is what makes it volatile and what an eviction costs. A ``cache://``
+    # member overrides the two with a segment store under its own directory
+    # (``adapters.cache_member``), so the same read and write paths above serve
+    # a tensor that outlives the process.
+
+    def _store_chunk_batch(
+        self,
+        chunk_id: bytes,
+        bounds: ChunkBounds,
+        batch: pa.RecordBatch,
+        size_bytes: int,
+    ) -> None:
+        """Store one uploaded chunk's batch under *chunk_id*."""
+        self._cache().put(chunk_id, batch, size_bytes)
+
+    def _read_chunk_batch(self, chunk_id: bytes, bounds: ChunkBounds) -> pa.RecordBatch:
+        """The batch stored for *chunk_id*; raises if it was stored and is gone.
+
+        Never called for a chunk the record does not hold, so a miss here is a
+        loss and not a gap -- the two must not look alike to a reader.
+        """
+        cache_manager = self._cache()
         entry = cache_manager.get_or_acquire(
             chunk_id, lambda: _raise_evicted(self.array_id, bounds)
         )
         try:
-            return unpack_chunk_array(entry.data)
+            return entry.data
         finally:
             cache_manager.release(chunk_id)
+
+    @staticmethod
+    def _cache() -> CacheManager:
+        """The process's cache manager; this kind has nowhere else to put bytes."""
+        cache_manager = CacheManager.get_instance()
+        if cache_manager is None:
+            raise RuntimeError("Cache not initialized")
+        return cache_manager
 
     def write_chunk(self, bounds: ChunkBounds, data: np.ndarray) -> None:
         """Write a NumPy chunk: the in-process producer's entry to ``put_chunk``.
@@ -403,10 +473,6 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             logical_shape: Logical chunk shape matching bounds
             dtype: NumPy dtype or dtype string for the chunk data
         """
-        cache_manager = CacheManager.get_instance()
-        if cache_manager is None:
-            raise RuntimeError("Cache not initialized")
-
         # Stored under the id the base read plan mints, so a client's echoed
         # chunk_id resolves here and a prior upload's chunks are never served.
         # Through mint_chunk_id because the read-side probe
@@ -439,14 +505,12 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             schema=CHUNK_WIRE_SCHEMA,
         )
 
-        cache_manager.put(chunk_id, batch, size_bytes)
+        self._store_chunk_batch(chunk_id, bounds, batch, size_bytes)
 
-        # Recorded even when put() declined (the chunk is already cached under
-        # this id): resolve_chunk_data gates reads on this map, so a re-upload of
-        # an existing chunk must still be readable.
-        self._written_chunks[chunk_id] = bounds
-        if not self._off_grid_writes and not self._on_grid(bounds):
-            self._off_grid_writes = True
+        # Recorded even when the store declined (the chunk is already there
+        # under this id): resolve_chunk_data gates reads on this map, so a
+        # re-upload of an existing chunk must still be readable.
+        self._record_write(chunk_id, bounds)
 
         logger.debug(
             f"write_chunk_arrow: stored {size_bytes} bytes at bounds "
@@ -460,9 +524,9 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
     ) -> pa.RecordBatch:
         """Serve an uploaded chunk, or an answer assembled from uploaded chunks.
 
-        An **uploaded** unscaled chunk is handed back verbatim: this source has
-        no backend, so the cache entry the upload put there *is* the chunk and
-        re-packing it would copy it for nothing.
+        An **uploaded** unscaled chunk is handed back verbatim: this source
+        has no backend, so what the upload stored *is* the chunk and re-packing
+        it would copy it for nothing.
 
         Everything else goes to the base over :meth:`get_data`, which zero-fills
         what was never uploaded -- an unscaled chunk in a gap, and a scaled
@@ -475,14 +539,8 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         nothing readable is still writable, so no write can fill a gap an
         answer already stored under its chunk_id stands on. That was not true
         while READY and writable were different states, and it is the reason
-        they are one. The uploaded chunks are cache entries throughout either
-        way; that is where an upload lives.
+        they are one.
         """
-        if cache_manager is None:
-            raise flight.FlightServerError(
-                f"CacheManager required for cache-backed source {self.array_id}"
-            )
-
         # The gate first, and before the version check: a tombstone owes a
         # reader its reason whatever ticket that reader is holding.
         self.check_readable()
@@ -504,13 +562,14 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
 
         if not is_scaled_chunk(chunk_id) and chunk_id in self._written_chunks:
             _, bounds = decode_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(
-                chunk_id, lambda: _raise_evicted(self.array_id, bounds)
-            )
-            data = entry.data
-            cache_manager.release(chunk_id)
-            return data
+            return self._read_chunk_batch(chunk_id, bounds)
 
+        # Only the base needs one: it caches what it assembles, and an uploaded
+        # chunk above was served out of this kind's own store.
+        if cache_manager is None:
+            raise flight.FlightServerError(
+                f"CacheManager required for cache-backed source {self.array_id}"
+            )
         return super().resolve_chunk_data(chunk_id, cache_manager)
 
 

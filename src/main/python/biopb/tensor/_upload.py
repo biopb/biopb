@@ -113,8 +113,9 @@ def _is_label_set(array_id: str) -> bool:
     at 0. A set is where the caller is already writing a sparse mask and means
     it; a ``cache:`` tensor is not.
     """
-    prefixed = ":" in array_id.partition("/")[0]
-    return not prefixed and "/labels/" in array_id
+    from biopb.tensor._labels import split_label_array_id
+
+    return split_label_array_id(array_id) is not None
 
 
 def _state_value(state: Any) -> int:

@@ -75,6 +75,7 @@ from google.protobuf import json_format
 from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.errors import AnnotationStoreError
+from biopb_tensor_server.core.labels import last_named_segment
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -93,14 +94,71 @@ _OPEN_RETRY_SECONDS = 0.5
 # `sources` is deliberately exempt: it is scan output, so it is dropped and
 # recreated on every open and its columns are always this build's. Only the
 # annotations are old enough to need carrying forward.
-_ROI_SCHEMA_VERSION = 1
-_ROI_MIGRATIONS: Dict[int, Callable[[duckdb.DuckDBPyConnection], None]] = {}
+_ROI_SCHEMA_VERSION = 2
+
+
+def _mark_label_segment(array_id: str) -> str:
+    """*array_id* with its label segment marked: ``labels`` -> ``@labels``.
+
+    The v1 parse, run once over stored ids: the **last** ``labels`` segment of
+    the within-source field that has a name after it, which is the one
+    ``split_label_field`` used to find. The source half is never touched -- a
+    source_id has no ``/`` -- and an id naming no set comes back unchanged.
+    """
+    head, slash, field = array_id.partition("/")
+    if not slash:
+        return array_id
+    parts = field.split("/")
+    i = last_named_segment(parts, "labels")
+    if i is None:
+        return array_id
+    parts[i] = "@labels"
+    return head + "/" + "/".join(parts)
+
+
+def _migrate_rois_v1_to_v2(conn: duckdb.DuckDBPyConnection) -> None:
+    """Carry annotations onto the marked label segment.
+
+    A set's wire id became ``<image>/@labels/<name>``, so an annotation filed
+    against the old form would otherwise anchor on a tensor id that is never
+    minted again -- the silent orphaning ``_require_bare_array_id`` exists to
+    prevent, and the reason this table has a ladder rather than being dropped
+    like ``decode_rates``.
+
+    In Python rather than SQL because the segment to mark is the one the v1
+    parser picked; a ``replace()`` would also hit a *set* named ``labels`` or
+    an image field containing one.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT array_id FROM rois WHERE array_id LIKE '%labels/%'"
+    ).fetchall()
+    moved = 0
+    for (array_id,) in rows:
+        marked = _mark_label_segment(array_id)
+        if marked == array_id:
+            continue
+        conn.execute(
+            "UPDATE rois SET array_id = ? WHERE array_id = ?", [marked, array_id]
+        )
+        moved += 1
+    if moved:
+        logger.info("Moved annotations of %d label set(s) onto '@labels'", moved)
+
+
+_ROI_MIGRATIONS: Dict[int, Callable[[duckdb.DuckDBPyConnection], None]] = {
+    1: _migrate_rois_v1_to_v2,
+}
 
 # Shape of the `decode_rates` table. Bumping this DROPS the table rather than
 # migrating it: every row is re-measurable by reading, so a schema change costs
 # one warmup, where the migration ladder `rois` needs exists because nothing can
 # reproduce an annotation.
-_DECODE_RATES_SCHEMA_VERSION = 1
+#
+# Bumped to 2 by the `@labels` marking, which is not a column change but does
+# change what a stored array_id means: a label set's rows are keyed on an id
+# that is never minted again. Dropped rather than rewritten, since that is what
+# this table is for.
+_DECODE_RATES_SCHEMA_VERSION = 2
 
 _DECODE_RATES_DDL = """
 CREATE TABLE IF NOT EXISTS decode_rates (

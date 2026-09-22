@@ -3,19 +3,21 @@
 Extracted from ``TensorFlightServer`` (biopb/biopb#278 item A). What is left
 here is only what a boundary does:
 
-- **Addressing** -- ``add_tensor`` takes ``<scheme>://<source_id>/<field>``,
-  or ``zarr://<array_id>/labels/<name>`` for a label set (biopb/biopb#1059).
-  Nothing here creates a source: the parent must already be registered, and
-  the new tensor is attached to it. The scheme names the store format and
-  nothing else (``adapters.registered.STORE_FORMATS``), so the catalog row
-  kept in step is always the parent's.
+- **Addressing** -- ``add_tensor`` takes ``<scheme>://<source_id>/<field>``
+  for a member of a registered source, ``<scheme>://<source_id>/@fields/<name>``
+  for a field on a discovered one, and ``zarr://<array_id>/@labels/<name>`` for
+  a label set (biopb/biopb#1059). Nothing here creates a source: the parent must
+  already be registered, and the new tensor is attached to it. The scheme names
+  the store format and nothing else (``adapters.registered.STORE_FORMATS``), so
+  the catalog row kept in step is always the parent's.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
 - **Lookup** -- ``status`` / ``set_status`` find the adapter and hand over
-  (``_locate``: the registry, or a parent's ``label_uploads``). ``write_chunk``
-  is handed one: a DoPut ticket routes the way a DoGet ticket does.
+  (``_locate``: the registry, then the parent's attachment index).
+  ``write_chunk`` is handed one: a DoPut ticket routes the way a DoGet ticket
+  does.
 - **Reclamation** -- ``reap`` sweeps every upload by its ``updated_at``, in
-  the registry and in each source's ``label_uploads``: one quiet past ``ttl``
+  the registry and in each source's attached tensors: one quiet past ``ttl``
   is discarded (a job that died) and a tombstone older than ``ttl`` is
   dropped, freeing the name. The sweep runs on a daemon thread started and
   stopped by the server that owns the manager, and
@@ -53,7 +55,9 @@ from biopb_tensor_server.adapters._writable import (
     unknown_upload_status,
     upload_of,
 )
+from biopb_tensor_server.adapters.fields import create_field_upload, fields_root
 from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
+from biopb_tensor_server.adapters.members import member_marker
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.registered import (
     RegisterAdapter,
@@ -62,7 +66,8 @@ from biopb_tensor_server.adapters.registered import (
     scan_registered_sources,
     sources_root,
 )
-from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, read_zattrs, upload_state
+from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
+from biopb_tensor_server.core.attached import FIELDS_SEGMENT
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
 from biopb_tensor_server.core.errors import (
@@ -71,7 +76,7 @@ from biopb_tensor_server.core.errors import (
     UploadTransitionError,
     WriteNotSupportedError,
 )
-from biopb_tensor_server.core.labels import split_label_field
+from biopb_tensor_server.core.labels import LABELS_SEGMENT, split_label_field
 from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
@@ -96,8 +101,9 @@ DEFAULT_UPLOAD_TTL = 3600.0
 #: ``array_id``, which is also the id it keeps and is answered with.
 _ID_GRAMMAR = (
     "'<scheme>://<source_id>/<field>' to add a tensor to a registered source, "
-    "or 'zarr://<array_id>/labels/<name>' to add a label set to one of its "
-    "tensors"
+    f"'<scheme>://<source_id>/{FIELDS_SEGMENT}/<name>' to add one to a source "
+    f"the server discovered, or 'zarr://<array_id>/{LABELS_SEGMENT}/<name>' to "
+    "add a label set to one of its tensors"
 )
 
 
@@ -142,23 +148,18 @@ def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
     return flight.FlightCancelledError(str(exc), json.dumps(payload).encode())
 
 
-def _is_member_field(parent: Any, field: Optional[str]) -> bool:
-    """Whether *field* names a member of *parent* rather than a label set.
+def _attached(adapter: Any) -> Dict[str, Any]:
+    """The tensors the upload path put on *adapter*, or none.
 
-    A member exists only on a :class:`RegisterAdapter`; every other field --
-    including every field on a source that isn't one -- is a label set.
-    """
-    return isinstance(parent, RegisterAdapter) and split_label_field(field) is None
-
-
-def _label_uploads(adapter: Any) -> Dict[str, Any]:
-    """The label sets an adapter is still filling, or none.
-
-    By attribute, like :func:`upload_of`: the registry also holds adapters
-    from outside this package, and one that knows nothing about labels has
+    By attribute, like :func:`upload_of`: the registry also holds adapters from
+    outside this package, and one that knows nothing about the upload path has
     none of them.
+
+    One index for every kind -- member, label set, field on a discovered source
+    -- so this boundary locates, publishes, unlists and reaps them alike
+    (``SourceAdapter.attached_tensors``).
     """
-    return getattr(adapter, "label_uploads", None) or {}
+    return getattr(adapter, "attached_tensors", None) or {}
 
 
 def _reap_step(adapter: Any, now: float, ttl: float) -> Tuple[bool, bool]:
@@ -212,9 +213,9 @@ class UploadManager:
 
         Every upload is a tensor of a source that already exists, so this is
         one lookup in two halves: the source from the registry, then the field
-        from the source -- its members, or its ``label_uploads`` when the field
-        names a set. Returns ``(adapter, parent, field)``, with *adapter* None
-        when nothing holds the id, which every caller already has to handle.
+        from that source's attachment index, whatever kind of tensor it is.
+        Returns ``(adapter, parent, field)``, with *adapter* None when nothing
+        holds the id, which every caller already has to handle.
 
         A bare ``source_id`` answers ``(the source, None, None)``: it is a real
         adapter and tracks no upload, which is what makes ``status`` report
@@ -226,11 +227,7 @@ class UploadManager:
         parent = self._registry.get(source_id)
         if parent is None:
             return None, None, None
-        if split_label_field(field) is not None:
-            return _label_uploads(parent).get(field), parent, field
-        if isinstance(parent, RegisterAdapter):
-            return parent.members.get(field), parent, field
-        return None, None, None
+        return _attached(parent).get(field), parent, field
 
     def status(self, source_id: str) -> Dict[str, Any]:
         """The ``upload_status`` answer: UNKNOWN for anything not tracking an upload."""
@@ -326,10 +323,7 @@ class UploadManager:
         parent = self._registry.get(source_id) if field else None
         if parent is None:
             return unknown_upload_status(array_id)
-        if _is_member_field(parent, field):
-            adapter = parent.detach_member(field)
-        else:
-            adapter = parent.detach_label_set(field)
+        adapter = parent.detach_tensor(field)
         if adapter is None:
             return unknown_upload_status(array_id)
         adapter.delete_store()
@@ -351,44 +345,37 @@ class UploadManager:
     def _publish(self, parent: Any, field: Optional[str], adapter: Any) -> None:
         """List a tensor that has just become readable, under its source.
 
-        A label set is attached to its parent here, because until READY it was
-        only an upload of one (``SourceAdapter.label_uploads``). A member is
-        already attached -- that is what routes its own writes -- and becomes
-        *listed* by becoming readable, so all it owes is the row.
+        Every kind was attached at ``add_tensor`` -- that is what routes its own
+        writes -- and becomes *listed* by becoming readable, which its own
+        upload record answers. So what is owed is the stale views and the row.
         """
-        if not _is_member_field(parent, field):
-            parent.attach_label_set(field, adapter)
+        parent.attachment_changed()
         self._sync_parent_row(parent)
 
     def _unlist(self, parent: Any, field: Optional[str]) -> None:
         """Take a tensor out of its source's listing, if it was in it.
 
-        A tensor that was never published was never listed, so this is a no-op
-        for the ordinary discard of an upload in flight and a catalog write
-        only where one is owed.
+        Nothing is detached: a tensor leaves the listing by ceasing to be
+        readable, and stays reachable as the tombstone a straggler polls until
+        the reclaim sweep drops it.
         """
         if parent is None or field is None:
             return
-        if _is_member_field(parent, field):
-            # Nothing to detach: a member leaves the listing by ceasing to be
-            # readable, and stays reachable as the tombstone a straggler polls
-            # until the reclaim sweep drops it. Only the row is owed.
-            detached = field in parent.members
-        else:
-            detached = parent.detach_label_set(field) is not None
-        if detached:
-            self._sync_parent_row(parent)
+        adapter = _attached(parent).get(field)
+        if adapter is None:
+            return
+        parent.attachment_changed()
+        self._sync_parent_row(parent)
 
     def _add_label_set(
         self, parent: Any, field: str, req_desc: TensorDescriptor
     ) -> TensorDescriptor:
         """A new label set on a tensor that already exists (biopb/biopb#1059).
 
-        The set is attached to its source as an *upload* -- routable from here
-        on, so its producer can poll and write it, but not listed until it
-        reaches READY (``SourceAdapter.label_uploads``). No catalog write
-        happens at create, and that is the one place a set differs from a
-        member: the source's row must not advertise a set nobody may read yet.
+        The set is attached to its source, which routes its own writes and its
+        status polls; it is not *listed* until it reaches READY
+        (``SourceAdapter.label_sets``). No catalog write at create: the row the
+        source already has still describes what a reader may see.
         """
         metadata = (
             self._parse_metadata_json(req_desc.metadata_json)
@@ -405,7 +392,7 @@ class UploadManager:
             )
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
-        parent.attach_label_upload(field, adapter)
+        parent.attach_tensor(field, adapter)
         logger.info(f"Added label set {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
@@ -445,7 +432,9 @@ class UploadManager:
         constructor, before any source is registered. Returns the count.
 
         The layouts the server mints: the members of a registered source
-        (``sources/<name>.zarr/<field>``), the label sidecars
+        (``sources/<name>.zarr/<field>``, in either store format), the fields
+        uploaded onto a discovered one (``fields/<source_id>/<name>``, likewise),
+        the label sidecars
         (``labels/<source_id>/*.zarr``), and -- for one more release -- the
         single-array stores the removed ``ome_zarr:`` kind left directly under
         ``write_dir``. They differ in what the catalog owes them, which is why
@@ -462,6 +451,13 @@ class UploadManager:
             # ``.zattrs`` or ``.zgroup`` file here is simply not a directory.
             if store.is_dir():
                 removed += self._remove_unfinished(store)
+        for store in sorted(fields_root(write_dir).glob("*/*")):
+            # A field has no row of its own either: its source is the user's own
+            # file, whose row is the reconciler's. Only the *pending* ones go --
+            # a published field is the only copy of what someone uploaded, and
+            # is kept even once its source has gone away.
+            if store.is_dir():
+                removed += self._remove_unfinished(store)
         for store in sorted(labels_root(write_dir).glob("*/*.zarr")):
             # A sidecar has no row of its own either, for the same reason.
             removed += self._remove_unfinished(store)
@@ -476,8 +472,8 @@ class UploadManager:
         it since the kind went. The row goes either way; the **bytes** go only
         if the upload never finished, because a finished store is the user's
         data and this server no longer has a claim to it -- it is left where it
-        is, for them to point a discovery root at (``docs/upload-model.md``,
-        Migration). Returns how many stores were removed.
+        is, for them to point a discovery root at. Returns how many stores were
+        removed.
         """
         removed = 0
         for store in sorted(write_dir.glob("*.zarr")):
@@ -487,8 +483,13 @@ class UploadManager:
 
     @staticmethod
     def _remove_unfinished(store: Path) -> bool:
-        """Delete *store* if it is still pending; whether it was."""
-        if upload_state(read_zattrs(store)) != UPLOAD_PENDING:
+        """Delete *store* if it is still pending; whether it was.
+
+        Through ``member_marker``, so the marker is read off whichever file
+        this store's format keeps it in -- the sweep decides before any adapter
+        is asked to open the directory, and neither format is privileged.
+        """
+        if upload_state(member_marker(store)) != UPLOAD_PENDING:
             return False
         shutil.rmtree(store, ignore_errors=True)
         logger.info(f"Removed unfinished upload store {store}")
@@ -528,11 +529,17 @@ class UploadManager:
 
         **Nothing here creates a source.** ``register_source`` does that, and
         an upload names what it is adding to: ``<scheme>://<source_id>/<field>``
-        for a tensor of a registered source, ``zarr://<array_id>/labels/<name>``
-        for a label set of one of its tensors. The scheme names the store
+        for a tensor of a registered source,
+        ``<scheme>://<source_id>/@fields/<name>`` for one on a source the server
+        discovered, and ``zarr://<array_id>/@labels/<name>`` for a label set of
+        any tensor of either. The scheme names the store
         format (``registered.STORE_FORMATS``) and nothing else -- the answered
         ``array_id`` carries none, because the format is a property of the
         stored tensor, read off its directory at the next registration.
+
+        Which of the three it is comes off the **field**, not the parent's
+        type: a marked segment says the upload path owns the bytes and picks
+        where they go; a bare field is the parent's own member.
 
         A field is taken for as long as its tensor is served. Replacing one is
         a discard first, which is what makes an ``array_id`` name a single
@@ -576,25 +583,62 @@ class UploadManager:
                 "and axes; the one exception is a label set's 'image-label' "
                 "block, which rides on its own add_tensor."
             )
+        if field == FIELDS_SEGMENT or field.startswith(f"{FIELDS_SEGMENT}/"):
+            # The *segment* dispatches, not the whole parse, so a malformed name
+            # under it is refused as a field rather than answered about members.
+            adapter = self._create_field(parent, field, scheme, req_desc)
+        else:
+            adapter = self._create_member(parent, source_id, field, scheme, req_desc)
+        # Attached, not listed: this routes the tensor's own writes, and the
+        # published gate keeps it out of the source's tensors until READY. So no
+        # catalog write is owed -- the row the source has still describes what a
+        # reader may see.
+        parent.attach_tensor(field, adapter)
+        logger.info(f"Added {scheme} tensor: {adapter.array_id}")
+        return adapter.upload_response(req_desc)
+
+    def _create_member(
+        self,
+        parent: Any,
+        source_id: str,
+        field: str,
+        scheme: str,
+        desc: TensorDescriptor,
+    ) -> Any:
+        """Mint a tensor of a source the server registered, inside its store."""
         if not isinstance(parent, RegisterAdapter):
             raise flight.FlightServerError(
                 f"add_tensor: {source_id!r} is not a registered source, so it "
-                f"takes no tensors of its own. Only a label set can be added "
-                f"to a source the server discovered: "
-                f"'zarr://{rest}/labels/<name>'."
+                f"has no store to put a tensor of its own in. Add it beside the "
+                f"source instead: "
+                f"'{scheme}://{source_id}/{FIELDS_SEGMENT}/<name>'."
             )
         try:
-            adapter = create_member(parent, field, scheme, req_desc)
+            return create_member(parent, field, scheme, desc)
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
-        # Attached, not listed: this is what routes the tensor's own writes,
-        # and ``RegisterAdapter.list_tensor_descriptors`` keeps it out of the
-        # source's tensors until it reaches READY. So no catalog write is owed
-        # here -- the row the source already has still describes what a reader
-        # may see.
-        parent.attach_member(field, adapter)
-        logger.info(f"Added {scheme} tensor: {adapter.array_id}")
-        return adapter.upload_response(req_desc)
+
+    def _create_field(
+        self, parent: Any, field: str, scheme: str, desc: TensorDescriptor
+    ) -> Any:
+        """Mint a tensor beside a source the server discovered.
+
+        Refused on a registered source: it has a store of its own, and a second
+        place for its tensors would be two layouts to adopt, sweep and reclaim
+        for one kind of source.
+        """
+        if isinstance(parent, RegisterAdapter):
+            raise flight.FlightServerError(
+                f"add_tensor: {parent.source_id!r} is a registered source, so "
+                f"its tensors are members of its own store: drop the "
+                f"{FIELDS_SEGMENT!r} segment."
+            )
+        try:
+            return create_field_upload(
+                parent, field, scheme, desc, fields_dir=fields_root(self._write_dir)
+            )
+        except ValueError as e:
+            raise flight.FlightServerError(f"add_tensor: {e}") from e
 
     def register_source(self, name: str = "", metadata_json: str = "") -> str:
         """Mint a source a client can add tensors to; answers its ``source_id``.
@@ -749,11 +793,11 @@ class UploadManager:
         catalog row is dropped here, since both were the server's own
         (biopb/biopb#1059).
 
-        Every source's uploads take the same step, because a tensor is
+        Every source's attached tensors take the same step, because a tensor is
         attached to its source rather than registered and would otherwise have
-        no sweep at all: a quiet pending member or label set is discarded (its
-        store with it) and unlisted, and its tombstone is later detached, which
-        is what frees the field.
+        no sweep at all: a quiet pending member, field or label set is discarded
+        (its store with it) and unlisted, and its tombstone is later detached,
+        which frees the field.
 
         A registered source left with no live tensor goes with them, once it
         too has been quiet for ``ttl``. That covers both ends of the same
@@ -789,38 +833,26 @@ class UploadManager:
                     self._registry.unregister(source_id)
                     reclaimed += 1
                     logger.info(f"Reclaimed discarded upload {source_id}")
-            # ...and the label sets being uploaded onto it, which are tracked
-            # on the source rather than in the registry.
-            label_expired, label_reclaimed, _ = self._reap_tensors(
+            # ...and every tensor attached to it -- member, uploaded field or
+            # label set -- tracked on the source rather than in the registry,
+            # and taking the identical step.
+            tensor_expired, tensor_reclaimed, emptied_now = self._reap_tensors(
                 adapter,
                 source_id,
-                _label_uploads(adapter),
-                # Lazy: an adapter with none to reap may not define this at
-                # all ("outside this package", per _label_uploads). Bound as a
-                # default so the callable doesn't chase the loop's own name.
-                lambda field, adapter=adapter: adapter.detach_label_upload(field),
-                "label upload",
+                _attached(adapter),
+                # Lazy: an adapter with none to reap may not define this at all
+                # ("outside this package", per _attached). Bound as a default so
+                # the callable doesn't chase the loop's own name.
+                lambda field, adapter=adapter: adapter.detach_tensor(field),
                 now,
                 ttl,
             )
-            expired += label_expired
-            reclaimed += label_reclaimed
-            # ...and the members, which are tracked the same way.
-            if not isinstance(adapter, RegisterAdapter):
-                continue
-            member_expired, member_reclaimed, emptied_now = self._reap_tensors(
-                adapter,
-                source_id,
-                adapter.members,
-                adapter.detach_member,
-                "tensor",
-                now,
-                ttl,
-            )
-            expired += member_expired
-            reclaimed += member_reclaimed
-            if not emptied_now and self._reclaim_empty_source(
-                source_id, adapter, now, ttl
+            expired += tensor_expired
+            reclaimed += tensor_reclaimed
+            if (
+                not emptied_now
+                and isinstance(adapter, RegisterAdapter)
+                and self._reclaim_empty_source(source_id, adapter, now, ttl)
             ):
                 reclaimed += 1
         return expired, reclaimed
@@ -831,17 +863,14 @@ class UploadManager:
         source_id: str,
         tensors: Dict[str, Any],
         detach: Any,
-        kind: str,
         now: float,
         ttl: float,
     ) -> Tuple[int, int, bool]:
-        """One reap pass over a field->upload mapping on *adapter*.
+        """One reap pass over *adapter*'s attachment index.
 
-        Shared by label sets and members: same expire-then-reclaim step, only
-        the detach verb and log wording differ. Returns
-        ``(expired, reclaimed, reclaimed_any)`` -- the last only meaningful to
-        the member caller, which uses it to decide whether the source itself
-        just went empty.
+        Returns ``(expired, reclaimed, reclaimed_any)`` -- the last only
+        meaningful on a registered source, which uses it to decide whether the
+        collection itself just went empty.
         """
         expired = reclaimed = 0
         reclaimed_any = False
@@ -855,7 +884,7 @@ class UploadManager:
                 detach(field)
                 reclaimed += 1
                 reclaimed_any = True
-                logger.info(f"Reclaimed discarded {kind} {source_id}/{field}")
+                logger.info(f"Reclaimed discarded tensor {source_id}/{field}")
         return expired, reclaimed, reclaimed_any
 
     def _reclaim_empty_source(
@@ -873,7 +902,7 @@ class UploadManager:
         What this closes is an abandoned ``register_source`` leaving a
         directory and a catalog row nothing will ever reach.
         """
-        if adapter.members or adapter.label_sets or _label_uploads(adapter):
+        if adapter.attached_tensors:
             return False
         if now - adapter.touched_at < ttl:
             return False

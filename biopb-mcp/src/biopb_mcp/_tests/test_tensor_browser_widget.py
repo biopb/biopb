@@ -1364,18 +1364,18 @@ class TestGroupTensors:
         return _group_tensors(tensors)
 
     def test_a_set_does_not_count_as_a_tensor_of_the_source(self):
-        groups = self._group("src0", "src0/labels/@ome")
+        groups = self._group("src0", "src0/@labels/@ome")
         assert len(groups) == 1
         assert groups[0].image.array_id == "src0"
-        assert [s.array_id for s in groups[0].label_sets] == ["src0/labels/@ome"]
+        assert [s.array_id for s in groups[0].label_sets] == ["src0/@labels/@ome"]
 
     def test_sets_file_under_their_own_image(self):
         groups = self._group(
-            "src0/A", "src0/B", "src0/B/labels/nuclei", "src0/A/labels/cells"
+            "src0/A", "src0/B", "src0/B/@labels/nuclei", "src0/A/@labels/cells"
         )
         assert [g.image.array_id for g in groups] == ["src0/A", "src0/B"]
-        assert [s.array_id for s in groups[0].label_sets] == ["src0/A/labels/cells"]
-        assert [s.array_id for s in groups[1].label_sets] == ["src0/B/labels/nuclei"]
+        assert [s.array_id for s in groups[0].label_sets] == ["src0/A/@labels/cells"]
+        assert [s.array_id for s in groups[1].label_sets] == ["src0/B/@labels/nuclei"]
 
     def test_images_keep_the_order_the_server_listed_them(self):
         # The server puts image tensors first on purpose: tensors[0] is the
@@ -1384,17 +1384,17 @@ class TestGroupTensors:
         assert [g.image.array_id for g in groups] == ["src0/Z", "src0/A"]
 
     def test_sets_are_sorted_by_id(self):
-        groups = self._group("src0", "src0/labels/nuclei", "src0/labels/@ome")
+        groups = self._group("src0", "src0/@labels/nuclei", "src0/@labels/@ome")
         assert [s.array_id for s in groups[0].label_sets] == [
-            "src0/labels/@ome",
-            "src0/labels/nuclei",
+            "src0/@labels/@ome",
+            "src0/@labels/nuclei",
         ]
 
     def test_an_orphan_set_keeps_its_own_row(self):
         # Should not happen -- the server registers a set on its parent -- but a
         # tensor the catalog lists and the tree hides is the worse failure.
-        groups = self._group("src0/labels/nuclei")
-        assert [g.image.array_id for g in groups] == ["src0/labels/nuclei"]
+        groups = self._group("src0/@labels/nuclei")
+        assert [g.image.array_id for g in groups] == ["src0/@labels/nuclei"]
         assert groups[0].label_sets == []
 
 
@@ -1410,7 +1410,7 @@ class TestSoleImage:
         return _sole_image(src)
 
     def test_an_image_with_sets_is_still_sole(self):
-        sole = self._sole("src0", "src0/labels/@ome", "src0/labels/nuclei")
+        sole = self._sole("src0", "src0/@labels/@ome", "src0/@labels/nuclei")
         assert sole.array_id == "src0"
 
     def test_two_images_have_no_sole(self):

@@ -866,7 +866,7 @@ class TestAddTensorLayerRoutesALabelSet:
     def _pair(self, metadata_json=""):
         image = _desc("src0", [5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
         label = _desc(
-            "src0/labels/nuclei",
+            "src0/@labels/nuclei",
             [5, 4, 64, 64],
             ["T", "Z", "Y", "X"],
             metadata_json=metadata_json,
@@ -1013,7 +1013,7 @@ class TestALabelSetOnARealViewerModel:
 
     def _add(self, viewer, scale_vec=None, unit_vec=None):
         image = _desc("src0", [5, 3, 4, 64, 64], ["T", "C", "Z", "Y", "X"])
-        label = _desc("src0/labels/nuclei", [5, 4, 64, 64], ["T", "Z", "Y", "X"])
+        label = _desc("src0/@labels/nuclei", [5, 4, 64, 64], ["T", "Z", "Y", "X"])
         client = _label_client(image, label, scale_vec, unit_vec)
         return add_tensor_layer(
             viewer, client, "src0", label.array_id, label, name="nuclei"
@@ -1039,7 +1039,7 @@ class TestALabelSetOnARealViewerModel:
         # The whole reason the inserted axis is broadcast: a singleton one puts
         # the layer outside its own extent at C>0 and napari draws nothing.
         image = _desc("src0", [2, 3, 8, 8], ["T", "C", "Y", "X"])
-        label = _desc("src0/labels/n", [2, 8, 8], ["T", "Y", "X"])
+        label = _desc("src0/@labels/n", [2, 8, 8], ["T", "Y", "X"])
         client = _label_client(image, label)
 
         def _get_tensor(array_id, scale_hint=None, reduction_method=None):

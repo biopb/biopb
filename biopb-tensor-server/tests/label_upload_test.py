@@ -1,7 +1,7 @@
 """Uploading a label set (biopb/biopb#1059 step 3).
 
 The third upload kind: selected by an ``array_id`` with no ``kind:`` prefix
-and a ``/labels/`` segment, it creates a tensor of a source that already
+and a ``/@labels/`` segment, it creates a tensor of a source that already
 exists rather than a source. What that costs the boundary is a second place to
 look an upload up (the parent's ``label_uploads``, not the registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
@@ -84,36 +84,36 @@ def _tensor_ids(server, source_id="oz1"):
 class TestTheRoundTrip:
     def test_create_upload_seal_and_read_back(self, served, client):
         labels = _labels()
-        desc = _create(client, "oz1/labels/nuclei")
-        assert desc.array_id == "oz1/labels/nuclei"
+        desc = _create(client, "oz1/@labels/nuclei")
+        assert desc.array_id == "oz1/@labels/nuclei"
 
         # Routable from create, so the producer can poll it -- but not listed,
         # because nobody may read it yet.
-        assert client.get_upload_status("oz1/labels/nuclei")["state"] == "PENDING"
-        assert "oz1/labels/nuclei" not in _tensor_ids(served)
+        assert client.get_upload_status("oz1/@labels/nuclei")["state"] == "PENDING"
+        assert "oz1/@labels/nuclei" not in _tensor_ids(served)
 
         status = client.upload_array(desc, labels)
         assert status["state"] == "READY"
 
-        read = client.get_tensor("oz1/labels/nuclei")
+        read = client.get_tensor("oz1/@labels/nuclei")
         assert read.dtype == np.uint32
         np.testing.assert_array_equal(read.compute(), labels)
 
     def test_publishing_lists_it_under_its_image(self, served, client):
-        desc = _create(client, "oz1/labels/nuclei")
+        desc = _create(client, "oz1/@labels/nuclei")
         client.upload_array(desc, _labels())
 
         ids = _tensor_ids(served)
         assert ids[0] == "oz1"  # the image is still tensors[0]
-        assert ids[-1] == "oz1/labels/nuclei"
-        assert client.label_sets("oz1") == ["oz1/labels/nuclei"]
+        assert ids[-1] == "oz1/@labels/nuclei"
+        assert client.label_sets("oz1") == ["oz1/@labels/nuclei"]
 
     def test_the_descriptor_names_its_image(self, served, client):
-        desc = _create(client, "oz1/labels/nuclei")
+        desc = _create(client, "oz1/@labels/nuclei")
         client.upload_array(desc, _labels())
 
         got = client.get_descriptor(
-            "oz1/labels/nuclei", with_metadata=True, with_pyramid=True
+            "oz1/@labels/nuclei", with_metadata=True, with_pyramid=True
         )
         meta = json.loads(got.metadata_json)["metadata"]
         assert meta["image-label"]["source"] == {"image": "oz1"}
@@ -122,19 +122,21 @@ class TestTheRoundTrip:
 
     def test_two_sets_coexist_under_one_image(self, served, client):
         for name in ("nuclei", "cells"):
-            client.upload_array(_create(client, f"oz1/labels/{name}"), _labels())
-        assert client.label_sets("oz1") == ["oz1/labels/cells", "oz1/labels/nuclei"]
+            client.upload_array(_create(client, f"oz1/@labels/{name}"), _labels())
+        assert client.label_sets("oz1") == ["oz1/@labels/cells", "oz1/@labels/nuclei"]
 
     def test_client_metadata_supplies_the_colours(self, served, client):
         colors = [{"label-value": 3, "rgba": [255, 0, 0, 255]}]
         desc = _create(
             client,
-            "oz1/labels/nuclei",
+            "oz1/@labels/nuclei",
             ome_metadata={"image-label": {"colors": colors}},
         )
         client.upload_array(desc, _labels())
         meta = json.loads(
-            client.get_descriptor("oz1/labels/nuclei", with_metadata=True).metadata_json
+            client.get_descriptor(
+                "oz1/@labels/nuclei", with_metadata=True
+            ).metadata_json
         )["metadata"]
         assert meta["image-label"]["colors"] == colors
         assert meta["image-label"]["source"] == {"image": "oz1"}
@@ -144,10 +146,10 @@ class TestWhatTheKindRefuses:
     @pytest.mark.parametrize(
         "array_id,arr,why",
         [
-            ("nope/labels/x", None, "names no registered source"),
-            ("oz1/labels/@ome", None, "are the server's own"),
-            ("oz1/labels/x", np.zeros(SHAPE, "float32"), "unsigned integer"),
-            ("oz1/labels/x", np.zeros((32, 32), "uint32"), "does not span"),
+            ("nope/@labels/x", None, "names no registered source"),
+            ("oz1/@labels/@ome", None, "are the server's own"),
+            ("oz1/@labels/x", np.zeros(SHAPE, "float32"), "unsigned integer"),
+            ("oz1/@labels/x", np.zeros((32, 32), "uint32"), "does not span"),
             ("oz1/nope", None, "is not a registered source"),
         ],
     )
@@ -166,7 +168,7 @@ class TestWhatTheKindRefuses:
         import pyarrow.flight as flight
 
         with pytest.raises(flight.FlightServerError, match="the set's name"):
-            _create(client, f"oz1/labels/{name}")
+            _create(client, f"oz1/@labels/{name}")
         assert not list(labels_root(Path(tmp_path)).glob("**/*.zarr"))
 
     def test_a_case_variant_of_a_taken_set_name_is_refused(self, served, client):
@@ -174,31 +176,31 @@ class TestWhatTheKindRefuses:
         on NTFS, APFS and HFS+, so the refusal folds (``fold_name``)."""
         import pyarrow.flight as flight
 
-        client.upload_array(_create(client, "oz1/labels/Nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/Nuclei"), _labels())
         with pytest.raises(flight.FlightServerError, match="already exists"):
-            _create(client, "oz1/labels/nuclei")
+            _create(client, "oz1/@labels/nuclei")
         # A name that differs by more than case is still free.
-        _create(client, "oz1/labels/membrane")
+        _create(client, "oz1/@labels/membrane")
 
     def test_a_taken_name_is_refused_until_it_is_deleted(self, served, client):
         import pyarrow.flight as flight
 
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         with pytest.raises(flight.FlightServerError, match="already exists"):
-            _create(client, "oz1/labels/nuclei")
+            _create(client, "oz1/@labels/nuclei")
         # ...and while it is still filling, too.
-        _create(client, "oz1/labels/pending")
+        _create(client, "oz1/@labels/pending")
         with pytest.raises(flight.FlightServerError, match="already exists"):
-            _create(client, "oz1/labels/pending")
+            _create(client, "oz1/@labels/pending")
 
     def test_a_finished_set_takes_no_further_chunk(self, served, client):
         """Sealed, like any finished upload -- there is no chunk-level edit."""
         from biopb_tensor_server.core.errors import UploadSealedError
 
         registered = served.sources.get("oz1")
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         with pytest.raises(UploadSealedError):
-            registered.label_sets["labels/nuclei"].put_chunk(None, None, None, None)
+            registered.label_sets["@labels/nuclei"].put_chunk(None, None, None, None)
 
     def test_a_set_that_is_not_an_upload_refuses_a_write_outright(self, tmp_path):
         """A sidecar read back at startup tracks no upload at all."""
@@ -217,7 +219,7 @@ class TestWhatTheKindRefuses:
 class TestTheSidecar:
     def test_it_is_born_pending_and_sealed_by_finish(self, served, client, tmp_path):
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "nuclei.zarr"
-        desc = _create(client, "oz1/labels/nuclei")
+        desc = _create(client, "oz1/@labels/nuclei")
         assert upload_state(json.loads((store / ".zattrs").read_text())) == (
             UPLOAD_PENDING
         )
@@ -234,13 +236,13 @@ class TestTheSidecar:
         """
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "sparse.zarr"
         empty = np.zeros(SHAPE, "uint32")
-        desc = _create(client, "oz1/labels/sparse", arr=empty)
+        desc = _create(client, "oz1/@labels/sparse", arr=empty)
         status = client.upload_array(desc, empty)
 
         assert status["uploaded_chunks"] == 0
         assert not [p for p in (store / "0").iterdir() if not p.name.startswith(".")]
         np.testing.assert_array_equal(
-            client.get_tensor("oz1/labels/sparse").compute(), empty
+            client.get_tensor("oz1/@labels/sparse").compute(), empty
         )
 
     def test_the_zero_skip_is_this_kind_s_alone(self, served, client):
@@ -258,7 +260,7 @@ class TestTheSidecar:
         """A finished sidecar is re-attached by the registration hook."""
         from tests import catalog_server
 
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         served.shutdown()
 
         fresh = catalog_server(
@@ -266,8 +268,8 @@ class TestTheSidecar:
         )
         try:
             registered = register_and_catalog(fresh, "oz1", _adapter(image))
-            assert "labels/nuclei" in registered.label_sets
-            assert "oz1/labels/nuclei" in [
+            assert "@labels/nuclei" in registered.label_sets
+            assert "oz1/@labels/nuclei" in [
                 t.array_id for t in catalog_tensors(registered)
             ]
         finally:
@@ -287,19 +289,19 @@ class TestDiscard:
 
     def test_it_unlists_the_set_and_removes_the_store(self, served, client, tmp_path):
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "nuclei.zarr"
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
 
-        assert self._gone(client, "oz1/labels/nuclei")["state"] == "DISCARDED"
+        assert self._gone(client, "oz1/@labels/nuclei")["state"] == "DISCARDED"
         assert not store.exists()
         assert client.label_sets("oz1") == []
 
     def test_a_pending_set_is_discardable_too(self, served, client, tmp_path):
         """It was never listed, so only the store goes."""
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "half.zarr"
-        _create(client, "oz1/labels/half")
+        _create(client, "oz1/@labels/half")
         assert store.is_dir()
 
-        assert self._gone(client, "oz1/labels/half", "abandoned")["state"] == (
+        assert self._gone(client, "oz1/@labels/half", "abandoned")["state"] == (
             "DISCARDED"
         )
         assert not store.exists()
@@ -310,24 +312,24 @@ class TestDiscard:
         import time
 
         first, second = _labels(), _labels() * 2
-        client.upload_array(_create(client, "oz1/labels/nuclei"), first)
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), first)
         np.testing.assert_array_equal(
-            client.get_tensor("oz1/labels/nuclei").compute(), first
+            client.get_tensor("oz1/@labels/nuclei").compute(), first
         )
-        self._gone(client, "oz1/labels/nuclei")
+        self._gone(client, "oz1/@labels/nuclei")
 
         # The tombstone holds the name until the reclaim sweep takes it, like
         # every other discarded upload's.
         with pytest.raises(flight.FlightServerError):
-            _create(client, "oz1/labels/nuclei")
+            _create(client, "oz1/@labels/nuclei")
         served.uploads.reap(now=time.monotonic() + 10_000)
 
-        client.upload_array(_create(client, "oz1/labels/nuclei"), second)
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), second)
         np.testing.assert_array_equal(
-            client.get_tensor("oz1/labels/nuclei").compute(), second
+            client.get_tensor("oz1/@labels/nuclei").compute(), second
         )
 
-    @pytest.mark.parametrize("array_id", ["oz1/labels/gone", "oz1"])
+    @pytest.mark.parametrize("array_id", ["oz1/@labels/gone", "oz1"])
     def test_what_is_not_an_upload_answers_unknown(self, served, client, array_id):
         """Total, like every discard: a name that never was, and an image that
         is not an upload at all, are both statements about an end state that
@@ -344,11 +346,11 @@ class TestDiscard:
         register_and_catalog(
             writable_server, "oz2", _adapter(Path(zarr_path), source_id="oz2")
         )
-        assert client.label_sets("oz2") == ["oz2/labels/own"]
+        assert client.label_sets("oz2") == ["oz2/@labels/own"]
 
-        assert self._gone(client, "oz2/labels/own")["state"] == "UNKNOWN"
+        assert self._gone(client, "oz2/@labels/own")["state"] == "UNKNOWN"
         assert group.exists()
-        assert client.label_sets("oz2") == ["oz2/labels/own"]
+        assert client.label_sets("oz2") == ["oz2/@labels/own"]
 
 
 class TestTheSweep:
@@ -359,29 +361,29 @@ class TestTheSweep:
 
         quiet = time.monotonic() + 10_000
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "dead.zarr"
-        _create(client, "oz1/labels/dead")
+        _create(client, "oz1/@labels/dead")
         assert store.is_dir()
 
         assert served.uploads.reap(now=quiet) == (1, 0)
         assert not store.exists()
-        assert client.get_upload_status("oz1/labels/dead")["state"] == "DISCARDED"
+        assert client.get_upload_status("oz1/@labels/dead")["state"] == "DISCARDED"
 
         # A second pass, a TTL later, reclaims the tombstone -- which is what
         # frees the name.
         assert served.uploads.reap(now=quiet + 10_000) == (0, 1)
-        assert client.get_upload_status("oz1/labels/dead")["state"] == "UNKNOWN"
-        client.upload_array(_create(client, "oz1/labels/dead"), _labels())
+        assert client.get_upload_status("oz1/@labels/dead")["state"] == "UNKNOWN"
+        client.upload_array(_create(client, "oz1/@labels/dead"), _labels())
 
     def test_a_finished_set_is_not_swept(self, served, client):
         import time
 
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         assert served.uploads.reap(now=time.monotonic() + 10_000) == (0, 0)
-        assert client.label_sets("oz1") == ["oz1/labels/nuclei"]
+        assert client.label_sets("oz1") == ["oz1/@labels/nuclei"]
 
     def test_a_crashed_upload_is_removed_at_boot(self, served, client, tmp_path):
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "crashed.zarr"
-        _create(client, "oz1/labels/crashed")
+        _create(client, "oz1/@labels/crashed")
         served.shutdown()
 
         from tests import catalog_server
@@ -416,17 +418,17 @@ class TestContentVersion:
         }
 
     def test_a_set_publishes_its_own_version_not_its_image_s(self, served, client):
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
 
         image = client.get_descriptor("oz1").content_version
-        labels = client.get_descriptor("oz1/labels/nuclei").content_version
+        labels = client.get_descriptor("oz1/@labels/nuclei").content_version
 
         assert image and labels
         assert labels != image
 
-    @pytest.mark.parametrize("array_id", ["oz1", "oz1/labels/nuclei"])
+    @pytest.mark.parametrize("array_id", ["oz1", "oz1/@labels/nuclei"])
     def test_the_published_version_is_the_minted_one(self, served, client, array_id):
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
 
         published = client.get_descriptor(array_id).content_version
         assert self._minted(client, array_id) == {published}
@@ -437,13 +439,13 @@ class TestContentVersion:
         so an image-derived version could not say so."""
         import time
 
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
-        first = client.get_descriptor("oz1/labels/nuclei").content_version
-        client.set_upload_status("oz1/labels/nuclei", "DISCARDED")
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
+        first = client.get_descriptor("oz1/@labels/nuclei").content_version
+        client.set_upload_status("oz1/@labels/nuclei", "DISCARDED")
         served.uploads.reap(now=time.monotonic() + 10_000)
 
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
-        second = client.get_descriptor("oz1/labels/nuclei").content_version
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
+        second = client.get_descriptor("oz1/@labels/nuclei").content_version
 
         assert first != second
         assert client.get_descriptor("oz1").content_version  # unmoved either way
@@ -456,8 +458,8 @@ class TestContentVersion:
         So the chunk_ids move, the published field does not, and the
         content_version inside the new chunk_ids is still the published one.
         """
-        client.upload_array(_create(client, "oz1/labels/nuclei"), _labels())
-        names = ("oz1", "oz1/labels/nuclei")
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
+        names = ("oz1", "oz1/@labels/nuclei")
         ids = {a: self._chunk_ids(client, a) for a in names}
         published = {a: client.get_descriptor(a).content_version for a in names}
         assert all(self._minted(client, a) == {published[a]} for a in names)

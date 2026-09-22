@@ -1,6 +1,6 @@
 """An upload adds a tensor to a source that already exists (step 5).
 
-``docs/upload-model.md``: ``register_source`` mints a container and nothing
+``register_source`` mints a container and nothing
 else; ``add_tensor`` puts ``<scheme>://<source_id>/<field>`` in it. The scheme
 names the store format and nothing else, so the answered ``array_id`` carries
 none and the format is read back off the directory at the next registration.
@@ -207,7 +207,7 @@ class TestWhatItRefuses:
     @pytest.mark.parametrize(
         "field,why",
         [
-            ("labels", "reserved"),
+            ("@labels", "server owns"),
             ("CON", "device name"),
             ("..", "cannot name a tensor"),
             (".hidden", "starts with"),
@@ -226,7 +226,7 @@ class TestWhatItRefuses:
         client.upload_array(_add(client, source, "img"), _arr())
         with pytest.raises(flight.FlightServerError, match="a label set is NGFF"):
             client.add_tensor(
-                f"cache://{source}/img/labels/nuclei",
+                f"cache://{source}/img/@labels/nuclei",
                 np.zeros(SHAPE, np.uint32),
                 chunk_shape=CHUNK,
             )
@@ -237,11 +237,12 @@ class TestWhatItRefuses:
         ):
             _add(client, "registered_nope", "img")
 
-    def test_a_discovered_source_takes_only_label_sets(
+    def test_a_discovered_source_takes_no_bare_field(
         self, writable_server, client, tmp_path
     ):
         """It is the user's data: the server mints stores under ``write_dir``
-        and nowhere else, so a plain tensor has nowhere to go."""
+        and nowhere else, so a tensor of a discovered source goes beside it,
+        under the marked segment -- which the refusal names."""
         import zarr
 
         store = tmp_path / "theirs.zarr"
@@ -252,7 +253,7 @@ class TestWhatItRefuses:
         writable_server.register_source("theirs", adapter)
 
         with pytest.raises(
-            flight.FlightServerError, match="takes no tensors of its own"
+            flight.FlightServerError, match=r"zarr://theirs/@fields/<name>"
         ):
             _add(client, "theirs", "img")
 
@@ -267,11 +268,11 @@ class TestALabelSetOnAMember:
         labels = np.zeros(SHAPE, np.uint32)
         labels[:2, :3] = 4
         desc = client.add_tensor(
-            f"zarr://{image.array_id}/labels/nuclei", labels, chunk_shape=CHUNK
+            f"zarr://{image.array_id}/@labels/nuclei", labels, chunk_shape=CHUNK
         )
         client.upload_array(desc, labels)
 
-        assert desc.array_id == f"{source}/img/labels/nuclei"
+        assert desc.array_id == f"{source}/img/@labels/nuclei"
         assert client.label_sets(image.array_id) == [desc.array_id]
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), labels
@@ -284,7 +285,7 @@ class TestALabelSetOnAMember:
 
         with pytest.raises(flight.FlightServerError):
             client.add_tensor(
-                f"zarr://{image.array_id}/labels/nuclei",
+                f"zarr://{image.array_id}/@labels/nuclei",
                 np.zeros(SHAPE, np.uint32),
                 chunk_shape=CHUNK,
             )

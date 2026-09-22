@@ -79,6 +79,11 @@ from biopb_tensor_server.adapters._writable import (
     unsettable_state_message,
     upload_of,
 )
+from biopb_tensor_server.adapters.fields import (
+    fields_attacher,
+    fields_root,
+    upload_attacher,
+)
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
@@ -264,6 +269,17 @@ _WARM_READ_BLOCK_BYTES = 8 * 1024 * 1024
 _WARM_PROGRESS_MIN_INTERVAL = 0.5
 _WARM_MAX_WORKERS = 4
 _WARM_POLL_SECONDS = 0.1
+
+
+def _upload_attacher(write_dir: Path):
+    """The registry's ``on_register`` hook over every layout the upload path owns.
+
+    Fields before sets, the order ``catalog_tensors`` lists them in.
+    """
+    return upload_attacher(
+        fields_attacher(fields_root(write_dir)),
+        sidecar_attacher(labels_root(write_dir)),
+    )
 
 
 class _AuthMiddleware(flight.ServerMiddleware):
@@ -481,10 +497,12 @@ class TensorFlightServer(flight.FlightServerBase):
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory())
         super().__init__(location, middleware=middleware, **kwargs)
-        # Uploaded label sets live under write_dir/labels/<source_id>/ and are
-        # attached to their source at registration (biopb/biopb#1059).
+        # What the upload path put beside a source -- fields under
+        # write_dir/fields/<source_id>/, label sidecars under
+        # write_dir/labels/<source_id>/ -- is attached at registration, the one
+        # chokepoint that sees every source (biopb/biopb#1059).
         self.sources = SourceRegistry(
-            on_register=sidecar_attacher(labels_root(Path(write_dir)))
+            on_register=_upload_attacher(Path(write_dir))
             if write_dir is not None
             else None
         )
@@ -2055,11 +2073,19 @@ class TensorFlightServer(flight.FlightServerBase):
                 # being asked (biopb/biopb#1048).
                 adapter.check_readable()
 
-                # If the chunk is already cached, just locate it. Resolving first
-                # would, on a chunk whose in-RAM entry has been trimmed, re-read the
-                # whole chunk from its segment server-side for nothing. Only
-                # materialize (same path as do_get) on a genuine cold miss.
-                location = cache_manager.locate_entry(cache_key)
+                # The adapter first: a source whose own store holds the chunk
+                # as the batch a client wants answers its byte range there,
+                # cold, with nothing resolved and nothing copied into the chunk
+                # cache (``adapters.cache_member``). Everything else answers
+                # None and takes the route below.
+                location = adapter.locate_chunk(chunk_id)
+                if location is None:
+                    # If the chunk is already cached, just locate it. Resolving
+                    # first would, on a chunk whose in-RAM entry has been
+                    # trimmed, re-read the whole chunk from its segment
+                    # server-side for nothing. Only materialize (same path as
+                    # do_get) on a genuine cold miss.
+                    location = cache_manager.locate_entry(cache_key)
                 if location is None:
                     # Resolving caches the chunk synchronously, so by the time
                     # this returns the bytes are on disk and the second locate

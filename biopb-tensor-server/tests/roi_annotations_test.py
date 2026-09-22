@@ -1637,10 +1637,13 @@ class TestSchemaVersioning:
     def test_a_missing_migration_is_refused_rather_than_skipped(
         self, tmp_path, monkeypatch
     ):
+        # Relative to this build's own version, not a fixed number: the ladder
+        # gains a rung on every schema change, and a test naming one by value
+        # starts asserting something else the moment it does.
         store = tmp_path / "catalog.duckdb"
         MetadataDatabase(store_path=store).open()
-        # This build now believes in a v2 it has no way to reach.
-        monkeypatch.setattr(metadata_db, "_ROI_SCHEMA_VERSION", 2)
+        unreachable = metadata_db._ROI_SCHEMA_VERSION + 1
+        monkeypatch.setattr(metadata_db, "_ROI_SCHEMA_VERSION", unreachable)
 
         with pytest.raises(AnnotationStoreError, match="No migration"):
             MetadataDatabase(store_path=store).open()
@@ -1651,22 +1654,74 @@ class TestSchemaVersioning:
         db.put_rois(ARRAY_ID, [_annotation(label="kept")])
         db.close()
 
+        current = metadata_db._ROI_SCHEMA_VERSION
         ran = []
 
-        def _v1_to_v2(conn):
+        def _next_rung(conn):
             ran.append(True)
             conn.execute("ALTER TABLE rois ADD COLUMN note TEXT")
 
-        monkeypatch.setattr(metadata_db, "_ROI_SCHEMA_VERSION", 2)
-        monkeypatch.setattr(metadata_db, "_ROI_MIGRATIONS", {1: _v1_to_v2})
+        monkeypatch.setattr(metadata_db, "_ROI_SCHEMA_VERSION", current + 1)
+        monkeypatch.setattr(metadata_db, "_ROI_MIGRATIONS", {current: _next_rung})
 
         db = MetadataDatabase(store_path=store)
         db.open()
         assert ran
         assert db._get_cursor().execute(
             "SELECT value FROM catalog_meta WHERE key = 'roi_schema_version'"
-        ).fetchone() == ("2",)
+        ).fetchone() == (str(current + 1),)
         assert [r.label for r in db.list_rois(ARRAY_ID)[0]] == ["kept"]
+
+    def test_annotations_follow_the_label_segment_onto_its_marker(self, tmp_path):
+        """v1 -> v2: a set's id became ``<image>/@labels/<name>``.
+
+        An annotation is the one thing in this store nothing can reproduce, so
+        the rename carries it rather than dropping it -- without this the rows
+        anchor on an id that is never minted again, which is the silent
+        orphaning ``_require_bare_array_id`` exists to catch.
+        """
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        conn = db._get_connection()
+        # A v1 file: ids on the bare segment, stamped one version back.
+        for array_id in ("src0/labels/nuclei", "plate/A/1/labels/cells", "src0/img"):
+            conn.execute(
+                "INSERT INTO rois (roi_id, array_id, source_id, set_name, label, "
+                "shape_kind, plane, bbox, geometry, rev, created_at, updated_at) "
+                "VALUES (?, ?, ?, '', 'x', 'point', MAP{}, [0,0,1,1], '{}', 1, "
+                "now(), now())",
+                [f"r-{array_id}", array_id, array_id.partition("/")[0]],
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('roi_schema_version', '1')"
+        )
+        db.close()
+
+        moved = MetadataDatabase(store_path=store)
+        moved.open()
+        ids = {
+            r[0]
+            for r in moved._get_cursor().execute("SELECT array_id FROM rois").fetchall()
+        }
+
+        assert ids == {
+            "src0/@labels/nuclei",
+            "plate/A/1/@labels/cells",
+            "src0/img",  # names no set: untouched
+        }
+
+    def test_the_move_marks_the_segment_the_v1_parser_picked(self):
+        """Right-to-left, like ``split_label_field``: a *set* named ``labels``
+        or an image field containing one must not be rewritten instead."""
+        mark = metadata_db._mark_label_segment
+
+        assert mark("src0/labels/nuclei") == "src0/@labels/nuclei"
+        assert mark("src0/labels/labels") == "src0/@labels/labels"
+        assert mark("src0/labels/a/labels/b") == "src0/labels/a/@labels/b"
+        assert mark("src0/labels") == "src0/labels"  # a field, not a set
+        assert mark("labels") == "labels"  # a source_id
+        assert mark("src0/img") == "src0/img"
 
     def test_a_stale_sources_shape_is_rebuilt_not_refused(self, tmp_path):
         # `sources` is scan output, so it is exempt from versioning entirely:

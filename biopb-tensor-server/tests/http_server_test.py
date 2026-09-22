@@ -1571,7 +1571,7 @@ def _label_set_desc(image_axes=(0, 2, 3, 4)) -> SimpleNamespace:
     if image_axes is not None:
         meta["biopb"] = {"labels": {"image_axes": list(image_axes)}}
     return SimpleNamespace(
-        array_id="tiled/Image:0/labels/nuclei",
+        array_id="tiled/Image:0/@labels/nuclei",
         shape=[1, 16, 1024, 1024],
         chunk_shape=[1, 1, 512, 512],
         dtype="uint32",
@@ -1786,7 +1786,7 @@ class TestTileInfoStatesALabelSetsAxes:
 
     def test_carries_the_mapping_the_server_states(self, labelled):
         with labelled() as (tc, _):
-            body = tc.get("/api/tile_info/tiled/Image:0/labels/nuclei").json()
+            body = tc.get("/api/tile_info/tiled/Image:0/@labels/nuclei").json()
             assert body["image_axes"] == [0, 2, 3, 4]
 
     def test_an_image_carries_none(self, labelled):
@@ -1797,7 +1797,7 @@ class TestTileInfoStatesALabelSetsAxes:
 
     def test_a_server_predating_the_block_simply_omits_it(self, labelled):
         with labelled(None) as (tc, _):
-            body = tc.get("/api/tile_info/tiled/Image:0/labels/nuclei").json()
+            body = tc.get("/api/tile_info/tiled/Image:0/@labels/nuclei").json()
             assert "image_axes" not in body
 
     def test_metadata_is_fetched_only_for_a_set(self, labelled):
@@ -1811,7 +1811,7 @@ class TestTileInfoStatesALabelSetsAxes:
                 for call in mock_fc.get_descriptor.call_args_list
             )
             mock_fc.get_descriptor.reset_mock()
-            tc.get("/api/tile_info/tiled/Image:0/labels/nuclei")
+            tc.get("/api/tile_info/tiled/Image:0/@labels/nuclei")
             assert any(
                 call.kwargs.get("with_metadata")
                 for call in mock_fc.get_descriptor.call_args_list

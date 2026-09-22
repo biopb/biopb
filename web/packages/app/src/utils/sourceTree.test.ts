@@ -169,21 +169,21 @@ describe("groupTensors", () => {
   });
 
   it("files a set under its image rather than beside it", () => {
-    const groups = groupTensors([labelTensor("src0"), labelTensor("src0/labels/nuclei")]);
+    const groups = groupTensors([labelTensor("src0"), labelTensor("src0/@labels/nuclei")]);
     expect(groups).toHaveLength(1);
     expect(groups[0]!.image.array_id).toBe("src0");
-    expect(ids(groups[0]!.labelSets)).toEqual(["src0/labels/nuclei"]);
+    expect(ids(groups[0]!.labelSets)).toEqual(["src0/@labels/nuclei"]);
   });
 
   it("files each set under the image it names, not under the first one", () => {
     const groups = groupTensors([
       labelTensor("plate/A/1"),
       labelTensor("plate/A/2"),
-      labelTensor("plate/A/2/labels/nuclei"),
+      labelTensor("plate/A/2/@labels/nuclei"),
     ]);
     expect(groups.map((g) => g.image.array_id)).toEqual(["plate/A/1", "plate/A/2"]);
     expect(groups[0]!.labelSets).toEqual([]);
-    expect(ids(groups[1]!.labelSets)).toEqual(["plate/A/2/labels/nuclei"]);
+    expect(ids(groups[1]!.labelSets)).toEqual(["plate/A/2/@labels/nuclei"]);
   });
 
   it("keeps the server's tensor order, which puts images first", () => {
@@ -196,24 +196,24 @@ describe("groupTensors", () => {
   it("sorts the sets by name, which the listing does not promise", () => {
     const groups = groupTensors([
       labelTensor("src0"),
-      labelTensor("src0/labels/nuclei"),
-      labelTensor("src0/labels/@ome"),
-      labelTensor("src0/labels/cells"),
+      labelTensor("src0/@labels/nuclei"),
+      labelTensor("src0/@labels/@ome"),
+      labelTensor("src0/@labels/cells"),
     ]);
     expect(ids(groups[0]!.labelSets)).toEqual([
-      "src0/labels/@ome",
-      "src0/labels/cells",
-      "src0/labels/nuclei",
+      "src0/@labels/@ome",
+      "src0/@labels/cells",
+      "src0/@labels/nuclei",
     ]);
   });
 
   it("shows an orphan set rather than hiding it", () => {
     // Should not happen -- the server registers a set on its parent -- but a
     // tensor the catalog lists and the tree silently drops is the worse failure.
-    const groups = groupTensors([labelTensor("src/A/1"), labelTensor("src/A/9/labels/nuclei")]);
+    const groups = groupTensors([labelTensor("src/A/1"), labelTensor("src/A/9/@labels/nuclei")]);
     expect(groups.map((g) => g.image.array_id)).toEqual([
       "src/A/1",
-      "src/A/9/labels/nuclei",
+      "src/A/9/@labels/nuclei",
     ]);
   });
 

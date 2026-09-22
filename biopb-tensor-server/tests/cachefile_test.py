@@ -178,7 +178,7 @@ class TestLocateEntry:
     def test_underivable_schema_length_degrades_to_do_get(self):
         """If the schema length can't be read, only that one entry loses mmap.
 
-        With no lazy walk behind it, `_schema_message_length` returning None is
+        With no lazy walk behind it, `schema_message_length` returning None is
         the sole way an entry can end up without a byte range. The blast radius
         must stay at the segment's *first* entry (the only append that shares
         its bracket with the schema message): it reports unavailable so the
@@ -194,7 +194,7 @@ class TestLocateEntry:
         arrs = {}
         try:
             with patch(
-                "biopb_tensor_server.cache.file_backend._schema_message_length",
+                "biopb_tensor_server.cache.segment_index.schema_message_length",
                 return_value=None,
             ):
                 for i in range(3):
@@ -651,6 +651,9 @@ class TestChunkLocateAction:
 
                 def check_readable(self):
                     pass
+
+                def locate_chunk(self, chunk_id):
+                    return None  # no store of its own; the cache route below
 
                 def resolve_chunk_data(self, chunk_id, cache_manager):
                     # Called on a cold miss -- the heaviest work in the handler.

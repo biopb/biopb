@@ -57,6 +57,7 @@ from biopb.tensor._catalog_rows import (
     sql_literal,
     tensor_descriptors_from_row,
 )
+from biopb.tensor._labels import LABELS_SEGMENT
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
@@ -1115,7 +1116,7 @@ class CatalogClient:
 
     def label_sets(self, image_array_id: str) -> List[str]:
         """Backs TensorFlightClient.label_sets; see that method."""
-        prefix = sql_literal(f"{image_array_id}/labels/")
+        prefix = sql_literal(f"{image_array_id}/{LABELS_SEGMENT}/")
         table = self._query_table(
             "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
             f"WHERE starts_with(t.array_id, {prefix}) ORDER BY t.array_id"
