@@ -126,6 +126,18 @@ final class TensorUploads {
             long[] chunkShape,
             List<String> dimLabels,
             String metadataJson) {
+        return addTensor(arrayId, shape, dtype, chunkShape, dimLabels, metadataJson, null);
+    }
+
+    /** Backs {@link TensorFlightClient#addTensor}; see that method. */
+    TensorDescriptor addTensor(
+            String arrayId,
+            long[] shape,
+            String dtype,
+            long[] chunkShape,
+            List<String> dimLabels,
+            String metadataJson,
+            Integer ttlSeconds) {
         TensorDescriptor.Builder request = TensorDescriptor.newBuilder()
                 .setArrayId(arrayId)
                 .setDtype(dtype);
@@ -140,6 +152,12 @@ final class TensorUploads {
         }
         if (metadataJson != null && !metadataJson.isEmpty()) {
             request.setMetadataJson(metadataJson);
+        }
+        if (ttlSeconds != null) {
+            // Set only when asked, so leaving it null means "unset" and not
+            // "zero" -- which the server refuses rather than reading as
+            // "expire immediately".
+            request.setTtlSeconds(ttlSeconds);
         }
 
         TensorDescriptor created = TensorChunkCodec.parseDescriptor(

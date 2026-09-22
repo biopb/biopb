@@ -68,13 +68,44 @@ def upload_state(zattrs: Any) -> Optional[str]:
     return state if isinstance(state, str) else None
 
 
-def with_upload_state(zattrs: dict, state: str) -> dict:
-    """*zattrs* with the upload marker set to *state* (a copy; the input is not touched)."""
+def with_upload_state(
+    zattrs: dict, state: str, expires_at: Optional[float] = None
+) -> dict:
+    """*zattrs* with the upload marker set to *state* (a copy; input untouched).
+
+    The rest of the marker is **kept**, which is what carries a recorded
+    deadline through publication: ``_publish_store`` rewrites the state over
+    whatever is on disk, and a lifetime the producer asked for at ``add_tensor``
+    must not be dropped by reaching READY.
+
+    *expires_at* is unix seconds -- a wall clock, unlike the intervals
+    ``UploadProgress`` measures, because this one is written down and has to
+    mean the same thing to the next life of the server.
+    """
     out = dict(zattrs)
     block = dict(out.get(UPLOAD_ATTR) or {})
-    block["upload"] = {"state": state}
+    upload = dict(block.get("upload") or {})
+    upload["state"] = state
+    if expires_at is not None:
+        upload["expires_at"] = float(expires_at)
+    block["upload"] = upload
     out[UPLOAD_ATTR] = block
     return out
+
+
+def upload_expires_at(zattrs: Any) -> Optional[float]:
+    """When the marker says this upload stops being served, or None for never.
+
+    Read back at adoption so a lifetime outlives the process that granted it --
+    a deadline only the uploading server remembered would be no deadline at all.
+    """
+    if not isinstance(zattrs, dict):
+        return None
+    upload = (zattrs.get(UPLOAD_ATTR) or {}).get("upload")
+    if not isinstance(upload, dict):
+        return None
+    deadline = upload.get("expires_at")
+    return float(deadline) if isinstance(deadline, (int, float)) else None
 
 
 def is_unfinished_upload(ctx: ClaimContext) -> bool:

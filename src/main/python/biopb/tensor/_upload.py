@@ -441,6 +441,7 @@ class UploadSession:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
+        ttl_seconds: Optional[int] = None,
     ) -> TensorDescriptor:
         """Backs TensorFlightClient.add_tensor; see that method for the full
         documentation."""
@@ -460,6 +461,11 @@ class UploadSession:
             dim_labels=list(dim_labels or []),
             metadata_json=json.dumps(ome_metadata) if ome_metadata else "",
         )
+        if ttl_seconds is not None:
+            # Set through the optional field rather than passed in the
+            # constructor, so leaving it None means "unset" and not "zero" --
+            # which the server refuses.
+            req_desc.ttl_seconds = int(ttl_seconds)
 
         action = flight.Action("add_tensor", req_desc.SerializeToString())
         results = self._state.client.do_action(action, options=self._state.call_options)

@@ -905,6 +905,7 @@ class TensorFlightClient:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
+        ttl_seconds: Optional[int] = None,
     ) -> TensorDescriptor:
         """Declare a tensor to fill: the first half of an upload.
 
@@ -957,9 +958,17 @@ class TensorFlightClient:
             ome_metadata: Ignored except for a label set's ``image-label``
                 block. Metadata is source-scoped and rides on
                 ``register_source``; a tensor inherits its source's.
+            ttl_seconds: How long to keep this tensor, in seconds. ``None``
+                asks for no deadline, which is what a source the server
+                discovered gives you. A source may **cap** the lifetime -- a
+                scratch source caps every upload on it, an unset request
+                included -- so the answer's own ``ttl_seconds`` is the
+                lifetime actually granted, which may be shorter than this.
+                Past it the tensor is discarded as if you had discarded it.
 
         Returns:
-            The new tensor's descriptor, under the ``array_id`` it keeps.
+            The new tensor's descriptor, under the ``array_id`` it keeps. Its
+            ``ttl_seconds`` is the lifetime granted, absent for no deadline.
 
         Raises:
             pyarrow.flight.FlightServerError: the source is not registered, the
@@ -972,6 +981,7 @@ class TensorFlightClient:
             chunk_shape=chunk_shape,
             dim_labels=dim_labels,
             ome_metadata=ome_metadata,
+            ttl_seconds=ttl_seconds,
         )
 
     def upload_array(

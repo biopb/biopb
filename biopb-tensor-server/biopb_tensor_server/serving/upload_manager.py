@@ -71,7 +71,11 @@ from biopb_tensor_server.adapters.registered import (
     scan_registered_sources,
     sources_root,
 )
-from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
+from biopb_tensor_server.adapters.zarr import (
+    UPLOAD_PENDING,
+    upload_expires_at,
+    upload_state,
+)
 from biopb_tensor_server.core.attached import FIELDS_SEGMENT
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
@@ -166,15 +170,30 @@ def _attached(adapter: Any) -> Dict[str, Any]:
     return getattr(adapter, "attached_tensors", None) or {}
 
 
-def _reap_step(adapter: Any, now: float, ttl: float) -> Tuple[bool, bool]:
+def _reap_step(
+    adapter: Any, now: float, ttl: float, wall_now: float
+) -> Tuple[bool, bool]:
     """One upload's turn in the sweep: ``(just expired, tombstone is stale)``.
 
     Both halves come from ``WritableSource.reap_step``; this only turns the
     tombstone's age into the sweep's yes/no, so the registered kinds and the
     label sets attached to a source take the identical step.
+
+    Two clocks, because the sweep asks two kinds of question: *now* is
+    monotonic and measures how long something has been idle, *wall_now* is the
+    wall clock a recorded deadline is written against.
     """
-    expired, age = adapter.reap_step(now, ttl)
+    expired, age = adapter.reap_step(now, ttl, wall_now)
     return expired, age is not None and age > ttl
+
+
+def _past_deadline(expires_at: Optional[float]) -> bool:
+    """Whether a recorded deadline has already gone by, on the wall clock.
+
+    Separate from ``WritableSource.expired`` because the boot sweep asks about
+    a *directory*, before anything has opened it as an adapter.
+    """
+    return expires_at is not None and time.time() >= expires_at
 
 
 def _reap_outcome(expired_now: bool, stale: bool) -> Optional[str]:
@@ -209,6 +228,31 @@ class UploadManager:
         self.ttl = float(ttl)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _deadline_for(self, parent: Any, desc: TensorDescriptor) -> Optional[float]:
+        """When a tensor added to *parent* stops being served, or None.
+
+        Two inputs. The request's ``ttl_seconds`` is what the producer asked
+        for, and unset means "no deadline". The parent's ``max_upload_ttl`` is
+        what the source allows: a scratch source caps every lifetime on it,
+        including an unset one, so nothing lands there forever by omission,
+        while a source the server discovered caps nothing and keeps what it is
+        given until someone discards it.
+
+        The cap wins, so a request can only ever shorten a lifetime -- which is
+        what makes the cap a policy rather than a default.
+        """
+        requested = desc.ttl_seconds if desc.HasField("ttl_seconds") else None
+        if requested is not None and requested <= 0:
+            raise flight.FlightServerError(
+                "add_tensor: ttl_seconds is a lifetime in seconds and must be "
+                "positive; leave it unset to ask for no deadline."
+            )
+        cap = getattr(parent, "max_upload_ttl", None)
+        ttl = float(requested) if requested is not None else None
+        if cap is not None:
+            ttl = float(cap) if ttl is None else min(ttl, float(cap))
+        return None if ttl is None else time.time() + ttl
 
     @property
     def write_dir(self) -> Optional[Path]:
@@ -491,16 +535,31 @@ class UploadManager:
 
     @staticmethod
     def _remove_unfinished(store: Path) -> bool:
-        """Delete *store* if it is still pending; whether it was.
+        """Delete *store* if this life should not serve it; whether it was.
 
-        Through ``member_marker``, so the marker is read off whichever file
-        this store's format keeps it in -- the sweep decides before any adapter
-        is asked to open the directory, and neither format is privileged.
+        Two reasons, both read off the marker before any adapter is asked to
+        open the directory -- through ``member_marker``, so it is found in
+        whichever file this store's format keeps it in and neither format is
+        privileged.
+
+        **Still pending**: a crash left it half written, and nothing here can
+        finish it.
+
+        **Past its deadline**: its lifetime ran out while the server was down.
+        Swept rather than adopted-and-reaped, because adopting it would serve
+        expired bytes for as long as it takes the first sweep to come round --
+        and a deadline the server honours only once it gets to it is a weaker
+        promise than the one that was made.
         """
-        if upload_state(member_marker(store)) != UPLOAD_PENDING:
+        marker = member_marker(store)
+        if upload_state(marker) == UPLOAD_PENDING:
+            why = "unfinished"
+        elif _past_deadline(upload_expires_at(marker)):
+            why = "expired"
+        else:
             return False
         shutil.rmtree(store, ignore_errors=True)
-        logger.info(f"Removed unfinished upload store {store}")
+        logger.info(f"Removed {why} upload store {store}")
         return True
 
     # -- write path ------------------------------------------------------------
@@ -591,7 +650,9 @@ class UploadManager:
                 "and axes; the one exception is a label set's 'image-label' "
                 "block, which rides on its own add_tensor."
             )
-        adapter = self._create_field(parent, field, scheme, req_desc)
+        adapter = self._create_field(
+            parent, field, scheme, req_desc, self._deadline_for(parent, req_desc)
+        )
         # Attached, not listed: this routes the tensor's own writes, and the
         # published gate keeps it out of the source's tensors until READY. So no
         # catalog write is owed -- the row the source has still describes what a
@@ -601,7 +662,12 @@ class UploadManager:
         return adapter.upload_response(req_desc)
 
     def _create_field(
-        self, parent: Any, field: str, scheme: str, desc: TensorDescriptor
+        self,
+        parent: Any,
+        field: str,
+        scheme: str,
+        desc: TensorDescriptor,
+        expires_at: Optional[float] = None,
     ) -> Any:
         """Mint an uploaded tensor beside its source, whatever kind it is.
 
@@ -612,7 +678,12 @@ class UploadManager:
         """
         try:
             return create_field_upload(
-                parent, field, scheme, desc, fields_dir=fields_root(self._write_dir)
+                parent,
+                field,
+                scheme,
+                desc,
+                fields_dir=fields_root(self._write_dir),
+                expires_at=expires_at,
             )
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
@@ -749,10 +820,13 @@ class UploadManager:
 
     # -- reclamation -----------------------------------------------------------
 
-    def reap(self, now: Optional[float] = None) -> Tuple[int, int]:
-        """One sweep over the registry by ``updated_at``; the unit the thread runs.
+    def reap(
+        self, now: Optional[float] = None, wall_now: Optional[float] = None
+    ) -> Tuple[int, int]:
+        """One sweep over the registry; the unit the reclaim thread runs.
 
-        Two halves, one clock. A PENDING upload with no write for ``ttl``
+        Three halves, two clocks -- see *now* and *wall_now* below. A PENDING
+        upload with no write for ``ttl``
         seconds is discarded with a reason -- the job that owned it died, and
         a discard is the one terminal transition there is, so a straggler
         that writes later is refused the same way it would be after an
@@ -762,13 +836,17 @@ class UploadManager:
         expired upload therefore takes two sweeps to vanish, and is a
         tombstone in between.
 
-        Only PENDING is swept. Past it the upload has been published, and a
-        published result's lifetime is its reader's, not this sweep's -- so an
-        upload left READY without ever being finished keeps its name and stays
-        writable, which is the cost of letting a producer publish early. A durable
-        kind is swept like any other: its store goes with the discard and its
-        catalog row is dropped here, since both were the server's own
-        (biopb/biopb#1059).
+        **A deadline is swept at any state, idleness only at PENDING.** A
+        tensor whose lifetime has run out is discarded wherever it is on the
+        ladder -- a deadline that stopped applying at READY would be no
+        deadline, since READY is where a finished result spends its life, and
+        an upload is a temp store for an intermediate result. Idleness is the
+        other half and is PENDING's alone: past it nothing is expected to make
+        progress, so an upload left READY without ever being finished keeps its
+        name and stays writable, which is the cost of letting a producer
+        publish early. A durable kind is swept like any other: its store goes
+        with the discard and its catalog row is dropped here, since both were
+        the server's own (biopb/biopb#1059).
 
         Every source's attached tensors take the same step, because a tensor is
         attached to its source rather than registered and would otherwise have
@@ -787,18 +865,28 @@ class UploadManager:
         ``content_version`` namespace, so its chunk ids never collide with
         the old ones (``CachedSourceAdapter.next_content_version``).
 
-        Returns ``(expired, reclaimed)`` counts. *now* is injectable for tests;
-        it is on the monotonic clock, like ``updated_at``.
+        Returns ``(expired, reclaimed)`` counts. Both clocks are injectable
+        for tests: *now* is monotonic, like ``updated_at``, and measures how
+        long something has been idle; *wall_now* is unix seconds and is what a
+        recorded deadline was written against (``WritableSource.expires_at``).
+        A recorded deadline has to survive a restart, which a monotonic reading
+        does not, so the two cannot be one.
+
+        ``ttl <= 0`` disables the sweep whole -- deadlines included: it is the
+        knob for "do not reclaim on this server", and a deadline is
+        reclamation.
         """
         ttl = self.ttl
         if ttl <= 0:
             return 0, 0
         if now is None:
             now = time.monotonic()
+        if wall_now is None:
+            wall_now = time.time()
         expired = reclaimed = 0
         for source_id, adapter in self._registry.snapshot():
             if upload_of(adapter) is not None:
-                expired_now, stale = _reap_step(adapter, now, ttl)
+                expired_now, stale = _reap_step(adapter, now, ttl, wall_now)
                 outcome = _reap_outcome(expired_now, stale)
                 if outcome == "expired":
                     self._drop_catalog_row(adapter, source_id)
@@ -823,6 +911,7 @@ class UploadManager:
                 lambda field, adapter=adapter: adapter.detach_tensor(field),
                 now,
                 ttl,
+                wall_now,
             )
             expired += tensor_expired
             reclaimed += tensor_reclaimed
@@ -842,6 +931,7 @@ class UploadManager:
         detach: Any,
         now: float,
         ttl: float,
+        wall_now: float,
     ) -> Tuple[int, int, bool]:
         """One reap pass over *adapter*'s attachment index.
 
@@ -852,7 +942,7 @@ class UploadManager:
         expired = reclaimed = 0
         reclaimed_any = False
         for field, tensor in list(tensors.items()):
-            expired_now, stale = _reap_step(tensor, now, ttl)
+            expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
             outcome = _reap_outcome(expired_now, stale)
             if outcome == "expired":
                 self._unlist(adapter, field)

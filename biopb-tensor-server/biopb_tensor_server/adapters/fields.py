@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -69,6 +69,7 @@ def create_field_upload(
     desc: TensorDescriptor,
     *,
     fields_dir: Path,
+    expires_at: Optional[float] = None,
 ) -> TensorAdapter:
     """Mint the store for a new uploaded field on *parent* and track its upload.
 
@@ -108,7 +109,7 @@ def create_field_upload(
             f"tensor, or add this one under another name."
         )
     store = source_fields_dir(fields_dir, parent.source_id) / name
-    return create_member_at(store, parent.source_id, field, scheme, desc)
+    return create_member_at(store, parent.source_id, field, scheme, desc, expires_at)
 
 
 def scan_source_fields(source_id: str, fields_dir: Path) -> Dict[str, TensorAdapter]:

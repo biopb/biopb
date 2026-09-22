@@ -1364,6 +1364,36 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
+     * {@link #addTensor(String, long[], String, long[], List, String)} with a lifetime.
+     *
+     * <p>An upload is a temp store for an intermediate result, so how long the
+     * result is worth keeping is the producer's to say. {@code null} asks for
+     * no deadline, which is what a source the server discovered gives you.
+     *
+     * <p>A source may <i>cap</i> the lifetime -- a scratch source caps every
+     * upload on it, an unset request included -- so the answer's own
+     * {@code ttl_seconds} is the lifetime actually granted, which may be
+     * shorter than this. Past it the tensor is discarded as if you had
+     * discarded it: the store goes and the id reads {@code DISCARDED}.
+     *
+     * @param ttlSeconds seconds to keep the tensor, or null for no deadline;
+     *        must be positive, since zero is not a lifetime
+     * @return the new tensor's descriptor, its {@code ttl_seconds} the lifetime
+     *         granted
+     */
+    public TensorDescriptor addTensor(
+            String arrayId,
+            long[] shape,
+            String dtype,
+            long[] chunkShape,
+            List<String> dimLabels,
+            String omeMetadataJson,
+            Integer ttlSeconds) {
+        return uploads.addTensor(
+                arrayId, shape, dtype, chunkShape, dimLabels, omeMetadataJson, ttlSeconds);
+    }
+
+    /**
      * Declare a tensor shaped like an array you already hold.
      *
      * <p><b>Experimental</b>, with the rest of the upload API. The template's

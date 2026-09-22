@@ -450,7 +450,30 @@ class WritableSource:
     #: checker for an attribute they assume rather than define.
     source_id: str
 
+    #: When this tensor stops being served, in unix seconds, or None to be kept
+    #: until someone discards it. On the *adapter* rather than on
+    #: :class:`UploadProgress`, because a tensor adopted from an earlier life
+    #: has no record and its deadline still has to be enforced -- that is the
+    #: whole point of writing it down (``zarr.upload_expires_at``).
+    #:
+    #: A wall clock, unlike ``updated_at``'s monotonic intervals: this one is
+    #: persisted, so it has to mean the same thing across a restart. It is set
+    #: at ``add_tensor`` and never moved, so a producer cannot hold bytes open
+    #: by writing to them, nor by never publishing.
+    _expires_at: Optional[float] = None
+
     _upload: Optional[UploadProgress] = None
+
+    @property
+    def expires_at(self) -> Optional[float]:
+        """When this tensor stops being served, or None for no deadline."""
+        return self._expires_at
+
+    def expired(self, wall_now: Optional[float] = None) -> bool:
+        """Whether this tensor's lifetime has run out."""
+        if self._expires_at is None:
+            return False
+        return (time.time() if wall_now is None else wall_now) >= self._expires_at
 
     # -- the format's half -----------------------------------------------------
 
@@ -504,16 +527,25 @@ class WritableSource:
         hand back a grid no plan mints and every ``upload_chunk`` on it would
         be refused. This is the same number ``get_flight_info`` advertises.
 
+        The **lifetime is the one granted, not the one asked for**: a source
+        may cap it, so echoing the request would tell a caller its result
+        outlives a deadline it does not. Absent when the tensor has none.
+
         Physical calibration is deliberately not echoed here: a format adds it
         only if a later read will reproduce it verbatim (issue #272).
         """
-        return TensorDescriptor(
+        answer = TensorDescriptor(
             array_id=self.array_id,
             dim_labels=desc.dim_labels,
             shape=desc.shape,
             chunk_shape=list(self.get_transfer_chunk_size()),
             dtype=desc.dtype,
         )
+        if self._expires_at is not None:
+            # Back to a duration, which is what the field means: the caller has
+            # no way to compare its clock against this server's.
+            answer.ttl_seconds = max(1, round(self._expires_at - time.time()))
+        return answer
 
     def discard(self, reason: str = "") -> Dict[str, Any]:
         """Give up on this upload: refuse further writes, keep the record.
@@ -564,23 +596,46 @@ class WritableSource:
         logger.info(f"Discarded upload {self.array_id}: {reason or 'no reason given'}")
         return True
 
-    def reap_step(self, now: float, ttl: float) -> Tuple[bool, Optional[float]]:
-        """The reclaim sweep's two questions for this upload, one lock hold.
+    def reap_step(
+        self, now: float, ttl: float, wall_now: Optional[float] = None
+    ) -> Tuple[bool, Optional[float]]:
+        """The reclaim sweep's questions for this upload, one lock hold.
 
         Returns ``(expired, tombstone_age)``:
 
-        - *expired*: a PENDING upload with no progress for *ttl* seconds was
-          just discarded here, with a reason -- one terminal transition, not
-          a second path into oblivion. The check and the transition share the
-          lock hold so a ``set_status`` racing the sweep either lands first
-          (and the upload keeps the state it reached) or is refused as
-          discarded; it can never be undone. A durable kind's store goes with it (:meth:`_dispose_store`).
+        - *expired*: this upload was just discarded here, with a reason -- one
+          terminal transition, not a second path into oblivion. Two things
+          cause it. **Its lifetime ran out** (:attr:`expires_at`), which
+          reaches an upload at *any* state, published included: a deadline that
+          stopped applying at READY would be no deadline, since READY is where
+          a finished result spends its life. Or it is **PENDING with no
+          progress for** *ttl* seconds -- the job that owned it died.
+
+          The check and the transition share the lock hold so a ``set_status``
+          racing the sweep either lands first (and the upload keeps the state
+          it reached) or is refused as discarded; it can never be undone. A
+          durable kind's store goes with it (:meth:`_dispose_store`).
         - *tombstone_age*: seconds since this upload was discarded, or
           ``None`` if it was not -- including right after this call just
           discarded it, since a fresh tombstone's age is not yet the sweep's
           concern.
+
+        A tensor adopted from an earlier life tracks no upload but may still
+        carry a deadline, so the expiry half runs before the record is asked
+        for: there is nothing to seal, and removing the store is the whole of
+        the discard.
         """
         progress = self._upload
+        if self.expired(wall_now):
+            if progress is None:
+                self._dispose_store()
+                return True, None
+            with progress.lock:
+                if progress.is_discarded:
+                    return False, progress.idle_for(now)
+                self._discard_locked(progress, "expired: lifetime elapsed", now)
+            self._dispose_store()
+            return True, None
         if progress is None:
             return False, None
         with progress.lock:
@@ -663,8 +718,18 @@ class WritableSource:
 
     # -- the shared half -------------------------------------------------------
 
-    def begin_upload(self, shape: Sequence[int], chunk_shape: Sequence[int]) -> None:
-        """Start tracking an upload of ``shape`` written in ``chunk_shape`` units."""
+    def begin_upload(
+        self,
+        shape: Sequence[int],
+        chunk_shape: Sequence[int],
+        expires_at: Optional[float] = None,
+    ) -> None:
+        """Start tracking an upload of ``shape`` written in ``chunk_shape`` units.
+
+        *expires_at* is the deadline the boundary granted (unix seconds), or
+        None to keep the tensor until someone discards it.
+        """
+        self._expires_at = expires_at
         self._upload = UploadProgress(
             expected_chunks=_expected_chunk_count(list(shape), list(chunk_shape))
         )

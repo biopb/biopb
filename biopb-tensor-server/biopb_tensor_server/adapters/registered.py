@@ -50,6 +50,7 @@ from biopb_tensor_server.adapters.members import (
     MEMBER_DESCRIPTOR,
     member_attrs,
     read_member_version,
+    upload_expires_at,
 )
 from biopb_tensor_server.adapters.ome_zarr import (
     OmeZarrAdapter,
@@ -369,6 +370,9 @@ def open_member(
     # puts on a re-opened set. Without it ``delete_store`` has no path and
     # silently leaves the bytes behind.
     member._upload_store_path = group
+    # The deadline outlives the record, so an adopted member's lifetime is still
+    # enforced by the sweep (``WritableSource.expired``).
+    member._expires_at = upload_expires_at(zattrs)
     return member
 
 
@@ -392,7 +396,12 @@ def open_any_member(
 
 
 def create_member_at(
-    store: Path, source_id: str, field: str, scheme: str, desc: TensorDescriptor
+    store: Path,
+    source_id: str,
+    field: str,
+    scheme: str,
+    desc: TensorDescriptor,
+    expires_at: Optional[float] = None,
 ) -> TensorAdapter:
     """Mint a member directory at *store* in the format *scheme* names.
 
@@ -401,9 +410,9 @@ def create_member_at(
     so a field gets both formats wherever its source came from.
     """
     if scheme == "cache":
-        return create_cache_member(store, source_id, field, desc)
+        return create_cache_member(store, source_id, field, desc, expires_at)
     if scheme == "zarr":
-        return _create_zarr_member(store, source_id, field, desc)
+        return _create_zarr_member(store, source_id, field, desc, expires_at)
     raise ValueError(
         f"{scheme!r} is not a store format: use "
         f"{' or '.join(repr(s) for s in STORE_FORMATS)}."
@@ -411,7 +420,11 @@ def create_member_at(
 
 
 def _create_zarr_member(
-    store: Path, source_id: str, field: str, desc: TensorDescriptor
+    store: Path,
+    source_id: str,
+    field: str,
+    desc: TensorDescriptor,
+    expires_at: Optional[float] = None,
 ) -> ZarrMember:
     """A ``zarr://`` member: an OME-Zarr image group at *store*.
 
@@ -424,7 +437,7 @@ def _create_zarr_member(
     content_version = os.urandom(8)
     zattrs = {
         **minimal_ome_metadata(desc),
-        **member_attrs(content_version, UPLOAD_PENDING),
+        **member_attrs(content_version, UPLOAD_PENDING, expires_at),
     }
     # Exclusive: the directory must be this create's own, because a discard
     # removes it whole. One already on disk under a field the source does not
@@ -452,7 +465,7 @@ def _create_zarr_member(
         content_version=content_version,
     )
     adapter._upload_store_path = store
-    adapter.begin_upload(desc.shape, grid)
+    adapter.begin_upload(desc.shape, grid, expires_at)
     return adapter
 
 

@@ -40,6 +40,7 @@ from biopb_tensor_server.adapters.members import (
     MEMBER_DESCRIPTOR,
     member_attrs,
     read_member_version,
+    upload_expires_at,
 )
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY
 from biopb_tensor_server.cache.segment_store import SegmentStore
@@ -245,7 +246,7 @@ class CacheMember(CachedSourceAdapter):
             "dim_labels": list(self._dim_labels),
             "physical_scale": list(self._physical_scale_vec),
             "physical_unit": list(self._physical_unit_vec),
-            **member_attrs(self.content_version, state),
+            **member_attrs(self.content_version, state, self._expires_at),
         }
 
 
@@ -264,7 +265,11 @@ def _lost_chunk(array_id: str, bounds: ChunkBounds) -> Exception:
 
 
 def create_cache_member(
-    store: Path, source_id: str, field: str, desc: TensorDescriptor
+    store: Path,
+    source_id: str,
+    field: str,
+    desc: TensorDescriptor,
+    expires_at: Optional[float] = None,
 ) -> CacheMember:
     """Mint a ``cache://`` member at *store*, ready to take chunks.
 
@@ -272,6 +277,9 @@ def create_cache_member(
     leaves a directory the boot sweep recognizes and removes rather than a
     partial tensor the next life would adopt. Raises ``ValueError`` if the
     directory is already there, which is that crash's leftovers.
+
+    *expires_at* is the deadline the boundary granted; it goes into the marker
+    with the state, so it outlives this process.
     """
     store = Path(store)
     try:
@@ -300,6 +308,7 @@ def create_cache_member(
     # uploaded one exactly, not a coalesced one: this format stores the chunks
     # as they arrive, and the index knows those bounds and no others
     # (``get_transfer_chunk_size``).
+    member._expires_at = expires_at
     member._write_descriptor(UPLOAD_PENDING)
     return member
 
@@ -356,6 +365,9 @@ def open_cache_member(
     except (KeyError, TypeError, ValueError) as e:
         logger.warning(f"member: {store} has an unusable descriptor ({e}); skipped")
         return None
+    # The deadline outlives the record: the sweep reads it off the adapter, so
+    # an adopted member's lifetime is still enforced (``WritableSource.expired``).
+    member._expires_at = upload_expires_at(descriptor)
     member.adopt_uploaded(
         _parse_bounds_key(key) for key in member._chunks.stored_keys()
     )
