@@ -26,6 +26,7 @@ import numpy as np
 import pyarrow.flight as flight
 import pytest
 from biopb_tensor_server.adapters.fields import fields_root, source_fields_dir
+from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.members import MEMBER_DESCRIPTOR
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import catalog_tensors
@@ -170,6 +171,78 @@ class TestTheSweepEnforcesIt:
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
 
+class TestALabelSetIsAnUploadedTensorToo:
+    """A set takes a lifetime like a field, and a cap reaches it like a field.
+
+    It is not a special case that gets to outlive the source's policy: if it
+    were, uploading a set would be the way to leave something on a temp store
+    for good.
+    """
+
+    @staticmethod
+    def _image(client, source):
+        desc = _publish(client, _add(client, source, field="img", scheme="zarr"))
+        return desc
+
+    @staticmethod
+    def _labels(client, image, name="nuclei", ttl=None):
+        arr = np.zeros(SHAPE, dtype=np.uint32)
+        arr[:2, :2] = 3
+        return client.add_tensor(
+            f"zarr://{image.array_id}/@labels/{name}",
+            arr,
+            chunk_shape=CHUNK,
+            ttl_seconds=ttl,
+        )
+
+    def test_a_requested_lifetime_reaches_a_set(self, client, source):
+        image = self._image(client, source)
+
+        assert self._labels(client, image, ttl=600).ttl_seconds <= 600
+
+    def test_a_source_cap_fills_an_unset_request_on_a_set(
+        self, client, source, writable_server
+    ):
+        """The hole this closes: the cap used to reach a field and not a set,
+        so a set on a capped source was kept for good."""
+        writable_server.sources.get(source).max_upload_ttl = 60
+        image = self._image(client, source)
+
+        assert 0 < self._labels(client, image).ttl_seconds <= 60
+
+    def test_no_cap_and_no_request_still_means_no_deadline(self, client, source):
+        """Unchanged for a set on a source that caps nothing."""
+        image = self._image(client, source)
+
+        assert not self._labels(client, image).HasField("ttl_seconds")
+
+    def test_the_sweep_discards_an_expired_set(
+        self, uploads, client, source, writable_server
+    ):
+        image = self._image(client, source)
+        desc = self._labels(client, image, ttl=600)
+        client.upload_array(desc, np.zeros(SHAPE, dtype=np.uint32))
+
+        assert uploads.reap(wall_now=time.time() + 601)[0] == 1
+
+        assert client.get_upload_status(desc.array_id)["state"] == "DISCARDED"
+        assert "lifetime" in client.get_upload_status(desc.array_id)["reason"]
+        assert desc.array_id not in writable_server.sources.get(source).label_sets
+
+    def test_the_deadline_is_recorded_in_the_sidecar(
+        self, client, source, writable_server, tmp_path
+    ):
+        """With the store, so it outlives the process -- which is also what
+        lets the boot sweep take a set whose lifetime ran out while the server
+        was down."""
+        image = self._image(client, source)
+        self._labels(client, image, ttl=600)
+
+        sidecar = sidecar_dir(labels_root(tmp_path), source) / "nuclei.zarr"
+        block = json.loads((sidecar / ".zattrs").read_text())["biopb"]["upload"]
+        assert block["expires_at"] > time.time()
+
+
 class TestASourceMayCapIt:
     def test_a_cap_shortens_a_longer_request(self, client, source, writable_server):
         writable_server.sources.get(source).max_upload_ttl = 60
@@ -224,8 +297,44 @@ class TestItSurvivesARestart:
                 f"{source}/@fields/temp"
             ]
 
-            assert second.uploads.reap(wall_now=time.time() + 601) == (1, 0)
+            # Expired *and* reclaimed in the one step: with no record there is
+            # no tombstone to age out, so this sweep is the whole ending.
+            assert second.uploads.reap(wall_now=time.time() + 601) == (1, 1)
             assert not _store(tmp_path, source).exists()
+        finally:
+            second.shutdown()
+            CacheManager.reset()
+
+    def test_an_adopted_tensor_leaves_no_tombstone_to_age_out(
+        self, writable_server, client, source, tmp_path
+    ):
+        """A tombstone's age is ``UploadProgress.updated_at``, stamped at the
+        discard. An adopted tensor has no record for that stamp to live on, so
+        a tombstone there could never age out and the field would stay taken
+        for good -- and it would buy nothing, since a tensor with no record
+        already polls as UNKNOWN either way.
+
+        So its expiry frees the name in one step, the way an explicit discard
+        of an adopted tensor already does (``_delete_adopted_tensor``).
+        """
+        _publish(client, _add(client, source, ttl=600))
+        client.close()
+        writable_server.shutdown()
+
+        second = self._serve(tmp_path)
+        try:
+            second.uploads.stop_sweep()
+            second.uploads.ttl = TTL
+            wall = time.time() + 601
+
+            second.uploads.reap(wall_now=wall)
+
+            parent = second.sources.get(source)
+            assert attached_field("temp") not in parent.attached_tensors
+            # ...and the sweep is done with it: no re-expiring it forever.
+            assert second.uploads.reap(
+                now=time.monotonic() + 100 * TTL, wall_now=wall
+            ) == (0, 0)
         finally:
             second.shutdown()
             CacheManager.reset()

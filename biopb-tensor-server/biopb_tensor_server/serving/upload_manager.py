@@ -197,12 +197,21 @@ def _past_deadline(expires_at: Optional[float]) -> bool:
 
 
 def _reap_outcome(expired_now: bool, stale: bool) -> Optional[str]:
-    """``"expired"``, ``"reclaimed"``, or None, for one entity's sweep step.
+    """``"expired"``, ``"reclaimed"``, ``"removed"`` or None, for one sweep step.
 
     The registered kinds and a source's label uploads take the identical
     decision in :meth:`reap`; only what each does about it -- a different
     namespace, registry vs. a source's own dict -- differs per loop.
+
+    ``"removed"`` is both at once, and is what an *adopted* tensor's expiry
+    answers: it leaves no tombstone to age out (``WritableSource.reap_step``),
+    so the step that ends it also frees its name. Keeping the two verbs
+    separate here rather than collapsing them lets each loop unlist and
+    detach in that order, which is the order a live upload reaches them in
+    over two sweeps.
     """
+    if expired_now and stale:
+        return "removed"
     if expired_now:
         return "expired"
     if stale:
@@ -434,6 +443,10 @@ class UploadManager:
         status polls; it is not *listed* until it reaches READY
         (``SourceAdapter.label_sets``). No catalog write at create: the row the
         source already has still describes what a reader may see.
+
+        It takes a deadline the same way a field does: a set is an uploaded
+        tensor, so a source that caps lifetimes caps this one too. Otherwise
+        a set would be the way to leave something on a temp store for good.
         """
         metadata = (
             self._parse_metadata_json(req_desc.metadata_json)
@@ -447,6 +460,7 @@ class UploadManager:
                 req_desc,
                 labels_dir=labels_root(self._write_dir),
                 metadata=metadata,
+                expires_at=self._deadline_for(parent, req_desc),
             )
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
@@ -494,9 +508,7 @@ class UploadManager:
         sidecars (``labels/<source_id>/*.zarr``), and -- for one more release --
         the single-array stores the removed ``ome_zarr:`` kind left directly
         under ``write_dir``. They differ in what the catalog owes them, which is
-        why they are swept separately. A registered source's container
-        (``sources/<name>.zarr``) holds no tensor, so there is nothing under it
-        to sweep.
+        why they are swept separately.
         """
         write_dir = self._write_dir
         if write_dir is None or not write_dir.is_dir():
@@ -841,10 +853,10 @@ class UploadManager:
             if upload_of(adapter) is not None:
                 expired_now, stale = _reap_step(adapter, now, ttl, wall_now)
                 outcome = _reap_outcome(expired_now, stale)
-                if outcome == "expired":
+                if outcome in ("expired", "removed"):
                     self._drop_catalog_row(adapter, source_id)
                     expired += 1
-                elif outcome == "reclaimed":
+                if outcome in ("reclaimed", "removed"):
                     # Safe without a compare-and-remove: a tombstone is
                     # terminal and its id cannot be re-registered while it
                     # stands, so this is still the adapter the snapshot saw.
@@ -885,10 +897,10 @@ class UploadManager:
         for field, tensor in list(tensors.items()):
             expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
             outcome = _reap_outcome(expired_now, stale)
-            if outcome == "expired":
+            if outcome in ("expired", "removed"):
                 self._unlist(adapter, field)
                 expired += 1
-            elif outcome == "reclaimed":
+            if outcome in ("reclaimed", "removed"):
                 detach(field)
                 reclaimed += 1
                 logger.info(f"Reclaimed discarded tensor {source_id}/{field}")

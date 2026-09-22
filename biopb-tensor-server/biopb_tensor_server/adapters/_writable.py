@@ -30,6 +30,7 @@ upload half should still reach it by attribute (``adapter.upload``,
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 import unicodedata
@@ -605,12 +606,21 @@ class WritableSource:
         carry a deadline, so the expiry half runs before the record is asked
         for: there is nothing to seal, and removing the store is the whole of
         the discard.
+
+        **An adopted tensor leaves no tombstone**, and answers ``inf`` for its
+        age to say so. A tombstone's age is ``UploadProgress.updated_at``,
+        stamped at the discard; with no record there is nowhere for that stamp
+        to live, so one would never age out and the name would stay taken for
+        good. Nor would it buy anything -- with no record ``get_upload_status``
+        already answers UNKNOWN, before and after -- which is why an explicit
+        discard of an adopted tensor also removes it outright
+        (``UploadManager._delete_adopted_tensor``).
         """
         progress = self._upload
         if self.expired(wall_now):
             if progress is None:
                 self._dispose_store()
-                return True, None
+                return True, math.inf
             with progress.lock:
                 if progress.is_discarded:
                     return False, progress.idle_for(now)

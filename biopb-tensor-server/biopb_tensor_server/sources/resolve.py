@@ -25,6 +25,7 @@ from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.adapters.remote_tensor import (
     _split_grpc_url,
     list_upstream_source_ids,
+    mirrorable_upstream_id,
     resolve_upstream_credentials,
 )
 from biopb_tensor_server.core.config import (
@@ -95,6 +96,17 @@ def _discover_tensor_server(
 
     if upstream_source_id is not None:
         # Single-source form: register under the alias-namespaced local id.
+        if not mirrorable_upstream_id(upstream_source_id):
+            # Named outright rather than reached by enumeration, so this is a
+            # refusal and not a silent skip -- but it is refused for the same
+            # reasons (``mirrorable_upstream_id``), and an unaliased one would
+            # land on this server's own scratch id.
+            raise ValueError(
+                f"{source.url}: an upstream's {upstream_source_id!r} source is "
+                f"its temp store, not a source to mirror -- everything on it "
+                f"has a deadline set by that server. Upload what you need to "
+                f"keep onto a source of its own."
+            )
         local_id = _namespaced_source_id(source.alias, upstream_source_id)
         return [replace(source, source_id=local_id)]
 
