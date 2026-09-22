@@ -840,10 +840,7 @@ class ArrowFileBackend:
         if batch is None:
             return None
 
-        return pa.RecordBatch.from_arrays(
-            [batch.column("data"), batch.column("shape"), batch.column("dtype")],
-            names=["data", "shape", "dtype"],
-        )
+        return segment_index.batch_without_key(batch)
 
     def _batch_at_offset(
         self, segment_id: int, mmap, entry_info: SegmentEntryInfo, key: bytes

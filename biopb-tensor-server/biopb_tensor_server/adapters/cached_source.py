@@ -227,9 +227,18 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             chunk_id = mint_chunk_id(
                 self.array_id, chunk_bounds, content_version=self.content_version
             )
-            self._written_chunks[chunk_id] = chunk_bounds
-            if not self._off_grid_writes and not self._on_grid(chunk_bounds):
-                self._off_grid_writes = True
+            self._record_write(chunk_id, chunk_bounds)
+
+    def _record_write(self, chunk_id: bytes, bounds: ChunkBounds) -> None:
+        """Note that *chunk_id* covers *bounds*, and whether that left the grid.
+
+        Shared by adoption (a store's own boot-time replay) and a live upload
+        (:meth:`write_chunk_arrow`) -- both are "this id now exists", differing
+        only in how the id was minted.
+        """
+        self._written_chunks[chunk_id] = bounds
+        if not self._off_grid_writes and not self._on_grid(bounds):
+            self._off_grid_writes = True
 
     def upload_response(self, desc: TensorDescriptor) -> TensorDescriptor:
         """Echo the uploader's physical calibration on the response.
@@ -501,9 +510,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         # Recorded even when the store declined (the chunk is already there
         # under this id): resolve_chunk_data gates reads on this map, so a
         # re-upload of an existing chunk must still be readable.
-        self._written_chunks[chunk_id] = bounds
-        if not self._off_grid_writes and not self._on_grid(bounds):
-            self._off_grid_writes = True
+        self._record_write(chunk_id, bounds)
 
         logger.debug(
             f"write_chunk_arrow: stored {size_bytes} bytes at bounds "

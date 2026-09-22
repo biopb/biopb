@@ -374,17 +374,23 @@ class ZarrMember(OmeZarrAdapter):
         self._dispose_store()
 
 
-def open_member(group: Path, *, source_id: str, field: str) -> Optional[ZarrMember]:
+def open_member(
+    group: Path, *, source_id: str, field: str, zattrs: Optional[dict] = None
+) -> Optional[ZarrMember]:
     """A :class:`ZarrMember` on the OME-Zarr group at *group*, or None.
 
     None, with a warning, for anything this server did not mint as a member: no
     readable ``.zattrs``, no recorded token, or no level-0 array. Skipped rather
     than served, because a member with no token has no chunk-id namespace of
     its own and would collide with whatever last held the name.
+
+    *zattrs*, when the caller already has it (``scan_members`` reads it as the
+    boot marker), is used as-is rather than read again.
     """
     import zarr
 
-    zattrs = read_zattrs(group)
+    if zattrs is None:
+        zattrs = read_zattrs(group)
     if zattrs is None:
         logger.warning(f"member: {group} has no readable .zattrs; skipped")
         return None
@@ -426,26 +432,35 @@ def scan_members(adapter: RegisterAdapter) -> Dict[str, TensorAdapter]:
     for group in sorted(adapter.store.iterdir()):
         if not group.is_dir() or group.name.startswith("."):
             continue
-        if upload_state(member_marker(group)) == UPLOAD_PENDING:
+        marker = member_marker(group)
+        if upload_state(marker) == UPLOAD_PENDING:
             logger.info(f"member: {group} was left pending; not adopted")
             continue
-        member = open_any_member(group, source_id=adapter.source_id, field=group.name)
+        member = open_any_member(
+            group, source_id=adapter.source_id, field=group.name, marker=marker
+        )
         if member is not None:
             members[group.name] = member
     return members
 
 
 def open_any_member(
-    group: Path, *, source_id: str, field: str
+    group: Path, *, source_id: str, field: str, marker: Optional[dict] = None
 ) -> Optional[TensorAdapter]:
     """The member at *group*, in whichever format minted it, or None.
 
     The one dispatch on layout: the adoption pass has a directory and no idea
     which format it is, and every other caller is in the same position.
+
+    *marker*, when the caller already read it (``scan_members``'s own
+    ``member_marker`` call), is handed to whichever format this dispatches to
+    instead of being read from disk a second time.
     """
     if (group / MEMBER_DESCRIPTOR).exists():
-        return open_cache_member(group, source_id=source_id, field=field)
-    return open_member(group, source_id=source_id, field=field)
+        return open_cache_member(
+            group, source_id=source_id, field=field, descriptor=marker
+        )
+    return open_member(group, source_id=source_id, field=field, zattrs=marker)
 
 
 def create_member(

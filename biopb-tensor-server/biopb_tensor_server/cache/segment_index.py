@@ -32,6 +32,7 @@ __all__ = [
     "SegmentScan",
     "batch_at_offset",
     "batch_with_key",
+    "batch_without_key",
     "bracket_message",
     "read_sidecar",
     "scan_segment_records",
@@ -317,6 +318,16 @@ def batch_with_key(batch: pa.RecordBatch, key: bytes) -> pa.RecordBatch:
         list(batch.columns) + [pa.array([key], type=pa.binary())],
         names=list(batch.schema.names) + [CACHE_KEY_FIELD],
     )
+
+
+def batch_without_key(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """*batch* with the trailing ``CACHE_KEY_FIELD`` column dropped.
+
+    The inverse of :func:`batch_with_key`: what a reader hands back over the
+    wire is the payload as it was uploaded, never the internal key column
+    ``batch_with_key`` appended for the segment's own bookkeeping.
+    """
+    return batch.remove_column(batch.num_columns - 1)
 
 
 def schema_message_length(path: Path) -> Optional[int]:

@@ -32,6 +32,7 @@ from biopb_tensor_server.cache.segment_index import (
     IndexRecord,
     batch_at_offset,
     batch_with_key,
+    batch_without_key,
     bracket_message,
     read_sidecar,
     scan_segment_records,
@@ -249,10 +250,7 @@ class SegmentStore:
             batch = self._batch(mm, schema, placed)
             if batch is None:
                 return None
-            return pa.RecordBatch.from_arrays(
-                [batch.column("data"), batch.column("shape"), batch.column("dtype")],
-                names=["data", "shape", "dtype"],
-            )
+            return batch_without_key(batch)
 
     def _batch(self, mm, schema: pa.Schema, placed: _Placed):
         """The record at *placed*, by byte range if it has one, else by walk."""

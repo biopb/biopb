@@ -297,16 +297,21 @@ def create_cache_member(
         physical_unit=list(desc.physical_unit) if desc.physical_unit else None,
         content_version=os.urandom(8),
     )
-    # The grid is the uploaded one exactly, not a coalesced one: this format
-    # stores the chunks as they arrive, and the index knows those bounds and no
-    # others (``get_transfer_chunk_size``).
-    member.begin_upload(desc.shape, member.get_transfer_chunk_size())
+    # The constructor's own begin_upload (track_upload defaults True) already
+    # started tracking against this exact shape/chunk_shape -- the grid is the
+    # uploaded one exactly, not a coalesced one: this format stores the chunks
+    # as they arrive, and the index knows those bounds and no others
+    # (``get_transfer_chunk_size``).
     member._write_descriptor(UPLOAD_PENDING)
     return member
 
 
 def open_cache_member(
-    store: Path, *, source_id: str, field: str
+    store: Path,
+    *,
+    source_id: str,
+    field: str,
+    descriptor: Optional[Dict[str, Any]] = None,
 ) -> Optional[CacheMember]:
     """The :class:`CacheMember` at *store*, or None if it is not one.
 
@@ -318,13 +323,17 @@ def open_cache_member(
     The chunk ids are **this build's**, minted here over the bounds the index
     holds: what is on disk is keyed by bounds, and only the record the read
     path consults is keyed by id.
+
+    *descriptor*, when the caller already has it (``open_any_member``'s own
+    boot marker), is used as-is rather than read and parsed again.
     """
     store = Path(store)
-    try:
-        descriptor = json.loads((store / MEMBER_DESCRIPTOR).read_text())
-    except (OSError, ValueError) as e:
-        logger.warning(f"member: {store} has no readable descriptor ({e}); skipped")
-        return None
+    if descriptor is None:
+        try:
+            descriptor = json.loads((store / MEMBER_DESCRIPTOR).read_text())
+        except (OSError, ValueError) as e:
+            logger.warning(f"member: {store} has no readable descriptor ({e}); skipped")
+            return None
     content_version = read_member_version(descriptor)
     if content_version is None:
         logger.warning(f"member: {store} records no content_version; skipped")
