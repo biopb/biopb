@@ -375,7 +375,13 @@ class SourceAdapter(ABC):
         anything, and a tensor still uploading is gated exactly as a published
         one is -- a grant that only started applying at READY would leave the
         window in between open.
+
+        Checked on every read through :meth:`TensorFlightServer._grants`, so a
+        source with nothing attached (the common case) skips the field parse
+        below rather than paying it on every chunk.
         """
+        if not self._attached_tensors:
+            return None
         attached = self._attached_for(self._within_source_field(array_id))
         return attached.capability_token if attached is not None else None
 

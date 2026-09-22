@@ -196,29 +196,6 @@ def _past_deadline(expires_at: Optional[float]) -> bool:
     return expires_at is not None and time.time() >= expires_at
 
 
-def _reap_outcome(expired_now: bool, stale: bool) -> Optional[str]:
-    """``"expired"``, ``"reclaimed"``, ``"removed"`` or None, for one sweep step.
-
-    The registered kinds and a source's label uploads take the identical
-    decision in :meth:`reap`; only what each does about it -- a different
-    namespace, registry vs. a source's own dict -- differs per loop.
-
-    ``"removed"`` is both at once, and is what an *adopted* tensor's expiry
-    answers: it leaves no tombstone to age out (``WritableSource.reap_step``),
-    so the step that ends it also frees its name. Keeping the two verbs
-    separate here rather than collapsing them lets each loop unlist and
-    detach in that order, which is the order a live upload reaches them in
-    over two sweeps.
-    """
-    if expired_now and stale:
-        return "removed"
-    if expired_now:
-        return "expired"
-    if stale:
-        return "reclaimed"
-    return None
-
-
 class UploadManager:
     """The DoPut boundary: picks the kind, registers, translates errors."""
 
@@ -852,11 +829,10 @@ class UploadManager:
         for source_id, adapter in self._registry.snapshot():
             if upload_of(adapter) is not None:
                 expired_now, stale = _reap_step(adapter, now, ttl, wall_now)
-                outcome = _reap_outcome(expired_now, stale)
-                if outcome in ("expired", "removed"):
+                if expired_now:
                     self._drop_catalog_row(adapter, source_id)
                     expired += 1
-                if outcome in ("reclaimed", "removed"):
+                if stale:
                     # Safe without a compare-and-remove: a tombstone is
                     # terminal and its id cannot be re-registered while it
                     # stands, so this is still the adapter the snapshot saw.
@@ -896,11 +872,10 @@ class UploadManager:
         expired = reclaimed = 0
         for field, tensor in list(tensors.items()):
             expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
-            outcome = _reap_outcome(expired_now, stale)
-            if outcome in ("expired", "removed"):
+            if expired_now:
                 self._unlist(adapter, field)
                 expired += 1
-            if outcome in ("reclaimed", "removed"):
+            if stale:
                 detach(field)
                 reclaimed += 1
                 logger.info(f"Reclaimed discarded tensor {source_id}/{field}")
