@@ -280,6 +280,23 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
         }
         self._bitmaps: Dict[int, np.ndarray] = {}
         self._unreadable_bitmap_ids: set[int] = set()
+        # Every mask's bbox and pins, as columns: a read narrows to the masks
+        # it touches in one vector test rather than a Python loop over all of
+        # them, which at ~1 us a mask was most of a tile read (0.85 of 1.17 ms
+        # at 800 masks, and growing with the count, not with the tile). A pin
+        # of -1 is "unpinned" -- ``_mask_shape`` never keeps a negative one.
+        boxes = np.array([_bbox(m) for m in self._masks], dtype=np.int64)
+        self._bx0, self._by0, self._bx1, self._by1 = boxes.reshape(-1, 4).T
+        self._pins = {
+            attr: np.array(
+                [
+                    -1 if pin is None else pin
+                    for pin in (getattr(m, f"the_{attr}") for m in self._masks)
+                ],
+                dtype=np.int64,
+            )
+            for attr in ("z", "t")
+        }
 
     @property
     def dim_labels(self) -> List[str]:
@@ -371,9 +388,32 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
                 "ome masks: %s has no y/x axis; serving an empty set", self.array_id
             )
             return out
-        for shape in self._masks:
-            self._paint(out, starts, stops, shape, y_axis, x_axis)
+        for i in self._touching(starts, stops, y_axis, x_axis):
+            self._paint(out, starts, stops, self._masks[i], y_axis, x_axis)
         return out
+
+    def _touching(
+        self, starts: List[int], stops: List[int], y_axis: int, x_axis: int
+    ) -> np.ndarray:
+        """Indices of the masks whose bbox and plane pins meet the bounds.
+
+        A superset of what :meth:`_paint` will paint, never a subset: the same
+        half-open overlap test on every axis, over the columns ``__init__``
+        built. ``_paint`` keeps its own checks, so a mask this admits and that
+        rejects (an empty bbox) is still a no-op there.
+        """
+        hit = (
+            (self._bx0 < stops[x_axis])
+            & (self._bx1 > starts[x_axis])
+            & (self._by0 < stops[y_axis])
+            & (self._by1 > starts[y_axis])
+        )
+        for attr, pins in self._pins.items():
+            axis = self._axis.get(attr)
+            if axis is None:
+                continue  # no such axis here: every pin on it is inert
+            hit &= (pins < 0) | ((starts[axis] <= pins) & (pins < stops[axis]))
+        return np.flatnonzero(hit)
 
     def _paint(
         self,
